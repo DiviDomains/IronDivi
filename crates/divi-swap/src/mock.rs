@@ -244,6 +244,16 @@ impl MockChain {
         self.state.lock().attempts.get(&kind).copied().unwrap_or(0)
     }
 
+    /// [`MockChain::attempts`] for every kind at once: funding, claim and refund
+    /// broadcasts that reached the node, refused ones included.
+    pub fn attempt_counts(&self) -> TxCounts {
+        TxCounts {
+            funds: self.attempts(TxKind::Fund) as u64,
+            claims: self.attempts(TxKind::Claim) as u64,
+            refunds: self.attempts(TxKind::Refund) as u64,
+        }
+    }
+
     /// The chain has `txid`, in the mempool or mined.
     pub fn contains(&self, txid: &Txid) -> bool {
         self.state.lock().txs.contains_key(txid)

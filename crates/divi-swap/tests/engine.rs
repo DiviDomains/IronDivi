@@ -92,6 +92,39 @@ struct H {
     first_maker: Vec<(SwapState, usize)>,
     first_taker: Vec<(TakerState, usize)>,
     drop: Option<DropPlan>,
+    /// The refund swap pins its clocks at this edge instead of `expire_both`.
+    edge: Option<Edge>,
+    /// Rounds left without blocks while the refund clock is pinned.
+    hold: usize,
+    /// Refund attempts per leg (taker, maker) already looked at by `check_refund_gate`.
+    seen_refunds: [usize; 2],
+    /// Refund broadcasts seen while that leg's MTP was at most its locktime.
+    early_refunds: Vec<String>,
+}
+
+/// Where a refund-edge row pins the refund swap's clocks when it times out.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Edge {
+    /// Each leg's chain MTP exactly at that leg's locktime L plus this offset.
+    At(i64),
+    /// A late lock: the maker's lock goes back to the mempool and the clocks sit at
+    /// L - claim_margin/2, where the maker stops waiting (`MakerRefundable`) before L.
+    LateLock,
+}
+
+/// Rounds an edge row holds the clocks where it pinned them (no blocks) before it releases
+/// them to L+1: the engines pass the edge several times, crashes and drops included.
+const HOLD_ROUNDS: usize = 4;
+
+/// The refund-edge rows: MTP at L-1, L and L+1, and the late lock.
+const EDGES: [Edge; 4] = [Edge::At(-1), Edge::At(0), Edge::At(1), Edge::LateLock];
+
+fn add_counts(a: TxCounts, b: TxCounts) -> TxCounts {
+    TxCounts {
+        funds: a.funds + b.funds,
+        claims: a.claims + b.claims,
+        refunds: a.refunds + b.refunds,
+    }
 }
 
 /// One leg of the swap: the taker's lock and its spend, or the maker's.
@@ -202,6 +235,10 @@ impl H {
             first_maker: Vec::new(),
             first_taker: Vec::new(),
             drop: None,
+            edge: None,
+            hold: 0,
+            seen_refunds: [0; 2],
+            early_refunds: Vec::new(),
         };
         h.maker = build_maker(&h, store.clone());
         h.taker = Taker::new(
@@ -393,21 +430,27 @@ impl H {
         self.btc.set_offline(offline);
         self.divi.set_offline(offline);
         let _ = self.maker.tick().await;
+        self.check_refund_gate();
         self.maybe_crash(crash);
         self.note_states();
         if scn == Scn::Refund && !*timed_out && self.maker_state() == SwapState::MakerLockConfirmed
         {
-            self.expire_both();
+            match self.edge {
+                Some(edge) => self.pin_edge(edge),
+                None => self.expire_both(),
+            }
             *timed_out = true;
         }
         if scn == Scn::Happy || *timed_out {
             let view = self.maker.view(&self.maker_id).unwrap();
             let _ = self.taker.step(&self.taker_id, view.as_ref()).await;
+            self.check_refund_gate();
             self.maybe_crash(crash);
         } else {
             // The silent taker: a real step (`on_locked` re-sends the persisted funding tx,
             // same bytes, same txid) with no maker view, so it never sees a lock to claim.
             let _ = self.taker.step(&self.taker_id, None).await;
+            self.check_refund_gate();
             self.maybe_crash(crash);
         }
         self.note_states();
@@ -415,9 +458,93 @@ impl H {
         self.divi.set_offline(false);
         self.end_fault_round();
         self.drop_tick();
-        self.btc.mine(1);
-        self.divi.mine(1);
+        if self.hold > 0 {
+            // A pinned refund clock: no blocks, so each chain's MTP stays exactly where it
+            // was set; on the last held round it is released to L+1 and blocks resume.
+            self.hold -= 1;
+            if self.hold == 0 {
+                self.pin_offset(1);
+            }
+        } else {
+            self.btc.mine(1);
+            self.divi.mine(1);
+        }
         self.round_no += 1;
+    }
+
+    /// Each leg's HTLC locktime, once the side that funds it has recorded it.
+    fn leg_locktime(&self, leg: Leg) -> Option<u32> {
+        match leg {
+            Leg::Maker if !self.maker_id.is_empty() => self
+                .store
+                .get_maker_swap(&self.maker_id)
+                .unwrap()?
+                .maker_leg_htlc
+                .map(|h| h.locktime),
+            Leg::Taker if !self.taker_id.is_empty() => self
+                .store
+                .get_taker_swap(&self.taker_id)
+                .unwrap()?
+                .taker_leg_htlc
+                .map(|h| h.locktime),
+            _ => None,
+        }
+    }
+
+    /// Note every refund broadcast that reached a leg's chain while its MTP was not past
+    /// that leg's locktime L: Core refuses it as non-final, so the engine must not send it.
+    /// Called after each engine pass; MTP only moves between passes.
+    fn check_refund_gate(&mut self) {
+        for (i, leg) in [Leg::Taker, Leg::Maker].into_iter().enumerate() {
+            let chain = self.leg_chain(leg);
+            let (n, mtp) = (chain.attempts(TxKind::Refund), chain.mtp());
+            if n > self.seen_refunds[i] {
+                if let Some(l) = self.leg_locktime(leg).filter(|l| mtp <= *l) {
+                    self.early_refunds.push(format!(
+                        "{leg:?} leg: {} refund attempt(s) at mtp {mtp}, locktime {l}",
+                        n - self.seen_refunds[i]
+                    ));
+                }
+                self.seen_refunds[i] = n;
+            }
+        }
+    }
+
+    /// Set each leg's chain MTP to exactly its own locktime L plus `off`.
+    fn pin_offset(&self, off: i64) {
+        for leg in [Leg::Taker, Leg::Maker] {
+            let l = self
+                .leg_locktime(leg)
+                .expect("pinned before the HTLC is set");
+            let at = (i64::from(l) + off) as u32;
+            let chain = self.leg_chain(leg);
+            assert!(
+                chain.mtp() <= at,
+                "{leg:?} leg: mtp {} past {at}",
+                chain.mtp()
+            );
+            chain.advance_time(at - chain.mtp());
+        }
+    }
+
+    /// The refund swap's timeout for an edge row (instead of `expire_both`): pin the clocks
+    /// and hold them there for `HOLD_ROUNDS` rounds.
+    fn pin_edge(&mut self, edge: Edge) {
+        let off = match edge {
+            Edge::At(off) => off,
+            Edge::LateLock => {
+                let lock = self.maker_rec().maker_leg_funding.unwrap().tx.txid;
+                self.ml_chain().unconfirm(&lock);
+                -i64::from(self.cfg.claim_margin_secs / 2)
+            }
+        };
+        self.pin_offset(off);
+        self.hold = HOLD_ROUNDS;
+    }
+
+    /// Broadcast attempts on both chains, by kind, refused ones included.
+    fn attempts(&self) -> TxCounts {
+        add_counts(self.btc.attempt_counts(), self.divi.attempt_counts())
     }
 
     fn finished(&self) -> bool {
@@ -807,8 +934,10 @@ impl H {
         self.restart();
         for _ in 0..3 {
             let _ = self.maker.tick().await;
+            self.check_refund_gate();
             let view = self.maker.view(&self.maker_id).unwrap();
             let _ = self.taker.step(&self.taker_id, view.as_ref()).await;
+            self.check_refund_gate();
             self.mine_all(1);
         }
     }
@@ -1038,15 +1167,41 @@ fn assert_on_path(h: &H, scn: Scn, what: &str) {
 
 /// The undisturbed run: its outcome is what every disturbed run must end with.
 async fn undisturbed(dir: Direction, scn: Scn) -> (H, Outcome) {
+    undisturbed_at(dir, scn, None).await
+}
+
+async fn undisturbed_at(dir: Direction, scn: Scn, edge: Option<Edge>) -> (H, Outcome) {
     let mut base = H::with(dir);
+    base.edge = edge;
     base.run(scn, None, &[]).await;
     assert_atomic(&base, scn);
     assert_on_path(&base, scn, "undisturbed");
     base.restart_and_settle().await;
+    assert_no_early_refund(&base, &format!("{dir:?} {scn:?} {edge:?} undisturbed"));
     let want = base.outcome();
     assert_eq!(want.coin_selections, (1, 1), "{scn:?}");
     assert_eq!(want.released, 0, "{scn:?}");
     (base, want)
+}
+
+/// No refund broadcast ever reached a leg's chain before that leg's refund was final.
+fn assert_no_early_refund(h: &H, what: &str) {
+    assert!(
+        h.early_refunds.is_empty(),
+        "{what}: refund sent before final: {:?}",
+        h.early_refunds
+    );
+}
+
+/// The per-matrix summary line: broadcast attempts on both chains, refused ones included.
+fn report_attempts(matrix: &str, dir: Direction, what: &str, runs: usize, a: TxCounts) {
+    eprintln!(
+        "DF-ATTEMPTS {matrix} {dir:?} {what}: {runs} runs, fund {} claim {} refund {} all {}",
+        a.funds,
+        a.claims,
+        a.refunds,
+        a.funds + a.claims + a.refunds
+    );
 }
 
 /// Restart while a chain backend is down or erroring: for the happy and the refund
@@ -1056,13 +1211,10 @@ async fn undisturbed(dir: Direction, scn: Scn) -> (H, Outcome) {
 /// leaves the scenario's path (no abort, no refund of a happy swap). Healed, every run ends
 /// like the undisturbed one: same states, balances, tx counts, coin selections.
 async fn outage_matrix_body(dir: Direction) {
-    let crashes: Vec<Crash> = MAKER_RESTART_POINTS
-        .iter()
-        .map(|s| Crash::Maker(*s))
-        .chain(TAKER_RESTART_POINTS.iter().map(|s| Crash::Taker(*s)))
-        .collect();
+    let crashes = restart_points();
     for scn in [Scn::Happy, Scn::Refund] {
         let (base, want) = undisturbed(dir, scn).await;
+        let mut sent = base.attempts();
         let mut runs = 0;
         for leg in [Leg::Taker, Leg::Maker] {
             for (name, err, send_only) in faults() {
@@ -1072,6 +1224,7 @@ async fn outage_matrix_body(dir: Direction) {
                     h.fault = Some((leg, err.clone(), send_only));
                     h.run(scn, Some(*crash), &[]).await;
                     if h.restarts == 0 {
+                        sent = add_counts(sent, h.attempts());
                         continue;
                     }
                     let what = format!(
@@ -1085,6 +1238,8 @@ async fn outage_matrix_body(dir: Direction) {
                     h.heal();
                     h.restart_and_settle().await;
                     assert_eq!(h.outcome(), want, "{what}");
+                    assert_no_early_refund(&h, &what);
+                    sent = add_counts(sent, h.attempts());
                     runs += 1;
                 }
                 assert!(
@@ -1094,6 +1249,7 @@ async fn outage_matrix_body(dir: Direction) {
             }
         }
         eprintln!("DF-MATRIX outage {dir:?} {scn:?}: {runs} runs");
+        report_attempts("outage", dir, &format!("{scn:?}"), runs, sent);
     }
 }
 both!(
@@ -1101,6 +1257,63 @@ both!(
     rev_outage_matrix_same_outcome,
     outage_matrix_body
 );
+
+/// Every restart point of both sides, as the restart and outage matrices use them.
+fn restart_points() -> Vec<Crash> {
+    MAKER_RESTART_POINTS
+        .iter()
+        .map(|s| Crash::Maker(*s))
+        .chain(TAKER_RESTART_POINTS.iter().map(|s| Crash::Taker(*s)))
+        .collect()
+}
+
+/// Every eviction plan of the mempool-drop matrix for a scenario whose spend is `spend`:
+/// each leg, its funding then its spend, once or three times, with or without a restart.
+fn drop_plans(spend: TxKind) -> Vec<DropPlan> {
+    let mut plans = Vec::new();
+    for leg in [Leg::Taker, Leg::Maker] {
+        for kind in [TxKind::Fund, spend] {
+            for times in [1, 3] {
+                for restart in [false, true] {
+                    plans.push(DropPlan {
+                        leg,
+                        kind,
+                        times,
+                        restart,
+                        drops: Vec::new(),
+                    });
+                }
+            }
+        }
+    }
+    plans
+}
+
+/// The eviction plan ran in full and each evicted tx came back by the next round with the
+/// same txid: the chain only ever saw one tx of that kind on that leg.
+fn assert_drops_resent(h: &mut H, what: &str) {
+    let p = h.drop.take().unwrap();
+    let (leg, kind) = (p.leg, p.kind);
+    assert_eq!(p.drops.len(), p.times, "{what}: {:?}", p.drops);
+    let id = p.drops[0].0;
+    for (d, at, back) in &p.drops {
+        assert_eq!(*d, id, "{what}: another {kind:?} was sent");
+        let back = back.unwrap_or_else(|| panic!("{what}: never sent again after round {at}"));
+        assert!(
+            back <= at + 1,
+            "{what}: evicted in round {at}, back in {back}"
+        );
+    }
+    assert!(h.leg_chain(leg).contains(&id), "{what}: not on chain");
+    let ids: Vec<Txid> = h
+        .leg_chain(leg)
+        .accepted()
+        .into_iter()
+        .filter(|(_, k)| *k == kind)
+        .map(|(t, _)| t)
+        .collect();
+    assert_eq!(ids, vec![id], "{what}: a second {kind:?} txid");
+}
 
 /// Mempool eviction: for the happy and the refund scenario, each leg and each tx the
 /// scenario sends on it (funding, then the claim or the refund), evict it while
@@ -1115,62 +1328,100 @@ async fn mempool_drop_matrix_body(dir: Direction) {
             Scn::Happy => TxKind::Claim,
             Scn::Refund => TxKind::Refund,
         };
+        let mut sent = base.attempts();
         let mut runs = 0;
-        for leg in [Leg::Taker, Leg::Maker] {
-            for kind in [TxKind::Fund, spend] {
-                for times in [1, 3] {
-                    for restart in [false, true] {
-                        let what = format!(
-                            "{dir:?} {scn:?}: {leg:?}-leg {kind:?} evicted {times}x, restart {restart}"
-                        );
-                        let mut h = H::with(dir);
-                        h.drop = Some(DropPlan {
-                            leg,
-                            kind,
-                            times,
-                            restart,
-                            drops: Vec::new(),
-                        });
-                        h.run(scn, None, &[]).await;
-                        let p = h.drop.take().unwrap();
-                        assert_eq!(p.drops.len(), times, "{what}: {:?}", p.drops);
-                        let id = p.drops[0].0;
-                        for (d, at, back) in &p.drops {
-                            assert_eq!(*d, id, "{what}: another {kind:?} was sent");
-                            let back = back.unwrap_or_else(|| {
-                                panic!("{what}: never sent again after round {at}")
-                            });
-                            assert!(
-                                back <= at + 1,
-                                "{what}: evicted in round {at}, back in {back}"
-                            );
-                        }
-                        assert!(h.leg_chain(leg).contains(&id), "{what}: not on chain");
-                        let ids: Vec<Txid> = h
-                            .leg_chain(leg)
-                            .accepted()
-                            .into_iter()
-                            .filter(|(_, k)| *k == kind)
-                            .map(|(t, _)| t)
-                            .collect();
-                        assert_eq!(ids, vec![id], "{what}: a second {kind:?} txid");
-                        assert_on_path(&h, scn, &what);
-                        assert_not_earlier(&h, &base, &what);
-                        assert_atomic(&h, scn);
-                        h.restart_and_settle().await;
-                        assert_eq!(h.outcome(), want, "{what}");
-                        runs += 1;
-                    }
-                }
-            }
+        for plan in drop_plans(spend) {
+            let what = format!(
+                "{dir:?} {scn:?}: {:?}-leg {:?} evicted {}x, restart {}",
+                plan.leg, plan.kind, plan.times, plan.restart
+            );
+            let mut h = H::with(dir);
+            h.drop = Some(plan);
+            h.run(scn, None, &[]).await;
+            assert_drops_resent(&mut h, &what);
+            assert_on_path(&h, scn, &what);
+            assert_not_earlier(&h, &base, &what);
+            assert_atomic(&h, scn);
+            h.restart_and_settle().await;
+            assert_eq!(h.outcome(), want, "{what}");
+            assert_no_early_refund(&h, &what);
+            sent = add_counts(sent, h.attempts());
+            runs += 1;
         }
         eprintln!("DF-MATRIX mempool-drop {dir:?} {scn:?}: {runs} runs");
+        report_attempts("mempool-drop", dir, &format!("{scn:?}"), runs, sent);
     }
 }
 both!(
     mempool_drop_matrix_same_txid,
     rev_mempool_drop_matrix_same_txid,
     mempool_drop_matrix_body
+);
+
+/// The refund clock at its edge: for each row of `EDGES`, the refund scenario times out by
+/// pinning each leg's chain MTP at exactly L-1, L or L+1 (or, for the late lock, sending the
+/// maker's lock back to the mempool at L - claim_margin/2, past the point where the maker
+/// goes `MakerRefundable`) and holding it there for `HOLD_ROUNDS` rounds before L+1. Each
+/// row runs undisturbed, then from every restart point and with every eviction plan. No
+/// refund attempt reaches either chain while its MTP is at most L (none before final, no
+/// extra one at L), and every run ends like the row's undisturbed one.
+async fn refund_edge_matrix_body(dir: Direction) {
+    let scn = Scn::Refund;
+    let crashes = restart_points();
+    let mut refunds = Vec::new();
+    for edge in EDGES {
+        let (base, want) = undisturbed_at(dir, scn, Some(edge)).await;
+        let mut sent = base.attempts();
+        let mut runs = 0;
+        for crash in &crashes {
+            let mut h = H::with(dir);
+            h.edge = Some(edge);
+            h.run(scn, Some(*crash), &[]).await;
+            let what = format!("{dir:?} {edge:?}: restart after {crash:?}");
+            if h.restarts > 0 {
+                assert_on_path(&h, scn, &what);
+                assert_not_earlier(&h, &base, &what);
+                assert_atomic(&h, scn);
+                h.restart_and_settle().await;
+                assert_eq!(h.outcome(), want, "{what}");
+                runs += 1;
+            }
+            assert_no_early_refund(&h, &what);
+            sent = add_counts(sent, h.attempts());
+        }
+        for plan in drop_plans(TxKind::Refund) {
+            let what = format!(
+                "{dir:?} {edge:?}: {:?}-leg {:?} evicted {}x, restart {}",
+                plan.leg, plan.kind, plan.times, plan.restart
+            );
+            let mut h = H::with(dir);
+            h.edge = Some(edge);
+            h.drop = Some(plan);
+            h.run(scn, None, &[]).await;
+            assert_drops_resent(&mut h, &what);
+            assert_on_path(&h, scn, &what);
+            assert_not_earlier(&h, &base, &what);
+            assert_atomic(&h, scn);
+            h.restart_and_settle().await;
+            assert_eq!(h.outcome(), want, "{what}");
+            assert_no_early_refund(&h, &what);
+            sent = add_counts(sent, h.attempts());
+            runs += 1;
+        }
+        eprintln!("DF-MATRIX refund-edge {dir:?} {edge:?}: {runs} runs");
+        report_attempts("refund-edge", dir, &format!("{edge:?}"), runs, sent);
+        refunds.push((edge, sent.refunds));
+    }
+    // MTP at L is still not final: pinning there sends no more refunds than at L-1.
+    assert_eq!(
+        refunds[0].1, refunds[1].1,
+        "{dir:?} refund attempts: {refunds:?}"
+    );
+}
+both!(
+    refund_edge_matrix_same_outcome,
+    rev_refund_edge_matrix_same_outcome,
+    refund_edge_matrix_body
 );
 
 const MAKER_STATES: [SwapState; 9] = [
