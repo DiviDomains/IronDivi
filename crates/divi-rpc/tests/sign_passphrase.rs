@@ -172,3 +172,30 @@ fn walletpassphrase_reads_its_timeout_after_the_unlock() {
     assert_eq!(node.status(), json!("locked"));
     assert_eq!(unlocked_until(&node), 0);
 }
+
+/// walletpassphrase on a wallet unlocked for everything takes any passphrase
+/// and only sets the staking-only flag (CWallet::Unlock, wallet.cpp:780-783);
+/// unlocked for staking only, the passphrase is checked again
+#[test]
+fn walletpassphrase_on_an_unlocked_wallet_takes_any_passphrase() {
+    let node = encrypted_node();
+    node.ok("walletpassphrase", vec![json!("pass"), json!(600)]);
+    assert_eq!(
+        node.ok("walletpassphrase", vec![json!("wrong"), json!(600)]),
+        json!(null)
+    );
+    assert_eq!(node.status(), json!("unlocked"));
+    node.ok(
+        "walletpassphrase",
+        vec![json!("wrong"), json!(600), json!(true)],
+    );
+    assert_eq!(node.status(), json!("unlocked-for-staking"));
+    assert_eq!(
+        node.err("walletpassphrase", vec![json!("wrong"), json!(600)]),
+        (
+            -14,
+            "Error: The wallet passphrase entered was incorrect.".to_string()
+        )
+    );
+    assert_eq!(node.status(), json!("unlocked-for-staking"));
+}

@@ -2569,6 +2569,12 @@ impl WalletDb {
     ) -> Result<(), WalletError> {
         // Settle a timer that has run out first
         self.is_locked();
+        // A wallet unlocked for everything takes any passphrase: only the
+        // staking-only flag changes (wallet.cpp:780-783)
+        if self.is_fully_unlocked() {
+            self.unlock.write().staking_only = staking_only;
+            return Ok(());
+        }
         let before = *self.unlock.read();
         self.unlock_for(passphrase, 0, staking_only)?;
         let mut state = self.unlock.write();
