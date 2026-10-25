@@ -224,3 +224,18 @@ async fn filtered_block_item_ends_a_getdata_pass() {
         ]
     );
 }
+
+/// A block that invalidateblock marked failed is not sent, though it was
+/// fully validated: Divi Core's IsValid(BLOCK_VALID_SCRIPTS) is false for a
+/// failed block (main.cpp:223-239, chain.h:313-319)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn getdata_of_an_invalidated_block_gets_nothing() {
+    let t = TestNode::start().await;
+    let _b1 = mine(&t);
+    let b2 = mine(&t);
+    t.node.chain().invalidate_block(&b2).unwrap();
+    let mut p = peer(&t, "127.0.0.3").await;
+    p.send("getdata", &getdata(&[(2, b2)])).await;
+    let got: Vec<String> = replies(&mut p).await.into_iter().map(|(c, _)| c).collect();
+    assert!(got.is_empty(), "{got:?}");
+}
