@@ -17,6 +17,9 @@ pub mod address;
 pub mod grpc;
 pub mod tx;
 
+#[cfg(test)]
+mod lwd_stub;
+
 use async_trait::async_trait;
 use secp256k1::{All, Secp256k1, SecretKey};
 

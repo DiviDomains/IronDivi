@@ -41,3 +41,5 @@ http = "1"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+# The in-process lightwalletd stub (src/lwd_stub.rs) serves CompactTxStreamer over tonic.
+tonic = { version = "=0.14.6", default-features = false, features = ["server", "codegen"] }
