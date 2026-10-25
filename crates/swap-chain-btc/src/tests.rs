@@ -636,6 +636,9 @@ async fn funding_selects_coins_and_change() {
         .await;
     let (_, hash) = new_preimage();
     let h = htlc(hash);
+    // Every case starts from the same coins, and a backend never reuses a coin a
+    // transaction it built spends, so each case after the first gets a fresh one.
+    let fresh = || backend(vec![server.uri()], TAKER_KEY);
 
     // 20,000 needs both confirmed coins (largest first); the unconfirmed one is not used.
     let f = b.build_funding(&h, Amount::from_sat(20_000)).await.unwrap();
@@ -658,19 +661,25 @@ async fn funding_selects_coins_and_change() {
     );
 
     // 5,000 fits in the largest confirmed coin alone, with change.
-    let f = b.build_funding(&h, Amount::from_sat(5_000)).await.unwrap();
+    let f = fresh()
+        .build_funding(&h, Amount::from_sat(5_000))
+        .await
+        .unwrap();
     let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&f.tx.raw).unwrap();
     assert_eq!(tx.input.len(), 1);
     assert_eq!(tx.output.len(), 2);
 
     // A remainder below dust is folded into the fee instead of a change output.
-    let f = b.build_funding(&h, Amount::from_sat(14_650)).await.unwrap();
+    let f = fresh()
+        .build_funding(&h, Amount::from_sat(14_650))
+        .await
+        .unwrap();
     let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&f.tx.raw).unwrap();
     assert_eq!(tx.input.len(), 1);
     assert_eq!(tx.output.len(), 1, "no dust change");
 
     // More than the confirmed coins hold pulls in the unconfirmed one.
-    let f = b
+    let f = fresh()
         .build_funding(&h, Amount::from_sat(500_000))
         .await
         .unwrap();
@@ -678,11 +687,65 @@ async fn funding_selects_coins_and_change() {
     assert!(tx.input.len() >= 3);
 
     // Insufficient funds is reported as such.
-    let err = b
+    let err = fresh()
         .build_funding(&h, Amount::from_sat(5_000_000))
         .await
         .unwrap_err();
     assert!(matches!(err, SwapError::InsufficientFunds(_)), "{err:?}");
+}
+
+/// Two swaps locking at once: the second build must not reuse the coin the first spends,
+/// though Esplora still lists it (the first is built but not yet broadcast).
+#[tokio::test]
+async fn concurrent_builds_never_share_a_coin() {
+    let server = MockServer::start().await;
+    let b = backend(vec![server.uri()], TAKER_KEY);
+    let addr = b.address().to_string();
+    let to = backend(vec![server.uri()], MAKER_KEY).address().to_string();
+    let t = |n: u8| hex::encode([n; 32]);
+    let coin =
+        |n: u8| json!({"txid": t(n), "vout": 0, "value": 50_000, "status": {"confirmed": true}});
+    let input = |f: &Funding| {
+        let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&f.tx.raw).unwrap();
+        assert_eq!(tx.input.len(), 1);
+        tx.input[0].previous_output
+    };
+    Mock::given(method("GET"))
+        .and(path(format!("/address/{addr}/utxo")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([coin(1), coin(2)])))
+        .mount(&server)
+        .await;
+    let (_, h1) = new_preimage();
+    let (_, h2) = new_preimage();
+    let (h1, h2) = (htlc(h1), htlc(h2));
+    let amount = Amount::from_sat(20_000);
+
+    // Esplora lists both coins to both builds; selection alone would pick the same one twice.
+    let (f1, f2) = tokio::join!(b.build_funding(&h1, amount), b.build_funding(&h2, amount));
+    let (a, c) = (input(&f1.unwrap()), input(&f2.unwrap()));
+    assert_ne!(a, c, "two fundings spend the same coin");
+
+    // Both coins are taken: a third funding, or a plain send, finds none.
+    let err = b.build_funding(&h1, amount).await.unwrap_err();
+    assert!(matches!(err, SwapError::InsufficientFunds(_)), "{err:?}");
+    let err = b.build_send(&to, 10_000).await.unwrap_err();
+    assert!(matches!(err, SwapError::InsufficientFunds(_)), "{err:?}");
+
+    // The first funding was broadcast (its coin left the list) and a new coin came in:
+    // the new coin is free, the second funding's coin is still taken.
+    server.reset().await;
+    let listed = if a.txid.to_byte_array() == [1; 32] {
+        2
+    } else {
+        1
+    };
+    Mock::given(method("GET"))
+        .and(path(format!("/address/{addr}/utxo")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([coin(listed), coin(3)])))
+        .mount(&server)
+        .await;
+    let f3 = b.build_funding(&h1, amount).await.unwrap();
+    assert_eq!(input(&f3).txid.to_byte_array(), [3; 32]);
 }
 
 #[tokio::test]

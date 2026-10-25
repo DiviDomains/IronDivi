@@ -20,6 +20,7 @@ pub use tx::{
     build_funding_tx, build_spend_tx, htlc_script_pubkey, verify_htlc_spend, Coin, Spend,
 };
 
+use std::collections::HashSet;
 use std::str::FromStr;
 
 use async_trait::async_trait;
@@ -103,6 +104,8 @@ pub struct BtcBackend {
     address: Address,
     network: Network,
     fees: FeePolicy,
+    /// Coins spent by transactions built here; see [`Self::with_free_coins`].
+    spent_by_built: parking_lot::Mutex<HashSet<OutPoint>>,
 }
 
 impl std::fmt::Debug for BtcBackend {
@@ -132,6 +135,7 @@ impl BtcBackend {
             address,
             network: Network::Signet,
             fees,
+            spent_by_built: Default::default(),
         })
     }
 
@@ -240,16 +244,40 @@ impl BtcBackend {
         let to_program: [u8; 20] = to_spk.as_bytes()[2..22]
             .try_into()
             .expect("a P2WPKH script carries a 20-byte program");
+        let fee_rate = self.sat_per_vb().await;
         let coins = self.my_utxos().await?;
-        let tx = build_send_tx(
-            &self.secp,
-            &self.key,
-            &coins,
-            to_program,
-            sats,
-            self.sat_per_vb().await,
+        let tx = self.with_free_coins(
+            coins,
+            |coins| build_send_tx(&self.secp, &self.key, coins, to_program, sats, fee_rate),
+            |tx| tx,
         )?;
         Ok(Self::to_signed(&tx))
+    }
+
+    /// `build` from `coins` less those a transaction this backend built already spends,
+    /// then mark the new transaction's inputs as spent. Two swaps locking at once both see
+    /// the same coins from Esplora — a funding is persisted before it is broadcast, so the
+    /// first is not in the mempool yet when the second is built — and without this both
+    /// would pick the same coin and the second broadcast would be rejected as a double
+    /// spend. Filter, build and mark run under one lock with no await, so builds serialise.
+    /// A mark lasts until its coin leaves the address's UTXO list (spent in the mempool or
+    /// a block). A transaction never broadcast holds its coins until the process restarts:
+    /// that fails closed, as insufficient funds, never as a double spend.
+    fn with_free_coins<T>(
+        &self,
+        coins: Vec<Coin>,
+        build: impl FnOnce(&[Coin]) -> Result<T>,
+        tx: impl FnOnce(&T) -> &bitcoin::Transaction,
+    ) -> Result<T> {
+        let mut spent = self.spent_by_built.lock();
+        spent.retain(|op| coins.iter().any(|c| c.outpoint == *op));
+        let free: Vec<Coin> = coins
+            .into_iter()
+            .filter(|c| !spent.contains(&c.outpoint))
+            .collect();
+        let built = build(&free)?;
+        spent.extend(tx(&built).input.iter().map(|i| i.previous_output));
+        Ok(built)
     }
 
     fn to_signed(tx: &bitcoin::Transaction) -> SignedTx {
@@ -416,14 +444,21 @@ impl ChainBackend for BtcBackend {
     }
 
     async fn build_funding(&self, htlc: &HtlcParams, amount: Amount) -> Result<Funding> {
+        let fee_rate = self.sat_per_vb().await;
         let coins = self.my_utxos().await?;
-        let built = build_funding_tx(
-            &self.secp,
-            &self.key,
-            &coins,
-            htlc,
-            amount.to_sat(),
-            self.sat_per_vb().await,
+        let built = self.with_free_coins(
+            coins,
+            |coins| {
+                build_funding_tx(
+                    &self.secp,
+                    &self.key,
+                    coins,
+                    htlc,
+                    amount.to_sat(),
+                    fee_rate,
+                )
+            },
+            |built| &built.tx,
         )?;
         let signed = Self::to_signed(&built.tx);
         Ok(Funding {
