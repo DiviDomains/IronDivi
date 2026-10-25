@@ -568,6 +568,13 @@ impl RpcServer {
             let help = self.help(&Params::Array(vec![serde_json::json!(method)]))?;
             return Err(RpcError::new(codes::MISC_ERROR, help.as_str().unwrap_or_default()).into());
         }
+        // signmessage and setupmasternode check that the wallet is unlocked
+        // before they read an argument (rpcwallet.cpp:1385, rpcmasternode.cpp:204)
+        if matches!(method, "signmessage" | "setupmasternode") {
+            if let Some(wallet) = self.wallet.wallet_db() {
+                crate::wallet::ensure_fully_unlocked(&wallet)?;
+            }
+        }
         rpc_type_check(method, params)?;
         // The wallet passphrase calls check the encryption state before they
         // read an argument (rpcwallet.cpp:2596, :2642, :2715)
@@ -1373,7 +1380,8 @@ fn core_argument_types(method: &str) -> &'static [(usize, &'static str)] {
         // rpcmisc.cpp:485
         "verifymessage" => &[(0, "str"), (1, "str"), (2, "str")],
         // rpcwallet.cpp:2573
-        "walletpassphrase" => &[(0, "str"), (1, "int"), (2, "bool")],
+        // (the timeout is read after the unlock, by the call: rpcwallet.cpp:2622)
+        "walletpassphrase" => &[(0, "str"), (2, "bool")],
         // rpcwallet.cpp:2628
         "walletpassphrasechange" => &[(0, "str"), (1, "str")],
         _ => &[],
@@ -1383,7 +1391,7 @@ fn core_argument_types(method: &str) -> &'static [(usize, &'static str)] {
 /// The arguments of `core_argument_types` Divi Core reads with no test for
 /// null first, so a null makes the getter throw too: every one of the calls
 /// listed first (rpcwallet.cpp:550, :1576-1584, :1752, :1798-1808,
-/// :2272-2283, :2342-2348, :2410-2427; rpcrawtransaction.cpp:206-207,
+/// :2272-2283, :2342-2348, :2410-2427, :2593-2600; rpcrawtransaction.cpp:206-207,
 /// :571-572; rpcblockchain.cpp:418-420), and the account names, addresses,
 /// messages and paths of the others, which take them with get_str or
 /// AccountFromValue while their comments are read only when not null
@@ -1403,6 +1411,7 @@ fn getter_reads_null(method: &str, index: usize) -> bool {
             | "listtransactions"
             | "signtransactionwithaddresskey"
             | "verifychain"
+            | "walletpassphrase"
     ) || matches!(
         (method, index),
         ("getnewaddress", 0)

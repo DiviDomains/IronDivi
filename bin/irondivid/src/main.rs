@@ -58,6 +58,9 @@ struct Args {
     daemon: bool,
     printtoconsole: bool,
     debug: bool,
+    logips: bool,
+    logtimestamps: bool,
+    shrinkdebugfile: bool,
     wallet: Option<PathBuf>,
     disablewallet: bool,
     sysperms: bool,
@@ -173,6 +176,10 @@ impl Args {
         // -debug=<category> may repeat; -debug=0 is no debugging
         let debug = s.get_multi("debug");
         self.debug = !debug.is_empty() && !debug.iter().any(|c| c == "0");
+        self.logips = s.get_bool("logips", false);
+        self.logtimestamps = s.get_bool("logtimestamps", true);
+        // Default: shrink unless debugging (Logging.cpp:204)
+        self.shrinkdebugfile = s.get_bool("shrinkdebugfile", !self.debug);
         self.wallet = path("wallet");
         self.disablewallet = s.get_bool("disablewallet", false);
         self.sysperms = s.get_bool("sysperms", false);
@@ -296,16 +303,10 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "checklevel",
     "dns",
     "listenonion",
-    "logips",
-    "logtimestamps",
-    "maxreceivebuffer",
-    "maxsendbuffer",
     "onion",
-    "onlynet",
     "par",
     "peerbloomfilters",
     "proxyrandomize",
-    "shrinkdebugfile",
     "torcontrol",
     "torpassword",
     "upnp",
@@ -313,13 +314,32 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
 
 /// Options divid takes and does nothing with, only naming them in its help:
 /// accepted without a word, as divid does (LicenseAndInfo.cpp:135, :143;
-/// -disablesystemnotifications :142, -mining and -genproclimit :186-187, :205)
+/// -disablesystemnotifications :142, -mining and -genproclimit :186-187, :205;
+/// -checkpoints :165, -printpriority :201)
 const UNUSED_BY_DIVID: &[&str] = &[
     "sendfreetransactions",
     "txconfirmtarget",
     "disablesystemnotifications",
     "mining",
     "genproclimit",
+    "checkpoints",
+    "printpriority",
+];
+
+/// Options divid reads for checks and test aids of its own that irondivid has
+/// no counterpart for, taken without a word as divid takes them: consistency
+/// checks of its block index and mempool (BlockCheckingHelpers.cpp:162,
+/// init.cpp:795), its wallet flush thread (init.cpp:1281) and signature cache
+/// size (script/sigcache.cpp:51), none of which shows outside, and its message
+/// fault injection (-dropmessagestest main.cpp:473, Node.cpp:479;
+/// -fuzzmessagestest Node.cpp:484-485), which irondivid does not do
+const NO_COUNTERPART: &[&str] = &[
+    "checkblockindex",
+    "checkmempool",
+    "flushwallet",
+    "maxsigcachesize",
+    "dropmessagestest",
+    "fuzzmessagestest",
 ];
 
 /// Options apply_settings reads
@@ -345,6 +365,8 @@ const APPLIED: &[&str] = &[
     "budgetvotemode",
     "rescan",
     "salvagewallet",
+    "dbloadfailexit",
+    "allowunencryptedwallet",
     "spendzeroconfchange",
     "keypool",
     "upgradewallet",
@@ -372,6 +394,12 @@ const APPLIED: &[&str] = &[
     "proxy",
     "discover",
     "externalip",
+    "onlynet",
+    "maxreceivebuffer",
+    "maxsendbuffer",
+    "logips",
+    "logtimestamps",
+    "shrinkdebugfile",
     "protocolversion",
     "banscore",
     "bantime",
@@ -502,6 +530,11 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     }
     if s.is_set("proxy") {
         s.soft_set_bool("listen", false);
+    }
+    // -salvagewallet rewrites nothing in Divi Core 3.0.0: it sets -rescan
+    // (EnableWalletFeatures, init.cpp:763-766)
+    if s.get_bool("salvagewallet", false) && s.soft_set_bool("rescan", true) {
+        info!("InitializeDivi : parameter interaction: -salvagewallet=1 -> setting -rescan=1");
     }
     // -proxy, -listen=0 and -externalip each turn -discover off unless it is
     // given (net.cpp:1690-1716)
@@ -730,12 +763,18 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     // -onlynet: each one of Divi Core's network names (ParseNetwork,
     // netbase.cpp:70-77; init.cpp:1734-1740)
     for net in s.get_multi("onlynet") {
-        if !matches!(
-            net.to_lowercase().as_str(),
-            "ipv4" | "ipv6" | "tor" | "onion"
-        ) {
+        if divi_network::local::Network::parse(net).is_none() {
             anyhow::bail!("Unknown network specified in -onlynet: '{}'", net);
         }
+        config.p2p.only_nets.push(net.to_lowercase());
+    }
+    // -maxreceivebuffer: thousands of bytes, read as divid's GetArg
+    if let Some(v) = s.get("maxreceivebuffer") {
+        config.p2p.max_receive_buffer = settings::atoi(v);
+    }
+    // -maxsendbuffer: thousands of bytes, read as divid's GetArg
+    if let Some(v) = s.get("maxsendbuffer") {
+        config.p2p.max_send_buffer = settings::atoi(v);
     }
     if let Some(wif) = s.get("sporkkey") {
         // Divi Core's SetSporkKey (init.cpp:968-975): a key that is not this
@@ -852,7 +891,11 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
 /// The warning an option read nowhere gets: one divid takes and irondivid
 /// has nothing for, or one neither knows; none for an option that is read
 fn option_warning(settings: &Settings, k: &str) -> Option<String> {
-    if APPLIED.contains(&k) || READ_ELSEWHERE.contains(&k) || UNUSED_BY_DIVID.contains(&k) {
+    if APPLIED.contains(&k)
+        || READ_ELSEWHERE.contains(&k)
+        || UNUSED_BY_DIVID.contains(&k)
+        || NO_COUNTERPART.contains(&k)
+    {
         return None;
     }
     Some(if UNSUPPORTED_OPTIONS.contains(&k) {
@@ -1074,6 +1117,32 @@ struct RotatingLog {
     redirect_std: bool,
     file: Option<std::fs::File>,
     size: u64,
+    /// -shrinkdebugfile, and when the size was last checked for it
+    shrink: bool,
+    shrink_checked: std::time::Instant,
+}
+
+/// Over this size debug.log is shrunk (Logging.cpp:99)
+const SHRINK_ABOVE: u64 = 10 * 1_000_000;
+/// What a shrink keeps of the end of debug.log (Logging.cpp:105)
+const SHRINK_KEEP: u64 = 200_000;
+/// How often a running node checks whether to shrink (Logging.cpp:186)
+const SHRINK_EVERY: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// Divi Core ShrinkDebugFile (Logging.cpp:94-118): a debug.log over 10 MB is
+/// cut to its last 200 000 bytes
+fn shrink_debug_file(path: &std::path::Path) -> std::io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    let size = std::fs::metadata(path)?.len();
+    if size <= SHRINK_ABOVE {
+        return Ok(());
+    }
+    let mut file = std::fs::File::open(path)?;
+    file.seek(SeekFrom::End(-(SHRINK_KEEP as i64)))?;
+    let mut tail = Vec::with_capacity(SHRINK_KEEP as usize);
+    file.read_to_end(&mut tail)?;
+    drop(file);
+    std::fs::write(path, tail)
 }
 
 impl RotatingLog {
@@ -1082,6 +1151,7 @@ impl RotatingLog {
         max_size: u64,
         max_files: u32,
         redirect_std: bool,
+        shrink: bool,
     ) -> std::io::Result<Self> {
         let mut log = RotatingLog {
             dir: dir.to_path_buf(),
@@ -1090,7 +1160,14 @@ impl RotatingLog {
             redirect_std,
             file: None,
             size: 0,
+            shrink,
+            shrink_checked: std::time::Instant::now(),
         };
+        // Shrunk at start as divid does (Logging.cpp:205); a file that is
+        // still over the size limit after that is rotated
+        if shrink {
+            let _ = shrink_debug_file(&dir.join("debug.log"));
+        }
         log.reopen()?;
         // The log may already be too big from an earlier run
         if log.size >= max_size {
@@ -1133,6 +1210,15 @@ impl std::io::Write for RotatingLog {
         if REOPEN_LOG.swap(false, std::sync::atomic::Ordering::Relaxed) {
             self.file = None;
             self.reopen()?;
+        }
+        // And every five minutes while running (Logging.cpp:186-191)
+        if self.shrink && self.shrink_checked.elapsed() > SHRINK_EVERY {
+            self.shrink_checked = std::time::Instant::now();
+            if self.size > SHRINK_ABOVE {
+                self.file = None;
+                let _ = shrink_debug_file(&self.dir.join("debug.log"));
+                self.reopen()?;
+            }
         }
         if self.size > 0 && self.size + buf.len() as u64 > self.max_size {
             self.rotate()?;
@@ -1227,6 +1313,8 @@ mod flush_log_tests {
 
 /// Initialize logging
 fn init_logging(log_config: &LogConfig, data_dir: &PathBuf) {
+    // -logips: whether log lines name peers by address too (Logging.cpp:202)
+    divi_network::peer_log::set_log_ips(log_config.log_ips);
     // Use RUST_LOG if set, otherwise use default based on debug config
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         if log_config.debug {
@@ -1267,6 +1355,7 @@ fn init_logging(log_config: &LogConfig, data_dir: &PathBuf) {
             log_config.max_file_size,
             log_config.max_files,
             std_is_log,
+            log_config.shrink,
         ) {
             Ok(log) => log,
             Err(e) => {
@@ -1290,10 +1379,15 @@ fn init_logging(log_config: &LogConfig, data_dir: &PathBuf) {
         // still holds
         *LOG_GUARD.lock().unwrap_or_else(|e| e.into_inner()) = Some(_guard);
 
-        // Set up file logging with timestamps
+        // Lines as divid writes them, without ANSI colours
         tracing_subscriber::registry()
             .with(
-                fmt::layer().with_writer(non_blocking).with_ansi(false), // No ANSI colors in file
+                fmt::layer()
+                    .with_writer(non_blocking)
+                    .with_ansi(false)
+                    .event_format(DividLogFormat {
+                        timestamps: log_config.timestamps,
+                    }),
             )
             .with(filter)
             .init();
@@ -1303,6 +1397,42 @@ fn init_logging(log_config: &LogConfig, data_dir: &PathBuf) {
             "Log rotation: max {} bytes per file, {} files kept",
             log_config.max_file_size, log_config.max_files
         );
+    }
+}
+
+/// A debug.log line as Divi Core writes it (Logging.cpp:179-184): with
+/// -logtimestamps (default 1) the time, `%Y-%m-%d %H:%M:%S` in UTC, and a
+/// space; then the message. Warnings and errors begin `WARNING: ` and
+/// `ERROR: ` (divid's error() writes `ERROR: `); no level or module name.
+struct DividLogFormat {
+    timestamps: bool,
+}
+
+impl<S, N> fmt::FormatEvent<S, N> for DividLogFormat
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    N: for<'a> fmt::FormatFields<'a> + 'static,
+{
+    fn format_event(
+        &self,
+        ctx: &fmt::FmtContext<'_, S, N>,
+        mut writer: fmt::format::Writer<'_>,
+        event: &tracing::Event<'_>,
+    ) -> std::fmt::Result {
+        if self.timestamps {
+            write!(
+                writer,
+                "{} ",
+                chrono::Utc::now().format("%Y-%m-%d %H:%M:%S")
+            )?;
+        }
+        match *event.metadata().level() {
+            tracing::Level::ERROR => write!(writer, "ERROR: ")?,
+            tracing::Level::WARN => write!(writer, "WARNING: ")?,
+            _ => {}
+        }
+        ctx.field_format().format_fields(writer.by_ref(), event)?;
+        writeln!(writer)
     }
 }
 
@@ -1368,12 +1498,34 @@ impl WalletSeed {
     }
 }
 
+/// A start that stops with exit code 1 and no error line, as Divi Core's
+/// AppInit2 returning false without an InitError (-dbloadfailexit)
+#[derive(Debug)]
+struct QuietExit;
+
+impl std::fmt::Display for QuietExit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the wallet loaded with a warning and -dbloadfailexit is set")
+    }
+}
+
+impl std::error::Error for QuietExit {}
+
 /// Wallet start options
 #[derive(Debug, Clone, Copy)]
 struct WalletOptions {
     /// -rescan: scan the whole chain at the start; -salvagewallet sets it
     /// unless it is given (init.cpp:763-766, :1242)
     rescan: bool,
+    /// Whether -rescan is given: a transaction record that cannot be read
+    /// asks for a rescan only when it is not (SoftSetBoolArg, walletdb.cpp:508)
+    rescan_given: bool,
+    /// -dbloadfailexit, read as a number: a wallet that loads with a warning
+    /// stops the start (init.cpp:1307-1309)
+    db_load_fail_exit: bool,
+    /// -allowunencryptedwallet: no warning at start about an unencrypted
+    /// wallet (init.cpp:1228-1231)
+    allow_unencrypted: bool,
     /// -spendzeroconfchange: sends may use unconfirmed outputs of our own
     /// transactions (wallet.cpp:1848)
     spend_zero_conf_change: bool,
@@ -1407,6 +1559,9 @@ impl WalletOptions {
     fn from_settings(settings: &Settings) -> Self {
         WalletOptions {
             rescan: settings.get_bool("rescan", settings.get_bool("salvagewallet", false)),
+            rescan_given: settings.get("rescan").is_some(),
+            db_load_fail_exit: settings.get("dbloadfailexit").is_some_and(|v| atoi(v) != 0),
+            allow_unencrypted: settings.get_bool("allowunencryptedwallet", false),
             spend_zero_conf_change: settings.get_bool("spendzeroconfchange", false),
             keypool: settings
                 .get("keypool")
@@ -1527,8 +1682,33 @@ fn load_or_restore_wallet_with_seed(
             }
         }
         info!("Loading wallet from {:?}", wallet_path);
-        let wallet = WalletDb::open(wallet_path, network)
-            .with_context(|| format!("Failed to open wallet at {:?}", wallet_path))?;
+        let wallet = match WalletDb::open(wallet_path, network) {
+            // A key record that cannot be read: Divi Core's DB_CORRUPT, an
+            // InitError (init.cpp:1153-1156, :1299-1305)
+            Err(divi_wallet::WalletError::Corrupt) => {
+                let message = divi_wallet::WalletError::Corrupt.to_string();
+                error!("Errors detected during wallet loading\n{}", message);
+                return Err(anyhow::Error::msg(message));
+            }
+            other => {
+                other.with_context(|| format!("Failed to open wallet at {:?}", wallet_path))?
+            }
+        };
+        // Other records that cannot be read: a warning, and the start goes
+        // on unless -dbloadfailexit (DB_NONCRITICAL_ERROR, init.cpp:1157-1162,
+        // :1299-1310)
+        let problems = wallet.load_problems();
+        if problems.transactions + problems.others > 0 {
+            let message = "Warning: error reading wallet.dat! All keys read correctly, but transaction data or address book entries might be missing or incorrect.";
+            info!("Errors detected during wallet loading\n{}", message);
+            // InitWarning: "Warning: " and the message, logged and on stderr
+            // (noui.cpp:38-40)
+            warn!("Warning: {}", message);
+            eprintln!("Warning: {}", message);
+            if options.db_load_fail_exit {
+                return Err(anyhow::Error::new(QuietExit));
+            }
+        }
 
         // Migrate chain_mode if needed (fixes wallets created before ChainMode was configurable)
         wallet
@@ -1577,7 +1757,11 @@ fn load_or_restore_wallet_with_seed(
     // The version limit is checked before the seed is made
     // (wallet.cpp:1963-1979), and before anything is written
     if options.refuses_new_wallet() {
-        anyhow::bail!("Error loading wallet.dat: database load failure");
+        // As Divi Core logs it (wallet.cpp:1969, init.cpp:1303)
+        info!("Unable to downgrade wallet version. -upgradewallet=<custom_version> might be incorrectly set");
+        let message = "Error loading wallet.dat: database load failure";
+        error!("Errors detected during wallet loading\n{}", message);
+        anyhow::bail!(message);
     }
     // Checked only when words make the wallet, before anything is written
     // (wallet.cpp:2302-2305, reported by init.cpp:1203-1209)
@@ -1859,6 +2043,18 @@ async fn run_daemon(
             &wallet_options,
         )?);
         if let Some(ref w) = wallet {
+            // Divi Core warns at every start of a wallet that is not locked,
+            // unless -allowunencryptedwallet; not after the load's own warning,
+            // which returns first (init.cpp:1220-1231)
+            let problems = w.load_problems();
+            if !wallet_options.allow_unencrypted
+                && !w.is_locked()
+                && problems.transactions + problems.others == 0
+            {
+                let message = "Make sure to encrypt your wallet and delete all non-encrypted backups after you verified that wallet works!";
+                warn!("Warning: {}", message);
+                eprintln!("Warning: {}", message);
+            }
             // -mnconflock, default on (MasternodeModule.cpp:454-466)
             if mn_options.lock {
                 core_files::lock_masternode_collateral(w, &mn_options.conf_path);
@@ -1993,7 +2189,11 @@ async fn run_daemon(
             // wallet holds, as Divi Core's verifySyncToActiveChain from the
             // genesis block (init.cpp:1242, wallet.cpp:279-313)
             let chain_height = node.chain().height();
-            if wallet_options.rescan {
+            // A transaction record that could not be read asks for a rescan,
+            // unless -rescan is given (walletdb.cpp:505-508)
+            let rescan = wallet_options.rescan
+                || (!wallet_options.rescan_given && wallet_arc.load_problems().transactions > 0);
+            if rescan {
                 info!("Rescanning... from height 0 to {}", chain_height);
                 wallet_arc.set_last_scan_height(0);
             } else {
@@ -3151,6 +3351,9 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
         max_file_size: args.maxlogsize.unwrap_or(1) as u64 * 1_048_576, // Convert MB to bytes
         max_files: args.maxlogfiles.unwrap_or(5),
         debug: args.debug,
+        log_ips: args.logips,
+        timestamps: args.logtimestamps,
+        shrink: args.shrinkdebugfile,
         // An export only reads the data directory: it logs to the console
         print_to_console: args.printtoconsole || args.export_chain,
     };
@@ -3268,6 +3471,13 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
     )
     .await
     {
+        // A start stopped without an InitError (-dbloadfailexit) prints nothing
+        // more (init.cpp:1307-1309)
+        if e.downcast_ref::<QuietExit>().is_some() {
+            remove_pid_file(&pid_file);
+            flush_log();
+            std::process::exit(1);
+        }
         error!("Daemon error: {:#}", e);
         // Also on stderr, as Divi Core's InitError (noui.cpp:38-40)
         {
@@ -3961,7 +4171,7 @@ mod log_rotation_tests {
     /// Write `lines` records of 50 bytes, checking the files after each
     fn write_and_check(max_size: u64, max_files: u32, lines: usize) -> Vec<(String, u64)> {
         let dir = tempfile::tempdir().unwrap();
-        let mut log = RotatingLog::open(dir.path(), max_size, max_files, false).unwrap();
+        let mut log = RotatingLog::open(dir.path(), max_size, max_files, false, false).unwrap();
         for i in 0..lines {
             let line = format!("{:049}\n", i);
             log.write_all(line.as_bytes()).unwrap();
@@ -4014,7 +4224,7 @@ mod log_rotation_tests {
     fn log_rotation_rotates_oversized_log_at_startup() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("debug.log"), vec![b'x'; 2000]).unwrap();
-        let mut log = RotatingLog::open(dir.path(), 1000, 3, false).unwrap();
+        let mut log = RotatingLog::open(dir.path(), 1000, 3, false, false).unwrap();
         log.write_all(b"new\n").unwrap();
         assert_eq!(
             log_files(dir.path()),
@@ -4632,6 +4842,8 @@ mod divid_option_tests {
     #[test]
     fn help_only_options_draw_no_warning() {
         let s = Settings::default();
+        assert_eq!(option_warning(&s, "checkpoints"), None);
+        assert_eq!(option_warning(&s, "printpriority"), None);
         assert_eq!(option_warning(&s, "litemode"), None);
         assert_eq!(option_warning(&s, "budgetvotemode"), None);
         assert_eq!(option_warning(&s, "masternode"), None);
@@ -4641,6 +4853,24 @@ mod divid_option_tests {
         assert!(option_warning(&s, "nosuchoption")
             .unwrap()
             .starts_with("Unknown option"));
+    }
+
+    /// divid's own check and test-aid options are taken without a warning
+    /// (BlockCheckingHelpers.cpp:162, init.cpp:795, :1281, script/sigcache.cpp:51,
+    /// main.cpp:473, Node.cpp:479-485)
+    #[test]
+    fn divids_check_and_test_options_draw_no_warning() {
+        let s = Settings::default();
+        for k in [
+            "checkblockindex",
+            "checkmempool",
+            "flushwallet",
+            "maxsigcachesize",
+            "dropmessagestest",
+            "fuzzmessagestest",
+        ] {
+            assert_eq!(option_warning(&s, k), None, "{k}");
+        }
     }
 
     /// The masternode options are read when the node starts, after

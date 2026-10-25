@@ -507,6 +507,19 @@ pub struct P2pConfig {
     #[serde(default)]
     pub external_ips: Vec<SocketAddr>,
 
+    /// Divi Core -onlynet: the only networks dialled from learnt addresses
+    /// (`ipv4`, `ipv6`, `onion`); empty: every network
+    #[serde(default)]
+    pub only_nets: Vec<String>,
+
+    /// Divi Core -maxreceivebuffer, in thousands of bytes (default 5000)
+    #[serde(default = "default_max_receive_buffer")]
+    pub max_receive_buffer: i64,
+
+    /// Divi Core -maxsendbuffer, in thousands of bytes (default 1000)
+    #[serde(default = "default_max_send_buffer")]
+    pub max_send_buffer: i64,
+
     /// The machine's interface addresses, found at start with `discover`
     #[serde(default)]
     pub interface_ips: Vec<std::net::IpAddr>,
@@ -561,6 +574,14 @@ impl P2pConfig {
     }
 }
 
+fn default_max_receive_buffer() -> i64 {
+    5000
+}
+
+fn default_max_send_buffer() -> i64 {
+    1000
+}
+
 fn default_discover() -> bool {
     true
 }
@@ -606,6 +627,9 @@ impl Default for P2pConfig {
             connect_timeout_ms: default_connect_timeout_ms(),
             discover: default_discover(),
             external_ips: Vec::new(),
+            only_nets: Vec::new(),
+            max_receive_buffer: default_max_receive_buffer(),
+            max_send_buffer: default_max_send_buffer(),
             interface_ips: Vec::new(),
             whitelist: Vec::new(),
             white_bind: Vec::new(),
@@ -940,6 +964,19 @@ pub struct LogConfig {
 
     /// Print to console instead of file
     pub print_to_console: bool,
+
+    /// Divi Core -logips: log lines carry peers' addresses (default off)
+    #[serde(default)]
+    pub log_ips: bool,
+
+    /// Divi Core -logtimestamps: debug.log lines begin with the time (default on)
+    #[serde(default = "default_discover")]
+    pub timestamps: bool,
+
+    /// Divi Core -shrinkdebugfile: cut a debug.log over 10 MB to its last
+    /// 200 000 bytes at start and every five minutes (default: without -debug)
+    #[serde(default = "default_discover")]
+    pub shrink: bool,
 }
 
 impl Default for LogConfig {
@@ -949,6 +986,9 @@ impl Default for LogConfig {
             max_files: 5,
             debug: false,
             print_to_console: false,
+            log_ips: false,
+            timestamps: true,
+            shrink: true,
         }
     }
 }
