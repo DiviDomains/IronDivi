@@ -510,6 +510,8 @@ const READ_ELSEWHERE: &[&str] = &[
     "maxlogfiles",
     // read by main before the runtime starts
     "mocktime",
+    "testsafemode",
+    "disablesafemode",
     "?",
     "help",
     "h",
@@ -3382,6 +3384,12 @@ fn main() -> Result<()> {
     if let Some(text) = args.settings.get("mocktime") {
         divi_primitives::clock::set_mock_time(atoi(text));
     }
+    // -testsafemode puts the RPC server in safe mode, -disablesafemode lets
+    // it run every call all the same (rpcserver.cpp:185, :1052)
+    divi_rpc::warnings::set_safe_mode(
+        args.settings.get_bool("testsafemode", false),
+        args.settings.get_bool("disablesafemode", false),
+    );
 
     // Now enter the tokio runtime (after daemonization)
     let runtime = tokio::runtime::Builder::new_multi_thread()

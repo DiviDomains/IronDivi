@@ -285,3 +285,32 @@ fn blockversion_is_the_version_of_the_blocks_made() {
     assert_eq!(made["error"]["code"], -25, "{made}");
     assert_eq!(made["error"]["message"], "failed to generate a valid block");
 }
+
+/// -testsafemode puts the server in divid's safe mode: getinfo's errors say
+/// so and the calls divid's table does not mark okSafeMode answer -2
+/// (Warnings.cpp:32-33, rpcserver.cpp:1049-1054); -disablesafemode lets them
+/// run, the errors unchanged
+#[test]
+fn testsafemode_refuses_what_divid_refuses_in_safe_mode() {
+    for (extra, refused) in [(None, true), (Some("-disablesafemode"), false)] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut args = vec!["-testsafemode".to_string()];
+        args.extend(extra.map(String::from));
+        let (_node, port) = start(dir.path(), &args);
+        let info = rpc(port, "getinfo", json!([])).unwrap();
+        assert_eq!(info["result"]["errors"], "testsafemode enabled", "{args:?}");
+        let balance = rpc(port, "getbalance", json!([])).unwrap();
+        if refused {
+            assert_eq!(balance["error"]["code"], -2, "{balance}");
+            assert_eq!(
+                balance["error"]["message"],
+                "Safe mode: testsafemode enabled"
+            );
+        } else {
+            assert!(balance["error"].is_null(), "{balance}");
+        }
+        // getblockcount is okSafeMode
+        let count = rpc(port, "getblockcount", json!([])).unwrap();
+        assert!(count["error"].is_null(), "{count}");
+    }
+}
