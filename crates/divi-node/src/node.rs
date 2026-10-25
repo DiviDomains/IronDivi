@@ -222,6 +222,9 @@ impl Node {
         // Create data directory if it doesn't exist
         std::fs::create_dir_all(&config.data_dir)
             .map_err(|e| NodeError::Init(format!("Failed to create data directory: {}", e)))?;
+        if config.resync {
+            clear_folders_for_resync(&config);
+        }
 
         // Initialize database, optionally with UTXO cache
         let db = Arc::new(if config.utxo_cache_size > 0 {
@@ -2036,6 +2039,29 @@ fn score_relayed_refusal(peers: &PeerManager, event: &divi_network::TxRelayEvent
         e.misbehaviour_score(),
         &format!("tx {} rejected by the mempool: {}", event.txid, e),
     );
+}
+
+/// Divi Core's -resync (ClearFoldersForResync, init.cpp:901-930): the chain's
+/// folders are deleted before it is loaded, one by one so a missing one does not
+/// stop the rest, and a failure is logged, not fatal. irondivid's chain database
+/// holds its blocks, undo data, sporks and the address and spent indexes; the
+/// transaction index has its own folder. The wallet, the configuration and the
+/// peer and masternode files stay.
+fn clear_folders_for_resync(config: &NodeConfig) {
+    tracing::info!("Deleting blockchain folders blocks, chainstate and sporks");
+    for dir in [
+        config.blocks_path(),
+        config.chainstate_path(),
+        config.data_dir.join("txindex"),
+    ] {
+        if !dir.exists() {
+            continue;
+        }
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => tracing::info!("-resync: folder deleted: {}", dir.display()),
+            Err(e) => tracing::warn!("Failed to delete blockchain folders {}", e),
+        }
+    }
 }
 
 /// The `reject` Divi Core sends the peer that relayed a transaction its

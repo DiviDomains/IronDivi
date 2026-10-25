@@ -64,6 +64,12 @@ pub struct NodeConfig {
     #[serde(default)]
     pub max_reorg: Option<u32>,
 
+    /// Remove the chain's folders before the chain is opened, so it syncs again
+    /// from genesis (Divi Core -resync: blocks, chainstate and sporks,
+    /// init.cpp:901-930, :1480-1483); the wallet and the configuration stay
+    #[serde(default)]
+    pub resync: bool,
+
     /// Block files to import at start (-loadblock), after bootstrap.dat
     #[serde(default)]
     pub load_block: Vec<PathBuf>,
@@ -119,6 +125,7 @@ impl Default for NodeConfig {
             expire: divi_storage::prune::Expire::Never,
             check_blocks: DEFAULT_CHECK_BLOCKS,
             max_reorg: None,
+            resync: false,
             load_block: Vec::new(),
             bootstrap_dir: None,
             stop_after_block_import: false,
