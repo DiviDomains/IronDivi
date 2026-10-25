@@ -684,6 +684,42 @@ impl WalletDb {
         }
     }
 
+    /// The wallet transactions to offer the mempool at start, parents before
+    /// children, each with whether it is detached: the unconfirmed ones, and
+    /// those that left the chain or the mempool (kept at depth -1), coinbases
+    /// and coinstakes left out, as Divi Core's
+    /// SubmitUnconfirmedWalletTransactionsToMempool offers every wallet
+    /// transaction with fewer than 0 confirmations (init.cpp:1262-1275)
+    pub fn transactions_to_resubmit(
+        &self,
+    ) -> Vec<(divi_primitives::transaction::Transaction, bool)> {
+        let mut txs: Vec<(u64, divi_primitives::transaction::Transaction)> = self
+            .mempool_txs
+            .read()
+            .values()
+            .map(|e| (e.record.timestamp, e.tx.clone()))
+            .collect();
+        let mut detached = HashSet::new();
+        for (txid, d) in self.detached_txs.read().iter() {
+            if let Some(tx) = &d.tx {
+                if !tx.is_coinbase()
+                    && !tx.is_coinstake()
+                    && !txs.iter().any(|(_, t)| t.txid() == *txid)
+                {
+                    detached.insert(*txid);
+                    txs.push((d.timestamp, tx.clone()));
+                }
+            }
+        }
+        parents_first(txs)
+            .into_iter()
+            .map(|(_, tx)| {
+                let is_detached = detached.contains(&tx.txid());
+                (tx, is_detached)
+            })
+            .collect()
+    }
+
     /// Unconfirmed wallet transactions, parents before children, to resubmit
     /// to the mempool after a restart
     pub fn unconfirmed_transactions(&self) -> Vec<divi_primitives::transaction::Transaction> {
@@ -5126,6 +5162,24 @@ mod tests {
             let swapped = parents_first(vec![(5, child.clone()), (5, tx.clone())]);
             assert_eq!(swapped[0].1.txid(), tx.txid());
             assert_eq!(wallet.unconfirmed_transactions(), vec![tx, child]);
+        }
+
+        /// A send the mempool dropped stays in the wallet at depth -1 and is
+        /// offered again at start, as Divi Core offers every wallet
+        /// transaction with fewer than 0 confirmations (init.cpp:1262-1275)
+        #[test]
+        fn dropped_sends_are_offered_again_at_start() {
+            let (wallet, fund) = funded();
+            let tx = own_send(&wallet, &fund);
+            let child = spend(&[(tx.txid(), 1)], vec![(69 * COIN, stranger())]);
+            assert!(wallet.add_mempool_tx(&tx));
+            assert!(wallet.add_mempool_tx(&child));
+            assert!(wallet.remove_mempool_tx(&tx.txid()));
+            assert_eq!(
+                wallet.transactions_to_resubmit(),
+                vec![(tx.clone(), true), (child.clone(), false)]
+            );
+            assert_eq!(wallet.unconfirmed_transactions(), vec![child]);
         }
     }
 
