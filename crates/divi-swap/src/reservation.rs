@@ -30,7 +30,7 @@ use rusqlite::{params, Connection};
 use crate::backend::{ChainBackend, TipHeader};
 use crate::error::{Result, SwapError};
 use crate::store::Store;
-use crate::types::{Chain, Outpoint, Txid};
+use crate::types::{Chain, Outpoint, SignedTx, Txid};
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS input_reservation (
@@ -570,29 +570,112 @@ impl InputReservations {
     }
 }
 
-/// The `(txid, HTLC locktime)` of every lock a swap in `store` funded on `chain`: the maker
-/// leg of each maker swap and the taker leg of each taker swap, whatever their state.
-pub fn swap_locks(store: &Store, chain: Chain) -> Result<Vec<(Txid, u32)>> {
+/// One lock a swap funded: its signed tx, its HTLC locktime (the swap's deadline) once the
+/// swap stored the HTLC, and whether the swap is finished.
+struct SwapLock {
+    tx: SignedTx,
+    locktime: Option<u32>,
+    finished: bool,
+}
+
+/// Every lock a swap in `store` funded on `chain`: the maker leg of each maker swap and the
+/// taker leg of each taker swap, whatever their state.
+fn locks_on(store: &Store, chain: Chain) -> Result<Vec<SwapLock>> {
     let mut out = Vec::new();
     for s in store.list_maker_swaps()? {
-        if let (true, Some(h), Some(f)) = (
-            s.quote.maker_chain() == chain,
-            &s.maker_leg_htlc,
-            &s.maker_leg_funding,
-        ) {
-            out.push((f.tx.txid, h.locktime));
+        if let (true, Some(f)) = (s.quote.maker_chain() == chain, &s.maker_leg_funding) {
+            out.push(SwapLock {
+                tx: f.tx.clone(),
+                locktime: s.maker_leg_htlc.map(|h| h.locktime),
+                finished: s.state.is_terminal(),
+            });
         }
     }
     for s in store.list_taker_swaps()? {
-        if let (true, Some(h), Some(f)) = (
-            s.quote.taker_chain() == chain,
-            &s.taker_leg_htlc,
-            &s.taker_leg_funding,
-        ) {
-            out.push((f.tx.txid, h.locktime));
+        if let (true, Some(f)) = (s.quote.taker_chain() == chain, &s.taker_leg_funding) {
+            out.push(SwapLock {
+                tx: f.tx.clone(),
+                locktime: s.taker_leg_htlc.map(|h| h.locktime),
+                finished: s.state.is_terminal(),
+            });
         }
     }
     Ok(out)
+}
+
+/// The `(txid, HTLC locktime)` of every lock a swap in `store` funded on `chain`: the maker
+/// leg of each maker swap and the taker leg of each taker swap, whatever their state.
+pub fn swap_locks(store: &Store, chain: Chain) -> Result<Vec<(Txid, u32)>> {
+    Ok(locks_on(store, chain)?
+        .into_iter()
+        .filter_map(|l| Some((l.tx.txid, l.locktime?)))
+        .collect())
+}
+
+impl InputReservations {
+    /// The transactions holding a reservation on `chain`.
+    fn holders(&self, chain: Chain) -> Result<HashSet<Txid>> {
+        Ok(self
+            .list_all()?
+            .into_iter()
+            .filter(|r| r.chain == chain)
+            .map(|r| r.reserved_by)
+            .collect())
+    }
+
+    /// Release the reservations held by the lock on `chain` of every terminal swap in
+    /// `store` (maker or taker); returns how many inputs were released. A finished swap's
+    /// lock is on chain (a claim or its refund spent it), so its inputs can never be
+    /// selected again anyway. Only rows still held are touched: running it again, or after a
+    /// restart, releases nothing twice, and a swap that is not finished keeps its
+    /// reservation however often it runs.
+    pub fn release_finished_swaps(&self, store: &Store, chain: Chain) -> Result<usize> {
+        let held = self.holders(chain)?;
+        if held.is_empty() {
+            return Ok(0);
+        }
+        let mut released = 0;
+        for l in locks_on(store, chain)? {
+            if l.finished && held.contains(&l.tx.txid) {
+                released += self.release_tx(chain, &l.tx.txid)?;
+            }
+        }
+        Ok(released)
+    }
+
+    /// [`Self::release_expired_swaps`] on `backend`, then the wallet booking of each lock it
+    /// released: a wallet that tombstoned a lock's inputs when it was broadcast (the DIVI
+    /// wallet file) gets them back through [`ChainBackend::release_dead_lock`] once the
+    /// backend has its own proof that they are unspent (no proof, nothing given back: the
+    /// coins stay out of the wallet, never spent twice; a failure only warns). Returns how
+    /// many inputs the table released.
+    pub async fn release_expired_swaps_and_bookings(
+        &self,
+        store: &Store,
+        backend: &dyn ChainBackend,
+        now: u32,
+    ) -> Result<usize> {
+        let chain = backend.chain();
+        let before = self.holders(chain)?;
+        if before.is_empty() {
+            return Ok(0);
+        }
+        let released = self.release_expired_swaps(store, backend, now).await?;
+        if released == 0 {
+            return Ok(0);
+        }
+        let after = self.holders(chain)?;
+        for l in locks_on(store, chain)? {
+            let txid = l.tx.txid;
+            if !before.contains(&txid) || after.contains(&txid) {
+                continue;
+            }
+            if let Err(e) = backend.release_dead_lock(&l.tx).await {
+                tracing::warn!(%chain, %txid, error = %e, "dropped lock: wallet booking kept");
+            }
+        }
+        Ok(released)
+    }
 }
 
 #[cfg(test)]

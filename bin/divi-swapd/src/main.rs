@@ -468,8 +468,10 @@ async fn live_backends(
     let (Some(divi_cfg), Some(btc_cfg)) = (&cfg.divi, &cfg.btc) else {
         bail!("live backend needs both [divi] and [btc] sections");
     };
-    // BTC, LTC and ZEC select coins from a live address query; this table keeps the inputs of
-    // a broadcast lock out of the next swap's selection until the lock confirms.
+    // BTC, LTC and ZEC select coins from a live address query, and the DIVI wallet file
+    // tombstones a lock's inputs only in the process that broadcast it; this table keeps the
+    // inputs of a broadcast lock out of the next swap's selection, in every process on this
+    // database, until the lock confirms.
     let reservations =
         InputReservations::open(&cfg.db_path).context("opening input reservations")?;
     let mut others: Vec<Arc<dyn ChainBackend>> = Vec::new();
@@ -534,13 +536,14 @@ async fn live_backends(
     Ok((backends, job, offers))
 }
 
-/// The live DIVI backend of `[divi]` for `key`.
+/// The live DIVI backend of `[divi]` for `key`, reserving the inputs of its locks in
+/// `reservations` so a second daemon on the same wallet file and database never funds from
+/// them.
 fn live_divi(
     cfg: &divi_swapd::config::DiviSection,
     key: divi_crypto::keys::SecretKey,
     reservations: &InputReservations,
 ) -> Result<DiviBackend> {
-    let _ = reservations;
     let network = cfg.network()?;
     let mut divi = DiviBackend::new(
         &cfg.rpc_url()?,
@@ -548,7 +551,8 @@ fn live_divi(
         network,
         DiviFeePolicy::default(),
         cfg.wallet_path.clone(),
-    )?;
+    )?
+    .with_input_reservations(reservations.clone());
     if let Some(fallback) = cfg.fallback_rpc_url()? {
         divi = divi.with_fallback_rpc(&fallback);
         tracing::info!(
@@ -559,12 +563,15 @@ fn live_divi(
     Ok(divi)
 }
 
-/// One pass of the lock-expiry sweep over `counters` at wall-clock `now` (unix seconds): a
-/// maker lock past its deadline that a fresh backend has found in no mempool and no block on
-/// two checks [`divi_swap::reservation::EXPIRY_ABSENT_BLOCKS`] blocks apart gives its inputs
-/// back to the wallet ([`InputReservations::release_expired`]). A chain that cannot be asked,
-/// or whose backend is stale or went backwards, keeps its reservations this pass
-/// (`--release-reservation` stays the manual override).
+/// One pass of the lock-expiry sweep over `counters` and the DIVI backend `divi` at
+/// wall-clock `now` (unix seconds): a maker lock past its deadline that a fresh backend has
+/// found in no mempool and no block on two checks [`divi_swap::reservation::EXPIRY_ABSENT_BLOCKS`]
+/// blocks apart gives its inputs back to the wallet ([`InputReservations::release_expired`];
+/// on DIVI the wallet file gets them back too, on the backend's own proof, through
+/// [`InputReservations::release_expired_swaps_and_bookings`]). A DIVI lock of a finished swap
+/// is released first ([`InputReservations::release_finished_swaps`]). A chain that cannot be
+/// asked, or whose backend is stale or went backwards, keeps its reservations this pass
+/// (`--release-reservation` stays the manual override). Returns how many inputs were released.
 async fn expiry_sweep_once(
     res: &InputReservations,
     store: &Store,
@@ -572,23 +579,41 @@ async fn expiry_sweep_once(
     counters: &[Arc<dyn ChainBackend>],
     now: u32,
 ) -> usize {
-    let _ = divi;
-    let mut released = 0;
+    let mut expired = 0;
     for b in counters {
         match res.release_expired_swaps(store, b.as_ref(), now).await {
-            Ok(n) => released += n,
+            Ok(n) => expired += n,
             Err(e) => {
                 tracing::warn!(chain = %b.chain(), error = %e, "could not check locks for expiry")
             }
         }
     }
-    if released > 0 {
+    let finished = match res.release_finished_swaps(store, Chain::Divi) {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not release finished DIVI lock inputs");
+            0
+        }
+    };
+    if finished > 0 {
+        tracing::info!(finished, "released the DIVI lock inputs of finished swaps");
+    }
+    match res
+        .release_expired_swaps_and_bookings(store, divi, now)
+        .await
+    {
+        Ok(n) => expired += n,
+        Err(e) => {
+            tracing::warn!(chain = %Chain::Divi, error = %e, "could not check locks for expiry")
+        }
+    }
+    if expired > 0 {
         tracing::info!(
-            released,
+            released = expired,
             "released the inputs of dropped locks past their deadline"
         );
     }
-    released
+    finished + expired
 }
 
 /// The live daemon's lock-expiry sweep: [`expiry_sweep_once`] every `every`.
