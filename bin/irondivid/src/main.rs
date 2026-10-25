@@ -346,6 +346,7 @@ const APPLIED: &[&str] = &[
     "rescan",
     "salvagewallet",
     "dbloadfailexit",
+    "allowunencryptedwallet",
     "spendzeroconfchange",
     "keypool",
     "upgradewallet",
@@ -1399,6 +1400,9 @@ struct WalletOptions {
     /// -dbloadfailexit, read as a number: a wallet that loads with a warning
     /// stops the start (init.cpp:1307-1309)
     db_load_fail_exit: bool,
+    /// -allowunencryptedwallet: no warning at start about an unencrypted
+    /// wallet (init.cpp:1228-1231)
+    allow_unencrypted: bool,
     /// -spendzeroconfchange: sends may use unconfirmed outputs of our own
     /// transactions (wallet.cpp:1848)
     spend_zero_conf_change: bool,
@@ -1434,6 +1438,7 @@ impl WalletOptions {
             rescan: settings.get_bool("rescan", settings.get_bool("salvagewallet", false)),
             rescan_given: settings.get("rescan").is_some(),
             db_load_fail_exit: settings.get("dbloadfailexit").is_some_and(|v| atoi(v) != 0),
+            allow_unencrypted: settings.get_bool("allowunencryptedwallet", false),
             spend_zero_conf_change: settings.get_bool("spendzeroconfchange", false),
             keypool: settings
                 .get("keypool")
@@ -1915,6 +1920,18 @@ async fn run_daemon(
             &wallet_options,
         )?);
         if let Some(ref w) = wallet {
+            // Divi Core warns at every start of a wallet that is not locked,
+            // unless -allowunencryptedwallet; not after the load's own warning,
+            // which returns first (init.cpp:1220-1231)
+            let problems = w.load_problems();
+            if !wallet_options.allow_unencrypted
+                && !w.is_locked()
+                && problems.transactions + problems.others == 0
+            {
+                let message = "Make sure to encrypt your wallet and delete all non-encrypted backups after you verified that wallet works!";
+                warn!("Warning: {}", message);
+                eprintln!("Warning: {}", message);
+            }
             // -mnconflock, default on (MasternodeModule.cpp:454-466)
             if mn_options.lock {
                 core_files::lock_masternode_collateral(w, &mn_options.conf_path);

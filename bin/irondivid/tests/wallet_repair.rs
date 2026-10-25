@@ -352,3 +352,24 @@ fn a_refused_upgradewallet_is_logged() {
     );
     assert!(log.contains("Errors detected during wallet loading"));
 }
+
+/// A wallet that is not locked gets Divi Core's warning at every start, on
+/// stderr, unless -allowunencryptedwallet, an option divid knows
+/// (init.cpp:1228-1231)
+#[test]
+fn an_unencrypted_wallet_is_warned_about_unless_allowed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (rpc_port, p2p_port) = (free_port(), free_port());
+    let warning = "Warning: Make sure to encrypt your wallet and delete all non-encrypted backups after you verified that wallet works!";
+    for (extra, warned) in [(&[][..], true), (&["-allowunencryptedwallet"][..], false)] {
+        let from = log(dir.path()).len();
+        let (child, err) = start_with_stderr(dir.path(), rpc_port, p2p_port, extra);
+        stop(Node(child), rpc_port);
+        let stderr = std::fs::read_to_string(err).unwrap();
+        assert_eq!(stderr.contains(warning), warned, "{extra:?}: {stderr}");
+        assert!(
+            !log(dir.path())[from..].contains("Unknown option -allowunencryptedwallet"),
+            "{extra:?}"
+        );
+    }
+}
