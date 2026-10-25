@@ -80,7 +80,7 @@ def row(name, core, iron, same, raw=None):
 def free_port():
     """A port nothing listens on now (the system picks it)"""
     with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
+        sock.bind(("127.0.0.2", 0))
         return sock.getsockname()[1]
 
 
@@ -107,7 +107,7 @@ class Node:
             "regtest=1", f"port={self.p2p}", f"rpcport={self.rpcport}",
             f"rpcuser={self.user}", f"rpcpassword={self.password}",
             "daemon=0", "printtoconsole=0", "server=1", "discover=0", "listenonion=0",
-            "bind=127.0.0.1", "dnsseed=0", "staking=0",
+            "bind=127.0.0.2", "rpcbind=127.0.0.2", "rpcallowip=127.0.0.0/8", "dnsseed=0", "staking=0",
         ] + [line() if callable(line) else line for line in self.extra]
         path = os.path.join(self.dir, "divi.conf")
         fd = os.open(path + ".new", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -175,7 +175,7 @@ class Node:
     def call(self, method, *params):
         """('ok', result) or ('err', code, message)"""
         body = json.dumps({"jsonrpc": "1.0", "id": 1, "method": method, "params": list(params)}).encode()
-        req = urllib.request.Request(f"http://127.0.0.1:{self.rpcport}/", data=body,
+        req = urllib.request.Request(f"http://127.0.0.2:{self.rpcport}/", data=body,
                                      headers={"Authorization": "Basic " + self.auth, "Content-Type": "text/plain"})
         try:
             with urllib.request.urlopen(req, timeout=RPC_TIMEOUT) as r:
@@ -307,11 +307,11 @@ sys.excepthook = setup_failed
 # --- the six nodes: side L (bridge C1; C3 and I1 behind it), side R (C2; C4, I2) -------
 
 C1 = Node("bridge-L", DIVID, 0, ["listen=1"])
-I1 = Node("irondivid-L", IRONDIVID, 1, ["listen=0", lambda: f"connect=127.0.0.1:{C1.p2p}"])
+I1 = Node("irondivid-L", IRONDIVID, 1, ["listen=0", lambda: f"connect=127.0.0.2:{C1.p2p}"])
 C2 = Node("bridge-R", DIVID, 2, ["listen=1"])
-I2 = Node("irondivid-R", IRONDIVID, 3, ["listen=0", lambda: f"connect=127.0.0.1:{C2.p2p}"])
-C3 = Node("divid-L", DIVID, 4, ["listen=0", lambda: f"connect=127.0.0.1:{C1.p2p}"])
-C4 = Node("divid-R", DIVID, 5, ["listen=0", lambda: f"connect=127.0.0.1:{C2.p2p}"])
+I2 = Node("irondivid-R", IRONDIVID, 3, ["listen=0", lambda: f"connect=127.0.0.2:{C2.p2p}"])
+C3 = Node("divid-L", DIVID, 4, ["listen=0", lambda: f"connect=127.0.0.2:{C1.p2p}"])
+C4 = Node("divid-R", DIVID, 5, ["listen=0", lambda: f"connect=127.0.0.2:{C2.p2p}"])
 ALL = (C1, I1, C2, I2, C3, C4)
 BRIDGES = (C1, C2)
 # The divid and the irondivid behind each bridge
@@ -325,7 +325,7 @@ def connected_within_sides():
 
 def join():
     """One link across the split: divid R dials divid L once"""
-    C2.rpc("addnode", f"127.0.0.1:{C1.p2p}", "onetry")
+    C2.rpc("addnode", f"127.0.0.2:{C1.p2p}", "onetry")
     need(wait_for(lambda: C1.rpc("getconnectioncount") >= 3, 60), "the sides did not connect")
 
 

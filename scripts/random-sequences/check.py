@@ -827,14 +827,18 @@ for step in steps:
                     if tx[0] == "ok":
                         pool.append(sorted(str(o["value"]) for o in tx[1]["vout"]))
                 log(f"#   {p.name} node {m} mempool output values: {json.dumps(sorted(pool))}"[:3000])
-        # A side branch would show here: invalidateblock moves to the most-work
-        # chain left (rpcblockchain.cpp:636-640)
+        # A side branch would show here (invalidateblock moves to the most-work
+        # chain left, rpcblockchain.cpp:636-640), and the peer it came from
         for p in PAIRS:
             for m in (1, 2):
                 tips = p.node(m).call("getchaintips")
                 if tips[0] == "ok":
                     log(f"#   {p.name} node {m} chain tips: "
                         f"{json.dumps([(t.get('height'), t.get('branchlen'), t.get('status')) for t in tips[1]])}")
+                # and a peer from outside the pair
+                peers = p.node(m).call("getpeerinfo")
+                if peers[0] == "ok":
+                    log(f"#   {p.name} node {m} peers: {json.dumps(sorted(x.get('addr', '') for x in peers[1]))}")
         # Why a node lacks a transaction its peer holds: offered to it now
         for p in PAIRS:
             for m in (1, 2):
