@@ -88,10 +88,9 @@ By design:
 - `getcoinavailability`: irondivid adds `total_vaults` and `vaults`; divid has `Vaulted`, `Stakable` and `Spendable` only (`rpcwallet.cpp:818-987`). Compared without them; their names are checked in the `getcoinavailability: fields divid lacks` rows.
 - `removevault` with a second argument: irondivid still takes it for older IronDivi callers (its help says so); divid takes exactly one and answers with its help text (`rpcwallet.cpp:1194-1201`).
 
-Open, not closed yet. Each is listed so the run stays usable; a fix turns the row into a FAIL until it is taken out here and in `KNOWN` in `check.py`.
-- **After `removevault`, the manager's `listtransactions` and the manager's `gettransaction` of the vault transactions:**
-  - divid's `removevault` only drops the vault script from memory (`wallet.cpp:707-716`). It keeps the wallet's transactions and amounts, and reads the script back from its wallet file at the next start, so after a restart the vault is managed again.
-  - irondivid removes the vault and its records for good.
+- **After `removevault`, until the next start: the manager's `listtransactions` and the manager's `gettransaction` of the vault transactions.** divid still lists the removed vault's transactions, with their amounts and as sends where the owner took coins out. It keeps each transaction's credit and debit in a cache (`CachedTransactionDeltasCalculator.cpp:108-118`) that `removevault` never clears (`wallet.cpp:707-716`), so the numbers belong to the vault as it was before. irondivid works the entries out from the wallet as it is, which is what divid gives as well once it has restarted. The balances, `listunspent` and `getcoinavailability` agree on both sides. Copying the stale entries would show coins the manager can no longer stake.
+
+The `after restart` rows match: both sides keep the vault in the wallet file after `removevault`, so the next start manages it again with its coins and transactions (`wallet.cpp:707-716` erases the script from memory only; `walletdb.cpp:402-409` loads it at the start). `scripts/vault-records` goes through the other ways a wallet starts again.
 
 ## Proving a difference is caught
 
