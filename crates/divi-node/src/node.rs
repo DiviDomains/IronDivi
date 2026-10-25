@@ -1063,6 +1063,8 @@ impl Node {
                                         .send_to_peer(peer_id, NetworkMessage::GetData(masternode_items))
                                         .await;
                                 }
+                                // Sporks are announced by inv as well
+                                spork_manager.handle_inv(peer_id, &items).await;
                             }
                             NetworkMessage::NotFound(items) => {
                                 let items: Vec<_> = items
@@ -1123,6 +1125,19 @@ impl Node {
                                             }
                                             None => not_found.push(item),
                                         },
+                                        // A spork held is sent, else named in the notfound
+                                        // (main.cpp:187-189, :337-346)
+                                        divi_network::InvType::Spork => {
+                                            match spork_manager.spork_by_hash(&item.hash) {
+                                                Some(spork) => {
+                                                    let msg = NetworkMessage::Spork(spork);
+                                                    let _ = peer_manager
+                                                        .send_block_to_peer(peer_id, msg)
+                                                        .await;
+                                                }
+                                                None => not_found.push(item),
+                                            }
+                                        }
                                         _ => {}
                                     }
                                 }
@@ -1398,6 +1413,11 @@ impl Node {
         self.keep(tokio::spawn(async move {
             pm_for_maintenance.run_maintenance().await;
         }));
+        // -connect peers are dialled again every few seconds, as Divi Core does
+        let pm_for_connect = Arc::clone(&self.peer_manager);
+        self.keep(tokio::spawn(async move {
+            pm_for_connect.run_connect_loop().await;
+        }));
 
         // Start sync progress tracker
         let sync = Arc::clone(&self.block_sync);
@@ -1476,6 +1496,42 @@ impl Node {
                     }
                     Err(e) => {
                         tracing::debug!("Rejected relayed tx {}: {}", event.txid, e);
+                    }
+                }
+            }
+        }));
+
+        // Rebroadcast some mempool transactions at a random time within 30
+        // minutes when the tip has moved since the last time, as Divi Core's
+        // SendMessages does (PeriodicallyRebroadcastMempoolTxs, main.cpp:1280-1294)
+        let tx_relay_for_rebroadcast = Arc::clone(&self.tx_relay);
+        let mempool_for_rebroadcast = Arc::clone(&self.mempool);
+        let chain_for_rebroadcast = Arc::clone(&self.chain);
+        self.keep(tokio::spawn(async move {
+            use crate::rebroadcast::{rebroadcast_candidates, RebroadcastTimer, MAX_WAIT_SECS};
+            use rand::Rng;
+            let mut timer = RebroadcastTimer::new();
+            let mut tip = chain_for_rebroadcast.tip().map(|t| t.hash);
+            let mut last_tip_update = 0i64;
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+            loop {
+                interval.tick().await;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                let current = chain_for_rebroadcast.tip().map(|t| t.hash);
+                if current != tip {
+                    tip = current;
+                    last_tip_update = now;
+                }
+                if timer.due(now, last_tip_update, || {
+                    rand::thread_rng().gen_range(0..MAX_WAIT_SECS)
+                }) {
+                    let txids = rebroadcast_candidates(&mempool_for_rebroadcast);
+                    if !txids.is_empty() {
+                        tracing::info!("Rebroadcasting {} mempool transaction(s)", txids.len());
+                        tx_relay_for_rebroadcast.rebroadcast(&txids).await;
                     }
                 }
             }

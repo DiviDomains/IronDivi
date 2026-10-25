@@ -1623,21 +1623,25 @@ fn load_or_restore_wallet_with_seed(
 }
 
 /// Put the wallet's unconfirmed transactions back into the mempool after a
-/// restart (Core's ReacceptWalletTransactions), so a send made before the
-/// node stopped can still confirm. Runs after the catch-up scan, which has
+/// restart (Core's SubmitUnconfirmedWalletTransactionsToMempool,
+/// init.cpp:1262-1275), so a send made before the node stopped can still
+/// confirm. Those the mempool dropped earlier (detached, at depth -1) are
+/// offered too, as Core offers every wallet transaction with fewer than 0
+/// confirmations. Runs after the catch-up scan, which has
 /// already dropped the ones mined meanwhile. A transaction whose inputs are
 /// neither unspent on chain nor outputs of a transaction in the mempool can
 /// never confirm (spent by another transaction while we were down): the
-/// wallet forgets it, as it does when the mempool evicts one.
+/// wallet forgets it, as it does when the mempool evicts one. Nothing is
+/// announced to peers, as Core announces none of them then.
 fn resubmit_wallet_txs(node: &Node, wallet: &Arc<WalletDb>) {
-    let txs = wallet.unconfirmed_transactions();
+    let txs = wallet.transactions_to_resubmit();
     if txs.is_empty() {
         return;
     }
     let chain = node.chain();
     let mempool = node.mempool();
     let mut resubmitted = 0;
-    for tx in txs {
+    for (tx, detached) in txs {
         let txid = tx.txid();
         let inputs_available = tx.vin.iter().all(|input| {
             mempool.contains(&input.prevout.txid)
@@ -1650,12 +1654,17 @@ fn resubmit_wallet_txs(node: &Node, wallet: &Arc<WalletDb>) {
             Err("inputs no longer available".to_string())
         };
         match result {
+            // Added to the mempool only, not announced: Divi Core's
+            // SubmitTransactionToMempool runs AcceptToMemoryPool alone
+            // (init.cpp:1272, txmempool.cpp:408-415); peers hear of the
+            // transaction from the periodic mempool rebroadcast
             Ok(_) => {
                 resubmitted += 1;
-                let relay = node.tx_relay().clone();
-                tokio::spawn(async move {
-                    relay.announce_tx(txid).await;
-                });
+            }
+            // A detached transaction the mempool refuses stays as it is, at
+            // depth -1, as Divi Core's wallet keeps it
+            Err(e) if detached => {
+                debug!("Detached wallet tx {} not resubmitted: {}", txid, e);
             }
             Err(e) => {
                 warn!(
