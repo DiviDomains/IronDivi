@@ -365,11 +365,15 @@ difficulty_rows()
 
 # The outputs of the life rows
 X = D.rpc("getnewaddress")
-cb1 = D.rpc("getblock", D.rpc("getblockhash", 1))["tx"][0]
 cs101 = first_stake["tx"][1]
 vault = D.rpc("fundvault", f"{D.rpc('getnewaddress')}:{D.rpc('getnewaddress')}", 250)["txhash"]
 A = D.rpc("sendtoaddress", X, 10)
 mine(1)
+# A mature coinbase still unspent (staking and the sends take some of them)
+cb1 = next(cb for cb in (D.rpc("getblock", D.rpc("getblockhash", h))["tx"][0] for h in range(1, 101))
+           if D.rpc("gettxout", cb, 0) is not None)
+# The vault output: the one of 250 DIVI (the other is the change)
+vault_n = next(o["n"] for o in D.rpc("getrawtransaction", vault, 1)["vout"] if o["value"] == "250.00000000")
 hA = D.rpc("getblockcount")
 blockA = D.rpc("getbestblockhash")
 a_vout = next(o["n"] for o in D.rpc("getrawtransaction", A, 1)["vout"]
@@ -385,7 +389,7 @@ LIFE = [
     ("confirmed, spent in the mempool", A, a_vout), ("confirmed, unspent", A, 1 - a_vout if a_vout < 2 else 0),
     ("spending the mempool output", A2, 0),
     ("spent in a block", spent_in["txid"], spent_in["vout"]),
-    ("mature coinbase", cb1, 0), ("mature coinstake", cs101, 1), ("vault", vault, 0),
+    ("mature coinbase", cb1, 0), ("mature coinstake", cs101, 1), ("vault", vault, vault_n),
     ("past the last output", A, 99),
 ]
 gettxout_rows("", LIFE)

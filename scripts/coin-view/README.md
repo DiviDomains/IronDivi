@@ -23,7 +23,7 @@ scripts/coin-view/run.sh target/release ~/divi-3.0.0/bin 53950 /var/tmp
 - `<port-base>`: ports `<port-base>` to `<port-base>+3` on 127.0.0.2 (divid p2p and RPC, then irondivid's).
 - `[root]`: a fresh directory is made under it (default `$TMPDIR`, else `/tmp`) and deleted at the end.
 
-A run takes about four minutes and is stopped after 10 minutes. However it ends, both nodes are stopped and their
+A run takes about half a minute and is stopped after 10 minutes. However it ends, both nodes are stopped and their
 directories deleted. Needs bash and python3 (standard library only). RPC passwords are made at random for each run
 and kept in each node's 0600 `divi.conf`.
 
@@ -77,4 +77,4 @@ Core paths are under `divi/src/` of the Divi Core source at v3.0.0 (commit 9e2f7
 ## Proving a difference is caught
 
 `COIN_VIEW_INJECT=<row name>` changes irondivid's reply of that row before it is compared, e.g.
-`COIN_VIEW_INJECT='gettxout vault 0'`: that row prints `FAIL` and the run exits 1.
+`COIN_VIEW_INJECT='gettxout mature coinbase 0'`: that row prints `FAIL` and the run exits 1.

@@ -114,12 +114,6 @@ ones (`<call>: fields divid lacks` rows).
 **Open, not closed yet.** These are listed so the run stays usable. A fix turns the row into a FAIL until it is
 taken out here and in `KNOWN` in `check.py`.
 
-- `createrawtransaction` with the outputs as an object: irondivid writes the outputs sorted by address, not in the
-  order given, so the transaction differs from divid's.
-  - **Cause:** the RPC layer parses each request into serde_json maps, which keep member names sorted (no
-    `preserve_order` in Cargo.toml; docs/divid-differences.md R6).
-  - divid keeps the order given (`rpcrawtransaction.cpp:400-410`).
-  - The array form (`[{"addr": n}, ...]`) keeps the order on irondivid, and that row passes.
 - `sendrawtransaction` of an unsigned spend: irondivid answers -25 `""`, divid -26
   `"16: mandatory-script-verify-flag-failed (...)"`.
   - **Cause:** divid runs here with `acceptnonstandard=1`, which skips its input standardness check

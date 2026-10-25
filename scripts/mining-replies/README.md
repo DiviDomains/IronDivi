@@ -28,7 +28,7 @@ It needs bash and python3 (standard library only).
   - the `time` a transaction entered the pool;
   - block hashes, since each node mines its own block;
   - the order of the txid list in `getrawmempool`, since divid's map order means nothing.
-- **Member order.** irondivid writes members in name order (difference R6), so it is not compared.
+- **Member order.** Not compared here (scripts/coin-view compares it for the coin-view calls).
 - **Help text.** A wrong argument count is answered with the method's help in both. The two help texts are worded differently, so such replies count as `SAME` when the code and the first (usage) line agree.
 
 ## What runs
