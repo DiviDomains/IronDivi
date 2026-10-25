@@ -503,3 +503,75 @@ fn pings_are_taken_as_divid_takes_them() {
         .is_err());
     assert_eq!(last_seen(), good);
 }
+
+/// A refused broadcast or ping carries the misbehaviour score Divi Core
+/// gives its sender: 1 for a time out of range, 20 for a tier that does not
+/// exist, 100 for a bad broadcast signature, 33 for a collateral that does
+/// not match and for a bad ping signature, none for the others
+/// (masternodeman.cpp:232-265, :309-375, :420-466, :504-534)
+#[test]
+fn refusals_carry_divids_misbehaviour_scores() {
+    use divi_masternode::cpp_wire::{CppBroadcast, CppPing};
+    let n = funded();
+    let (_, _, address, signed) = set_up(&n, "mn1", 16);
+    let (coll_key, mn_key) = keys(&n, &address);
+    let recent = *n
+        .chain
+        .get_block_index_by_height(n.chain.height() - 2)
+        .unwrap()
+        .unwrap()
+        .hash
+        .as_bytes();
+    let base = CppBroadcast::decode(&hex::decode(&signed).unwrap()).unwrap();
+    let make = |f: &dyn Fn(&mut CppBroadcast)| {
+        let mut mnb = base.clone();
+        mnb.sig_time = now();
+        mnb.last_ping.sig_time = now() - 3000;
+        mnb.last_ping.block_hash = recent;
+        f(&mut mnb);
+        mnb.last_ping.sign(&mn_key).unwrap();
+        mnb.sign(&coll_key).unwrap();
+        mnb
+    };
+    let score = |mnb: CppBroadcast| {
+        n.list
+            .accept_broadcast(&n.chain, &mnb.encode())
+            .unwrap_err()
+            .dos
+    };
+    let other = divi_crypto::SecretKey::new_random();
+    assert_eq!(score(make(&|m| m.sig_time = now() + 7200)), 1);
+    assert_eq!(score(make(&|m| m.tier = 7)), 20);
+    assert_eq!(score(make(&|m| m.protocol_version = 70914)), 0);
+    assert_eq!(score(make(&|m| m.vin.script_sig = vec![0x51])), 0);
+    let mut forged = make(&|_| {});
+    forged.sign(&other).unwrap();
+    assert_eq!(score(forged), 100);
+    let mut stranger = make(&|m| m.pubkey_collateral = other.public_key().to_bytes().to_vec());
+    stranger.sign(&other).unwrap();
+    assert_eq!(score(stranger), 33);
+    let mut bad_ping = make(&|_| {});
+    bad_ping.last_ping.sign(&other).unwrap();
+    bad_ping.sign(&coll_key).unwrap();
+    assert_eq!(score(bad_ping), 33);
+    assert_eq!(score(make(&|m| m.last_ping.sig_time = now() + 7200)), 1);
+    assert_eq!(score(make(&|m| m.last_ping.block_hash = [0xcd; 32])), 0);
+
+    let good = make(&|_| {});
+    assert_eq!(n.list.accept_broadcast(&n.chain, &good.encode()), Ok(true));
+    let ping = |sig_time: i64, key: &divi_crypto::SecretKey| {
+        let mut p = CppPing {
+            vin: good.vin.clone(),
+            block_hash: recent,
+            sig_time,
+            signature: vec![],
+        };
+        p.sign(key).unwrap();
+        n.list.accept_ping(&n.chain, &p.to_bytes())
+    };
+    assert_eq!(ping(now(), &other).unwrap_err().dos, 33);
+    assert_eq!(ping(now() + 7200, &mn_key).unwrap_err().dos, 1);
+    assert_eq!(ping(now() - 7200, &mn_key).unwrap_err().dos, 1);
+    assert_eq!(ping(now(), &mn_key), Ok(true));
+    assert_eq!(ping(now() + 60, &mn_key).unwrap_err().dos, 0);
+}

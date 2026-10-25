@@ -78,6 +78,50 @@ impl NetworkMasternode {
     }
 }
 
+/// Why a masternode message from a peer was not taken, and the misbehaviour
+/// score Divi Core gives the peer for it (its nDoS, 0 for none) with the
+/// cause it names
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refusal {
+    pub dos: u32,
+    pub cause: &'static str,
+    pub reason: String,
+}
+
+impl Refusal {
+    fn scored(dos: u32, cause: &'static str, reason: impl Into<String>) -> Self {
+        Refusal {
+            dos,
+            cause,
+            reason: reason.into(),
+        }
+    }
+}
+
+impl From<&str> for Refusal {
+    fn from(reason: &str) -> Self {
+        Refusal::scored(0, "", reason)
+    }
+}
+
+impl From<String> for Refusal {
+    fn from(reason: String) -> Self {
+        Refusal::scored(0, "", reason)
+    }
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
+/// The causes Divi Core names for these scores (masternodeman.cpp:428-466, :519-528)
+const BAD_CONTEXT: &str = "Bad masternode broadcast context";
+const MISMATCHED_VIN: &str = "Mismatched pubkey and vin for masternode";
+const INVALID_PING: &str = "Invalid masternode ping";
+const PING_FAILED: &str = "Ping update failed";
+
 #[derive(Default)]
 pub struct MasternodeList {
     entries: RwLock<Vec<NetworkMasternode>>,
@@ -146,18 +190,26 @@ impl MasternodeList {
     /// (CMasternodeBroadcast::CheckAndUpdate, CheckInputsAndAdd,
     /// CMasternodeMan::ProcessBroadcast), then added, or replacing an older
     /// broadcast of the same collateral. Ok(true) when the list changed.
-    pub fn accept_broadcast(&self, chain: &Chain, payload: &[u8]) -> Result<bool, String> {
+    pub fn accept_broadcast(&self, chain: &Chain, payload: &[u8]) -> Result<bool, Refusal> {
         let mnb = CppBroadcast::decode(payload).map_err(|e| format!("{e:?}"))?;
         self.accept_decoded(chain, mnb, now())
     }
 
-    fn accept_decoded(&self, chain: &Chain, mnb: CppBroadcast, now: i64) -> Result<bool, String> {
+    fn accept_decoded(&self, chain: &Chain, mnb: CppBroadcast, now: i64) -> Result<bool, Refusal> {
         // CheckMasternodeBroadcastContext (masternodeman.cpp:232-265)
         if mnb.sig_time > now + 3600 {
-            return Err("signature too far in the future".into());
+            return Err(Refusal::scored(
+                1,
+                BAD_CONTEXT,
+                "signature too far in the future",
+            ));
         }
         if !(0..=4).contains(&mnb.tier) {
-            return Err(format!("invalid tier {}", mnb.tier));
+            return Err(Refusal::scored(
+                20,
+                BAD_CONTEXT,
+                format!("invalid tier {}", mnb.tier),
+            ));
         }
         if mnb.protocol_version < ACTIVE_PROTOCOL {
             return Err("obsolete protocol version".into());
@@ -166,7 +218,7 @@ impl MasternodeList {
             return Err("the input has a scriptSig".into());
         }
         if !mnb.signature_is_valid() {
-            return Err("bad broadcast signature".into());
+            return Err(Refusal::scored(100, BAD_CONTEXT, "bad broadcast signature"));
         }
         let hash = Hash256(mnb.vin.prevout_hash);
         let outpoint = OutPoint::new(hash, mnb.vin.prevout_n);
@@ -211,12 +263,18 @@ impl MasternodeList {
         }
         // IsVinAssociatedWithPubkey (masternodeman.cpp:57-74): the collateral
         // pays the tier's amount to the broadcast's collateral key
-        let coll = find_collateral(chain, &hash, mnb.vin.prevout_n)
-            .ok_or("collateral not found in the active chain")?;
+        let mismatched = || {
+            Refusal::scored(
+                33,
+                MISMATCHED_VIN,
+                "collateral does not match the broadcast's key and tier",
+            )
+        };
+        let coll = find_collateral(chain, &hash, mnb.vin.prevout_n).ok_or_else(mismatched)?;
         if tier_for_collateral(chain, coll.amount) != Some(mnb.tier)
             || coll.script != payee_script(&mnb)
         {
-            return Err("collateral does not match the broadcast's key and tier".into());
+            return Err(mismatched());
         }
         // CheckInputsForMasternode (masternodeman.cpp:196-230), unless the
         // masternode is listed and enabled
@@ -228,7 +286,8 @@ impl MasternodeList {
             if conf_height > chain.height() {
                 return Err(format!(
                     "collateral must have at least {MIN_CONFIRMATIONS} confirmations"
-                ));
+                )
+                .into());
             }
             let conf = chain
                 .get_block_index_by_height(conf_height)
@@ -241,7 +300,10 @@ impl MasternodeList {
         }
         // The attached ping, checked as for a masternode with no ping yet
         // (masternodeman.cpp:456-466)
-        check_ping(chain, &mnb, None, &mnb.last_ping, now)?;
+        check_ping(chain, &mnb, None, &mnb.last_ping, now).map_err(|r| Refusal {
+            cause: INVALID_PING,
+            ..r
+        })?;
         // Listed and enabled: nothing more to do (masternodeman.cpp:476-487)
         if existing_enabled {
             return Ok(changed);
@@ -263,7 +325,7 @@ impl MasternodeList {
     /// ping, signed by the masternode key, naming a known block at most 24
     /// below the tip (masternodeman.cpp:309-375, :504-534). Ok(true) when the
     /// ping was taken.
-    pub fn accept_ping(&self, chain: &Chain, payload: &[u8]) -> Result<bool, String> {
+    pub fn accept_ping(&self, chain: &Chain, payload: &[u8]) -> Result<bool, Refusal> {
         let ping = CppPing::decode_bytes(payload).map_err(|e| format!("{e:?}"))?;
         let now = now();
         {
@@ -277,7 +339,10 @@ impl MasternodeList {
             if !e.is_enabled(now) {
                 return Ok(false);
             }
-            check_ping(chain, &e.mnb, Some(&e.mnb.last_ping), &ping, now)?;
+            check_ping(chain, &e.mnb, Some(&e.mnb.last_ping), &ping, now).map_err(|r| Refusal {
+                cause: PING_FAILED,
+                ..r
+            })?;
             e.mnb.last_ping = ping;
         }
         self.save();
@@ -495,9 +560,9 @@ fn check_ping(
     last: Option<&CppPing>,
     ping: &CppPing,
     now: i64,
-) -> Result<(), String> {
+) -> Result<(), Refusal> {
     if ping.sig_time > now + 3600 || ping.sig_time <= now - 3600 {
-        return Err("ping signature time out of range".into());
+        return Err(Refusal::scored(1, "", "ping signature time out of range"));
     }
     if mnb.protocol_version < ACTIVE_PROTOCOL {
         return Err("no masternode of a compatible protocol".into());
@@ -509,7 +574,7 @@ fn check_ping(
         return Err("ping arrived too early".into());
     }
     if !ping_signature_valid(mnb, ping) {
-        return Err("bad ping signature".into());
+        return Err(Refusal::scored(33, "", "bad ping signature"));
     }
     let block = chain
         .get_block_index(&Hash256(ping.block_hash))

@@ -1206,11 +1206,16 @@ impl Node {
                                         peer_id
                                     ),
                                     Ok(false) => {}
-                                    Err(e) => tracing::debug!(
-                                        "Masternode broadcast from peer {} not taken: {}",
-                                        peer_id,
-                                        e
-                                    ),
+                                    Err(e) => {
+                                        tracing::debug!(
+                                            "Masternode broadcast from peer {} not taken: {}",
+                                            peer_id,
+                                            e
+                                        );
+                                        if e.dos > 0 {
+                                            peer_manager.report_misbehavior_score(peer_id, e.dos, e.cause);
+                                        }
+                                    }
                                 }
                             }
                             NetworkMessage::MasternodePing(payload) => {
@@ -1220,6 +1225,9 @@ impl Node {
                                         peer_id,
                                         e
                                     );
+                                    if e.dos > 0 {
+                                        peer_manager.report_misbehavior_score(peer_id, e.dos, e.cause);
+                                    }
                                 }
                             }
                             // A payment vote, counted when it passes Divi Core's
