@@ -249,3 +249,29 @@ async fn a_valid_block_draws_no_reject() {
     assert_eq!(peer.expect("reject", QUIET).await, None);
     assert_eq!(t.node.chain().height(), 1);
 }
+
+/// A block whose parent the node does not know, offered without being asked for:
+/// Divi Core answers with a getblocks that stops at the block (main.cpp:820-830),
+/// and with one that stops at its parent when the peer sends it again
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_block_with_an_unknown_parent_is_answered_with_getblocks() {
+    let t = TestNode::start().await;
+    let (block, hash) = block_on_tip(&t, false, |b| {
+        b.header.prev_block = Hash256::from_bytes([0x33; 32])
+    });
+    let mut peer = RawPeer::connect(&t, "127.0.0.2").await;
+    peer.handshake().await;
+    // what the node says to a new peer on its own comes first
+    while let Recv::Message(..) = peer.recv(std::time::Duration::from_secs(2)).await {}
+    let stop_of =
+        |payload: &[u8]| -> Hash256 { Hash256::from_slice(&payload[payload.len() - 32..]) };
+    peer.send("block", &serialize(&block)).await;
+    let asked = peer.expect("getblocks", WAIT).await.expect("getblocks");
+    assert_eq!(stop_of(&asked), hash);
+    peer.send("block", &serialize(&block)).await;
+    let asked = peer
+        .expect("getblocks", WAIT)
+        .await
+        .expect("getblocks again");
+    assert_eq!(stop_of(&asked), Hash256::from_bytes([0x33; 32]));
+}

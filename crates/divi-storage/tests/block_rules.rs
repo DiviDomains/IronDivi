@@ -263,10 +263,11 @@ fn pos_block_is_checked_during_initial_sync() {
     assert_eq!(t.tip().height, 100);
 }
 
-/// A side-chain PoS block is checked when a reorg connects it: a fork with
-/// more work whose block carries a bad block signature does not become the tip
+/// A side-chain PoS block is checked when it arrives, as Divi Core does
+/// (ChainExtensionService.cpp:477): one with a bad block signature is refused and
+/// not stored, and the fork never becomes the tip
 #[test]
-fn side_chain_pos_block_is_checked_on_reorg() {
+fn side_chain_pos_block_is_checked_on_arrival() {
     let t = TestChain::new(regtest());
     let coins = t.extend_pow(100);
     let fork_point = t.tip();
@@ -278,7 +279,7 @@ fn side_chain_pos_block_is_checked_on_reorg() {
     let main_tip = t.tip();
     assert_eq!(main_tip.height, 102);
 
-    // Fork from 100: b1 fine, b2 with a broken block signature, b3 on top
+    // Fork from 100: b1 fine, b2 with a broken block signature
     let b1 = t.pos_block(&fork_point, fork_point.time + 61, coins[2], |_| {}, |_| {});
     let b1h = compute_block_hash(&b1.header);
     t.chain.accept_block(b1).unwrap();
@@ -291,20 +292,15 @@ fn side_chain_pos_block_is_checked_on_reorg() {
     );
     b2.block_sig[10] ^= 0x55;
     let b2h = compute_block_hash(&b2.header);
-    t.chain.accept_block(b2).unwrap(); // stored: equal work, not connected
-    let b3 = t.pos_block(
-        &t.index(&b2h),
-        fork_point.time + 181,
-        coins[4],
-        |_| {},
-        |_| {},
+    let msg = err_text(t.chain.accept_block(b2));
+    assert!(msg.contains("signature"), "{msg}");
+    assert!(
+        t.chain.get_block_index(&b2h).unwrap().is_none(),
+        "the refused block was stored"
     );
-    let _ = t.chain.accept_block(b3);
-    assert_eq!(
-        t.tip().hash,
-        main_tip.hash,
-        "fork with a bad signature became the tip"
-    );
+    assert_eq!(t.tip().hash, main_tip.hash, "the tip moved");
+    // the chain tips: the main chain and the good fork block
+    assert_eq!(t.chain.get_chain_tips().unwrap().len(), 2);
 }
 
 // ---------------------------------------------------------------------------
