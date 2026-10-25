@@ -57,7 +57,7 @@ fn zip317_conventional(script_sigs: &[usize], script_pubkeys: &[usize]) -> u64 {
 /// The real spend builder a claim is priced with.
 enum Real {
     /// The DIVI backend at the relay minimum. Its `build_claim` makes no RPC call.
-    Divi(DiviBackend),
+    Divi(Box<DiviBackend>),
     /// The ZEC builder `ZecBackend::build_claim` calls (after reading the branch id and tip
     /// height from lightwalletd, which this harness has none of), at 1 zatoshi per byte.
     Zec {
@@ -82,7 +82,7 @@ impl Real {
             None,
         )
         .unwrap();
-        Real::Divi(b)
+        Real::Divi(Box::new(b))
     }
 
     fn zec() -> Self {
