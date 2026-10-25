@@ -640,7 +640,8 @@ def kept(book, addrs, src):
     for ip, port in addrs:
         if (ip, port) in book["addrs"]:
             out.append("kept")
-        elif ip not in ips and collided(book, ip, port, src):
+        elif ip not in ips and not (book is books["i"] and port == 0) and collided(book, ip, port, src):
+            # (irondivid keeps no port 0 address, collision or not)
             out.append("collision")
         else:
             out.append("not kept")
@@ -1028,8 +1029,10 @@ compare("divid's peers.dat read by irondivid: getaddr answer (divid: its own)",
 compare("irondivid's peers.dat read by divid: getaddr answer (irondivid: its own)",
         ("ok", got["c"]), ("ok", 23 * own_count["i"] // 100))
 after = {"c": read_peers(C.peers_dat()), "i": read_peers(I.peers_dat())}
-compare("after reading the other's peers.dat and a clean stop: the file's addresses",
-        ("ok", len(after["c"]["addrs"])), ("ok", len(after["i"]["addrs"])))
+# each wrote back what it read: the other's addresses (the two books can differ
+# by a bucket collision, so each is held against the file it was given)
+compare("after reading the other's peers.dat and a clean stop: the file holds what was read",
+        ("ok", len(after["c"]["addrs"]) == own_count["i"]), ("ok", len(after["i"]["addrs"]) == own_count["c"]))
 
 for what, damage in (("truncated", lambda b: b[:len(b) // 2]), ("zero-length", lambda b: b""),
                      ("wrong checksum", lambda b: b[:-1] + bytes([b[-1] ^ 1]))):

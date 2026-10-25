@@ -80,7 +80,7 @@ The 1000-entry message is sent last, so its addresses do not take the places of 
 | restart | after a start the answer is 23% of the book read, all from it; the file after the next stop holds the same addresses |
 | 2500 known | the answer: one message, at most 1000, 23% of the book, no repeats; about 1870 of the 2500 kept (one source group reaches 64 of the 1024 new buckets, 4096 places, `addrman.cpp:20-26`) |
 | 10 known | 2 in the answer, none twice |
-| swapped | each daemon's `peers.dat` planted in the other's data directory: the answer is what the writer gives reading its own |
+| swapped | each daemon's `peers.dat` planted in the other's data directory: the answer is what the writer gives reading its own, and the file after the next stop holds what was read |
 | damaged | truncated, zero-length, a wrong checksum: the node starts, answers with nothing, and writes a readable empty file at the next stop (`net.cpp:1431-1438`) |
 | unclean stop | 10 addresses learnt, then `kill -9`: the file has none of them (written at a clean stop and every 15 minutes, `net.cpp:83`, `:1471`, `:1480`); after the start the answer is the old book's |
 | start options | `-addnode`, `-connect`, `-seednode`: the node connects, sends `getaddr`, and keeps the peer after its `addr` (a `-seednode` peer is dropped then, `main.cpp:556-557`; `-connect` still dials it, `net.cpp:1094-1096`); `-addnode` in `getaddednodeinfo`, and the peer kept after `addnode remove`; `-listen=0`: no inbound peer, an onetry peer gets `getaddr`; `-discover=0` and `=1` without `externalip`: how many local addresses |
