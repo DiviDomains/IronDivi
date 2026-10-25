@@ -1254,21 +1254,18 @@ impl BlockSync {
         }
         debug!("Received block {} from peer {}", hash, peer_id);
 
-        // A block not asked for whose parent is unknown: Divi Core asks the
-        // peer for the blocks up to it with a getblocks, or up to its parent
-        // when it asked for this block that way before (main.cpp:822-833).
-        // A block asked for may come before its parent from a download in
-        // parallel; it is kept for it
+        // A block whose parent is unknown: Divi Core asks the peer for the
+        // blocks up to it with a getblocks, or up to its parent when it asked
+        // for this block that way before (main.cpp:822-833). A block asked for
+        // may come before its parent from a download in parallel; it is kept
+        // for it while the parent is on its way, and asks like any other when
+        // the parent is not
+        let prev = block.header.prev_block;
         let requested = self.blocks_in_flight.read().contains_key(&hash);
-        if !requested
-            && self
-                .chain
-                .get_block_index(&block.header.prev_block)
-                .ok()
-                .flatten()
-                .is_none()
+        if self.chain.get_block_index(&prev).ok().flatten().is_none()
+            && !(requested && self.block_on_its_way(&prev))
         {
-            self.ask_up_to(peer_id, hash, block.header.prev_block).await;
+            self.ask_up_to(peer_id, hash, prev).await;
         }
 
         // The tip before, to announce the new one if it moves
@@ -1323,6 +1320,18 @@ impl BlockSync {
 
         // Emit progress
         let _ = self.progress_tx.send(self.progress());
+    }
+
+    /// A block asked for, held, or queued to be asked for
+    fn block_on_its_way(&self, hash: &Hash256) -> bool {
+        self.blocks_in_flight.read().contains_key(hash)
+            || self.downloaded_blocks.read().contains_key(hash)
+            || self.orphan_blocks.read().contains_key(hash)
+            || self
+                .pending_block_requests
+                .read()
+                .iter()
+                .any(|(queued, _)| queued == hash)
     }
 
     /// The getblocks Divi Core sends for a block whose parent it does not
@@ -4280,5 +4289,66 @@ mod tests {
             vec![child_hash],
             "a getblocks up to the block that came"
         );
+    }
+
+    /// A block that was asked for but whose parent is unknown and not on its way
+    /// (not asked for, held or queued) gets the same getblocks: Divi Core sends it
+    /// for any block whose parent it lacks (main.cpp:822-833), and without it the
+    /// block waits for a parent nobody sends
+    #[tokio::test]
+    async fn a_block_asked_for_whose_parent_is_not_on_its_way_asks_for_it() {
+        let (sync, mut rxs, _dir) = sync_with_peers(2);
+        let parent = next_block(&sync.chain);
+        let parent_hash = compute_block_hash(&parent.header);
+        let tip = sync.chain.tip().unwrap();
+        let mut child = parent.clone();
+        child.header.prev_block = parent_hash;
+        child.header.time = parent.header.time + 60;
+        let mut tag = divi_storage::bip34_height_script(tip.height + 2);
+        tag.extend_from_slice(&(tip.height + 2).to_le_bytes());
+        child.transactions[0].vin[0].script_sig = divi_primitives::script::Script::from_bytes(tag);
+        child.header.merkle_root = divi_crypto::compute_merkle_root(&child.transactions);
+        child.header.nonce = 0;
+        let target = Hash256::from_compact(child.header.bits);
+        while compute_block_hash(&child.header) > target {
+            child.header.nonce += 1;
+        }
+        let child_hash = compute_block_hash(&child.header);
+        let in_flight = |hash| BlockRequest {
+            peer_id: 1,
+            _hash: hash,
+            requested_at: Instant::now(),
+        };
+        sync.blocks_in_flight
+            .write()
+            .insert(child_hash, in_flight(child_hash));
+
+        sync.handle_block(1, child.clone()).await;
+        let stops = |rx: &mut tokio::sync::mpsc::Receiver<NetworkMessage>| {
+            let mut stops = Vec::new();
+            while let Ok(msg) = rx.try_recv() {
+                if let NetworkMessage::GetBlocks(m) = msg {
+                    stops.push(m.stop_hash);
+                }
+            }
+            stops
+        };
+        assert_eq!(
+            stops(rxs.get_mut(&1).unwrap()),
+            vec![child_hash],
+            "a getblocks up to the block that came"
+        );
+
+        // With its parent asked for too, as in a download in parallel, it waits
+        sync.downloaded_blocks.write().remove(&child_hash);
+        sync.orphan_blocks.write().remove(&child_hash);
+        sync.blocks_in_flight
+            .write()
+            .insert(child_hash, in_flight(child_hash));
+        sync.blocks_in_flight
+            .write()
+            .insert(parent_hash, in_flight(parent_hash));
+        sync.handle_block(1, child).await;
+        assert_eq!(stops(rxs.get_mut(&1).unwrap()), vec![], "no getblocks");
     }
 }
