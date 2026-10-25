@@ -2989,7 +2989,10 @@ version = "0.2.6"
 dependencies = [
  "alloy",
  "async-trait",
+ "getrandom 0.2.17",
+ "gloo-timers",
  "hex",
+ "js-sys",
  "parking_lot",
  "proptest",
  "rand 0.8.8",
@@ -3742,6 +3745,18 @@ name = "glob"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
+
+[[package]]
+name = "gloo-timers"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbb143cf96099802033e0d4f4963b19fd2e0b728bcf076cd9cf7f6634f092994"
+dependencies = [
+ "futures-channel",
+ "futures-core",
+ "js-sys",
+ "wasm-bindgen",
+]
 
 [[package]]
 name = "gmp-mpfr-sys"
@@ -7099,6 +7114,7 @@ dependencies = [
  "async-trait",
  "bitcoin",
  "divi-swap",
+ "getrandom 0.2.17",
  "hex",
  "parking_lot",
  "proptest",
@@ -7124,6 +7140,7 @@ dependencies = [
  "divi-script",
  "divi-swap",
  "divi-wallet",
+ "getrandom 0.2.17",
  "hex",
  "parking_lot",
  "proptest",
@@ -7165,6 +7182,7 @@ dependencies = [
  "bech32",
  "bitcoin",
  "divi-swap",
+ "getrandom 0.2.17",
  "hex",
  "parking_lot",
  "proptest",
@@ -7234,6 +7252,21 @@ dependencies = [
  "tonic-prost",
  "tracing",
  "zcash_script",
+]
+
+[[package]]
+name = "swap-keys"
+version = "0.2.6"
+dependencies = [
+ "bip39",
+ "bitcoin",
+ "divi-crypto",
+ "divi-wallet",
+ "hex",
+ "swap-chain-divi",
+ "swap-chain-ltc",
+ "thiserror 1.0.69",
+ "zeroize",
 ]
 
 [[package]]

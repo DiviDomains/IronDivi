@@ -1,0 +1,19 @@
+[package]
+license = "AGPL-3.0-only"
+name = "swap-keys"
+version.workspace = true
+edition.workspace = true
+description = "Atomic swap keys for DIVI, BTC and LTC from one BIP39 seed"
+
+[dependencies]
+divi-wallet = { workspace = true }
+divi-crypto = { workspace = true }
+bitcoin = { workspace = true }
+thiserror = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+bip39 = "2.0"
+hex = { workspace = true }
+swap-chain-ltc = { workspace = true }
+swap-chain-divi = { workspace = true }
