@@ -74,15 +74,9 @@ Not in Divi Core 3.0.0, so not checked: a rule on the masternode's port, and a 1
 
 ## KNOWN differences
 
-- **Masternode sync** (`mnsync status: currentMasternodeSyncStatus`; `a vote with a bad signature: banscore of the
-  sender`; and three rows of `a vote for a payee not in the queue`):
-  - divid's masternode sync stays unfinished here: with only raw peers it does not get past its first stage.
-    irondivid reports its sync finished (999).
-  - Until its sync is finished, divid takes a vote's payee without checking the queue, and charges nothing for a
-    bad vote signature (masternode-payments.cpp:241-245, :320-328). irondivid applies both, as divid does once
-    synced.
-  - The sync stages are B11's work; once irondivid has them, `MasternodeVotes::set_sync_finished` follows them and
-    these rows should match.
+None. With only raw peers neither node's masternode sync gets past its first stage (SPORKS, 1;
+masternode-sync.cpp:437-440), so both take a vote's payee without the queue check and charge nothing for a bad vote
+signature (masternode-payments.cpp:241-245, :320-328).
 
 ## Proving a difference is caught
 
