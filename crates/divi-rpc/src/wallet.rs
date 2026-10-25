@@ -1458,14 +1458,6 @@ impl WalletRpc {
             .into());
         }
 
-        // Get change address
-        let change_addr = wallet.new_change_address().map_err(|e| {
-            RpcError::new(
-                codes::WALLET_ERROR,
-                format!("Failed to generate change address: {}", e),
-            )
-        })?;
-
         // Build the transaction
         let mut builder = TransactionBuilder::new();
 
@@ -3329,14 +3321,6 @@ impl WalletRpc {
             ensure_not_dust(*amount, &addr.script_pubkey())?;
         }
 
-        // Get change address
-        let change_addr = wallet.new_change_address().map_err(|e| {
-            RpcError::new(
-                codes::WALLET_ERROR,
-                format!("Failed to generate change address: {}", e),
-            )
-        })?;
-
         // Build transaction
         let mut builder = TransactionBuilder::new();
 
@@ -3352,9 +3336,7 @@ impl WalletRpc {
         // Add change output if significant
         let min_output = min_change_value();
         let change_amount = total_input - adjusted_total_send - fee;
-        if change_amount >= min_output {
-            builder = builder.add_output_to_address(change_amount, &change_addr);
-        }
+        builder = add_change_output(builder, &wallet, change_amount, min_output)?;
 
         let (mut tx, prev_scripts) = builder.build();
 
@@ -3862,14 +3844,6 @@ impl WalletRpc {
             .into());
         }
 
-        // Get change address
-        let change_addr = wallet.new_change_address().map_err(|e| {
-            RpcError::new(
-                codes::WALLET_ERROR,
-                format!("Failed to generate change address: {}", e),
-            )
-        })?;
-
         // Build transaction
         let mut builder = TransactionBuilder::new();
 
@@ -3883,9 +3857,7 @@ impl WalletRpc {
 
         // Add change output if significant
         let change_amount = total_input - send_amount - fee;
-        if change_amount >= min_output {
-            builder = builder.add_output_to_address(change_amount, &change_addr);
-        }
+        builder = add_change_output(builder, &wallet, change_amount, min_output)?;
 
         let (mut tx, prev_scripts) = builder.build();
 
@@ -5728,6 +5700,26 @@ mod send_unlock_regression {
     }
 
     #[test]
+    fn change_below_dust_goes_to_fee() {
+        let (rpc, _, sent) = funded_rpc();
+        let to = address(8, Network::Testnet);
+        // 10 DIVI in, fee estimate 3000 sat for one input: leave 3000 sat of change,
+        // above the old 546 limit and below the real 5460 one.
+        let amount = (1_000_000_000i64 - 6000) as f64 / 100_000_000.0;
+        rpc.send_to_address(&p(vec![json!(to), json!(amount)]))
+            .unwrap();
+        let sent = sent.lock();
+        assert_eq!(sent.len(), 1);
+        for out in &sent[0].vout {
+            assert!(
+                out.value.as_sat() >= 5460,
+                "dust output of {} sat",
+                out.value.as_sat()
+            );
+        }
+    }
+
+    #[test]
     fn node18_send_without_change_takes_no_change_key() {
         let to = address(8, Network::Testnet);
         // Exactly the coin less the 3000 sat fee, and 3000 sat of dust change
@@ -5760,26 +5752,6 @@ mod send_unlock_regression {
             (codes::TYPE_ERROR, "Invalid amount".to_string())
         );
         assert!(sent.lock().is_empty());
-    }
-
-    #[test]
-    fn change_below_dust_goes_to_fee() {
-        let (rpc, _, sent) = funded_rpc();
-        let to = address(8, Network::Testnet);
-        // 10 DIVI in, fee estimate 3000 sat for one input: leave 3000 sat of change,
-        // above the old 546 limit and below the real 5460 one.
-        let amount = (1_000_000_000i64 - 6000) as f64 / 100_000_000.0;
-        rpc.send_to_address(&p(vec![json!(to), json!(amount)]))
-            .unwrap();
-        let sent = sent.lock();
-        assert_eq!(sent.len(), 1);
-        for out in &sent[0].vout {
-            assert!(
-                out.value.as_sat() >= 5460,
-                "dust output of {} sat",
-                out.value.as_sat()
-            );
-        }
     }
 
     #[test]
