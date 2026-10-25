@@ -4011,7 +4011,9 @@ impl WalletRpc {
 
         let wallet = self.get_wallet()?;
         let mut dst = std::path::PathBuf::from(destination);
-        if dst.is_dir() {
+        // A backup is itself a RocksDB directory (it holds CURRENT); naming an
+        // earlier backup is refused below rather than nesting a new one in it
+        if dst.is_dir() && !dst.join("CURRENT").exists() {
             let name = wallet
                 .database_path()
                 .file_name()
