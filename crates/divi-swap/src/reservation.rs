@@ -13,7 +13,9 @@
 //! the mempool would hand its inputs to the next swap. A backend holding an
 //! [`InputReservations`] writes the inputs here **before** it broadcasts (a failed write
 //! blocks the broadcast), filters them out of coin selection, and releases them once the
-//! transaction is seen confirmed. "Not seen" never releases: that is the bug.
+//! transaction is seen confirmed. "Not seen" never releases: that is the bug. The one
+//! exception is [`InputReservations::release_expired`]: a lock still not seen once its own
+//! swap's deadline has passed was dropped, and would be refundable at once if it came back.
 //!
 //! The table lives in the swap database next to the `Store` tables but on its own SQLite
 //! connection, so it does not touch the `Store` schema.
@@ -25,7 +27,9 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use rusqlite::{params, Connection};
 
+use crate::backend::ChainBackend;
 use crate::error::{Result, SwapError};
+use crate::store::Store;
 use crate::types::{Chain, Outpoint, Txid};
 
 const SCHEMA: &str = "
@@ -247,11 +251,193 @@ impl InputReservations {
         }
         Ok(out)
     }
+
+    /// Release the inputs of each lock in `locks` (its txid and its HTLC locktime, the
+    /// swap's deadline) that holds a reservation on `backend`'s chain, once `backend`'s
+    /// median time past has reached the deadline and `backend` finds the lock neither in
+    /// the mempool nor on chain. Such a lock was dropped; if it ever came back it would be
+    /// refundable at once, so its inputs can fund the next swap without risking funds, and
+    /// a rebroadcast of it after they are reused is refused by [`Self::reserve`]. A lock in
+    /// the mempool or on chain, or before its deadline, keeps its inputs; so does every
+    /// reservation `locks` does not name (`divi-swapd --release-reservation` is the
+    /// override for those). A backend error stops the sweep with the error and releases
+    /// nothing more. Returns how many inputs were released.
+    pub async fn release_expired(
+        &self,
+        backend: &dyn ChainBackend,
+        locks: &[(Txid, u32)],
+    ) -> Result<usize> {
+        let chain = backend.chain();
+        let held: HashSet<Txid> = self
+            .list_all()?
+            .into_iter()
+            .filter(|r| r.chain == chain)
+            .map(|r| r.reserved_by)
+            .collect();
+        let due: Vec<_> = locks.iter().filter(|(t, _)| held.contains(t)).collect();
+        if due.is_empty() {
+            return Ok(0);
+        }
+        let mtp = backend.median_time_past().await?;
+        let mut released = 0;
+        for (txid, deadline) in due {
+            if mtp >= *deadline && backend.confirmations(txid).await?.is_none() {
+                released += self.release_tx(chain, txid)?;
+            }
+        }
+        Ok(released)
+    }
+
+    /// [`Self::release_expired`] over every swap in `store` that funds a lock on
+    /// `backend`'s chain ([`swap_locks`]).
+    pub async fn release_expired_swaps(
+        &self,
+        store: &Store,
+        backend: &dyn ChainBackend,
+    ) -> Result<usize> {
+        self.release_expired(backend, &swap_locks(store, backend.chain())?)
+            .await
+    }
+}
+
+/// The `(txid, HTLC locktime)` of every lock a swap in `store` funded on `chain`: the maker
+/// leg of each maker swap and the taker leg of each taker swap, whatever their state.
+pub fn swap_locks(store: &Store, chain: Chain) -> Result<Vec<(Txid, u32)>> {
+    let mut out = Vec::new();
+    for s in store.list_maker_swaps()? {
+        if let (true, Some(h), Some(f)) = (
+            s.quote.maker_chain() == chain,
+            &s.maker_leg_htlc,
+            &s.maker_leg_funding,
+        ) {
+            out.push((f.tx.txid, h.locktime));
+        }
+    }
+    for s in store.list_taker_swaps()? {
+        if let (true, Some(h), Some(f)) = (
+            s.quote.taker_chain() == chain,
+            &s.taker_leg_htlc,
+            &s.taker_leg_funding,
+        ) {
+            out.push((f.tx.txid, h.locktime));
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::htlc::HtlcParams;
+    use crate::mock::{MockBackend, MockChain};
+    use crate::types::Amount;
+
+    const T0: u32 = 1_700_000_000;
+    const DEADLINE: u32 = T0 + 3_600;
+
+    /// A BTC mock chain at MTP `T0` and a funded wallet on it.
+    fn chain() -> (MockChain, MockBackend) {
+        let c = MockChain::new(Chain::Btc, T0, 600);
+        let b = c.backend(4, Amount(10 * Amount::COIN));
+        (c, b)
+    }
+
+    /// Broadcast a lock (hash `[n; 32]`, deadline [`DEADLINE`]) and reserve input `[n; 32]:0`
+    /// for it, as a live backend does.
+    async fn lock(r: &InputReservations, b: &MockBackend, n: u8) -> Txid {
+        let htlc = HtlcParams {
+            hash: [n; 32],
+            claim_pubkey: [2; 33],
+            refund_pubkey: [3; 33],
+            locktime: DEADLINE,
+            script_version: Default::default(),
+        };
+        let f = b.build_funding(&htlc, Amount(1_000)).await.unwrap();
+        b.broadcast(&f.tx).await.unwrap();
+        r.reserve(Chain::Btc, &f.tx.txid, &[op(n, 0)]).unwrap();
+        f.tx.txid
+    }
+
+    fn held_by(r: &InputReservations) -> HashSet<Txid> {
+        r.list_all()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.reserved_by)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_dropped_lock_past_its_deadline_releases_its_inputs() {
+        let (c, b) = chain();
+        let r = InputReservations::in_memory().unwrap();
+        let t = lock(&r, &b, 1).await;
+        c.forget(&t); // gone from the mempool and from every block
+        let locks = [(t, DEADLINE)];
+
+        c.advance_time(DEADLINE - T0 - 1);
+        assert_eq!(r.release_expired(&b, &locks).await.unwrap(), 0);
+        assert_eq!(held_by(&r), HashSet::from([t]), "one second early: kept");
+
+        c.advance_time(1);
+        assert_eq!(r.release_expired(&b, &locks).await.unwrap(), 1);
+        assert!(r.reserved(Chain::Btc).unwrap().is_empty());
+        assert_eq!(r.release_expired(&b, &locks).await.unwrap(), 0);
+        // The freed input can fund the next lock.
+        r.reserve(Chain::Btc, &Txid([0x77; 32]), &[op(1, 0)])
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_lock_in_the_mempool_or_on_chain_keeps_its_inputs_past_its_deadline() {
+        let (c, b) = chain();
+        let r = InputReservations::in_memory().unwrap();
+        let mined = lock(&r, &b, 1).await;
+        c.mine(1);
+        let pending = lock(&r, &b, 2).await;
+        c.advance_time(2 * 3_600);
+        let locks = [(mined, DEADLINE), (pending, DEADLINE)];
+        assert_eq!(r.release_expired(&b, &locks).await.unwrap(), 0);
+        c.unconfirm(&mined); // reorged back into the mempool
+        assert_eq!(r.release_expired(&b, &locks).await.unwrap(), 0);
+        assert_eq!(held_by(&r), HashSet::from([mined, pending]));
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_backend_an_unnamed_lock_or_another_chain_keeps_the_inputs() {
+        let (c, b) = chain();
+        let r = InputReservations::in_memory().unwrap();
+        let named = lock(&r, &b, 1).await;
+        let orphan = lock(&r, &b, 2).await;
+        c.forget(&named);
+        c.forget(&orphan);
+        // Same txid reserved on LTC: a BTC sweep never touches it.
+        r.reserve(Chain::Ltc, &named, &[op(3, 0)]).unwrap();
+        c.advance_time(2 * 3_600);
+        let locks = [(named, DEADLINE)];
+
+        c.set_offline(true);
+        assert!(r.release_expired(&b, &locks).await.is_err());
+        assert_eq!(r.list_all().unwrap().len(), 3, "an error releases nothing");
+
+        c.set_offline(false);
+        assert_eq!(r.release_expired(&b, &locks).await.unwrap(), 1);
+        let left: Vec<_> = r
+            .list_all()
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.chain, r.reserved_by))
+            .collect();
+        assert_eq!(left, vec![(Chain::Btc, orphan), (Chain::Ltc, named)]);
+    }
+
+    #[tokio::test]
+    async fn nothing_held_never_asks_the_backend() {
+        let (c, b) = chain();
+        let r = InputReservations::in_memory().unwrap();
+        c.set_offline(true);
+        let locks = [(Txid([1; 32]), DEADLINE)];
+        assert_eq!(r.release_expired(&b, &locks).await.unwrap(), 0);
+    }
 
     fn op(n: u8, vout: u32) -> Outpoint {
         Outpoint {
