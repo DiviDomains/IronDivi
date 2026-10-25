@@ -187,6 +187,15 @@ pub struct FeeEscalation {
     pub cap_feerate: u64,
     /// Highest multiple of the first claim's feerate ever paid.
     pub max_multiple: u64,
+    /// Under `FeeBump::Cpfp`, bump by replacing the newest CPFP child (falling back to a
+    /// new child where the node refuses that) rather than by adding a child on top of it.
+    /// Off in every built-in schedule: Litecoin Core 0.21.4 relays no replacement
+    /// (`DEFAULT_ENABLE_REPLACEMENT=false`) and the LTC backend refuses to spend an input
+    /// an unmined child already spends before it reaches the node, so the replacement is
+    /// only ever refused. Off, a crash between a bump's write-ahead and its broadcast
+    /// leaves a child on top of the one the node holds, which the next step resends.
+    #[serde(default)]
+    pub replace_cpfp_child: bool,
 }
 
 impl FeeEscalation {
@@ -211,6 +220,7 @@ impl FeeEscalation {
             cap_secs_left: m / 2,
             cap_feerate,
             max_multiple: 50,
+            replace_cpfp_child: false,
         })
     }
 

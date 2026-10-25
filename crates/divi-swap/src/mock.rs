@@ -100,6 +100,9 @@ struct ChainState {
     /// One-shot: the next `broadcast()` call fails with `SwapError::Rejected` instead of
     /// whatever it would otherwise do, then clears itself.
     reject_next_broadcast: bool,
+    /// One-shot: the next `broadcast()` of a transaction the chain does not hold yet fails
+    /// with `SwapError::Transient` and relays nothing, then clears itself.
+    lose_next_new_broadcast: bool,
     /// Txids the node cannot look up (no txindex): `confirmations`/`htlc_output` say `None`
     /// although the tx stays in the chain and `broadcast` still answers already-known.
     blind: HashSet<Txid>,
@@ -413,6 +416,14 @@ impl MockChain {
     /// "a rejected claim/refund is forgotten and re-signed on the next step" paths.
     pub fn reject_next_broadcast(&self) {
         self.state.lock().reject_next_broadcast = true;
+    }
+
+    /// The next `broadcast()` on this chain of a transaction it does not hold yet fails
+    /// with `SwapError::Transient` and relays nothing; rebroadcasts of transactions it holds
+    /// still answer already-known. One-shot. As if the process died between persisting a
+    /// transaction and sending it: the record has it, the chain never saw it.
+    pub fn lose_next_new_broadcast(&self) {
+        self.state.lock().lose_next_new_broadcast = true;
     }
 
     /// How backends on this chain bump a claim ([`ChainBackend::fee_bump`]) and what the
@@ -839,6 +850,12 @@ impl ChainBackend for MockBackend {
         }
         if s.txs.contains_key(&tx.txid) {
             return Ok(tx.txid);
+        }
+        if s.lose_next_new_broadcast {
+            s.lose_next_new_broadcast = false;
+            return Err(SwapError::Transient(
+                "mock: lost before broadcast (test)".into(),
+            ));
         }
         if !matches!(parsed, MockTx::Fund { .. }) && parsed.feerate() < s.mempool_floor {
             return Err(SwapError::Rejected(format!(

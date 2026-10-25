@@ -961,9 +961,10 @@ impl Taker {
         Ok((target, esc.should_add_child(base, left, current, target)))
     }
 
-    /// [`Taker::escalate_claim_fee`] for a CPFP claim: replace the newest child of `claim`
-    /// (or add the first), and where the node refuses the replacement, keep the old child
-    /// and add one on top of it.
+    /// [`Taker::escalate_claim_fee`] for a CPFP claim: add a child on top of the newest
+    /// child of `claim` (or the first). With [`FeeEscalation::replace_cpfp_child`], replace
+    /// the newest child instead, and where the node refuses the replacement, keep the old
+    /// child and add one on top of it.
     async fn bump_claim_child(
         &self,
         r: &mut TakerRecord,
@@ -976,11 +977,17 @@ impl Taker {
         let mk = self.mk(r)?;
         let amount = r.maker_leg_amount.expect("checked by the caller");
         let held = r.claim_children.len() as u64;
-        let (target, bump) = self.cpfp_target(r, esc, base, current, left, held.max(1))?;
+        let replace = esc.replace_cpfp_child && held > 0;
+        let children = if replace { held } else { held + 1 };
+        let (target, bump) = self.cpfp_target(r, esc, base, current, left, children)?;
         if !bump {
             return Ok(());
         }
-        let old = r.claim_children.pop();
+        let old = if replace {
+            r.claim_children.pop()
+        } else {
+            None
+        };
         let mut package = vec![claim.clone()];
         package.extend(r.claim_children.iter().cloned());
         let tx = match mk.build_cpfp(&package, amount, target).await {

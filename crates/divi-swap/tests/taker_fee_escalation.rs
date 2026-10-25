@@ -9,8 +9,8 @@
 //! Fee escalation of a maker-leg claim that is not confirming. On a chain that relays
 //! replacements (BTC) the taker re-signs the claim at rising feerates and the new version
 //! replaces the old one; on a chain that does not but mines by ancestor package (LTC) it
-//! bumps through a CPFP child, replacing the child where the node takes that and adding
-//! one where it does not; both climb only inside the escalation window, never past the
+//! bumps through a CPFP child, adding one per bump (or, switched on, replacing the child
+//! where the node takes that and adding one where it does not); both climb only inside the escalation window, never past the
 //! cap until the cap point and never past the post-leak ceiling. Where the backend cannot
 //! bump, or escalation is off, the claim is resent unchanged.
 
@@ -240,9 +240,12 @@ async fn ltc_claim_replaces_its_one_child_and_steps_past_the_cap_at_most_four_ti
     w.ml.set_child_replacement(true);
     let store = Store::in_memory().unwrap();
     let maker = maker(&w, &store);
-    let taker = taker(&w, &store);
+    let esc = FeeEscalation {
+        replace_cpfp_child: true,
+        ..FeeEscalation::builtin(Chain::Ltc).unwrap()
+    };
+    let taker = taker(&w, &store).with_fee_escalation(Chain::Ltc, Some(esc));
     let (tid, view) = to_claimed(&w, &maker, &taker).await;
-    let esc = FeeEscalation::builtin(Chain::Ltc).unwrap();
     let seen = ride_to_locktime(&w, &store, &taker, &tid, &view, 150).await;
     assert_climbs_inside_the_window(&seen, esc, MOCK_FEERATE);
     assert_under_the_ceiling(&seen, Chain::Ltc, 2 * MOCK_VSIZE);
@@ -280,43 +283,133 @@ async fn ltc_claim_replaces_its_one_child_and_steps_past_the_cap_at_most_four_ti
 
 #[tokio::test]
 async fn ltc_claim_adds_a_child_per_bump_where_the_node_takes_no_child_replacement() {
+    // Switched on, each replacement is refused and a child is added instead.
+    for replace in [false, true] {
+        let w = world(Chain::Ltc, 150, FeeBump::Cpfp);
+        let store = Store::in_memory().unwrap();
+        let maker = maker(&w, &store);
+        let esc = FeeEscalation {
+            replace_cpfp_child: replace,
+            ..FeeEscalation::builtin(Chain::Ltc).unwrap()
+        };
+        let taker = taker(&w, &store).with_fee_escalation(Chain::Ltc, Some(esc));
+        let (tid, view) = to_claimed(&w, &maker, &taker).await;
+        let seen = ride_to_locktime(&w, &store, &taker, &tid, &view, 150).await;
+        assert_climbs_inside_the_window(&seen, esc, MOCK_FEERATE);
+        let late = bumps_past_the_cap_point(&seen, esc);
+        assert!(
+            (1..=4).contains(&late),
+            "replace={replace}: {late} bumps past the cap point: {seen:?}"
+        );
+
+        let rec = store.get_taker_swap(&tid).unwrap().unwrap();
+        let claim = rec.maker_leg_claim.clone().unwrap();
+        assert!(rec.claim_replaced.is_empty(), "LTC relays no replacement");
+        let n = rec.claim_children.len();
+        assert!((3..=12).contains(&n), "replace={replace}: {n} children");
+        assert_eq!(w.ml.longest_unconfirmed_chain(), n as u64 + 1);
+        // The package (claim and every child) pays at least the recorded feerate.
+        let mut fee = w.ml.feerate_of(&claim.txid).unwrap() * MOCK_VSIZE;
+        for child in &rec.claim_children {
+            fee += w.ml.feerate_of(&child.txid).expect("child relayed") * MOCK_VSIZE;
+        }
+        let vsize = MOCK_VSIZE * (n as u64 + 1);
+        assert!(
+            fee >= rec.claim_feerate.unwrap() * vsize - MOCK_VSIZE,
+            "{fee} over {vsize}"
+        );
+        // The post-leak ceiling bounds the fee of the whole package, not just the child.
+        let left = seen.last().unwrap().0;
+        let window = ClaimDeadline::builtin(Chain::Ltc).margin_secs();
+        assert!(
+            fee <= FeeEscalation::ceiling_fee(1_000_000, 0, 0, left, window),
+            "{fee} for the package"
+        );
+
+        w.ml.mine(1);
+        assert_eq!(
+            taker.step(&tid, Some(&view)).await.unwrap(),
+            TakerState::Done
+        );
+    }
+}
+
+#[tokio::test]
+async fn ltc_claim_keeps_climbing_after_a_crash_between_a_bumps_write_ahead_and_its_broadcast() {
+    // The built-in LTC schedule adds a child per bump rather than replacing one.
+    assert!(
+        !FeeEscalation::builtin(Chain::Ltc)
+            .unwrap()
+            .replace_cpfp_child
+    );
     let w = world(Chain::Ltc, 150, FeeBump::Cpfp);
     let store = Store::in_memory().unwrap();
     let maker = maker(&w, &store);
-    let taker = taker(&w, &store);
-    let (tid, view) = to_claimed(&w, &maker, &taker).await;
-    let esc = FeeEscalation::builtin(Chain::Ltc).unwrap();
-    let seen = ride_to_locktime(&w, &store, &taker, &tid, &view, 150).await;
-    assert_climbs_inside_the_window(&seen, esc, MOCK_FEERATE);
-    let late = bumps_past_the_cap_point(&seen, esc);
-    assert!(
-        (1..=4).contains(&late),
-        "{late} bumps past the cap point: {seen:?}"
-    );
-
+    let (tid, view, held) = {
+        let taker = taker(&w, &store);
+        let (tid, view) = to_claimed(&w, &maker, &taker).await;
+        // Ride to the first child, which the node holds.
+        while store
+            .get_taker_swap(&tid)
+            .unwrap()
+            .unwrap()
+            .claim_children
+            .is_empty()
+        {
+            assert!(w.ml.mtp() + 150 < locktime(&view));
+            w.ml.advance_time(150);
+            taker.step(&tid, Some(&view)).await.unwrap();
+        }
+        let held = store.get_taker_swap(&tid).unwrap().unwrap().claim_children;
+        assert!(held.iter().all(|c| w.ml.feerate_of(&c.txid).is_some()));
+        // The next bump is written ahead and never sent: the process dies in between.
+        w.ml.lose_next_new_broadcast();
+        loop {
+            assert!(w.ml.mtp() + 150 < locktime(&view));
+            w.ml.advance_time(150);
+            let _ = taker.step(&tid, Some(&view)).await;
+            let rec = store.get_taker_swap(&tid).unwrap().unwrap();
+            if rec
+                .claim_children
+                .iter()
+                .any(|c| w.ml.feerate_of(&c.txid).is_none())
+            {
+                break;
+            }
+        }
+        (tid, view, held)
+    };
     let rec = store.get_taker_swap(&tid).unwrap().unwrap();
-    let claim = rec.maker_leg_claim.clone().unwrap();
-    assert!(rec.claim_replaced.is_empty(), "LTC relays no replacement");
+    let at_crash = rec.claim_feerate.unwrap();
+
+    // Restart on the same store; the climb resumes on top of the child the node holds.
+    let taker = taker(&w, &store);
+    let seen = ride_to_locktime(&w, &store, &taker, &tid, &view, 150).await;
+    let rec = store.get_taker_swap(&tid).unwrap().unwrap();
+    let after = rec.claim_feerate.unwrap();
+    assert!(
+        after > at_crash,
+        "{after} after the restart, {at_crash} at the crash: {seen:?}"
+    );
     let n = rec.claim_children.len();
-    assert!((3..=12).contains(&n), "{n} children");
-    assert_eq!(w.ml.longest_unconfirmed_chain(), n as u64 + 1);
-    // The package (claim and every child) pays at least the recorded feerate.
-    let mut fee = w.ml.feerate_of(&claim.txid).unwrap() * MOCK_VSIZE;
-    for child in &rec.claim_children {
-        fee += w.ml.feerate_of(&child.txid).expect("child relayed") * MOCK_VSIZE;
+    assert!(
+        n >= held.len() + 2,
+        "{n} children, {} before the crash: {seen:?}",
+        held.len()
+    );
+    for (i, child) in rec.claim_children.iter().enumerate() {
+        assert!(
+            w.ml.feerate_of(&child.txid).is_some(),
+            "child {i} of {n} not relayed"
+        );
     }
-    let vsize = MOCK_VSIZE * (n as u64 + 1);
-    assert!(
-        fee >= rec.claim_feerate.unwrap() * vsize - MOCK_VSIZE,
-        "{fee} over {vsize}"
-    );
-    // The post-leak ceiling bounds the fee of the whole package, not just the child.
-    let left = seen.last().unwrap().0;
-    let window = ClaimDeadline::builtin(Chain::Ltc).margin_secs();
-    assert!(
-        fee <= FeeEscalation::ceiling_fee(1_000_000, 0, 0, left, window),
-        "{fee} for the package"
-    );
+    for child in &held {
+        assert!(
+            rec.claim_children.contains(child),
+            "the held child stays in the package"
+        );
+    }
+    assert_eq!(w.ml.longest_unconfirmed_chain(), n as u64 + 1);
 
     w.ml.mine(1);
     assert_eq!(
