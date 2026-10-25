@@ -546,6 +546,13 @@ pub struct Chain {
 /// them and the chain that reads them
 pub type SharedSporks = Arc<RwLock<ConsensusSporks>>;
 
+/// An output a coinstake spends, as proof of stake reads it
+struct StakePrevout {
+    value: Amount,
+    script_pubkey: divi_primitives::script::Script,
+    height: u32,
+}
+
 /// Metadata marker: the one-time height index repair has run on this datadir.
 const HEIGHT_INDEX_REPAIR_KEY: &[u8] = b"height_index_repair_v1";
 
@@ -3235,6 +3242,27 @@ impl Chain {
         Ok(())
     }
 
+    /// The output a proof of stake spends: the unspent output, else the output
+    /// of the transaction in the chain (Divi Core reads the transaction itself,
+    /// BlockProofVerifier.cpp:58-77)
+    fn stake_prevout(&self, outpoint: &OutPoint) -> Result<Option<StakePrevout>, StorageError> {
+        if let Some(utxo) = self.db.get_utxo(outpoint)? {
+            return Ok(Some(StakePrevout {
+                value: utxo.value,
+                script_pubkey: utxo.script_pubkey.clone(),
+                height: utxo.height,
+            }));
+        }
+        let Some((tx, height, _, _)) = self.find_transaction(&outpoint.txid)? else {
+            return Ok(None);
+        };
+        Ok(tx.vout.get(outpoint.vout as usize).map(|out| StakePrevout {
+            value: out.value,
+            script_pubkey: out.script_pubkey.clone(),
+            height,
+        }))
+    }
+
     /// Find a transaction by its hash and return (tx, height, is_coinbase, is_coinstake)
     #[allow(dead_code)]
     fn find_transaction(
@@ -3884,17 +3912,19 @@ impl Chain {
             StorageError::invalid_block_scored(0, format!("Invalid coinstake: {}", e))
         })?;
 
-        // Validate all inputs pay to the same script
+        // Validate all inputs pay to the same script. As Divi Core's
+        // CheckProofOfStake reads the transaction of each input (GetTransaction,
+        // BlockProofVerifier.cpp:58-77), a coin already spent is found too; it is
+        // connecting the block that finds it spent
         let chain_ref = self;
         let get_utxo = |outpoint: &divi_primitives::OutPoint| -> Option<divi_primitives::TxOut> {
             chain_ref
-                .db
-                .get_utxo(outpoint)
+                .stake_prevout(outpoint)
                 .ok()
                 .flatten()
-                .map(|utxo| divi_primitives::TxOut {
-                    value: utxo.value,
-                    script_pubkey: utxo.script_pubkey.clone(),
+                .map(|prevout| divi_primitives::TxOut {
+                    value: prevout.value,
+                    script_pubkey: prevout.script_pubkey,
                 })
         };
 
@@ -3909,7 +3939,7 @@ impl Chain {
         // Divi Core verifies the kernel's signature under POS_SCRIPT_VERIFY_FLAGS
         // before the kernel itself, and a failure scores nothing
         // (BlockProofVerifier.cpp:76-77)
-        if let Some(kernel) = self.db.get_utxo(&coinstake.vin[0].prevout)? {
+        if let Some(kernel) = self.stake_prevout(&coinstake.vin[0].prevout)? {
             verify_input_with_flags(
                 coinstake,
                 0,
@@ -3949,7 +3979,7 @@ impl Chain {
         let kernel_input = &coinstake.vin[0];
 
         // Get UTXO being staked
-        let kernel_utxo = self.db.get_utxo(&kernel_input.prevout)?.ok_or_else(|| {
+        let kernel_utxo = self.stake_prevout(&kernel_input.prevout)?.ok_or_else(|| {
             StorageError::invalid_block_scored(
                 0,
                 format!(
@@ -6923,6 +6953,33 @@ mod tests {
         let err = chain.validate_proof_of_stake(&block, &parent).unwrap_err();
         assert!(err.to_string().contains("VerifySignature failed"), "{err}");
         assert_eq!(err.misbehaviour_score(), 0);
+    }
+
+    /// A coinstake may stake a coin the chain no longer holds unspent: Divi Core
+    /// reads the transaction of the kernel (GetTransaction,
+    /// BlockProofVerifier.cpp:58-77), so such a block gets as far as connecting,
+    /// where it fails for the missing input and scores 100. It was refused while
+    /// its proof was checked, as an unknown kernel, with no score.
+    #[test]
+    fn a_proof_of_stake_reads_a_coin_that_is_spent() {
+        let (chain, _dir) = create_test_chain();
+        let genesis = chain
+            .get_block(&chain.tip().unwrap().hash)
+            .unwrap()
+            .unwrap();
+        // The genesis coinbase is in a block but not in the UTXO set
+        let outpoint = OutPoint::new(chain.compute_txid(&genesis.transactions[0]), 0);
+        assert!(!chain.has_utxo(&outpoint).unwrap());
+        let found = chain
+            .stake_prevout(&outpoint)
+            .unwrap()
+            .expect("the output is found");
+        assert_eq!(found.value, genesis.transactions[0].vout[0].value);
+        assert_eq!(found.height, 0);
+        assert!(chain
+            .stake_prevout(&OutPoint::new(Hash256::from_bytes([7; 32]), 0))
+            .unwrap()
+            .is_none());
     }
 
     #[test]
