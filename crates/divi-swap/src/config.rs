@@ -160,6 +160,85 @@ impl ClaimDeadline {
     }
 }
 
+/// How the taker raises the fee of a maker-leg claim that has not confirmed as the maker-leg
+/// locktime nears ([`FeeEscalation::builtin`]; `Taker::with_fee_escalation` overrides or
+/// turns it off for one chain). Applied only where the backend can bump
+/// (`FeeBump::Rbf` or `FeeBump::Cpfp`).
+///
+/// The feerate stays at what the first claim paid until `start_secs_left` seconds are left,
+/// then climbs geometrically to the cap, reached with `cap_secs_left` left. The cap is the
+/// lower of `cap_feerate` and `max_multiple` times the first claim's feerate: the claim is
+/// worth the maker leg, so overpaying beats losing it, but not without bound (a fee estimate
+/// gone wrong must not hand the leg to the miners).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FeeEscalation {
+    /// Seconds left before the maker-leg locktime when bumping starts.
+    pub start_secs_left: u32,
+    /// Seconds left when the cap is reached.
+    pub cap_secs_left: u32,
+    /// Highest feerate ever paid, base unit per vbyte.
+    pub cap_feerate: u64,
+    /// Highest multiple of the first claim's feerate ever paid.
+    pub max_multiple: u64,
+}
+
+impl FeeEscalation {
+    /// Built-in schedule for a maker leg on `chain`, or `None` where no backend can bump
+    /// (DIVI and ZEC relay no replacement and ignore CPFP; XMR has no HTLC; the EVM backend
+    /// does not replace by nonce yet). Bumping starts at twice the claim deadline
+    /// ([`ClaimDeadline::builtin`]) and caps out at half of it, so a claim sent at the
+    /// deadline is at the cap with three BTC blocks (six LTC blocks) still to come.
+    pub fn builtin(chain: Chain) -> Option<Self> {
+        let cap_feerate = match chain {
+            // sat/vB. Above every sustained mainnet peak so far (a few hundred sat/vB);
+            // 1000 sat/vB on a ~150 vB claim is 150 000 sat.
+            Chain::Btc => 1000,
+            // litoshi/vB. LTC fees sit near the relay floor; 500 is far above any backlog
+            // it has had, and its blocks are four times as frequent.
+            Chain::Ltc => 500,
+            Chain::Zec | Chain::Divi | Chain::Usdc | Chain::Xmr => return None,
+        };
+        let m = ClaimDeadline::builtin(chain).margin_secs();
+        Some(FeeEscalation {
+            start_secs_left: m.saturating_mul(2),
+            cap_secs_left: m / 2,
+            cap_feerate,
+            max_multiple: 50,
+        })
+    }
+
+    /// The feerate to pay with `left` seconds before the locktime, the first claim having paid
+    /// `base`. Never below `base` and never above the cap.
+    pub fn target(&self, base: u64, left: i64) -> u64 {
+        let base = base.max(1);
+        let cap = self
+            .cap_feerate
+            .min(base.saturating_mul(self.max_multiple))
+            .max(base);
+        let (start, end) = (
+            i64::from(self.start_secs_left),
+            i64::from(self.cap_secs_left),
+        );
+        if left >= start {
+            return base;
+        }
+        if left <= end || start <= end {
+            return cap;
+        }
+        let t = (start - left) as f64 / (start - end) as f64;
+        let rate = base as f64 * (cap as f64 / base as f64).powf(t);
+        (rate.ceil() as u64).clamp(base, cap)
+    }
+
+    /// Whether paying `target` instead of `current` is worth a new transaction: at least a
+    /// quarter more, and at least one unit per vbyte more (BIP125's incremental relay fee, so
+    /// a replacement is never refused for paying too little extra). A quarter keeps a climb
+    /// to 50x within 18 bumps, so a CPFP chain stays inside the 25-transaction ancestor limit.
+    pub fn worth_bumping(current: u64, target: u64) -> bool {
+        target >= current.saturating_add((current / 4).max(1))
+    }
+}
+
 /// Swap timing and confirmation requirements. All durations in seconds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SwapConfig {
@@ -614,6 +693,36 @@ mod tests {
                 d.margin_secs()
             );
         }
+    }
+
+    #[test]
+    fn fee_escalation_climbs_from_base_to_the_cap() {
+        let e = FeeEscalation::builtin(Chain::Btc).unwrap();
+        assert_eq!((e.start_secs_left, e.cap_secs_left), (7200, 1800));
+        assert_eq!(
+            e.target(10, 9000),
+            10,
+            "before the start: the first claim's rate"
+        );
+        assert_eq!(e.target(10, 7200), 10);
+        assert_eq!(e.target(10, 1800), 500, "cap: 50 x base, under 1000 sat/vB");
+        assert_eq!(e.target(10, -60), 500, "past the locktime: still the cap");
+        assert_eq!(e.target(100, 0), 1000, "cap: the absolute 1000 sat/vB");
+        let mid = e.target(10, 4500);
+        assert!(mid > 10 && mid < 500, "{mid}");
+        let mut last = 0;
+        for left in (0..=9000).rev().step_by(60) {
+            let t = e.target(10, left);
+            assert!(t >= last, "never falls as the locktime nears");
+            last = t;
+        }
+        assert!(FeeEscalation::worth_bumping(10, 12) && !FeeEscalation::worth_bumping(10, 11));
+        assert!(!FeeEscalation::worth_bumping(100, 124));
+        assert!(FeeEscalation::worth_bumping(1, 2) && !FeeEscalation::worth_bumping(1, 1));
+        for chain in [Chain::Divi, Chain::Zec, Chain::Xmr, Chain::Usdc] {
+            assert!(FeeEscalation::builtin(chain).is_none(), "{chain}");
+        }
+        assert!(FeeEscalation::builtin(Chain::Ltc).is_some());
     }
 
     #[test]

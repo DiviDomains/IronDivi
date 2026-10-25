@@ -21,13 +21,28 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use crate::backend::ChainBackend;
+use crate::backend::{ChainBackend, FeeBump};
 use crate::error::{Result, SwapError};
 use crate::htlc::HtlcParams;
 use crate::types::{Amount, Chain, Funding, LockedOutput, Outpoint, SignedTx, SpendInfo, Txid};
 
-/// Flat fee every mock transaction pays.
+/// Flat fee every mock funding and refund pays, and a claim at [`MOCK_FEERATE`].
 pub const MOCK_FEE: Amount = Amount(1_000);
+
+/// Virtual size of every mock claim, refund and CPFP child.
+pub const MOCK_VSIZE: u64 = 100;
+
+/// Feerate of a claim built by [`ChainBackend::build_claim`]: [`MOCK_FEE`] over
+/// [`MOCK_VSIZE`].
+pub const MOCK_FEERATE: u64 = MOCK_FEE.0 / MOCK_VSIZE;
+
+fn default_feerate() -> u64 {
+    MOCK_FEERATE
+}
+
+fn is_default_feerate(f: &u64) -> bool {
+    *f == MOCK_FEERATE
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum MockTx {
@@ -43,6 +58,20 @@ enum MockTx {
         at: Outpoint,
         amount: Amount,
         preimage: [u8; 32],
+        /// Left out at the default so that claims built before it existed keep their txids.
+        #[serde(
+            default = "default_feerate",
+            skip_serializing_if = "is_default_feerate"
+        )]
+        feerate: u64,
+    },
+    /// A CPFP child: spends output 0 of `parent` (worth `value_in`, owned by `to`) back to
+    /// `to`.
+    Child {
+        to: String,
+        parent: Txid,
+        value_in: u64,
+        value_out: u64,
     },
     Refund {
         to: String,
@@ -70,6 +99,38 @@ struct ChainState {
     blind: HashSet<Txid>,
     /// Every distinct claim/refund ever handed to `broadcast`, accepted or not.
     spend_attempts: HashMap<Txid, MockTx>,
+    /// How this chain's backends bump a claim, and what its relay accepts as a bump.
+    fee_bump: FeeBump,
+    /// Feerate backends report through `claim_feerate` (`None`: [`MOCK_FEERATE`]).
+    fee_estimate: Option<u64>,
+}
+
+impl MockTx {
+    /// Fee and output 0's value of a claim, refund or child (`None` for a funding).
+    fn fee_and_out(&self) -> Option<(u64, u64)> {
+        match self {
+            MockTx::Fund { .. } => None,
+            MockTx::Claim {
+                amount, feerate, ..
+            } => {
+                let fee = feerate.saturating_mul(MOCK_VSIZE).min(amount.0);
+                Some((fee, amount.0 - fee))
+            }
+            MockTx::Refund { amount, .. } => {
+                let fee = MOCK_FEE.0.min(amount.0);
+                Some((fee, amount.0 - fee))
+            }
+            MockTx::Child {
+                value_in,
+                value_out,
+                ..
+            } => Some((value_in.saturating_sub(*value_out), *value_out)),
+        }
+    }
+
+    fn feerate(&self) -> u64 {
+        self.fee_and_out().map_or(0, |(fee, _)| fee / MOCK_VSIZE)
+    }
 }
 
 /// What one HTLC outpoint has seen on a [`MockChain`] ([`MockChain::tx_counts`]).
@@ -184,6 +245,113 @@ impl MockChain {
     /// "a rejected claim/refund is forgotten and re-signed on the next step" paths.
     pub fn reject_next_broadcast(&self) {
         self.state.lock().reject_next_broadcast = true;
+    }
+
+    /// How backends on this chain bump a claim ([`ChainBackend::fee_bump`]) and what the
+    /// relay accepts: under [`FeeBump::Rbf`] a spend of an outpoint an unmined claim or
+    /// refund already spends replaces it if it pays at least that one's fee plus one unit
+    /// per vbyte (BIP125 rules 3 and 4, incremental relay feerate 1); otherwise it is a
+    /// double spend. Default [`FeeBump::None`]: backends report no feerate and nothing is
+    /// ever replaced, as before.
+    pub fn set_fee_bump(&self, bump: FeeBump) {
+        self.state.lock().fee_bump = bump;
+    }
+
+    /// The feerate backends report through `claim_feerate` from now on.
+    pub fn set_fee_estimate(&self, feerate: u64) {
+        self.state.lock().fee_estimate = Some(feerate);
+    }
+
+    /// Feerate of `txid` (a claim, refund or CPFP child) if the chain holds it.
+    pub fn feerate_of(&self, txid: &Txid) -> Option<u64> {
+        self.state.lock().txs.get(txid).map(|(tx, _)| tx.feerate())
+    }
+
+    /// The txid spending `at`, mined or not.
+    pub fn spender(&self, at: &Outpoint) -> Option<Txid> {
+        self.state.lock().spends.get(at).copied()
+    }
+
+    /// Drop unmined `id` and everything spending it, giving back what each booked
+    /// (a replacement evicting the losers).
+    fn evict(s: &mut ChainState, id: Txid) {
+        let mut queue = vec![id];
+        while let Some(id) = queue.pop() {
+            queue.extend(
+                s.spends
+                    .iter()
+                    .filter(|(at, _)| at.txid == id)
+                    .map(|(_, spender)| *spender),
+            );
+            if !matches!(s.txs.get(&id), Some((_, None))) {
+                continue;
+            }
+            let (tx, _) = s.txs.remove(&id).expect("checked above");
+            s.spends.retain(|_, spender| *spender != id);
+            match tx {
+                MockTx::Fund { from, amount, .. } => {
+                    *s.balances.entry(from).or_default() += amount.0 + MOCK_FEE.0;
+                }
+                MockTx::Claim { ref to, .. } | MockTx::Refund { ref to, .. } => {
+                    let (_, out) = tx.fee_and_out().expect("a spend");
+                    let bal = s.balances.entry(to.clone()).or_default();
+                    *bal = bal.saturating_sub(out);
+                }
+                MockTx::Child {
+                    to,
+                    value_in,
+                    value_out,
+                    ..
+                } => {
+                    let bal = s.balances.entry(to).or_default();
+                    *bal = bal.saturating_sub(value_out) + value_in;
+                }
+            }
+        }
+    }
+
+    /// Fee of unmined `id` and every unmined tx spending it.
+    fn fee_with_descendants(s: &ChainState, id: Txid) -> u64 {
+        let mut fee = 0;
+        let mut queue = vec![id];
+        while let Some(id) = queue.pop() {
+            if let Some((tx, None)) = s.txs.get(&id) {
+                fee += tx.fee_and_out().map_or(0, |(f, _)| f);
+            }
+            queue.extend(
+                s.spends
+                    .iter()
+                    .filter(|(at, _)| at.txid == id)
+                    .map(|(_, spender)| *spender),
+            );
+        }
+        fee
+    }
+
+    /// Make room for `new` spending `at`, or refuse it as a double spend: an unmined
+    /// claim or refund there is replaced if the relay takes replacements and `new` pays
+    /// enough more ([`MockChain::set_fee_bump`]).
+    fn replace_spend(s: &mut ChainState, at: &Outpoint, new: &MockTx) -> Result<()> {
+        let Some(&old) = s.spends.get(at) else {
+            return Ok(());
+        };
+        let replaceable = s.fee_bump == FeeBump::Rbf
+            && matches!(
+                s.txs.get(&old),
+                Some((MockTx::Claim { .. } | MockTx::Refund { .. }, None))
+            );
+        if !replaceable {
+            return Err(SwapError::Rejected("double spend".into()));
+        }
+        let (new_fee, _) = new.fee_and_out().expect("a spend");
+        let need = Self::fee_with_descendants(s, old) + MOCK_VSIZE;
+        if new_fee < need || new.feerate() <= s.txs[&old].0.feerate() {
+            return Err(SwapError::Rejected(format!(
+                "insufficient fee: replacement pays {new_fee}, needs {need}"
+            )));
+        }
+        Self::evict(s, old);
+        Ok(())
     }
 
     /// Funding, accepted spends and spend attempts of `at`. Test-only observation, e.g.
@@ -386,6 +554,73 @@ impl ChainBackend for MockBackend {
             at: *at,
             amount,
             preimage: *preimage,
+            feerate: MOCK_FEERATE,
+        }))
+    }
+
+    fn fee_bump(&self) -> FeeBump {
+        self.chain.state.lock().fee_bump
+    }
+
+    async fn claim_feerate(&self) -> Result<Option<u64>> {
+        self.check_online()?;
+        let s = self.chain.state.lock();
+        Ok((s.fee_bump != FeeBump::None).then(|| s.fee_estimate.unwrap_or(MOCK_FEERATE)))
+    }
+
+    async fn build_claim_at(
+        &self,
+        htlc: &HtlcParams,
+        at: &Outpoint,
+        amount: Amount,
+        preimage: &[u8; 32],
+        feerate: u64,
+    ) -> Result<SignedTx> {
+        self.check_online()?;
+        if self.fee_bump() == FeeBump::None {
+            return Err(SwapError::Other("mock chain takes no fee bumps".into()));
+        }
+        Ok(Self::sign(&MockTx::Claim {
+            to: self.owner(),
+            htlc: *htlc,
+            at: *at,
+            amount,
+            preimage: *preimage,
+            feerate: feerate.max(1),
+        }))
+    }
+
+    async fn build_cpfp(
+        &self,
+        package: &[SignedTx],
+        htlc_amount: Amount,
+        feerate: u64,
+    ) -> Result<SignedTx> {
+        self.check_online()?;
+        if self.fee_bump() != FeeBump::Cpfp {
+            return Err(SwapError::Other("mock chain takes no CPFP".into()));
+        }
+        let last = package
+            .last()
+            .ok_or_else(|| SwapError::InvalidParams("empty CPFP package".into()))?;
+        let parsed: MockTx = serde_json::from_slice(&last.raw)
+            .map_err(|e| SwapError::Other(format!("decode: {e}")))?;
+        let (_, value_in) = parsed
+            .fee_and_out()
+            .ok_or_else(|| SwapError::InvalidParams("CPFP parent is a funding".into()))?;
+        let package_fee = htlc_amount.0.saturating_sub(value_in);
+        let want = feerate
+            .max(1)
+            .saturating_mul(MOCK_VSIZE * (package.len() as u64 + 1));
+        let fee = want.saturating_sub(package_fee).max(MOCK_VSIZE);
+        let value_out = value_in.checked_sub(fee).ok_or_else(|| {
+            SwapError::InsufficientFunds(format!("claim output {value_in} < fee {fee}"))
+        })?;
+        Ok(Self::sign(&MockTx::Child {
+            to: self.owner(),
+            parent: last.txid,
+            value_in,
+            value_out,
         }))
     }
 
@@ -433,6 +668,7 @@ impl ChainBackend for MockBackend {
                 at,
                 amount,
                 preimage,
+                ..
             } => {
                 let locked = htlc_amount(&s, htlc, at)
                     .ok_or_else(|| SwapError::Rejected("missing inputs".into()))?;
@@ -442,11 +678,36 @@ impl ChainBackend for MockBackend {
                 if <[u8; 32]>::from(Sha256::digest(preimage)) != htlc.hash {
                     return Err(SwapError::Rejected("hashlock: wrong preimage".into()));
                 }
-                if s.spends.contains_key(at) {
+                MockChain::replace_spend(&mut s, at, &parsed)?;
+                s.spends.insert(*at, tx.txid);
+                let (_, out) = parsed.fee_and_out().expect("a spend");
+                *s.balances.entry(to.clone()).or_default() += out;
+            }
+            MockTx::Child {
+                to,
+                parent,
+                value_in,
+                ..
+            } => {
+                let at = Outpoint {
+                    txid: *parent,
+                    vout: 0,
+                };
+                let (_, parent_out) = s
+                    .txs
+                    .get(parent)
+                    .and_then(|(p, _)| p.fee_and_out())
+                    .ok_or_else(|| SwapError::Rejected("missing inputs".into()))?;
+                if parent_out != *value_in {
+                    return Err(SwapError::Rejected("amount mismatch".into()));
+                }
+                if s.spends.contains_key(&at) {
                     return Err(SwapError::Rejected("double spend".into()));
                 }
-                s.spends.insert(*at, tx.txid);
-                *s.balances.entry(to.clone()).or_default() += amount.0 - MOCK_FEE.0;
+                s.spends.insert(at, tx.txid);
+                let (_, out) = parsed.fee_and_out().expect("a spend");
+                let bal = s.balances.entry(to.clone()).or_default();
+                *bal = bal.saturating_sub(*value_in) + out;
             }
             MockTx::Refund {
                 to,

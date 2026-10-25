@@ -28,7 +28,8 @@ pub use crosscheck::{
 };
 pub use send::build_send_tx;
 pub use tx::{
-    build_funding_tx, build_spend_tx, htlc_script_pubkey, verify_htlc_spend, Coin, Spend,
+    build_cpfp_tx, build_funding_tx, build_spend_tx, htlc_script_pubkey, verify_htlc_spend, Coin,
+    Spend,
 };
 
 use std::str::FromStr;
@@ -40,8 +41,8 @@ use bitcoin::secp256k1::{All, Secp256k1, SecretKey};
 use bitcoin::{CompressedPublicKey, OutPoint};
 use crosscheck::enforce;
 use divi_swap::{
-    Amount, Chain, ChainBackend, Funding, HtlcParams, InputReservations, LockedOutput, Outpoint,
-    SignedTx, SpendInfo, SwapError, Txid,
+    Amount, Chain, ChainBackend, FeeBump, Funding, HtlcParams, InputReservations, LockedOutput,
+    Outpoint, SignedTx, SpendInfo, SwapError, Txid,
 };
 use serde_json::Value;
 
@@ -559,6 +560,71 @@ impl ChainBackend for LtcBackend {
             amount.to_sat(),
             Spend::Claim(preimage),
             self.sat_per_vb().await,
+        )?;
+        Ok(Self::to_signed(&tx))
+    }
+
+    /// Litecoin Core does not relay replacements by default (`DEFAULT_ENABLE_REPLACEMENT`
+    /// is false, `src/validation.h:80`), but its miner selects by ancestor package
+    /// (`addPackageTxs`, `src/miner.cpp:351`), so a child paying for the claim works.
+    fn fee_bump(&self) -> FeeBump {
+        FeeBump::Cpfp
+    }
+
+    async fn claim_feerate(&self) -> Result<Option<u64>> {
+        Ok(Some(self.sat_per_vb().await))
+    }
+
+    async fn build_claim_at(
+        &self,
+        htlc: &HtlcParams,
+        at: &Outpoint,
+        amount: Amount,
+        preimage: &[u8; 32],
+        feerate: u64,
+    ) -> Result<SignedTx> {
+        let tx = build_spend_tx(
+            &self.secp,
+            &self.key,
+            htlc,
+            ltc_outpoint(at),
+            amount.to_sat(),
+            Spend::Claim(preimage),
+            feerate.max(1),
+        )?;
+        Ok(Self::to_signed(&tx))
+    }
+
+    async fn build_cpfp(
+        &self,
+        package: &[SignedTx],
+        htlc_amount: Amount,
+        feerate: u64,
+    ) -> Result<SignedTx> {
+        let txs = package
+            .iter()
+            .map(|t| bitcoin::consensus::deserialize::<bitcoin::Transaction>(&t.raw))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| SwapError::Other(format!("cannot read own claim package: {e}")))?;
+        let last = txs
+            .last()
+            .ok_or_else(|| SwapError::InvalidParams("empty CPFP package".into()))?;
+        let parent_value = last
+            .output
+            .first()
+            .ok_or_else(|| SwapError::InvalidParams("CPFP parent has no output".into()))?
+            .value
+            .to_sat();
+        let package_vsize = txs.iter().map(|t| t.vsize() as u64).sum();
+        let package_fee = htlc_amount.to_sat().saturating_sub(parent_value);
+        let tx = build_cpfp_tx(
+            &self.secp,
+            &self.key,
+            last,
+            parent_value,
+            package_vsize,
+            package_fee,
+            feerate,
         )?;
         Ok(Self::to_signed(&tx))
     }

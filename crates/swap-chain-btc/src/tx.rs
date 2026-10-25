@@ -237,7 +237,9 @@ pub fn build_spend_tx(
         Spend::Refund => Witness::from_slice(&[sig, vec![], ws.to_bytes()]),
     };
     let (lock_time, sequence) = match spend {
-        Spend::Claim(_) => (LockTime::ZERO, Sequence::MAX),
+        // Signals replacement (BIP125), so a claim that is not confirming can be re-signed
+        // at a higher feerate (`build_claim_at`). The claim branch has no relative lock.
+        Spend::Claim(_) => (LockTime::ZERO, Sequence::ENABLE_RBF_NO_LOCKTIME),
         Spend::Refund => (
             LockTime::from_time(htlc.locktime)
                 .map_err(|e| SwapError::InvalidParams(format!("locktime: {e}")))?,

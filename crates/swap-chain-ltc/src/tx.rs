@@ -307,3 +307,52 @@ pub fn verify_htlc_spend(
     )
     .map_err(|e| SwapError::Rejected(format!("spend fails consensus verification: {e:?}")))
 }
+
+/// Build and sign a CPFP child: spend output 0 of `parent` (paid to the key's own P2WPKH,
+/// worth `parent_value`) back to the same address, paying enough that the package it joins
+/// (`package_vsize` vbytes that paid `package_fee` in all) and the child together pay
+/// `sat_per_vb`, and never less than 1 litoshi/vB for the child itself.
+pub fn build_cpfp_tx(
+    secp: &Secp256k1<All>,
+    sk: &SecretKey,
+    parent: &Transaction,
+    parent_value: u64,
+    package_vsize: u64,
+    package_fee: u64,
+    sat_per_vb: u64,
+) -> Result<Transaction, SwapError> {
+    let pk = CompressedPublicKey(sk.public_key(secp));
+    let my_spk = ScriptBuf::new_p2wpkh(&pk.wpubkey_hash());
+    if parent.output.first().map(|o| &o.script_pubkey) != Some(&my_spk) {
+        return Err(SwapError::InvalidParams(
+            "CPFP parent output 0 is not this key's address".into(),
+        ));
+    }
+    let at = OutPoint::new(parent.compute_txid(), 0);
+    let mut tx = Transaction {
+        version: Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![input(at, Sequence::MAX)],
+        output: vec![TxOut {
+            value: Amount::from_sat(parent_value),
+            script_pubkey: my_spk.clone(),
+        }],
+    };
+    let pk_bytes = pk.to_bytes().to_vec();
+    tx.input[0].witness = Witness::from_slice(&[DUMMY_SIG.to_vec(), pk_bytes.clone()]);
+    let child_vsize = tx.vsize() as u64;
+    let want = sat_per_vb
+        .max(1)
+        .saturating_mul(package_vsize.saturating_add(child_vsize));
+    let fee = want.saturating_sub(package_fee).max(child_vsize);
+    let out = parent_value.checked_sub(fee).filter(|v| *v >= DUST_SATS);
+    let out = out.ok_or_else(|| {
+        SwapError::InsufficientFunds(format!(
+            "claim output {parent_value} does not cover fee {fee}"
+        ))
+    })?;
+    tx.output[0].value = Amount::from_sat(out);
+    let sig = p2wpkh_sign(secp, sk, &tx, 0, &my_spk, parent_value)?;
+    tx.input[0].witness = Witness::from_slice(&[sig, pk_bytes]);
+    Ok(tx)
+}

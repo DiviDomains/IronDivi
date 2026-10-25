@@ -19,15 +19,15 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::api::{AcceptRequest, LockNotice, Quote, SwapView};
-use crate::backend::ChainBackend;
+use crate::backend::{ChainBackend, FeeBump};
 use crate::config::{
     check_maker_leg_locktime, check_maker_leg_locktime_exact, check_terms_against_profile,
-    ClaimDeadline, OfferedTerms, Profile,
+    ClaimDeadline, FeeEscalation, OfferedTerms, Profile,
 };
 use crate::error::{Result, SwapError};
 use crate::htlc::{new_preimage, HtlcParams};
 use crate::store::{Store, TakerRecord};
-use crate::types::{Chain, SpendInfo};
+use crate::types::{Amount, Chain, Outpoint, SignedTx, SpendInfo};
 
 /// The least margin, on any chain, that the taker keeps before the maker's locktime when it
 /// broadcasts its first claim: a claim that confirms after the maker refunds would lose the
@@ -111,6 +111,8 @@ pub struct Taker {
     profile_floor: Option<Profile>,
     /// Per-chain claim deadlines replacing [`ClaimDeadline::builtin`].
     claim_deadlines: BTreeMap<Chain, ClaimDeadline>,
+    /// Per-chain fee escalations replacing [`FeeEscalation::builtin`] (`None`: off).
+    fee_escalations: BTreeMap<Chain, Option<FeeEscalation>>,
     halt_after: Mutex<Option<TakerState>>,
     gate: tokio::sync::Mutex<()>,
 }
@@ -135,6 +137,7 @@ impl Taker {
             store,
             profile_floor: None,
             claim_deadlines: BTreeMap::new(),
+            fee_escalations: BTreeMap::new(),
             halt_after: Mutex::new(None),
             gate: tokio::sync::Mutex::new(()),
         }
@@ -161,6 +164,21 @@ impl Taker {
             .get(&chain)
             .copied()
             .unwrap_or_else(|| ClaimDeadline::builtin(chain))
+    }
+
+    /// Use `escalation` instead of [`FeeEscalation::builtin`] for claims of maker legs on
+    /// `chain`; `None` never bumps them.
+    pub fn with_fee_escalation(mut self, chain: Chain, escalation: Option<FeeEscalation>) -> Self {
+        self.fee_escalations.insert(chain, escalation);
+        self
+    }
+
+    /// The fee escalation this taker applies to claims of maker legs on `chain`.
+    pub fn fee_escalation(&self, chain: Chain) -> Option<FeeEscalation> {
+        self.fee_escalations
+            .get(&chain)
+            .copied()
+            .unwrap_or_else(|| FeeEscalation::builtin(chain))
     }
 
     /// The counter chains this taker holds a key on.
@@ -210,6 +228,10 @@ impl Taker {
             maker_leg_claim: None,
             taker_leg_refund: None,
             claim_declined: None,
+            claim_base_feerate: None,
+            claim_feerate: None,
+            claim_replaced: Vec::new(),
+            claim_children: Vec::new(),
             last_error: None,
         })?;
         Ok((id, req))
@@ -584,11 +606,7 @@ impl Taker {
         if r.claim_declined.is_none() && deadline.is_ok() {
             let op = r.maker_leg_outpoint.expect("set with maker_leg_htlc");
             let amount = r.maker_leg_amount.expect("set with maker_leg_htlc");
-            let claim = self
-                .mk(r)?
-                .build_claim(&htlc, &op, amount, &r.preimage)
-                .await?;
-            r.maker_leg_claim = Some(claim);
+            self.sign_first_claim(r, &htlc, &op, amount).await?;
             // Persist the signed claim (which reveals the preimage) before broadcasting it.
             return self.enter(r, TakerState::Claimed);
         }
@@ -614,27 +632,72 @@ impl Taker {
                     .ok_or_else(|| SwapError::Other("Claimed without a maker-leg lock".into()))?;
                 let op = r.maker_leg_outpoint.expect("set with maker_leg_htlc");
                 let amount = r.maker_leg_amount.expect("set with maker_leg_htlc");
-                let tx = self
-                    .mk(r)?
-                    .build_claim(&htlc, &op, amount, &r.preimage)
-                    .await?;
-                r.maker_leg_claim = Some(tx.clone());
+                let tx = self.sign_first_claim(r, &htlc, &op, amount).await?;
                 self.store.put_taker_swap(r)?; // write-ahead
                 tx
             }
         };
+        // A version an RBF bump replaced may be the one that got mined.
+        for (old, _) in &r.claim_replaced {
+            if self
+                .mk(r)?
+                .confirmations(&old.txid)
+                .await?
+                .is_some_and(|c| c >= 1)
+            {
+                return self.enter(r, TakerState::Done);
+            }
+        }
         if let Err(e) = self.mk(r)?.broadcast(&claim).await {
             if matches!(e, SwapError::Rejected(_)) {
+                // The chain still holding a version (this one or one it replaced) means the
+                // refusal is not about the claim itself: keep the newest version it holds,
+                // drop the newer ones it never relayed, and never re-sign at the base
+                // feerate, which would only conflict with the version in the mempool.
+                if !r.claim_replaced.is_empty() {
+                    if self.mk(r)?.confirmations(&claim.txid).await?.is_some() {
+                        tracing::warn!(swap = %r.id, txid = %claim.txid, error = %e,
+                            "claim rebroadcast refused but the chain holds it; keeping it");
+                        return Err(e);
+                    }
+                    while let Some((prev, feerate)) = r.claim_replaced.pop() {
+                        let held = self.mk(r)?.confirmations(&prev.txid).await?.is_some();
+                        if held || r.claim_replaced.is_empty() {
+                            tracing::warn!(swap = %r.id, refused = %claim.txid,
+                                back_to = %prev.txid, held, error = %e,
+                                "claim replacement refused; back to the earlier claim");
+                            r.maker_leg_claim = Some(prev);
+                            r.claim_feerate = Some(feerate);
+                            break;
+                        }
+                    }
+                    self.store.put_taker_swap(r)?;
+                    return Err(e);
+                }
                 // Refused for good (e.g. signed by an older, buggy build): forget it so the
                 // next step re-signs from the persisted preimage, same as the maker/taker
                 // claim/refund paths.
                 r.maker_leg_claim = None;
+                r.claim_children.clear();
                 if self.maker_leg_refunded(r).await? {
                     return self.enter(r, TakerState::Refunded);
                 }
                 self.store.put_taker_swap(r)?;
             }
             return Err(e);
+        }
+        for (i, child) in r.claim_children.clone().iter().enumerate() {
+            if let Err(e) = self.mk(r)?.broadcast(child).await {
+                if matches!(e, SwapError::Rejected(_)) {
+                    // Drop it and every child built on it; the next bump builds afresh.
+                    tracing::warn!(swap = %r.id, refused = %child.txid, error = %e,
+                        "claim CPFP child refused; dropping it");
+                    r.claim_children.truncate(i);
+                    r.claim_feerate = r.claim_base_feerate;
+                    self.store.put_taker_swap(r)?;
+                }
+                return Err(e);
+            }
         }
         if self
             .mk(r)?
@@ -644,7 +707,100 @@ impl Taker {
         {
             return self.enter(r, TakerState::Done);
         }
+        self.escalate_claim_fee(r, &claim).await?;
         Ok(Flow::Idle)
+    }
+
+    /// Sign the first maker-leg claim. Where the backend can bump it, at the feerate it
+    /// reports now, recorded as the base the escalation climbs from.
+    async fn sign_first_claim(
+        &self,
+        r: &mut TakerRecord,
+        htlc: &HtlcParams,
+        op: &Outpoint,
+        amount: Amount,
+    ) -> Result<SignedTx> {
+        let mk = self.mk(r)?;
+        let feerate = match (mk.fee_bump(), self.fee_escalation(r.quote.maker_chain())) {
+            (FeeBump::None, _) | (_, None) => None,
+            _ => mk.claim_feerate().await?,
+        };
+        let tx = match feerate {
+            Some(f) => mk.build_claim_at(htlc, op, amount, &r.preimage, f).await?,
+            None => mk.build_claim(htlc, op, amount, &r.preimage).await?,
+        };
+        r.maker_leg_claim = Some(tx.clone());
+        r.claim_base_feerate = feerate;
+        r.claim_feerate = feerate;
+        r.claim_replaced.clear();
+        r.claim_children.clear();
+        Ok(tx)
+    }
+
+    /// Raise the fee of the unconfirmed `claim` along the chain's [`FeeEscalation`] as the
+    /// maker-leg locktime nears: replace it (RBF) or add a child (CPFP), persisting the new
+    /// transaction before broadcasting it and logging every bump. A no-op where the backend
+    /// cannot bump, escalation is off, or the target is not yet worth a new transaction.
+    async fn escalate_claim_fee(&self, r: &mut TakerRecord, claim: &SignedTx) -> Result<()> {
+        let chain = r.quote.maker_chain();
+        let mk = self.mk(r)?;
+        let (Some(esc), Some(base), Some(current)) = (
+            self.fee_escalation(chain),
+            r.claim_base_feerate,
+            r.claim_feerate,
+        ) else {
+            return Ok(());
+        };
+        let kind = mk.fee_bump();
+        if kind == FeeBump::None {
+            return Ok(());
+        }
+        let (Some(htlc), Some(op), Some(amount)) =
+            (r.maker_leg_htlc, r.maker_leg_outpoint, r.maker_leg_amount)
+        else {
+            return Ok(());
+        };
+        let left = i64::from(htlc.locktime) - i64::from(mk.median_time_past().await?);
+        let target = esc.target(base, left);
+        if !FeeEscalation::worth_bumping(current, target) {
+            return Ok(());
+        }
+        let tx = match kind {
+            FeeBump::Rbf => {
+                let tx = mk
+                    .build_claim_at(&htlc, &op, amount, &r.preimage, target)
+                    .await?;
+                r.claim_replaced.push((claim.clone(), current));
+                r.maker_leg_claim = Some(tx.clone());
+                tx
+            }
+            FeeBump::Cpfp => {
+                let mut package = vec![claim.clone()];
+                package.extend(r.claim_children.iter().cloned());
+                let tx = mk.build_cpfp(&package, amount, target).await?;
+                r.claim_children.push(tx.clone());
+                tx
+            }
+            FeeBump::None => unreachable!("returned above"),
+        };
+        r.claim_feerate = Some(target);
+        self.store.put_taker_swap(r)?; // write-ahead
+        tracing::info!(
+            swap = %r.id,
+            %chain,
+            bump = ?kind,
+            old_feerate = current,
+            new_feerate = target,
+            txid = %tx.txid,
+            claim = %claim.txid,
+            secs_left = left,
+            "claim fee bumped"
+        );
+        if let Err(e) = mk.broadcast(&tx).await {
+            // Kept: the next step resends it and, if refused for good, falls back.
+            tracing::warn!(swap = %r.id, txid = %tx.txid, error = %e, "fee bump broadcast failed");
+        }
+        Ok(())
     }
 
     async fn on_refunded(&self, r: &mut TakerRecord) -> Result<Flow> {

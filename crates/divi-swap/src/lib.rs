@@ -29,8 +29,8 @@ pub mod taker;
 pub mod types;
 
 pub use api::Direction;
-pub use backend::ChainBackend;
-pub use config::{ChainParams, ClaimDeadline, Profile, SwapConfig};
+pub use backend::{ChainBackend, FeeBump};
+pub use config::{ChainParams, ClaimDeadline, FeeEscalation, Profile, SwapConfig};
 pub use error::{Result, SwapError};
 pub use htlc::HtlcParams;
 pub use maker::{Maker, OfferEngine};
