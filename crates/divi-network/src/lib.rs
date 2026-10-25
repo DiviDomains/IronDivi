@@ -78,6 +78,7 @@ pub mod socks5;
 pub mod spork;
 pub mod subnet;
 pub mod sync;
+pub mod timedata;
 
 pub use constants::{
     services, Magic, MAINNET_MAGIC, MAX_MESSAGE_SIZE, MIN_PEER_PROTO_VERSION, PROTOCOL_VERSION,

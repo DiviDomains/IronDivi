@@ -46,9 +46,11 @@ pub struct MasternodeVotes {
     winners: RwLock<HashMap<[u8; 32], (CppWinner, Hash256)>>,
     /// The counts per scoring block
     blocks: RwLock<HashMap<Hash256, BlockPayees>>,
-    /// The masternode sync is not finished (CMasternodeSync::IsSynced false);
-    /// irondivid reports it finished, so this starts false
+    /// The masternode sync is not finished (CMasternodeSync::IsSynced false),
+    /// for votes that follow no sync; starts false
     sync_unfinished: std::sync::atomic::AtomicBool,
+    /// The node's masternode sync, which decides once set
+    sync: RwLock<Option<divi_masternode::mnsync::SharedMasternodeSync>>,
 }
 
 impl MasternodeVotes {
@@ -64,7 +66,16 @@ impl MasternodeVotes {
             .store(!finished, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Follow the node's masternode sync: a vote is checked against its
+    /// stage at the time (IsSynced, masternode-sync.cpp:55-58)
+    pub fn follow_sync(&self, sync: divi_masternode::mnsync::SharedMasternodeSync) {
+        *self.sync.write() = Some(sync);
+    }
+
     fn sync_finished(&self) -> bool {
+        if let Some(sync) = self.sync.read().as_ref() {
+            return sync.lock().sync.is_synced();
+        }
         !self
             .sync_unfinished
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -78,6 +89,15 @@ impl MasternodeVotes {
     /// MasternodeModule.cpp:329-338)
     pub fn winner_bytes(&self, hash: &[u8; 32]) -> Option<Vec<u8>> {
         self.winners.read().get(hash).map(|(w, _)| w.encode())
+    }
+
+    /// Every vote taken: the height it is for and its hash
+    pub fn heights_and_hashes(&self) -> Vec<(i32, [u8; 32])> {
+        self.winners
+            .read()
+            .iter()
+            .map(|(hash, (winner, _))| (winner.height, *hash))
+            .collect()
     }
 
     /// A vote from a peer, checked as Divi Core checks one

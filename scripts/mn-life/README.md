@@ -74,6 +74,8 @@ How a row compares:
   `timestamp`.
 - `mnsync status` is compared by its fields and by `IsBlockchainSynced` and `currentMasternodeSyncStatus`; its counters
   and times are each node's own.
+- The sync stages of C and I from their start until the network is up (every node finished its sync, 999), and
+  across the controllers' restart: `scripts/lib/mnsync_stages.py` polls both nodes side by side; each node's stages are kept in order, each once, and compared as sequences, not by the moment a node moves (its sync takes a step at most every five seconds, `masternode-sync.cpp:297-333`).
 - `getmasternodestatus` on M1 and M2 is compared without txhash, outputidx, netaddr and addr, which are each
   masternode's own.
 
@@ -120,9 +122,6 @@ What the payment rows check (Divi Core 3.0.0):
 
 - **`getmasternodecount: tier counts divid lacks`**: irondivid adds `copper`, `silver`, `gold`, `platinum`,
   `diamond`, as in scripts/masternode-replies.
-- **`mnsync status`, while divid is still in a sync stage** (the rows before the network is up and right after the
-  restarts): irondivid has no masternode sync stages and reports 999 (finished). A row where both report 999 is a
-  plain PASS.
 
 ## Proving a difference is caught
 

@@ -48,7 +48,8 @@ them); a few rows send a number or a string where divid reads another type, for 
 |---|---|
 | state (before and after the restart) | `spork show`, `spork active`, `mnsync status`, `listmasternodes`, `getmasternodecount`, `getmasternodestatus` (not a masternode), `getmasternodewinners`, `listmnbroadcasts` |
 | `spork` | an unknown name (`Invalid spork name`), a set without the spork key (`failure`), the value as a number, no arguments, an unknown mode, `show` with a value, three arguments |
-| `mnsync` | no arguments, an unknown mode, two arguments, `reset`, `status` after the reset |
+| `mnsync` | `status` right after start (the chain not synced: stage 0); no arguments, an unknown mode, two arguments, `reset`, `status` after the reset |
+| sync stages | the stages each node goes through as the chain becomes synced (0, 1: SPORKS, where a node with one peer stays, `masternode-sync.cpp:424-454`) and after `mnsync reset` (1, 0, 1). `scripts/lib/mnsync_stages.py` polls both nodes side by side; each node's stages are kept in order, each once, and compared as sequences, not by the moment a node moves (its sync takes a step at most every five seconds, `masternode-sync.cpp:297-333`). |
 | `listmasternodes` | a filter, two arguments, the filter as a number |
 | `getmasternodecount`, `getmasternodestatus` | with an argument |
 | `getmasternodewinners` | `5`, `5 Unknown`, `5 nomatch`, `abc` (atoi 0), the count as a number, four arguments |
@@ -78,9 +79,6 @@ Each is a row of its own, so the rest of the reply is still compared:
 
 - `getmasternodecount: tier counts divid lacks`: irondivid adds `copper`, `silver`, `gold`, `platinum`, `diamond`
   (divid's 8 counts, `rpcmasternode.cpp:327-358`; by design, as in `scripts/net-replies`).
-- `mnsync status: currentMasternodeSyncStatus` (and after `reset`, and after the restart): irondivid has no masternode
-  sync stages and reports 999 (finished). divid's stages move on only with 3 spork-synced peers
-  (`masternode-sync.cpp:425-455`), so on this two-node chain divid stays at its first stage (0).
 
 No other row differs from divid.
 

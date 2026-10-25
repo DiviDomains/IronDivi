@@ -82,10 +82,10 @@ mined by the owner instead), so each coinstake holds only the vault's payout.
 
 - `getstakingstatus`: irondivid adds `staking status text`, the string it gave before the member became a bool
   (docs/rpc-parity-audit.md: getstakingstatus).
-- `getstakingstatus mnsync (divid's masternode sync not finished)`: open: irondivid has no masternode sync and
-  counts it finished once the chain is synced; divid gives false on a regtest node until its masternode sync times
-  out (rpcmisc.cpp:1068; the same gap as `mnsync status` in scripts/net-replies). The row is a PASS once both say
-  true.
+- `owner getstakingstatus mnsync (the owners' peers differ)`: the topology, not a difference. divid's owner has three
+  inbound peers (both managers and irondivid's owner dial it), so its masternode sync can finish (`mnsync` is
+  IsSynced, rpcmisc.cpp:1069); irondivid's owner has one peer and stays at SPORKS (masternode-sync.cpp:437-440). The
+  managers, one peer each, are compared as usual.
 - `getcoinavailability`: irondivid adds `total_vaults` and `vaults` (also KNOWN in scripts/vault-replies).
 - `manager listtransactions * 100 0 true (a removed vault's records)`: by design: after `removevault`, divid still lists
   the removed vault's transactions, with their amounts, until its next start. It keeps each transaction's credit and

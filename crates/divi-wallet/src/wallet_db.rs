@@ -3179,10 +3179,8 @@ impl WalletDb {
     /// the received time (or a later entry of the wallet up to five minutes
     /// ahead) and no earlier than the latest earlier entry of the wallet
     fn note_times(&self, txid: &Hash256, block_time: Option<u64>) {
-        let received = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        // nTimeReceived = GetAdjustedTime() (SpentOutputTracker.cpp:47)
+        let received = divi_primitives::clock::adjusted_now().max(0) as u64;
         let smart = match block_time {
             None => received,
             Some(block_time) => {

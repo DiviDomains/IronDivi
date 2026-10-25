@@ -26,6 +26,9 @@ import time
 import urllib.error
 import urllib.request
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "lib"))
+import mnsync_stages  # noqa: E402  (scripts/lib: the sync stages of nodes over time)
+
 IRONDIVID, DIVID, PORT_BASE, WORK = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
 # For the proof that a difference is caught: irondivid's reply of the named row is
 # changed before it is compared
@@ -249,22 +252,19 @@ def compare(name, c, i, by_shape=False, mask=None):
     return c, i
 
 
-STAGES = ("irondivid has no masternode sync stages and reports 999 (finished); divid moves through its stages "
-          "with three spork-synced peers (masternode-sync.cpp:425-455) and was still in one here "
-          "(scripts/masternode-replies README)")
-
-
 def compare_mnsync(name, c, i):
-    """mnsync status; a divid still in a sync stage against irondivid's 999 is the
-    known difference, anything else is compared as usual"""
+    """mnsync status: whether the chain is synced, the stage, and the shape of
+    the node's own counters and times"""
     cv = mnsync_view(c[1]) if c[0] == "ok" else c
     iv = mnsync_view(i[1]) if i[0] == "ok" else i
     a, b = json.dumps(cv, sort_keys=True), json.dumps(iv, sort_keys=True)
-    staged = (c[0] == i[0] == "ok" and cv.get("currentMasternodeSyncStatus") != 999
-              and iv.get("currentMasternodeSyncStatus") == 999
-              and {k: x for k, x in cv.items() if k != "currentMasternodeSyncStatus"}
-              == {k: x for k, x in iv.items() if k != "currentMasternodeSyncStatus"})
-    row(name, a, b, a == b, reason=STAGES if staged else None)
+    row(name, a, b, a == b)
+
+
+def stage_rows(name, seqs):
+    """The stages C and I went through, compared as sequences"""
+    a, b = seqs[C.name], seqs[I.name]
+    row(name, mnsync_stages.text(a), mnsync_stages.text(b), a == b)
 
 
 def sorted_list(v):
@@ -322,6 +322,7 @@ NODES = [C, I, M1, M2, M3, M4]
 # 1. The two controllers, one chain, coins on both
 for n in (C, I):
     n.start()
+poller = mnsync_stages.StagePoller([C, I]).start()
 mesh()
 print(f"# divid {C.rpc('getinfo').get('version')}, irondivid {I.rpc('getinfo').get('version')}", flush=True)
 mine(C, 30)
@@ -434,10 +435,12 @@ def sync_state(node):
     return out[1].get("currentMasternodeSyncStatus") if out[0] == "ok" else out
 
 
-# divid's masternode sync moves through its stages with three spork-synced peers
+# The masternode sync moves through its stages with three peers it may ask
+# (inbound or spork-synced), on each controller as on the masternode nodes
 t0 = time.time()
-finished = wait_for(lambda: all(sync_state(n) == 999 for n in (C, M1, M2)), 240, step=2)
-info(f"divid nodes' masternode sync finished: {finished} after {time.time() - t0:.0f} s")
+finished = wait_for(lambda: all(sync_state(n) == 999 for n in (C, M1, M2, I)), 240, step=2)
+info(f"the nodes' masternode sync finished: {finished} after {time.time() - t0:.0f} s")
+stage_rows("mnsync stages from start to the network up", poller.stop())
 compare_mnsync("mnsync status, the network up", C.call("mnsync", "status"), I.call("mnsync", "status"))
 compare("getmasternodestatus on a masternode node before its start (M1 for C, M2 for I)",
         M1.call("getmasternodestatus"), M2.call("getmasternodestatus"))
@@ -517,8 +520,11 @@ for n in (C, I):
     n.stop()
 for n in (C, I):
     n.start()
+poller = mnsync_stages.StagePoller([C, I]).start()
 mesh()
 need(synced(secs=180), "the controllers did not come back to the tip")
+wait_for(lambda: all(sync_state(n) == 999 for n in (C, I)), 240, step=2)
+stage_rows("mnsync stages after the controllers restarted", poller.stop())
 time.sleep(5)
 views("after the controllers restarted")
 for n in (M1, M2):

@@ -61,7 +61,8 @@ with `staking=0`.
 | `walletverify`, `settxfee` | in neither program |
 | `bip38paperwallet` | `<passphrase>` (its two fields); none |
 | `bip38decrypt` | divid's paper key with the passphrase; again (already held); a wrong passphrase; `notakey`; one argument; not a string; irondivid's paper key on both; a second key of divid's |
-| `bip38encrypt`, `setstakesplitthreshold`, `getstakesplitthreshold`, `reservebalance` | irondivid only: show, set, unset and bad arguments |
+| `bip38encrypt`, `setstakesplitthreshold`, `getstakesplitthreshold` | irondivid only: show, set, unset and bad arguments |
+| `reservebalance` | show, set, unset, no amount: neither node has it ("Method not found") |
 | `encryptwallet` | `<passphrase>` |
 | locked | `getwalletinfo` unlocked_until, `importprivkey`, `importaddress`, `dumpprivkey` (an address, `notanaddress`), `backupwallet`, `keypoolrefill` (none, `-1`), `bip38paperwallet`, `bip38decrypt`, `bip38encrypt`, `setstakesplitthreshold`, `reservebalance` |
 | unlocked again | `walletpassphrase <passphrase> 60`, `dumpprivkey`, `importprivkey`, `walletlock`, `dumpprivkey` |
@@ -85,6 +86,5 @@ Not here, because `crates/divi-rpc/tests/core_replies.rs` `key_errors` already c
 | `bip38decrypt <encrypted key> <wrong passphrase>` | Adds whatever key the wrong passphrase gives, and answers its address: Core's BIP38_Decrypt does not check the address hash (bip38.cpp:131-178, rpcdump.cpp:313-343) | -4 "Failed To Decrypt" | A wrong passphrase must not put an unrelated key into the wallet |
 | `bip38encrypt` (every form) | Method not found (rpcserver.cpp:424-425 has bip38paperwallet and bip38decrypt only) | Encrypts a key the wallet holds | Kept: it exports a held key in BIP38 form |
 | `setstakesplitthreshold`, `getstakesplitthreshold` (every form) | Method not found; the threshold is the start-up option `-stakesplitthreshold` | Read and change the threshold of the running node | Kept: no restart needed to change it |
-| `reservebalance` (every form) | Method not found in 3.0.0 | Shows or sets an amount the staker keeps back | Kept from earlier Divi releases |
 
 An irondivid-only row is `KNOWN` while divid answers "Method not found" and irondivid answers; otherwise it is a `FAIL`.

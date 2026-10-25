@@ -93,7 +93,7 @@ string: a C++ bug). Rust returns a proper array.
 `getaddressinfo`, `getaddresstxids`, `getaddressutxos`, `getaddressesbylabel`,
 `getimmaturebalance`, `getkeypoolsize`, `getlitewalletinfo`, `getlogconfig`,
 `getmintinginfo`, `getpeerscores`, `getspentinfo`, `gettxindex`, `rescanblockchain`,
-`reservebalance`, `setban`, `setlogconfig`, `setstaking`, `signrawtransactionwithwallet`,
+`setban`, `setlogconfig`, `setstaking`, `signrawtransactionwithwallet`,
 `validateaddresses`. (`setban` is Rust's spelling of C++ `ban`; both now exist.)
 
 ## C++ divid 3.0.0 crash bugs found by the harness
