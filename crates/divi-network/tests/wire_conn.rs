@@ -144,3 +144,20 @@ async fn unparseable_reject_and_headers_get_no_answer() {
         seen
     );
 }
+
+/// Divi Core 3.0.0 has no sendheaders (BIP 130): it never sends one, and a
+/// peer that receives one from it would not either. None follows the
+/// handshake here
+#[tokio::test]
+async fn no_sendheaders_after_the_handshake() {
+    let (mut peer, _keep) = connected_peer().await;
+    send(&mut peer, NetworkMessage::Ping(9)).await;
+    let seen = until_pong(&mut peer, 9).await;
+    assert!(
+        !seen
+            .iter()
+            .any(|m| matches!(m, NetworkMessage::SendHeaders)),
+        "sent {:?}",
+        seen
+    );
+}
