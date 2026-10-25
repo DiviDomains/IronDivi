@@ -305,8 +305,7 @@ fn resolve_args(mut args: Args) -> Result<Args> {
 /// version.cpp:11-17), -manual_fork (two fork times, ForkActivation.cpp:50-55),
 /// -override_mnpayee (BlockIncentivesPopulator.cpp:224), -prunewalletconfs
 /// (the wallet's transactions in memory, wallet.cpp:1162-1239),
-/// -stakeupdatetime (PoSTransactionCreator.cpp:116) and -whitelisted_vault
-/// (init.cpp:1182-1191)
+/// and -stakeupdatetime (PoSTransactionCreator.cpp:116)
 const UNSUPPORTED_OPTIONS: &[&str] = &[
     "accountlabels",
     "activeversion",
@@ -314,7 +313,6 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "override_mnpayee",
     "prunewalletconfs",
     "stakeupdatetime",
-    "whitelisted_vault",
     "checklevel",
     "par",
 ];
