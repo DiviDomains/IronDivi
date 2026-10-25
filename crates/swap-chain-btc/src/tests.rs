@@ -89,6 +89,24 @@ async fn claim_verifies_with_consensus() {
 }
 
 #[tokio::test]
+async fn claim_sizes_are_the_vsize_a_claim_is_charged_for() {
+    let (pre, hash) = new_preimage();
+    let h = htlc(hash);
+    let b = backend(vec![dead_url()], TAKER_KEY);
+    let sizes = b.claim_sizes(&h).unwrap();
+    assert_eq!((sizes.child_vsize, sizes.dust), (0, DUST_SATS));
+    let signed = b
+        .build_claim_at(&h, &outpoint(), Amount::from_sat(1_000_000), &pre, 10)
+        .await
+        .unwrap();
+    let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&signed.raw).unwrap();
+    // The fee is computed on the same 72-byte-signature size the ceiling divides by.
+    assert_eq!(1_000_000 - tx.output[0].value.to_sat(), 10 * sizes.claim_vsize);
+    let actual = tx.vsize() as u64;
+    assert!(actual <= sizes.claim_vsize && actual + 1 >= sizes.claim_vsize);
+}
+
+#[tokio::test]
 async fn refund_verifies_with_consensus() {
     let (_, hash) = new_preimage();
     let h = htlc(hash);

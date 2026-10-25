@@ -94,6 +94,32 @@ async fn claim_verifies_with_consensus() {
 }
 
 #[tokio::test]
+async fn claim_sizes_are_the_vsizes_a_claim_and_its_child_are_charged_for() {
+    let (pre, hash) = new_preimage();
+    let h = htlc(hash);
+    let b = backend(vec![dead_url()], TAKER_KEY);
+    let sizes = b.claim_sizes(&h).unwrap();
+    assert_eq!(sizes.dust, DUST_SATS);
+    let amount = Amount::from_sat(1_000_000);
+    let claim = b
+        .build_claim_at(&h, &outpoint(), amount, &pre, 10)
+        .await
+        .unwrap();
+    let parent: bitcoin::Transaction = bitcoin::consensus::deserialize(&claim.raw).unwrap();
+    let parent_value = parent.output[0].value.to_sat();
+    // The claim's fee is computed on the same 72-byte-signature size the ceiling divides by.
+    assert_eq!(1_000_000 - parent_value, 10 * sizes.claim_vsize);
+    let child = b.build_cpfp(&[claim], amount, 100).await.unwrap();
+    let child: bitcoin::Transaction = bitcoin::consensus::deserialize(&child.raw).unwrap();
+    let actual = child.vsize() as u64;
+    assert!(actual <= sizes.child_vsize && actual + 1 >= sizes.child_vsize);
+    // The package (claim and child) pays about 100/vB over both sizes.
+    let fee = 1_000_000 - child.output[0].value.to_sat();
+    let want = 100 * (sizes.claim_vsize + sizes.child_vsize);
+    assert!(fee <= want && fee + 200 >= want, "{fee} for {want}");
+}
+
+#[tokio::test]
 async fn refund_verifies_with_consensus() {
     let (_, hash) = new_preimage();
     let h = htlc(hash);
