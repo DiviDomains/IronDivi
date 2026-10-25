@@ -325,6 +325,22 @@ const UNUSED_BY_DIVID: &[&str] = &[
     "printpriority",
 ];
 
+/// Options divid reads for checks and test aids of its own that irondivid has
+/// no counterpart for, taken without a word as divid takes them: consistency
+/// checks of its block index and mempool (BlockCheckingHelpers.cpp:162,
+/// init.cpp:795), its wallet flush thread (init.cpp:1281) and signature cache
+/// size (script/sigcache.cpp:51), none of which shows outside, and its message
+/// fault injection (-dropmessagestest main.cpp:473, Node.cpp:479;
+/// -fuzzmessagestest Node.cpp:484-485), which irondivid does not do
+const NO_COUNTERPART: &[&str] = &[
+    "checkblockindex",
+    "checkmempool",
+    "flushwallet",
+    "maxsigcachesize",
+    "dropmessagestest",
+    "fuzzmessagestest",
+];
+
 /// Options apply_settings reads
 const APPLIED: &[&str] = &[
     // divid's -forcestart skips the checks it makes after a stop that was
@@ -855,7 +871,11 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
 /// The warning an option read nowhere gets: one divid takes and irondivid
 /// has nothing for, or one neither knows; none for an option that is read
 fn option_warning(settings: &Settings, k: &str) -> Option<String> {
-    if APPLIED.contains(&k) || READ_ELSEWHERE.contains(&k) || UNUSED_BY_DIVID.contains(&k) {
+    if APPLIED.contains(&k)
+        || READ_ELSEWHERE.contains(&k)
+        || UNUSED_BY_DIVID.contains(&k)
+        || NO_COUNTERPART.contains(&k)
+    {
         return None;
     }
     Some(if UNSUPPORTED_OPTIONS.contains(&k) {
@@ -4646,6 +4666,24 @@ mod divid_option_tests {
         assert!(option_warning(&s, "nosuchoption")
             .unwrap()
             .starts_with("Unknown option"));
+    }
+
+    /// divid's own check and test-aid options are taken without a warning
+    /// (BlockCheckingHelpers.cpp:162, init.cpp:795, :1281, script/sigcache.cpp:51,
+    /// main.cpp:473, Node.cpp:479-485)
+    #[test]
+    fn divids_check_and_test_options_draw_no_warning() {
+        let s = Settings::default();
+        for k in [
+            "checkblockindex",
+            "checkmempool",
+            "flushwallet",
+            "maxsigcachesize",
+            "dropmessagestest",
+            "fuzzmessagestest",
+        ] {
+            assert_eq!(option_warning(&s, k), None, "{k}");
+        }
     }
 
     /// The masternode options are read when the node starts, after
