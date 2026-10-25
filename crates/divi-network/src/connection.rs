@@ -341,6 +341,8 @@ impl Connection {
 
         // Store their version info
         self.info.time_offset = their_version.timestamp - divi_primitives::clock::now();
+        // A sample of the network's time (Divi Core AddTimeData, main.cpp:465)
+        crate::timedata::add_time_data(self.info.addr.ip(), their_version.timestamp);
         // An inbound peer names the address it reached us at (Divi Core
         // main.cpp:402-404 SeenLocal)
         if self.info.direction == PeerDirection::Inbound {
