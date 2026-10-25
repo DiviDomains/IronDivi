@@ -215,7 +215,8 @@ fn htlc_amount(s: &ChainState, htlc: &HtlcParams, at: &Outpoint) -> Option<Amoun
     }
 }
 
-#[async_trait]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl ChainBackend for MockBackend {
     fn chain(&self) -> Chain {
         self.chain.chain

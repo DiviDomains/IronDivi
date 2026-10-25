@@ -24,7 +24,8 @@ use crate::types::{Amount, Chain, Funding, LockedOutput, Outpoint, SignedTx, Spe
 /// 1Password at startup): it funds HTLCs from that key's coins, and claims / refunds to it.
 // clippy >= 1.99 flags the `#[must_use]` that `async_trait` adds to the boxed futures.
 #[allow(clippy::double_must_use)]
-#[async_trait]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 pub trait ChainBackend: Send + Sync {
     /// Which chain this is.
     fn chain(&self) -> Chain;

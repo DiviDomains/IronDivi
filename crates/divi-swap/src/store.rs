@@ -6,16 +6,20 @@
 // it under the terms of the GNU Affero General Public License as published
 // by the Free Software Foundation, version 3.
 
-//! SQLite persistence for maker and taker swaps (file mode 0600; the taker's preimage
-//! lives here). **Lane engine** owns the implementation; `open`/`in_memory` are frozen.
+//! Persistence for maker and taker swaps. **Lane engine** owns the implementation;
+//! `open`/`in_memory` are frozen.
 //!
-//! Every record is one JSON document written in a single statement, so a transition and
+//! Every record is one JSON document written in a single backend call, so a transition and
 //! the signed transaction it refers to become durable together (write-ahead, plan §3.2).
+//!
+//! Native builds use SQLite (file mode 0600; the taker's preimage lives here). The
+//! [`StoreBackend`] trait lets a host without SQLite (the wasm32 taker in the IronDivi
+//! browser extension) supply its own durable storage via [`Store::with_backend`];
+//! [`MemoryBackend`] is the in-process reference implementation.
 
-use rusqlite::{params, Connection, OptionalExtension};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::sync::Arc;
 
 use crate::api::Quote;
 use crate::error::{Result, SwapError};
@@ -27,7 +31,7 @@ use crate::types::{Amount, Funding, Outpoint, SignedTx};
 /// Swap database handle. Cheap to clone.
 #[derive(Clone)]
 pub struct Store {
-    conn: std::sync::Arc<parking_lot::Mutex<Connection>>,
+    backend: Arc<dyn StoreBackend>,
 }
 
 /// A quote as issued, with whether a swap has consumed it.
@@ -136,7 +140,254 @@ fn storage<E: std::fmt::Display>(e: E) -> SwapError {
     SwapError::Storage(e.to_string())
 }
 
-const SCHEMA: &str = "
+/// A table of the swap database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Table<'a> {
+    /// Issued quotes ([`QuoteRecord`]).
+    Quotes,
+    /// Maker swaps ([`MakerRecord`]).
+    MakerSwaps,
+    /// Taker swaps ([`TakerRecord`]).
+    TakerSwaps,
+    /// Other engines' documents of one kind (see [`Store::put_doc`]).
+    Docs(&'a str),
+}
+
+/// Columns a maker-swap row carries besides its JSON (SQLite indexes them).
+#[derive(Debug, Clone, Copy)]
+pub struct MakerMeta<'a> {
+    /// [`MakerRecord::created_at`].
+    pub created_at: u64,
+    /// [`SwapState::as_str`] of [`MakerRecord::state`].
+    pub state: &'a str,
+}
+
+/// `Send + Sync` on native targets, where swaps run on a multi-threaded runtime; nothing
+/// on wasm32, which is single-threaded and whose JS-backed handles are `!Send`.
+#[cfg(not(target_arch = "wasm32"))]
+pub trait MaybeSendSync: Send + Sync {}
+#[cfg(not(target_arch = "wasm32"))]
+impl<T: Send + Sync + ?Sized> MaybeSendSync for T {}
+/// `Send + Sync` on native targets; nothing on wasm32.
+#[cfg(target_arch = "wasm32")]
+pub trait MaybeSendSync {}
+#[cfg(target_arch = "wasm32")]
+impl<T: ?Sized> MaybeSendSync for T {}
+
+/// Durable JSON-document storage behind [`Store`].
+///
+/// Contract: `put` is an upsert that is durable when it returns `Ok` (the engine broadcasts
+/// a transaction only after the record holding it was put); an upsert keeps the row's
+/// original insertion position. `list` returns the table's documents newest first by
+/// first insertion.
+pub trait StoreBackend: MaybeSendSync {
+    /// Insert or replace document `id` in `table`. `maker` is `Some` exactly for
+    /// [`Table::MakerSwaps`].
+    fn put(
+        &self,
+        table: Table<'_>,
+        id: &str,
+        json: &str,
+        maker: Option<MakerMeta<'_>>,
+    ) -> Result<()>;
+    /// Fetch document `id` from `table`.
+    fn get(&self, table: Table<'_>, id: &str) -> Result<Option<String>>;
+    /// All documents in `table`, newest first by first insertion.
+    fn list(&self, table: Table<'_>) -> Result<Vec<String>>;
+}
+
+impl Store {
+    /// Open (creating if needed) the database at `path`, migrating the schema.
+    ///
+    /// The file is created with mode 0600 before SQLite touches it.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn open(path: &std::path::Path) -> Result<Self> {
+        Ok(Self::with_backend(Arc::new(sqlite::SqliteBackend::open(
+            path,
+        )?)))
+    }
+
+    /// A throwaway in-memory database (tests).
+    pub fn in_memory() -> Result<Self> {
+        #[cfg(not(target_arch = "wasm32"))]
+        return Ok(Self::with_backend(Arc::new(
+            sqlite::SqliteBackend::in_memory()?,
+        )));
+        #[cfg(target_arch = "wasm32")]
+        return Ok(Self::with_backend(Arc::new(MemoryBackend::default())));
+    }
+
+    /// A store over a caller-supplied backend (the browser extension's durable storage).
+    pub fn with_backend(backend: Arc<dyn StoreBackend>) -> Self {
+        Store { backend }
+    }
+
+    // ---- quotes ----
+
+    /// Insert or replace a quote.
+    pub fn put_quote(&self, rec: &QuoteRecord) -> Result<()> {
+        self.put_json(Table::Quotes, &rec.quote.id, rec, None)
+    }
+
+    /// Fetch a quote.
+    pub fn get_quote(&self, id: &str) -> Result<Option<QuoteRecord>> {
+        self.get_json(Table::Quotes, id)
+    }
+
+    // ---- maker swaps ----
+
+    /// Insert or replace a maker swap.
+    pub fn put_maker_swap(&self, rec: &MakerRecord) -> Result<()> {
+        let meta = MakerMeta {
+            created_at: rec.created_at,
+            state: rec.state.as_str(),
+        };
+        self.put_json(Table::MakerSwaps, &rec.id, rec, Some(meta))
+    }
+
+    /// Fetch a maker swap.
+    pub fn get_maker_swap(&self, id: &str) -> Result<Option<MakerRecord>> {
+        self.get_json(Table::MakerSwaps, id)
+    }
+
+    /// All maker swaps, newest first.
+    pub fn list_maker_swaps(&self) -> Result<Vec<MakerRecord>> {
+        let mut recs: Vec<MakerRecord> = self.list_json(Table::MakerSwaps)?;
+        // Backends list by insertion; a stable sort keeps that as the tie-break.
+        recs.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        Ok(recs)
+    }
+
+    // ---- taker swaps ----
+
+    /// Insert or replace a taker swap.
+    pub fn put_taker_swap(&self, rec: &TakerRecord) -> Result<()> {
+        self.put_json(Table::TakerSwaps, &rec.id, rec, None)
+    }
+
+    /// Fetch a taker swap.
+    pub fn get_taker_swap(&self, id: &str) -> Result<Option<TakerRecord>> {
+        self.get_json(Table::TakerSwaps, id)
+    }
+
+    /// All taker swaps, newest first.
+    pub fn list_taker_swaps(&self) -> Result<Vec<TakerRecord>> {
+        self.list_json(Table::TakerSwaps)
+    }
+
+    // ---- other engines' records ----
+
+    /// Insert or replace a JSON document of `kind` (e.g. `"xmr_maker"`): storage for swap
+    /// engines that live outside this crate (the DIVI<->XMR adaptor swap) but share its
+    /// database, file mode and single-statement write-ahead property.
+    pub fn put_doc<T: Serialize>(&self, kind: &str, id: &str, doc: &T) -> Result<()> {
+        self.put_json(Table::Docs(kind), id, doc, None)
+    }
+
+    /// Fetch a document of `kind`.
+    pub fn get_doc<T: DeserializeOwned>(&self, kind: &str, id: &str) -> Result<Option<T>> {
+        self.get_json(Table::Docs(kind), id)
+    }
+
+    /// All documents of `kind`, newest first.
+    pub fn list_docs<T: DeserializeOwned>(&self, kind: &str) -> Result<Vec<T>> {
+        self.list_json(Table::Docs(kind))
+    }
+
+    // ---- helpers ----
+
+    fn put_json<T: Serialize>(
+        &self,
+        table: Table<'_>,
+        id: &str,
+        v: &T,
+        maker: Option<MakerMeta<'_>>,
+    ) -> Result<()> {
+        let json = serde_json::to_string(v).map_err(storage)?;
+        self.backend.put(table, id, &json, maker)
+    }
+
+    fn get_json<T: DeserializeOwned>(&self, table: Table<'_>, id: &str) -> Result<Option<T>> {
+        self.backend
+            .get(table, id)?
+            .map(|j| serde_json::from_str(&j).map_err(storage))
+            .transpose()
+    }
+
+    fn list_json<T: DeserializeOwned>(&self, table: Table<'_>) -> Result<Vec<T>> {
+        self.backend
+            .list(table)?
+            .iter()
+            .map(|j| serde_json::from_str(j).map_err(storage))
+            .collect()
+    }
+}
+
+/// In-process [`StoreBackend`]: the reference implementation of the contract, and the
+/// wasm32 [`Store::in_memory`]. Nothing survives the process.
+#[derive(Default)]
+pub struct MemoryBackend {
+    tables: parking_lot::Mutex<std::collections::BTreeMap<String, MemTable>>,
+}
+
+#[derive(Default)]
+struct MemTable {
+    next_seq: u64,
+    rows: std::collections::HashMap<String, (u64, String)>,
+}
+
+fn table_key(table: Table<'_>) -> String {
+    match table {
+        Table::Quotes => "quotes".into(),
+        Table::MakerSwaps => "maker_swaps".into(),
+        Table::TakerSwaps => "taker_swaps".into(),
+        Table::Docs(kind) => format!("docs/{kind}"),
+    }
+}
+
+impl StoreBackend for MemoryBackend {
+    fn put(&self, table: Table<'_>, id: &str, json: &str, _: Option<MakerMeta<'_>>) -> Result<()> {
+        let mut tables = self.tables.lock();
+        let t = tables.entry(table_key(table)).or_default();
+        match t.rows.get_mut(id) {
+            Some(row) => row.1 = json.to_string(),
+            None => {
+                t.next_seq += 1;
+                t.rows
+                    .insert(id.to_string(), (t.next_seq, json.to_string()));
+            }
+        }
+        Ok(())
+    }
+
+    fn get(&self, table: Table<'_>, id: &str) -> Result<Option<String>> {
+        let tables = self.tables.lock();
+        Ok(tables
+            .get(&table_key(table))
+            .and_then(|t| t.rows.get(id))
+            .map(|(_, j)| j.clone()))
+    }
+
+    fn list(&self, table: Table<'_>) -> Result<Vec<String>> {
+        let tables = self.tables.lock();
+        let Some(t) = tables.get(&table_key(table)) else {
+            return Ok(Vec::new());
+        };
+        let mut rows: Vec<_> = t.rows.values().collect();
+        rows.sort_by(|a, b| b.0.cmp(&a.0));
+        Ok(rows.into_iter().map(|(_, j)| j.clone()).collect())
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+mod sqlite {
+    use rusqlite::{params, Connection, OptionalExtension};
+    use std::path::Path;
+
+    use super::{storage, MakerMeta, StoreBackend, Table};
+    use crate::error::{Result, SwapError};
+
+    const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS quotes (
     id TEXT PRIMARY KEY,
     json TEXT NOT NULL
@@ -161,199 +412,149 @@ CREATE TABLE IF NOT EXISTS docs (
 );
 ";
 
-impl Store {
-    /// Open (creating if needed) the database at `path`, migrating the schema.
-    ///
-    /// The file is created with mode 0600 before SQLite touches it.
-    pub fn open(path: &Path) -> Result<Self> {
-        if !path.exists() {
-            create_private(path)?;
+    /// The SQLite backend (native default): one statement per write.
+    pub(super) struct SqliteBackend {
+        conn: parking_lot::Mutex<Connection>,
+    }
+
+    impl SqliteBackend {
+        pub(super) fn open(path: &Path) -> Result<Self> {
+            if !path.exists() {
+                create_private(path)?;
+            }
+            let conn = Connection::open(path).map_err(storage)?;
+            conn.pragma_update(None, "journal_mode", "WAL")
+                .map_err(storage)?;
+            conn.pragma_update(None, "synchronous", "FULL")
+                .map_err(storage)?;
+            Self::init(conn)
         }
-        let conn = Connection::open(path).map_err(storage)?;
-        conn.pragma_update(None, "journal_mode", "WAL")
+
+        pub(super) fn in_memory() -> Result<Self> {
+            Self::init(Connection::open_in_memory().map_err(storage)?)
+        }
+
+        fn init(conn: Connection) -> Result<Self> {
+            conn.execute_batch(SCHEMA).map_err(storage)?;
+            Ok(SqliteBackend {
+                conn: parking_lot::Mutex::new(conn),
+            })
+        }
+    }
+
+    impl StoreBackend for SqliteBackend {
+        fn put(
+            &self,
+            table: Table<'_>,
+            id: &str,
+            json: &str,
+            maker: Option<MakerMeta<'_>>,
+        ) -> Result<()> {
+            let conn = self.conn.lock();
+            match table {
+                Table::Quotes => conn.execute(
+                    "INSERT INTO quotes (id, json) VALUES (?1, ?2)
+                     ON CONFLICT(id) DO UPDATE SET json = excluded.json",
+                    params![id, json],
+                ),
+                Table::MakerSwaps => {
+                    let m = maker.ok_or_else(|| {
+                        SwapError::Storage("maker swap written without its columns".into())
+                    })?;
+                    conn.execute(
+                        "INSERT INTO maker_swaps (id, created_at, state, json) VALUES (?1, ?2, ?3, ?4)
+                         ON CONFLICT(id) DO UPDATE SET state = excluded.state, json = excluded.json",
+                        params![id, m.created_at as i64, m.state, json],
+                    )
+                }
+                Table::TakerSwaps => conn.execute(
+                    "INSERT INTO taker_swaps (id, seq, json)
+                     VALUES (?1, (SELECT COALESCE(MAX(seq), 0) + 1 FROM taker_swaps), ?2)
+                     ON CONFLICT(id) DO UPDATE SET json = excluded.json",
+                    params![id, json],
+                ),
+                Table::Docs(kind) => conn.execute(
+                    "INSERT INTO docs (kind, id, seq, json)
+                     VALUES (?1, ?2, (SELECT COALESCE(MAX(seq), 0) + 1 FROM docs), ?3)
+                     ON CONFLICT(kind, id) DO UPDATE SET json = excluded.json",
+                    params![kind, id, json],
+                ),
+            }
             .map_err(storage)?;
-        conn.pragma_update(None, "synchronous", "FULL")
-            .map_err(storage)?;
-        Self::init(conn)
-    }
+            Ok(())
+        }
 
-    /// A throwaway in-memory database (tests).
-    pub fn in_memory() -> Result<Self> {
-        Self::init(Connection::open_in_memory().map_err(storage)?)
-    }
-
-    fn init(conn: Connection) -> Result<Self> {
-        conn.execute_batch(SCHEMA).map_err(storage)?;
-        Ok(Store {
-            conn: std::sync::Arc::new(parking_lot::Mutex::new(conn)),
-        })
-    }
-
-    // ---- quotes ----
-
-    /// Insert or replace a quote.
-    pub fn put_quote(&self, rec: &QuoteRecord) -> Result<()> {
-        self.put_json(
-            "INSERT INTO quotes (id, json) VALUES (?1, ?2)
-             ON CONFLICT(id) DO UPDATE SET json = excluded.json",
-            &rec.quote.id,
-            rec,
-        )
-    }
-
-    /// Fetch a quote.
-    pub fn get_quote(&self, id: &str) -> Result<Option<QuoteRecord>> {
-        self.get_json("SELECT json FROM quotes WHERE id = ?1", id)
-    }
-
-    // ---- maker swaps ----
-
-    /// Insert or replace a maker swap.
-    pub fn put_maker_swap(&self, rec: &MakerRecord) -> Result<()> {
-        let json = serde_json::to_string(rec).map_err(storage)?;
-        self.conn
-            .lock()
-            .execute(
-                "INSERT INTO maker_swaps (id, created_at, state, json) VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT(id) DO UPDATE SET state = excluded.state, json = excluded.json",
-                params![rec.id, rec.created_at as i64, rec.state.as_str(), json],
-            )
-            .map_err(storage)?;
-        Ok(())
-    }
-
-    /// Fetch a maker swap.
-    pub fn get_maker_swap(&self, id: &str) -> Result<Option<MakerRecord>> {
-        self.get_json("SELECT json FROM maker_swaps WHERE id = ?1", id)
-    }
-
-    /// All maker swaps, newest first.
-    pub fn list_maker_swaps(&self) -> Result<Vec<MakerRecord>> {
-        self.list_json("SELECT json FROM maker_swaps ORDER BY created_at DESC, rowid DESC")
-    }
-
-    // ---- taker swaps ----
-
-    /// Insert or replace a taker swap.
-    pub fn put_taker_swap(&self, rec: &TakerRecord) -> Result<()> {
-        let json = serde_json::to_string(rec).map_err(storage)?;
-        let conn = self.conn.lock();
-        conn.execute(
-            "INSERT INTO taker_swaps (id, seq, json)
-             VALUES (?1, (SELECT COALESCE(MAX(seq), 0) + 1 FROM taker_swaps), ?2)
-             ON CONFLICT(id) DO UPDATE SET json = excluded.json",
-            params![rec.id, json],
-        )
-        .map_err(storage)?;
-        Ok(())
-    }
-
-    /// Fetch a taker swap.
-    pub fn get_taker_swap(&self, id: &str) -> Result<Option<TakerRecord>> {
-        self.get_json("SELECT json FROM taker_swaps WHERE id = ?1", id)
-    }
-
-    /// All taker swaps, newest first.
-    pub fn list_taker_swaps(&self) -> Result<Vec<TakerRecord>> {
-        self.list_json("SELECT json FROM taker_swaps ORDER BY seq DESC")
-    }
-
-    // ---- other engines' records ----
-
-    /// Insert or replace a JSON document of `kind` (e.g. `"xmr_maker"`): storage for swap
-    /// engines that live outside this crate (the DIVI<->XMR adaptor swap) but share its
-    /// database, file mode and single-statement write-ahead property.
-    pub fn put_doc<T: Serialize>(&self, kind: &str, id: &str, doc: &T) -> Result<()> {
-        let json = serde_json::to_string(doc).map_err(storage)?;
-        self.conn
-            .lock()
-            .execute(
-                "INSERT INTO docs (kind, id, seq, json)
-                 VALUES (?1, ?2, (SELECT COALESCE(MAX(seq), 0) + 1 FROM docs), ?3)
-                 ON CONFLICT(kind, id) DO UPDATE SET json = excluded.json",
-                params![kind, id, json],
-            )
-            .map_err(storage)?;
-        Ok(())
-    }
-
-    /// Fetch a document of `kind`.
-    pub fn get_doc<T: DeserializeOwned>(&self, kind: &str, id: &str) -> Result<Option<T>> {
-        let json: Option<String> = self
-            .conn
-            .lock()
-            .query_row(
-                "SELECT json FROM docs WHERE kind = ?1 AND id = ?2",
-                params![kind, id],
-                |r| r.get(0),
-            )
+        fn get(&self, table: Table<'_>, id: &str) -> Result<Option<String>> {
+            let conn = self.conn.lock();
+            match table {
+                Table::Quotes => {
+                    conn.query_row("SELECT json FROM quotes WHERE id = ?1", params![id], |r| {
+                        r.get(0)
+                    })
+                }
+                Table::MakerSwaps => conn.query_row(
+                    "SELECT json FROM maker_swaps WHERE id = ?1",
+                    params![id],
+                    |r| r.get(0),
+                ),
+                Table::TakerSwaps => conn.query_row(
+                    "SELECT json FROM taker_swaps WHERE id = ?1",
+                    params![id],
+                    |r| r.get(0),
+                ),
+                Table::Docs(kind) => conn.query_row(
+                    "SELECT json FROM docs WHERE kind = ?1 AND id = ?2",
+                    params![kind, id],
+                    |r| r.get(0),
+                ),
+            }
             .optional()
+            .map_err(storage)
+        }
+
+        fn list(&self, table: Table<'_>) -> Result<Vec<String>> {
+            let conn = self.conn.lock();
+            let (sql, kind) = match table {
+                Table::Quotes => ("SELECT json FROM quotes ORDER BY rowid DESC", None),
+                Table::MakerSwaps => (
+                    "SELECT json FROM maker_swaps ORDER BY created_at DESC, rowid DESC",
+                    None,
+                ),
+                Table::TakerSwaps => ("SELECT json FROM taker_swaps ORDER BY seq DESC", None),
+                Table::Docs(kind) => (
+                    "SELECT json FROM docs WHERE kind = ?1 ORDER BY seq DESC",
+                    Some(kind),
+                ),
+            };
+            let mut stmt = conn.prepare(sql).map_err(storage)?;
+            fn json(r: &rusqlite::Row<'_>) -> rusqlite::Result<String> {
+                r.get(0)
+            }
+            let rows = match kind {
+                Some(k) => stmt.query_map(params![k], json),
+                None => stmt.query_map([], json),
+            }
             .map_err(storage)?;
-        json.map(|j| serde_json::from_str(&j).map_err(storage))
-            .transpose()
+            rows.map(|j| j.map_err(storage)).collect()
+        }
     }
 
-    /// All documents of `kind`, newest first.
-    pub fn list_docs<T: DeserializeOwned>(&self, kind: &str) -> Result<Vec<T>> {
-        let conn = self.conn.lock();
-        let mut stmt = conn
-            .prepare("SELECT json FROM docs WHERE kind = ?1 ORDER BY seq DESC")
-            .map_err(storage)?;
-        let rows = stmt
-            .query_map(params![kind], |r| r.get::<_, String>(0))
-            .map_err(storage)?;
-        rows.map(|j| serde_json::from_str(&j.map_err(storage)?).map_err(storage))
-            .collect()
+    #[cfg(unix)]
+    fn create_private(path: &Path) -> Result<()> {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .map(|_| ())
+            .map_err(storage)
     }
 
-    // ---- helpers ----
-
-    fn put_json<T: Serialize>(&self, sql: &str, id: &str, v: &T) -> Result<()> {
-        let json = serde_json::to_string(v).map_err(storage)?;
-        self.conn
-            .lock()
-            .execute(sql, params![id, json])
-            .map_err(storage)?;
-        Ok(())
+    #[cfg(not(unix))]
+    fn create_private(path: &Path) -> Result<()> {
+        std::fs::File::create(path).map(|_| ()).map_err(storage)
     }
-
-    fn get_json<T: DeserializeOwned>(&self, sql: &str, id: &str) -> Result<Option<T>> {
-        let json: Option<String> = self
-            .conn
-            .lock()
-            .query_row(sql, params![id], |r| r.get(0))
-            .optional()
-            .map_err(storage)?;
-        json.map(|j| serde_json::from_str(&j).map_err(storage))
-            .transpose()
-    }
-
-    fn list_json<T: DeserializeOwned>(&self, sql: &str) -> Result<Vec<T>> {
-        let conn = self.conn.lock();
-        let mut stmt = conn.prepare(sql).map_err(storage)?;
-        let rows = stmt
-            .query_map([], |r| r.get::<_, String>(0))
-            .map_err(storage)?;
-        rows.map(|j| serde_json::from_str(&j.map_err(storage)?).map_err(storage))
-            .collect()
-    }
-}
-
-#[cfg(unix)]
-fn create_private(path: &Path) -> Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
-        .map(|_| ())
-        .map_err(storage)
-}
-
-#[cfg(not(unix))]
-fn create_private(path: &Path) -> Result<()> {
-    std::fs::File::create(path).map(|_| ()).map_err(storage)
 }
 
 mod hex33 {
@@ -486,6 +687,48 @@ mod tests {
         );
         // The hashlock tables are untouched by documents.
         assert!(store.list_maker_swaps().unwrap().is_empty());
+    }
+
+    /// The in-process backend keeps the SQLite backend's contract: upserts keep their
+    /// position, maker swaps list by `created_at` then insertion, docs stay per kind.
+    #[test]
+    fn memory_backend_matches_sqlite() {
+        fn exercise(store: &Store) -> (Vec<String>, Vec<serde_json::Value>, Option<QuoteRecord>) {
+            store.put_maker_swap(&maker_rec("a", 10)).unwrap();
+            store.put_maker_swap(&maker_rec("b", 30)).unwrap();
+            store.put_maker_swap(&maker_rec("c", 10)).unwrap();
+            store.put_maker_swap(&maker_rec("a", 10)).unwrap();
+            store
+                .put_doc("k", "x", &serde_json::json!({"n": 1}))
+                .unwrap();
+            store
+                .put_doc("k", "y", &serde_json::json!({"n": 2}))
+                .unwrap();
+            store
+                .put_doc("k", "x", &serde_json::json!({"n": 3}))
+                .unwrap();
+            store
+                .put_quote(&QuoteRecord {
+                    quote: quote("q"),
+                    used: true,
+                })
+                .unwrap();
+            let ids = store
+                .list_maker_swaps()
+                .unwrap()
+                .into_iter()
+                .map(|r| r.id)
+                .collect();
+            (
+                ids,
+                store.list_docs("k").unwrap(),
+                store.get_quote("q").unwrap(),
+            )
+        }
+        let sqlite = exercise(&Store::in_memory().unwrap());
+        let memory = exercise(&Store::with_backend(Arc::new(MemoryBackend::default())));
+        assert_eq!(sqlite.0, ["b", "c", "a"]);
+        assert_eq!(sqlite, memory);
     }
 
     #[cfg(unix)]

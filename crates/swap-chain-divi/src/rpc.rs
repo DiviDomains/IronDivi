@@ -66,10 +66,10 @@ pub struct RpcClient {
 impl RpcClient {
     /// New client for `url`.
     pub fn new(url: &str, retry: RetryPolicy) -> Self {
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .unwrap_or_default();
+        let builder = reqwest::Client::builder();
+        #[cfg(not(target_arch = "wasm32"))]
+        let builder = builder.timeout(Duration::from_secs(30));
+        let http = builder.build().unwrap_or_default();
         RpcClient {
             http,
             url: url.to_string(),
@@ -84,7 +84,7 @@ impl RpcClient {
         let mut last = RpcError::Swap(SwapError::Transient("no attempt made".into()));
         for attempt in 0..attempts {
             if attempt > 0 {
-                tokio::time::sleep(delay).await;
+                divi_swap::rt::sleep(delay).await;
                 delay *= 2;
             }
             match self.once(method, &params).await {

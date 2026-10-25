@@ -12,7 +12,15 @@
 fn main() {
     let crypto_dir = "csrc";
 
-    cc::Build::new()
+    let mut build = cc::Build::new();
+    // wasm32-unknown-unknown has no libc headers: compile freestanding against a
+    // two-function string.h (memcpy/memset come from compiler-builtins).
+    if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("wasm32") {
+        build
+            .include(format!("{crypto_dir}/wasm-sysroot"))
+            .flag("-ffreestanding");
+    }
+    build
         .files([
             format!("{crypto_dir}/blake.c"),
             format!("{crypto_dir}/bmw.c"),
@@ -38,5 +46,6 @@ fn main() {
     println!("cargo:rerun-if-changed={crypto_dir}/sph_keccak.h");
     println!("cargo:rerun-if-changed={crypto_dir}/sph_skein.h");
     println!("cargo:rerun-if-changed={crypto_dir}/sph_types.h");
+    println!("cargo:rerun-if-changed={crypto_dir}/wasm-sysroot/string.h");
     println!("cargo:rerun-if-changed=build.rs");
 }

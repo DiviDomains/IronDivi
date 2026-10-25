@@ -15,7 +15,7 @@
 use bitcoin::consensus::encode::serialize;
 use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::{All, Secp256k1, SecretKey};
-use bitcoin::{Amount, CompressedPublicKey, ScriptBuf, Transaction, WPubkeyHash, Witness};
+use bitcoin::{CompressedPublicKey, ScriptBuf, Transaction, WPubkeyHash, Witness};
 use divi_swap::SwapError;
 
 use crate::tx::{p2wpkh_sign, select_coins, skeleton, Coin, DUST_SATS};
@@ -51,8 +51,8 @@ pub fn build_send_tx(
     }
     let raw = serialize(&tx);
     for (i, c) in chosen.iter().enumerate() {
-        bitcoin::consensus::verify_script(&my_spk, i, Amount::from_sat(c.value), &raw)
-            .map_err(|e| SwapError::Other(format!("send input {i} fails consensus: {e:?}")))?;
+        crate::tx::verify_input(&my_spk, i, c.value, &raw)
+            .map_err(|e| SwapError::Other(format!("send input {i} fails consensus: {e}")))?;
     }
     Ok(tx)
 }
@@ -90,7 +90,7 @@ mod tests {
         let pk = CompressedPublicKey(sk.public_key(&secp));
         let my_spk = ScriptBuf::new_p2wpkh(&pk.wpubkey_hash());
         let raw = serialize(&tx);
-        bitcoin::consensus::verify_script(&my_spk, 0, Amount::from_sat(50_000), &raw).unwrap();
+        crate::tx::verify_input(&my_spk, 0, 50_000, &raw).unwrap();
     }
 
     #[test]

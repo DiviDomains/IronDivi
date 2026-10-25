@@ -23,7 +23,6 @@
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::api::{AcceptRequest, LegView, LockNotice, Offer, Quote, SwapView};
 use crate::backend::ChainBackend;
@@ -740,9 +739,7 @@ impl Maker {
 }
 
 fn unix_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
+    crate::rt::unix_now()
 }
 
 fn view_of(r: &MakerRecord) -> SwapView {

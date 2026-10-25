@@ -343,7 +343,8 @@ fn ltc_outpoint(o: &Outpoint) -> OutPoint {
     OutPoint::new(bitcoin::Txid::from_byte_array(o.txid.0), o.vout)
 }
 
-#[async_trait]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl ChainBackend for LtcBackend {
     fn chain(&self) -> Chain {
         Chain::Ltc

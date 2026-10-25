@@ -89,6 +89,7 @@ async fn claim_verifies_with_consensus() {
     assert_eq!(signed.txid.0, tx.compute_txid().to_byte_array());
     assert!(tx.output[0].value.to_sat() < 20_000);
     // The claim cannot be verified against a different amount (sighash commits to it).
+    #[cfg(feature = "consensus")]
     assert!(verify_htlc_spend(&tx, &h, 19_999).is_err());
 }
 
@@ -216,15 +217,18 @@ async fn wrong_preimage_rejected() {
 
     // Even if the early check were bypassed, consensus rejects a wrong preimage: build a
     // claim for a matching HTLC, then verify it against an HTLC with a different hash.
-    let (pre, good_hash) = new_preimage();
-    let good = htlc(good_hash);
-    let signed = b
-        .build_claim(&good, &outpoint(), Amount::from_sat(20_000), &pre)
-        .await
-        .unwrap();
-    let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&signed.raw).unwrap();
-    let other = htlc(hash);
-    assert!(verify_htlc_spend(&tx, &other, 20_000).is_err());
+    #[cfg(feature = "consensus")]
+    {
+        let (pre, good_hash) = new_preimage();
+        let good = htlc(good_hash);
+        let signed = b
+            .build_claim(&good, &outpoint(), Amount::from_sat(20_000), &pre)
+            .await
+            .unwrap();
+        let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&signed.raw).unwrap();
+        let other = htlc(hash);
+        assert!(verify_htlc_spend(&tx, &other, 20_000).is_err());
+    }
 }
 
 #[tokio::test]

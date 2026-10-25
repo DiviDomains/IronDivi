@@ -7,7 +7,6 @@ edition.workspace = true
 [dependencies]
 divi-primitives = { workspace = true }
 divi-crypto = { workspace = true }
-divi-storage = { workspace = true }
 divi-script = { workspace = true }
 
 serde = { workspace = true }
@@ -18,7 +17,6 @@ rand = { workspace = true }
 sha2 = { workspace = true }
 parking_lot = { workspace = true }
 tracing = { workspace = true }
-rocksdb = { workspace = true }
 
 # BIP32/BIP39
 bip32 = "0.6"
@@ -33,6 +31,13 @@ pbkdf2 = { version = "0.12", features = ["simple"] }
 argon2 = { version = "0.5", default-features = false, features = ["alloc", "zeroize"] }
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
 zeroize = "1.7"
+
+# RocksDB-backed wallet storage (persistence, wallet_db and the stake/coin
+# selection built on them) is native-only; keys, HD, addresses and signing are
+# target-neutral so the swap taker can run in wasm32.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+divi-storage = { workspace = true }
+rocksdb = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

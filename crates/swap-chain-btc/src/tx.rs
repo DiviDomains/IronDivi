@@ -142,8 +142,8 @@ pub fn build_funding_tx(
     }
     let raw = serialize(&tx);
     for (i, c) in chosen.iter().enumerate() {
-        bitcoin::consensus::verify_script(&my_spk, i, Amount::from_sat(c.value), &raw)
-            .map_err(|e| SwapError::Other(format!("funding input {i} fails consensus: {e:?}")))?;
+        verify_input(&my_spk, i, c.value, &raw)
+            .map_err(|e| SwapError::Other(format!("funding input {i} fails consensus: {e}")))?;
     }
     Ok(BuiltFunding {
         tx,
@@ -271,11 +271,33 @@ pub fn verify_htlc_spend(
     htlc: &HtlcParams,
     amount: u64,
 ) -> Result<(), SwapError> {
-    bitcoin::consensus::verify_script(
-        &htlc_script_pubkey(htlc),
-        0,
-        Amount::from_sat(amount),
-        &serialize(tx),
-    )
-    .map_err(|e| SwapError::Rejected(format!("spend fails consensus verification: {e:?}")))
+    verify_input(&htlc_script_pubkey(htlc), 0, amount, &serialize(tx))
+        .map_err(|e| SwapError::Rejected(format!("spend fails consensus verification: {e}")))
+}
+
+/// Self-check input `i` of the just-signed `raw` against the output it spends, with
+/// libbitcoinconsensus. Only transactions this process built and signed come through
+/// here; counterparty outputs are validated structurally in `htlc_output`/`find_spend`.
+///
+/// Without the `consensus` feature (wasm32: libbitcoinconsensus is C++) this is a
+/// documented no-op, so a malformed spend would surface only at broadcast time.
+#[cfg(feature = "consensus")]
+pub(crate) fn verify_input(
+    spk: &ScriptBuf,
+    i: usize,
+    value: u64,
+    raw: &[u8],
+) -> Result<(), String> {
+    bitcoin::consensus::verify_script(spk, i, Amount::from_sat(value), raw)
+        .map_err(|e| format!("{e:?}"))
+}
+
+#[cfg(not(feature = "consensus"))]
+pub(crate) fn verify_input(
+    _spk: &ScriptBuf,
+    _i: usize,
+    _value: u64,
+    _raw: &[u8],
+) -> Result<(), String> {
+    Ok(())
 }

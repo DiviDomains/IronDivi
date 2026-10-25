@@ -308,7 +308,8 @@ impl DiviBackend {
     }
 }
 
-#[async_trait]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl ChainBackend for DiviBackend {
     fn chain(&self) -> Chain {
         Chain::Divi
@@ -485,7 +486,7 @@ impl ChainBackend for DiviBackend {
                         if known {
                             break;
                         }
-                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        divi_swap::rt::sleep(Duration::from_millis(500)).await;
                         known = self.get_tx_opt(&tx.txid).await?.is_some();
                     }
                     if !known {
