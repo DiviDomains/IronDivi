@@ -3906,6 +3906,29 @@ impl Chain {
                 )
             })?;
 
+        // Divi Core verifies the kernel's signature under POS_SCRIPT_VERIFY_FLAGS
+        // before the kernel itself, and a failure scores nothing
+        // (BlockProofVerifier.cpp:76-77)
+        if let Some(kernel) = self.db.get_utxo(&coinstake.vin[0].prevout)? {
+            verify_input_with_flags(
+                coinstake,
+                0,
+                &kernel.script_pubkey,
+                kernel.value,
+                ScriptFlags::pos(),
+            )
+            .map_err(|e| {
+                StorageError::invalid_block_scored(
+                    0,
+                    format!(
+                        "VerifySignature failed on coinstake {} ({})",
+                        self.compute_txid(coinstake),
+                        e.core_message()
+                    ),
+                )
+            })?;
+        }
+
         let expected_stake_reward = coinstake_stake_reward(
             &self.block_rewards(parent.height + 1),
             self.masternodes_deprecated(parent)?,
@@ -6863,6 +6886,42 @@ mod tests {
                 .contains("bad-txns-premature-spend-of-coinbase"),
             "{err}"
         );
+        assert_eq!(err.misbehaviour_score(), 0);
+    }
+
+    /// A coinstake whose first input has a signature that does not check is
+    /// refused before the kernel is looked at, with no score: Divi Core's
+    /// CheckProofOfStake verifies the script first (BlockProofVerifier.cpp:76-77).
+    /// Connecting the block would have scored it 100.
+    #[test]
+    fn a_coinstake_with_a_damaged_kernel_signature_scores_nothing() {
+        let (chain, _dir) = create_test_chain();
+        let (genesis_hash, genesis_time) = get_genesis_info(&chain);
+        let block1 = create_child_block(genesis_hash, genesis_time);
+        let hash1 = chain.accept_block(block1.clone()).unwrap().hash;
+        let coinbase_txid =
+            chain.compute_txid(&chain.get_block(&hash1).unwrap().unwrap().transactions[0]);
+        let mut block = create_child_block(hash1, block1.header.time);
+        block.transactions.push(Transaction {
+            version: 1,
+            vin: vec![TxIn {
+                prevout: OutPoint::new(coinbase_txid, 0),
+                script_sig: Script::from_bytes(vec![0x01, 0x01]),
+                sequence: 0xffffffff,
+            }],
+            vout: vec![
+                TxOut::new(Amount::ZERO, Script::new()),
+                TxOut::new(
+                    Amount::from_sat(1251_00000000),
+                    Script::new_p2pkh(&[0x99; 20]),
+                ),
+            ],
+            lock_time: 0,
+        });
+        assert!(block.is_proof_of_stake());
+        let parent = chain.tip().unwrap();
+        let err = chain.validate_proof_of_stake(&block, &parent).unwrap_err();
+        assert!(err.to_string().contains("VerifySignature failed"), "{err}");
         assert_eq!(err.misbehaviour_score(), 0);
     }
 
