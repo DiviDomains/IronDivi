@@ -101,6 +101,15 @@ fn items(p: &[u8]) -> Vec<(u32, Hash256)> {
         .collect()
 }
 
+/// The items of a notfound; none for any other message
+fn notfound_items(command: &str, p: &[u8]) -> Vec<(u32, Hash256)> {
+    if command == "notfound" {
+        items(p)
+    } else {
+        Vec::new()
+    }
+}
+
 /// getheaders is answered as getblocks: an inv of the blocks after the
 /// locator (main.cpp:624-668), not a headers message
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -207,8 +216,8 @@ async fn getdata_of_items_held_by_no_store_is_not_found() {
 
 /// A filtered block item ends a getdata pass as a block item does, so the
 /// unknown transactions before and after it are named in two notfounds
-/// (main.cpp:300-332); with no bloom filters offered nothing is sent for the
-/// filtered block itself
+/// (main.cpp:300-332), with the block's merkleblock, and any matched
+/// transactions, sent between them
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn filtered_block_item_ends_a_getdata_pass() {
     let t = TestNode::start().await;
@@ -220,15 +229,17 @@ async fn filtered_block_item_ends_a_getdata_pass() {
     let got: Vec<(String, Vec<(u32, Hash256)>)> = replies(&mut p)
         .await
         .iter()
-        .map(|(c, m)| (c.clone(), items(m)))
+        .map(|(c, m)| (c.clone(), notfound_items(c, m)))
         .collect();
-    assert_eq!(
-        got,
-        vec![
-            ("notfound".to_string(), vec![(1, tx1)]),
-            ("notfound".to_string(), vec![(1, tx2)]),
-        ]
+    let commands: Vec<&str> = got.iter().map(|(c, _)| c.as_str()).collect();
+    assert!(got.len() >= 3, "{commands:?}");
+    assert_eq!(got[0], ("notfound".to_string(), vec![(1, tx1)]));
+    assert_eq!(commands[1], "merkleblock", "{commands:?}");
+    assert!(
+        commands[2..got.len() - 1].iter().all(|&c| c == "tx"),
+        "{commands:?}"
     );
+    assert_eq!(got[got.len() - 1], ("notfound".to_string(), vec![(1, tx2)]));
 }
 
 /// A block that invalidateblock marked failed is not sent, though it was
