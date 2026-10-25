@@ -47,8 +47,8 @@ def pair(core, iron):
 LEVEL = ("irondivid's start check reads each block, its hash, merkle root and parent link, decodes its undo data, "
          "and undoes the tip blocks in memory against the coins as divid's level 3 does "
          "(crates/divi-storage/src/chain.rs verify_recent_blocks, verify_utxo_set_at_tip); it does not run level 4, "
-         "connecting those blocks again (verifyDb.cpp:122-157), and logs 'Verified the last N blocks in M ms' "
-         "instead of 'Verifying last N blocks at level 4' and 'No coin database inconsistencies'")
+         "connecting those blocks again (verifyDb.cpp:122-157). It logs divid's 'Verifying last N blocks at level 4', "
+         "then 'Verified the last N blocks in M ms' instead of 'No coin database inconsistencies'")
 CHECKLEVEL = ("same message; divid then aborts (SIGABRT) in the shutdown after this early InitError, before the "
               "chain state exists (init.cpp:381, ChainstateManager.cpp:102); irondivid exits 1 (also KNOWN in "
               "scripts/restart-options)")
@@ -68,8 +68,6 @@ def par_shape(c, i):
 
 
 KNOWN = {
-    "the log's 'Verifying last N blocks at level L' (undamaged, default)":
-        (LEVEL, lambda c, i: c[1] and all(lv == "4" for _, lv in c[1]) and i == ("ok", [])),
     "the log's 'No coin database inconsistencies' line (undamaged, default)": (LEVEL, pair(("ok", True), ("ok", False))),
 }
 for v in ("4", "3", "0"):

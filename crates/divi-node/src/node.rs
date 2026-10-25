@@ -421,7 +421,7 @@ impl Node {
         // (init.cpp:1116-1119) on the first line; what was found, and how to
         // recover, after it and in the log
         let checked = chain
-            .verify_recent_blocks(config.check_blocks)
+            .verify_db(i64::from(config.check_blocks))
             .map_err(|e| {
                 tracing::error!("VerifyDB() : *** {}", e);
                 match damaged(e) {
@@ -654,6 +654,8 @@ impl Node {
         }
         if reindex {
             db.delete_metadata(REINDEXING_KEY).map_err(damaged)?;
+            // divid's line once its -reindex is done (init.cpp:681)
+            tracing::info!("Reindexing finished");
         }
 
         // Divi Core notes an unclean stop at start and brings the chain to the

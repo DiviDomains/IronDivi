@@ -64,7 +64,7 @@ a live node, a replay, or a datadir anyone else uses.
 
 | case | what is compared |
 |---|---|
-| an undamaged copy, default | starts; the log's `Verifying last N blocks at level L` and `No coin database inconsistencies` lines (see KNOWN) |
+| an undamaged copy, default | starts; the log's `Verifying last N blocks at level L` line, and its `No coin database inconsistencies` line (see KNOWN) |
 | `block-bad`, `block-missing`, `undo-bad` at the tip and 5 below it | refused: exit 1, `Error: Corrupted block database detected` (`init.cpp:1116-1119`, InitError `:1530`) |
 | `block-bad` at tip-100 and tip-101, default `-checkblocks` (100) | tip-100 is refused, tip-101 starts: VerifyDB checks the heights from the tip down to tip-100 (`verifyDb.cpp:83-90`) |
 | `block-bad` at height 10 with `-checkblocks=` 5, 0, -1, 200, abc | 5 starts; 0, -1, 200 and abc are refused: 0 or below checks every block (`:73-76`), more than the height checks every block, and `abc` reads as 0 |
@@ -79,6 +79,6 @@ a live node, a replay, or a datadir anyone else uses.
 
 | row | divid | irondivid | reason |
 |---|---|---|---|
-| the log's `Verifying last N blocks at level L`, `No coin database inconsistencies` | `Verifying last 100 blocks at level 4`, then `No coin database inconsistencies in last …` | neither; `Verified the last N blocks in M ms` | irondivid's check covers divid's levels 0 to 3. It reads each block, checks its hash, merkle root and parent link, decodes its undo data, and undoes the tip blocks in memory against the coins (`crates/divi-storage/src/chain.rs` `verify_recent_blocks`, `verify_utxo_set_at_tip`). It does not run level 4, connecting those blocks again (`verifyDb.cpp:122-157`) |
+| the log's `No coin database inconsistencies` | `Verifying last 100 blocks at level 4`, then `No coin database inconsistencies in last …` | the same `Verifying` line, then `Verified the last N blocks in M ms` | irondivid's check covers divid's levels 0 to 3. It reads each block, checks its hash, merkle root and parent link, decodes its undo data, and undoes the tip blocks in memory against the coins (`crates/divi-storage/src/chain.rs` `verify_recent_blocks`, `verify_utxo_set_at_tip`). It does not run level 4, connecting those blocks again (`verifyDb.cpp:122-157`) |
 | `-checklevel=` 4, 3, 0 | the error, then exit -6 | the same error, exit 1 | divid aborts (SIGABRT) in the shutdown after this early InitError, before the chain state exists (`init.cpp:381`, `ChainstateManager.cpp:102`); also KNOWN in `scripts/restart-options` |
 | `-par=…: the log` | `Using <n> threads for script verification` (`init.cpp:965`) | `Option -par is not supported by irondivid; ignored` | `-par` sets divid's script check threads (`init.cpp:801`, `TransactionInputChecker.cpp:16-26`). irondivid checks scripts on the block's own thread. What is accepted is the same: the row before it checks a block still connects |
