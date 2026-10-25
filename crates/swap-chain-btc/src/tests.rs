@@ -101,7 +101,10 @@ async fn claim_sizes_are_the_vsize_a_claim_is_charged_for() {
         .unwrap();
     let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&signed.raw).unwrap();
     // The fee is computed on the same 72-byte-signature size the ceiling divides by.
-    assert_eq!(1_000_000 - tx.output[0].value.to_sat(), 10 * sizes.claim_vsize);
+    assert_eq!(
+        1_000_000 - tx.output[0].value.to_sat(),
+        10 * sizes.claim_vsize
+    );
     let actual = tx.vsize() as u64;
     assert!(actual <= sizes.claim_vsize && actual + 1 >= sizes.claim_vsize);
 }
