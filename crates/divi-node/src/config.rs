@@ -93,6 +93,11 @@ pub struct NodeConfig {
     #[serde(default)]
     pub blocknotify: Option<String>,
 
+    /// Command run when the node raises a warning, `%s` replaced by its text
+    /// (Divi Core's -alertnotify)
+    #[serde(default)]
+    pub alertnotify: Option<String>,
+
     /// The ZMQ notifier addresses (Divi Core's -zmqpub* options)
     #[serde(default)]
     pub zmq: crate::zmq::ZmqConfig,
@@ -176,6 +181,7 @@ impl Default for NodeConfig {
             bootstrap_dir: None,
             stop_after_block_import: false,
             blocknotify: None,
+            alertnotify: None,
             zmq: Default::default(),
             walletnotify: None,
             vault: false,
@@ -476,6 +482,11 @@ pub struct P2pConfig {
     #[serde(default = "default_ban_score")]
     pub ban_score: u32,
 
+    /// Read the alerts peers send (Divi Core -alerts, default on); off, an
+    /// alert message is ignored (main.cpp:870)
+    #[serde(default = "default_alerts")]
+    pub alerts: bool,
+
     /// User agent string
     pub user_agent: String,
 
@@ -558,6 +569,10 @@ fn default_listen_on_addr() -> bool {
     true
 }
 
+fn default_alerts() -> bool {
+    true
+}
+
 fn default_ban_score() -> u32 {
     100
 }
@@ -585,6 +600,7 @@ impl Default for P2pConfig {
             force_dns_seed: false,
             ban_time: 86400, // 24 hours
             ban_score: default_ban_score(),
+            alerts: true,
             user_agent: format!("/DiviRust:{}/", env!("CARGO_PKG_VERSION")),
             proxy: None,
             connect_timeout_ms: default_connect_timeout_ms(),
@@ -681,10 +697,18 @@ pub struct RpcConfig {
     /// Serve the REST interface (Divi Core's -rest, default off)
     #[serde(default)]
     pub rest: bool,
+
+    /// Connections served at once (Divi Core's -rpcthreads, default 4)
+    #[serde(default = "default_rpc_threads")]
+    pub threads: i64,
 }
 
 fn default_rpc_keep_alive() -> bool {
     true
+}
+
+fn default_rpc_threads() -> i64 {
+    4
 }
 
 impl Default for RpcConfig {
@@ -700,6 +724,7 @@ impl Default for RpcConfig {
             allowed_ips: Vec::new(),
             keep_alive: true,
             rest: false,
+            threads: 4,
         }
     }
 }
