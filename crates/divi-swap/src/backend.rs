@@ -49,6 +49,15 @@ pub enum FeeBump {
     /// Leave the claim, and spend its output in a child paying enough for the pair: the
     /// miner selects by package feerate though replacements are not relayed (LTC).
     Cpfp,
+    /// Re-sign the identical call at the claim's own nonce with higher EIP-1559 fees
+    /// ([`ChainBackend::build_claim_replacement`]); the feerate is `maxFeePerGas` in wei. The
+    /// node takes it only if *both* `maxFeePerGas` and `maxPriorityFeePerGas` rise by its
+    /// price bump, at least 1 wei each (go-ethereum `core/txpool/legacypool/list.go`,
+    /// `list.Add`; `PriceBump` defaults to 10 in `legacypool.go`), else it answers
+    /// `replacement transaction underpriced` (`core/txpool/errors.go`). Not [`Self::Rbf`]:
+    /// the conflict is the nonce, which only the previous signed transaction carries, so a
+    /// fresh signing at a feerate would take a new nonce behind the stuck claim (USDC).
+    SameNonce,
 }
 
 /// Sizes of a maker-leg claim on one chain ([`ChainBackend::claim_sizes`]), so the taker can
@@ -205,6 +214,22 @@ pub trait ChainBackend: Send + Sync {
     ) -> Result<SignedTx> {
         Err(SwapError::Other(format!(
             "{} backend cannot build a CPFP child",
+            self.chain()
+        )))
+    }
+
+    /// Re-sign `prev`, a claim this backend built, as its replacement: the same call at the
+    /// same nonce, with `maxFeePerGas` at most `feerate` and both fees past the node's
+    /// replacement minimum ([`FeeBump::SameNonce`]). `Ok(None)` when no replacement the node
+    /// would take fits under `feerate`: the caller keeps `prev`. **Does not broadcast.**
+    /// Only for [`FeeBump::SameNonce`] backends.
+    async fn build_claim_replacement(
+        &self,
+        _prev: &SignedTx,
+        _feerate: u64,
+    ) -> Result<Option<SignedTx>> {
+        Err(SwapError::Other(format!(
+            "{} backend cannot replace a claim at its nonce",
             self.chain()
         )))
     }

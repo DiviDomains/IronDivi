@@ -183,7 +183,7 @@ pub struct FeeEscalation {
     pub start_secs_left: u32,
     /// Seconds left when the cap is reached.
     pub cap_secs_left: u32,
-    /// Highest feerate ever paid, base unit per vbyte.
+    /// Highest feerate ever paid, base unit per vbyte (on EVM, wei per gas).
     pub cap_feerate: u64,
     /// Highest multiple of the first claim's feerate ever paid.
     pub max_multiple: u64,
@@ -191,8 +191,7 @@ pub struct FeeEscalation {
 
 impl FeeEscalation {
     /// Built-in schedule for a maker leg on `chain`, or `None` where no backend can bump
-    /// (DIVI and ZEC relay no replacement and ignore CPFP; XMR has no HTLC; the EVM backend
-    /// does not replace by nonce yet). Bumping starts at twice the claim deadline
+    /// (DIVI and ZEC relay no replacement and ignore CPFP; XMR has no HTLC). Bumping starts at twice the claim deadline
     /// ([`ClaimDeadline::builtin`]) and caps out at half of it, so a claim sent at the
     /// deadline is at the cap with three BTC blocks (six LTC blocks) still to come.
     pub fn builtin(chain: Chain) -> Option<Self> {
@@ -203,7 +202,11 @@ impl FeeEscalation {
             // litoshi/vB. LTC fees sit near the relay floor; 500 is far above any backlog
             // it has had, and its blocks are four times as frequent.
             Chain::Ltc => 500,
-            Chain::Zec | Chain::Divi | Chain::Usdc | Chain::Xmr => return None,
+            // wei per gas (`maxFeePerGas`; the claim is replaced at its nonce,
+            // `FeeBump::SameNonce`). 500 gwei is above every sustained mainnet base fee
+            // since EIP-1559; on a claim of under 100 000 gas it is at most 0.05 ETH.
+            Chain::Usdc => 500_000_000_000,
+            Chain::Zec | Chain::Divi | Chain::Xmr => return None,
         };
         let m = ClaimDeadline::builtin(chain).margin_secs();
         Some(FeeEscalation {
@@ -819,10 +822,14 @@ mod tests {
             "short of the cap: a quarter step"
         );
         assert!(!btc.should_bump(10, 500, 500));
-        for chain in [Chain::Divi, Chain::Zec, Chain::Xmr, Chain::Usdc] {
+        for chain in [Chain::Divi, Chain::Zec, Chain::Xmr] {
             assert!(FeeEscalation::builtin(chain).is_none(), "{chain}");
         }
         assert!(FeeEscalation::builtin(Chain::Ltc).is_some());
+        // USDC: same-nonce replacement, feerate in wei per gas (maxFeePerGas).
+        let usdc = FeeEscalation::builtin(Chain::Usdc).expect("EVM claims escalate");
+        assert_eq!(usdc.cap_feerate, 500_000_000_000, "500 gwei");
+        assert_eq!((usdc.start_secs_left, usdc.cap_secs_left), (3600, 900));
     }
 
     #[test]

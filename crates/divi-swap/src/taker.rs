@@ -733,7 +733,14 @@ impl Taker {
             return self.enter(r, TakerState::Refunded);
         }
         let chain = r.quote.maker_chain();
-        if let (Some(esc), Some(base), Some(current), FeeBump::Rbf | FeeBump::Cpfp) = (
+        // Under `SameNonce` nothing at the claim's nonce is held here, so it is free (or a
+        // different transaction took it): `build_claim_at` signs at the next free nonce.
+        if let (
+            Some(esc),
+            Some(base),
+            Some(current),
+            FeeBump::Rbf | FeeBump::Cpfp | FeeBump::SameNonce,
+        ) = (
             self.fee_escalation(chain),
             r.claim_base_feerate,
             r.claim_feerate,
@@ -864,7 +871,8 @@ impl Taker {
     }
 
     /// Raise the fee of the unconfirmed `claim` along the chain's [`FeeEscalation`] as the
-    /// maker-leg locktime nears: replace it (RBF) or add a child (CPFP), persisting the new
+    /// maker-leg locktime nears: replace it (RBF, or at its nonce on EVM) or add a child
+    /// (CPFP), persisting the new
     /// transaction before broadcasting it and logging every bump. A no-op where the backend
     /// cannot bump, escalation is off, or the target is not yet worth a new transaction.
     async fn escalate_claim_fee(&self, r: &mut TakerRecord, claim: &SignedTx) -> Result<()> {
@@ -927,6 +935,15 @@ impl Taker {
                 package.extend(r.claim_children.iter().cloned());
                 let tx = mk.build_cpfp(&package, amount, target).await?;
                 r.claim_children.push(tx.clone());
+                tx
+            }
+            FeeBump::SameNonce => {
+                // `None`: the node's replacement minimum is above the target; keep the claim.
+                let Some(tx) = mk.build_claim_replacement(claim, target).await? else {
+                    return Ok(());
+                };
+                r.claim_replaced.push((claim.clone(), current));
+                r.maker_leg_claim = Some(tx.clone());
                 tx
             }
             FeeBump::None => unreachable!("returned above"),
