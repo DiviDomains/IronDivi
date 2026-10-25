@@ -223,6 +223,36 @@ pub fn start_node(
     );
 }
 
+/// Start a node on the ports the caller holds and wait until it answers, for a
+/// test that keeps its ports across several starts. A node that lost a port to
+/// another process is started again on new ports, which are stored through
+/// `rpc_port` and `p2p_port` for the caller's later starts and calls. Returns
+/// the running node.
+pub fn start_on(
+    datadir: &Path,
+    rpc_port: &mut u16,
+    p2p_port: &mut u16,
+    mut command: impl FnMut(u16, u16) -> Command,
+    mut up: impl FnMut(u16) -> bool,
+) -> Child {
+    for _ in 0..START_TRIES {
+        let from = log_len(datadir);
+        let mut child = command(*rpc_port, *p2p_port)
+            .spawn()
+            .expect("spawn irondivid");
+        let rpc = *rpc_port;
+        if wait_up(&mut child, datadir, from, || up(rpc)) == Started::Up {
+            return child;
+        }
+        *rpc_port = free_port();
+        *p2p_port = free_port();
+    }
+    panic!(
+        "irondivid lost a port {START_TRIES} times; its log ends:\n{}",
+        log_tail(datadir)
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,6 +265,39 @@ mod tests {
             "{ports:?}"
         );
         assert!(ports.iter().any(|p| *p != ports[0]), "{ports:?}");
+    }
+
+    /// A node that loses a port to another process is started again on new
+    /// ports, which the caller sees
+    #[test]
+    fn start_on_takes_new_ports_when_the_first_are_taken() {
+        let dir = tempfile_dir();
+        let (mut rpc, mut p2p) = (free_port(), free_port());
+        let first = (rpc, p2p);
+        let calls = std::cell::Cell::new(0);
+        let mut child = start_on(
+            &dir,
+            &mut rpc,
+            &mut p2p,
+            |_, _| {
+                calls.set(calls.get() + 1);
+                let mut cmd = Command::new("sh");
+                if calls.get() == 1 {
+                    cmd.args(["-c", "echo 'Address already in use' > debug.log; exit 1"]);
+                } else {
+                    cmd.args(["-c", "sleep 30"]);
+                }
+                cmd.current_dir(&dir);
+                cmd
+            },
+            // answers only once the second one runs: the first exits with its log
+            |_| calls.get() >= 2,
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(calls.get(), 2, "started again once");
+        assert_ne!((rpc, p2p), first, "on new ports");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// A port is handed out once per process: the bind-and-release check alone
