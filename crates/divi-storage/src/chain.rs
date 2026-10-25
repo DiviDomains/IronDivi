@@ -4407,10 +4407,15 @@ impl Chain {
                         if utxo.is_coinbase || utxo.is_coinstake {
                             let depth = i64::from(height) - i64::from(utxo.height);
                             if depth < i64::from(self.params.coinbase_maturity) {
-                                return Err(StorageError::InvalidBlock(format!(
-                                    "bad-txns-premature-spend-of-coinbase: tried to spend coinbase at depth {}, coinstake={} (tx {})",
-                                    depth, utxo.is_coinstake, txid
-                                )));
+                                // Divi Core refuses it with state.Invalid, which scores
+                                // nothing (UtxoCheckingAndUpdating.cpp:75-83)
+                                return Err(StorageError::invalid_block_scored(
+                                    0,
+                                    format!(
+                                        "bad-txns-premature-spend-of-coinbase: tried to spend coinbase at depth {}, coinstake={} (tx {})",
+                                        depth, utxo.is_coinstake, txid
+                                    ),
+                                ));
                             }
                         }
                         value_in += utxo.value;
@@ -6823,6 +6828,42 @@ mod tests {
         assert!(utxo.is_coinbase);
         assert_eq!(utxo.height, 1);
         assert_eq!(utxo.value.as_sat(), 1250_00000000);
+    }
+
+    /// Spending a coinbase or a coinstake output before it matures refuses the
+    /// block, and scores the peer nothing: Divi Core gives it state.Invalid, not
+    /// state.DoS (UtxoCheckingAndUpdating.cpp:75-83)
+    #[test]
+    fn spending_an_immature_coinbase_refuses_the_block_without_a_score() {
+        let (chain, _dir) = create_test_chain();
+        let (genesis_hash, genesis_time) = get_genesis_info(&chain);
+        let block1 = create_child_block(genesis_hash, genesis_time);
+        let hash1 = chain.accept_block(block1.clone()).unwrap().hash;
+        let coinbase_txid =
+            chain.compute_txid(&chain.get_block(&hash1).unwrap().unwrap().transactions[0]);
+
+        let mut spending_block = create_child_block(hash1, block1.header.time);
+        spending_block.transactions.push(Transaction {
+            version: 1,
+            vin: vec![TxIn {
+                prevout: OutPoint::new(coinbase_txid, 0),
+                script_sig: Script::from_bytes(vec![]),
+                sequence: 0xffffffff,
+            }],
+            vout: vec![TxOut::new(
+                Amount::from_sat(1249_00000000),
+                Script::new_p2pkh(&[0x99; 20]),
+            )],
+            lock_time: 0,
+        });
+        seal(&mut spending_block);
+        let err = chain.accept_block(spending_block).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("bad-txns-premature-spend-of-coinbase"),
+            "{err}"
+        );
+        assert_eq!(err.misbehaviour_score(), 0);
     }
 
     #[test]
