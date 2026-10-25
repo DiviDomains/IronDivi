@@ -68,7 +68,8 @@ divid, but their masternodes were set up and started by different controllers.
 
 How a row compares:
 - the same outcome; an error with the same code and first line;
-- a result with the same fields, JSON types and values, the members compared as sets (see KNOWN for their order).
+- a result with the same fields, JSON types and values, the members compared as sets; the order of the members
+  is compared once, for `setupmasternode`.
 - Left out, because they change from one moment to the next: `lastseen`, `activetime`, `lastpaid`, `sigtime`,
   `timestamp`.
 - `mnsync status` is compared by its fields and by `IsBlockchainSynced` and `currentMasternodeSyncStatus`; its counters
