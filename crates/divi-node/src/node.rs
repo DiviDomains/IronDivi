@@ -1063,6 +1063,8 @@ impl Node {
                                         .send_to_peer(peer_id, NetworkMessage::GetData(masternode_items))
                                         .await;
                                 }
+                                // Sporks are announced by inv as well
+                                spork_manager.handle_inv(peer_id, &items).await;
                             }
                             NetworkMessage::NotFound(items) => {
                                 let items: Vec<_> = items
@@ -1123,6 +1125,19 @@ impl Node {
                                             }
                                             None => not_found.push(item),
                                         },
+                                        // A spork held is sent, else named in the notfound
+                                        // (main.cpp:187-189, :337-346)
+                                        divi_network::InvType::Spork => {
+                                            match spork_manager.spork_by_hash(&item.hash) {
+                                                Some(spork) => {
+                                                    let msg = NetworkMessage::Spork(spork);
+                                                    let _ = peer_manager
+                                                        .send_block_to_peer(peer_id, msg)
+                                                        .await;
+                                                }
+                                                None => not_found.push(item),
+                                            }
+                                        }
                                         _ => {}
                                     }
                                 }
