@@ -1759,7 +1759,10 @@ impl Chain {
             let within_depth = self.params.max_reorg_depth.is_none_or(|depth| {
                 i64::from(self.height()) - i64::from(index.height) < i64::from(depth)
             });
+            // CBlockIndex::IsValid(BLOCK_VALID_SCRIPTS): never a block that
+            // failed, as one invalidateblock marks (chain.h:313-319)
             if !(index.status.contains(BlockStatus::VALID_SCRIPTS)
+                && !index.failed()
                 && best_header_height > 0
                 && within_depth)
             {

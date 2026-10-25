@@ -394,6 +394,9 @@ pub struct BlockSync {
     /// Peers sent the getblocks that starts a sync when they connected
     /// (Divi Core CNodeState::Syncing, NodeState.cpp)
     sync_started_peers: RwLock<HashSet<PeerId>>,
+    /// Per peer: the blocks a getblocks was sent up to after it sent a block
+    /// whose parent is unknown (Divi Core CNode::vBlockRequested)
+    blocks_requested: RwLock<HashMap<PeerId, Vec<Hash256>>>,
 }
 
 /// Sync statistics
@@ -437,6 +440,7 @@ impl BlockSync {
             stalled_sync_peers: RwLock::new(HashSet::new()),
             side_chain_tip: RwLock::new(None),
             sync_started_peers: RwLock::new(HashSet::new()),
+            blocks_requested: RwLock::new(HashMap::new()),
         })
     }
 
@@ -613,6 +617,7 @@ impl BlockSync {
     /// Remove peer from tracking
     pub fn remove_peer(&self, peer_id: PeerId) {
         self.sync_started_peers.write().remove(&peer_id);
+        self.blocks_requested.write().remove(&peer_id);
         let removed_height = self.peer_heights.write().remove(&peer_id);
         let remaining_peers = self.peer_heights.read().len();
 
@@ -1285,6 +1290,23 @@ impl BlockSync {
         }
         debug!("Received block {} from peer {}", hash, peer_id);
 
+        // A block not asked for whose parent is unknown: Divi Core asks the
+        // peer for the blocks up to it with a getblocks, or up to its parent
+        // when it asked for this block that way before (main.cpp:822-833).
+        // A block asked for may come before its parent from a download in
+        // parallel; it is kept for it
+        let requested = self.blocks_in_flight.read().contains_key(&hash);
+        if !requested
+            && self
+                .chain
+                .get_block_index(&block.header.prev_block)
+                .ok()
+                .flatten()
+                .is_none()
+        {
+            self.ask_up_to(peer_id, hash, block.header.prev_block).await;
+        }
+
         // Track chain height before processing to detect newly connected blocks
         let height_before = self.chain.height();
 
@@ -1336,6 +1358,28 @@ impl BlockSync {
 
         // Emit progress
         let _ = self.progress_tx.send(self.progress());
+    }
+
+    /// The getblocks Divi Core sends for a block whose parent it does not
+    /// know: up to the block, or up to its parent once it has asked for the
+    /// block (main.cpp:822-833)
+    async fn ask_up_to(&self, peer_id: PeerId, hash: Hash256, prev: Hash256) {
+        let stop = {
+            let mut requested = self.blocks_requested.write();
+            let asked = requested.entry(peer_id).or_default();
+            // Kept bounded: a peer could send unknown blocks without end
+            if asked.len() >= 1000 {
+                asked.clear();
+            }
+            let stop = if asked.contains(&hash) { prev } else { hash };
+            asked.push(stop);
+            stop
+        };
+        let msg =
+            NetworkMessage::GetBlocks(GetHeadersMessage::new(self.build_block_locator(), stop));
+        if let Err(e) = self.peer_manager.send_to_peer(peer_id, msg).await {
+            warn!("Failed to send getblocks to peer {}: {}", peer_id, e);
+        }
     }
 
     /// Try to connect downloaded blocks to the chain

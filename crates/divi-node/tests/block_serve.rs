@@ -22,8 +22,8 @@ use divi_primitives::script::Script;
 use divi_primitives::transaction::{Transaction, TxIn, TxOut};
 use std::time::Duration;
 
-/// A work block on the node's tip; its hash
-fn mine(t: &TestNode) -> Hash256 {
+/// A work block on the node's tip, not given to the node
+fn next_block(t: &TestNode) -> Block {
     let chain = t.node.chain();
     let tip = chain.tip().unwrap();
     let mut tag = divi_storage::bip34_height_script(tip.height + 1);
@@ -48,8 +48,14 @@ fn mine(t: &TestNode) -> Hash256 {
     while divi_crypto::compute_block_hash(&block.header) > target {
         block.header.nonce += 1;
     }
+    block
+}
+
+/// A work block on the node's tip; its hash
+fn mine(t: &TestNode) -> Hash256 {
+    let block = next_block(t);
     let hash = divi_crypto::compute_block_hash(&block.header);
-    chain.accept_block(block).unwrap();
+    t.node.chain().accept_block(block).unwrap();
     hash
 }
 
@@ -176,4 +182,110 @@ async fn getdata_answers_in_order_and_names_only_missing_transactions() {
             "block 2".to_string(),
         ]
     );
+}
+
+/// A getdata of the known types the node holds nothing for (tx lock, scan
+/// error, budget, quorum) is answered with a notfound naming them, in order:
+/// Divi Core finds them neither in its relay map nor in PushKnownInventory
+/// (main.cpp:168-211, :321-327, :337-345)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn getdata_of_items_held_by_no_store_is_not_found() {
+    let t = TestNode::start().await;
+    let asked: Vec<(u32, Hash256)> = [4u32, 5, 8, 9, 10, 11, 12, 13]
+        .iter()
+        .map(|&k| (k, Hash256::from_bytes([k as u8; 32])))
+        .collect();
+    let mut p = peer(&t, "127.0.0.3").await;
+    p.send("getdata", &getdata(&asked)).await;
+    let got: Vec<(String, Vec<(u32, Hash256)>)> = replies(&mut p)
+        .await
+        .iter()
+        .map(|(c, m)| (c.clone(), items(m)))
+        .collect();
+    assert_eq!(got, vec![("notfound".to_string(), asked)]);
+}
+
+/// A filtered block item ends a getdata pass as a block item does, so the
+/// unknown transactions before and after it are named in two notfounds
+/// (main.cpp:300-332); with no bloom filters offered nothing is sent for the
+/// filtered block itself
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn filtered_block_item_ends_a_getdata_pass() {
+    let t = TestNode::start().await;
+    let b1 = mine(&t);
+    let (tx1, tx2) = (Hash256::from_bytes([1; 32]), Hash256::from_bytes([2; 32]));
+    let mut p = peer(&t, "127.0.0.3").await;
+    p.send("getdata", &getdata(&[(1, tx1), (3, b1), (1, tx2)]))
+        .await;
+    let got: Vec<(String, Vec<(u32, Hash256)>)> = replies(&mut p)
+        .await
+        .iter()
+        .map(|(c, m)| (c.clone(), items(m)))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            ("notfound".to_string(), vec![(1, tx1)]),
+            ("notfound".to_string(), vec![(1, tx2)]),
+        ]
+    );
+}
+
+/// A block that invalidateblock marked failed is not sent, though it was
+/// fully validated: Divi Core's IsValid(BLOCK_VALID_SCRIPTS) is false for a
+/// failed block (main.cpp:223-239, chain.h:313-319)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn getdata_of_an_invalidated_block_gets_nothing() {
+    let t = TestNode::start().await;
+    let _b1 = mine(&t);
+    let b2 = mine(&t);
+    t.node.chain().invalidate_block(&b2).unwrap();
+    let mut p = peer(&t, "127.0.0.3").await;
+    p.send("getdata", &getdata(&[(2, b2)])).await;
+    let got: Vec<String> = replies(&mut p).await.into_iter().map(|(c, _)| c).collect();
+    assert!(got.is_empty(), "{got:?}");
+}
+
+/// A headers message is not read: Divi Core reads one only with
+/// headers-first syncing, which no network has (main.cpp:669,
+/// chainparams.cpp:251, :360, :440), so a header of a block the node lacks
+/// is not asked for, and an empty one is not answered either
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn headers_message_is_not_read() {
+    let t = TestNode::start().await;
+    mine(&t);
+    let header = divi_primitives::serialize::serialize(&next_block(&t).header);
+    let mut p = peer(&t, "127.0.0.3").await;
+    let mut one = compact(1);
+    one.extend_from_slice(&header);
+    one.push(0);
+    p.send("headers", &one).await;
+    p.send("headers", &compact(0)).await;
+    let got: Vec<String> = replies(&mut p).await.into_iter().map(|(c, _)| c).collect();
+    assert!(got.is_empty(), "{got:?}");
+}
+
+/// A block whose parent is unknown is answered with a getblocks up to it,
+/// and the same block again with one up to its parent: Divi Core asks the
+/// peer that way for what it is missing (main.cpp:822-833)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn block_with_an_unknown_parent_is_answered_with_getblocks() {
+    let t = TestNode::start().await;
+    mine(&t);
+    let mut block = next_block(&t);
+    let parent = Hash256::from_bytes([0x6b; 32]);
+    block.header.prev_block = parent;
+    let hash = divi_crypto::compute_block_hash(&block.header);
+    let bytes = divi_primitives::serialize::serialize(&block);
+    let mut p = peer(&t, "127.0.0.3").await;
+    let mut stops = Vec::new();
+    for _ in 0..2 {
+        p.send("block", &bytes).await;
+        for (c, m) in replies(&mut p).await {
+            if c == "getblocks" {
+                stops.push(Hash256::from_bytes(m[m.len() - 32..].try_into().unwrap()));
+            }
+        }
+    }
+    assert_eq!(stops, vec![hash, parent]);
 }

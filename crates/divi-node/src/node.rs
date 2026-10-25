@@ -208,13 +208,45 @@ pub fn serve_getdata(
                 }
                 queue.pop_front();
             }
+            // A filtered block is a block request to Divi Core: with no bloom
+            // filters offered nothing is sent for it, but like a block it ends
+            // the pass, whose notfound goes out now (main.cpp:300-332)
+            divi_network::InvType::FilteredBlock => {
+                queue.pop_front();
+                if !not_found.is_empty() {
+                    let msg = NetworkMessage::NotFound(std::mem::take(&mut not_found));
+                    let _ = peer_manager.try_send_to_peer(peer_id, msg);
+                }
+            }
+            // A type outside 1..15 is not known and gets nothing (main.cpp:321,
+            // protocol.cpp:146-149)
+            divi_network::InvType::Unknown => {
+                queue.pop_front();
+            }
+            // The other known types: Divi Core holds nothing to send for them,
+            // neither in its relay map nor in PushKnownInventory, so they are
+            // not found (main.cpp:168-211, :321-327, net.cpp:1565-1575)
             _ => {
+                not_found.push(item);
                 queue.pop_front();
             }
         }
     }
     if !not_found.is_empty() {
         let _ = peer_manager.try_send_to_peer(peer_id, NetworkMessage::NotFound(not_found));
+    }
+}
+
+/// A peer's message the node is handling, marked taken when dropped
+struct Taken<'a> {
+    peer_manager: &'a PeerManager,
+    peer_id: divi_network::PeerId,
+    size: u64,
+}
+
+impl Drop for Taken<'_> {
+    fn drop(&mut self) {
+        self.peer_manager.message_taken(self.peer_id, self.size);
     }
 }
 
@@ -1197,6 +1229,8 @@ impl Node {
             // Masternode broadcasts and pings already asked for (Divi Core's
             // AlreadyHave for MSG_MASTERNODE_ANNOUNCE / _PING)
             let mut masternode_items_asked: HashSet<Hash256> = HashSet::new();
+            // Transaction lock requests and votes already asked for
+            let mut lock_items_asked: HashSet<Hash256> = HashSet::new();
             // The peers known to have each masternode item: it came from them
             // in an inv, or went to them in one (CNode::setInventoryKnown)
             let mut masternode_items_known: HashMap<[u8; 32], HashSet<u64>> = HashMap::new();
@@ -1244,9 +1278,19 @@ impl Node {
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 };
-                if let PeerEvent::Message { peer_id, size, .. } = &event {
-                    peer_manager.message_taken(*peer_id, *size);
-                }
+                // Taken once handled, at the end of this turn of the loop: until
+                // then it counts against the peer's receive limits, and the
+                // connection's own answers to later messages wait for it (Divi
+                // Core erases a message from vRecvMsg after ProcessMessage,
+                // main.cpp:1072-1077)
+                let _taken = match &event {
+                    PeerEvent::Message { peer_id, size, .. } => Some(Taken {
+                        peer_manager: &peer_manager,
+                        peer_id: *peer_id,
+                        size: *size,
+                    }),
+                    _ => None,
+                };
                 match event {
                     PeerEvent::Connected {
                         peer_id,
@@ -1310,8 +1354,17 @@ impl Node {
                         }
 
                         match message {
+                            // Divi Core reads a headers message only with
+                            // headers-first syncing, which no network has, so it
+                            // never acts on one or answers it (main.cpp:669,
+                            // chainparams.cpp:251, :360, :440); nor does any node
+                            // send one, as getheaders is answered with an inv
                             NetworkMessage::Headers(headers) => {
-                                block_sync.handle_headers(peer_id, headers).await;
+                                tracing::debug!(
+                                    "headers ({} entries) from peer {} not read",
+                                    headers.len(),
+                                    peer_id
+                                );
                             }
                             NetworkMessage::Block(block) => {
                                 if history.deliver(
@@ -1407,6 +1460,30 @@ impl Node {
                                 if !masternode_items.is_empty() {
                                     let _ = peer_manager
                                         .send_to_peer(peer_id, NetworkMessage::GetData(masternode_items))
+                                        .await;
+                                }
+                                // Divi Core never has a transaction lock request or
+                                // vote (AlreadyHave, main.cpp:143-146), so it asks for
+                                // each one announced (AskFor, main.cpp:580-581); what
+                                // comes back is not read (main.cpp:963-966)
+                                if lock_items_asked.len() > 100_000 {
+                                    lock_items_asked.clear();
+                                }
+                                let lock_items: Vec<_> = items
+                                    .iter()
+                                    .filter(|i| {
+                                        matches!(
+                                            i.inv_type,
+                                            divi_network::message::InvType::TxLockRequest
+                                                | divi_network::message::InvType::TxLockVote
+                                        )
+                                    })
+                                    .filter(|i| lock_items_asked.insert(i.hash))
+                                    .cloned()
+                                    .collect();
+                                if !lock_items.is_empty() {
+                                    let _ = peer_manager
+                                        .send_to_peer(peer_id, NetworkMessage::GetData(lock_items))
                                         .await;
                                 }
                                 // Sporks are announced by inv as well
