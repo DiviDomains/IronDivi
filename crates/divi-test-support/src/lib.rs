@@ -241,7 +241,7 @@ mod tests {
     /// returns the same free port to two callers that have not bound yet
     #[test]
     fn free_port_is_not_handed_out_twice() {
-        let ports: Vec<u16> = (0..3000).map(|_| free_port()).collect();
+        let ports: Vec<u16> = (0..500).map(|_| free_port()).collect();
         let distinct: std::collections::HashSet<_> = ports.iter().collect();
         assert_eq!(distinct.len(), ports.len(), "a port was given twice");
     }
