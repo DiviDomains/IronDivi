@@ -2631,7 +2631,7 @@ mod tests {
             vec![(Chain::Btc, lock_of(&s))],
             "deadline not passed"
         );
-        c.advance_time(3_600);
+        c.advance_time(3_601); // MTP past the locktime: the refund is final
         let err = refund().await.unwrap_err();
         assert!(err.to_string().contains("missing inputs"), "{err:#}");
         assert_eq!(held(&db), vec![], "past the deadline and nowhere: released");
@@ -2643,7 +2643,7 @@ mod tests {
         let db = dir.path().join("cli.db");
         let (c, b) = btc_chain();
         let s = locked_swap(&db, b.as_ref(), "slow", TakerState::Locked, 1).await;
-        c.advance_time(3_600); // the lock never confirmed, but it is still in the mempool
+        c.advance_time(3_601); // past the locktime; the lock never confirmed but is in the mempool
         let out = refund_command(&db, "btc", "slow", b.clone()).await.unwrap();
         assert_eq!(out, "Refunded", "the refund spends the pending lock");
         assert_eq!(held(&db), vec![(Chain::Btc, lock_of(&s))]);
