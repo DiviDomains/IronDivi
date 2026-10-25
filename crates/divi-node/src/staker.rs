@@ -922,9 +922,8 @@ impl Staker {
         overrides: &BlockOverrides,
     ) -> Result<Hash256, GenerateBlockError> {
         use GenerateBlockError::{Failed, Refused};
-        if self.wallet.is_locked() {
-            return Err(Failed("wallet is locked".to_string()));
-        }
+        // A locked wallet mines as in setgenerate: the same createNewBlock
+        // (rpcmining.cpp:200-208)
         let _producing = self.producing.lock();
         let tip = self
             .chain

@@ -55,8 +55,8 @@ impl Drop for KillOnDrop {
     }
 }
 
-/// A node with 100 work blocks and an encrypted wallet, locked
-fn locked_node(dir: &std::path::Path) -> (KillOnDrop, u16) {
+/// A node with `blocks` work blocks and an encrypted wallet, locked
+fn locked_node(dir: &std::path::Path, blocks: u32) -> (KillOnDrop, u16) {
     let (child, rpc_port, _) = start_node(
         dir,
         |rpc_port, p2p_port| {
@@ -76,7 +76,7 @@ fn locked_node(dir: &std::path::Path) -> (KillOnDrop, u16) {
         |rpc_port| rpc(rpc_port, "getblockcount", serde_json::json!([])).is_some(),
     );
     let node = KillOnDrop(child);
-    ok(rpc_port, "setgenerate", serde_json::json!([100]));
+    ok(rpc_port, "setgenerate", serde_json::json!([blocks]));
     ok(
         rpc_port,
         "encryptwallet",
@@ -97,7 +97,7 @@ fn error(port: u16, method: &str, params: Value) -> Value {
 #[test]
 fn setgenerate_on_a_locked_wallet_fails_in_getkey_for_a_stake() {
     let dir = tempfile::tempdir().unwrap();
-    let (_node, port) = locked_node(dir.path());
+    let (_node, port) = locked_node(dir.path(), 100);
 
     let err = error(port, "setgenerate", serde_json::json!([1]));
     assert_eq!(err["code"], -1, "{err}\n{}", log_tail(dir.path()));
@@ -112,4 +112,21 @@ fn setgenerate_on_a_locked_wallet_fails_in_getkey_for_a_stake() {
     );
     ok(port, "setgenerate", serde_json::json!([1]));
     assert_eq!(ok(port, "getblockcount", serde_json::json!([])), 101);
+}
+
+/// generateblock makes its block as setgenerate does (rpcmining.cpp:200-208,
+/// minter.createNewBlock): on a locked wallet a work block pays a keypool key,
+/// and a stake block fails in GetKey
+#[test]
+fn generateblock_on_a_locked_wallet_mines_as_setgenerate() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_node, port) = locked_node(dir.path(), 99);
+
+    ok(port, "generateblock", serde_json::json!([{}]));
+    assert_eq!(ok(port, "getblockcount", serde_json::json!([])), 100);
+
+    let err = error(port, "generateblock", serde_json::json!([{}]));
+    assert_eq!(err["code"], -1, "{err}\n{}", log_tail(dir.path()));
+    assert_eq!(err["message"], "GetKey: DecryptHDChainSeed failed", "{err}");
+    assert_eq!(ok(port, "getblockcount", serde_json::json!([])), 100);
 }
