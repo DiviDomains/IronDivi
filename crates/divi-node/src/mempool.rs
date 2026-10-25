@@ -301,6 +301,11 @@ pub struct Mempool {
     /// Divi Core's free-transaction rate limiter: decayed byte count and the
     /// time it was last updated
     free_limiter: parking_lot::Mutex<(f64, i64)>,
+
+    /// Held for each add, and by a wallet send from picking its coins to its
+    /// commit (`with_admission`), as Divi Core's cs_main is (main.cpp:726,
+    /// rpcserver.cpp:1060-1093); reentrant, so the send's own add goes through
+    admission: parking_lot::ReentrantMutex<()>,
 }
 
 impl Mempool {
@@ -319,6 +324,7 @@ impl Mempool {
             tip_height: RwLock::new(None),
             validator: RwLock::new(None),
             free_limiter: parking_lot::Mutex::new((0.0, 0)),
+            admission: parking_lot::ReentrantMutex::new(()),
         }
     }
 
@@ -407,6 +413,7 @@ impl Mempool {
     }
 
     fn add_with(&self, tx: Transaction, fee: Amount, origin: Origin) -> Result<Hash256, NodeError> {
+        let _admission = self.admission.lock();
         let txid = tx.txid();
 
         // Check if already exists
@@ -1002,6 +1009,11 @@ impl divi_rpc::blockchain::MempoolProvider for Mempool {
 
     fn is_spent(&self, outpoint: &divi_primitives::transaction::OutPoint) -> bool {
         self.is_spent(&outpoint.txid, outpoint.vout)
+    }
+
+    fn with_admission(&self, f: &mut dyn FnMut()) {
+        let _admission = self.admission.lock();
+        f()
     }
 
     fn get_tx_infos(&self) -> Vec<divi_rpc::blockchain::MempoolTxInfo> {
