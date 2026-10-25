@@ -133,6 +133,14 @@ pub trait MempoolProvider: Send + Sync {
         false
     }
 
+    /// Run `f` while no other transaction can enter the pool. Divi Core runs a
+    /// wallet send holding cs_main (rpcserver.cpp:452-454, :1060-1093), which
+    /// its `tx` handler takes too (main.cpp:726): the send picks its coins and
+    /// commits with no relayed transaction accepted in between.
+    fn with_admission(&self, f: &mut dyn FnMut()) {
+        f()
+    }
+
     /// The pool's copy of a transaction, if it holds `txid`
     fn get_transaction(
         &self,
@@ -704,7 +712,7 @@ impl BlockchainRpc {
                 "hash": hash.to_string(),
                 "historyvalidated": false
             })),
-            "warnings": ""
+            "warnings": crate::warnings::status_bar()
         }))
     }
 
@@ -731,7 +739,7 @@ impl BlockchainRpc {
             "paytxfee": 0.0,
             "relayfee": self.relay_fee(),
             "staking status": "Staking Not Active",
-            "errors": ""
+            "errors": crate::warnings::status_bar()
         }))
     }
 
@@ -1509,7 +1517,7 @@ impl BlockchainRpc {
         Ok(json!({
             "blocks": blocks,
             "difficulty": difficulty,
-            "errors": "",
+            "errors": crate::warnings::status_bar(),
             "pooledtx": pooled_tx,
             "testnet": matches!(self.chain.network_type(), NetworkType::Testnet),
             "chain": match self.chain.network_type() {

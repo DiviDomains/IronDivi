@@ -46,10 +46,6 @@ def pair(core, iron):
 # Rows where irondivid differs on purpose: (reason, shape); shape is true only
 # for the difference described, so a KNOWN row that matches divid, or differs in
 # another way, is a FAIL
-SPORKCOUNT = ("divid sends sporkcount, ping and getblocks as soon as it has read the peer's version "
-              "(main.cpp:418-420, SendMessages runs for a peer with a version: Node.cpp:1043-1069, main.cpp:1130-1142); "
-              "irondivid sends them once the peer's verack is in (crates/divi-node/src/node.rs PeerEvent::Connected). "
-              "The same messages follow the verack, which every node sends at once")
 NO_BLOOM = ("irondivid offers no bloom filters (crates/divi-node/src/node.rs bloom arm), so it does not set "
             "NODE_BLOOM (4) and scores a filter message 100, as divid run with -peerbloomfilters=0 does "
             "(net.cpp:1722, main.cpp:892-898) [by design]")
@@ -57,12 +53,6 @@ PARTIAL = ("divid sets the peer's version and services before it reads the rest 
            "that fails to parse after addrMe leaves them set; irondivid keeps nothing from a version that does "
            "not parse. Both send the same reject and keep the connection")
 KNOWN = {
-    "handshake: commands before our verack (first 3 s)": (SPORKCOUNT, lambda c, i: (
-        c[:3] == ["version", "verack", ["sporkcount", 0]] and i == ["version", "verack"])),
-    "handshake: commands in the first 6 s, as a set": (
-        "irondivid also sends sendheaders after the handshake (BIP 130, crates/divi-network/src/connection.rs "
-        "Connection::run); divid has no handler for it and ignores it, unscored (main.cpp:963-966)",
-        lambda c, i: set(i) - set(c) == {"sendheaders"} and set(c) <= set(i)),
     "handshake: version: services": (NO_BLOOM, pair(5, 1)),
     "handshake: version: addr_from": (NO_BLOOM, lambda c, i: c.get("services") == 5 and i == dict(c, services=1)),
     "handshake: version: subver": (

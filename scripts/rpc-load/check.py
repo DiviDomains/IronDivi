@@ -30,18 +30,12 @@ ANSWER_SECS = 3
 # Differences irondivid has on purpose, by row name; each is listed in README.md
 # with divid's source line. A KNOWN row whose outcome starts to match divid is a
 # FAIL, so the list stays true.
-THREADS = ("divid serves -rpcthreads connections at a time, each to its end, keep-alive "
-           "included (rpcserver.cpp:578-622, :756, :1000-1033); irondivid serves each "
-           "connection on its own task and accepts -rpcthreads without using it")
 CS_MAIN = ("divid runs a call its table does not mark thread-safe only while it holds cs_main, which it "
            "tries for every 50 ms (rpcserver.cpp:1072-1096): keypoolrefill (rpcserver.cpp:442) holds it while it "
            "makes the keys, so getblockcount (rpcserver.cpp:345) waits for the long call; irondivid runs calls "
            "side by side and its chain reads take no wallet or miner lock")
 KNOWN = {
     "a short call while a long call runs": CS_MAIN,
-    "rpcthreads=1: a short call while a long call runs": THREADS + "; and " + CS_MAIN,
-    "rpcthreads=1: a call while another client holds its connection open": THREADS,
-    "rpcthreads=2: a call while two clients hold their connections open": THREADS,
 }
 
 fails = 0

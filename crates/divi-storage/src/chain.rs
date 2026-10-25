@@ -22,6 +22,7 @@ use crate::search_index::{self, SearchIndex};
 use crate::txindex::{TxIndex, TxLocation};
 use crate::undo::BlockUndo;
 use crate::utxo::Utxo;
+use divi_consensus::spork_values::ConsensusSporks;
 use divi_crypto::{compute_block_hash, compute_merkle_root, hash256};
 use divi_primitives::amount::Amount;
 use divi_primitives::block::Block;
@@ -329,6 +330,16 @@ pub struct TreasuryDue {
 /// BlockSubsidyProvider::updateTreasuryReward, BlockIncentivesPopulator.cpp:31-42:
 /// every network but mainnet pays testnet's addresses)
 pub fn treasury_payments_due(network_type: NetworkType, height: u32) -> Option<TreasuryDue> {
+    treasury_payments_due_with(network_type, height, None)
+}
+
+/// [`treasury_payments_due`] with the network's sporks, which set the per-block
+/// rewards the payment adds up
+pub fn treasury_payments_due_with(
+    network_type: NetworkType,
+    height: u32,
+    sporks: Option<&divi_consensus::SporkView>,
+) -> Option<TreasuryDue> {
     use divi_consensus::treasury;
     let (treasury_cycle, treasury_start, lottery_cycle, halving_interval) = match network_type {
         NetworkType::Mainnet => (
@@ -360,11 +371,13 @@ pub fn treasury_payments_due(network_type: NetworkType, height: u32) -> Option<T
     }
     let is_mainnet = matches!(network_type, NetworkType::Mainnet);
     let payment_cycle = treasury::get_treasury_payment_cycle(height, treasury_cycle, lottery_cycle);
-    let (treasury_amount, charity_amount) = divi_consensus::calculate_weighted_treasury_payment(
-        height,
-        payment_cycle,
-        halving_interval,
-    );
+    let (treasury_amount, charity_amount) =
+        divi_consensus::calculate_weighted_treasury_payment_with(
+            height,
+            payment_cycle,
+            halving_interval,
+            sporks,
+        );
     Some(TreasuryDue {
         treasury: (treasury::get_treasury_script(is_mainnet), treasury_amount),
         charity: (treasury::get_charity_script(is_mainnet), charity_amount),
@@ -380,7 +393,17 @@ pub fn check_treasury_payments(
     block: &Block,
     height: u32,
 ) -> Result<(), StorageError> {
-    let Some(due) = treasury_payments_due(network_type, height) else {
+    check_treasury_payments_with(network_type, block, height, None)
+}
+
+/// [`check_treasury_payments`] with the network's sporks
+pub fn check_treasury_payments_with(
+    network_type: NetworkType,
+    block: &Block,
+    height: u32,
+    sporks: Option<&divi_consensus::SporkView>,
+) -> Result<(), StorageError> {
+    let Some(due) = treasury_payments_due_with(network_type, height, sporks) else {
         // Not a treasury block - nothing to validate
         return Ok(());
     };
@@ -515,7 +538,13 @@ pub struct Chain {
     importing: std::sync::atomic::AtomicBool,
     /// What block script verification has checked, logged periodically
     script_stats: ScriptStats,
+    /// Sporks 13 to 16, which set block values, payments and the lottery ticket
+    consensus_sporks: SharedSporks,
 }
+
+/// The entries of sporks 13 to 16, shared between the spork manager that holds
+/// them and the chain that reads them
+pub type SharedSporks = Arc<RwLock<ConsensusSporks>>;
 
 /// Metadata marker: the one-time height index repair has run on this datadir.
 const HEIGHT_INDEX_REPAIR_KEY: &[u8] = b"height_index_repair_v1";
@@ -581,6 +610,7 @@ impl Chain {
             ibd_mode: RwLock::new(true),
             importing: std::sync::atomic::AtomicBool::new(false),
             script_stats: ScriptStats::default(),
+            consensus_sporks: Arc::new(RwLock::new(ConsensusSporks::default())),
         };
 
         crate::datadir::check_network(&chain.db, &chain.params)?;
@@ -4601,7 +4631,65 @@ impl Chain {
         block: &Block,
         index: &BlockIndex,
     ) -> Result<(), StorageError> {
-        check_treasury_payments(self.network_type(), block, index.height)
+        self.with_sporks(|sporks| {
+            check_treasury_payments_with(self.network_type(), block, index.height, sporks)
+        })
+    }
+
+    /// The entries of sporks 13 to 16, to be filled by the spork manager
+    pub fn consensus_sporks(&self) -> SharedSporks {
+        Arc::clone(&self.consensus_sporks)
+    }
+
+    /// The time of the block at `height` as sporks read it: that of the block in
+    /// the active chain, else the time now (Divi Core `GetBlockTime`,
+    /// spork.cpp:84-88; a block being connected is not in the active chain yet)
+    fn spork_block_time(&self, height: u32) -> i64 {
+        if height <= self.height() {
+            if let Ok(Some(index)) = self.db.get_block_index_by_height(height) {
+                return index.time as i64;
+            }
+        }
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
+    }
+
+    /// Run `f` with the sporks consensus reads
+    pub fn with_sporks<R>(&self, f: impl FnOnce(Option<&divi_consensus::SporkView>) -> R) -> R {
+        let sporks = self.consensus_sporks.read();
+        let time = |height: u32| self.spork_block_time(height);
+        let view = divi_consensus::SporkView {
+            sporks: &sporks,
+            block_time: &time,
+        };
+        f(Some(&view))
+    }
+
+    /// What the lottery asks a coinstake to pay at `height` to hold a ticket, in
+    /// satoshis: spork 16's value in force there, else 10,000 DIVI
+    pub fn lottery_ticket_minimum(&self, height: u32) -> i64 {
+        let time = self.spork_block_time(height);
+        self.consensus_sporks
+            .read()
+            .lottery_ticket_minimum(height, time)
+            .map(|a| a.as_sat())
+            .unwrap_or(divi_consensus::LOTTERY_TICKET_MINIMUM)
+    }
+
+    /// The fee settings spork 14 has in force at the tip, as Divi Core reads
+    /// them when the spork arrives (`ExecuteMultiValueSpork`, spork.cpp:286-302)
+    pub fn tx_fee_spork_at_tip(&self) -> Option<divi_consensus::spork_values::TxFeeValue> {
+        let tip = self.tip()?;
+        self.consensus_sporks
+            .read()
+            .tx_fee(tip.height, tip.time as i64)
+    }
+
+    /// Treasury and charity payments due at `height` (None: not a treasury block)
+    pub fn treasury_payments_due(&self, height: u32) -> Option<TreasuryDue> {
+        self.with_sporks(|sporks| treasury_payments_due_with(self.network_type(), height, sporks))
     }
 
     /// Subsidy halving interval for this network
@@ -4616,12 +4704,15 @@ impl Chain {
     /// Per-block rewards at `height`
     /// Divi Core's CBlockRewards for a height (GetBlockSubsidity)
     pub fn block_rewards(&self, height: u32) -> divi_consensus::block_subsidy::BlockRewards {
-        let mut rewards = divi_consensus::block_subsidy::get_block_subsidy_for_chain(
-            self.params.chain_mode,
-            self.network_type() == NetworkType::Mainnet,
-            height,
-            self.halving_interval(),
-        );
+        let mut rewards = self.with_sporks(|sporks| {
+            divi_consensus::block_subsidy::get_block_subsidy_for_chain_with(
+                self.params.chain_mode,
+                self.network_type() == NetworkType::Mainnet,
+                height,
+                self.halving_interval(),
+                sporks,
+            )
+        });
         // Divi regtest's premine is 1250 coins (Divi Core chainparams.cpp:470)
         if height == 1
             && self.params.chain_mode == ChainMode::Divi
@@ -4751,11 +4842,14 @@ impl Chain {
                 treasury_cycle,
                 treasury_lottery_cycle,
             );
-            let (treasury_amt, charity_amt) = block_subsidy::calculate_weighted_treasury_payment(
-                height,
-                payment_cycle,
-                halving_interval,
-            );
+            let (treasury_amt, charity_amt) = self.with_sporks(|sporks| {
+                block_subsidy::calculate_weighted_treasury_payment_with(
+                    height,
+                    payment_cycle,
+                    halving_interval,
+                    sporks,
+                )
+            });
             base_expected + treasury_amt + charity_amt
         } else if is_lottery {
             // Lottery reward = 50 DIVI per block × cycle_length (always 50, independent of halving)
@@ -4869,7 +4963,10 @@ impl Chain {
 
         let coinstake = &block.transactions[1];
 
-        if !lottery::is_coinstake_valid_for_lottery(coinstake) {
+        if !lottery::is_coinstake_valid_for_lottery_with_minimum(
+            coinstake,
+            self.lottery_ticket_minimum(height),
+        ) {
             index.lottery_winners = prev_winners;
             return Ok(());
         }
@@ -5769,6 +5866,178 @@ mod tests {
         )
         .unwrap();
         (chain, dir)
+    }
+
+    /// Put signed entries of a multi-value spork where the chain reads them
+    fn set_spork(chain: &Chain, id: i32, entries: &[(&str, i64)]) {
+        chain.consensus_sporks().write().set(
+            id,
+            entries
+                .iter()
+                .map(|(v, t)| divi_consensus::spork_values::SporkEntry::new(*v, *t))
+                .collect(),
+        );
+    }
+
+    /// A block with a coinbase and a coinstake that pays `staked` DIVI back to one
+    /// script, as the lottery counts it
+    fn block_staking(staked: i64) -> Block {
+        let coinstake = Transaction {
+            version: 1,
+            vin: vec![TxIn::new(
+                OutPoint::new(Hash256::from_bytes([9u8; 32]), 0),
+                Script::new(),
+                0xffff_ffff,
+            )],
+            vout: vec![
+                TxOut::new(Amount::ZERO, Script::new()),
+                TxOut::new(Amount::from_divi(staked), Script::new_p2pkh(&[5u8; 20])),
+            ],
+            lock_time: 0,
+        };
+        Block {
+            transactions: vec![Transaction::default(), coinstake],
+            ..Block::default()
+        }
+    }
+
+    /// The lottery asks a coinstake for a ticket to pay more than spork 16 sets at
+    /// the block's height, else 10,000 DIVI (Divi Core
+    /// LotteryWinnersCalculator.cpp:27-37, spork.cpp:127-141)
+    #[test]
+    fn lottery_ticket_minimum_follows_spork_16() {
+        let (chain, _dir) = create_test_chain();
+        // the lottery blocks the cycle looks back to
+        for (n, height) in [101u32, 110].into_iter().enumerate() {
+            let mut lottery_block = chain.tip().unwrap();
+            lottery_block.height = height;
+            lottery_block.hash = Hash256::from_bytes([0x40 + n as u8; 32]);
+            chain.db.store_block_index_entry(&lottery_block).unwrap();
+            chain
+                .db
+                .set_height_mapping(height, &lottery_block.hash)
+                .unwrap();
+        }
+        let tickets_at = |chain: &Chain, staked: i64, height: u32| {
+            let mut block = block_staking(staked);
+            block.header.prev_block = chain.tip().unwrap().hash;
+            let mut index = chain.tip().unwrap();
+            index.height = height;
+            chain.update_lottery_winners(&block, &mut index).unwrap();
+            index.lottery_winners.coinstakes.len()
+        };
+        // no entry: 10,000 DIVI
+        assert_eq!(tickets_at(&chain, 6000, 112), 0);
+        assert_eq!(tickets_at(&chain, 10_001, 112), 1);
+        assert_eq!(chain.lottery_ticket_minimum(112), 10_000 * 100_000_000);
+
+        // an entry from height 115 on, signed a long time ago
+        set_spork(&chain, 10015, &[("5000;115", 1_000)]);
+        assert_eq!(tickets_at(&chain, 6000, 112), 0, "before its height");
+        assert_eq!(tickets_at(&chain, 6000, 115), 1);
+        assert_eq!(tickets_at(&chain, 5000, 115), 0, "the stake must be more");
+        assert_eq!(tickets_at(&chain, 5001, 117), 1);
+        assert_eq!(chain.lottery_ticket_minimum(117), 5_000 * 100_000_000);
+
+        // an entry signed in the future is not in force yet
+        set_spork(&chain, 10015, &[("5000;115", i64::MAX / 2)]);
+        assert_eq!(tickets_at(&chain, 6000, 117), 0);
+    }
+
+    /// The block value comes from spork 15 where its entry is in force
+    /// (LegacyBlockSubsidies.cpp:30-42, spork.cpp:90-107)
+    #[test]
+    fn block_value_follows_spork_15() {
+        let (chain, _dir) = create_test_chain();
+        let mut index = chain.tip().unwrap();
+        index.height = 135;
+        let mut block = Block::default();
+        block.header.prev_block = index.hash;
+        let accepts = |mint: i64| {
+            chain
+                .validate_block_value(&block, &index, Amount::from_divi(mint), Amount::ZERO)
+                .is_ok()
+        };
+        // 1250 DIVI: 50 for the lottery and 83% of the rest for stake and masternode
+        assert!(accepts(996));
+        assert!(!accepts(1000));
+
+        set_spork(&chain, 10014, &[("2000;100", 1_000)]);
+        assert_eq!(chain.block_rewards(135).stake, Amount::from_divi(741));
+        assert!(accepts(1000));
+        assert!(accepts(1618));
+        assert!(!accepts(1619));
+        // not before its height; a proof-of-work block takes the whole value
+        assert_eq!(chain.block_rewards(99).stake, Amount::from_divi(1250));
+        assert_eq!(chain.block_rewards(100).stake, Amount::from_divi(2000));
+        // a height that is not on the halving interval is not used
+        set_spork(&chain, 10014, &[("2000;150", 1_000)]);
+        assert!(!accepts(1000));
+    }
+
+    /// The split of the block value comes from spork 13 where its entry is in force
+    /// (LegacyBlockSubsidies.cpp:72-89, spork.cpp:109-125)
+    #[test]
+    fn block_payments_follow_spork_13() {
+        let (chain, _dir) = create_test_chain();
+        let mut index = chain.tip().unwrap();
+        index.height = 135;
+        let mut block = Block::default();
+        block.header.prev_block = index.hash;
+        let accepts = |mint: i64| {
+            chain
+                .validate_block_value(&block, &index, Amount::from_divi(mint), Amount::ZERO)
+                .is_ok()
+        };
+        assert!(accepts(990));
+
+        // stake 50, masternode 30: the staker side is 80% of 1200 DIVI
+        set_spork(&chain, 10012, &[("50;30;10;5;5;100", 1_000)]);
+        let rewards = chain.block_rewards(135);
+        assert_eq!(rewards.stake, Amount::from_divi(600));
+        assert_eq!(rewards.masternode, Amount::from_divi(360));
+        assert_eq!(rewards.treasury, Amount::from_divi(120));
+        assert_eq!(rewards.proposals, Amount::from_divi(60));
+        assert_eq!(rewards.charity, Amount::from_divi(60));
+        assert!(accepts(960));
+        assert!(!accepts(990));
+
+        // 90% to the staker side
+        set_spork(&chain, 10012, &[("40;50;5;0;5;100", 1_000)]);
+        assert!(accepts(1080));
+        assert!(!accepts(1081));
+
+        // the five must add up to 100
+        set_spork(&chain, 10012, &[("40;50;5;0;6;100", 1_000)]);
+        assert!(accepts(990));
+        assert!(!accepts(1000));
+    }
+
+    /// A treasury block is paid from the rewards of the network's sporks, at both
+    /// ends of its cycle (BlockSubsidyProvider.cpp:19-37)
+    #[test]
+    fn treasury_payments_follow_sporks_13_and_15() {
+        let (chain, _dir) = create_test_chain();
+        let due = |chain: &Chain| {
+            let due = chain.treasury_payments_due(150).unwrap();
+            (due.treasury.1, due.charity.1)
+        };
+        assert_eq!(
+            due(&chain),
+            (Amount::from_divi(9600), Amount::from_divi(600))
+        );
+        set_spork(&chain, 10012, &[("50;30;10;5;5;100", 1_000)]);
+        assert_eq!(
+            due(&chain),
+            (Amount::from_divi(6000), Amount::from_divi(3000))
+        );
+        set_spork(&chain, 10012, &[]);
+        set_spork(&chain, 10014, &[("2000;100", 1_000)]);
+        // 16% and 1% of 1950 DIVI, for 50 blocks
+        assert_eq!(
+            due(&chain),
+            (Amount::from_divi(15_600), Amount::from_divi(975))
+        );
     }
 
     /// A regtest treasury block pays exactly the treasury and the charity, as

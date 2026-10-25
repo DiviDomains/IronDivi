@@ -1,14 +1,14 @@
 #!/bin/bash
-# Wallet RPC replies on Divi Core divid and on irondivid restored from the same
-# phrase, side by side on one regtest chain, after the same sends, receives,
-# watch-only import and restart on both. Prints PASS/KNOWN/FAIL per row; the
-# exit code is the number of FAILs. See README.md.
+# Seeded random wallet and chain steps on two Divi Core divid nodes and two
+# irondivid nodes restored from the same phrases, compared after every step.
+# Prints PASS/KNOWN/FAIL per step; the exit code is the number of FAILs. See
+# README.md.
 #
 #   run.sh <irondivid-bin-dir> <core-bin-dir> <port-base> [root]
 #
 # <irondivid-bin-dir> holds irondivid, <core-bin-dir> divid. Ports
-# <port-base> .. <port-base>+7 are used. A fresh directory is made under
-# [root] (default $TMPDIR or /tmp) and deleted, with both nodes stopped,
+# <port-base> .. <port-base>+7 are used on 127.0.0.2. A fresh directory is made under
+# [root] (default $TMPDIR or /tmp) and deleted, with all four nodes stopped,
 # however the run ends.
 set -u
 

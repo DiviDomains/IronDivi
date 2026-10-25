@@ -22,7 +22,7 @@ use divi_primitives::{
 };
 use divi_storage::{Chain, ChainDatabase, ChainParams, NetworkType};
 use divi_test_support::{
-    free_port, log_len, log_tail, port_taken_since, wait_up, Started, START_TRIES,
+    free_port, log_len, log_tail, port_taken_since, wait_up, Started, START_TRIES, START_WAIT,
 };
 use divi_wallet::{HdWallet, Network, WalletDb};
 use serde_json::{json, Value};
@@ -37,12 +37,11 @@ const MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon \
      abandon abandon abandon abandon abandon about";
 
 /// The HTTP status and JSON body of one call to `ip:port`; None if the
-/// connection fails
+/// connection fails. The reply is waited for as long as a node is waited for
+/// at start: a loaded host can answer far later than an idle one
 fn http_rpc(ip: IpAddr, port: u16, method: &str, params: &Value) -> Option<(u16, Value)> {
     let mut stream = TcpStream::connect((ip, port)).ok()?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(30)))
-        .ok()?;
+    stream.set_read_timeout(Some(START_WAIT)).ok()?;
     let body = json!({"jsonrpc": "1.0", "id": 1, "method": method, "params": params}).to_string();
     // "dGVzdDp0ZXN0" is base64 of test:test
     let request = format!(
@@ -394,13 +393,15 @@ fn acceptnonstandard_takes_a_nonstandard_transaction() {
         let daemon = Daemon::start(&args, &[], rpc_port, true);
         daemon.rpc("setgenerate", json!([21]));
         let hex = spend_to_op_true(&daemon);
+        // The node's port: Daemon::start moves it when another process took
+        // the one asked for
         let (_, reply) = http_rpc(
             "127.0.0.1".parse().unwrap(),
-            rpc_port,
+            daemon.rpc_port,
             "sendrawtransaction",
             &json!([hex]),
         )
-        .unwrap();
+        .expect("sendrawtransaction: no reply");
         if taken {
             assert!(reply["error"].is_null(), "{flag}: {reply}");
             assert!(
@@ -523,7 +524,8 @@ fn blocknotify_and_walletnotify_run_their_commands() {
 /// -rescan scans the wallet from the first block when it loads
 /// (init.cpp:1242, wallet.cpp:279-313), and -salvagewallet sets -rescan
 /// (init.cpp:763-766): a key imported without a rescan shows its coins after
-/// such a start, and not after a plain one
+/// such a start, and not after a plain one (a coin in the last block is the
+/// exception: every start scans that block again)
 #[test]
 fn rescan_and_salvagewallet_find_the_coins_of_a_key_imported_without_rescan() {
     let dir = tempfile::tempdir().unwrap();
@@ -543,7 +545,9 @@ fn rescan_and_salvagewallet_find_the_coins_of_a_key_imported_without_rescan() {
         );
         let to = daemon.rpc("getnewaddress", json!([]));
         daemon.rpc("sendtoaddress", json!([to, 3]));
-        daemon.rpc("setgenerate", json!([1]));
+        // Two blocks: a start scans the last block again (wallet.cpp:258-269),
+        // so the payment must not be in the last one
+        daemon.rpc("setgenerate", json!([2]));
         daemon.rpc("dumpprivkey", json!([to]))
     };
     let start = |wallet: &str, extra: &[&str]| {

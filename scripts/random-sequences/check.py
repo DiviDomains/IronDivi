@@ -46,7 +46,11 @@ GO_ON = os.environ.get("RANDOM_SEQUENCES_GO_ON", "") == "1"
 # For looking into a difference: a folder to copy the four debug.logs to on a FAIL
 LOGS = os.environ.get("RANDOM_SEQUENCES_LOGS", "")
 # For looking into a difference: irondivid logs at debug level
+# For looking into a difference: irondivid logs at debug level, divid logs its
+# mempool decisions
 IRON_DEBUG = ["debug=1"] if os.environ.get("RANDOM_SEQUENCES_DEBUG", "") == "1" else []
+CORE_DEBUG = ["debug=mempool"] if os.environ.get("RANDOM_SEQUENCES_DEBUG", "") == "1" else []
+HOST = "127.0.0.2"
 RPC_TIMEOUT = 120
 START_TIMEOUT = 180
 SETTLE_TIMEOUT = 45
@@ -76,7 +80,7 @@ class Node:
             "regtest=1", f"port={self.p2p}", f"rpcport={self.rpcport}",
             f"rpcuser=seq{index}", f"rpcpassword={password}",
             "daemon=0", "printtoconsole=0", "server=1", "discover=0", "listenonion=0",
-            "bind=127.0.0.1", "dnsseed=0", "staking=0",
+            f"bind={HOST}", f"rpcbind={HOST}", "rpcallowip=127.0.0.0/8", "dnsseed=0", "staking=0",
         ] + list(extra_conf)
         fd = os.open(os.path.join(self.dir, "divi.conf"), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w") as f:
@@ -116,7 +120,7 @@ class Node:
     def call(self, method, *params):
         """('ok', result), ('err', code, message), or ('down',)"""
         body = json.dumps({"jsonrpc": "1.0", "id": 1, "method": method, "params": list(params)}).encode()
-        req = urllib.request.Request(f"http://127.0.0.1:{self.rpcport}/", data=body,
+        req = urllib.request.Request(f"http://{HOST}:{self.rpcport}/", data=body,
                                      headers={"Authorization": "Basic " + self.auth, "Content-Type": "text/plain"})
         try:
             with urllib.request.urlopen(req, timeout=RPC_TIMEOUT) as r:
@@ -508,11 +512,11 @@ def new_episode():
         for name in ("divid1", "divid2", "irondivid1", "irondivid2"):
             shutil.rmtree(os.path.join(WORK, name), ignore_errors=True)
     episode += 1
-    c1 = Node("divid1", DIVID, 0, ["listen=1"])
-    c2 = Node("divid2", DIVID, 1, ["listen=0", f"connect=127.0.0.1:{PORT_BASE}"])
+    c1 = Node("divid1", DIVID, 0, ["listen=1"] + CORE_DEBUG)
+    c2 = Node("divid2", DIVID, 1, ["listen=0", f"connect={HOST}:{PORT_BASE}"] + CORE_DEBUG)
     phrases = [c1.rpc("dumphdinfo")["mnemonic"], c2.rpc("dumphdinfo")["mnemonic"]]
     i1 = Node("irondivid1", IRONDIVID, 2, ["listen=1"] + IRON_DEBUG, env={"WALLET_MNEMONIC": phrases[0]})
-    i2 = Node("irondivid2", IRONDIVID, 3, ["listen=0", f"connect=127.0.0.1:{PORT_BASE + 4}"] + IRON_DEBUG,
+    i2 = Node("irondivid2", IRONDIVID, 3, ["listen=0", f"connect={HOST}:{PORT_BASE + 4}"] + IRON_DEBUG,
               env={"WALLET_MNEMONIC": phrases[1]})
     del phrases
     PAIRS = [Pair("divid", [c1, c2]), Pair("irondivid", [i1, i2])]
@@ -596,6 +600,24 @@ def spends_immature(pair, holder, txid, next_height):
                     return True
                 break
     return False
+
+
+def input_ages(pair, holder, txid):
+    """The inputs of a transaction in `holder`'s mempool, with what the
+    wallets of the pair know of each: coinbase or coinstake, confirmations"""
+    tx = holder.call("getrawtransaction", txid, 1)
+    if tx[0] != "ok":
+        return []
+    out = []
+    for i in tx[1]["vin"]:
+        known = None
+        for wallet in pair.nodes:
+            prev = wallet.call("gettransaction", i.get("txid", ""))
+            if prev[0] == "ok":
+                known = (bool(prev[1].get("generated")), prev[1].get("confirmations"))
+                break
+        out.append((f"{i.get('txid', '')[:16]}:{i.get('vout')}",) + (known or ("?", "?")))
+    return out
 
 
 def maturity_explains(n, mid_heights):
@@ -805,6 +827,18 @@ for step in steps:
                     if tx[0] == "ok":
                         pool.append(sorted(str(o["value"]) for o in tx[1]["vout"]))
                 log(f"#   {p.name} node {m} mempool output values: {json.dumps(sorted(pool))}"[:3000])
+        # A side branch would show here (invalidateblock moves to the most-work
+        # chain left, rpcblockchain.cpp:636-640), and the peer it came from
+        for p in PAIRS:
+            for m in (1, 2):
+                tips = p.node(m).call("getchaintips")
+                if tips[0] == "ok":
+                    log(f"#   {p.name} node {m} chain tips: "
+                        f"{json.dumps([(t.get('height'), t.get('branchlen'), t.get('status')) for t in tips[1]])}")
+                # and a peer from outside the pair
+                peers = p.node(m).call("getpeerinfo")
+                if peers[0] == "ok":
+                    log(f"#   {p.name} node {m} peers: {json.dumps(sorted(x.get('addr', '') for x in peers[1]))}")
         # Why a node lacks a transaction its peer holds: offered to it now
         for p in PAIRS:
             for m in (1, 2):
@@ -821,6 +855,7 @@ for step in steps:
                     offered = node.call("sendrawtransaction", raw[1])
                     log(f"#   {p.name} node {m} lacks a transaction node {3 - m} holds; offered now: "
                         f"{outcome(offered)}; spends a coin immature at node {m}'s next height: {immature}")
+                    log(f"#     {txid} inputs (txid:vout, generated, confirmations): {input_ages(p, peer, txid)}")
         if LOGS:
             import shutil
             os.makedirs(LOGS, exist_ok=True)

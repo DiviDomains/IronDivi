@@ -99,17 +99,9 @@ pub struct Connection {
     sent_nonce: Option<NonceGuard>,
     /// The node's own addresses (our address in the version message)
     local: Arc<crate::local::LocalAddresses>,
-    /// Messages the peer sent between its version and its verack, handled
-    /// once the handshake is done
-    pending: Vec<NetworkMessage>,
-    /// Bytes of `pending` on the wire
-    pending_bytes: u64,
+    /// The node's active spork count, told to an inbound peer
+    spork_count: Option<crate::peer_manager::HeightSource>,
 }
-
-/// Bytes of messages kept between a peer's version and its verack: Divi Core
-/// stops reading a peer whose receive buffer holds more than -maxreceivebuffer,
-/// default 5000 * 1000 bytes (Node.cpp:23)
-const MAX_PENDING_BYTES: u64 = 5_000_000;
 
 /// Nonces in the version messages a node has sent on its open connections:
 /// a version arriving with one of them comes from the node itself (Divi Core
@@ -195,8 +187,7 @@ impl Connection {
             local_nonces,
             sent_nonce: None,
             local,
-            pending: Vec::new(),
-            pending_bytes: 0,
+            spork_count: None,
         };
 
         Ok((conn, handle))
@@ -251,11 +242,16 @@ impl Connection {
             local_nonces,
             sent_nonce: None,
             local,
-            pending: Vec::new(),
-            pending_bytes: 0,
+            spork_count: None,
         };
 
         Ok((conn, handle))
+    }
+
+    /// Tell an inbound peer the spork count `source` gives
+    pub fn with_spork_count(mut self, source: Option<crate::peer_manager::HeightSource>) -> Self {
+        self.spork_count = source;
+        self
     }
 
     /// Run the connection handler
@@ -365,11 +361,20 @@ impl Connection {
         // Send verack
         self.send_message(NetworkMessage::Verack).await?;
 
-        // Wait for their verack
-        timeout(HANDSHAKE_TIMEOUT, self.recv_verack())
-            .await
-            .map_err(|_| NetworkError::Timeout)??;
+        // Then, as Divi Core's version handler: an inbound peer is told the
+        // spork count, an outbound one asked for addresses (main.cpp:417-442)
+        if self.info.direction == PeerDirection::Inbound {
+            let count = self.spork_count.as_ref().map_or(0, |source| source());
+            self.send_message(NetworkMessage::SporkCount(count)).await?;
+        } else {
+            self.send_message(NetworkMessage::GetAddr).await?;
+        }
 
+        // Divi Core counts the peer as connected once its version is handled
+        // (RecordSuccessfullConnection, main.cpp:454): what goes out to a peer
+        // with a version (sporkcount, ping, getblocks, getaddr) goes now, and
+        // what the peer sends is handled as it comes, its verack included
+        // (main.cpp:484-514 checks only for the version)
         self.info.state = PeerState::Connected;
         Ok(())
     }
@@ -442,47 +447,6 @@ impl Connection {
             score: 1,
             reason: "Version message has not arrived before other handshake steps".into(),
         });
-    }
-
-    /// Wait for verack message (during handshake - uses blocking read, ok because no select!).
-    /// Divi Core handles every message once the peer's version is in
-    /// (main.cpp:484-514 checks only for the version): a ping is answered at
-    /// once, the others are kept and handled after the handshake.
-    async fn recv_verack(&mut self) -> Result<(), NetworkError> {
-        loop {
-            let before = self.info.bytes_recv;
-            match self.read_message_handshake().await? {
-                Some(Decoded::Message(NetworkMessage::Verack)) => return Ok(()),
-                Some(Decoded::Message(NetworkMessage::Version(_))) => {
-                    self.send_message(duplicate_version_reject()).await?;
-                    let _ = self.event_tx.send(duplicate_version(self.peer_id));
-                }
-                Some(Decoded::Malformed { command, .. }) if command == "version" => {
-                    self.send_message(duplicate_version_reject()).await?;
-                    let _ = self.event_tx.send(duplicate_version(self.peer_id));
-                }
-                Some(Decoded::Message(NetworkMessage::Ping(nonce))) => {
-                    self.send_message(NetworkMessage::Pong(nonce)).await?;
-                }
-                Some(Decoded::Message(msg)) => {
-                    self.pending_bytes += self.info.bytes_recv - before;
-                    if self.pending_bytes <= MAX_PENDING_BYTES {
-                        self.pending.push(msg);
-                    } else {
-                        debug!(
-                            "Dropping {} from {}: over {} bytes before its verack",
-                            msg.command(),
-                            self.info.addr,
-                            MAX_PENDING_BYTES
-                        );
-                    }
-                }
-                Some(Decoded::Malformed { command, error }) => {
-                    self.reject_malformed(&command, &error).await?;
-                }
-                None => {}
-            }
-        }
     }
 
     /// Divi Core's answer to a message that does not parse
@@ -568,41 +532,38 @@ impl Connection {
             stats,
             local_nonces: _,
             local: _,
+            spork_count: _,
             // Kept until the loop ends: the nonce leaves the node's set then
             sent_nonce: _nonce_guard,
-            pending,
-            pending_bytes: _,
         } = self;
 
         // Split stream for concurrent read/write
         let (reader, mut writer) = tokio::io::split(stream);
 
-        // What the peer sent before its verack, in the order it came
-        for msg in pending {
-            if let Err(e) = Self::handle_message(
-                &mut writer,
-                &mut info,
-                magic,
-                &total_bytes_sent,
-                peer_id,
-                &event_tx,
-                msg,
-            )
-            .await
-            {
-                warn!("Error handling message from {}: {}", info.addr, e);
-            }
-        }
-
         // Wrap reader in FramedRead with our codec - this is CANCELLATION SAFE!
         let codec = DiviCodec::new(magic);
         let mut framed = FramedRead::new(reader, codec);
 
-        // Keepalive pings as Divi Core's MaybeSendPing: the first check comes at
-        // once, so a ping goes out right after the handshake, then one each
-        // PING_INTERVAL after the last ping sent (a `ping` call included)
+        // Keepalive pings as Divi Core's MaybeSendPing: the first goes out now,
+        // after what the version handler sent and before anything else, as the
+        // message handler sends it before SendMessages (net.cpp:871-893); then
+        // one each PING_INTERVAL after the last ping sent (a `ping` call included)
         let mut ping_timer = tokio::time::interval(PING_CHECK);
-        let mut last_ping_sent: Option<std::time::Instant> = None;
+        let first_ping = rand::random();
+        info.ping_nonce = Some(first_ping);
+        info.ping_time = Some(std::time::Instant::now());
+        let mut last_ping_sent = info.ping_time;
+        if let Err(e) = Self::write_message(
+            &mut writer,
+            &mut info,
+            magic,
+            &total_bytes_sent,
+            NetworkMessage::Ping(first_ping),
+        )
+        .await
+        {
+            error!("Failed to send keepalive ping to {}: {}", info.addr, e);
+        }
 
         loop {
             info.publish(&stats);
@@ -754,6 +715,8 @@ impl Connection {
         msg: NetworkMessage,
     ) -> Result<(), NetworkError> {
         match &msg {
+            // The peer's verack: nothing waits for it (main.cpp:498-507)
+            NetworkMessage::Verack => {}
             // Divi Core: one version per connection
             NetworkMessage::Version(_) => {
                 Self::write_message(

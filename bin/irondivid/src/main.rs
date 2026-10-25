@@ -60,6 +60,7 @@ struct Args {
     debug: bool,
     wallet: Option<PathBuf>,
     disablewallet: bool,
+    sysperms: bool,
     pid: Option<PathBuf>,
     export_chain: bool,
     export_start: Option<u32>,
@@ -96,7 +97,7 @@ the data directory) for whatever the command line left unset. Among them:\n  \
 -rpcpassword=<pw> -txindex -addressindex -spentindex -checkblocks=<n>\n  \
 -maxreorg=<n> -maxorphantx=<n> -minrelaytxfee=<amt> -staking\n  \
 -blockmaxsize=<n> -blockprioritysize=<n> -blockminsize=<n>\n  \
--blocknotify=<cmd> -walletnotify=<cmd>\n  \
+-blocknotify=<cmd> -walletnotify=<cmd> -alertnotify=<cmd>\n  \
 -zmqpubhashblock=<address> -zmqpubhashtx=<address>\n  \
 -zmqpubrawblock=<address> -zmqpubrawtx=<address>\n\
 IronDivi's own: -fullnode=<ip> -stakeonstaletip -stakesplitthreshold=<n>\n  \
@@ -174,6 +175,7 @@ impl Args {
         self.debug = !debug.is_empty() && !debug.iter().any(|c| c == "0");
         self.wallet = path("wallet");
         self.disablewallet = s.get_bool("disablewallet", false);
+        self.sysperms = s.get_bool("sysperms", false);
         self.pid = path("pid");
         self.export_chain = self.cli.get_bool("export-chain", false);
         self.export_start = number("export-start")?;
@@ -291,40 +293,45 @@ fn resolve_args(mut args: Args) -> Result<Args> {
 
 /// Options divid takes that irondivid has nothing for: accepted, with a warning
 const UNSUPPORTED_OPTIONS: &[&str] = &[
-    "alertnotify",
-    "alerts",
     "checklevel",
-    "dbcache",
-    "disablesystemnotifications",
     "dns",
-    "forcednsseed",
-    "forcestart",
-    "genproclimit",
     "listenonion",
     "logips",
     "logtimestamps",
     "maxreceivebuffer",
     "maxsendbuffer",
-    "mining",
     "onion",
     "onlynet",
     "par",
     "peerbloomfilters",
     "proxyrandomize",
-    "rpcthreads",
     "shrinkdebugfile",
-    "sysperms",
     "torcontrol",
     "torpassword",
     "upnp",
 ];
 
 /// Options divid takes and does nothing with, only naming them in its help:
-/// accepted without a word, as divid does (LicenseAndInfo.cpp:135, :143)
-const UNUSED_BY_DIVID: &[&str] = &["sendfreetransactions", "txconfirmtarget"];
+/// accepted without a word, as divid does (LicenseAndInfo.cpp:135, :143;
+/// -disablesystemnotifications :142, -mining and -genproclimit :186-187, :205)
+const UNUSED_BY_DIVID: &[&str] = &[
+    "sendfreetransactions",
+    "txconfirmtarget",
+    "disablesystemnotifications",
+    "mining",
+    "genproclimit",
+];
 
 /// Options apply_settings reads
 const APPLIED: &[&str] = &[
+    // divid's -forcestart skips the checks it makes after a stop that was
+    // not prepared: its best block in the block index, its coin database
+    // at that block (BlockIndexLoading.cpp:267-285). irondivid writes each
+    // block's chain state in one batch, so after a kill it is at its last
+    // whole block and has no such check to skip: the option is taken as is
+    "forcestart",
+    "rpcthreads",
+    "alerts",
     "vault",
     // read by masternode_options
     "masternode",
@@ -394,8 +401,11 @@ const APPLIED: &[&str] = &[
     "addressindex",
     "reindex",
     "utxocachesize",
+    "dbcache",
+    "forcednsseed",
     "expire",
     "blocknotify",
+    "alertnotify",
     "walletnotify",
     "zmqpubhashblock",
     "zmqpubhashtx",
@@ -420,6 +430,7 @@ const READ_ELSEWHERE: &[&str] = &[
     "debug",
     "wallet",
     "disablewallet",
+    "sysperms",
     "pid",
     "export-chain",
     "export-start",
@@ -484,7 +495,9 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         s.soft_set_bool("listen", true);
     }
     if !s.get_multi("connect").is_empty() {
-        s.soft_set_bool("dnsseed", false);
+        if s.soft_set_bool("dnsseed", false) {
+            info!("InitializeDivi : parameter interaction: -connect set -> setting -dnsseed=0");
+        }
         s.soft_set_bool("listen", false);
     }
     if s.is_set("proxy") {
@@ -615,6 +628,10 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     if !s.get_bool("dnsseed", true) {
         config.network.dns_seeds.clear();
     }
+    if s.is_set("dnsseed") {
+        config.p2p.dns_seed = Some(s.get_bool("dnsseed", true));
+    }
+    config.p2p.force_dns_seed = s.get_bool("forcednsseed", false);
     // -maxconnections counts inbound and outbound; at most 16 are outbound
     // (net.cpp:106, :757, :1727)
     if let Some(n) = number_option(&s, "maxconnections", 0..=i64::from(u32::MAX)) {
@@ -770,6 +787,15 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     if let Some(n) = number_option(&s, "maxlogfiles", 1..=100) {
         config.log.max_files = n as u32;
     }
+    // -dbcache in MiB, read as divid reads a number (atoi: 0 for a word) and
+    // split as divid splits it (init.cpp:1030, :1046-1056): the block tree and
+    // coin database caches make the chain database's block cache, the coins
+    // in memory the UTXO cache (unless -utxocachesize gives that)
+    if let Some(text) = s.get("dbcache") {
+        let sizes = divi_node::config::db_cache_sizes(settings::atoi(text), config.index.txindex);
+        config.block_cache_size = Some(sizes.block_tree + sizes.coin_db);
+        config.utxo_cache_size = sizes.coin_cache_entries;
+    }
     if let Some(n) = number_option(&s, "utxocachesize", 0..=i64::MAX) {
         config.utxo_cache_size = n as u64;
     }
@@ -779,6 +805,10 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     }
     config.blocknotify = s
         .get("blocknotify")
+        .filter(|c| !c.is_empty())
+        .map(String::from);
+    config.alertnotify = s
+        .get("alertnotify")
         .filter(|c| !c.is_empty())
         .map(String::from);
     config.walletnotify = s
@@ -795,6 +825,11 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         rawtx: zmq_address("zmqpubrawtx"),
     };
     config.vault = s.get_bool("vault", false);
+    // GetArg("-rpcthreads", 4), an atoi64 of the text (rpcserver.cpp:756)
+    if let Some(n) = s.get("rpcthreads") {
+        config.rpc.threads = settings::atoi(n);
+    }
+    config.p2p.alerts = s.get_bool("alerts", true);
 
     let mut keys: Vec<&String> = settings.keys().collect();
     keys.sort();
@@ -1747,6 +1782,7 @@ async fn run_daemon(
     if let Some(cmd) = config.blocknotify.clone() {
         spawn_block_notify(node.chain().clone(), cmd);
     }
+    spawn_version_warning(node.chain().clone(), config.alertnotify.clone());
 
     // The ZMQ notifiers, before the chain takes blocks (init.cpp:1495-1500).
     // Kept for the life of the node; none if an address cannot be bound.
@@ -1828,6 +1864,16 @@ async fn run_daemon(
             w.set_vault_min(wallet_options.vault_min);
             w.set_relay_fee_per_kb(config.mempool.min_relay_fee_per_kb);
             w.set_max_tx_fee(config.mempool.max_tx_fee);
+            // A spork 14 entry sets the fees the wallet's sends pay and may pay
+            {
+                let (w, chain) = (Arc::clone(w), node.chain().clone());
+                node.spork_manager().on_tx_fee_spork(Arc::new(move || {
+                    if let Some(fee) = chain.tx_fee_spork_at_tip() {
+                        w.set_relay_fee_per_kb(fee.min_fee_per_kb as i64);
+                        w.set_max_tx_fee(fee.max_fee as i64);
+                    }
+                }));
+            }
             // -walletnotify, before the wallet catches up with the chain
             // (init.cpp:1199, before the rescan at :1242)
             if let Some(cmd) = config.walletnotify.clone() {
@@ -1946,6 +1992,11 @@ async fn run_daemon(
             if wallet_options.rescan {
                 info!("Rescanning... from height 0 to {}", chain_height);
                 wallet_arc.set_last_scan_height(0);
+            } else {
+                // Divi Core scans from the wallet's stored best block, itself
+                // included (wallet.cpp:258-269, :279-313): the last block is
+                // scanned again at every start
+                divi_rpc::wallet::resume_wallet_scan(wallet_arc, node.chain());
             }
             let last_scan = wallet_arc.last_scan_height();
             if last_scan > chain_height {
@@ -2195,6 +2246,7 @@ async fn run_daemon(
         password: Some(rpc_password),
         keep_alive: config.rpc.keep_alive,
         rest: config.rpc.rest,
+        threads: config.rpc.threads,
     };
 
     info!("Starting RPC server on {}...", rpc_config.bind_address);
@@ -2354,9 +2406,19 @@ async fn run_daemon(
                         rpc_server
                             .staking()
                             .set_generate_control(Arc::new(move |n| {
+                                use divi_node::staker::GenerateBlockError;
+                                use divi_rpc::staking::GenerateBlockFailure;
                                 staker_for_generate
                                     .generate_blocks(n)
                                     .map(|hashes| hashes.iter().map(|h| h.to_string()).collect())
+                                    .map_err(|e| match e {
+                                        GenerateBlockError::Refused(m) => {
+                                            GenerateBlockFailure::Refused(m)
+                                        }
+                                        GenerateBlockError::Failed(m) => {
+                                            GenerateBlockFailure::Failed(m)
+                                        }
+                                    })
                             }));
                         let staker_for_block = Arc::clone(staker_arc);
                         rpc_server
@@ -2506,6 +2568,59 @@ fn run_notify(cmd: &str, value: &str) {
             Err(e) => warn!("runCommand error: {} ({})", cmd, e),
         }
     });
+}
+
+/// -alertnotify: run the command with the warning's text, kept to Divi Core's
+/// safe characters and put in single quotes (CAlert::Notify, alert.cpp:218-235)
+fn alert_notify(cmd: &str, message: &str) {
+    const SAFE: &str =
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ01234567890 .,;_-/:?@()";
+    let safe: String = message.chars().filter(|c| SAFE.contains(*c)).collect();
+    run_notify(cmd, &format!("'{safe}'"));
+}
+
+/// Divi Core's warning when most of the last 100 blocks are of a newer
+/// version than it makes (ChainTipManager.cpp:43-60): once out of initial
+/// download, with more than 50 of them above version 4 (block.h:26), the
+/// miscellaneous warning is set and -alertnotify run, once. Initial download
+/// ends, for good, at a tip less than 6 hours old (ChainSyncHelpers.cpp:42-49)
+fn spawn_version_warning(chain: Arc<divi_storage::Chain>, alertnotify: Option<String>) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    const CURRENT_VERSION: i32 = 4;
+    let warned = AtomicBool::new(false);
+    let synced = AtomicBool::new(false);
+    let blocks = chain.clone();
+    chain.add_tip_listener(Arc::new(move |tip| {
+        if warned.load(Ordering::SeqCst) {
+            return;
+        }
+        if !synced.load(Ordering::SeqCst) {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs() as i64);
+            if blocks.is_importing() || i64::from(tip.time) < now - 6 * 60 * 60 {
+                return;
+            }
+            synced.store(true, Ordering::SeqCst);
+        }
+        let upgraded = (0..100u32)
+            .map_while(|back| tip.height.checked_sub(back))
+            .filter_map(|height| blocks.get_block_index_by_height(height).ok().flatten())
+            .filter(|index| index.version > CURRENT_VERSION)
+            .count();
+        if upgraded > 100 / 2 {
+            let message = "Warning: This version is obsolete, upgrade required!";
+            warn!(
+                "{} of last 100 blocks above version {}",
+                upgraded, CURRENT_VERSION
+            );
+            divi_rpc::warnings::set_misc_warning(message);
+            if let Some(cmd) = &alertnotify {
+                alert_notify(cmd, message);
+            }
+            warned.store(true, Ordering::SeqCst);
+        }
+    }));
 }
 
 /// -blocknotify: run the command each time the best block changes, with the
@@ -2905,6 +3020,20 @@ fn main() -> Result<()> {
     // ... and so are -testnet and -regtest together
     if args.testnet && args.regtest {
         eprintln!("Error: Invalid combination of -regtest and -testnet.");
+        std::process::exit(1);
+    }
+
+    // divid creates its files 0600 and its directories 0700 (umask 077), or
+    // with the system's umask under -sysperms, which it refuses with the
+    // wallet on (init.cpp:1378-1385)
+    #[cfg(unix)]
+    if !args.sysperms {
+        // SAFETY: umask(2) only sets this process's file-creation mask
+        unsafe { libc::umask(0o077) };
+    } else if !args.disablewallet {
+        eprintln!(
+            "Error: Error: -sysperms is not allowed in combination with enabled wallet functionality"
+        );
         std::process::exit(1);
     }
 
@@ -4242,6 +4371,98 @@ mod divid_option_tests {
         assert!(!UNSUPPORTED_OPTIONS.contains(&"seednode"));
     }
 
+    /// -dbcache is applied as divid splits it (init.cpp:1030, :1046-1056):
+    /// read with atoi, clamped, the coins in memory unless -utxocachesize
+    #[test]
+    fn dbcache_sets_the_caches() {
+        const MIB: usize = 1 << 20;
+        let c = cfg_in("divi.conf", "rpcuser=u\ndbcache=100\n", &[]).unwrap();
+        let d = divi_node::config::db_cache_sizes(100, c.index.txindex);
+        assert_eq!(c.block_cache_size, Some(d.block_tree + d.coin_db));
+        assert_eq!(c.utxo_cache_size, d.coin_cache_entries);
+        let word = cfg_in("divi.conf", "rpcuser=u\n", &["-dbcache=abc"]).unwrap();
+        assert_eq!(word.block_cache_size.map(|b| b < 4 * MIB), Some(true));
+        let big = cfg_in("divi.conf", "rpcuser=u\n", &["-dbcache=99999999"]).unwrap();
+        // Clamped to 4096 MiB: 512 to the block tree, 1792 to the coin database
+        assert_eq!(big.block_cache_size, Some(2304 * MIB));
+        let both = cfg_in(
+            "divi.conf",
+            "rpcuser=u\n",
+            &["-dbcache=100", "-utxocachesize=7"],
+        )
+        .unwrap();
+        assert_eq!(both.utxo_cache_size, 7);
+        // Not given: irondivid's own sizes
+        let none = cfg_in("divi.conf", "rpcuser=u\n", &[]).unwrap();
+        assert_eq!(none.block_cache_size, None);
+        assert_eq!(none.utxo_cache_size, 10_000_000);
+        assert!(!UNSUPPORTED_OPTIONS.contains(&"dbcache"));
+    }
+
+    /// -dnsseed and -forcednsseed, and -connect turning -dnsseed off unless it
+    /// is given (net.cpp:1015-1030, :1683-1685)
+    #[test]
+    fn dnsseed_and_forcednsseed_are_applied() {
+        let c = cfg_in("divi.conf", "rpcuser=u\n", &["-forcednsseed=1"]).unwrap();
+        assert!(c.p2p.force_dns_seed);
+        assert_eq!(c.p2p.dns_seed, None);
+        let c = cfg_in("divi.conf", "rpcuser=u\nforcednsseed=0\ndnsseed=0\n", &[]).unwrap();
+        assert!(!c.p2p.force_dns_seed);
+        assert_eq!(c.p2p.dns_seed, Some(false));
+        let c = cfg_in("divi.conf", "rpcuser=u\n", &["-connect=127.0.0.2:1"]).unwrap();
+        assert_eq!(c.p2p.dns_seed, Some(false), "-connect sets -dnsseed=0");
+        let c = cfg_in(
+            "divi.conf",
+            "rpcuser=u\n",
+            &["-connect=127.0.0.2:1", "-dnsseed=1"],
+        )
+        .unwrap();
+        assert_eq!(c.p2p.dns_seed, Some(true));
+        assert!(!UNSUPPORTED_OPTIONS.contains(&"forcednsseed"));
+    }
+
+    /// -mining, -genproclimit and -disablesystemnotifications: divid lists them
+    /// in its help only (LicenseAndInfo.cpp:142, :186-187), so they are taken
+    /// without a warning
+    #[test]
+    fn help_only_options_are_taken_without_a_warning() {
+        let s = Settings::default();
+        for o in ["mining", "genproclimit", "disablesystemnotifications"] {
+            assert!(!UNSUPPORTED_OPTIONS.contains(&o), "{o}");
+            assert_eq!(option_warning(&s, o), None, "{o}");
+        }
+        assert!(cfg_in(
+            "divi.conf",
+            "rpcuser=u\nmining=1\ngenproclimit=-1\ndisablesystemnotifications=1\n",
+            &["-genproclimit=4"],
+        )
+        .is_ok());
+    }
+
+    /// Each option is in one list only: read by apply_settings, read
+    /// elsewhere, one divid does not use, or one irondivid does not support
+    #[test]
+    fn every_option_is_in_one_list() {
+        let lists: [(&str, &[&str]); 4] = [
+            ("APPLIED", APPLIED),
+            ("READ_ELSEWHERE", READ_ELSEWHERE),
+            ("UNUSED_BY_DIVID", UNUSED_BY_DIVID),
+            ("UNSUPPORTED_OPTIONS", UNSUPPORTED_OPTIONS),
+        ];
+        let mut seen = std::collections::HashMap::new();
+        for (name, list) in lists {
+            for key in list {
+                if let Some(first) = seen.insert(*key, name) {
+                    panic!("-{key} is in {first} and in {name}");
+                }
+            }
+        }
+        for key in ["forcestart", "rpcthreads", "alerts", "alertnotify"] {
+            assert_eq!(seen.get(key), Some(&"APPLIED"), "-{key}");
+        }
+        assert_eq!(seen.get("sysperms"), Some(&"READ_ELSEWHERE"));
+    }
+
     /// -conf is relative to the data directory (Settings::GetConfigFile)
     #[test]
     fn conf_is_relative_to_the_data_directory() {
@@ -4420,9 +4641,9 @@ mod divid_option_tests {
         assert_eq!(option_warning(&s, "litemode"), None);
         assert_eq!(option_warning(&s, "budgetvotemode"), None);
         assert_eq!(option_warning(&s, "masternode"), None);
-        assert!(option_warning(&s, "dbcache")
-            .unwrap()
-            .contains("not supported"));
+        // applied as divid applies it
+        assert_eq!(option_warning(&s, "dbcache"), None);
+        assert!(option_warning(&s, "par").unwrap().contains("not supported"));
         assert!(option_warning(&s, "nosuchoption")
             .unwrap()
             .starts_with("Unknown option"));

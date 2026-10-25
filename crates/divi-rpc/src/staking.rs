@@ -63,7 +63,8 @@ pub type SplitThresholdCallback = Arc<dyn Fn(Option<i64>) -> i64 + Send + Sync>;
 
 /// Callback that mines blocks to the wallet at once (regtest setgenerate) and
 /// returns their hashes
-pub type GenerateCallback = Arc<dyn Fn(u32) -> Result<Vec<String>, String> + Send + Sync>;
+pub type GenerateCallback =
+    Arc<dyn Fn(u32) -> Result<Vec<String>, GenerateBlockFailure> + Send + Sync>;
 
 /// What `generateblock` asks of the one block it makes (rpcmining.cpp:121-210)
 #[derive(Debug, Clone, Default)]
@@ -78,7 +79,7 @@ pub struct GenerateBlockOptions {
     pub bits_shift: Option<u32>,
 }
 
-/// Why `generateblock` made no block
+/// Why `setgenerate` or `generateblock` made no block
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GenerateBlockFailure {
     /// Refused with Divi Core's message, answered as -1
@@ -229,7 +230,7 @@ impl StakingRpc {
             "currentblocksize": info.current_block_size,
             "currentblocktx": info.current_block_tx,
             "difficulty": info.difficulty,
-            "errors": info.errors.unwrap_or_default(),
+            "errors": info.errors.unwrap_or_else(crate::warnings::status_bar),
             "generate": info.enabled,
             "genproclimit": 1,
             "pooledtx": info.pooled_tx,
@@ -295,9 +296,15 @@ impl StakingRpc {
         let callback = callback.ok_or_else(|| {
             RpcError::new(codes::MISC_ERROR, "setgenerate needs a wallet to mine to")
         })?;
-        let hashes = callback(count).map_err(|e| {
-            info!("setgenerate failed: {}", e);
-            RpcError::new(codes::VERIFY_ERROR, "failed to generate a valid block")
+        // Divi Core's setgenerate answers -25 when no block is made
+        // (rpcmining.cpp:101-102), and -1 with the message of an exception
+        // thrown on the way (rpcserver.cpp:1107-1108)
+        let hashes = callback(count).map_err(|e| match e {
+            GenerateBlockFailure::Refused(message) => RpcError::new(codes::MISC_ERROR, message),
+            GenerateBlockFailure::Failed(why) => {
+                info!("setgenerate failed: {}", why);
+                RpcError::new(codes::VERIFY_ERROR, "failed to generate a valid block")
+            }
         })?;
         Ok(serde_json::json!(hashes))
     }
