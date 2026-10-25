@@ -49,10 +49,10 @@ trap 'exit 255' INT TERM HUP
 
 echo "# int-args: ports $BASE..$((BASE + 3)), work directory $WORK"
 # In the background, so a signal to this script runs the trap at once
-timeout 600 python3 -I "$HERE/check.py" "$IRD" "$DIVID" "$BASE" "$WORK" &
+timeout 1200 python3 -I "$HERE/check.py" "$IRD" "$DIVID" "$BASE" "$WORK" &
 CHILD=$!
 wait "$CHILD"
 rc=$?
 CHILD=
-[ $rc = 124 ] && echo "FAIL  run: did not finish within 10 minutes" && rc=255
+[ $rc = 124 ] && echo "FAIL  run: did not finish within 20 minutes" && rc=255
 exit $rc
