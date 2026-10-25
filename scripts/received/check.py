@@ -51,9 +51,6 @@ KNOWN = {
     **{f"getstakingstatus ({when}): mnsync": MNSYNC
        for when in ("immature coins only", "mature coins", "after stake blocks", "locked", "unlocked for staking only",
                     "unlocked")},
-    "getstakingstatus (after stake blocks): staking status":
-        "divid counts a stake search made through setgenerate as staking for 5 minutes (init.cpp:157-174); "
-        "irondivid reports its staker, which is off here (staking=0)",
     **{f"{method}: member order": R6
        for method in ("getstakingstatus", "listreceivedbyaddress", "listreceivedbyaccount", "validateaddress")},
     "listreceivedbyaddress: fields divid lacks":

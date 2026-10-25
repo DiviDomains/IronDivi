@@ -11,6 +11,9 @@
 # <port-base> .. <port-base>+5 are used, on 127.0.0.2. A fresh directory is made under
 # [root] (default $TMPDIR or /tmp) and deleted, with both nodes stopped,
 # however the run ends.
+#
+# SB_LONG=1 also stakes past the switch at 500 and compares heights 490-560;
+# it may then run for 30 minutes instead of 10.
 set -u
 
 if [ $# -lt 3 ]; then
@@ -48,12 +51,14 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 255' INT TERM HUP
 
-echo "# superblocks: ports $BASE..$((BASE + 5)) on 127.0.0.2, work directory $WORK"
+LIMIT=600
+[ "${SB_LONG:-}" = 1 ] && LIMIT=1800
+echo "# superblocks: ports $BASE..$((BASE + 5)) on 127.0.0.2, work directory $WORK${SB_LONG:+, SB_LONG=$SB_LONG}"
 # In the background, so a signal to this script runs the trap at once
-timeout 600 python3 -I "$HERE/check.py" "$IRD" "$DIVID" "$BASE" "$WORK" &
+timeout $LIMIT python3 -I "$HERE/check.py" "$IRD" "$DIVID" "$BASE" "$WORK" &
 CHILD=$!
 wait "$CHILD"
 rc=$?
 CHILD=
-[ $rc = 124 ] && echo "FAIL  run: did not finish within 10 minutes" && rc=255
+[ $rc = 124 ] && echo "FAIL  run: did not finish within $((LIMIT / 60)) minutes" && rc=255
 exit $rc

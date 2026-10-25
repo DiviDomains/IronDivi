@@ -363,8 +363,13 @@ impl<'a> History<'a> {
             json!(crate::wallet::bare_txid(&loaded.tx).to_string()),
         );
         entry.insert("walletconflicts".into(), json!(self.conflicts(&loaded.tx)));
-        entry.insert("time".into(), json!(record.timestamp));
-        entry.insert("timereceived".into(), json!(record.timestamp));
+        // GetTxTime (the smart time) and nTimeReceived (rpcwallet.cpp:267-268)
+        let (received, smart) = self.wallet.tx_times(&record.txid);
+        entry.insert(
+            "time".into(),
+            json!(if smart != 0 { smart } else { received }),
+        );
+        entry.insert("timereceived".into(), json!(received));
         // The notes the send kept with the transaction (mapValue,
         // rpcwallet.cpp:268-269)
         for (key, value) in self.wallet.tx_notes(&record.txid) {

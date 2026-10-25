@@ -11,8 +11,11 @@
 
 use crate::error::{codes, Error, RpcError};
 use crate::mn_broadcast::{self, BroadcastRelay, BroadcastStore, MnContext};
+use crate::mn_list::MasternodeList;
+use crate::mn_votes::MasternodeVotes;
 use crate::protocol::Params;
 use divi_masternode::{MasternodeManager, MasternodeRpc as MasternodeRpcImpl, PaymentVoteTracker};
+use divi_storage::Chain;
 use parking_lot::RwLock;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -65,6 +68,10 @@ pub struct MasternodeRpc {
     datadir: RwLock<Option<std::path::PathBuf>>,
     /// Sends raw broadcast bytes to the P2P layer
     relay: RwLock<Option<BroadcastRelay>>,
+    /// The masternodes the network announced, in Divi Core's form
+    network_list: RwLock<Option<Arc<MasternodeList>>>,
+    /// The masternodes' payment votes
+    votes: RwLock<Option<Arc<MasternodeVotes>>>,
 }
 
 impl MasternodeRpc {
@@ -75,7 +82,17 @@ impl MasternodeRpc {
             stored: BroadcastStore::default(),
             datadir: RwLock::new(None),
             relay: RwLock::new(None),
+            network_list: RwLock::new(None),
+            votes: RwLock::new(None),
         }
+    }
+
+    pub fn set_votes(&self, votes: Arc<MasternodeVotes>) {
+        *self.votes.write() = Some(votes);
+    }
+
+    pub fn set_network_list(&self, list: Arc<MasternodeList>) {
+        *self.network_list.write() = Some(list);
     }
 
     /// Set the datadir: broadcasts persist to `mnbroadcasts.json`, config is `masternode.conf`
@@ -105,10 +122,39 @@ impl MasternodeRpc {
     }
 
     /// Get masternode count values
-    pub fn get_masternode_count(&self, params: &Params) -> Result<Value, Error> {
+    pub fn get_masternode_count(
+        &self,
+        params: &Params,
+        chain: &Arc<Chain>,
+    ) -> Result<Value, Error> {
         // No arguments: anything else gets the help (rpcmasternode.cpp:329)
         if !params.is_empty() {
             return Err(Self::usage(GETMASTERNODECOUNT_USAGE));
+        }
+        if let Some(list) = self.network_list.read().clone() {
+            let c = list.counts(chain);
+            let mut value = json!({
+                "total": c.total,
+                "stable": c.stable,
+                "obfcompat": c.enabled,
+                "enabled": c.enabled,
+                "inqueue": c.inqueue,
+                "ipv4": c.ipv4,
+                "ipv6": c.ipv6,
+                "onion": c.onion,
+            });
+            // The count of each tier, which divid does not give
+            let entries = list.entries();
+            if let Some(obj) = value.as_object_mut() {
+                for (tier, name) in ["copper", "silver", "gold", "platinum", "diamond"]
+                    .iter()
+                    .enumerate()
+                {
+                    let n = entries.iter().filter(|e| e.mnb.tier == tier as i32).count();
+                    obj.insert(name.to_string(), json!(n));
+                }
+            }
+            return Ok(value);
         }
         let rpc = self.get_rpc()?;
         let mut value = serde_json::to_value(rpc.count())?;
@@ -142,17 +188,37 @@ impl MasternodeRpc {
     /// exactly two are given; height h is listed only when the block it is scored
     /// with, at h - 101, is on the chain (GetBlockHashForScoring,
     /// MasternodeHelpers.cpp:75-86).
-    pub fn get_masternode_winners(&self, params: &Params, tip_height: i32) -> Result<Value, Error> {
+    pub fn get_masternode_winners(
+        &self,
+        params: &Params,
+        chain: &Arc<Chain>,
+    ) -> Result<Value, Error> {
+        if let Some(votes) = self.votes.read().clone() {
+            let (blocks, filter) = Self::winners_args(params)?;
+            return Ok(votes.winners_json(chain, blocks as i64, filter));
+        }
+        self.winners_at(params, chain.height() as i32)
+    }
+
+    /// `blocks` (read with atoi, default 10) and the filter, read only when
+    /// there are exactly two arguments (rpcmasternode.cpp:489-552)
+    fn winners_args(params: &Params) -> Result<(i32, &str), Error> {
         if params.len() > 3 {
             return Err(Self::usage(GETMASTERNODEWINNERS_USAGE));
         }
-        self.get_rpc()?;
         let blocks = str_arg(params, 0)?.map(atoi).unwrap_or(10);
         let filter = if params.len() == 2 {
             str_arg(params, 1)?.unwrap_or("")
         } else {
             ""
         };
+        Ok((blocks, filter))
+    }
+
+    /// The winners with no vote known: every listed height "Unknown"
+    fn winners_at(&self, params: &Params, tip_height: i32) -> Result<Value, Error> {
+        let (blocks, filter) = Self::winners_args(params)?;
+        self.get_rpc()?;
         if !filter.is_empty() && !"Unknown".contains(filter) {
             return Ok(json!([]));
         }
@@ -165,11 +231,14 @@ impl MasternodeRpc {
     }
 
     /// Get a ranked list of masternodes
-    pub fn list_masternodes(&self, params: &Params) -> Result<Value, Error> {
+    pub fn list_masternodes(&self, params: &Params, chain: &Arc<Chain>) -> Result<Value, Error> {
         // One string filter at most (rpcmasternode.cpp:263-275)
         let filter = str_arg(params, 0)?;
         if params.len() > 1 {
             return Err(Self::usage(LISTMASTERNODES_USAGE));
+        }
+        if let Some(list) = self.network_list.read().clone() {
+            return Ok(list.list_json(chain, filter));
         }
         let rpc = self.get_rpc()?;
         let mode = filter.map(|s| s.to_string());
@@ -278,8 +347,22 @@ impl MasternodeRpc {
             Some("update_ping") | None => None,
             Some(s) => Some(s),
         };
+        // Divi Core takes the broadcast into its own list, then relays it
+        // (RelayParsedMasternodeBroadcast, RpcMasternodeFeatures.cpp:80-121)
         let relay = self.relay.read().clone();
-        mn_broadcast::relay_broadcast(ctx, relay.as_ref(), hex_in, sig)
+        let list = self.network_list.read().clone();
+        let chain = Arc::clone(ctx.chain);
+        let relay: BroadcastRelay = Arc::new(move |bytes: Vec<u8>| {
+            if let Some(list) = &list {
+                if let Err(e) = list.accept_broadcast(&chain, &bytes) {
+                    tracing::debug!("own masternode broadcast not listed: {}", e);
+                }
+            }
+            if let Some(relay) = &relay {
+                relay(bytes);
+            }
+        });
+        mn_broadcast::relay_broadcast(ctx, Some(&relay), hex_in, sig)
     }
 
     /// `signmnbroadcast mnhex`
@@ -468,6 +551,23 @@ mod tests {
         (code, message.lines().next().unwrap_or("").to_string())
     }
 
+    /// An empty regtest chain, for the calls that read one
+    fn test_chain() -> (tempfile::TempDir, Arc<divi_storage::Chain>) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = divi_storage::ChainDatabase::open(dir.path()).unwrap();
+        let chain = Arc::new(
+            divi_storage::Chain::new(
+                Arc::new(db),
+                divi_storage::ChainParams::for_network(
+                    divi_storage::chain::NetworkType::Regtest,
+                    divi_primitives::ChainMode::Divi,
+                ),
+            )
+            .unwrap(),
+        );
+        (dir, chain)
+    }
+
     /// Argument counts and types as Divi Core checks them: more arguments than
     /// a call takes is its help (-1), and a parameter read with get_str/get_bool
     /// that is another JSON type is json_spirit's -1 type error
@@ -475,10 +575,11 @@ mod tests {
     #[test]
     fn masternode_calls_check_argument_counts_and_types_as_divid() {
         let rpc = with_manager();
+        let (_dir, chain) = test_chain();
         let s = |v: &str| json!(v);
         let help = |r| first_line(rpc_err(r));
         assert_eq!(
-            help(rpc.get_masternode_count(&args(&[s("x")]))),
+            help(rpc.get_masternode_count(&args(&[s("x")]), &chain)),
             (-1, "getmasternodecount".into())
         );
         assert_eq!(
@@ -486,24 +587,24 @@ mod tests {
             (-1, "getmasternodestatus".into())
         );
         assert_eq!(
-            help(rpc.list_masternodes(&args(&[s("a"), s("b")]))),
+            help(rpc.list_masternodes(&args(&[s("a"), s("b")]), &chain)),
             (-1, "listmasternodes ( \"filter\" )".into())
         );
         assert_eq!(
-            help(rpc.list_masternodes(&args(&[json!(5)]))),
+            help(rpc.list_masternodes(&args(&[json!(5)]), &chain)),
             (-1, "value is type int, expected str".into())
         );
         assert_eq!(
-            help(rpc.get_masternode_winners(&args(&[s("5"), s("a"), s("b"), s("c")]), 200)),
+            help(rpc.winners_at(&args(&[s("5"), s("a"), s("b"), s("c")]), 200)),
             (-1, "getmasternodewinners ( blocks \"filter\" )".into())
         );
         assert_eq!(
-            help(rpc.get_masternode_winners(&args(&[json!(5)]), 200)),
+            help(rpc.winners_at(&args(&[json!(5)]), 200)),
             (-1, "value is type int, expected str".into())
         );
         // Three arguments are taken; the filter is read only when there are two
         let three = rpc
-            .get_masternode_winners(&args(&[s("5"), s("nomatch"), s("x")]), 200)
+            .winners_at(&args(&[s("5"), s("nomatch"), s("x")]), 200)
             .unwrap();
         assert_eq!(three.as_array().unwrap().len(), 25);
     }
@@ -515,7 +616,7 @@ mod tests {
     fn masternode_winners_list_only_heights_with_a_scoring_block() {
         let rpc = with_manager();
         let heights = |a: &[&str], tip: i32| -> Vec<i64> {
-            rpc.get_masternode_winners(&args(&a.iter().map(|v| json!(v)).collect::<Vec<_>>()), tip)
+            rpc.winners_at(&args(&a.iter().map(|v| json!(v)).collect::<Vec<_>>()), tip)
                 .unwrap()
                 .as_array()
                 .unwrap()
@@ -591,9 +692,10 @@ mod tests {
     #[test]
     fn test_masternode_rpc_without_manager() {
         let rpc = MasternodeRpc::new();
+        let (_dir, chain) = test_chain();
 
         // Should return error when manager is not set
-        let result = rpc.get_masternode_count(&Params::None);
+        let result = rpc.get_masternode_count(&Params::None, &chain);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("not initialized"));
     }
@@ -605,7 +707,8 @@ mod tests {
         rpc.set_manager(manager);
 
         // Should now work and return empty counts
-        let result = rpc.get_masternode_count(&Params::None);
+        let (_dir, chain) = test_chain();
+        let result = rpc.get_masternode_count(&Params::None, &chain);
         assert!(result.is_ok());
 
         let value = result.unwrap();
@@ -620,7 +723,8 @@ mod tests {
         rpc.set_manager(manager);
 
         // Should return empty list
-        let result = rpc.list_masternodes(&Params::None);
+        let (_dir, chain) = test_chain();
+        let result = rpc.list_masternodes(&Params::None, &chain);
         assert!(result.is_ok());
 
         let value = result.unwrap();

@@ -392,8 +392,7 @@ outpoint = lambda c: {"txid": c["txid"], "vout": c["vout"]}
 # Private keys for the given-key forms: in memory and in RPC messages only
 wif = {a: C.rpc("dumpprivkey", a) for a in (A, B)}
 
-# Raw transactions, made on divid; outputs in name order (irondivid's RPC maps
-# keep names sorted; see README.md)
+# Raw transactions, made on divid; outputs in name order (see README.md)
 LO, HI = sorted((Y, Z))
 raw_a = C.rpc("createrawtransaction", [outpoint(coin["a"])], {Y: 49.99})
 raw_a_two = C.rpc("createrawtransaction", [outpoint(coin["a2"])], {LO: 10, HI: 19.99})

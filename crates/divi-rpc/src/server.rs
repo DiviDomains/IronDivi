@@ -252,6 +252,17 @@ impl RpcServer {
     }
 
     /// Set the masternode manager
+    /// The masternodes the network announced (Core's list), read by
+    /// listmasternodes and getmasternodecount
+    pub fn set_masternode_list(&self, list: Arc<crate::mn_list::MasternodeList>) {
+        self.masternode.set_network_list(list);
+    }
+
+    /// The masternodes' payment votes, read by getmasternodewinners
+    pub fn set_masternode_votes(&self, votes: Arc<crate::mn_votes::MasternodeVotes>) {
+        self.masternode.set_votes(votes);
+    }
+
     pub fn set_masternode_manager(&self, manager: divi_masternode::MasternodeManager) {
         self.masternode.set_manager(manager);
     }
@@ -487,6 +498,8 @@ impl RpcServer {
         if !state_first {
             json_spirit_getter_check(method, params)?;
         }
+        let cut = cut_int_arguments(method, params);
+        let params = cut.as_ref().unwrap_or(params);
         match method {
             // Blockchain methods
             "getblockcount" => self.blockchain.get_block_count(params),
@@ -628,12 +641,16 @@ impl RpcServer {
             "getlitewalletinfo" => self.lite_wallet.read().get_lite_wallet_info(params),
 
             // Masternode methods
-            "getmasternodecount" => self.masternode.get_masternode_count(params),
+            "getmasternodecount" => self
+                .masternode
+                .get_masternode_count(params, self.blockchain.chain()),
             "getmasternodestatus" => self.masternode.get_masternode_status(params),
             "getmasternodewinners" => self
                 .masternode
-                .get_masternode_winners(params, self.blockchain.tip_height()),
-            "listmasternodes" => self.masternode.list_masternodes(params),
+                .get_masternode_winners(params, self.blockchain.chain()),
+            "listmasternodes" => self
+                .masternode
+                .list_masternodes(params, self.blockchain.chain()),
             "setupmasternode"
             | "startmasternode"
             | "broadcaststartmasternode"
@@ -1176,6 +1193,7 @@ fn core_argument_types(method: &str) -> &'static [(usize, &'static str)] {
         // rpcwallet.cpp:650
         "getaddressesbyaccount" => &[(0, "str")],
         // rpcwallet.cpp:1554
+        // (for "*" it answers before it reads minconf: json_spirit_getter_check)
         "getbalance" => &[(0, "str"), (1, "int"), (2, "bool")],
         // rpcblockchain.cpp:176
         // verbose: IronDivi also takes 0, 1 and 2 (verbosity 2 decodes the
@@ -1263,7 +1281,8 @@ fn core_argument_types(method: &str) -> &'static [(usize, &'static str)] {
         // rpcrawtransaction.cpp:602
         "signrawtransaction" => &[(1, "array"), (2, "array"), (3, "str")],
         // rpcrawtransaction.cpp:566
-        "signtransactionwithaddresskey" => &[(1, "str"), (2, "int")],
+        // (the input index is read before the address, :572 then :586)
+        "signtransactionwithaddresskey" => &[(2, "int"), (1, "str")],
         // rpcmisc.cpp:277
         "spork" => &[(0, "str"), (1, "str")],
         // rpcmasternode.cpp:393
@@ -1284,15 +1303,73 @@ fn core_argument_types(method: &str) -> &'static [(usize, &'static str)] {
 
 /// The calls whose arguments of `core_argument_types` Divi Core reads with no
 /// test for null first, so a null makes the getter throw too
-/// (rpcwallet.cpp:550, :1752, :1798-1808)
+/// (rpcwallet.cpp:550, :1576-1584, :1752, :1798-1808, :2272-2283, :2342-2348, :2410-2427;
+/// rpcrawtransaction.cpp:206-207, :571-572; rpcblockchain.cpp:418-420)
 fn getter_reads_null(method: &str) -> bool {
     matches!(
         method,
         "addmultisigaddress"
             | "getaccountaddress"
+            | "getbalance"
+            | "getrawtransaction"
+            | "listaccounts"
             | "listreceivedbyaccount"
             | "listreceivedbyaddress"
+            | "listsinceblock"
+            | "listtransactions"
+            | "signtransactionwithaddresskey"
+            | "verifychain"
     )
+}
+
+/// The positional arguments Divi Core reads with json_spirit's get_int(), which
+/// cuts an integer to a C++ int (json_spirit_value.h:385-390). Those read with
+/// get_int64() (prioritisetransaction, setmocktime, walletpassphrase) are not cut.
+fn core_int_arguments(method: &str) -> &'static [usize] {
+    match method {
+        // Chain calls (rpcblockchain.cpp:168, :369, :418-420; rpclottery.cpp:50;
+        // rpcrawtransaction.cpp:207); verifychain's one argument too
+        "getblockhash" | "getlotteryblockwinners" => &[0],
+        "gettxout" | "getrawtransaction" => &[1],
+        "verifychain" => &[0, 1],
+        // Raw transaction calls (rpcrawtransaction.cpp:572; rpcmisc.cpp:390,
+        // _createmultisig_redeemScript)
+        "signtransactionwithaddresskey" => &[2],
+        "createmultisig" | "addmultisigaddress" => &[0],
+        // Wallet calls (rpcrawtransaction.cpp:290-294; rpcwallet.cpp:1461, :1520,
+        // :1582, :1798, :2276-2279, :2343, :2420, :2559-2561)
+        "listunspent" => &[0, 1],
+        "getreceivedbyaddress" | "getreceivedbyaccount" | "getbalance" => &[1],
+        "listreceivedbyaddress" | "listreceivedbyaccount" | "listaccounts" | "keypoolrefill" => {
+            &[0]
+        }
+        "listtransactions" => &[1, 2],
+        "listsinceblock" => &[1],
+        // Mining (rpcmining.cpp:79)
+        "setgenerate" => &[0],
+        _ => &[],
+    }
+}
+
+/// The arguments as Divi Core's handler reads them: each integer of
+/// `core_int_arguments` cut to a C++ int. None when nothing changes.
+fn cut_int_arguments(method: &str, params: &Params) -> Option<Params> {
+    let Params::Array(values) = params else {
+        return None;
+    };
+    let mut cut = values.clone();
+    let mut changed = false;
+    for &index in core_int_arguments(method) {
+        if let Some(v) = cut.get_mut(index) {
+            if let Some(n) = crate::protocol::json_spirit_int(v) {
+                if v.as_i64() != Some(n) {
+                    *v = serde_json::json!(n);
+                    changed = true;
+                }
+            }
+        }
+    }
+    changed.then_some(Params::Array(cut))
 }
 
 /// Refuse an argument of the wrong JSON type as json_spirit's getter does. A
@@ -1302,7 +1379,15 @@ fn json_spirit_getter_check(method: &str, params: &Params) -> Result<(), RpcErro
     let Params::Array(values) = params else {
         return Ok(());
     };
+    // getbalance "*" answers before it reads another argument (rpcwallet.cpp:1576-1577)
+    let read = match (method, values.first()) {
+        ("getbalance", Some(serde_json::Value::String(account))) if account == "*" => 1,
+        _ => usize::MAX,
+    };
     for (index, want) in core_argument_types(method) {
+        if *index >= read {
+            continue;
+        }
         let Some(value) = values.get(*index) else {
             continue;
         };

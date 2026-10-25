@@ -57,6 +57,8 @@ pub mod json_spirit_text;
 pub mod lite_wallet;
 pub mod masternode;
 pub mod mn_broadcast;
+pub mod mn_list;
+pub mod mn_votes;
 pub mod network;
 pub mod protocol;
 pub mod rest;

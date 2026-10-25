@@ -14,6 +14,7 @@
 //! Methods for querying blockchain state: blocks, transactions, chain info.
 
 use crate::error::{codes, Error, RpcError};
+use crate::protocol::json_spirit_int;
 use crate::protocol::Params;
 use divi_consensus::bits_to_difficulty;
 use divi_primitives::hash::{Hash160, Hash256};
@@ -836,10 +837,11 @@ impl BlockchainRpc {
             "bestblock": stats.best_block.to_string(),
             "transactions": stats.transactions,
             "txouts": stats.txouts,
-            "bogosize": stats.bogosize,
             "bytes_serialized": stats.bytes_serialized,
             "hash_serialized": stats.hash_serialized.to_string(),
-            "total_amount": total_amount_divi
+            "total_amount": total_amount_divi,
+            // irondivid's own member, after divid's
+            "bogosize": stats.bogosize
         }))
     }
 
@@ -955,10 +957,14 @@ impl BlockchainRpc {
             return Ok(if verbose { json!({}) } else { json!([]) });
         };
 
+        // In txid order, as Divi Core reads its mempool's map (uint256 order,
+        // the order of the txids as shown; rpcblockchain.cpp:119, :143)
         if verbose {
             // Divi Core rpcblockchain.cpp:122-128
             let mut out = serde_json::Map::new();
-            for info in mempool.get_tx_infos() {
+            let mut infos = mempool.get_tx_infos();
+            infos.sort_by_key(|info| info.txid.to_string());
+            for info in infos {
                 out.insert(
                     info.txid.to_string(),
                     json!({
@@ -975,11 +981,12 @@ impl BlockchainRpc {
             return Ok(Value::Object(out));
         }
 
-        let txids: Vec<String> = mempool
+        let mut txids: Vec<String> = mempool
             .get_txids()
             .iter()
             .map(|txid| txid.to_string())
             .collect();
+        txids.sort();
 
         Ok(json!(txids))
     }
@@ -1142,8 +1149,8 @@ impl BlockchainRpc {
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
                 match (
-                    obj.get("start").and_then(|v| v.as_i64()),
-                    obj.get("end").and_then(|v| v.as_i64()),
+                    obj.get("start").and_then(json_spirit_int),
+                    obj.get("end").and_then(json_spirit_int),
                 ) {
                     (Some(start), Some(end)) => {
                         if start <= 0 || end <= 0 {
@@ -1218,7 +1225,12 @@ impl BlockchainRpc {
         let (start, end) = params
             .get(0)
             .and_then(|p| p.as_object())
-            .and_then(|obj| Some((obj.get("start")?.as_i64()?, obj.get("end")?.as_i64()?)))
+            .and_then(|obj| {
+                Some((
+                    json_spirit_int(obj.get("start")?)?,
+                    json_spirit_int(obj.get("end")?)?,
+                ))
+            })
             .filter(|(start, end)| *start > 0 && *end > 0)
             .unwrap_or((0, 0));
         let index = self.address_index()?;
@@ -1308,10 +1320,8 @@ impl BlockchainRpc {
             (1, Some(Value::Object(obj))) => obj,
             _ => return Err(RpcError::invalid_params("getspentinfo {txid:,index:}").into()),
         };
-        let (txid, index) = match (obj.get("txid"), obj.get("index")) {
-            (Some(Value::String(txid)), Some(Value::Number(n))) if n.is_i64() || n.is_u64() => {
-                (txid.as_str(), n.as_i64().unwrap_or(i64::MAX))
-            }
+        let (txid, index) = match (obj.get("txid"), obj.get("index").and_then(json_spirit_int)) {
+            (Some(Value::String(txid)), Some(index)) => (txid.as_str(), index),
             _ => {
                 return Err(
                     RpcError::new(codes::INVALID_ADDRESS_OR_KEY, "Invalid txid or index").into(),
@@ -1441,8 +1451,11 @@ impl BlockchainRpc {
     /// Verify blockchain database
     /// verifychain ( numblocks )
     pub fn verifychain(&self, params: &Params) -> Result<Value, Error> {
-        // Parse optional numblocks parameter (default 288)
-        let numblocks = params.get_i64(0).unwrap_or(288).max(0) as u64;
+        // numblocks, default 288. Divi Core reads params[1] whenever an argument
+        // is given (rpcblockchain.cpp:418-420); with only one it reads past the
+        // list, so that one is taken here
+        let at = if params.len() > 1 { 1 } else { 0 };
+        let numblocks = params.get_i64(at).unwrap_or(288).max(0) as u64;
 
         let best_height = self.chain.height() as u64;
 

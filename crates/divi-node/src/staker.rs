@@ -526,9 +526,12 @@ impl Staker {
             .height
             .and_then(|h| self.chain.get_block_index_by_height(h).ok().flatten())
             .map(|idx| idx.time);
-        match self.wallet.get_transaction(&utxo.txid) {
-            Some(record) => Some(u32::try_from(record.timestamp).unwrap_or(u32::MAX)),
-            None => block_time,
+        match self.wallet.tx_times(&utxo.txid) {
+            (0, 0) => block_time,
+            (received, smart) => {
+                let time = if smart != 0 { smart } else { received };
+                Some(u32::try_from(time).unwrap_or(u32::MAX))
+            }
         }
     }
 

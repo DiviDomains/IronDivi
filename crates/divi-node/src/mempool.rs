@@ -207,10 +207,6 @@ pub struct Admission {
 /// Divi Core `DEFAULT_BLOCK_PRIORITY_SIZE` (defaultValues.h:50)
 pub const DEFAULT_BLOCK_PRIORITY_SIZE: usize = 50_000;
 
-/// Divi Core `-limitfreerelay` default (MempoolConsensus.cpp:228), thousands of
-/// bytes per minute
-const LIMIT_FREE_RELAY: f64 = 30.0;
-
 /// Divi Core `CTxMemPoolEntry::AllowFreeThreshold` (MemPoolEntry.h:18-21)
 const ALLOW_FREE_THRESHOLD: f64 = (100_000_000i64 * 1440 / 250) as f64;
 
@@ -477,6 +473,22 @@ impl Mempool {
         self.check_conflicts(tx)
     }
 
+    /// Whether a transaction must be standard to be taken (Divi Core's
+    /// requireStandard, the opposite of `-acceptnonstandard`)
+    pub fn requires_standard(&self) -> bool {
+        !self.config.accept_nonstandard
+    }
+
+    /// The largest standard OP_META output script (Core's `nMaxDatacarrierBytes`)
+    pub fn max_datacarrier_bytes(&self) -> usize {
+        self.config.max_datacarrier_bytes as usize
+    }
+
+    /// Whether bare multisig outputs are standard (Core's `-permitbaremultisig`)
+    pub fn permits_bare_multisig(&self) -> bool {
+        self.config.permit_bare_multisig
+    }
+
     /// The minimum relay fee in satoshis per 1000 bytes (Core's
     /// `minimumRelayTransactionFee`)
     pub fn min_relay_fee_per_kb(&self) -> i64 {
@@ -512,11 +524,11 @@ impl Mempool {
         Ok(())
     }
 
-    /// Divi Core `CheckFeesPaidAreAcceptable` (MempoolConsensus.cpp:236-266) with
-    /// `-relaypriority` on: below the relay fee a transaction needs enough coin
-    /// age per byte (`priority`, Core's `ComputeInputCoinAgePerByte` at the next
-    /// height); a relayed one (`limit_free`) must also be under 49,000 bytes
-    /// unless prioritised, and free relay is rate limited.
+    /// Divi Core `CheckFeesPaidAreAcceptable` (MempoolConsensus.cpp:236-266):
+    /// below the relay fee a transaction needs enough coin age per byte
+    /// (`priority`, Core's `ComputeInputCoinAgePerByte` at the next height),
+    /// unless `-relaypriority=0`; a relayed one (`limit_free`) must also be
+    /// under 49,000 bytes unless prioritised, and free relay is rate limited.
     pub fn check_fees_paid(
         &self,
         txid: &Hash256,
@@ -535,7 +547,7 @@ impl Mempool {
         if limit_free && !prioritised && size >= DEFAULT_BLOCK_PRIORITY_SIZE - 1000 {
             return Err(rejected(reject::INSUFFICIENT_FEE, "insufficient fee"));
         }
-        if !allow_free(priority) {
+        if self.config.relay_priority && !allow_free(priority) {
             return Err(rejected(reject::INSUFFICIENT_FEE, "insufficient priority"));
         }
         if limit_free && !self.free_relay_allows(size) {
@@ -548,14 +560,15 @@ impl Mempool {
     }
 
     /// Divi Core `RateLimiterAllowsFreeTransaction` (MempoolConsensus.cpp:211-234):
-    /// an exponentially decaying ~10-minute window of free bytes
+    /// an exponentially decaying ~10-minute window of free bytes, full at
+    /// `-limitfreerelay` times 10,000 bytes
     fn free_relay_allows(&self, size: usize) -> bool {
         let now = unix_now() as i64;
         let mut limiter = self.free_limiter.lock();
         let (count, last) = &mut *limiter;
         *count *= (1.0 - 1.0 / 600.0f64).powf((now - *last) as f64);
         *last = now;
-        if *count >= LIMIT_FREE_RELAY * 10.0 * 1000.0 {
+        if *count >= self.config.limit_free_relay as f64 * 10.0 * 1000.0 {
             return false;
         }
         *count += size as f64;

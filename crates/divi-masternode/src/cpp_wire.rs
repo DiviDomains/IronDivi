@@ -180,7 +180,8 @@ impl CppTxIn {
     pub fn to_cpp_string(&self) -> String {
         let hash = hash_to_string(&self.prevout_hash);
         let null = self.prevout_hash == [0u8; 32] && self.prevout_n == u32::MAX;
-        let mut s = format!("CTxIn(COutPoint({}, {})", &hash[..10], self.prevout_n);
+        // COutPoint::ToString prints the whole hash in Divi Core (OutPoint.cpp:31)
+        let mut s = format!("CTxIn(COutPoint({}, {})", hash, self.prevout_n);
         if null {
             let hex: String = self
                 .script_sig
@@ -228,6 +229,16 @@ impl CppPing {
             sig_time: r.i64_le()?,
             signature: r.varbytes()?,
         })
+    }
+
+    /// Parse a ping (`mnp`); the whole input must be consumed
+    pub fn decode_bytes(data: &[u8]) -> Result<Self, WireError> {
+        let mut r = Reader { data, pos: 0 };
+        let ping = Self::decode(&mut r)?;
+        if r.pos != data.len() {
+            return Err(WireError::TrailingData);
+        }
+        Ok(ping)
     }
 
     /// C++ `CMasternodePing::getMessageToSign`: `vin.ToString() + blockHash.ToString() + sigTime`
@@ -382,6 +393,78 @@ pub fn sign_message(key: &SecretKey, message: &[u8]) -> Result<Vec<u8>, WireErro
     Ok(sig.to_compact_with_recovery().to_vec())
 }
 
+/// C++ `CMasternodePaymentWinner` as an `mnw` message carries it: a
+/// masternode's vote for the payee of a block height
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CppWinner {
+    pub vin: CppTxIn,
+    pub height: i32,
+    /// The payee's script
+    pub payee: Vec<u8>,
+    pub signature: Vec<u8>,
+}
+
+impl CppWinner {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.vin.encode(&mut out);
+        out.extend_from_slice(&self.height.to_le_bytes());
+        write_varbytes(&mut out, &self.payee);
+        write_varbytes(&mut out, &self.signature);
+        out
+    }
+
+    /// Parse an `mnw` payload; the whole input must be consumed
+    pub fn decode(data: &[u8]) -> Result<Self, WireError> {
+        let mut r = Reader { data, pos: 0 };
+        let w = Self {
+            vin: CppTxIn::decode(&mut r)?,
+            height: r.i32_le()?,
+            payee: r.varbytes()?,
+            signature: r.varbytes()?,
+        };
+        if r.pos != data.len() {
+            return Err(WireError::TrailingData);
+        }
+        Ok(w)
+    }
+
+    /// `GetHash`: payee, height and the voter's outpoint, double SHA-256
+    /// (MasternodePaymentWinner.cpp:38-46)
+    pub fn hash(&self) -> [u8; 32] {
+        let mut data = Vec::new();
+        write_varbytes(&mut data, &self.payee);
+        data.extend_from_slice(&self.height.to_le_bytes());
+        data.extend_from_slice(&self.vin.prevout_hash);
+        data.extend_from_slice(&self.vin.prevout_n.to_le_bytes());
+        double_sha256(&data)
+    }
+
+    /// `getMessageToSign`: `prevout.ToStringShort() + nBlockHeight +
+    /// payee.ToString()` (MasternodePaymentWinner.cpp:72-77)
+    pub fn message_to_sign(&self) -> Vec<u8> {
+        format!(
+            "{}-{}{}{}",
+            hash_to_string(&self.vin.prevout_hash),
+            self.vin.prevout_n,
+            self.height,
+            divi_script::asm::to_asm(&self.payee)
+        )
+        .into_bytes()
+    }
+
+    /// Whether the vote is signed by `pubkey` (the masternode key)
+    pub fn signature_is_valid(&self, pubkey: &[u8]) -> bool {
+        verify_message(pubkey, &self.signature, &self.message_to_sign())
+    }
+
+    /// Sign the vote with the masternode key
+    pub fn sign(&mut self, key: &SecretKey) -> Result<(), WireError> {
+        self.signature = sign_message(key, &self.message_to_sign())?;
+        Ok(())
+    }
+}
+
 /// Check that `signature` over `message` recovers to `pubkey`
 pub fn verify_message(pubkey: &[u8], signature: &[u8], message: &[u8]) -> bool {
     let Ok(sig) = RecoverableSig::from_compact_with_recovery(signature) else {
@@ -461,6 +544,44 @@ mod tests {
         assert_eq!(v6.service_string(), "[2001:db8:0:0:0:0:0:1]:5");
     }
 
+    /// A payment vote as `mnw` carries it: vin, height, payee script,
+    /// signature; signed over `prevout.ToStringShort() + height +
+    /// payee.ToString()` (MasternodePaymentWinner.cpp:72-77)
+    #[test]
+    fn winner_wire_and_message_as_divid() {
+        let mut payee = vec![0x76, 0xa9, 0x14];
+        payee.extend_from_slice(&[0xab; 20]);
+        payee.extend_from_slice(&[0x88, 0xac]);
+        let mut hash = [0u8; 32];
+        hash[0] = 0x01;
+        hash[31] = 0xfe;
+        let key = SecretKey::new_random();
+        let mut w = CppWinner {
+            vin: CppTxIn::new(hash, 2),
+            height: 1234,
+            payee,
+            signature: vec![],
+        };
+        w.sign(&key).unwrap();
+        let bytes = w.encode();
+        assert_eq!(CppWinner::decode(&bytes), Ok(w.clone()));
+        let msg = String::from_utf8(w.message_to_sign()).unwrap();
+        assert_eq!(
+            msg,
+            format!(
+                "fe{}01-21234OP_DUP OP_HASH160 {} OP_EQUALVERIFY OP_CHECKSIG",
+                "00".repeat(30),
+                "ab".repeat(20)
+            )
+        );
+        assert!(w.signature_is_valid(&key.public_key().to_bytes()));
+        let other = SecretKey::new_random();
+        assert!(!w.signature_is_valid(&other.public_key().to_bytes()));
+        let mut extra = bytes.clone();
+        extra.push(0);
+        assert_eq!(CppWinner::decode(&extra), Err(WireError::TrailingData));
+    }
+
     #[test]
     fn ping_message_uses_cpp_txin_string() {
         let mut p = sample().last_ping;
@@ -474,8 +595,14 @@ mod tests {
             3,
         );
         let msg = String::from_utf8(p.message_to_sign()).unwrap();
+        // Divi Core prints the whole hash (OutPoint.cpp:31, its .substr(0,10)
+        // commented out), so a ping signed or checked over a shortened hash
+        // fails on divid ("Got bad Masternode address signature")
         assert!(
-            msg.starts_with("CTxIn(COutPoint(abcd000000, 3), scriptSig=)"),
+            msg.starts_with(&format!(
+                "CTxIn(COutPoint(abcd{}, 3), scriptSig=)",
+                "0".repeat(60)
+            )),
             "{}",
             msg
         );

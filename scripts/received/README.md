@@ -103,8 +103,6 @@ Core paths are under `divi/src/` of the Divi Core source at v3.0.0 (commit 9e2f7
 - **`getstakingstatus (...): mnsync`** (after the first blocks): irondivid has no masternode sync stages and reports
   whether the chain is synced. divid's stages need 3 spork-synced peers to move on (`masternode-sync.cpp:425-455`),
   so on this chain it stays false (as in `scripts/masternode-replies`).
-- **`getstakingstatus (after stake blocks): staking status`:** divid counts a stake search made through `setgenerate`
-  as staking for 5 minutes (`init.cpp:157-174`). irondivid reports its staker, which is off here (`staking=0`).
 - **`<call>: member order`** for `getstakingstatus`, `listreceivedbyaddress`, `listreceivedbyaccount` and
   `validateaddress`: irondivid writes a reply's members in name order (`docs/divid-differences.md` R6).
 - **`listreceivedbyaddress: fields divid lacks`:** irondivid adds `label` (as in `scripts/wallet-replies`).

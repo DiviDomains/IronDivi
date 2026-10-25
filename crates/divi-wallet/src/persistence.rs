@@ -1090,6 +1090,41 @@ impl WalletDatabase {
             .collect())
     }
 
+    /// Key prefix of a transaction's received and smart times
+    const TX_TIMES_PREFIX: &'static [u8] = b"tx_times_";
+
+    /// Store a transaction's received and smart times (Divi Core
+    /// nTimeReceived, nTimeSmart)
+    pub fn store_tx_times(
+        &self,
+        txid: &Hash256,
+        received: u64,
+        smart: u64,
+    ) -> Result<(), WalletError> {
+        let mut value = received.to_le_bytes().to_vec();
+        value.extend_from_slice(&smart.to_le_bytes());
+        self.db
+            .put_cf(
+                self.cf(CF_DEFAULT),
+                Self::prefixed_txid_key(Self::TX_TIMES_PREFIX, txid),
+                value,
+            )
+            .map_err(|e| WalletError::Storage(e.to_string()))
+    }
+
+    /// Every stored transaction's (received, smart) times
+    pub fn load_tx_times(&self) -> Result<Vec<(Hash256, u64, u64)>, WalletError> {
+        Ok(self
+            .load_prefixed(Self::TX_TIMES_PREFIX)?
+            .into_iter()
+            .filter_map(|(txid, v)| {
+                let received = u64::from_le_bytes(v.get(..8)?.try_into().ok()?);
+                let smart = u64::from_le_bytes(v.get(8..16)?.try_into().ok()?);
+                Some((txid, received, smart))
+            })
+            .collect())
+    }
+
     /// Store a transaction's notes (JSON object of strings), synced
     pub fn store_tx_notes(&self, txid: &Hash256, notes: &[u8]) -> Result<(), WalletError> {
         let mut batch = WriteBatch::default();

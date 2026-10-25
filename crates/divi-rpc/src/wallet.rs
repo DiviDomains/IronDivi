@@ -356,11 +356,9 @@ pub(crate) fn spirit_bool(params: &Params, index: usize) -> Result<bool, Error> 
 
 /// get_int: a JSON integer, taken as a C++ int
 pub(crate) fn spirit_int(params: &Params, index: usize) -> Result<i32, Error> {
-    match params.get(index) {
-        Some(serde_json::Value::Number(n)) if !n.is_f64() => {
-            Ok(n.as_i64().unwrap_or(i64::MAX) as i32)
-        }
-        other => Err(spirit_type_error(other, "int")),
+    match params.get(index).and_then(crate::protocol::json_spirit_int) {
+        Some(n) => Ok(n as i32),
+        None => Err(spirit_type_error(params.get(index), "int")),
     }
 }
 
@@ -394,15 +392,18 @@ pub(crate) fn script_pubkey_to_json(
 ) -> serde_json::Value {
     use divi_script::{extract_destinations, extract_script_type, get_script_type_name, to_asm};
     let (script_type, _solutions) = extract_script_type(script_bytes);
-    let mut script_obj = json!({
-        "asm": to_asm(script_bytes),
-        "type": get_script_type_name(script_type),
-    });
+    // Members in the order ScriptPubKeyToJSON writes them: asm, hex, then
+    // reqSigs, type and addresses, or only type for a script with no
+    // destination (JsonTxHelpers.cpp:15-37)
+    let mut script_obj = serde_json::Map::new();
+    script_obj.insert("asm".into(), json!(to_asm(script_bytes)));
     if include_hex {
-        script_obj["hex"] = json!(hex::encode(script_bytes));
+        script_obj.insert("hex".into(), json!(hex::encode(script_bytes)));
     }
+    let type_name = json!(get_script_type_name(script_type));
     if let Some((_stype, destinations, req_sigs)) = extract_destinations(script_bytes) {
-        script_obj["reqSigs"] = json!(req_sigs);
+        script_obj.insert("reqSigs".into(), json!(req_sigs));
+        script_obj.insert("type".into(), type_name);
         let addresses: Vec<String> = destinations
             .iter()
             .map(|dest| match dest {
@@ -414,9 +415,11 @@ pub(crate) fn script_pubkey_to_json(
                 }
             })
             .collect();
-        script_obj["addresses"] = json!(addresses);
+        script_obj.insert("addresses".into(), json!(addresses));
+    } else {
+        script_obj.insert("type".into(), type_name);
     }
-    script_obj
+    serde_json::Value::Object(script_obj)
 }
 
 /// Where `address` comes in Divi Core's address book, a std::map keyed by
@@ -1204,8 +1207,10 @@ impl WalletRpc {
         let wallet = self.get_wallet()?;
 
         // Optional parameters
-        let min_conf = params.get_u64(0).unwrap_or(1) as u32;
-        let max_conf = params.get_u64(1).unwrap_or(9999999) as u32;
+        // C++ ints: a negative minconf takes every depth, a negative maxconf
+        // none (rpcrawtransaction.cpp:288-294, :318)
+        let min_conf = params.get_i64(0).unwrap_or(1);
+        let max_conf = params.get_i64(1).unwrap_or(9999999);
 
         // Optional ["address", ...] filter. As in Core, a bad address is -5
         // and a repeated one is -8.
@@ -1253,7 +1258,7 @@ impl WalletRpc {
         let result: Vec<_> = utxos
             .iter()
             .filter(|utxo| {
-                let confs = utxo.confirmations(height);
+                let confs = i64::from(utxo.confirmations(height));
                 confs >= min_conf && confs <= max_conf
             })
             .filter(|utxo| !wallet.is_coin_locked(&utxo.outpoint()))
@@ -1983,12 +1988,16 @@ impl WalletRpc {
             }
             let txid = parse_hash_v(input.get("txid"), "txid")?;
 
-            let vout = input.get("vout").and_then(|v| v.as_i64()).ok_or_else(|| {
-                RpcError::new(
-                    codes::INVALID_PARAMETER,
-                    "Invalid parameter, missing vout key",
-                )
-            })?;
+            // vout_v.get_int() (rpcrawtransaction.cpp:420-422)
+            let vout = input
+                .get("vout")
+                .and_then(crate::protocol::json_spirit_int)
+                .ok_or_else(|| {
+                    RpcError::new(
+                        codes::INVALID_PARAMETER,
+                        "Invalid parameter, missing vout key",
+                    )
+                })?;
             if vout < 0 {
                 return Err(RpcError::new(
                     codes::INVALID_PARAMETER,
@@ -2136,7 +2145,8 @@ impl WalletRpc {
                     &[("scriptPubKey", "str"), ("txid", "str"), ("vout", "int")],
                 )?;
                 let txid = parse_hash_v(prevtx.get("txid"), "txid")?;
-                let vout = prevtx["vout"].as_i64().unwrap_or(i64::MAX);
+                // get_int() (rpcrawtransaction.cpp:726)
+                let vout = crate::protocol::json_spirit_int(&prevtx["vout"]).unwrap_or(i64::MAX);
                 if vout < 0 {
                     return Err(RpcError::new(
                         codes::DESERIALIZATION_ERROR,
@@ -3647,21 +3657,34 @@ impl WalletRpc {
             })?;
             let (amount, repetitions) = match amount_value.as_object() {
                 Some(details) => {
-                    let amount = details.get("amount").ok_or_else(|| {
+                    // RPCTypeCheck of {amount: real, repetitions: int}, nulls
+                    // allowed, in the map's name order (rpcwallet.cpp:1668)
+                    for (name, want) in [("amount", "real"), ("repetitions", "int")] {
+                        let got = details.get(name).map_or("null", json_spirit_type);
+                        if got != want && got != "null" {
+                            return Err(RpcError::new(
+                                codes::TYPE_ERROR,
+                                format!("Expected type {want} for {name}, got {got}"),
+                            )
+                            .into());
+                        }
+                    }
+                    let unparsed = |what: &str| -> Error {
                         RpcError::new(
                             codes::INVALID_PARAMETER,
-                            format!("Unable to parse amount for: {}", addr_str),
+                            format!("Unable to parse {what} for: {addr_str}"),
                         )
-                    })?;
+                        .into()
+                    };
+                    let amount = details
+                        .get("amount")
+                        .filter(|v| !v.is_null())
+                        .ok_or_else(|| unparsed("amount"))?;
                     let repetitions = details
                         .get("repetitions")
-                        .and_then(|r| r.as_i64())
-                        .ok_or_else(|| {
-                            RpcError::new(
-                                codes::INVALID_PARAMETER,
-                                format!("Unable to parse repetitions for: {}", addr_str),
-                            )
-                        })?;
+                        .and_then(crate::protocol::json_spirit_int)
+                        .ok_or_else(|| unparsed("repetitions"))?;
+                    // std::max<int>(repetitions.get_int(), 1) (:1675)
                     (
                         amount_from_value(amount, false)?,
                         repetitions.max(1) as usize,
@@ -4239,7 +4262,8 @@ impl WalletRpc {
                 return Err(invalid("Invalid parameter, expected hex txid"));
             }
             let txid = uint256_set_hex(txid_str);
-            let vout = o["vout"].as_i64().unwrap_or(-1);
+            // get_int() (rpcwallet.cpp:2801)
+            let vout = crate::protocol::json_spirit_int(&o["vout"]).unwrap_or(-1);
             if vout < 0 {
                 return Err(invalid("Invalid parameter, vout must be positive"));
             }
