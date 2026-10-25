@@ -1307,8 +1307,8 @@ impl BlockSync {
             self.ask_up_to(peer_id, hash, block.header.prev_block).await;
         }
 
-        // Track chain height before processing to detect newly connected blocks
-        let height_before = self.chain.height();
+        // The tip before, to announce the new one if it moves
+        let tip_before = self.chain.tip().map(|t| t.hash);
 
         // Remove from in-flight
         let solicited = self.blocks_in_flight.write().remove(&hash).is_some();
@@ -1337,24 +1337,28 @@ impl BlockSync {
         // A block stored on a competing fork becomes the side-chain locator hint.
         self.note_side_chain_block(hash);
 
-        // Relay block inv to other peers if the chain advanced (block was accepted).
-        // Only relay during normal operation (not during initial bulk sync) to avoid
-        // flooding peers with inv messages for blocks they already have.
-        let height_after = self.chain.height();
-        if height_after > height_before {
-            let best_height = *self.best_peer_height.read();
-            let blocks_behind = best_height.saturating_sub(height_after);
-            if blocks_behind < 10 {
-                // Near tip -- relay to all peers except the sender
-                self.peer_manager.broadcast_block_inv_except(hash, peer_id);
-            }
-        }
-
         // Request more blocks (header-first sync)
         self.request_blocks().await;
 
         // Request more blocks from queue (inv-based sync)
         self.request_queued_blocks().await;
+
+        // Divi Core announces the new tip to its peers each time the tip moves,
+        // outside initial download (ChainExtensionService.cpp:553-565,
+        // NotifyPeersOfNewChainTip net.cpp:1490-1497): the tip, not the block
+        // that came, which may be one of several that connected at once
+        if let Some(tip) = self.chain.tip().filter(|t| Some(t.hash) != tip_before) {
+            let best_height = *self.best_peer_height.read();
+            if best_height.saturating_sub(tip.height) < 10 {
+                if tip.hash == hash {
+                    // The peer that sent it has it
+                    self.peer_manager
+                        .broadcast_block_inv_except(tip.hash, peer_id);
+                } else {
+                    self.peer_manager.broadcast_block_inv(tip.hash);
+                }
+            }
+        }
 
         // Emit progress
         let _ = self.progress_tx.send(self.progress());
@@ -4240,5 +4244,42 @@ mod tests {
         assert_eq!(sync.chain.height(), 0);
         assert_eq!(score(&sync, peer_id), 0);
         assert!(!sync.peer_manager.is_banned(&ip));
+    }
+
+    /// When a block lets blocks already received connect after it, the peers are
+    /// told of the new tip, as Divi Core announces the tip each time it moves
+    /// (ChainExtensionService.cpp:553-565, net.cpp:1490-1497); the block that
+    /// came is only the middle of the chain they need
+    #[tokio::test]
+    async fn the_new_tip_is_announced_when_held_blocks_connect() {
+        let (sync, mut rxs, _dir) = sync_with_peers(2);
+        let parent = next_block(&sync.chain);
+        let parent_hash = compute_block_hash(&parent.header);
+        let tip = sync.chain.tip().unwrap();
+        let mut child = parent.clone();
+        child.header.prev_block = parent_hash;
+        child.header.time = parent.header.time + 60;
+        let mut tag = divi_storage::bip34_height_script(tip.height + 2);
+        tag.extend_from_slice(&(tip.height + 2).to_le_bytes());
+        child.transactions[0].vin[0].script_sig = divi_primitives::script::Script::from_bytes(tag);
+        child.header.merkle_root = divi_crypto::compute_merkle_root(&child.transactions);
+        child.header.nonce = 0;
+        let target = Hash256::from_compact(child.header.bits);
+        while compute_block_hash(&child.header) > target {
+            child.header.nonce += 1;
+        }
+        let child_hash = compute_block_hash(&child.header);
+
+        sync.handle_block(1, child).await;
+        sync.handle_block(1, parent).await;
+        assert_eq!(sync.chain.tip().unwrap().hash, child_hash, "both connected");
+
+        let mut announced = Vec::new();
+        while let Ok(msg) = rxs.get_mut(&2).unwrap().try_recv() {
+            if let NetworkMessage::Inv(items) = msg {
+                announced.extend(items.into_iter().map(|i| i.hash));
+            }
+        }
+        assert_eq!(announced.last(), Some(&child_hash), "told of {announced:?}");
     }
 }
