@@ -1016,6 +1016,35 @@ impl Node {
                                     );
                                     continue;
                                 }
+                                // A filtered block: a merkleblock under the peer's
+                                // filter (which matching updates), then each matched
+                                // transaction the peer is not known to have; served
+                                // whatever -peerbloomfilters says, as every peer has a
+                                // filter (main.cpp:249-278, Node.cpp:556). A block not
+                                // had gets no answer (main.cpp:300-318).
+                                for item in items
+                                    .iter()
+                                    .filter(|i| i.inv_type == divi_network::InvType::FilteredBlock)
+                                {
+                                    let (Ok(Some(block)), Some(stats)) =
+                                        (chain.get_block_for_peer(&item.hash), peer_manager.peer_stats(peer_id))
+                                    else {
+                                        continue;
+                                    };
+                                    let (payload, matched) = {
+                                        let mut filter = stats.bloom.filter();
+                                        divi_network::bloom::merkle_block(&block, &mut filter)
+                                    };
+                                    let _ = peer_manager
+                                        .send_block_to_peer(peer_id, NetworkMessage::MerkleBlock(payload))
+                                        .await;
+                                    for (i, txid) in matched {
+                                        if !tx_relay.peer_knows(peer_id, &txid) {
+                                            let tx = NetworkMessage::Tx(block.transactions[i].clone());
+                                            let _ = peer_manager.send_block_to_peer(peer_id, tx).await;
+                                        }
+                                    }
+                                }
                                 // Split block and tx getdata items
                                 let block_items: Vec<_> = items
                                     .iter()

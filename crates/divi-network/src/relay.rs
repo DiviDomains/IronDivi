@@ -305,6 +305,15 @@ impl TxRelay {
         let _ = self.event_tx.send(event);
     }
 
+    /// Whether `peer_id` is known to have `txid` (it announced or was told of
+    /// it): Divi Core's setInventoryKnown
+    pub fn peer_knows(&self, peer_id: PeerId, txid: &Hash256) -> bool {
+        self.peer_inventory
+            .read()
+            .get(&peer_id)
+            .is_some_and(|known| known.contains(txid))
+    }
+
     /// Relay a transaction the mempool took, to every peer but the one it came
     /// from (Divi Core RelayTransactionToAllPeers after AcceptToMemoryPool,
     /// main.cpp:734, and for an orphan accepted once its parent came, :763)

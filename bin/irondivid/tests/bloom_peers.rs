@@ -351,3 +351,96 @@ fn filter_messages_are_taken_and_scored_as_divid() {
     );
     assert!(bans(&off, &[("filterclear", vec![])]), "off: filterclear");
 }
+
+/// A getdata of one block of inv type `kind` (3: a filtered block)
+fn getdata(kind: u32, hash_hex: &str) -> Vec<u8> {
+    let mut hash = hex::decode(hash_hex).unwrap();
+    hash.reverse();
+    let mut p = vec![1u8];
+    p.extend_from_slice(&kind.to_le_bytes());
+    p.extend_from_slice(&hash);
+    p
+}
+
+/// The serialized header and first transaction of a block, from getblock
+fn header_and_coinbase(daemon: &Daemon, hash: &str) -> (Vec<u8>, Vec<u8>) {
+    let raw = hex::decode(
+        daemon
+            .rpc("getblock", json!([hash, false]))
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    let version = i32::from_le_bytes(raw[..4].try_into().unwrap());
+    let header_len = if version > 3 { 112 } else { 80 };
+    let block = daemon.rpc("getblock", json!([hash]));
+    let coinbase = block["tx"][0].as_str().unwrap().to_string();
+    let tx = hex::decode(
+        daemon
+            .rpc("getrawtransaction", json!([coinbase]))
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    (raw[..header_len].to_vec(), tx)
+}
+
+/// A getdata of a filtered block is answered as Divi Core answers it
+/// (main.cpp:249-278): a merkleblock of the block's header and partial merkle
+/// tree, then each matched transaction; served whatever -peerbloomfilters
+/// says, as every peer has a filter that matches all (Node.cpp:556)
+#[test]
+fn filtered_block_getdata_gets_a_merkleblock_and_the_matched_transactions() {
+    for extra in [&[][..], &["-peerbloomfilters=0"][..]] {
+        let daemon = Daemon::start(extra);
+        daemon.rpc("setgenerate", json!([1]));
+        let hash = daemon
+            .rpc("getblockhash", json!([1]))
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (header, coinbase) = header_and_coinbase(&daemon, &hash);
+
+        let mut peer = Peer::connect(daemon.p2p_port, true);
+        if extra.is_empty() {
+            peer.send("filterload", &filterload(10, 0xff));
+        }
+        peer.send("getdata", &getdata(3, &hash));
+        let got = peer.drain(Duration::from_secs(3));
+        let merkle = got
+            .iter()
+            .find(|(c, _)| c == "merkleblock")
+            .unwrap_or_else(|| {
+                panic!(
+                    "{extra:?}: no merkleblock in {:?}",
+                    got.iter().map(|m| &m.0).collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(&merkle.1[..header.len()], &header[..], "{extra:?}: header");
+        assert_eq!(
+            u32::from_le_bytes(merkle.1[header.len()..header.len() + 4].try_into().unwrap()),
+            1,
+            "{extra:?}: one transaction"
+        );
+        assert!(
+            got.iter().any(|(c, p)| c == "tx" && *p == coinbase),
+            "{extra:?}: the matched coinbase was not sent"
+        );
+
+        if extra.is_empty() {
+            // A filter that matches nothing: the merkleblock, and no transaction
+            let mut peer = Peer::connect(daemon.p2p_port, true);
+            peer.send("filterload", &filterload(10, 0));
+            peer.send("getdata", &getdata(3, &hash));
+            let got = peer.drain(Duration::from_secs(3));
+            assert!(
+                got.iter().any(|(c, _)| c == "merkleblock"),
+                "empty filter: no merkleblock"
+            );
+            assert!(
+                !got.iter().any(|(c, _)| c == "tx"),
+                "empty filter: a tx was sent"
+            );
+        }
+    }
+}
