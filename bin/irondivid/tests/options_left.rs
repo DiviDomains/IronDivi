@@ -11,7 +11,7 @@
 
 #![cfg(unix)]
 
-use divi_test_support::start_node;
+use divi_test_support::{free_port, start_node};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -93,7 +93,10 @@ fn debug_log(datadir: &Path) -> String {
 fn run_to_exit(datadir: &Path, extra: &[String]) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_irondivid"))
         .args(base_args(datadir))
-        .args(["-rpcport=1".to_string(), "-port=1".to_string()])
+        .args([
+            format!("-rpcport={}", free_port()),
+            format!("-port={}", free_port()),
+        ])
         .args(extra)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -365,4 +368,31 @@ fn a_refused_start_writes_its_error_to_debug_log() {
     let named: Vec<&str> = log.lines().filter(|l| l.contains("-checklevel")).collect();
     assert_eq!(named.len(), 1, "{log}");
     assert!(named[0].ends_with(line), "{log}");
+}
+
+/// The start's check of the last blocks finds one too far in the future of
+/// the clock, as divid's VerifyDB does with CheckBlock (verifyDb.cpp:95-97):
+/// blocks made a day ahead with setmocktime refuse the next start on the real
+/// clock
+#[test]
+fn the_start_check_refuses_blocks_from_the_future() {
+    let ahead = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 86_400;
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let (_node, port) = start(dir.path(), &[]);
+        let set = rpc(port, "setmocktime", json!([ahead])).unwrap();
+        assert!(set["error"].is_null(), "{set}");
+        let made = rpc(port, "setgenerate", json!([3])).unwrap();
+        assert!(made["error"].is_null(), "{made}");
+    }
+    let out = run_to_exit(dir.path(), &[]);
+    assert_eq!(
+        errors(&out)[..1],
+        ["Error: Corrupted block database detected"]
+    );
+    assert_eq!(out.status.code(), Some(1));
 }
