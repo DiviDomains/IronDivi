@@ -264,3 +264,28 @@ async fn headers_message_is_not_read() {
     let got: Vec<String> = replies(&mut p).await.into_iter().map(|(c, _)| c).collect();
     assert!(got.is_empty(), "{got:?}");
 }
+
+/// A block whose parent is unknown is answered with a getblocks up to it,
+/// and the same block again with one up to its parent: Divi Core asks the
+/// peer that way for what it is missing (main.cpp:822-833)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn block_with_an_unknown_parent_is_answered_with_getblocks() {
+    let t = TestNode::start().await;
+    mine(&t);
+    let mut block = next_block(&t);
+    let parent = Hash256::from_bytes([0x6b; 32]);
+    block.header.prev_block = parent;
+    let hash = divi_crypto::compute_block_hash(&block.header);
+    let bytes = divi_primitives::serialize::serialize(&block);
+    let mut p = peer(&t, "127.0.0.3").await;
+    let mut stops = Vec::new();
+    for _ in 0..2 {
+        p.send("block", &bytes).await;
+        for (c, m) in replies(&mut p).await {
+            if c == "getblocks" {
+                stops.push(Hash256::from_bytes(m[m.len() - 32..].try_into().unwrap()));
+            }
+        }
+    }
+    assert_eq!(stops, vec![hash, parent]);
+}
