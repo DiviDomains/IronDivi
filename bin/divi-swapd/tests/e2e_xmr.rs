@@ -485,10 +485,10 @@ async fn garbage_forwarded_for_falls_back_to_the_socket() {
 }
 
 /// One honest swap's setup (`begin`: the `/j` exchanges and `/sigs`), then a status read with
-/// its own token per request: the XMR `:id` routes share one per-IP bucket, counted before the
-/// token check, and the setup leaves most of it. Fails on 7361ae6 (no limit: never 429).
+/// its own token per request: a swap's right-token requests on the XMR `:id` routes share one
+/// per-swap bucket, and the setup leaves most of it. Fails on 7361ae6 (no limit: never 429).
 #[tokio::test]
-async fn xmr_swap_routes_share_a_per_ip_bucket() {
+async fn xmr_swap_routes_share_a_per_swap_bucket() {
     let w = World::new();
     let tmp = tempfile::tempdir().unwrap();
     let d = serve(&w, &tmp.path().join("m.db")).await;
@@ -527,8 +527,8 @@ async fn xmr_swap_routes_share_a_per_ip_bucket() {
 }
 
 /// Token guesses: past `XMR_TOKEN_MISS_LIMIT_PER_WINDOW` misses an IP gets 429 on every XMR
-/// `:id` route, even with the right token, so it cannot keep testing tokens. Fails on 7361ae6
-/// (every guess a 404).
+/// `:id` route without the right token, while the right token still passes (so a prober on a
+/// shared address cannot lock its taker out). Fails on 7361ae6 (every guess a 404).
 #[tokio::test]
 async fn xmr_token_guesses_are_throttled() {
     let w = World::new();
@@ -556,12 +556,12 @@ async fn xmr_token_guesses_are_throttled() {
     assert_eq!(get(format!("{misses:064x}")).await, 429, "the next guess");
     assert_eq!(
         get(session.swap_token.clone()).await,
-        429,
-        "even the right token, for the rest of the window"
+        200,
+        "the right token still passes"
     );
     let r = http
         .post(format!("{url}/sigs"))
-        .header("X-Swap-Token", &session.swap_token)
+        .header("X-Swap-Token", "0".repeat(64))
         .json(&serde_json::json!({}))
         .send()
         .await
@@ -607,4 +607,141 @@ async fn spoofed_forwarded_for_cannot_reset_token_misses() {
         .await
         .unwrap();
     assert_eq!(r.status().as_u16(), 404, "another client is not throttled");
+}
+
+/// Starts a swap on `w`'s daemon at `base` and returns its `(maker id, token)`.
+async fn begun(w: &World, tmp: &std::path::Path, base: &str) -> (String, String) {
+    let tdb = tmp.join("t.db");
+    let taker = w.taker(&tdb);
+    let client = MakerClient::new(base);
+    let sessions = Sessions::beside(&tdb);
+    let local = xmr_flow::begin(&taker, &client, &sessions, "divi-xmr-stagenet", XMR_UNITS)
+        .await
+        .unwrap();
+    let session = sessions.get(&local).unwrap();
+    (session.maker_swap_id, session.swap_token)
+}
+
+/// The shared-bucket DoS: with `trust_proxy_headers` off every client behind a proxy is one
+/// address, so a prober there spends the token misses and floods the XMR `:id` routes. A
+/// client holding the right token on that same address still reaches every `:id` route.
+/// Fails on 747ec44 (the prober's misses lock the whole address out: 429).
+#[tokio::test]
+async fn a_prober_cannot_lock_a_valid_token_client_out() {
+    let w = World::new();
+    let tmp = tempfile::tempdir().unwrap();
+    let d = serve(&w, &tmp.path().join("m.db")).await;
+    let (id, token) = begun(&w, tmp.path(), &d.base).await;
+    let url = format!("{}/xmr/swaps/{id}", d.base);
+    let http = reqwest::Client::new();
+    let limit = divi_swapd::XMR_SWAP_LIMIT_PER_WINDOW;
+    let misses = divi_swapd::XMR_TOKEN_MISS_LIMIT_PER_WINDOW;
+    for i in 0..misses + 5 {
+        http.get(&url)
+            .header("X-Swap-Token", format!("{i:064x}"))
+            .send()
+            .await
+            .unwrap();
+    }
+    for _ in 0..limit + 20 {
+        http.get(&url).send().await.unwrap();
+        http.get(format!("{}/xmr/swaps/nope", d.base))
+            .send()
+            .await
+            .unwrap();
+    }
+    let r = http.get(&url).header("X-Swap-Token", &token).send().await;
+    assert_eq!(
+        r.unwrap().status().as_u16(),
+        200,
+        "GET with the right token"
+    );
+    for tail in ["j", "sigs", "xmr-lock"] {
+        let r = http
+            .post(format!("{url}/{tail}"))
+            .header("X-Swap-Token", &token)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap();
+        let code = r.status().as_u16();
+        // A junk body: the handler answers it (4xx/5xx), but the gate let it through.
+        assert!(
+            code != 429 && code != 404,
+            "{tail} with the right token: {code}"
+        );
+    }
+}
+
+/// The prober's own guesses are still throttled: past `XMR_TOKEN_MISS_LIMIT_PER_WINDOW`
+/// wrong tokens on a real id, every wrong-token request from that address is a 429 on every
+/// XMR `:id` route.
+#[tokio::test]
+async fn wrong_tokens_to_a_real_id_still_hit_the_miss_limit() {
+    let w = World::new();
+    let tmp = tempfile::tempdir().unwrap();
+    let d = serve(&w, &tmp.path().join("m.db")).await;
+    let (id, _token) = begun(&w, tmp.path(), &d.base).await;
+    let url = format!("{}/xmr/swaps/{id}", d.base);
+    let http = reqwest::Client::new();
+    let misses = divi_swapd::XMR_TOKEN_MISS_LIMIT_PER_WINDOW;
+    for i in 0..misses {
+        let r = http
+            .get(&url)
+            .header("X-Swap-Token", format!("{i:064x}"))
+            .send()
+            .await;
+        assert_eq!(r.unwrap().status().as_u16(), 404, "guess {i}");
+    }
+    let r = http
+        .get(&url)
+        .header("X-Swap-Token", format!("{misses:064x}"))
+        .send()
+        .await;
+    assert_eq!(r.unwrap().status().as_u16(), 429, "the next guess");
+    for tail in ["j", "sigs", "xmr-lock"] {
+        let r = http
+            .post(format!("{url}/{tail}"))
+            .header("X-Swap-Token", "f".repeat(64))
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 429, "{tail} with a wrong token");
+    }
+    let r = http.get(format!("{}/xmr/swaps/nope", d.base)).send().await;
+    assert_eq!(r.unwrap().status().as_u16(), 429, "no token, unknown id");
+}
+
+/// A wrong token for an id that exists counts against the address's misses, never against
+/// that swap's bucket: after twice the swap limit of wrong-token requests to the real id, its
+/// taker still has the whole bucket less what the setup used. Fails on 747ec44 (429 at once).
+#[tokio::test]
+async fn wrong_tokens_never_spend_the_swaps_bucket() {
+    let w = World::new();
+    let tmp = tempfile::tempdir().unwrap();
+    let d = serve(&w, &tmp.path().join("m.db")).await;
+    let (id, token) = begun(&w, tmp.path(), &d.base).await;
+    let url = format!("{}/xmr/swaps/{id}", d.base);
+    let http = reqwest::Client::new();
+    let limit = divi_swapd::XMR_SWAP_LIMIT_PER_WINDOW;
+    for i in 0..2 * limit {
+        http.get(&url)
+            .header("X-Swap-Token", format!("{i:064x}"))
+            .send()
+            .await
+            .unwrap();
+    }
+    let mut ok = 0;
+    loop {
+        let r = http.get(&url).header("X-Swap-Token", &token).send().await;
+        match r.unwrap().status().as_u16() {
+            200 => ok += 1,
+            429 => break,
+            other => panic!("status {other}"),
+        }
+        assert!(ok <= limit, "no 429 after {ok} reads");
+    }
+    // `begin` used about ten `/j` and one `/sigs` of the bucket (at most 66).
+    assert!(ok >= limit - 66, "the taker got {ok} of {limit}");
 }
