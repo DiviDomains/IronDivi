@@ -54,6 +54,7 @@ use divi_swap::store::QuoteRecord;
 use divi_swap::{Amount as SwapAmount, Chain, Result, Store, SwapError};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 use swap_adaptor::adaptor::{EncryptedSignature, Point};
 use swap_adaptor::dleq::{random_clamped_secret, CrossCurveDLEQProof, PointQ, ScalarQ};
 use swap_chain_xmr::lock_scripts::{self, CancelScript, LockScript, LockSpend, CANCEL_VARIANTS};
@@ -333,14 +334,12 @@ pub fn new_swap_token() -> String {
     hex::encode(b)
 }
 
-/// `given == expected` without an early exit on the first differing byte; an empty
-/// `expected` (a record from before tokens) matches nothing.
+/// Whether `given` is `expected`, in constant time over the bytes (`subtle`; only a length
+/// mismatch returns early, and every token is 64 hex characters); an empty `expected` (a
+/// record from before tokens) matches nothing.
 pub fn token_matches(expected: &str, given: &str) -> bool {
     let (e, g) = (expected.as_bytes(), given.as_bytes());
-    if e.is_empty() || e.len() != g.len() {
-        return false;
-    }
-    e.iter().zip(g).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
+    !e.is_empty() && bool::from(e.ct_eq(g))
 }
 
 /// `Tx_cancel`, `Tx_punish` and late-branch `nLockTime`s from the DIVI median time past.
@@ -1723,5 +1722,19 @@ mod tests {
         assert!(!token_matches(&t, &t[1..]));
         assert!(!token_matches(&t, &format!("{}0", &t[..63])) || t.ends_with('0'));
         assert!(!token_matches("", ""), "pre-token records match nothing");
+    }
+
+    /// The token compare stays constant-time: a plain `==` (which exits on the first differing
+    /// byte) in `token_matches` fails this.
+    #[test]
+    fn token_compare_stays_constant_time() {
+        let src = include_str!("maker.rs");
+        let body = src.split("pub fn token_matches").nth(1).unwrap();
+        let body = &body[..body.find("\n}\n").unwrap()];
+        assert!(
+            body.contains(".ct_eq("),
+            "token_matches must use subtle::ConstantTimeEq"
+        );
+        assert!(!body.contains("=="), "a plain == compare in token_matches");
     }
 }

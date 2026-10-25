@@ -17,6 +17,7 @@
 //! HTTP routes. Request/response bodies are the frozen `divi_swap::api` types.
 
 use std::collections::{BTreeMap, HashMap};
+use std::hash::Hash;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -68,17 +69,22 @@ pub const READ_LIMIT_PER_WINDOW: u32 = 300;
 /// `trust_proxy_headers` is off. Enough to stop a flood from turning every request into chain
 /// RPCs (`/healthz` asks each chain for its tip).
 pub const PUBLIC_READ_LIMIT_PER_WINDOW: u32 = 600;
-/// Requests one IP may make per [`RATE_WINDOW`] to the token-gated XMR routes
-/// (`GET /xmr/swaps/:id`, `POST .../j`, `/sigs`, `/xmr-lock`), counted before the token is
-/// checked. An honest taker's busiest minute is the setup: at most `MAX_J_EXCHANGES` (64,
+/// Requests one swap may get per [`RATE_WINDOW`] on the token-gated XMR routes
+/// (`GET /xmr/swaps/:id`, `POST .../j`, `/sigs`, `/xmr-lock`) with its right token, counted
+/// per swap id rather than per IP: clients sharing an address (behind a proxy with
+/// `trust_proxy_headers` off) cannot spend each other's budget. Requests without the right
+/// token count in a per-IP bucket of the same size instead. An honest taker's busiest minute is the setup: at most `MAX_J_EXCHANGES` (64,
 /// about ten in practice) `/j` calls and one `/sigs`, then one `GET` per poll and at most one
 /// `/xmr-lock` beside it: 64 + 1 + 2 * 60 = 185 at `--poll-secs 1`, 77 at the default 10 s.
 pub const XMR_SWAP_LIMIT_PER_WINDOW: u32 = 300;
-/// Token misses (the 404 of a wrong, missing or other-swap token, or an unknown id) one IP may
-/// make per [`RATE_WINDOW`] on the XMR `:id` routes. Past it every XMR `:id` request from that
-/// IP is a 429 for the rest of the window, right token or not, so a prober cannot keep
-/// testing tokens. An honest taker reads its token from its own session file and never
-/// misses; 20 leaves room for an operator's typos.
+/// Token misses (a wrong, missing or other-swap token, or an unknown id) one IP may make per
+/// [`RATE_WINDOW`] on the XMR `:id` routes. Past it every request from that IP without the
+/// right token is a 429 for the rest of the window; a request with the right token still
+/// passes, so a prober sharing an address cannot lock a taker out. The 429-versus-200 split
+/// does tell a locked-out prober which guess is right, so the limit slows guessing only up to
+/// the lockout; what stops guessing is the token's 256 bits ([`new_swap_token`]). An honest
+/// taker reads its token from its own session file and never misses; 20 leaves room for an
+/// operator's typos.
 pub const XMR_TOKEN_MISS_LIMIT_PER_WINDOW: u32 = 20;
 /// Length of the fixed window [`RATE_LIMIT_PER_WINDOW`] counts in.
 pub const RATE_WINDOW: Duration = Duration::from_secs(60);
@@ -87,14 +93,15 @@ pub const RATE_WINDOW: Duration = Duration::from_secs(60);
 /// map without bound).
 const RATE_MAX_TRACKED: usize = 10_000;
 
-/// Fixed-window per-IP request counter.
-pub struct RateLimiter {
+/// Fixed-window request counter, per IP unless keyed otherwise (the XMR per-swap bucket keys
+/// on the swap id).
+pub struct RateLimiter<K = IpAddr> {
     max: u32,
     window: Duration,
-    hits: parking_lot::Mutex<HashMap<IpAddr, (Instant, u32)>>,
+    hits: parking_lot::Mutex<HashMap<K, (Instant, u32)>>,
 }
 
-impl RateLimiter {
+impl<K: Hash + Eq> RateLimiter<K> {
     /// At most `max` requests per `window` per IP.
     pub fn new(max: u32, window: Duration) -> Self {
         RateLimiter {
@@ -105,7 +112,7 @@ impl RateLimiter {
     }
 
     /// Count one request from `ip` at `now`; `false` when it is over the limit.
-    pub fn allow(&self, ip: IpAddr, now: Instant) -> bool {
+    pub fn allow(&self, ip: K, now: Instant) -> bool {
         let mut hits = self.hits.lock();
         if hits.len() >= RATE_MAX_TRACKED && !hits.contains_key(&ip) {
             hits.retain(|_, (start, _)| now.duration_since(*start) < self.window);
@@ -122,10 +129,10 @@ impl RateLimiter {
     }
 
     /// Whether `ip` has used its whole budget in the current window, without counting a request.
-    pub fn exhausted(&self, ip: IpAddr, now: Instant) -> bool {
+    pub fn exhausted(&self, ip: &K, now: Instant) -> bool {
         self.hits
             .lock()
-            .get(&ip)
+            .get(ip)
             .is_some_and(|(start, n)| now.duration_since(*start) < self.window && *n >= self.max)
     }
 }
@@ -187,26 +194,27 @@ async fn rate_limit(State(l): State<RateState>, req: Request, next: Next) -> Res
     }
 }
 
-/// Counts the 404s of the route it wraps per IP ([`XMR_TOKEN_MISS_LIMIT_PER_WINDOW`]); once an
-/// IP has used its misses, every request from it is a 429 until the window ends, before the
-/// token is looked at.
-async fn token_miss_limit(State(l): State<RateState>, req: Request, next: Next) -> Response {
-    let ip = request_ip(&req, l.trust_proxy_headers);
-    if l.limiter.exhausted(ip, Instant::now()) {
-        return too_many();
-    }
-    let resp = next.run(req).await;
-    if resp.status() == StatusCode::NOT_FOUND {
-        l.limiter.allow(ip, Instant::now());
-    }
-    resp
+/// The limits in front of the XMR `:id` routes and the maker that checks their tokens.
+#[derive(Clone)]
+struct XmrGate {
+    maker: Arc<XmrMaker>,
+    /// Requests with the right token, per swap id ([`XMR_SWAP_LIMIT_PER_WINDOW`]).
+    per_swap: Arc<RateLimiter<String>>,
+    /// Requests without it, per IP (the same size).
+    per_ip: Arc<RateLimiter>,
+    /// Token misses per IP ([`XMR_TOKEN_MISS_LIMIT_PER_WINDOW`]).
+    misses: Arc<RateLimiter>,
+    trust_proxy_headers: bool,
 }
 
 /// Gate for every `/xmr/swaps/:id...` route, run before the body is parsed (a 422 for a bad
-/// body would otherwise tell a prober the id exists). A missing, wrong or unknown-swap token
-/// is the same 404 an unknown swap id gets.
-async fn swap_token_gate(
-    State(x): State<Arc<XmrMaker>>,
+/// body would otherwise tell a prober the id exists). A request with the right token counts
+/// in its swap's bucket only, so nothing another client on the same address does can use it
+/// up. Any other request (missing, wrong or another swap's token, or an unknown id; the same
+/// 404) counts in the address's bucket and as one of its misses, and is a 429 once either
+/// is used up. A wrong token for a real id never touches that id's bucket.
+async fn xmr_swap_gate(
+    State(g): State<XmrGate>,
     Path(params): Path<HashMap<String, String>>,
     req: Request,
     next: Next,
@@ -217,11 +225,20 @@ async fn swap_token_gate(
         .get(SWAP_TOKEN_HEADER)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    if x.authorize(id, token) {
-        next.run(req).await
-    } else {
-        ApiError(StatusCode::NOT_FOUND, format!("no xmr swap {id}")).into_response()
+    let now = Instant::now();
+    if g.maker.authorize(id, token) {
+        return if g.per_swap.allow(id.to_owned(), now) {
+            next.run(req).await
+        } else {
+            too_many()
+        };
     }
+    let ip = request_ip(&req, g.trust_proxy_headers);
+    if g.misses.exhausted(&ip, now) || !g.per_ip.allow(ip, now) {
+        return too_many();
+    }
+    g.misses.allow(ip, now);
+    ApiError(StatusCode::NOT_FOUND, format!("no xmr swap {id}")).into_response()
 }
 
 /// `docs` kind holding a hashlock swap's token, keyed by the maker's swap id. A swap with no
@@ -443,18 +460,25 @@ pub fn router_with_auth(
                         .route("/xmr/swaps/:id/j", post(xmr_j))
                         .route("/xmr/swaps/:id/sigs", post(xmr_sigs))
                         .route("/xmr/swaps/:id/xmr-lock", post(xmr_lock))
-                        .route_layer(middleware::from_fn_with_state(x.clone(), swap_token_gate))
                         .route_layer(middleware::from_fn_with_state(
-                            RateState {
-                                limiter: Arc::new(RateLimiter::new(
+                            XmrGate {
+                                maker: x.clone(),
+                                per_swap: Arc::new(RateLimiter::new(
+                                    XMR_SWAP_LIMIT_PER_WINDOW,
+                                    RATE_WINDOW,
+                                )),
+                                per_ip: Arc::new(RateLimiter::new(
+                                    XMR_SWAP_LIMIT_PER_WINDOW,
+                                    RATE_WINDOW,
+                                )),
+                                misses: Arc::new(RateLimiter::new(
                                     XMR_TOKEN_MISS_LIMIT_PER_WINDOW,
                                     RATE_WINDOW,
                                 )),
                                 trust_proxy_headers,
                             },
-                            token_miss_limit,
-                        ))
-                        .route_layer(bucket(XMR_SWAP_LIMIT_PER_WINDOW)),
+                            xmr_swap_gate,
+                        )),
                 )
                 .with_state(x),
         );

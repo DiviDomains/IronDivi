@@ -38,6 +38,9 @@ thiserror = { workspace = true }
 # builds GMP from source (needs m4 on the build host).
 cggmp21 = { version = "=0.6.3", features = ["curve-secp256k1", "state-machine"] }
 sha2 = { workspace = true }
+# Constant-time swap-token compare (`token_matches`). Pinned; already in the lock through the
+# crypto crates.
+subtle = "=2.6.1"
 
 [dev-dependencies]
 tempfile = { workspace = true }
