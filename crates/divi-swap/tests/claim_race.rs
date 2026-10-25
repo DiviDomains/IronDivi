@@ -102,11 +102,12 @@ fn schedule(chain: Chain) -> Option<FeeEscalation> {
     })
 }
 
-/// USDC markets: a first claim priced from 1 gwei, floors at or below `cap_feerate`
-/// (500 gwei), so up to 500 times the first feerate and far above its fixed cap.
+/// USDC markets: a first claim priced at 1 to 19 gwei (so the 50x multiple binds, under the
+/// 500 gwei `cap_feerate`, about half the time), floors at or below `cap_feerate`, so up to
+/// 500 times the first feerate and far above its fixed cap.
 fn usdc_market() -> impl Strategy<Value = Market> {
     (
-        1u64..60,
+        1u64..20,
         0u32..7200,
         proptest::collection::vec((0u16..=1000, 0u16..=1000), 1..40),
         2000u64..20_000,
@@ -217,11 +218,12 @@ async fn race(m: &Market, escalation: bool) -> Outcome {
     divi.advance_time(m.delay_secs);
 
     let secs = block_secs(m.chain);
+    // One block per round, and on USDC (12 s blocks) one round a minute: a block a minute
+    // gets the claim mined, the rest of the minute passes with nothing mined.
+    let round = secs.max(60);
     let at = |f: u16| cap * u64::from(f) / 1000;
     let mut leaked = false;
-    // USDC's 12 s blocks need more rounds to reach the locktime.
-    let rounds = if m.chain == Chain::Usdc { 2000 } else { 400 };
-    for i in 0..rounds {
+    for i in 0..400usize {
         let (bf, mf) = m.floors[i.min(m.floors.len() - 1)];
         let block_floor = at(bf).max(1);
         ml.set_block_floor(block_floor);
@@ -243,9 +245,12 @@ async fn race(m: &Market, escalation: bool) -> Outcome {
             .unwrap()
             .maker_leg_claim
             .is_some();
+        if round > secs {
+            ml.advance_time(round - secs);
+        }
         ml.mine(1);
         divi.mine(1);
-        divi.advance_time(secs.saturating_sub(60));
+        divi.advance_time(round.saturating_sub(60));
         let t = store.get_taker_swap(&tid).unwrap().unwrap().state;
         let mk = maker.view(&mid).unwrap().unwrap().state;
         if t.is_terminal() && mk == SwapState::Done {

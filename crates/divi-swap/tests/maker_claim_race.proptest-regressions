@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 5d7d496e0b1394538a530898b0dd83885c4f1806e9987cbb846f669af529ff65 # shrinks to m = Market { chain: Usdc, estimate: 1, reveal: 0, floors: [(51, 0)], refund_feerate: 2000 }
