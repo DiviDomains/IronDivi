@@ -347,6 +347,13 @@ impl SporkManager {
             }
         }
 
+        // Divi Core announces every spork it accepted to its other peers
+        // (spork.cpp:259, `CSporkMessage::Relay`); they fetch it by getdata
+        self.peer_manager.broadcast_except(
+            NetworkMessage::Inv(vec![InvItem::new(InvType::Spork, hash)]),
+            peer_id,
+        );
+
         self.emit_progress();
     }
 
@@ -617,6 +624,46 @@ mod tests {
                 received: 0
             }
         );
+    }
+
+    /// Divi Core relays a spork it accepted as an inv to its peers
+    /// (spork.cpp:259); a spork it refused, or one no newer than the active
+    /// one, is not relayed
+    #[tokio::test]
+    async fn an_accepted_spork_is_announced_to_the_other_peers() {
+        let kp = divi_crypto::KeyPair::new_random();
+        let peers = quiet_peers();
+        let sporks =
+            SporkManager::with_key(Arc::clone(&peers), Some(kp.public_key().to_bytes()), None);
+        let mut sender = test_peer(&peers, 1);
+        let mut other = test_peer(&peers, 2);
+        let mut third = test_peer(&peers, 3);
+
+        let spork = signed(&kp, 10007, "1600000000", 2000);
+        sporks.handle_spork(1, spork.clone()).await;
+        let announced = |rx: &mut tokio::sync::mpsc::Receiver<NetworkMessage>| {
+            received(rx)
+                .into_iter()
+                .filter_map(|m| match m {
+                    NetworkMessage::Inv(items) => Some(items),
+                    _ => None,
+                })
+                .flatten()
+                .collect::<Vec<_>>()
+        };
+        let expected = vec![InvItem::new(InvType::Spork, spork.hash())];
+        assert_eq!(announced(&mut other), expected);
+        assert_eq!(announced(&mut third), expected);
+        assert!(announced(&mut sender).is_empty());
+
+        // older than the active one: counted, not relayed
+        sporks.handle_spork(1, signed(&kp, 10007, "1", 1000)).await;
+        // refused
+        let mut forged = signed(&kp, 10007, "2", 3000);
+        forged.signature[10] ^= 1;
+        sporks.handle_spork(1, forged).await;
+        assert!(announced(&mut other).is_empty());
+        assert!(announced(&mut third).is_empty());
     }
 
     /// Divi Core AddActiveSpork and GetActiveSporkCount (spork.cpp:144-168,
