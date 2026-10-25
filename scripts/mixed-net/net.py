@@ -202,12 +202,17 @@ def draw_links(nodes):
     return edges
 
 
+OUTBOUND_END = {}  # edge -> the index that connects out, where it is not the lower one (the joined node's links)
+
+
 def connect_lists(nodes, edges, allowed=None):
-    """Each edge becomes one outbound connect= line, on its lower-indexed end"""
+    """Each edge becomes one outbound connect= line, on its lower-indexed end (or the end named in OUTBOUND_END)"""
     out = {n.index: [] for n in nodes}
     by = {n.index: n for n in nodes}
     for e in edges:
         a, b = sorted(e)
+        if OUTBOUND_END.get(e) == b:
+            a, b = b, a
         if allowed is None or (a in allowed and b in allowed) or (a not in allowed and b not in allowed):
             if a in by and b in by:
                 out[a].append(by[b])
@@ -713,6 +718,8 @@ def step_join():
     new = {frozenset((n.index, t.index)) for t in to}
     EDGES.update(new)
     ACTIVE_EDGES |= new
+    for e in new:
+        OUTBOUND_END[e] = n.index  # it keeps connecting out, so a later restart of either end links them again
     n.start(to)
     wait_links(NODES, ACTIVE_EDGES)
     deadline = time.time() + 180
