@@ -342,3 +342,23 @@ fn blocks_made_carry_the_adjusted_time() {
         "block time {time}, clock {before}"
     );
 }
+
+/// The wallet dates what it receives by the adjusted time
+/// (nTimeReceived = GetAdjustedTime(), SpentOutputTracker.cpp:47)
+#[test]
+fn the_wallet_receives_on_the_adjusted_clock() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = Daemon::start(dir.path(), &[]);
+    let _peers = ahead(&d, 50, 1800);
+    d.rpc_with("setgenerate", json!([101]));
+    let to = d.rpc("getnewaddress");
+    let before = unix_now();
+    let txid = d.rpc_with("sendtoaddress", json!([to, 1]));
+    let received = d.rpc_with("gettransaction", json!([txid]))["timereceived"]
+        .as_i64()
+        .unwrap();
+    assert!(
+        (before + 1795..=unix_now() + 1805).contains(&received),
+        "timereceived {received}, clock {before}"
+    );
+}
