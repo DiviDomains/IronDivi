@@ -1092,6 +1092,17 @@ const ZIP317_IN_WEIGHT: u64 = 150;
 /// Transparent output weight, same idea as [`ZIP317_IN_WEIGHT`] for outputs.
 const ZIP317_OUT_WEIGHT: u64 = 34;
 
+/// A maker-leg claim pays this many times the [ZIP 317] conventional fee. ZEC cannot bump a
+/// claim (zcashd v6.10.0 and zebra v2.5.0 reject spend conflicts and select blocks by
+/// ZIP 317 weight, not by package), so the first claim is the only one and has to start
+/// ahead. 4 is ZIP 317's `weight_ratio_cap`: block templates draw transactions with weight
+/// `min(fee / conventional_fee, 4)` (zebra v2.5.0
+/// `zebra-chain/src/transaction/unmined/zip317.rs:34-36,131-133`), so paying more buys
+/// nothing more, and paying less leaves the claim behind transactions that pay the cap.
+///
+/// [ZIP 317]: https://zips.z.cash/zip-0317
+pub const CLAIM_ZIP317_FACTOR: u64 = 4;
+
 /// Serialized length of one transparent input or output, via its own `write`.
 fn serialized_len(write: impl FnOnce(&mut Vec<u8>)) -> u64 {
     let mut v = Vec::new();
@@ -1349,7 +1360,10 @@ pub fn build_spend_tx(
             script_pubkey: my_spk.clone(),
         }],
     };
-    let fee = probe_fee(&probe, zats_per_byte);
+    let mut fee = probe_fee(&probe, zats_per_byte);
+    if let Spend::Claim(_) = spend {
+        fee = fee.max(CLAIM_ZIP317_FACTOR * zip317_fee(&probe.vin, &probe.vout));
+    }
     let out_value = amount.checked_sub(fee).filter(|v| *v >= DUST_ZATOSHI);
     let out_value = out_value.ok_or_else(|| {
         SwapError::InsufficientFunds(format!("HTLC value {amount} does not cover fee {fee}"))
@@ -1612,6 +1626,55 @@ mod tests {
     }
 
     #[test]
+    fn a_claim_pays_the_zip317_conventional_fee_times_the_claim_factor() {
+        let (pre, hash) = new_preimage();
+        let h = htlc(hash);
+        let secp = Secp256k1::new();
+        let sk = SecretKey::from_slice(&TAKER_KEY).unwrap();
+        let pk = pubkey_of(&TAKER_KEY);
+        let amount = 1_000_000;
+        let tx = build_spend_tx(
+            &secp,
+            &sk,
+            &pk,
+            &h,
+            outpoint(),
+            amount,
+            Spend::Claim(&pre),
+            6,
+            BRANCH_ID,
+            1,
+        )
+        .unwrap();
+        let fee = amount - tx.vout[0].value;
+        let conventional = zip317_fee(&tx.vin, &tx.vout);
+        assert!(
+            fee >= CLAIM_ZIP317_FACTOR * conventional,
+            "claim fee {fee} < {CLAIM_ZIP317_FACTOR} x conventional {conventional}"
+        );
+        // A refund keeps the conventional fee: only the claim races a deadline.
+        let maker_sk = SecretKey::from_slice(&MAKER_KEY).unwrap();
+        let maker_pk = pubkey_of(&MAKER_KEY);
+        let refund = build_spend_tx(
+            &secp,
+            &maker_sk,
+            &maker_pk,
+            &h,
+            outpoint(),
+            amount,
+            Spend::Refund,
+            6,
+            BRANCH_ID,
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            amount - refund.vout[0].value,
+            zip317_fee(&refund.vin, &refund.vout)
+        );
+    }
+
+    #[test]
     fn claim_script_executes() {
         let (pre, hash) = new_preimage();
         let h = htlc(hash);
@@ -1624,7 +1687,7 @@ mod tests {
             &pk,
             &h,
             outpoint(),
-            20_000,
+            60_000,
             Spend::Claim(&pre),
             6,
             BRANCH_ID,
@@ -1633,16 +1696,17 @@ mod tests {
         .unwrap();
         assert_eq!(tx.lock_time, 0);
         assert_eq!(tx.vin[0].sequence, 0xffff_ffff);
-        assert!(tx.vout[0].value < 20_000);
-        // A claim pays the ZIP 317 conventional fee too, not the old per-byte rate.
+        assert!(tx.vout[0].value < 60_000);
+        // A claim pays CLAIM_ZIP317_FACTOR x the ZIP 317 conventional fee (the 2-action
+        // grace floor), not the old per-byte rate.
         assert_eq!(
-            20_000 - tx.vout[0].value,
-            10_000,
-            "claim fee should be the ZIP 317 2-action grace floor"
+            60_000 - tx.vout[0].value,
+            40_000,
+            "claim fee should be 4 x the ZIP 317 2-action grace floor"
         );
         // build_spend_tx already ran verify_htlc_spend; re-run explicitly for clarity.
         let sig_inputs = [SigInput {
-            value: 20_000,
+            value: 60_000,
             script_pubkey: htlc_script_pubkey(&h.redeem_script()),
         }];
         verify_htlc_spend(&tx, 0, &sig_inputs, &h.redeem_script()).unwrap();
@@ -1650,7 +1714,7 @@ mod tests {
         // Regression (live NU7 run, claim rejected "script verification failed"): ZIP 244
         // signs the P2SH scriptPubKey, so a digest over the redeem script must not verify.
         let redeem_inputs = [SigInput {
-            value: 20_000,
+            value: 60_000,
             script_pubkey: h.redeem_script(),
         }];
         assert_ne!(
@@ -1716,7 +1780,7 @@ mod tests {
             &pk,
             &h,
             outpoint(),
-            20_000,
+            60_000,
             Spend::Claim(&wrong),
             6,
             BRANCH_ID,
@@ -1735,7 +1799,7 @@ mod tests {
             &pk,
             &good,
             outpoint(),
-            20_000,
+            60_000,
             Spend::Claim(&pre),
             6,
             BRANCH_ID,
@@ -1744,7 +1808,7 @@ mod tests {
         .unwrap();
         let other = htlc(hash);
         let sig_inputs = [SigInput {
-            value: 20_000,
+            value: 60_000,
             script_pubkey: htlc_script_pubkey(&other.redeem_script()),
         }];
         assert!(verify_htlc_spend(&tx, 0, &sig_inputs, &other.redeem_script()).is_err());
@@ -1900,7 +1964,7 @@ mod tests {
             &pk,
             &h,
             outpoint(),
-            20_000,
+            60_000,
             Spend::Claim(&pre),
             5,
             BRANCH_ID,

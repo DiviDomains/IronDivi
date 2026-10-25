@@ -879,7 +879,7 @@ mod tests {
             &pk,
             &htlc,
             fund_outpoint,
-            20_000,
+            60_000,
             tx::Spend::Claim(&preimage),
             6,
             BRANCH_ID,
@@ -1029,7 +1029,8 @@ mod tests {
 
         use crate::{FeePolicy, ZecBackend};
 
-        const HTLC_ZATOSHI: u64 = 20_000;
+        // Covers a claim's CLAIM_ZIP317_FACTOR x conventional fee (40,000) plus dust.
+        const HTLC_ZATOSHI: u64 = 60_000;
         const REFUND_AHEAD_OF_MTP: u32 = 2 * 3600;
 
         fn key_from_env() -> secp256k1::SecretKey {
