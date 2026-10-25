@@ -445,3 +445,19 @@ fn the_start_logs_the_key_pool_and_address_book_sizes() {
     assert!(logged(dir.path(), "Address Book size = "));
     stop(node, rpc);
 }
+
+/// backupwallet logs divid's "copied wallet.dat to <path>" with the path
+/// written (walletdb.cpp:619)
+#[test]
+fn backupwallet_logs_where_it_copied_the_wallet() {
+    let dir = tempfile::tempdir().unwrap();
+    let (rpc, p2p) = (free_port(), free_port());
+    let node = start(dir.path(), rpc, p2p, &[]);
+    let dest = dir.path().join("copy.dat");
+    ok(rpc, "backupwallet", json!([dest.to_str().unwrap()]));
+    assert!(logged(
+        dir.path(),
+        &format!("copied wallet.dat to {}", dest.display())
+    ));
+    stop(node, rpc);
+}

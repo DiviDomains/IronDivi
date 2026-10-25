@@ -4605,6 +4605,8 @@ impl WalletRpc {
         let wallet = self.get_wallet()?;
         wallet
             .backup_to(std::path::Path::new(destination))
+            // walletdb.cpp:619, naming the wallet as divid does
+            .inspect(|written| info!("copied wallet.dat to {}", written.display()))
             .map_err(|e| {
                 // Core's reply (rpcwallet.cpp:2538); the cause goes to the log
                 warn!("backupwallet to {}: {}", destination, e);
