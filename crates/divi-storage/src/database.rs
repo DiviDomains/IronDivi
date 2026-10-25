@@ -260,7 +260,18 @@ impl ChainDatabase {
         path: P,
         utxo_cache_entries: u64,
     ) -> Result<Self, StorageError> {
-        let mut db = Self::open_with_cache_size(path, DEFAULT_BLOCK_CACHE_SIZE)?;
+        Self::open_with_caches(path, DEFAULT_BLOCK_CACHE_SIZE, utxo_cache_entries)
+    }
+
+    /// Open or create a chain database with a block cache of
+    /// `block_cache_size` bytes and, unless 0, a UTXO cache of
+    /// `utxo_cache_entries` entries (Divi Core -dbcache, init.cpp:1046-1056)
+    pub fn open_with_caches<P: AsRef<Path>>(
+        path: P,
+        block_cache_size: usize,
+        utxo_cache_entries: u64,
+    ) -> Result<Self, StorageError> {
+        let mut db = Self::open_with_cache_size(path, block_cache_size)?;
         if utxo_cache_entries > 0 {
             db.utxo_cache = Some(UtxoCache::new(utxo_cache_entries));
             info!("UTXO cache enabled with {} max entries", utxo_cache_entries);

@@ -52,6 +52,11 @@ pub struct NodeConfig {
     /// UTXO cache size (number of entries). Default: 10_000_000. Set to 0 to disable.
     pub utxo_cache_size: u64,
 
+    /// The chain database's block cache in bytes (`-dbcache`: divid's block
+    /// tree and coin database caches); None for the default
+    #[serde(default)]
+    pub block_cache_size: Option<usize>,
+
     /// Block-expiry pruning (`-1` = never, `0` = minimum, else a retention window).
     pub expire: divi_storage::prune::Expire,
 
@@ -99,6 +104,46 @@ pub struct NodeConfig {
 /// C++ `-checkblocks` default (init.cpp: `VerifyChain(4, GetArg("-checkblocks", 100))`)
 pub const DEFAULT_CHECK_BLOCKS: u32 = 100;
 
+/// Divi Core's -dbcache bounds and default, in MiB (defaultValues.h:27-31)
+pub const DEFAULT_DB_CACHE_MIB: i64 = 100;
+pub const MIN_DB_CACHE_MIB: i64 = 4;
+pub const MAX_DB_CACHE_MIB: i64 = 4096;
+
+/// How Divi Core splits -dbcache (init.cpp:1038-1059)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DbCacheSizes {
+    /// The total, in bytes, after clamping to 4..4096 MiB
+    pub total: usize,
+    /// The block tree database's cache: an eighth (at most 2 MiB without -txindex)
+    pub block_tree: usize,
+    /// The coin database's cache: half of the rest
+    pub coin_db: usize,
+    /// Coins held in memory: the rest at about 300 bytes a coin
+    pub coin_cache_entries: u64,
+}
+
+/// The cache sizes for `-dbcache=<mib>`. A negative value is the minimum:
+/// divid shifts it into an unsigned size and so gets the maximum
+/// (init.cpp:1030), which nobody asks for by giving -1.
+pub fn db_cache_sizes(mib: i64, txindex: bool) -> DbCacheSizes {
+    let mib = mib.clamp(MIN_DB_CACHE_MIB, MAX_DB_CACHE_MIB) as usize;
+    let mut total = mib << 20;
+    let all = total;
+    let mut block_tree = total / 8;
+    if block_tree > (1 << 21) && !txindex {
+        block_tree = 1 << 21;
+    }
+    total -= block_tree;
+    let coin_db = total / 2;
+    total -= coin_db;
+    DbCacheSizes {
+        total: all,
+        block_tree,
+        coin_db,
+        coin_cache_entries: (total / 300) as u64,
+    }
+}
+
 fn default_check_blocks() -> u32 {
     DEFAULT_CHECK_BLOCKS
 }
@@ -116,6 +161,7 @@ impl Default for NodeConfig {
             index: IndexConfig::default(),
             log: LogConfig::default(),
             utxo_cache_size: 10_000_000,
+            block_cache_size: None,
             expire: divi_storage::prune::Expire::Never,
             check_blocks: DEFAULT_CHECK_BLOCKS,
             max_reorg: None,
@@ -405,6 +451,17 @@ pub struct P2pConfig {
     #[serde(default)]
     pub listen: Option<bool>,
 
+    /// Query the DNS seeds (Divi Core -dnsseed). `None` = default: on unless
+    /// `connect` is set (C++ soft-sets `-dnsseed=0` under `-connect`,
+    /// net.cpp:1683-1685)
+    #[serde(default)]
+    pub dns_seed: Option<bool>,
+
+    /// Query the DNS seeds even when peers.dat has addresses (Divi Core
+    /// -forcednsseed, net.cpp:1018-1019)
+    #[serde(default)]
+    pub force_dns_seed: bool,
+
     /// Ban time for misbehaving peers (seconds; Divi Core -bantime)
     pub ban_time: u64,
 
@@ -517,6 +574,8 @@ impl Default for P2pConfig {
             addnode: Vec::new(),
             seednode: Vec::new(),
             listen: None,
+            dns_seed: None,
+            force_dns_seed: false,
             ban_time: 86400, // 24 hours
             ban_score: default_ban_score(),
             user_agent: format!("/DiviRust:{}/", env!("CARGO_PKG_VERSION")),
@@ -547,7 +606,13 @@ impl NodeConfig {
         if !self.p2p.connect.is_empty() {
             return PeerSources {
                 static_peers: self.p2p.connect.clone(),
-                dns_seeds: Vec::new(),
+                // Only with -dnsseed=1 given: the seeds' addresses go into
+                // the book, and -connect still dials only its own peers
+                dns_seeds: if self.p2p.dns_seed == Some(true) {
+                    self.network.dns_seeds.clone()
+                } else {
+                    Vec::new()
+                },
                 listen: self.p2p.listen.unwrap_or(false),
             };
         }
@@ -865,6 +930,44 @@ mod tests {
         let config = NodeConfig::default();
         assert_eq!(config.p2p.port, 51472);
         assert_eq!(config.rpc.port, 51473);
+    }
+
+    /// Divi Core's split of -dbcache (init.cpp:1046-1056), worked out by hand
+    #[test]
+    fn db_cache_is_split_as_divid_splits_it() {
+        const MIB: usize = 1 << 20;
+        // The default, 100 MiB: 12.5 to the block tree, 43.75 to the coin db,
+        // 43.75 MiB / 300 coins
+        let d = db_cache_sizes(DEFAULT_DB_CACHE_MIB, true);
+        assert_eq!(d.total, 100 * MIB);
+        assert_eq!(d.block_tree, 100 * MIB / 8);
+        assert_eq!(d.coin_db, (100 * MIB - 100 * MIB / 8) / 2);
+        assert_eq!(d.coin_cache_entries, 152_917);
+        // Clamped to 4..4096 MiB; 0 and a non-number (atoi 0) give 4
+        assert_eq!(db_cache_sizes(0, true).total, 4 * MIB);
+        assert_eq!(db_cache_sizes(3, true).total, 4 * MIB);
+        assert_eq!(db_cache_sizes(4, true).total, 4 * MIB);
+        assert_eq!(db_cache_sizes(4096, true).total, 4096 * MIB);
+        assert_eq!(db_cache_sizes(4097, true).total, 4096 * MIB);
+        assert_eq!(db_cache_sizes(i64::MAX, true).total, 4096 * MIB);
+        assert_eq!(db_cache_sizes(-1, true).total, 4 * MIB);
+        // Without -txindex the block tree gets at most 2 MiB
+        let n = db_cache_sizes(100, false);
+        assert_eq!(n.block_tree, 2 * MIB);
+        assert_eq!(n.coin_db, 49 * MIB);
+        assert_eq!(n.coin_cache_entries, (49 * MIB / 300) as u64);
+        assert_eq!(db_cache_sizes(4, false).block_tree, MIB / 2);
+    }
+
+    /// -connect leaves the DNS seeds out unless -dnsseed=1 is given (net.cpp:1683-1685)
+    #[test]
+    fn connect_keeps_dns_seeds_only_with_dnsseed_given() {
+        let mut c = NodeConfig::default();
+        c.p2p.connect = vec!["127.0.0.2:1".into()];
+        assert!(c.peer_sources().dns_seeds.is_empty());
+        c.p2p.dns_seed = Some(true);
+        assert_eq!(c.peer_sources().dns_seeds, c.network.dns_seeds);
+        assert_eq!(c.peer_sources().static_peers, ["127.0.0.2:1"]);
     }
 
     #[test]

@@ -224,7 +224,20 @@ impl Node {
             .map_err(|e| NodeError::Init(format!("Failed to create data directory: {}", e)))?;
 
         // Initialize database, optionally with UTXO cache
-        let db = Arc::new(if config.utxo_cache_size > 0 {
+        let db = Arc::new(if let Some(block_cache) = config.block_cache_size {
+            // -dbcache: divid's split of it (init.cpp:1046-1056)
+            tracing::info!(
+                "Cache configuration: block cache {} MiB, UTXO cache {} entries",
+                block_cache >> 20,
+                config.utxo_cache_size
+            );
+            ChainDatabase::open_with_caches(
+                config.chainstate_path(),
+                block_cache,
+                config.utxo_cache_size,
+            )
+            .map_err(|e| NodeError::Init(format!("Failed to open chain database: {}", e)))?
+        } else if config.utxo_cache_size > 0 {
             tracing::info!("UTXO cache enabled: {} entries", config.utxo_cache_size);
             ChainDatabase::open_with_utxo_cache(config.chainstate_path(), config.utxo_cache_size)
                 .map_err(|e| NodeError::Init(format!("Failed to open chain database: {}", e)))?
@@ -576,6 +589,11 @@ impl Node {
                 Vec::new()
             },
             seed_nodes: config.p2p.seednode.clone(),
+            dns_seed: config
+                .p2p
+                .dns_seed
+                .unwrap_or(config.p2p.connect.is_empty()),
+            force_dns_seed: config.p2p.force_dns_seed,
         };
         let peer_manager = PeerManager::new(peer_manager_config);
         // The -addnode values are the first added nodes (net.cpp:1218)
