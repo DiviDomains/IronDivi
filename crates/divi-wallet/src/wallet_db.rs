@@ -330,6 +330,10 @@ pub struct WalletDb {
     /// Divi Core's -vault: addvault and removevault change the wallet only
     /// when it is on (wallet.cpp:152, :693-716)
     vault_mode: std::sync::atomic::AtomicBool,
+    /// Divi Core's -vault_min in satoshis: a managed vault coin below it is
+    /// not stakable (AvailableUtxoCollector.cpp:22,
+    /// AvailableUtxoCalculator.cpp:22-27)
+    vault_min: std::sync::atomic::AtomicI64,
     /// Divi Core's -spendzeroconfchange: a send may also use unconfirmed
     /// outputs of our own transactions (wallet.cpp:1848)
     spend_zero_conf_change: std::sync::atomic::AtomicBool,
@@ -399,6 +403,7 @@ impl WalletDb {
             pending_deletes: RwLock::new(PendingDeletes::default()),
             scanned_hashes: RwLock::new(BTreeMap::new()),
             vault_mode: std::sync::atomic::AtomicBool::new(false),
+            vault_min: std::sync::atomic::AtomicI64::new(0),
             spend_zero_conf_change: std::sync::atomic::AtomicBool::new(false),
             relay_fee_per_kb: std::sync::atomic::AtomicI64::new(crate::send::MIN_RELAY_FEE_PER_KB),
             max_tx_fee: std::sync::atomic::AtomicI64::new(crate::send::DEFAULT_MAX_TX_FEE.as_sat()),
@@ -438,6 +443,7 @@ impl WalletDb {
             pending_deletes: RwLock::new(PendingDeletes::default()),
             scanned_hashes: RwLock::new(BTreeMap::new()),
             vault_mode: std::sync::atomic::AtomicBool::new(false),
+            vault_min: std::sync::atomic::AtomicI64::new(0),
             spend_zero_conf_change: std::sync::atomic::AtomicBool::new(false),
             relay_fee_per_kb: std::sync::atomic::AtomicI64::new(crate::send::MIN_RELAY_FEE_PER_KB),
             max_tx_fee: std::sync::atomic::AtomicI64::new(crate::send::DEFAULT_MAX_TX_FEE.as_sat()),
@@ -481,6 +487,7 @@ impl WalletDb {
             pending_deletes: RwLock::new(PendingDeletes::default()),
             scanned_hashes: RwLock::new(BTreeMap::new()),
             vault_mode: std::sync::atomic::AtomicBool::new(false),
+            vault_min: std::sync::atomic::AtomicI64::new(0),
             spend_zero_conf_change: std::sync::atomic::AtomicBool::new(false),
             relay_fee_per_kb: std::sync::atomic::AtomicI64::new(crate::send::MIN_RELAY_FEE_PER_KB),
             max_tx_fee: std::sync::atomic::AtomicI64::new(crate::send::DEFAULT_MAX_TX_FEE.as_sat()),
@@ -787,6 +794,7 @@ impl WalletDb {
             pending_deletes: RwLock::new(PendingDeletes::default()),
             scanned_hashes: RwLock::new(BTreeMap::new()),
             vault_mode: std::sync::atomic::AtomicBool::new(false),
+            vault_min: std::sync::atomic::AtomicI64::new(0),
             spend_zero_conf_change: std::sync::atomic::AtomicBool::new(false),
             relay_fee_per_kb: std::sync::atomic::AtomicI64::new(crate::send::MIN_RELAY_FEE_PER_KB),
             max_tx_fee: std::sync::atomic::AtomicI64::new(crate::send::DEFAULT_MAX_TX_FEE.as_sat()),
@@ -3698,6 +3706,13 @@ impl WalletDb {
             .store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Divi Core's -vault_min: managed vault coins below `min` are left out
+    /// of the stakable coins
+    pub fn set_vault_min(&self, min: Amount) {
+        self.vault_min
+            .store(min.as_sat(), std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Let sends use unconfirmed outputs of our own transactions (Divi
     /// Core's -spendzeroconfchange, off by default)
     pub fn set_spend_zero_conf_change(&self, on: bool) {
@@ -3924,6 +3939,10 @@ impl WalletDb {
             // key is in the wallet is owned, even when the manager key is too
             // (AvailableUtxoCalculator.cpp:28-31)
             .filter(|(utxo, _)| self.vault_role(&utxo.script_pubkey) == Some(VaultRole::Managed))
+            // nor a managed coin below -vault_min (AvailableUtxoCalculator.cpp:22-27)
+            .filter(|(utxo, _)| {
+                utxo.value.as_sat() >= self.vault_min.load(std::sync::atomic::Ordering::Relaxed)
+            })
             .collect()
     }
 }
@@ -5920,6 +5939,36 @@ mod tests {
             let stakeable = wallet.get_stakeable_vault_utxos(20, 1);
             assert_eq!(stakeable.len(), 1);
             assert_eq!(stakeable[0].0.script_pubkey, managed);
+        }
+
+        /// -vault_min leaves managed vault coins below it out of staking,
+        /// and a coin at it in (AvailableUtxoCalculator.cpp:22-27)
+        #[test]
+        fn vault_min_leaves_smaller_managed_coins_unstaked() {
+            let wallet = create_test_wallet();
+            let manager = wallet.new_receiving_address().unwrap();
+            let managed =
+                divi_script::StakingVaultScript::new([0x55; 20], hash20(&manager)).to_script();
+            register(&wallet, [0x55; 20], &manager, &managed);
+            let tx = pay(vec![
+                (100 * COIN, managed.clone()),
+                (500 * COIN, managed.clone()),
+            ]);
+            wallet.scan_transaction(&tx, Some(Hash256::from_bytes([7; 32])), Some(10), None);
+            let staked = |w: &WalletDb| {
+                let mut v: Vec<i64> = w
+                    .get_stakeable_vault_utxos(20, 1)
+                    .iter()
+                    .map(|(u, _)| u.value.as_sat() / COIN)
+                    .collect();
+                v.sort();
+                v
+            };
+            assert_eq!(staked(&wallet), vec![100, 500]);
+            wallet.set_vault_min(Amount::from_sat(500 * COIN));
+            assert_eq!(staked(&wallet), vec![500]);
+            wallet.set_vault_min(Amount::from_sat(-1));
+            assert_eq!(staked(&wallet), vec![100, 500]);
         }
 
         /// `lockunspent` locks a coin for the whole wallet, in memory
