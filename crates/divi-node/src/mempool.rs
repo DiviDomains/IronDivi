@@ -188,11 +188,43 @@ fn unix_now() -> u32 {
         .unwrap_or(0)
 }
 
+/// Where a transaction entering the mempool comes from, for the checks that
+/// depend on it
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    /// Submitted locally (RPC, wallet): Divi Core's `fLimitFree` false
+    Local,
+    /// Relayed by a peer: `fLimitFree` true
+    Relayed,
+    /// Taken off the chain with its block: `fLimitFree` false, and its height
+    /// lock is checked with the tip still on that block, as Divi Core's
+    /// disconnectTip offers a block's transactions to AcceptToMemoryPool
+    /// before it moves the tip (ChainTipManager.cpp:175-185,
+    /// MempoolConsensus.cpp:61). The block held it, so its height lock passes.
+    DisconnectedBlock,
+}
+
+impl Origin {
+    /// Divi Core's `fLimitFree`
+    pub fn limit_free(self) -> bool {
+        self == Origin::Relayed
+    }
+
+    /// The tip height a height lock is checked against (for the next block):
+    /// the chain tip, or for a transaction of a disconnected block one its
+    /// block was at or below
+    pub fn lock_tip(self, tip_height: u32) -> u32 {
+        match self {
+            Origin::DisconnectedBlock => u32::MAX - 1,
+            Origin::Local | Origin::Relayed => tip_height,
+        }
+    }
+}
+
 /// Checks a transaction against the chain before it may enter the mempool and
-/// returns its fee; see [`Mempool::set_validator`]. The flag is Core's
-/// `fLimitFree`: true for a transaction a peer relayed.
+/// returns its fee; see [`Mempool::set_validator`].
 pub type MempoolValidator =
-    Arc<dyn Fn(&Mempool, &Transaction, bool) -> Result<Admission, NodeError> + Send + Sync>;
+    Arc<dyn Fn(&Mempool, &Transaction, Origin) -> Result<Admission, NodeError> + Send + Sync>;
 
 /// What the checks found for a transaction entering the pool: its fee, the
 /// chain tip height and the coin age of its inputs there (Divi Core
@@ -352,21 +384,22 @@ impl Mempool {
     /// AcceptToMemoryPool with `fLimitFree` false. Policy refusals are
     /// `NodeError::TxRejected` with Divi Core's reject code and reason.
     pub fn add(&self, tx: Transaction, fee: Amount) -> Result<Hash256, NodeError> {
-        self.add_with(tx, fee, false)
+        self.add_with(tx, fee, Origin::Local)
     }
 
     /// Add a transaction a peer relayed: AcceptToMemoryPool with `fLimitFree`
     /// true, so a free transaction must be small and is rate limited
     pub fn add_relayed(&self, tx: Transaction, fee: Amount) -> Result<Hash256, NodeError> {
-        self.add_with(tx, fee, true)
+        self.add_with(tx, fee, Origin::Relayed)
     }
 
-    fn add_with(
-        &self,
-        tx: Transaction,
-        fee: Amount,
-        limit_free: bool,
-    ) -> Result<Hash256, NodeError> {
+    /// Add a transaction of a block the chain disconnected; see
+    /// [`Origin::DisconnectedBlock`]
+    pub fn add_from_disconnected_block(&self, tx: Transaction) -> Result<Hash256, NodeError> {
+        self.add_with(tx, Amount::ZERO, Origin::DisconnectedBlock)
+    }
+
+    fn add_with(&self, tx: Transaction, fee: Amount, origin: Origin) -> Result<Hash256, NodeError> {
         let txid = tx.txid();
 
         // Check if already exists
@@ -378,9 +411,9 @@ impl Mempool {
         // mempool lock: the validator looks up parent transactions here)
         let validator = self.validator.read().clone();
         let admission = match validator {
-            Some(validator) => validator(self, &tx, limit_free)?,
+            Some(validator) => validator(self, &tx, origin)?,
             None => {
-                self.check_without_chain(&tx, fee)?;
+                self.check_without_chain(&tx, fee, origin)?;
                 // No chain to look the inputs up in: no coin age
                 Admission {
                     fee,
@@ -451,8 +484,13 @@ impl Mempool {
 
     /// The checks made without a chain (no validator installed): finality,
     /// block-reward transactions, relay fee, dust and conflicts
-    fn check_without_chain(&self, tx: &Transaction, fee: Amount) -> Result<(), NodeError> {
-        if !is_final_for_next_block(tx, self.tip_height(), unix_now()) {
+    fn check_without_chain(
+        &self,
+        tx: &Transaction,
+        fee: Amount,
+        origin: Origin,
+    ) -> Result<(), NodeError> {
+        if !is_final_for_next_block(tx, origin.lock_tip(self.tip_height()), unix_now()) {
             return Err(NodeError::NonFinal);
         }
         if tx.is_coinbase() {

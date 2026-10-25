@@ -290,3 +290,32 @@ fn a_send_a_lower_tip_makes_non_final_stays_in_the_mempool() {
     assert!(t.in_mempool(&locked), "the locked send stays");
     assert!(t.in_mempool(&child), "its child stays");
 }
+
+/// A send with a height lock, confirmed in a block that invalidateblock
+/// disconnects together with the block below it, comes back to the mempool
+/// although the new tip is below its lock: Divi Core's disconnectTip offers a
+/// block's transactions to AcceptToMemoryPool before it moves the tip
+/// (ChainTipManager.cpp:175-185), so IsStandardTx checks the lock against the
+/// block that held it (MempoolConsensus.cpp:61), where it passed.
+#[test]
+fn a_locked_send_of_a_disconnected_block_returns_to_the_mempool() {
+    let t = TestNode::new();
+    let coin = t.mature_coins(1)[0];
+    t.mine(&[]);
+    let lock_height = t.node.chain().height();
+    let below = t.tip();
+
+    // Final for the next block (lock_height + 1), which confirms it
+    let locked = spend_locked(&t.key, coin, 1250 * COIN, FEE, lock_height);
+    t.mine(std::slice::from_ref(&locked));
+
+    // Both blocks off: the next height is lock_height, where the lock holds
+    let disconnected = t.node.chain().invalidate_block(&below).unwrap();
+    assert_eq!(t.node.chain().height(), lock_height - 1);
+    update_mempool_after_reorg(t.node.chain(), t.node.mempool(), disconnected);
+
+    assert!(
+        t.in_mempool(&locked),
+        "the locked send is back in the mempool"
+    );
+}
