@@ -301,7 +301,6 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "alertnotify",
     "alerts",
     "checklevel",
-    "createwalletbackups",
     "dbcache",
     "disablesystemnotifications",
     "dns",
@@ -310,20 +309,20 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "genproclimit",
     "listenonion",
     "mining",
-    "monthlybackups",
     "onion",
     "par",
     "peerbloomfilters",
     "proxyrandomize",
     "rpcthreads",
-    "sendfreetransactions",
     "sysperms",
     "torcontrol",
     "torpassword",
-    "txconfirmtarget",
     "upnp",
-    "vault_min",
 ];
+
+/// Options divid takes and does nothing with, only naming them in its help:
+/// accepted without a word, as divid does (LicenseAndInfo.cpp:135, :143)
+const UNUSED_BY_DIVID: &[&str] = &["sendfreetransactions", "txconfirmtarget"];
 
 /// Options apply_settings reads
 const APPLIED: &[&str] = &[
@@ -343,6 +342,9 @@ const APPLIED: &[&str] = &[
     "spendzeroconfchange",
     "keypool",
     "upgradewallet",
+    "createwalletbackups",
+    "monthlybackups",
+    "vault_min",
     "rpcuser",
     "rpcpassword",
     "rpcport",
@@ -828,7 +830,7 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
 /// The warning an option read nowhere gets: one divid takes and irondivid
 /// has nothing for, or one neither knows; none for an option that is read
 fn option_warning(settings: &Settings, k: &str) -> Option<String> {
-    if APPLIED.contains(&k) || READ_ELSEWHERE.contains(&k) {
+    if APPLIED.contains(&k) || READ_ELSEWHERE.contains(&k) || UNUSED_BY_DIVID.contains(&k) {
         return None;
     }
     Some(if UNSUPPORTED_OPTIONS.contains(&k) {
@@ -1432,7 +1434,7 @@ impl WalletSeed {
 }
 
 /// Wallet start options
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 struct WalletOptions {
     /// -rescan: scan the whole chain at the start; -salvagewallet sets it
     /// unless it is given (init.cpp:763-766, :1242)
@@ -1446,6 +1448,24 @@ struct WalletOptions {
     /// -upgradewallet, read as a number: the highest wallet version a new
     /// wallet may have (wallet.cpp:1963-1971)
     upgrade_wallet: Option<i64>,
+    /// -createwalletbackups: backups kept in backups/ and monthlyBackups/ by
+    /// the backup at start, 20 by default, a negative count as 0
+    /// (init.cpp:124, :938; WalletBackupCreator.cpp:21)
+    wallet_backups: usize,
+    /// -monthlybackups: backups kept in monthlyBackups/ by the daily check,
+    /// 12 by default; 0 or less leaves the check off (init.cpp:1284,
+    /// LegacyWalletDatabaseEndpointFactory.cpp:77)
+    monthly_backups: usize,
+    /// -vault_min, whole DIVI read as a number: managed vault coins below it
+    /// are not staked (AvailableUtxoCollector.cpp:22)
+    vault_min: Amount,
+}
+
+/// divid's defaults: the options as when none is given
+impl Default for WalletOptions {
+    fn default() -> Self {
+        WalletOptions::from_settings(&Settings::default())
+    }
 }
 
 impl WalletOptions {
@@ -1457,6 +1477,21 @@ impl WalletOptions {
                 .get("keypool")
                 .map(|v| atoi(v).clamp(1, u32::MAX as i64) as u32),
             upgrade_wallet: settings.get("upgradewallet").map(atoi),
+            wallet_backups: settings
+                .get("createwalletbackups")
+                .map_or(divi_wallet::backup::STARTUP_BACKUPS, |v| {
+                    atoi(v).max(0) as usize
+                }),
+            monthly_backups: settings
+                .get("monthlybackups")
+                .map_or(divi_wallet::backup::MONTHLY_BACKUPS, |v| {
+                    atoi(v).max(0) as usize
+                }),
+            vault_min: Amount::from_sat(
+                settings
+                    .get("vault_min")
+                    .map_or(0, |v| atoi(v).saturating_mul(100_000_000)),
+            ),
         }
     }
 
@@ -1550,7 +1585,9 @@ fn load_or_restore_wallet_with_seed(
         // Divi Core copies the wallet into backups/ (and monthlyBackups/) at
         // every start, before it opens it (init.cpp:1479)
         if let Some(data_dir) = wallet_path.parent() {
-            if let Err(e) = divi_wallet::backup::backup_at_start(wallet_path, data_dir) {
+            if let Err(e) =
+                divi_wallet::backup::backup_at_start(wallet_path, data_dir, options.wallet_backups)
+            {
                 warn!("Failed to create backup: {}", e);
             }
         }
@@ -1872,6 +1909,7 @@ async fn run_daemon(
             }
             w.set_vault_mode(config.vault);
             w.set_spend_zero_conf_change(wallet_options.spend_zero_conf_change);
+            w.set_vault_min(wallet_options.vault_min);
             w.set_relay_fee_per_kb(config.mempool.min_relay_fee_per_kb);
             w.set_max_tx_fee(config.mempool.max_tx_fee);
             // -walletnotify, before the wallet catches up with the chain
@@ -2036,23 +2074,32 @@ async fn run_daemon(
 
             resubmit_wallet_txs(&node, wallet_arc);
 
-            // Divi Core checks once a day whether a monthly backup is due
-            // (LegacyWalletDatabaseEndpointFactory.cpp:111-121; on regtest
-            // that loop runs on mock time)
-            if config.network.network_type != NetworkType::Regtest {
+            // Divi Core checks a day after start, and a day after each check,
+            // whether a monthly backup is due; on regtest the day is counted
+            // on mock time (LegacyWalletDatabaseEndpointFactory.cpp:111-121,
+            // MockMilliSleep in utiltime.cpp:54-60)
+            if wallet_options.monthly_backups > 0 {
                 let wallet_for_backup = Arc::clone(wallet_arc);
                 let backup_root = wallet_dir.parent().map(|p| p.to_path_buf());
+                let keep = wallet_options.monthly_backups;
+                let clock: fn() -> i64 = if config.network.network_type == NetworkType::Regtest {
+                    divi_primitives::clock::now
+                } else {
+                    divi_primitives::clock::system_now
+                };
                 tokio::spawn(async move {
                     let Some(root) = backup_root else { return };
-                    let mut daily =
-                        tokio::time::interval(std::time::Duration::from_secs(24 * 3600));
-                    daily.tick().await;
+                    const DAY: i64 = 24 * 3600;
+                    let mut since = clock();
                     loop {
-                        daily.tick().await;
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        if clock() - since <= DAY {
+                            continue;
+                        }
                         let wallet = Arc::clone(&wallet_for_backup);
                         let root = root.clone();
                         let made = tokio::task::spawn_blocking(move || {
-                            divi_wallet::backup::monthly_backup(&wallet, &root)
+                            divi_wallet::backup::monthly_backup(&wallet, &root, keep)
                         })
                         .await;
                         match made {
@@ -2061,6 +2108,7 @@ async fn run_daemon(
                             Ok(Err(e)) => warn!("Monthly wallet backup failed: {}", e),
                             Err(e) => warn!("Monthly wallet backup failed: {}", e),
                         }
+                        since = clock();
                     }
                 });
             }

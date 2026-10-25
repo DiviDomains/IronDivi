@@ -87,12 +87,15 @@ pub fn getblocks_reply(
 /// last block of a full getblocks answer an inv of the tip follows, so the peer
 /// asks for more. A transaction comes from what was relayed in the last 15
 /// minutes, then the mempool (main.cpp:324), else it is named in a notfound,
-/// which goes out after the next block, or at the end of the pass.
+/// which goes out after the next block, or at the end of the pass. A spork
+/// held is sent, else named in the same notfound (main.cpp:187-189, :337-346).
+#[allow(clippy::too_many_arguments)]
 pub fn serve_getdata(
     chain: &Chain,
     peer_manager: &PeerManager,
     tx_relay: &TxRelay,
     mempool: &Mempool,
+    spork_manager: &SporkManager,
     hash_continue: &mut HashMap<divi_network::PeerId, Hash256>,
     queue: &mut std::collections::VecDeque<divi_network::InvItem>,
     peer_id: divi_network::PeerId,
@@ -152,6 +155,19 @@ pub fn serve_getdata(
                 {
                     Some(tx) => {
                         match peer_manager.try_send_to_peer(peer_id, NetworkMessage::Tx(tx)) {
+                            TrySend::Sent => {}
+                            TrySend::Full => break,
+                            TrySend::Gone => return queue.clear(),
+                        }
+                    }
+                    None => not_found.push(item),
+                }
+                queue.pop_front();
+            }
+            divi_network::InvType::Spork => {
+                match spork_manager.spork_by_hash(&item.hash) {
+                    Some(spork) => {
+                        match peer_manager.try_send_to_peer(peer_id, NetworkMessage::Spork(spork)) {
                             TrySend::Sent => {}
                             TrySend::Full => break,
                             TrySend::Gone => return queue.clear(),
@@ -988,14 +1004,14 @@ impl Node {
                     received = peer_events.recv() => received,
                     _ = divi_network::buffers::send_space().notified(), if !pending_getdata.is_empty() => {
                         pending_getdata.retain(|peer_id, queue| {
-                            serve_getdata(&chain, &peer_manager, &tx_relay, &mempool, &mut hash_continue, queue, *peer_id);
+                            serve_getdata(&chain, &peer_manager, &tx_relay, &mempool, &spork_manager, &mut hash_continue, queue, *peer_id);
                             !queue.is_empty()
                         });
                         continue;
                     }
                     _ = resume.tick(), if !pending_getdata.is_empty() => {
                         pending_getdata.retain(|peer_id, queue| {
-                            serve_getdata(&chain, &peer_manager, &tx_relay, &mempool, &mut hash_continue, queue, *peer_id);
+                            serve_getdata(&chain, &peer_manager, &tx_relay, &mempool, &spork_manager, &mut hash_continue, queue, *peer_id);
                             !queue.is_empty()
                         });
                         continue;
@@ -1160,6 +1176,8 @@ impl Node {
                                         .send_to_peer(peer_id, NetworkMessage::GetData(masternode_items))
                                         .await;
                                 }
+                                // Sporks are announced by inv as well
+                                spork_manager.handle_inv(peer_id, &items).await;
                             }
                             NetworkMessage::NotFound(items) => {
                                 let items: Vec<_> = items
@@ -1192,6 +1210,7 @@ impl Node {
                                         &peer_manager,
                                         &tx_relay,
                                         &mempool,
+                                        &spork_manager,
                                         &mut hash_continue,
                                         queue,
                                         peer_id,
@@ -1292,6 +1311,24 @@ impl Node {
                                         e
                                     ),
                                 }
+                            }
+                            // Divi Core reads no transaction from a dstx
+                            // (main.cpp:705-718) and checks an empty one, which
+                            // fails CheckTransaction (DoS 10,
+                            // BlockCheckingHelpers.cpp:101-103) and then bad-tx
+                            // (DoS 100, MempoolConsensus.cpp:276-277): a reject
+                            // and a score of 110 (main.cpp:803-812)
+                            NetworkMessage::Unknown(cmd, _) if cmd == "dstx" => {
+                                if let Err(e) =
+                                    peer_manager.send_to_peer(peer_id, dstx_reject()).await
+                                {
+                                    tracing::debug!("Failed to send reject to peer {}: {}", peer_id, e);
+                                }
+                                peer_manager.report_misbehavior_score(
+                                    peer_id,
+                                    DSTX_SCORE,
+                                    "Transaction from peer rejected by memory pool",
+                                );
                             }
                             NetworkMessage::Unknown(cmd, payload) => {
                                 // Unknown messages are logged with payload details for debugging
@@ -2198,6 +2235,23 @@ fn clear_folders_for_resync(config: &NodeConfig) {
             Err(e) => tracing::warn!("Failed to delete blockchain folders {}", e),
         }
     }
+}
+
+/// The score a `dstx` costs its sender: Divi Core checks the empty
+/// transaction it never read, 10 for CheckTransaction and 100 for bad-tx
+/// (BlockCheckingHelpers.cpp:101-103, MempoolConsensus.cpp:276-277)
+pub const DSTX_SCORE: u32 = 110;
+
+/// The `reject` Divi Core sends for a `dstx` (main.cpp:803-809): bad-tx, with
+/// the hash of the empty transaction, which is all zeros since a transaction
+/// that was never read has no hash computed
+pub fn dstx_reject() -> divi_network::NetworkMessage {
+    divi_network::NetworkMessage::Reject(divi_network::RejectMessage {
+        message: "dstx".to_string(),
+        code: crate::error::reject::INVALID,
+        reason: "bad-tx".to_string(),
+        data: vec![0u8; 32],
+    })
 }
 
 /// The `reject` Divi Core sends the peer that relayed a transaction its
