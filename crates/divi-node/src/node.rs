@@ -2020,8 +2020,6 @@ impl Node {
 
         tracing::info!("Stopping Divi node...");
         *self.status.write() = NodeStatus::Stopping;
-        // netfulfilled.dat is written at shutdown (MasternodeModule.cpp:290-296)
-        crate::masternode_sync::save(&self.masternode_sync, &self.config.data_dir);
 
         // Stop the block import between two records and wait for it, for a
         // minute at most (a read can block where the flag is not seen)
@@ -2069,6 +2067,13 @@ impl Node {
             );
         }
         shutdown_stage("node loops stopped", started);
+
+        // netfulfilled.dat once the loops that change it have stopped, as
+        // Divi Core's SaveMasternodeDataToDisk follows StopNode
+        // (init.cpp:372, :376; MasternodeModule.cpp:284-297)
+        let started = std::time::Instant::now();
+        crate::masternode_sync::save(&self.masternode_sync, &self.config.data_dir);
+        shutdown_stage("netfulfilled.dat written", started);
 
         // The addresses learnt, for the next start (Divi Core DumpAddresses at stop)
         let started = std::time::Instant::now();

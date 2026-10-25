@@ -339,3 +339,17 @@ fn peers_are_written_before_and_closed_after_the_flush() {
     assert!(written < closed && flushed < closed, "{lines:#?}");
     assert!(dir.path().join("peers.dat").exists());
 }
+
+/// netfulfilled.dat is written once the node's loops have stopped, as Divi
+/// Core's SaveMasternodeDataToDisk follows StopNode (init.cpp:372, :376)
+#[test]
+fn netfulfilled_is_written_after_the_loops_stop() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(dir.path());
+    daemon.stop();
+    let lines = log_lines(dir.path());
+    let loops = line_of(&lines, "Shutdown: node loops stopped").expect("loops stopped");
+    let written =
+        line_of(&lines, "Shutdown: netfulfilled.dat written").expect("netfulfilled.dat written");
+    assert!(loops < written, "{lines:#?}");
+}
