@@ -426,6 +426,12 @@ pub struct P2pConfig {
     #[serde(default)]
     pub proxy: Option<String>,
 
+    /// Random credentials for each connection through a proxy, which gives each
+    /// its own Tor circuit (Divi Core's `-proxyrandomize`, on by default;
+    /// net.cpp:1761)
+    #[serde(default = "default_proxy_randomize")]
+    pub proxy_randomize: bool,
+
     /// Connection timeout in milliseconds (Divi Core's -timeout)
     #[serde(default = "default_connect_timeout_ms")]
     pub connect_timeout_ms: u64,
@@ -463,12 +469,13 @@ pub struct P2pConfig {
 impl P2pConfig {
     /// The `proxy` setting as a socket address: `ip:port`, `host:port`, or a bare IP
     /// or host with the Tor default port 9050 (C++ `-proxy` accepts the same).
+    /// Empty and `0` (also `-noproxy`) are no proxy (net.cpp:1763-1765).
     pub fn proxy_addr(&self) -> Result<Option<SocketAddr>, String> {
         let Some(raw) = self
             .proxy
             .as_deref()
             .map(str::trim)
-            .filter(|s| !s.is_empty())
+            .filter(|s| !s.is_empty() && *s != "0")
         else {
             return Ok(None);
         };
@@ -491,6 +498,10 @@ impl P2pConfig {
             .map(Some)
             .ok_or_else(|| format!("Invalid -proxy address or hostname: '{raw}'"))
     }
+}
+
+fn default_proxy_randomize() -> bool {
+    true
 }
 
 fn default_discover() -> bool {
@@ -528,6 +539,7 @@ impl Default for P2pConfig {
             ban_score: default_ban_score(),
             user_agent: format!("/DiviRust:{}/", env!("CARGO_PKG_VERSION")),
             proxy: None,
+            proxy_randomize: default_proxy_randomize(),
             connect_timeout_ms: default_connect_timeout_ms(),
             discover: default_discover(),
             external_ips: Vec::new(),
@@ -1000,6 +1012,7 @@ mod tests {
         };
         assert_eq!(P2pConfig::default().proxy_addr(), Ok(None));
         assert_eq!(with("").proxy_addr(), Ok(None));
+        assert_eq!(with("0").proxy_addr(), Ok(None));
         assert_eq!(
             with("127.0.0.1:9150").proxy_addr(),
             Ok(Some("127.0.0.1:9150".parse().unwrap()))

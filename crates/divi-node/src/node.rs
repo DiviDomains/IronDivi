@@ -571,8 +571,15 @@ impl Node {
                 peer_sources.listen
             );
         }
-        let proxy = config.p2p.proxy_addr().map_err(NodeError::Init)?;
-        if let Some(proxy) = proxy {
+        let proxy = config
+            .p2p
+            .proxy_addr()
+            .map_err(NodeError::Init)?
+            .map(|addr| divi_network::socks5::Proxy {
+                addr,
+                randomize_credentials: config.p2p.proxy_randomize,
+            });
+        if let Some(proxy) = proxy.map(|p| p.addr) {
             tracing::info!("Outbound P2P connections go through SOCKS5 proxy {}", proxy);
         }
         // -timeout for outbound connections

@@ -133,7 +133,7 @@ impl Connection {
     #[allow(clippy::too_many_arguments)]
     pub async fn connect(
         addr: SocketAddr,
-        proxy: Option<SocketAddr>,
+        proxy: Option<crate::socks5::Proxy>,
         magic: Magic,
         our_height: u32,
         our_services: u64,
@@ -148,7 +148,7 @@ impl Connection {
         // connection when the proxy fails
         let stream = match proxy {
             Some(proxy) => {
-                info!("Connecting to peer {} via proxy {}", addr, proxy);
+                info!("Connecting to peer {} via proxy {}", addr, proxy.addr);
                 timeout(connect_timeout(), crate::socks5::connect(proxy, addr))
                     .await
                     .map_err(|_| NetworkError::Timeout)??

@@ -310,7 +310,6 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "onlynet",
     "par",
     "peerbloomfilters",
-    "proxyrandomize",
     "rpcthreads",
     "shrinkdebugfile",
     "sysperms",
@@ -363,6 +362,7 @@ const APPLIED: &[&str] = &[
     "maxconnections",
     "timeout",
     "proxy",
+    "proxyrandomize",
     "discover",
     "externalip",
     "protocolversion",
@@ -630,6 +630,8 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     if let Some(proxy) = s.get("proxy") {
         config.p2p.proxy = Some(proxy.to_string());
     }
+    // GetBoolArg("-proxyrandomize", true) (net.cpp:1761)
+    config.p2p.proxy_randomize = s.get_bool("proxyrandomize", true);
     config.p2p.discover = s.get_bool("discover", true);
     // -externalip=<ip>[:port], the listen port when none is given; one that
     // does not resolve to a valid address stops the start (net.cpp:1834-1839)

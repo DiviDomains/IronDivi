@@ -52,9 +52,12 @@ pub struct PeerManagerConfig {
     pub listen_addr: Option<SocketAddr>,
     /// Default P2P port for DNS seed resolution
     pub default_port: u16,
-    /// SOCKS5 proxy for every outbound connection (C++ `-proxy`). When set, no
-    /// outbound connection is made directly and DNS seeds are not resolved locally.
-    pub proxy: Option<SocketAddr>,
+    /// SOCKS5 proxy for outbound connections to IPv4 and IPv6 peers (C++ `-proxy`,
+    /// with `-proxyrandomize`). When set, no such connection is made directly and
+    /// DNS seeds are not resolved locally; a peer at an address that is not
+    /// routable (127.0.0.1, a private network) is dialled directly, as Divi
+    /// Core keeps no proxy for those (netbase.cpp:620-629).
+    pub proxy: Option<crate::socks5::Proxy>,
     /// `static_peers` are `-connect` peers (dialled by address and port, as
     /// Divi Core dials `-connect`) rather than `-addnode` and built-in peers
     pub connect_only: bool,
@@ -791,8 +794,17 @@ impl PeerManager {
     }
 
     /// SOCKS5 proxy used for outbound connections, if any
-    pub fn proxy(&self) -> Option<SocketAddr> {
+    pub fn proxy(&self) -> Option<crate::socks5::Proxy> {
         self.config.proxy
+    }
+
+    /// The proxy a connection to `addr` goes through: Divi Core's GetProxy for
+    /// the address's network, which is none for an address that is not routable
+    /// (ConnectSocket, netbase.cpp:620-629)
+    fn proxy_for(&self, addr: &SocketAddr) -> Option<crate::socks5::Proxy> {
+        self.config
+            .proxy
+            .filter(|_| crate::local::is_routable(&addr.ip()))
     }
 
     /// Discover peers from DNS seeds
@@ -801,7 +813,7 @@ impl PeerManager {
             debug!("No DNS seeds configured; skipping DNS peer discovery");
             return;
         }
-        if let Some(proxy) = self.config.proxy {
+        if let Some(proxy) = self.config.proxy.map(|p| p.addr) {
             // A local lookup would reveal the node outside the proxy
             info!(
                 "Proxy {} set: not resolving DNS seeds locally; using configured peers only",
@@ -988,7 +1000,7 @@ impl PeerManager {
 
         let result = Connection::connect(
             addr,
-            self.config.proxy,
+            self.proxy_for(&addr),
             self.config.magic,
             our_height,
             self.services(),
@@ -1896,31 +1908,44 @@ mod tests {
         }
     }
 
+    /// An address in Divi Core's OnionCat range (fd87:d87e:eb43::/48): routable,
+    /// and not reachable from the host without Tor
+    fn onion_test_ip() -> std::net::IpAddr {
+        "fd87:d87e:eb43:1:2:3:4:5".parse().unwrap()
+    }
+
     fn local_only(listen_addr: Option<SocketAddr>, proxy: Option<SocketAddr>) -> PeerManagerConfig {
         PeerManagerConfig {
             magic: crate::REGTEST_MAGIC,
             dns_seeds: vec![],
             static_peers: vec![],
             listen_addr,
-            proxy,
+            proxy: proxy.map(|addr| crate::socks5::Proxy {
+                addr,
+                randomize_credentials: true,
+            }),
             ..Default::default()
         }
     }
 
-    /// With a proxy set, the outbound P2P connection goes through it (SOCKS5 CONNECT
-    /// to the peer) and completes the handshake end to end.
+    /// With a proxy set, the outbound P2P connection to a routable peer goes
+    /// through it (SOCKS5 CONNECT to the peer, with random credentials) and
+    /// completes the handshake end to end. The client names an onion (OnionCat)
+    /// address, routable to Divi Core and never dialled directly here; the stub
+    /// opens the local server in its place, so nothing leaves the host.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_outbound_connection_goes_through_socks5_proxy() {
         let listen = SocketAddr::from(([127, 0, 0, 1], divi_test_support::free_port()));
         let server = PeerManager::new(local_only(Some(listen), None));
         tokio::spawn(Arc::clone(&server).start());
-        let (proxy, seen) = crate::socks5::stub::start().await;
+        let (proxy, seen, greetings) = crate::socks5::stub::start_redirecting(listen).await;
         let client = PeerManager::new(local_only(None, Some(proxy)));
-        assert_eq!(client.proxy(), Some(proxy));
+        assert_eq!(client.proxy().map(|p| p.addr), Some(proxy));
+        let routable = SocketAddr::new(onion_test_ip(), listen.port());
 
         let mut connected = false;
         for _ in 0..50 {
-            if Arc::clone(&client).connect_to_peer(listen).await.is_ok() {
+            if Arc::clone(&client).connect_to_peer(routable).await.is_ok() {
                 connected = true;
                 break;
             }
@@ -1938,7 +1963,36 @@ mod tests {
         }
         assert_eq!(inbound, 1);
         assert_eq!(client.outbound_count(), 1);
-        assert!(!seen.lock().is_empty() && seen.lock().iter().all(|t| *t == listen));
+        assert!(!seen.lock().is_empty() && seen.lock().iter().all(|t| *t == routable));
+        assert!(greetings.lock().iter().all(|(_, creds)| creds.is_some()));
+        client.disconnect_all();
+        server.disconnect_all();
+    }
+
+    /// A peer at an address that is not routable (127.0.0.1) is dialled
+    /// directly even with a proxy set: Divi Core has no proxy for that network
+    /// (netbase.cpp:620-629)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unroutable_peer_is_dialled_without_the_proxy() {
+        let listen = SocketAddr::from(([127, 0, 0, 1], divi_test_support::free_port()));
+        let server = PeerManager::new(local_only(Some(listen), None));
+        tokio::spawn(Arc::clone(&server).start());
+        let (proxy, seen, _) = crate::socks5::stub::start_recording().await;
+        let client = PeerManager::new(local_only(None, Some(proxy)));
+        let mut connected = false;
+        for _ in 0..50 {
+            if Arc::clone(&client).connect_to_peer(listen).await.is_ok() {
+                connected = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(connected, "could not connect directly");
+        assert!(
+            seen.lock().is_empty(),
+            "went through the proxy: {:?}",
+            seen.lock()
+        );
         client.disconnect_all();
         server.disconnect_all();
     }
@@ -1946,14 +2000,17 @@ mod tests {
     /// A dead proxy must fail the connection, never fall back to connecting directly.
     #[tokio::test]
     async fn test_dead_proxy_does_not_fall_back_to_direct() {
-        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let target_addr = target.local_addr().unwrap();
+        // A routable onion (OnionCat) target: a direct dial of it fails on the
+        // host, so nothing leaves it even if the proxy were skipped
         let dead_proxy = SocketAddr::from(([127, 0, 0, 1], divi_test_support::free_port()));
         let client = PeerManager::new(local_only(None, Some(dead_proxy)));
-        let err = Arc::clone(&client).connect_to_peer(target_addr).await;
+        let routable = SocketAddr::new(onion_test_ip(), 51476);
+        let err = Arc::clone(&client).connect_to_peer(routable).await;
         assert!(err.is_err());
-        let direct = tokio::time::timeout(Duration::from_millis(300), target.accept()).await;
-        assert!(direct.is_err(), "connected to the peer directly");
+        assert!(
+            err.unwrap_err().to_string().contains("cannot reach proxy"),
+            "did not try the proxy"
+        );
     }
 
     #[test]
