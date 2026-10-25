@@ -895,7 +895,7 @@ impl WalletDb {
                 Ok(notes) => {
                     self.tx_notes.write().insert(txid, notes);
                 }
-                Err(e) => debug!("Skipping unreadable notes of {}: {}", txid, e),
+                Err(e) => db.note_unreadable_transaction(&format!("notes of {txid}"), e),
             }
         }
 
@@ -1050,6 +1050,12 @@ impl WalletDb {
             "Restored {} spent UTXO data entries for reorg recovery",
             self.spent_utxo_data.read().len()
         );
+
+        // A key that could not be read stops the load (DB_CORRUPT,
+        // walletdb.cpp:499-500)
+        if db.load_problems().keys > 0 {
+            return Err(WalletError::Corrupt);
+        }
 
         info!(
             "Wallet loaded: {} keys, {} UTXOs, {} transactions, {} accounts, {} scripts, balance = {}",
@@ -1550,6 +1556,15 @@ impl WalletDb {
         result?;
         info!("Wallet backed up to {}", target.display());
         Ok(target)
+    }
+
+    /// The records the load could not read, by kind (Divi Core's ReadKeyValue
+    /// failures, walletdb.cpp:495-511)
+    pub fn load_problems(&self) -> crate::persistence::LoadProblems {
+        self.db
+            .as_ref()
+            .map(|db| db.load_problems())
+            .unwrap_or_default()
     }
 
     pub fn database_path(&self) -> std::path::PathBuf {

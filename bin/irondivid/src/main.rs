@@ -346,6 +346,8 @@ const APPLIED: &[&str] = &[
     "budgetvotemode",
     "rescan",
     "salvagewallet",
+    "dbloadfailexit",
+    "allowunencryptedwallet",
     "spendzeroconfchange",
     "keypool",
     "upgradewallet",
@@ -509,6 +511,11 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     }
     if s.is_set("proxy") {
         s.soft_set_bool("listen", false);
+    }
+    // -salvagewallet rewrites nothing in Divi Core 3.0.0: it sets -rescan
+    // (EnableWalletFeatures, init.cpp:763-766)
+    if s.get_bool("salvagewallet", false) && s.soft_set_bool("rescan", true) {
+        info!("InitializeDivi : parameter interaction: -salvagewallet=1 -> setting -rescan=1");
     }
     // -proxy, -listen=0 and -externalip each turn -discover off unless it is
     // given (net.cpp:1690-1716)
@@ -1468,12 +1475,34 @@ impl WalletSeed {
     }
 }
 
+/// A start that stops with exit code 1 and no error line, as Divi Core's
+/// AppInit2 returning false without an InitError (-dbloadfailexit)
+#[derive(Debug)]
+struct QuietExit;
+
+impl std::fmt::Display for QuietExit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the wallet loaded with a warning and -dbloadfailexit is set")
+    }
+}
+
+impl std::error::Error for QuietExit {}
+
 /// Wallet start options
 #[derive(Debug, Clone, Copy)]
 struct WalletOptions {
     /// -rescan: scan the whole chain at the start; -salvagewallet sets it
     /// unless it is given (init.cpp:763-766, :1242)
     rescan: bool,
+    /// Whether -rescan is given: a transaction record that cannot be read
+    /// asks for a rescan only when it is not (SoftSetBoolArg, walletdb.cpp:508)
+    rescan_given: bool,
+    /// -dbloadfailexit, read as a number: a wallet that loads with a warning
+    /// stops the start (init.cpp:1307-1309)
+    db_load_fail_exit: bool,
+    /// -allowunencryptedwallet: no warning at start about an unencrypted
+    /// wallet (init.cpp:1228-1231)
+    allow_unencrypted: bool,
     /// -spendzeroconfchange: sends may use unconfirmed outputs of our own
     /// transactions (wallet.cpp:1848)
     spend_zero_conf_change: bool,
@@ -1507,6 +1536,9 @@ impl WalletOptions {
     fn from_settings(settings: &Settings) -> Self {
         WalletOptions {
             rescan: settings.get_bool("rescan", settings.get_bool("salvagewallet", false)),
+            rescan_given: settings.get("rescan").is_some(),
+            db_load_fail_exit: settings.get("dbloadfailexit").is_some_and(|v| atoi(v) != 0),
+            allow_unencrypted: settings.get_bool("allowunencryptedwallet", false),
             spend_zero_conf_change: settings.get_bool("spendzeroconfchange", false),
             keypool: settings
                 .get("keypool")
@@ -1627,8 +1659,33 @@ fn load_or_restore_wallet_with_seed(
             }
         }
         info!("Loading wallet from {:?}", wallet_path);
-        let wallet = WalletDb::open(wallet_path, network)
-            .with_context(|| format!("Failed to open wallet at {:?}", wallet_path))?;
+        let wallet = match WalletDb::open(wallet_path, network) {
+            // A key record that cannot be read: Divi Core's DB_CORRUPT, an
+            // InitError (init.cpp:1153-1156, :1299-1305)
+            Err(divi_wallet::WalletError::Corrupt) => {
+                let message = divi_wallet::WalletError::Corrupt.to_string();
+                error!("Errors detected during wallet loading\n{}", message);
+                return Err(anyhow::Error::msg(message));
+            }
+            other => {
+                other.with_context(|| format!("Failed to open wallet at {:?}", wallet_path))?
+            }
+        };
+        // Other records that cannot be read: a warning, and the start goes
+        // on unless -dbloadfailexit (DB_NONCRITICAL_ERROR, init.cpp:1157-1162,
+        // :1299-1310)
+        let problems = wallet.load_problems();
+        if problems.transactions + problems.others > 0 {
+            let message = "Warning: error reading wallet.dat! All keys read correctly, but transaction data or address book entries might be missing or incorrect.";
+            info!("Errors detected during wallet loading\n{}", message);
+            // InitWarning: "Warning: " and the message, logged and on stderr
+            // (noui.cpp:38-40)
+            warn!("Warning: {}", message);
+            eprintln!("Warning: {}", message);
+            if options.db_load_fail_exit {
+                return Err(anyhow::Error::new(QuietExit));
+            }
+        }
 
         // Migrate chain_mode if needed (fixes wallets created before ChainMode was configurable)
         wallet
@@ -1677,7 +1734,11 @@ fn load_or_restore_wallet_with_seed(
     // The version limit is checked before the seed is made
     // (wallet.cpp:1963-1979), and before anything is written
     if options.refuses_new_wallet() {
-        anyhow::bail!("Error loading wallet.dat: database load failure");
+        // As Divi Core logs it (wallet.cpp:1969, init.cpp:1303)
+        info!("Unable to downgrade wallet version. -upgradewallet=<custom_version> might be incorrectly set");
+        let message = "Error loading wallet.dat: database load failure";
+        error!("Errors detected during wallet loading\n{}", message);
+        anyhow::bail!(message);
     }
     // Checked only when words make the wallet, before anything is written
     // (wallet.cpp:2302-2305, reported by init.cpp:1203-1209)
@@ -1959,6 +2020,18 @@ async fn run_daemon(
             &wallet_options,
         )?);
         if let Some(ref w) = wallet {
+            // Divi Core warns at every start of a wallet that is not locked,
+            // unless -allowunencryptedwallet; not after the load's own warning,
+            // which returns first (init.cpp:1220-1231)
+            let problems = w.load_problems();
+            if !wallet_options.allow_unencrypted
+                && !w.is_locked()
+                && problems.transactions + problems.others == 0
+            {
+                let message = "Make sure to encrypt your wallet and delete all non-encrypted backups after you verified that wallet works!";
+                warn!("Warning: {}", message);
+                eprintln!("Warning: {}", message);
+            }
             // -mnconflock, default on (MasternodeModule.cpp:454-466)
             if mn_options.lock {
                 core_files::lock_masternode_collateral(w, &mn_options.conf_path);
@@ -2093,7 +2166,11 @@ async fn run_daemon(
             // wallet holds, as Divi Core's verifySyncToActiveChain from the
             // genesis block (init.cpp:1242, wallet.cpp:279-313)
             let chain_height = node.chain().height();
-            if wallet_options.rescan {
+            // A transaction record that could not be read asks for a rescan,
+            // unless -rescan is given (walletdb.cpp:505-508)
+            let rescan = wallet_options.rescan
+                || (!wallet_options.rescan_given && wallet_arc.load_problems().transactions > 0);
+            if rescan {
                 info!("Rescanning... from height 0 to {}", chain_height);
                 wallet_arc.set_last_scan_height(0);
             } else {
@@ -3371,6 +3448,13 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
     )
     .await
     {
+        // A start stopped without an InitError (-dbloadfailexit) prints nothing
+        // more (init.cpp:1307-1309)
+        if e.downcast_ref::<QuietExit>().is_some() {
+            remove_pid_file(&pid_file);
+            flush_log();
+            std::process::exit(1);
+        }
         error!("Daemon error: {:#}", e);
         // Also on stderr, as Divi Core's InitError (noui.cpp:38-40)
         {

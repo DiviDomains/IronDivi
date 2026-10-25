@@ -50,4 +50,5 @@ fault-injection = ["divi-storage/fault-injection"]
 
 [dev-dependencies]
 divi-test-support = { workspace = true }
+rocksdb = { workspace = true }
 tempfile = { workspace = true }

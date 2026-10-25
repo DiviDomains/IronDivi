@@ -4178,6 +4178,7 @@ dependencies = [
  "divi-wallet",
  "hex",
  "libc",
+ "rocksdb",
  "serde",
  "serde_json",
  "tempfile",
