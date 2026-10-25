@@ -25,6 +25,9 @@ import time
 import urllib.error
 import urllib.request
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "lib"))
+import member_order  # noqa: E402  (scripts/lib: the order check the replies scripts share)
+
 IRONDIVID, DIVID, PORT_BASE, WORK = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
 # For the proof that a difference is caught: irondivid's body of the named row is
 # changed before it is compared
@@ -44,8 +47,13 @@ KNOWN = {f"zmq {t}": ZMQ_REASON for t in ("hashblock", "hashtx", "rawblock", "ra
 fails = 0
 
 
-def row(name, core, iron, same):
+def row(name, core, iron, same, moved=None):
     global fails
+    if moved:
+        # The same members or items in another order than divid's: a FAIL of its own kind
+        fails += 1
+        print(f"ORDER  {name}  {moved}  divid={core}  irondivid={iron}"[:400], flush=True)
+        return
     reason = KNOWN.get(name)
     if reason:
         word = "KNOWN" if not same else "FAIL"
@@ -161,8 +169,8 @@ class Node:
 
 def first_difference(a, b, path="$"):
     """Where two JSON values first differ, or None. Reals are compared as each
-    node writes them (the text of the number); members in any order (irondivid
-    writes them in name order, docs/divid-differences.md)."""
+    node writes them (the text of the number); members in any order here (their
+    order is compared by member_order, in compare())."""
     if isinstance(a, dict) and isinstance(b, dict):
         for k in sorted(set(a) | set(b)):
             if k not in a:
@@ -232,7 +240,14 @@ def compare(name, path, method="GET"):
         d = f"Content-Type {iron[1] or '-'}"
     else:
         d = body_difference(core[1], core[2], iron[2])
-    row(name, short(core), d or short(iron), d is None)
+    moved = None
+    if core[0] == iron[0] and core[1] == iron[1] and core[1].startswith("application/json"):
+        try:
+            moved = member_order.difference(json.loads(core[2], parse_float=str),
+                                            json.loads(iron[2], parse_float=str))
+        except ValueError:
+            pass
+    row(name, short(core), d or short(iron), d is None, moved=moved)
 
 
 # --- the chain ----------------------------------------------------------------------
