@@ -44,6 +44,61 @@ pub(crate) fn is_tor(b: &[u8; 16]) -> bool {
     b[..6] == [0xFD, 0x87, 0xD8, 0x7E, 0xEB, 0x43]
 }
 
+/// Whether `ip` is an onion address (Divi Core's OnionCat range,
+/// fd87:d87e:eb43::/48, netbase.cpp: pchOnionCat)
+pub fn is_onion(ip: &IpAddr) -> bool {
+    is_tor(&bytes(ip))
+}
+
+/// The `.onion` name of an onion address: its last ten bytes in lowercase
+/// base32 (Divi Core CNetAddr::ToStringIP, EncodeBase32); None for any other
+/// address
+pub fn onion_name(ip: &IpAddr) -> Option<String> {
+    let b = bytes(ip);
+    if !is_tor(&b) {
+        return None;
+    }
+    const ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
+    let mut out = String::new();
+    let mut acc: u32 = 0;
+    let mut bits = 0;
+    for byte in &b[6..] {
+        acc = (acc << 8) | u32::from(*byte);
+        bits += 8;
+        while bits >= 5 {
+            bits -= 5;
+            out.push(ALPHABET[((acc >> bits) & 31) as usize] as char);
+        }
+    }
+    Some(out + ".onion")
+}
+
+/// The onion address of a `.onion` name of 16 base32 characters (a version 2
+/// service id), as Divi Core's CNetAddr::SetSpecial reads it
+pub fn onion_from_name(name: &str) -> Option<IpAddr> {
+    let id = name.strip_suffix(".onion")?;
+    if id.len() != 16 {
+        return None;
+    }
+    // 16 characters of 5 bits: the 80 bits of the ten bytes after the prefix
+    let mut value: u128 = 0;
+    for c in id.bytes() {
+        let v = match c {
+            b'a'..=b'z' => c - b'a',
+            b'A'..=b'Z' => c - b'A',
+            b'2'..=b'7' => c - b'2' + 26,
+            _ => return None,
+        };
+        value = (value << 5) | u128::from(v);
+    }
+    let mut b = [0u8; 16];
+    b[..6].copy_from_slice(&[0xFD, 0x87, 0xD8, 0x7E, 0xEB, 0x43]);
+    for (n, byte) in b[6..].iter_mut().enumerate() {
+        *byte = (value >> (8 * (9 - n))) as u8;
+    }
+    Some(IpAddr::V6(Ipv6Addr::from(b)))
+}
+
 /// Divi Core CNetAddr::IsValid (netbase.cpp:840-873): not unspecified, not a
 /// documentation address, not 0.0.0.0 or 255.255.255.255
 pub fn is_valid(ip: &IpAddr) -> bool {
@@ -287,6 +342,16 @@ impl Default for LocalAddresses {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A v2 onion name and its OnionCat address read back as each other
+    #[test]
+    fn onion_names_round_trip() {
+        let ip = onion_from_name("abcdefghij234567.onion").unwrap();
+        assert!(is_onion(&ip) && is_routable(&ip));
+        assert_eq!(onion_name(&ip).as_deref(), Some("abcdefghij234567.onion"));
+        assert_eq!(onion_from_name("abc.onion"), None);
+        assert_eq!(onion_name(&"127.0.0.1".parse().unwrap()), None);
+    }
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()

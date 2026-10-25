@@ -158,3 +158,90 @@ fn proxy_and_proxyrandomize_in_getnetworkinfo() {
         }
     }
 }
+
+/// What a SOCKS5 stand-in on 127.0.0.1 was asked: per connection, the
+/// methods offered and the CONNECT address type and destination
+type Socks5Seen = std::sync::Arc<std::sync::Mutex<Vec<(Vec<u8>, u8, String)>>>;
+
+fn read_n(c: &mut TcpStream, n: usize) -> std::io::Result<Vec<u8>> {
+    let mut b = vec![0u8; n];
+    c.read_exact(&mut b).map(|_| b)
+}
+
+/// One SOCKS5 exchange: take username/password when offered, record the
+/// CONNECT, refuse it
+fn socks5_serve(c: &mut TcpStream, record: &Socks5Seen) -> std::io::Result<()> {
+    let head = read_n(c, 2)?;
+    let methods = read_n(c, head[1] as usize)?;
+    let auth = methods.contains(&2);
+    c.write_all(&[5, if auth { 2 } else { 0 }])?;
+    if auth {
+        let user = read_n(c, 2)?;
+        read_n(c, user[1] as usize)?;
+        let len = read_n(c, 1)?;
+        read_n(c, len[0] as usize)?;
+        c.write_all(&[1, 0])?;
+    }
+    let req = read_n(c, 4)?;
+    let dest = match req[3] {
+        1 => {
+            let b = read_n(c, 4)?;
+            format!("{}.{}.{}.{}", b[0], b[1], b[2], b[3])
+        }
+        3 => {
+            let len = read_n(c, 1)?;
+            String::from_utf8_lossy(&read_n(c, len[0] as usize)?).into_owned()
+        }
+        _ => {
+            let b: [u8; 16] = read_n(c, 16)?.try_into().unwrap();
+            std::net::Ipv6Addr::from(b).to_string()
+        }
+    };
+    read_n(c, 2)?;
+    record.lock().unwrap().push((methods, req[3], dest));
+    c.write_all(&[5, 5, 0, 1, 0, 0, 0, 0, 0, 0])
+}
+
+/// A SOCKS5 stand-in on 127.0.0.1 that records each CONNECT and refuses it
+fn socks5_stand_in() -> (u16, Socks5Seen) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let seen: Socks5Seen = Default::default();
+    let record = seen.clone();
+    std::thread::spawn(move || {
+        for mut c in listener.incoming().flatten() {
+            let record = record.clone();
+            std::thread::spawn(move || {
+                let _ = socks5_serve(&mut c, &record);
+            });
+        }
+    });
+    (port, seen)
+}
+
+/// The destination goes to the proxy as a name, an onion address as its
+/// .onion name (netbase.cpp:379-386, CNetAddr::ToStringIP); irondivid sent
+/// the binary address. The onion target is never reachable off the proxy.
+#[test]
+fn proxy_destination_is_sent_as_a_name() {
+    let (socks, seen) = socks5_stand_in();
+    let dir = tempfile::tempdir().unwrap();
+    let proxy = format!("-proxy=127.0.0.1:{socks}");
+    // abcdefghij234567.onion as an OnionCat address
+    let connect = "-connect=[fd87:d87e:eb43:44:3214:c742:75be:77df]:51476";
+    let node = up(dir.path(), &[proxy.as_str(), connect]);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while seen.lock().unwrap().is_empty() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    drop(node);
+    let seen = seen.lock().unwrap().clone();
+    assert!(!seen.is_empty(), "nothing reached the proxy");
+    for (_, atyp, dest) in &seen {
+        assert_eq!(
+            (*atyp, dest.as_str()),
+            (3, "abcdefghij234567.onion"),
+            "{seen:?}"
+        );
+    }
+}

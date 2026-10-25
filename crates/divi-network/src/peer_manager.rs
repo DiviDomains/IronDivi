@@ -1963,7 +1963,13 @@ mod tests {
         }
         assert_eq!(inbound, 1);
         assert_eq!(client.outbound_count(), 1);
-        assert!(!seen.lock().is_empty() && seen.lock().iter().all(|t| *t == routable));
+        // The onion address goes to the proxy as its .onion name
+        let name = format!(
+            "{}:{}",
+            crate::local::onion_name(&routable.ip()).unwrap(),
+            routable.port()
+        );
+        assert!(!seen.lock().is_empty() && seen.lock().iter().all(|t| *t == name));
         assert!(greetings.lock().iter().all(|(_, creds)| creds.is_some()));
         client.disconnect_all();
         server.disconnect_all();
