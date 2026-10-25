@@ -28,7 +28,14 @@ A run takes about 12 minutes. Needs bash and python3 (standard library only). Ke
 
 ## Rounds
 
-Two registered vaults and a plain coin first. After each step: `getbalance` (three forms), `getunconfirmedbalance`, `listunspent`, `listtransactions * 100 0 true`, `gettransaction` of every transaction the run made, `getcoinavailability`, `getwalletinfo`, `getstakingstatus` on the owner pair and the manager pair, the mempools of each pair, and the `-walletnotify` calls since the last mark (a transaction told twice counts twice; when a count differs the run prints each side's order and the transactions that differ). Each round is compared before, on the first branch, and after the reorganisation.
+Two registered vaults and a plain coin first. After each step: `getbalance` (three forms), `getbalance` of each account at minconf 1 and 0, `listaccounts` at minconf 1 and 0, `getunconfirmedbalance`, `listunspent`, `listtransactions * 100 0 true`, `gettransaction` of every transaction the run made, `getcoinavailability`, `getwalletinfo`, `getstakingstatus` on the owner pair and the manager pair, the mempools of each pair, and the `-walletnotify` calls since the last mark (a transaction told twice counts twice; when a count differs the run prints each side's order and the transactions that differ). Each round is compared before, on the first branch, and after the reorganisation.
+
+The account rows cover the default account `""` and every account either wallet of a pair lists (this run's wallets
+use only `""`). divid's `GetAccountBalance` (`rpcwallet.cpp:383-415`) adds an account's credits at minconf or deeper
+and takes off its debits and fees, leaving out an immature transaction and a conflicted one (depth < 0). So the rows
+after the double spend round, where the dropped payment is conflicted in both wallets of each pair, compare that
+rule. The run prints `# <when>: <side> conflicted: <transaction>, confirmations divid <n>, irondivid <n>` for each
+transaction a view finds at depth < 0 on divid.
 
 1. **Double spend:** the first branch holds a payment from the owner to the manager (raw, so the owner's wallet did not make it with `sendtoaddress`); the second miner spends the same coin to the owner's own address and mines four blocks.
 2. **A chain of three:** a spends a coin, b spends a's change, c spends b's change, each in its own block; the second branch double-spends the coin a spent, so a is dropped and b and c lose their input.
