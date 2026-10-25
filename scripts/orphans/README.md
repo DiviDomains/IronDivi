@@ -63,7 +63,7 @@ environment (`WALLET_MNEMONIC`); it is never printed or put on a command line.
 | two children of one parent, then the parent | the same for three |
 | a child of two parents: one arrives, then the other | after the first parent only that parent; after the second, the child too |
 | the same orphan twice, then its parent | kept once: one `stored` line names it (`OrphanTransactions.cpp:47-48`); both in the mempool |
-| orphans of 5000 and 5001 bytes (one unknown input, 140 outputs, a push-only scriptSig of the needed length) | 5000 is kept: a second peer's `inv` of it gets no `getdata` (AlreadyHave). 5001 is not (`ignoring large orphan tx`, `OrphanTransactions.cpp:52-61`): the `inv` gets a `getdata`. Neither is announced |
+| orphans of 5000 and 5001 bytes (one unknown input, 140 outputs, a push-only scriptSig of the needed length) | only the `stored` and `ignoring large orphan tx` lines are compared here, as the erase of an earlier case's orphans may be logged in this window. 5000 is kept: a second peer's `inv` of it gets no `getdata` (AlreadyHave). 5001 is not (`ignoring large orphan tx`, `OrphanTransactions.cpp:52-61`): the `inv` gets a `getdata`. Neither is announced |
 | a transaction the mempool refused (it pays out more than its input) | not announced; an `inv` of it gets a `getdata` again: AlreadyHave is the mempool and the orphans only |
 | an `inv` of a transaction never seen | a `getdata` |
 | one sender goes before its parent comes, another stays | the gone peer's orphan is erased (`EraseOrphansFor`, `NodeState.cpp:41`): only the other child enters with the parents |

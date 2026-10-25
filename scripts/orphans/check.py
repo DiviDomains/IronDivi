@@ -673,9 +673,13 @@ def held(raw, txid):
         p = Peer(node, src)
         feed(node, p, [raw], pause=1.0)
         q = Peer(node, next(SRC))
+        # Only the lines about this transaction: the erase of an earlier
+        # case's orphans, when its peer went, may be logged in this window
+        log = log_facts(log_since(node, mark), txid)
         out = {"announced": relayed(node, [txid], secs=3),
                "getdata for its inv from another peer": asks(node, q, txid),
-               "log": log_facts(log_since(node, mark), txid)}
+               "log": {k: v for k, v in log.items() if k in ("stored orphan tx", "ignoring large orphan tx")
+                       or k.startswith("stored lines")}}
         p.close()
         q.close()
         return out
