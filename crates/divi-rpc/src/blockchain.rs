@@ -728,7 +728,7 @@ impl BlockchainRpc {
             "version": 2000000,
             "protocolversion": divi_network::constants::protocol_version(),
             "blocks": height,
-            "timeoffset": 0,
+            "timeoffset": divi_primitives::clock::time_offset(),
             "connections": 0,
             "proxy": "",
             "difficulty": difficulty,

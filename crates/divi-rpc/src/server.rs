@@ -334,6 +334,11 @@ impl RpcServer {
         self.masternode.set_network_list(list);
     }
 
+    /// The node's masternode sync, read and reset by mnsync
+    pub fn set_masternode_sync(&self, sync: divi_masternode::mnsync::SharedMasternodeSync) {
+        self.masternode.set_sync(sync);
+    }
+
     /// The masternodes' payment votes, read by getmasternodewinners
     pub fn set_masternode_votes(&self, votes: Arc<crate::mn_votes::MasternodeVotes>) {
         self.masternode.set_votes(votes);
@@ -465,7 +470,8 @@ impl RpcServer {
             info["balance"] = serde_json::json!(wallet["balance"].as_f64().unwrap_or(0.0));
         }
         info["blocks"] = serde_json::json!(height);
-        info["timeoffset"] = serde_json::json!(0);
+        // GetTimeOffset (rpcmisc.cpp:147)
+        info["timeoffset"] = serde_json::json!(divi_primitives::clock::time_offset());
         info["connections"] = serde_json::json!(connections);
         info["proxy"] = serde_json::json!("");
         info["difficulty"] = serde_json::json!(difficulty);
@@ -765,7 +771,7 @@ impl RpcServer {
                 };
                 self.masternode.verify_masternode_setup(params, port)
             }
-            "mnsync" => self.masternode.mnsync(params),
+            "mnsync" => self.masternode.mnsync(params, self.blockchain.chain()),
 
             // Spork methods
             "spork" => self.spork.spork(params),
