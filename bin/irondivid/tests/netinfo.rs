@@ -231,7 +231,8 @@ fn getnetworkinfo_and_version_message_as_divid() {
     let (_s, v) = handshake(&d, me);
     assert_eq!(v.version, 70915);
     assert_eq!(v.services, 5);
-    assert_eq!(v.addr_from, (1, me), "our address");
+    // Our address carries our services too (NetworkLocalAddressHelpers.cpp:210)
+    assert_eq!(v.addr_from, (5, me), "our address");
     assert_eq!(v.addr_recv.1, "0.0.0.0:0".parse::<SocketAddr>().unwrap());
     // The inbound peer named our address: score 5 (Divi Core SeenLocal)
     let deadline = Instant::now() + WAIT;
@@ -249,7 +250,7 @@ fn without_a_local_address_the_version_names_the_listen_port() {
     assert_eq!(local_addresses(&d), json!([]));
     let (_s, v) = handshake(&d, "0.0.0.0:0".parse().unwrap());
     let any: SocketAddr = format!("0.0.0.0:{}", d.p2p_port).parse().unwrap();
-    assert_eq!(v.addr_from, (1, any), "0.0.0.0 with our listen port");
+    assert_eq!(v.addr_from, (5, any), "0.0.0.0 with our listen port");
 }
 
 #[test]
