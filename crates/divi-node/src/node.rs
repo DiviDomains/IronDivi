@@ -316,6 +316,10 @@ pub struct Node {
     /// The loops `start` runs (peer events, sync, relay, peer upkeep):
     /// stopped by `stop` before it flushes, so nothing writes after it
     tasks: parking_lot::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+
+    /// The -upnp port mapping: its stop signal and task, which removes the
+    /// mapping once told to stop
+    upnp: parking_lot::Mutex<Option<(broadcast::Sender<()>, tokio::task::JoinHandle<()>)>>,
 }
 
 /// How long `Node::stop` waits for the node's loops once told to stop
@@ -687,12 +691,35 @@ impl Node {
                 peer_sources.listen
             );
         }
-        let proxy = config.p2p.proxy_addr().map_err(NodeError::Init)?;
-        if let Some(proxy) = proxy {
+        let proxy = config
+            .p2p
+            .proxy_addr()
+            .map_err(NodeError::Init)?
+            .map(|addr| divi_network::socks5::Proxy {
+                addr,
+                randomize_credentials: config.p2p.proxy_randomize,
+            });
+        if let Some(proxy) = proxy.map(|p| p.addr) {
             tracing::info!("Outbound P2P connections go through SOCKS5 proxy {}", proxy);
         }
+        // The onion network: -onion's proxy, else -proxy's; reachable with
+        // either, not with -onion=0 (net.cpp:1774-1800)
+        let (tor_proxy, tor_reachable) =
+            match config.p2p.onion_setting().map_err(NodeError::Init)? {
+                crate::config::OnionSetting::Unset => (proxy, proxy.is_some()),
+                crate::config::OnionSetting::Off => (proxy, false),
+                crate::config::OnionSetting::Proxy(addr) => (
+                    Some(divi_network::socks5::Proxy {
+                        addr,
+                        randomize_credentials: config.p2p.proxy_randomize,
+                    }),
+                    true,
+                ),
+            };
         // -timeout for outbound connections
         divi_network::set_connect_timeout_ms(config.p2p.connect_timeout_ms);
+        // -connect and -addnode host names that go to the proxy by name
+        let mut named_peers: Vec<(String, u16)> = Vec::new();
         let peer_manager_config = PeerManagerConfig {
             max_outbound: config.p2p.max_outbound,
             max_inbound: config.p2p.max_inbound,
@@ -702,16 +729,26 @@ impl Node {
                 .static_peers
                 .iter()
                 .filter_map(|s| {
-                    // First try to parse as SocketAddr (IP:port)
+                    // First try to parse as SocketAddr (IP:port), then as an
+                    // onion name, which no DNS lookup reads
                     if let Ok(addr) = s.parse() {
                         return Some(addr);
                     }
-                    // If that fails, try to resolve as hostname:port
+                    if let Some(addr) =
+                        divi_network::local::onion_service(s, config.network.default_p2p_port())
+                    {
+                        return Some(addr);
+                    }
+                    // A host name: given to the proxy, which resolves it, when
+                    // one is set; resolved here only with -dns
+                    // (ConnectSocketByName, netbase.cpp:631-660)
                     if proxy.is_some() {
-                        tracing::warn!(
-                            "Resolving peer {} with local DNS, outside the proxy; give an IP address to avoid this",
-                            s
-                        );
+                        named_peers.push(host_and_port(s, config.network.default_p2p_port()));
+                        return None;
+                    }
+                    if !config.p2p.name_lookup {
+                        tracing::info!("Peer {} is a host name and -dns=0: not resolved", s);
+                        return None;
                     }
                     use std::net::ToSocketAddrs;
                     match s.to_socket_addrs() {
@@ -736,6 +773,9 @@ impl Node {
             },
             default_port: config.network.default_p2p_port(),
             proxy,
+            tor_proxy,
+            tor_reachable,
+            named_peers,
             connect_only: !config.p2p.connect.is_empty(),
             whitelist: config
                 .p2p
@@ -748,21 +788,48 @@ impl Node {
             } else {
                 Vec::new()
             },
-            seed_nodes: config.p2p.seednode.clone(),
-            dns_seed: config
+            more_listen: if peer_sources.listen {
+                config.p2p.more_bind.clone()
+            } else {
+                Vec::new()
+            },
+            // A -seednode host name is looked up only with -dns, as a
+            // -connect one (ProcessOneShot, net.cpp:1071-1084, dials it by
+            // name: ConnectSocketByName, netbase.cpp:631-660)
+            seed_nodes: config
                 .p2p
-                .dns_seed
-                .unwrap_or(config.p2p.connect.is_empty()),
+                .seednode
+                .iter()
+                .filter(|s| {
+                    let numeric = s.parse::<std::net::SocketAddr>().is_ok()
+                        || s.trim_matches(['[', ']'])
+                            .parse::<std::net::IpAddr>()
+                            .is_ok();
+                    if !numeric && proxy.is_none() && !config.p2p.name_lookup {
+                        tracing::info!("Peer {} is a host name and -dns=0: not resolved", s);
+                        return false;
+                    }
+                    true
+                })
+                .cloned()
+                .collect(),
+            dns_seed: config.p2p.dns_seed.unwrap_or(config.p2p.connect.is_empty()),
             force_dns_seed: config.p2p.force_dns_seed,
         };
         let peer_manager = PeerManager::new(peer_manager_config);
         // The -addnode values are the first added nodes (net.cpp:1218)
         for node in &config.p2p.addnode {
-            let addr = node.parse::<std::net::SocketAddr>().ok().or_else(|| {
-                node.parse::<std::net::IpAddr>()
-                    .ok()
-                    .map(|ip| std::net::SocketAddr::new(ip, config.network.default_p2p_port()))
-            });
+            let addr = node
+                .parse::<std::net::SocketAddr>()
+                .ok()
+                .or_else(|| {
+                    node.parse::<std::net::IpAddr>()
+                        .ok()
+                        .map(|ip| std::net::SocketAddr::new(ip, config.network.default_p2p_port()))
+                })
+                .or_else(|| {
+                    divi_network::local::onion_service(node, config.network.default_p2p_port())
+                });
             match addr {
                 Some(addr) => {
                     peer_manager.add_node(addr);
@@ -888,6 +955,7 @@ impl Node {
             event_tx,
             shutdown_tx,
             tasks: parking_lot::Mutex::new(Vec::new()),
+            upnp: parking_lot::Mutex::new(None),
         })
     }
 
@@ -1033,6 +1101,31 @@ impl Node {
             .set_local_addresses(self.local_addresses());
         divi_network::buffers::set_max_receive_buffer(self.config.p2p.max_receive_buffer);
         divi_network::buffers::set_max_send_buffer(self.config.p2p.max_send_buffer);
+        // -listenonion: the Tor controller, for the life of the node
+        // (init.cpp:1621-1622)
+        if self.config.p2p.listen_onion {
+            self.keep(divi_network::torcontrol::spawn(
+                divi_network::torcontrol::TorControl {
+                    target: self.config.p2p.tor_control.clone(),
+                    password: self.config.p2p.tor_password.clone(),
+                    private_key_file: self.config.data_dir.join("onion_private_key"),
+                    set_onion_proxy: self.config.p2p.onion.as_deref().unwrap_or("").is_empty(),
+                },
+                Arc::clone(&self.peer_manager),
+            ));
+        }
+        // -upnp: map the listen port until shutdown (net.cpp:1454, :1477)
+        if self.config.p2p.upnp {
+            let local = self.peer_manager.local_addresses();
+            let (stop, shutdown) = broadcast::channel(1);
+            let discover = self.config.p2p.discover;
+            let task = tokio::spawn(async move {
+                let igd = divi_network::upnp::Igd::discover().await;
+                let description = format!("DIVI v{}", env!("CARGO_PKG_VERSION"));
+                divi_network::upnp::map_port(igd, local, discover, description, shutdown).await;
+            });
+            *self.upnp.lock() = Some((stop, task));
+        }
 
         // Start peer event handler
         let event_tx = self.event_tx.clone();
@@ -1953,6 +2046,18 @@ impl Node {
         // or transaction is taken and no peer dialled while the state below
         // is written, as Divi Core's StopNode joins its threads before the
         // flush (init.cpp Shutdown)
+        // -upnp: remove the port mapping (MapPort(false), net.cpp:1477)
+        let upnp = self.upnp.lock().take();
+        if let Some((stop, mut task)) = upnp {
+            let _ = stop.send(());
+            if tokio::time::timeout(std::time::Duration::from_secs(10), &mut task)
+                .await
+                .is_err()
+            {
+                task.abort();
+            }
+        }
+
         let started = std::time::Instant::now();
         let tasks = std::mem::take(&mut *self.tasks.lock());
         let stalled = stop_tasks(tasks, STOP_TASKS_TIMEOUT).await;
@@ -2740,6 +2845,18 @@ pub fn update_mempool_after_reorg(
         offered,
         dropped
     );
+}
+
+/// A `host[:port]` peer as its host and port, `default_port` when none is
+/// given (SplitHostPort)
+fn host_and_port(text: &str, default_port: u16) -> (String, u16) {
+    match text.rsplit_once(':') {
+        Some((host, port)) if !host.contains(':') => match port.parse() {
+            Ok(port) => (host.to_string(), port),
+            Err(_) => (text.to_string(), default_port),
+        },
+        _ => (text.to_string(), default_port),
+    }
 }
 
 /// Divi Core `MAX_STANDARD_TX_SIZE` (defaultValues.h:54)
