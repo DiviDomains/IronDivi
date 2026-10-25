@@ -726,6 +726,11 @@ pub struct MempoolConfig {
     /// `-datacarrier=0` (MempoolConsensus.cpp:32-33)
     #[serde(default = "default_max_datacarrier_bytes")]
     pub max_datacarrier_bytes: u32,
+
+    /// Below the relay fee a transaction needs enough coin-age priority (Divi
+    /// Core's `-relaypriority`, on by default; MempoolConsensus.cpp:254-259)
+    #[serde(default = "default_true")]
+    pub relay_priority: bool,
 }
 
 impl Default for MempoolConfig {
@@ -739,6 +744,7 @@ impl Default for MempoolConfig {
             accept_nonstandard: false,
             permit_bare_multisig: true,
             max_datacarrier_bytes: default_max_datacarrier_bytes(),
+            relay_priority: true,
         }
     }
 }

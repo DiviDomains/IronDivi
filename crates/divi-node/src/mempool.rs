@@ -528,11 +528,11 @@ impl Mempool {
         Ok(())
     }
 
-    /// Divi Core `CheckFeesPaidAreAcceptable` (MempoolConsensus.cpp:236-266) with
-    /// `-relaypriority` on: below the relay fee a transaction needs enough coin
-    /// age per byte (`priority`, Core's `ComputeInputCoinAgePerByte` at the next
-    /// height); a relayed one (`limit_free`) must also be under 49,000 bytes
-    /// unless prioritised, and free relay is rate limited.
+    /// Divi Core `CheckFeesPaidAreAcceptable` (MempoolConsensus.cpp:236-266):
+    /// below the relay fee a transaction needs enough coin age per byte
+    /// (`priority`, Core's `ComputeInputCoinAgePerByte` at the next height),
+    /// unless `-relaypriority=0`; a relayed one (`limit_free`) must also be
+    /// under 49,000 bytes unless prioritised, and free relay is rate limited.
     pub fn check_fees_paid(
         &self,
         txid: &Hash256,
@@ -551,7 +551,7 @@ impl Mempool {
         if limit_free && !prioritised && size >= DEFAULT_BLOCK_PRIORITY_SIZE - 1000 {
             return Err(rejected(reject::INSUFFICIENT_FEE, "insufficient fee"));
         }
-        if !allow_free(priority) {
+        if self.config.relay_priority && !allow_free(priority) {
             return Err(rejected(reject::INSUFFICIENT_FEE, "insufficient priority"));
         }
         if limit_free && !self.free_relay_allows(size) {

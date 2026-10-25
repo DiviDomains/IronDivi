@@ -267,3 +267,35 @@ fn datacarrier_options_set_the_largest_op_meta() {
         }
     }
 }
+
+/// A free spend of a young 1 DIVI coin has too little priority: refused with
+/// 66 "insufficient priority" unless -relaypriority=0 (MempoolConsensus.cpp:254-259)
+#[test]
+fn relaypriority_off_takes_a_free_low_priority_spend() {
+    for (option, taken) in [(None, false), (Some("-relaypriority=0"), true)] {
+        let dir = tempfile::tempdir().unwrap();
+        let extra: Vec<&str> = option.into_iter().collect();
+        let node = Node::funded(dir.path(), &extra);
+        let to = node.rpc("getnewaddress", json!([]));
+        node.rpc("sendtoaddress", json!([to, 1]));
+        node.rpc("setgenerate", json!([1]));
+        let coins = node.rpc("listunspent", json!([1, 1, [to]]));
+        let c = &coins[0];
+        let coin = (
+            c["txid"].as_str().unwrap().to_string(),
+            c["vout"].as_u64().unwrap() as u32,
+            COIN,
+        );
+        let tx = node.signed(&coin, &[(COIN, node.script())]);
+        let got = node.send(&tx);
+        if taken {
+            assert!(got.is_ok(), "{option:?}: {got:?}");
+        } else {
+            assert_eq!(
+                got,
+                Err((-26, "66: insufficient priority".to_string())),
+                "{option:?}"
+            );
+        }
+    }
+}

@@ -600,6 +600,9 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     config.mempool.permit_bare_multisig = s.get_bool("permitbaremultisig", true);
     // -datacarrier ? GetArg("-datacarriersize", MAX_OP_META_RELAY) : 0, kept as
     // an unsigned int, read once (MempoolConsensus.cpp:32-33)
+    // GetBoolArg("-relaypriority", true), read for each transaction in Core;
+    // the options do not change while a node runs (MempoolConsensus.cpp:255)
+    config.mempool.relay_priority = s.get_bool("relaypriority", true);
     config.mempool.max_datacarrier_bytes = if s.get_bool("datacarrier", true) {
         s.get("datacarriersize")
             .map_or(603, |text| settings::atoi(text) as u32)
@@ -751,6 +754,7 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         "permitbaremultisig",
         "datacarrier",
         "datacarriersize",
+        "relaypriority",
         "maxtxfee",
         "sporkkey",
         "staking",
