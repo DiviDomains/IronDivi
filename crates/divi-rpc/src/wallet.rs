@@ -561,6 +561,8 @@ pub(crate) fn tx_to_json(tx: &Transaction, network: Network) -> serde_json::Valu
         })
         .collect();
 
+    // getrawtransaction's order: hex, then TxToJSONExpanded's members
+    // (rpcrawtransaction.cpp:245-246, :56-135), size last
     let hex_value = hex::encode(serialize(tx));
     json!({
         "hex": hex_value,
@@ -568,10 +570,19 @@ pub(crate) fn tx_to_json(tx: &Transaction, network: Network) -> serde_json::Valu
         "baretxid": bare_txid(tx).to_string(),
         "version": tx.version,
         "locktime": tx.lock_time,
-        "size": hex_value.len() / 2,
         "vin": vin,
         "vout": vout,
+        "size": hex_value.len() / 2,
     })
+}
+
+/// Move a member of a reply object to its end, keeping the order of the others
+pub(crate) fn move_to_end(value: &mut serde_json::Value, key: &str) {
+    if let Some(obj) = value.as_object_mut() {
+        if let Some(v) = obj.shift_remove(key) {
+            obj.insert(key.to_string(), v);
+        }
+    }
 }
 
 /// What Divi Core's TxToJSONExpanded adds from the spent index
@@ -608,6 +619,8 @@ fn add_spent_info(
             if let Some(address) = address {
                 entry["address"] = json!(address);
             }
+            // sequence comes after them (rpcrawtransaction.cpp:88)
+            move_to_end(entry, "sequence");
         }
     }
     let txid = tx.txid();
@@ -2540,15 +2553,17 @@ impl WalletRpc {
                 .is_some_and(|active| active.hash == location.block_hash);
             if on_active_chain {
                 let confirmations = chain.height() - block_index.height + 1;
+                result["height"] = json!(block_index.height);
                 result["confirmations"] = json!(confirmations);
                 result["time"] = json!(block_index.time);
                 result["blocktime"] = json!(block_index.time);
-                result["height"] = json!(block_index.height);
             } else {
                 result["height"] = json!(-1);
                 result["confirmations"] = json!(0);
             }
         }
+        // size after the block members (rpcrawtransaction.cpp:135)
+        move_to_end(&mut result, "size");
         Ok(result)
     }
 
@@ -2565,9 +2580,11 @@ impl WalletRpc {
             deserialize(&tx_bytes).map_err(|_| decode_failed())?;
 
         let mut result = tx_to_json(&tx, self.address_network());
+        // TxToJSON has neither (JsonTxHelpers.cpp:39-91); shift_remove keeps
+        // the order of the other members
         if let Some(obj) = result.as_object_mut() {
-            obj.remove("hex");
-            obj.remove("size");
+            obj.shift_remove("hex");
+            obj.shift_remove("size");
         }
         Ok(result)
     }

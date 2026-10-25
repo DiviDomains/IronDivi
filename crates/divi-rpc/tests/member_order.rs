@@ -344,3 +344,87 @@ fn getaddressesbyaccount_is_in_address_book_order() {
         json!(expected)
     );
 }
+
+/// getrawtransaction: hex, then TxToJSONExpanded's members with the block's
+/// and size last (rpcrawtransaction.cpp:56-135, :245-246)
+#[test]
+fn getrawtransaction_members_are_in_cores_order() {
+    let n = node();
+    let coinbase = n.mine(vec![], &nobody());
+    let reply = n.ok(
+        "getrawtransaction",
+        vec![json!(coinbase.txid().to_string()), json!(1)],
+    );
+    assert_eq!(
+        keys(&reply),
+        [
+            "hex",
+            "txid",
+            "baretxid",
+            "version",
+            "locktime",
+            "vin",
+            "vout",
+            "blockhash",
+            "height",
+            "confirmations",
+            "time",
+            "blocktime",
+            "size"
+        ]
+    );
+}
+
+/// An input with the spent index: value, valueSat and address before
+/// sequence (rpcrawtransaction.cpp:66-88)
+#[test]
+fn getrawtransaction_input_members_are_in_cores_order() {
+    let n = node();
+    let to = n.wallet.new_receiving_address().unwrap();
+    let coinbase = n.mine(vec![], &to);
+    for _ in 0..20 {
+        n.mine(vec![], &nobody());
+    }
+    let (mut tx, prev) = divi_wallet::TransactionBuilder::new()
+        .add_input(
+            divi_primitives::transaction::OutPoint::new(coinbase.txid(), 0),
+            coinbase.vout[0].script_pubkey.clone(),
+        )
+        .add_output_to_address(Amount::from_sat(1249 * COIN), &nobody())
+        .build();
+    divi_wallet::TransactionSigner::new(n.wallet.keystore())
+        .sign_all_inputs(&mut tx, &prev)
+        .unwrap();
+    n.mine(vec![tx.clone()], &nobody());
+    let reply = n.ok(
+        "getrawtransaction",
+        vec![json!(tx.txid().to_string()), json!(1)],
+    );
+    assert_eq!(
+        keys(&reply["vin"][0]),
+        [
+            "txid",
+            "vout",
+            "scriptSig",
+            "value",
+            "valueSat",
+            "address",
+            "sequence"
+        ]
+    );
+}
+
+/// decoderawtransaction: TxToJSON's members (JsonTxHelpers.cpp:39-73)
+#[test]
+fn decoderawtransaction_members_are_in_cores_order() {
+    let n = node();
+    let coinbase = n.mine(vec![], &nobody());
+    let hex = n.ok(
+        "getrawtransaction",
+        vec![json!(coinbase.txid().to_string())],
+    );
+    assert_eq!(
+        keys(&n.ok("decoderawtransaction", vec![hex])),
+        ["txid", "baretxid", "version", "locktime", "vin", "vout"]
+    );
+}
