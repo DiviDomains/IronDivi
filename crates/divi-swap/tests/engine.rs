@@ -2087,6 +2087,69 @@ both!(
     claimed_after_maker_refund_refund_only_body
 );
 
+/// An evicted maker-leg claim is resent, the same signed bytes on every step, for as long as
+/// the maker cannot refund: the claim confirms before the maker-leg locktime and wins the leg,
+/// so an eviction alone never costs the taker the swap. DF's mempool-drop matrix (hp3,
+/// `lane/restart-safety` at 7ade81c, `crates/divi-swap/tests/engine.rs`, the "Fund/claim
+/// evicted" cases) covers evictions across restarts; this pins the resend itself.
+async fn evicted_claim_is_resent_body(dir: Direction) {
+    let mut h = H::with(dir);
+    h.accept(None).await;
+    h.lock_and_notify(None).await;
+    drive_taker_to(&mut h, TakerState::Claimed).await; // signed and stored, not broadcast
+    let t = h.store.get_taker_swap(&h.taker_id).unwrap().unwrap();
+    let claim = t.maker_leg_claim.clone().unwrap();
+    let (htlc, at, amount) = (
+        t.maker_leg_htlc.unwrap(),
+        t.maker_leg_outpoint.unwrap(),
+        t.maker_leg_amount.unwrap(),
+    );
+    let ml = h.ml_chain().clone();
+    let maker_refund = h.m_ml().build_refund(&htlc, &at, amount).await.unwrap();
+    for _ in 0..3 {
+        let view = h.maker.view(&h.maker_id).unwrap();
+        h.taker.step(&h.taker_id, view.as_ref()).await.unwrap();
+        let c = ml.tx_counts(&at);
+        assert_eq!(
+            (c.claims, c.claim_attempts),
+            (1, 1),
+            "the claim is resent: {c:?}"
+        );
+        ml.forget(&claim.txid); // evicted
+        assert_eq!(ml.tx_counts(&at).claims, 0);
+        assert!(
+            matches!(
+                h.m_ml().broadcast(&maker_refund).await,
+                Err(SwapError::Premature(_))
+            ),
+            "the maker's refund is not valid yet"
+        );
+        h.mine_all(1); // a block goes by without the claim
+    }
+    for _ in 0..2 {
+        let view = h.maker.view(&h.maker_id).unwrap();
+        h.taker.step(&h.taker_id, view.as_ref()).await.unwrap();
+        h.mine_all(1);
+    }
+    assert_eq!(h.taker_state(), TakerState::Done);
+    assert!(
+        ml.mtp() < htlc.locktime,
+        "confirmed before the maker could refund"
+    );
+    assert_eq!(
+        h.t_ml().confirmations(&claim.txid).await.unwrap(),
+        Some(2),
+        "the stored claim is the one that confirmed"
+    );
+    let c = ml.tx_counts(&at);
+    assert_eq!((c.claims, c.refunds, c.claim_attempts), (1, 0, 1), "{c:?}");
+}
+both!(
+    evicted_claim_is_resent,
+    rev_evicted_claim_is_resent,
+    evicted_claim_is_resent_body
+);
+
 /// The loss the taker can only detect, not undo: its maker-leg claim reveals the preimage in
 /// the mempool and is evicted, the maker refunds the maker leg after its locktime and then
 /// claims the taker leg with the leaked preimage, before the taker-leg locktime. Both legs go
