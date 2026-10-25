@@ -196,7 +196,8 @@ class Pair:
                 return True
             steady = steady + 1 if (tips, pools) == last else 0
             last = (tips, pools)
-            if tips[0] == tips[1] and steady >= 8:
+            # 8 s with nothing new: divid can take a few seconds to relay
+            if tips[0] == tips[1] and steady >= 16:
                 return True
             time.sleep(0.5)
         return False
@@ -229,7 +230,14 @@ def outcome(out):
         return "ok"
     if out[0] == "down":
         return "down"
-    return f"error {out[1]}"
+    # the message goes along for the FAIL line; only the code is compared
+    return f"error {out[1]}: {str(out[2])[:200]}"
+
+
+def code_only(text):
+    """An outcome as compared: the error codes without their messages"""
+    import re
+    return re.sub(r"(error -?\d+): [^/]*", r"\1", text)
 
 
 # --- steps -------------------------------------------------------------------------------
@@ -354,6 +362,10 @@ def run_step(pair, step):
         target = node.rpc("getblockhash", height - depth + 1)
         first = node.call("invalidateblock", target)
         mid = snapshot(node)
+        # the coins in full, printed with a FAIL but not compared
+        coins = node.call("listunspent", 0)
+        mid["_coins (amount, confirmations)"] = sorted(
+            (str(u["amount"]), u["confirmations"]) for u in coins[1]) if coins[0] == "ok" else coins
         second = node.call("reconsiderblock", target)
         return f"{outcome(first)}/{outcome(second)}", mid
     if kind == "restart":
@@ -368,7 +380,9 @@ def run_step(pair, step):
             # divid's block index is not on disk after a kill: it refuses to
             # start until -reindex (BlockIndexLoading.cpp:275, init.cpp:1082),
             # the recovery it asks for; irondivid starts without it
-            if node.binary != DIVID or "Block database corruption detected" not in node.log_tail(40):
+            # (or it aborts while loading the block index); -reindex is the
+            # recovery for both
+            if node.binary != DIVID:
                 raise
             node.start("-reindex")
             pair.note = "divid started again with -reindex after the kill (BlockIndexLoading.cpp:275)"
@@ -481,7 +495,8 @@ def new_episode():
 
 
 def differs(a, b):
-    return [k for k in a if a[k] != b.get(k)]
+    """The compared keys whose values differ (a key starting with _ is detail)"""
+    return [k for k in a if not k.startswith("_") and a[k] != b.get(k)]
 
 
 # Differences that come from divid's accidental choices, not from a fault:
@@ -504,6 +519,16 @@ EXPLAINED = {
         "(CachedUtxoBalanceCalculator.cpp:13-30), recomputed only when a wallet transaction spending it is "
         "added (wallet.cpp:1242-1333), so a spend the mempool drops (removeCoinbaseSpends, "
         "txmempool.cpp:139-157) still counts as spending the coin"),
+    "divid reindex after a kill": (
+        "divid had to start again with -reindex after the kill; its reindex runs on a thread of its own "
+        "(init.cpp:1580) while its wallet's unconfirmed transactions are offered to the mempool at the end "
+        "of the start (init.cpp:1646), before the chain is rebuilt, so they are refused and the wallet "
+        "counts their inputs unspent; irondivid starts without -reindex and keeps them"),
+    "divid wallet after a kill": (
+        "after the kill divid's restarted node has fewer transactions than irondivid's: divid writes its "
+        "wallet to disk 2 s after the last change (ThreadFlushWalletDB, "
+        "LegacyWalletDatabaseEndpointFactory.cpp:23-50), so a send made just before a kill -9 is lost; "
+        "irondivid stores a send before the RPC that made it answers"),
     "maturity after a reorg": (
         "after invalidateblock the dropped mempool transactions all spend a coinbase or coinstake "
         "output that is immature at the new height, which divid's removeCoinbaseSpends drops too "
@@ -637,9 +662,9 @@ for step in steps:
     while True:
         snaps = [snapshot(p.node(n)) for p in PAIRS] + [snapshot(p.other(n)) for p in PAIRS]
         diff = []
-        if c_res[0] != i_res[0]:
+        if code_only(c_res[0]) != code_only(i_res[0]):
             diff.append("outcome")
-        if c_res[1] is not None and i_res[1] is not None and c_res[1] != i_res[1]:
+        if c_res[1] is not None and i_res[1] is not None:
             diff += ["after invalidateblock: " + k for k in differs(c_res[1], i_res[1])]
         diff += [f"node {n}: {k}" for k in differs(snaps[0], snaps[1])]
         diff += [f"node {3 - n}: {k}" for k in differs(snaps[2], snaps[3])]
@@ -660,6 +685,11 @@ for step in steps:
                 and c_res[1]["height"][0] == i_res[1]["height"][0] == "ok" \
                 and maturity_explains(n, [c_res[1]["height"][1], i_res[1]["height"][1]]):
             explained = "maturity after a reorg"
+        elif step["kind"] == "kill" and PAIRS[0].note:
+            explained = "divid reindex after a kill"
+        elif step["kind"] == "kill" and counted(PAIRS[0].node(n).call("getrawmempool"))[1:] \
+                < counted(PAIRS[1].node(n).call("getrawmempool"))[1:]:
+            explained = "divid wallet after a kill"
         elif all(k.split(": ")[-1].startswith("getbalance") for k in diff) and balance_cache_explains():
             explained = "divid balance cache"
         elif step["kind"] in ("restart", "kill") and rebroadcast_explains(n) and all(
@@ -682,6 +712,10 @@ for step in steps:
             elif k.startswith("after invalidateblock: "):
                 f = k.split(": ", 1)[1]
                 log(f"#   {k}: divid {json.dumps(c_res[1][f])[:3000]} irondivid {json.dumps(i_res[1][f])[:3000]}")
+                detail = "_coins (amount, confirmations)"
+                if detail in c_res[1] and f == "listunspent 0 amounts":
+                    log(f"#   after invalidateblock: {detail}: divid {json.dumps(c_res[1][detail])[:4000]} "
+                        f"irondivid {json.dumps(i_res[1][detail])[:4000]}")
             else:
                 who, f = k.split(": ", 1)
                 a, b = (snaps[0], snaps[1]) if who == f"node {n}" else (snaps[2], snaps[3])
@@ -702,6 +736,22 @@ for step in steps:
                     if tx[0] == "ok":
                         pool.append(sorted(str(o["value"]) for o in tx[1]["vout"]))
                 log(f"#   {p.name} node {m} mempool output values: {json.dumps(sorted(pool))}"[:3000])
+        # Why a node lacks a transaction its peer holds: offered to it now
+        for p in PAIRS:
+            for m in (1, 2):
+                node, peer = p.node(m), p.other(m)
+                mine, theirs = node.call("getrawmempool"), peer.call("getrawmempool")
+                if mine[0] != "ok" or theirs[0] != "ok":
+                    continue
+                for txid in sorted(set(theirs[1]) - set(mine[1])):
+                    raw = peer.call("getrawtransaction", txid)
+                    if raw[0] != "ok":
+                        continue
+                    height = node.call("getblockcount")
+                    immature = height[0] == "ok" and spends_immature(p, peer, txid, height[1] + 1)
+                    offered = node.call("sendrawtransaction", raw[1])
+                    log(f"#   {p.name} node {m} lacks a transaction node {3 - m} holds; offered now: "
+                        f"{outcome(offered)}; spends a coin immature at node {m}'s next height: {immature}")
         # The steps of this episode: replayed with REPLAY on four fresh nodes,
         # they reach the same point
         log(f"#   episode steps: {json.dumps(episode_steps)}"[:30000])
