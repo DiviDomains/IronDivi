@@ -2117,7 +2117,7 @@ impl Chain {
                     return Err(StorageError::invalid_block_scored(
                         0,
                         format!(
-                            "block timestamp {} is not greater than median time past {}",
+                            "time-too-old: block's timestamp {} is not greater than the median time past {}",
                             block.header.time, mtp
                         ),
                     ));
@@ -3390,7 +3390,7 @@ impl Chain {
         let computed_merkle_root = compute_merkle_root(&block.transactions);
         if block.header.merkle_root != computed_merkle_root {
             return Err(StorageError::InvalidBlock(format!(
-                "merkle root mismatch: header has {}, computed {}",
+                "bad-txnmrklroot: merkle root mismatch: header has {}, computed {}",
                 block.header.merkle_root, computed_merkle_root
             )));
         }
@@ -3441,7 +3441,7 @@ impl Chain {
             return Err(StorageError::invalid_block_scored(
                 0,
                 format!(
-                    "block timestamp {} is not greater than median time past {}",
+                    "time-too-old: block's timestamp {} is not greater than the median time past {}",
                     block.header.time, mtp
                 ),
             ));
