@@ -703,7 +703,6 @@ impl RpcServer {
             "getstakingstatus" => self.staking.get_staking_status(params),
             "getmintinginfo" => self.staking.get_minting_info(params),
             "setstaking" => self.staking.set_staking(params),
-            "reservebalance" => self.staking.reserve_balance(params),
             "getstakesplitthreshold" => self.staking.get_stake_split_threshold(params),
             "setstakesplitthreshold" => self.staking.set_stake_split_threshold(params),
 
@@ -908,7 +907,6 @@ impl RpcServer {
                 "getstakingstatus" => "getstakingstatus\n\nReturns an object containing staking information.",
                 "getmintinginfo" => "getmintinginfo\n\nReturns detailed staking/minting information.",
                 "setstaking" => "setstaking true|false\n\nEnable or disable staking.",
-                "reservebalance" => "reservebalance ( true|false amount )\n\nShow or set reserve balance for staking.",
                 "getstakesplitthreshold" => "getstakesplitthreshold\n\nReturns the stake split threshold in DIVI (startup value: -stakesplitthreshold, default 20000).",
                 "setstakesplitthreshold" => "setstakesplitthreshold value\n\nSet the stake split threshold in whole DIVI for this run: a stake whose value plus reward exceeds it is paid back as two outputs; smaller coins of the same address are combined up to half of it.",
                 // Lite wallet (external address queries)
@@ -1082,7 +1080,6 @@ impl RpcServer {
                 "== Staking ==",
                 "getmintinginfo",
                 "getstakingstatus",
-                "reservebalance",
                 "getstakesplitthreshold",
                 "setstakesplitthreshold",
                 "setstaking",
