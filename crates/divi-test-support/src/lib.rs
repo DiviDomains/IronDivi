@@ -11,10 +11,13 @@
 //! names the cause when the node exits instead.
 
 use std::collections::hash_map::RandomState;
+use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
 use std::hash::{BuildHasher, Hasher};
 use std::net::TcpListener;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// How long a started node may take to answer: a loaded host can take far
@@ -31,17 +34,68 @@ pub const START_WAIT: Duration = Duration::from_secs(120);
 /// fixed range walked in the same order by every process gives two test runs
 /// at once the same ports. These ports are below the ephemeral range and
 /// picked at random.
+///
+/// Two callers must not get the same port while one of them has yet to bind
+/// it, which a bind-and-release check cannot tell (the port is free in
+/// between): this process hands each port out once, and every process that
+/// uses this function takes an exclusive lock on a file named for the port,
+/// held until it exits, so no other test process picks it either. A port held
+/// by anything else is skipped by the bind check.
 pub fn free_port() -> u16 {
     let seed = RandomState::new();
-    for i in 0u32..1000 {
+    for i in 0u32..10_000 {
         let mut h = seed.build_hasher();
         h.write_u32(i);
         let port = 20000 + (h.finish() % 12768) as u16;
-        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
+        if reserve(port) && TcpListener::bind(("127.0.0.1", port)).is_ok() {
             return port;
         }
     }
     panic!("no free port in 20000-32767");
+}
+
+/// The files that reserve ports for this process, kept open until it exits
+fn reserved() -> &'static Mutex<HashMap<u16, Option<File>>> {
+    static RESERVED: OnceLock<Mutex<HashMap<u16, Option<File>>>> = OnceLock::new();
+    RESERVED.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Take `port` for this process: true unless this process or another test
+/// process has it. Without a lock directory it only keeps the process from
+/// handing a port out twice.
+fn reserve(port: u16) -> bool {
+    let mut held = reserved().lock().unwrap();
+    if held.contains_key(&port) {
+        return false;
+    }
+    let dir = if Path::new("/tmp").is_dir() {
+        PathBuf::from("/tmp")
+    } else {
+        std::env::temp_dir()
+    }
+    .join("irondivi-test-ports");
+    let file = std::fs::create_dir_all(&dir).ok().and_then(|_| {
+        OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.join(port.to_string()))
+            .ok()
+    });
+    match file {
+        Some(file) => match file.try_lock() {
+            Ok(()) => {
+                held.insert(port, Some(file));
+                true
+            }
+            Err(_) => false,
+        },
+        None => {
+            // no lock file: only this process keeps from handing the port out twice
+            held.insert(port, None);
+            true
+        }
+    }
 }
 
 /// The node's debug.log in `datadir` (regtest writes it there, other networks
@@ -181,6 +235,30 @@ mod tests {
             "{ports:?}"
         );
         assert!(ports.iter().any(|p| *p != ports[0]), "{ports:?}");
+    }
+
+    /// A port is handed out once per process: the bind-and-release check alone
+    /// returns the same free port to two callers that have not bound yet
+    #[test]
+    fn free_port_is_not_handed_out_twice() {
+        let ports: Vec<u16> = (0..3000).map(|_| free_port()).collect();
+        let distinct: std::collections::HashSet<_> = ports.iter().collect();
+        assert_eq!(distinct.len(), ports.len(), "a port was given twice");
+    }
+
+    /// Another test process picking the same port finds it locked
+    #[test]
+    fn free_port_is_locked_for_other_processes() {
+        let port = free_port();
+        let path = Path::new("/tmp/irondivi-test-ports").join(port.to_string());
+        let other = OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("the port's lock file");
+        assert!(
+            other.try_lock().is_err(),
+            "another process could take the port"
+        );
     }
 
     #[test]
