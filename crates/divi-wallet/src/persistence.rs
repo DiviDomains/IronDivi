@@ -26,7 +26,7 @@ use divi_primitives::transaction::OutPoint;
 use divi_primitives::ChainMode;
 use rocksdb::{ColumnFamilyDescriptor, Options, WriteBatch, DB};
 use std::path::Path;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Column family names
 const CF_DEFAULT: &str = "default";
@@ -102,9 +102,30 @@ fn decode_scanned_hashes(data: &[u8]) -> Vec<(u32, Hash256)> {
 /// Salt and encrypted master key pair
 type EncryptionMetadata = (Vec<u8>, Vec<u8>);
 
+/// Records a load could not read, by kind, as Divi Core's ReadKeyValue
+/// failures count (walletdb.cpp:495-511): a private key stops the load
+/// (DB_CORRUPT), a transaction asks for a rescan, anything else is a warning
+/// (DB_NONCRITICAL_ERROR)
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct LoadProblems {
+    /// Keys (Divi Core's key, wkey, mkey and ckey records, IsKeyType)
+    pub keys: usize,
+    /// Transactions and what the wallet keeps of them (its tx records)
+    pub transactions: usize,
+    /// Address book, vaults and the rest
+    pub others: usize,
+}
+
+/// The kind of a record that could not be read
+#[derive(Debug, Clone, Copy)]
+enum Kind {
+    Key,
+}
+
 /// Wallet database for persistence
 pub struct WalletDatabase {
     db: DB,
+    problems: std::sync::Mutex<LoadProblems>,
 }
 
 impl WalletDatabase {
@@ -145,7 +166,25 @@ impl WalletDatabase {
             .map_err(|e| WalletError::Storage(e.to_string()))?;
 
         info!("Wallet database opened");
-        Ok(WalletDatabase { db })
+        Ok(WalletDatabase {
+            db,
+            problems: std::sync::Mutex::new(LoadProblems::default()),
+        })
+    }
+
+    /// The records the loads so far could not read
+    pub fn load_problems(&self) -> LoadProblems {
+        *self.problems.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A record that could not be read: logged as Divi Core logs ReadKeyValue's
+    /// error (walletdb.cpp:509-510), counted, and left out
+    fn unreadable(&self, kind: Kind, what: &str, error: impl std::fmt::Display) {
+        warn!("Error reading wallet database: {} corrupt: {}", what, error);
+        let mut problems = self.problems.lock().unwrap_or_else(|e| e.into_inner());
+        match kind {
+            Kind::Key => problems.keys += 1,
+        }
     }
 
     pub fn path(&self) -> &Path {
@@ -573,9 +612,7 @@ impl WalletDatabase {
                 let hash = Hash160::from_bytes(key[..20].try_into().unwrap());
                 match deserialize_key_entry(&value) {
                     Ok(entry) => keys.push((hash, entry)),
-                    Err(e) => {
-                        debug!("Failed to deserialize key: {}", e);
-                    }
+                    Err(e) => self.unreadable(Kind::Key, "key", e),
                 }
             }
         }

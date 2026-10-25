@@ -1527,8 +1527,18 @@ fn load_or_restore_wallet_with_seed(
             }
         }
         info!("Loading wallet from {:?}", wallet_path);
-        let wallet = WalletDb::open(wallet_path, network)
-            .with_context(|| format!("Failed to open wallet at {:?}", wallet_path))?;
+        let wallet = match WalletDb::open(wallet_path, network) {
+            // A key record that cannot be read: Divi Core's DB_CORRUPT, an
+            // InitError (init.cpp:1153-1156, :1299-1305)
+            Err(divi_wallet::WalletError::Corrupt) => {
+                let message = divi_wallet::WalletError::Corrupt.to_string();
+                error!("Errors detected during wallet loading\n{}", message);
+                return Err(anyhow::Error::msg(message));
+            }
+            other => {
+                other.with_context(|| format!("Failed to open wallet at {:?}", wallet_path))?
+            }
+        };
 
         // Migrate chain_mode if needed (fixes wallets created before ChainMode was configurable)
         wallet
