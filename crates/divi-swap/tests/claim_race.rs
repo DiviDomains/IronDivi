@@ -23,7 +23,7 @@
 //! ZEC (and DIVI) cannot bump at all (no replacement, CPFP inert): the margin is all they
 //! have, so there the test is only that a claim paying the block floor confirms in time.
 //!
-//! `PROPTEST_CASES=2000` runs a longer search than the default.
+//! `PROPTEST_CASES=5000` runs a longer search than the default.
 
 use divi_swap::api::{Direction, Offer};
 use divi_swap::mock::{MockBackend, MockChain};
@@ -56,10 +56,10 @@ struct Market {
     /// the fixed escalation cap (`FeeEscalation::cap`). Repeats its last entry once
     /// exhausted.
     floors: Vec<(u16, u16)>,
-    /// What the maker's refund of its leg pays: at least twice the BTC fixed cap, so above
-    /// every floor drawn. The hostile refund always gets mined once the locktime passes, the
-    /// worst case for the taker; a maker whose own refund is under the floor is a maker-side
-    /// fee question, not this race.
+    /// What the maker's refund of its leg pays. `market()` draws it at least twice the BTC
+    /// fixed cap, so above every floor: the hostile refund always gets mined once the
+    /// locktime passes, the worst case for the taker. A maker refund under the floor is
+    /// drawn by `low_refund_market()` and its own tests below, not dropped.
     refund_feerate: u64,
 }
 
@@ -83,6 +83,14 @@ fn market() -> impl Strategy<Value = Market> {
                 refund_feerate,
             },
         )
+}
+
+/// `market()` with the maker's refund drawn under the floors: it may never be mined.
+fn low_refund_market() -> impl Strategy<Value = Market> {
+    (market(), 1u64..2000).prop_map(|(m, refund_feerate)| Market {
+        refund_feerate,
+        ..m
+    })
 }
 
 fn block_secs(chain: Chain) -> u32 {
@@ -245,6 +253,20 @@ proptest! {
     }
 }
 
+proptest! {
+    #![proptest_config(ProptestConfig { cases: cases(), ..ProptestConfig::default() })]
+
+    #[test]
+    fn a_maker_refund_under_the_floor_never_costs_the_taker_its_leg(m in low_refund_market()) {
+        // The maker may be left waiting on a refund that is never mined; the taker still
+        // ends, never `Lost`, and has claimed exactly when the preimage was out.
+        let o = run(&m, true);
+        prop_assert_ne!(o.taker, TakerState::Lost, "{:?} {:?}", m, o);
+        prop_assert!(o.taker.is_terminal(), "{:?} {:?}", m, o);
+        prop_assert_eq!(o.claimed, o.leaked, "{:?} {:?}", m, o);
+    }
+}
+
 fn congested(chain: Chain) -> Market {
     Market {
         chain,
@@ -333,6 +355,57 @@ fn a_floor_above_half_the_leg_is_declined_before_the_preimage_is_revealed() {
         assert_eq!(
             (o.taker, o.declined, o.claimed),
             (TakerState::Done, false, true),
+            "{chain}: {o:?}"
+        );
+    }
+}
+
+#[test]
+fn a_declined_swap_leaves_a_maker_refund_under_the_floor_waiting_not_mined() {
+    // Declined as above, but the block floor (the cap, here the 6000/vB estimate) stays
+    // above what the maker's refund pays. The taker still refunds its own leg and ends
+    // `Done`; the maker's refund is held back rather than lost track of, and the maker
+    // waits in `MakerRefundable` with its leg unspent. Paying over the floor, it is mined.
+    for chain in [Chain::Btc, Chain::Ltc] {
+        let mut m = congested(chain);
+        m.estimate = 6000;
+        m.floors = vec![(1000, 0)];
+        m.refund_feerate = 100;
+        let o = run(&m, true);
+        assert_eq!(
+            (o.taker, o.declined, o.leaked, o.claimed, o.maker),
+            (
+                TakerState::Done,
+                true,
+                false,
+                false,
+                SwapState::MakerRefundable
+            ),
+            "{chain}: {o:?}"
+        );
+
+        m.refund_feerate = 20_000;
+        let o = run(&m, true);
+        assert_eq!(
+            (o.taker, o.declined, o.maker),
+            (TakerState::Done, true, SwapState::Done),
+            "{chain}: {o:?}"
+        );
+    }
+}
+
+#[test]
+fn a_maker_refund_under_the_floor_after_the_leak_is_outbid_by_the_claim() {
+    // The leak of the floor-above-the-cap test, with the maker's refund paying 100/vB, under
+    // every floor: it can never be mined, and the taker's claim confirms.
+    for chain in [Chain::Btc, Chain::Ltc] {
+        let mut m = congested(chain);
+        m.floors = vec![(400, 0), (1500, 1000)];
+        m.refund_feerate = 100;
+        let o = run(&m, true);
+        assert_eq!(
+            (o.taker, o.claimed, o.leaked),
+            (TakerState::Done, true, true),
             "{chain}: {o:?}"
         );
     }

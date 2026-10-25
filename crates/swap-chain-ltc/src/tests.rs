@@ -120,6 +120,37 @@ async fn claim_sizes_are_the_vsizes_a_claim_and_its_child_are_charged_for() {
 }
 
 #[tokio::test]
+async fn a_cpfp_child_signals_replacement_and_a_richer_sibling_outbids_it() {
+    let (pre, hash) = new_preimage();
+    let h = htlc(hash);
+    let b = backend(vec![dead_url()], TAKER_KEY);
+    let amount = Amount::from_sat(1_000_000);
+    let claim = b
+        .build_claim_at(&h, &outpoint(), amount, &pre, 10)
+        .await
+        .unwrap();
+    let read = |t: &divi_swap::SignedTx| -> bitcoin::Transaction {
+        bitcoin::consensus::deserialize(&t.raw).unwrap()
+    };
+    let child = read(
+        &b.build_cpfp(std::slice::from_ref(&claim), amount, 100)
+            .await
+            .unwrap(),
+    );
+    assert!(child.is_explicitly_rbf(), "BIP125 signal");
+    // The next bump replaces it: same input, and its extra fee pays for its own size ten
+    // times over (BIP125 rule 4 asks the incremental relay feerate on it).
+    let sibling = read(&b.build_cpfp(&[claim], amount, 200).await.unwrap());
+    assert!(sibling.is_explicitly_rbf());
+    assert_eq!(
+        sibling.input[0].previous_output,
+        child.input[0].previous_output
+    );
+    let extra = child.output[0].value.to_sat() - sibling.output[0].value.to_sat();
+    assert!(extra >= 10 * sibling.vsize() as u64, "{extra}");
+}
+
+#[tokio::test]
 async fn refund_verifies_with_consensus() {
     let (_, hash) = new_preimage();
     let h = htlc(hash);
