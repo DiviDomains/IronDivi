@@ -9,7 +9,7 @@ and compares the replies. Each row is one (call, argument, value) and prints one
 - `FAIL`: differs and should not, or a `KNOWN` row that now matches divid (the list below is out of date).
 
 The run ends with a count of each and `FAILS <n>`. The exit code is the number of FAILs (255: usage error,
-interrupted, or over 10 minutes).
+interrupted, or over 20 minutes).
 
 ```sh
 scripts/int-args/run.sh <irondivid-bin-dir> <core-bin-dir> <port-base> [root]
@@ -24,7 +24,7 @@ scripts/int-args/run.sh target/release ~/divi-3.0.0/bin 54300 /var/tmp
   `INT_ARGS_HOST` when it is set.
 - `[root]`: a fresh directory is made under it (default `$TMPDIR`, else `/tmp`) and deleted at the end.
 
-A run takes about 2 minutes and is stopped after 10. However it ends, both nodes are stopped and their directories
+A run takes about 2 minutes and is stopped after 20. However it ends, both nodes are stopped and their directories
 deleted. Needs bash and python3 (standard library only). RPC passwords are made at random for each run and kept in
 each node's 0600 `divi.conf`. The wallet phrase is passed to irondivid in its environment only.
 
@@ -102,7 +102,12 @@ wallets share the phrase; irondivid gets A's account "" with `setaccount`, as di
 | setgenerate | numberofblocks | get_int, `rpcmining.cpp:79` |
 | generateblock | blockBitsShift | RPCTypeCheck int, get_int, `rpcmining.cpp:144`, `:202` |
 
-The calls that move the clock or the chain come last. Other calls in the table take no number: `getmasternodewinners`
+The calls that move the clock or the chain come last. `setgenerate` and `generateblock` are sent to one node at a
+time: divid first, then, once irondivid has divid's tip, irondivid, and then divid must take irondivid's tip. Both
+mining at once would fork the chain. divid reads a coinstake's input with `GetTransaction`, which knows only its own
+chain (`BlockProofVerifier.cpp:66-70`), so it refuses a block of irondivid's side of the fork, "read txPrev failed"
+(`:145-147`), and the two chains never meet again. A tip that does not reach the other node within 120 s ends the
+run with a FAIL naming both tips. Other calls in the table take no number: `getmasternodewinners`
 and `startmasternode` read numbers from strings with `atoi` (`rpcmasternode.cpp:544-578`), and the rest take strings,
 bools, arrays and objects.
 
@@ -144,3 +149,14 @@ No other row differs from divid.
 `INT_ARGS_INJECT=<row name>` changes irondivid's reply of that row before it is compared, e.g.
 `INT_ARGS_INJECT='getblockhash height 2^32+41'`: that row prints `FAIL` and the run exits 1.
 `INT_ARGS_DUMP=<dir>` writes both replies of every row that differs to `<dir>`.
+
+## A node that does not answer
+
+A call not answered within 150 s (`INT_ARGS_CALL_TIMEOUT`) ends the run with `FAIL   hang: <node> did not answer
+<call> within N s`. The report then:
+- says whether each node still answers `getblockcount` on a new connection;
+- keeps both nodes' `debug.log` and output, and each running node's threads (name, state, wait channel and system
+  call, from `/proc`), in `INT_ARGS_KEEP`. The default is `int-args-hang.<run>` beside the work directory, which
+  run.sh deletes.
+
+A call that takes over 30 s prints a `# slow:` line, and the run ends with `# ran for N s`.

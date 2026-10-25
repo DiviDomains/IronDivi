@@ -57,10 +57,6 @@ KNOWN = {
         "until its next start: it keeps each transaction's credit and debit in a cache "
         "(CachedTransactionDeltasCalculator.cpp:108-118) that removevault never clears (wallet.cpp:707-716); "
         "irondivid works the entries out from the wallet as it is; as in scripts/vault-replies",
-    "locked manager: setgenerate":
-        "divid's locked wallet throws from key derivation (CWallet::GetKey, wallet.cpp:544) and the RPC layer "
-        "returns that text as -1; irondivid answers -25 \"failed to generate a valid block\", as divid does "
-        "when no stake is found (rpcmining.cpp:110)",
 }
 
 EXTRA = {

@@ -21,6 +21,7 @@ use divi_primitives::transaction::{OutPoint, Transaction};
 use parking_lot::RwLock;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::sync::atomic::{AtomicI64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -188,11 +189,43 @@ fn unix_now() -> u32 {
         .unwrap_or(0)
 }
 
+/// Where a transaction entering the mempool comes from, for the checks that
+/// depend on it
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    /// Submitted locally (RPC, wallet): Divi Core's `fLimitFree` false
+    Local,
+    /// Relayed by a peer: `fLimitFree` true
+    Relayed,
+    /// Taken off the chain with its block: `fLimitFree` false, and its height
+    /// lock is checked with the tip still on that block, as Divi Core's
+    /// disconnectTip offers a block's transactions to AcceptToMemoryPool
+    /// before it moves the tip (ChainTipManager.cpp:175-185,
+    /// MempoolConsensus.cpp:61). The block held it, so its height lock passes.
+    DisconnectedBlock,
+}
+
+impl Origin {
+    /// Divi Core's `fLimitFree`
+    pub fn limit_free(self) -> bool {
+        self == Origin::Relayed
+    }
+
+    /// The tip height a height lock is checked against (for the next block):
+    /// the chain tip, or for a transaction of a disconnected block one its
+    /// block was at or below
+    pub fn lock_tip(self, tip_height: u32) -> u32 {
+        match self {
+            Origin::DisconnectedBlock => u32::MAX - 1,
+            Origin::Local | Origin::Relayed => tip_height,
+        }
+    }
+}
+
 /// Checks a transaction against the chain before it may enter the mempool and
-/// returns its fee; see [`Mempool::set_validator`]. The flag is Core's
-/// `fLimitFree`: true for a transaction a peer relayed.
+/// returns its fee; see [`Mempool::set_validator`].
 pub type MempoolValidator =
-    Arc<dyn Fn(&Mempool, &Transaction, bool) -> Result<Admission, NodeError> + Send + Sync>;
+    Arc<dyn Fn(&Mempool, &Transaction, Origin) -> Result<Admission, NodeError> + Send + Sync>;
 
 /// What the checks found for a transaction entering the pool: its fee, the
 /// chain tip height and the coin age of its inputs there (Divi Core
@@ -234,6 +267,11 @@ pub struct Mempool {
     /// Configuration
     config: MempoolConfig,
 
+    /// The minimum relay fee and the highest fee a spork 14 entry set, in
+    /// satoshis (Divi Core `FeeAndPriorityCalculator::setFeeRate`, `SetMaxFee`,
+    /// spork.cpp:295-296); `i64::MIN` while none has
+    spork_fees: (AtomicI64, AtomicI64),
+
     /// All transactions indexed by txid
     txs: RwLock<HashMap<Hash256, MempoolEntry>>,
 
@@ -270,6 +308,7 @@ impl Mempool {
     pub fn new(config: MempoolConfig) -> Self {
         Mempool {
             config,
+            spork_fees: (AtomicI64::new(i64::MIN), AtomicI64::new(i64::MIN)),
             txs: RwLock::new(HashMap::new()),
             priority_queue: RwLock::new(BinaryHeap::new()),
             spenders: RwLock::new(HashMap::new()),
@@ -352,21 +391,22 @@ impl Mempool {
     /// AcceptToMemoryPool with `fLimitFree` false. Policy refusals are
     /// `NodeError::TxRejected` with Divi Core's reject code and reason.
     pub fn add(&self, tx: Transaction, fee: Amount) -> Result<Hash256, NodeError> {
-        self.add_with(tx, fee, false)
+        self.add_with(tx, fee, Origin::Local)
     }
 
     /// Add a transaction a peer relayed: AcceptToMemoryPool with `fLimitFree`
     /// true, so a free transaction must be small and is rate limited
     pub fn add_relayed(&self, tx: Transaction, fee: Amount) -> Result<Hash256, NodeError> {
-        self.add_with(tx, fee, true)
+        self.add_with(tx, fee, Origin::Relayed)
     }
 
-    fn add_with(
-        &self,
-        tx: Transaction,
-        fee: Amount,
-        limit_free: bool,
-    ) -> Result<Hash256, NodeError> {
+    /// Add a transaction of a block the chain disconnected; see
+    /// [`Origin::DisconnectedBlock`]
+    pub fn add_from_disconnected_block(&self, tx: Transaction) -> Result<Hash256, NodeError> {
+        self.add_with(tx, Amount::ZERO, Origin::DisconnectedBlock)
+    }
+
+    fn add_with(&self, tx: Transaction, fee: Amount, origin: Origin) -> Result<Hash256, NodeError> {
         let txid = tx.txid();
 
         // Check if already exists
@@ -378,9 +418,9 @@ impl Mempool {
         // mempool lock: the validator looks up parent transactions here)
         let validator = self.validator.read().clone();
         let admission = match validator {
-            Some(validator) => validator(self, &tx, limit_free)?,
+            Some(validator) => validator(self, &tx, origin)?,
             None => {
-                self.check_without_chain(&tx, fee)?;
+                self.check_without_chain(&tx, fee, origin)?;
                 // No chain to look the inputs up in: no coin age
                 Admission {
                     fee,
@@ -451,8 +491,13 @@ impl Mempool {
 
     /// The checks made without a chain (no validator installed): finality,
     /// block-reward transactions, relay fee, dust and conflicts
-    fn check_without_chain(&self, tx: &Transaction, fee: Amount) -> Result<(), NodeError> {
-        if !is_final_for_next_block(tx, self.tip_height(), unix_now()) {
+    fn check_without_chain(
+        &self,
+        tx: &Transaction,
+        fee: Amount,
+        origin: Origin,
+    ) -> Result<(), NodeError> {
+        if !is_final_for_next_block(tx, origin.lock_tip(self.tip_height()), unix_now()) {
             return Err(NodeError::NonFinal);
         }
         if tx.is_coinbase() {
@@ -492,13 +537,28 @@ impl Mempool {
     /// The minimum relay fee in satoshis per 1000 bytes (Core's
     /// `minimumRelayTransactionFee`)
     pub fn min_relay_fee_per_kb(&self) -> i64 {
-        self.config.min_relay_fee_per_kb
+        match self.spork_fees.0.load(AtomicOrdering::Relaxed) {
+            i64::MIN => self.config.min_relay_fee_per_kb,
+            set => set,
+        }
+    }
+
+    /// Take the fee settings of a spork 14 entry: the minimum relay fee per
+    /// 1000 bytes and the highest fee, in satoshis
+    pub fn set_spork_fees(&self, min_relay_fee_per_kb: i64, max_tx_fee: i64) {
+        self.spork_fees
+            .0
+            .store(min_relay_fee_per_kb, AtomicOrdering::Relaxed);
+        self.spork_fees.1.store(max_tx_fee, AtomicOrdering::Relaxed);
     }
 
     /// The highest fee sendrawtransaction takes without allowhighfees
     /// (Core's `CFeeRate::GetMaxTxFee`, -maxtxfee)
     pub fn max_tx_fee(&self) -> Amount {
-        Amount::from_sat(self.config.max_tx_fee)
+        match self.spork_fees.1.load(AtomicOrdering::Relaxed) {
+            i64::MIN => Amount::from_sat(self.config.max_tx_fee),
+            set => Amount::from_sat(set),
+        }
     }
 
     /// Divi Core `CFeeRate::GetFee` (FeeRate.cpp:35-43) of the relay fee
@@ -601,45 +661,15 @@ impl Mempool {
         Some(entry)
     }
 
-    /// Remove transactions that are now confirmed in a block, then any that
-    /// can no longer be mined in the next block (after a reorg to a lower tip)
+    /// Remove transactions that are now confirmed in a block. One a lower tip
+    /// made non-final stays, as in Divi Core, whose connectTip and
+    /// disconnectTip never check the mempool's lock times
+    /// (ChainTipManager.cpp:139-141, :175-183); the staker leaves it out of
+    /// its blocks until it is final.
     pub fn remove_for_block(&self, txids: &[Hash256]) {
         for txid in txids {
             self.remove(txid);
         }
-        self.remove_non_final();
-    }
-
-    /// Remove transactions that are not final for the next block, together
-    /// with the mempool transactions that spend their outputs
-    pub fn remove_non_final(&self) -> usize {
-        let tip_height = self.tip_height();
-        let now = unix_now();
-        let mut to_remove: Vec<Hash256> = self
-            .txs
-            .read()
-            .values()
-            .filter(|entry| !is_final_for_next_block(&entry.tx, tip_height, now))
-            .map(|entry| entry.txid)
-            .collect();
-
-        let mut removed = 0;
-        while let Some(txid) = to_remove.pop() {
-            if let Some(entry) = self.remove(&txid) {
-                removed += 1;
-                let spenders = self.spenders.read();
-                for vout in 0..entry.tx.vout.len() as u32 {
-                    if let Some(child) = spenders.get(&(txid, vout)) {
-                        to_remove.push(*child);
-                    }
-                }
-            }
-        }
-
-        if removed > 0 {
-            tracing::info!("Removed {} non-final transaction(s) from mempool", removed);
-        }
-        removed
     }
 
     /// Remove every transaction with an input that is neither spendable on chain
@@ -1114,6 +1144,20 @@ mod tests {
         mempool
     }
 
+    /// A spork 14 entry sets the relay fee and the highest fee the mempool
+    /// uses (Divi Core spork.cpp:295-296)
+    #[test]
+    fn spork_fees_replace_the_configured_ones() {
+        let mempool = Mempool::new(MempoolConfig::default());
+        assert_eq!(mempool.min_relay_fee_per_kb(), 10_000);
+        let configured_max = mempool.max_tx_fee();
+        mempool.set_spork_fees(25_000, 500_000);
+        assert_eq!(mempool.min_relay_fee_per_kb(), 25_000);
+        assert_eq!(mempool.min_relay_fee_for(2_000), 50_000);
+        assert_eq!(mempool.max_tx_fee(), Amount::from_sat(500_000));
+        assert_ne!(configured_max, mempool.max_tx_fee());
+    }
+
     #[test]
     fn test_non_final_time_locked_tx_rejected() {
         // a tx time-locked far in the future with a non-final input
@@ -1158,25 +1202,25 @@ mod tests {
     }
 
     #[test]
-    fn test_reorg_evicts_non_final_tx_and_its_spender() {
+    fn test_reorg_keeps_non_final_tx_and_its_spender() {
         let height = Arc::new(std::sync::atomic::AtomicU32::new(300));
         let mempool = mempool_at_height(Arc::clone(&height));
         let parent = locked_tx([11u8; 32], 250, 0);
         let parent_txid = mempool.add(parent, Amount::from_sat(10000)).unwrap();
         let child = create_test_tx(*parent_txid.as_bytes(), 1);
         mempool.add(child, Amount::from_sat(10000)).unwrap();
-        let unrelated = mempool
+        mempool
             .add(create_test_tx([12u8; 32], 1), Amount::from_sat(10000))
             .unwrap();
         assert_eq!(mempool.size(), 3);
 
-        // Reorg to a chain whose tip is below the lock height
+        // Reorg to a chain whose tip is below the lock height: Divi Core keeps
+        // them (ChainTipManager.cpp:139-141, :175-183)
         height.store(240, std::sync::atomic::Ordering::SeqCst);
         mempool.remove_for_block(&[]);
 
-        assert_eq!(mempool.size(), 1);
-        assert!(mempool.contains(&unrelated));
-        assert!(!mempool.contains(&parent_txid));
+        assert_eq!(mempool.size(), 3);
+        assert!(mempool.contains(&parent_txid));
     }
 
     #[test]

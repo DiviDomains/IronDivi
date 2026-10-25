@@ -772,6 +772,17 @@ pub struct WalletRpc {
     mempool: RwLock<Option<Arc<dyn crate::blockchain::MempoolProvider>>>,
 }
 
+/// Position the wallet's scan for a start (see [`WalletDb::resume_scan`])
+pub fn resume_wallet_scan(wallet: &WalletDb, chain: &Chain) {
+    wallet.resume_scan(chain.height(), |height| {
+        chain
+            .get_block_index_by_height(height)
+            .ok()
+            .flatten()
+            .map(|index| index.hash)
+    });
+}
+
 /// Scan the active chain into the wallet, in order, from its last scanned
 /// height up to the tip (rolling back first if the chain switched under it).
 /// Returns the heights whose block could not be read (pruned); they are
