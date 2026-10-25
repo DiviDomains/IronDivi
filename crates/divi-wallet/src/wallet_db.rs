@@ -4784,15 +4784,20 @@ mod tests {
         assert!(wallet.mnemonic().is_none());
     }
 
-    /// NODE-16: no new address is derived after the unlock has run out.
+    /// NODE-16: no new key is derived from the seed after the unlock has run
+    /// out; as when locked, the address comes from the pre-generated keypool.
     #[test]
     fn node16_new_address_after_timeout_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let (wallet, _) = timed_encrypted_wallet(dir.path());
         wallet.unlock("pw", 1).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(1_200));
-        assert!(wallet.new_receiving_address().is_err());
+        let pool_before = wallet.keypool_size();
+        assert!(pool_before > 0);
+        let addr = wallet.new_receiving_address().unwrap();
         assert!(*wallet.locked.read());
+        assert_eq!(wallet.keypool_size(), pool_before - 1);
+        assert!(wallet.is_mine(&addr));
     }
 
     fn files_containing(dir: &std::path::Path, needle: &[u8]) -> Vec<std::path::PathBuf> {
