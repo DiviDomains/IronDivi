@@ -56,7 +56,7 @@ UNKNOWN = ("not a divid 3.0.0 option: divid keeps it and says nothing (Settings.
 
 
 def unknown_line(option):
-    return (UNKNOWN, pair(("ok", []), ("ok", [f"Unknown option -{option}; ignored"])))
+    return (UNKNOWN, pair(("ok", []), ("ok", [f"WARNING: Unknown option -{option}; ignored"])))
 
 
 CHECKLEVEL = ("divid aborts (SIGABRT, exit -6) in the shutdown after this early InitError, before the chain state "
@@ -88,7 +88,7 @@ KNOWN = {f"-checklevel={v}: start": (CHECKLEVEL, checklevel_shape) for v in rang
 KNOWN["-reindex with -loadblock: log lines"] = (REINDEX_FILE, without_file_lines)
 for _v in ("0", "-1", "-100", "16", "17", "abc"):
     KNOWN[f"-par={_v}: log lines naming -par"] = (
-        PAR, pair(("ok", []), ("ok", ["Option -par is not supported by irondivid; ignored"])))
+        PAR, pair(("ok", []), ("ok", ["WARNING: Option -par is not supported by irondivid; ignored"])))
 for _o in ("prune", "blocksonly", "stopatheight", "assumevalid"):
     KNOWN[f"-loadblock with -{_o}: log lines naming -{_o}"] = unknown_line(_o)
     KNOWN[f"-{_o} on a node with the chain: log lines naming -{_o}"] = unknown_line(_o)
