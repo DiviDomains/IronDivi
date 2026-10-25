@@ -47,6 +47,13 @@ struct Node {
 }
 
 impl Node {
+    fn rpc(&self, method: &str, params: Value) -> Value {
+        let reply =
+            try_rpc(self.port, method, &params).unwrap_or_else(|| panic!("{method}: no reply"));
+        assert!(reply["error"].is_null(), "{method}: {reply}");
+        reply["result"].clone()
+    }
+
     fn log(&self) -> String {
         std::fs::read_to_string(&self.log).unwrap_or_default()
     }
@@ -234,4 +241,48 @@ fn parameter_interactions_are_logged_as_divid_logs_them() {
         assert!(log.contains(want.as_str()), "{want}: {log}");
     }
     assert!(!log.contains(&bind_listen), "{log}");
+}
+
+/// A peer turned away is logged with divid's text: "dropped (banned)" always,
+/// "dropped (full)" only with -debug, divid's "net" category (net.cpp:757-762)
+#[test]
+fn refused_peers_are_logged_as_divid_logs_them() {
+    for debug in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let p = free_port();
+        let bind = format!("-bind=127.0.0.1:{p}");
+        let mut args = vec![bind.as_str(), "-maxconnections=16", "-discover=0"];
+        if debug {
+            args.push("-debug=net");
+        }
+        let node = up(dir.path(), &args);
+        let at: SocketAddr = format!("127.0.0.1:{p}").parse().unwrap();
+        knock("127.0.0.5", at);
+        let seen = wait_until(|| node.log().contains("dropped (full)"), 5);
+        assert_eq!(seen, debug, "-debug: {debug}: {}", node.log());
+        if debug {
+            assert!(
+                node.log().contains("connection from 127.0.0.5:"),
+                "{}",
+                node.log()
+            );
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let p = free_port();
+    let bind = format!("-bind=127.0.0.1:{p}");
+    let node = up(dir.path(), &[&bind, "-discover=0"]);
+    node.rpc("setban", json!(["127.0.0.6", "add"]));
+    let at: SocketAddr = format!("127.0.0.1:{p}").parse().unwrap();
+    knock("127.0.0.6", at);
+    assert!(
+        wait_until(
+            || node.log().contains("connection from 127.0.0.6:")
+                && node.log().contains("dropped (banned)"),
+            10
+        ),
+        "{}",
+        node.log()
+    );
 }

@@ -984,7 +984,8 @@ impl PeerManager {
                             // done or not, against -maxconnections less the outbound
                             // slots; outbound peers do not use them (net.cpp:744-759)
                             if !self.has_inbound_room() {
-                                warn!("Connection from {} dropped (full)", peer_addr);
+                                // divid's text, in its "net" debug category (net.cpp:757-759)
+                                debug!("connection from {} dropped (full)", peer_addr);
                                 continue;
                             }
 
@@ -1247,7 +1248,8 @@ impl PeerManager {
         let peer_addr = stream.peer_addr()?;
         let whitelisted = self.whitelisted_inbound(peer_addr.ip(), white_listener);
         if !whitelisted && self.is_banned(&peer_addr.ip()) {
-            warn!("Rejecting connection from banned IP {}", peer_addr.ip());
+            // divid's text (net.cpp:760-762)
+            info!("connection from {} dropped (banned)", peer_addr);
             return Err(NetworkError::ConnectionRefused(format!(
                 "{} is banned",
                 peer_addr.ip()
