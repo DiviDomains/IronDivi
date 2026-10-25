@@ -2220,19 +2220,22 @@ impl Chain {
                 let db_clone = self.db.clone();
                 let mut block_map = std::collections::HashMap::new();
 
-                // Stake modifier needs blocks within the selection interval (~2087 seconds).
-                // On testnets with fast block production (~12s/block), this can span ~200 blocks.
-                // The selection algorithm also needs to find blocks by hash for entropy selection,
-                // and the last_modifier_index walk needs to find generated_stake_modifier flags.
-                // Use 2000 as a safe upper bound that covers all networks while still being
-                // much cheaper than the original full-chain walk.
-                let max_walk_depth = 2000;
-                let mut walk_count = 0u32;
+                // The modifier reads every block back to the last one that generated a
+                // modifier, and every block of the selection interval (~2087 seconds) up
+                // to the first older one, however many blocks that is
+                // (ChainExtensionService.cpp:115-130, :161, :172-185)
+                let interval_start = (parent.time / crate::stake_modifier::MODIFIER_INTERVAL
+                    * crate::stake_modifier::MODIFIER_INTERVAL)
+                    as i64
+                    - crate::stake_modifier::get_stake_modifier_selection_interval();
+                let mut seen_generated = false;
+                let mut seen_older = false;
                 let mut current = Some(parent.clone());
                 while let Some(ref idx) = current {
                     block_map.insert(idx.hash, idx.clone());
-                    walk_count += 1;
-                    if idx.prev_hash.is_zero() || walk_count >= max_walk_depth {
+                    seen_generated |= idx.generated_stake_modifier;
+                    seen_older |= (idx.time as i64) < interval_start;
+                    if idx.prev_hash.is_zero() || (seen_generated && seen_older) {
                         break;
                     }
                     current = db_clone.get_block_index(&idx.prev_hash).ok().flatten();
@@ -6366,6 +6369,58 @@ mod tests {
         let _hash2 = chain.accept_block(block2).unwrap().hash;
 
         assert_eq!(chain.height(), 2);
+    }
+
+    /// Divi Core picks the stake modifier's blocks from every block of the
+    /// selection interval, however many (ChainExtensionService.cpp:115-130,
+    /// :172-185). A chain making a block a second has over 2,000 in it.
+    #[test]
+    fn stake_modifier_sees_every_block_of_the_selection_interval() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(ChainDatabase::open(dir.path()).unwrap());
+        // Mainnet's first lottery and treasury blocks are far past these heights
+        let params = ChainParams {
+            check_block_work: false,
+            checkpoints: Vec::new(),
+            ..ChainParams::for_network(NetworkType::Mainnet, ChainMode::Divi)
+        };
+        let chain = Chain::new(db, params).unwrap();
+        let (mut prev_hash, mut prev_time) = get_genesis_info(&chain);
+        for _ in 0..2200 {
+            let mut block = create_child_block_with_pubkey(prev_hash, prev_time, [3u8; 20]);
+            block.header.time = prev_time + 1;
+            block.transactions[0].vout[0].value = Amount::from_divi(1);
+            seal(&mut block);
+            prev_hash = chain.accept_block(block).unwrap().hash;
+            prev_time += 1;
+        }
+        assert_eq!(chain.height(), 2200);
+
+        let all: HashMap<Hash256, BlockIndex> = (0..=2200)
+            .map(|h| chain.get_block_index_by_height(h).unwrap().unwrap())
+            .map(|b| (b.hash, b))
+            .collect();
+        let refs: HashMap<Hash256, &BlockIndex> = all.iter().map(|(k, v)| (*k, v)).collect();
+        let get_prev = |hash: &Hash256| refs.get(hash).copied();
+        for height in 2000..=2200 {
+            let index = chain.get_block_index_by_height(height).unwrap().unwrap();
+            let parent = refs[&index.prev_hash];
+            let hardened = crate::fork_activation::ActivationState::new(parent)
+                .is_hardened_stake_modifier_active();
+            let expected = crate::stake_modifier::compute_next_stake_modifier(
+                Some(parent),
+                &get_prev,
+                &refs,
+                hardened,
+            )
+            .unwrap();
+            assert_eq!(
+                (index.stake_modifier, index.generated_stake_modifier),
+                expected,
+                "stake modifier at height {}",
+                height
+            );
+        }
     }
 
     #[test]
