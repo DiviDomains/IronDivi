@@ -298,10 +298,18 @@ impl TxRelay {
             from_peer: peer_id,
         };
 
+        // The mempool decides; it is relayed once accepted (relay_accepted),
+        // as Divi Core relays a transaction only after AcceptToMemoryPool took
+        // it (main.cpp:732-734), so a transaction it cannot take yet, such as
+        // a child whose parent has not come, is not announced
         let _ = self.event_tx.send(event);
+    }
 
-        // Relay to other peers
-        self.relay_tx(txid, Some(peer_id)).await;
+    /// Relay a transaction the mempool took, to every peer but the one it came
+    /// from (Divi Core RelayTransactionToAllPeers after AcceptToMemoryPool,
+    /// main.cpp:734, and for an orphan accepted once its parent came, :763)
+    pub async fn relay_accepted(&self, txid: Hash256, from_peer: Option<PeerId>) {
+        self.relay_tx(txid, from_peer).await;
     }
 
     /// Handle getdata request for transactions
@@ -534,6 +542,60 @@ mod tests {
             .get(&txid)
             .map(|s| s.contains(&peer_id))
             .unwrap_or(false));
+    }
+
+    /// A peer and the receiver of the messages sent to it
+    fn test_peer(relay: &TxRelay, id: PeerId) -> tokio::sync::mpsc::Receiver<NetworkMessage> {
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        relay
+            .peer_manager
+            .insert_test_peer(crate::peer::PeerHandle {
+                id,
+                addr: format!("127.0.0.1:{}", 2000 + id).parse().unwrap(),
+                tx,
+                inbound: false,
+                stats: Default::default(),
+            });
+        rx
+    }
+
+    fn invs(rx: &mut tokio::sync::mpsc::Receiver<NetworkMessage>) -> Vec<Hash256> {
+        let mut got = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            if let NetworkMessage::Inv(items) = msg {
+                got.extend(items.iter().map(|i| i.hash));
+            }
+        }
+        got
+    }
+
+    /// A received transaction is announced to the other peers only once the
+    /// mempool took it (Divi Core main.cpp:732-734): a child that came before
+    /// its parent is not announced while it waits, then is when accepted
+    /// (:763)
+    #[tokio::test]
+    async fn a_received_transaction_is_announced_only_once_accepted() {
+        let relay = create_test_relay();
+        let _from = test_peer(&relay, 1);
+        let mut other = test_peer(&relay, 2);
+        let mut events = relay.subscribe();
+        let tx = Transaction {
+            version: 1,
+            vin: vec![],
+            vout: vec![],
+            lock_time: 7,
+        };
+        let txid = tx.txid();
+
+        relay.handle_tx(1, tx).await;
+        assert_eq!(events.try_recv().map(|e| e.txid).ok(), Some(txid));
+        assert!(
+            invs(&mut other).is_empty(),
+            "announced before the mempool took it"
+        );
+
+        relay.relay_accepted(txid, Some(1)).await;
+        assert_eq!(invs(&mut other), vec![txid]);
     }
 
     #[test]

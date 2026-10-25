@@ -598,6 +598,7 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         })?;
         config.mempool.min_relay_fee_per_kb = sat;
     }
+    config.mempool.accept_nonstandard = s.get_bool("acceptnonstandard", false);
     // -maxtxfee: an amount ParseMoney reads, at least the relay fee for 1 kB;
     // above 10 DIVI a warning (init.cpp:831-845)
     if let Some(text) = s.get("maxtxfee") {
@@ -739,6 +740,7 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         "maxreorg",
         "maxorphantx",
         "minrelaytxfee",
+        "acceptnonstandard",
         "maxtxfee",
         "sporkkey",
         "staking",
