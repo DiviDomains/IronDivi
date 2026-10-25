@@ -244,6 +244,9 @@ pub struct LivePeerStats {
     pub recv_space: tokio::sync::Notify,
     /// Bytes queued for the peer and not yet written (Divi Core nSendSize)
     pub send_queued_bytes: AtomicU64,
+    /// The peer's bloom filter and transaction relay flag (not published by
+    /// the connection: the filter messages change them)
+    pub bloom: crate::bloom::PeerBloom,
 }
 
 impl LivePeerStats {

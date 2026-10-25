@@ -101,10 +101,17 @@ pub struct TxRelay {
     /// Whether a transaction is in the node's mempool and whether it is a
     /// held orphan; without it, the transactions seen here count as had
     have: RwLock<Option<HaveTx>>,
+
+    /// The mempool's transaction by txid, so an announcement can be held to
+    /// each peer's bloom filter
+    tx_source: RwLock<Option<TxSource>>,
 }
 
 /// The node's view of a transaction: (in the mempool, a held orphan)
 pub type HaveTx = Arc<dyn Fn(&Hash256) -> (bool, bool) + Send + Sync>;
+
+/// Looks a transaction up by txid (the node's mempool)
+pub type TxSource = Arc<dyn Fn(&Hash256) -> Option<Transaction> + Send + Sync>;
 
 impl TxRelay {
     /// Create a new transaction relay manager
@@ -122,7 +129,13 @@ impl TxRelay {
             event_tx,
             relayed: RwLock::new(HashMap::new()),
             have: RwLock::new(None),
+            tx_source: RwLock::new(None),
         })
+    }
+
+    /// Where announcements find the transaction to test peers' filters with
+    pub fn set_tx_source(&self, source: TxSource) {
+        *self.tx_source.write() = Some(source);
     }
 
     /// Subscribe to transaction events
@@ -373,6 +386,15 @@ impl TxRelay {
             .map(|(tx, _)| tx.clone())
     }
 
+    /// Whether `peer_id` is known to have `txid` (it announced or was told of
+    /// it): Divi Core's setInventoryKnown
+    pub fn peer_knows(&self, peer_id: PeerId, txid: &Hash256) -> bool {
+        self.peer_inventory
+            .read()
+            .get(&peer_id)
+            .is_some_and(|known| known.contains(txid))
+    }
+
     /// Relay a transaction the mempool took, to every peer but the one it came
     /// from (Divi Core RelayTransactionToAllPeers after AcceptToMemoryPool,
     /// main.cpp:734, and for an orphan accepted once its parent came, :763)
@@ -443,8 +465,15 @@ impl TxRelay {
         }
     }
 
-    /// Relay a transaction to peers that don't have it
+    /// Relay a transaction to peers that don't have it: only to a peer that
+    /// wants transactions, and that one's bloom filter matches (which the match
+    /// updates), as Divi Core's RelayTransaction (net.cpp:1593-1606)
     async fn relay_tx(&self, txid: Hash256, exclude_peer: Option<PeerId>) {
+        let source = self.tx_source.read().clone();
+        // The mempool's copy, else the one kept since it was announced
+        let tx = source
+            .and_then(|lookup| lookup(&txid))
+            .or_else(|| self.relayed_tx(&txid));
         let peers_to_notify: Vec<PeerId> = {
             let peer_inventory = self.peer_inventory.read();
             let all_peers = self.peer_manager.connected_peers();
@@ -464,7 +493,16 @@ impl TxRelay {
                         }
                     }
 
-                    true
+                    let Some(stats) = self.peer_manager.peer_stats(peer_id) else {
+                        return true;
+                    };
+                    if !stats.bloom.relays_txs() {
+                        return false;
+                    }
+                    match &tx {
+                        Some(tx) => stats.bloom.filter().is_relevant_and_update(tx),
+                        None => true,
+                    }
                 })
                 .collect()
         };

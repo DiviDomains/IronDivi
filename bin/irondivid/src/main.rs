@@ -317,7 +317,6 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "whitelisted_vault",
     "checklevel",
     "par",
-    "peerbloomfilters",
 ];
 
 /// Options divid takes and does nothing with, only naming them in its help:
@@ -447,6 +446,7 @@ const APPLIED: &[&str] = &[
     "maxreorg",
     "maxorphantx",
     "minrelaytxfee",
+    "peerbloomfilters",
     "acceptnonstandard",
     "permitbaremultisig",
     "datacarrier",
@@ -803,6 +803,7 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     config.p2p.tor_password = s.get("torpassword").unwrap_or("").to_string();
     config.p2p.upnp = s.get_bool("upnp", divi_network::upnp::DEFAULT_UPNP);
     config.p2p.discover = s.get_bool("discover", true);
+    config.p2p.peer_bloom_filters = s.get_bool("peerbloomfilters", true);
     // -externalip=<ip>[:port], the listen port when none is given; one that
     // does not resolve to a valid address stops the start (net.cpp:1834-1839)
     for raw in s.get_multi("externalip") {

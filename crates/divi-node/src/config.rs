@@ -583,6 +583,11 @@ pub struct P2pConfig {
     /// this off (net.cpp:1808-1823)
     #[serde(default = "default_listen_on_addr")]
     pub listen_on_addr: bool,
+
+    /// Serve bloom-filtered connections and advertise NODE_BLOOM (Divi Core
+    /// `-peerbloomfilters`, on by default: defaultValues.h:100, net.cpp:1722-1723)
+    #[serde(default = "default_peer_bloom_filters")]
+    pub peer_bloom_filters: bool,
 }
 
 impl P2pConfig {
@@ -684,6 +689,10 @@ fn default_alerts() -> bool {
     true
 }
 
+fn default_peer_bloom_filters() -> bool {
+    true
+}
+
 fn default_ban_score() -> u32 {
     100
 }
@@ -732,6 +741,7 @@ impl Default for P2pConfig {
             white_bind: Vec::new(),
             more_bind: Vec::new(),
             listen_on_addr: true,
+            peer_bloom_filters: true,
         }
     }
 }

@@ -215,8 +215,9 @@ fn getnetworkinfo_and_version_message_as_divid() {
     // Divi Core 3.0.0's PROTOCOL_VERSION (version.h:21)
     assert_eq!(net["protocolversion"], 70915, "{net}");
     assert_eq!(d.rpc("getinfo")["protocolversion"], 70915);
-    // irondivid serves no bloom filters: NODE_NETWORK, as divid with -peerbloomfilters=0
-    assert_eq!(net["localservices"], "0000000000000001", "{net}");
+    // NODE_NETWORK | NODE_BLOOM, as divid with the default -peerbloomfilters
+    // (defaultValues.h:100, net.cpp:1722-1723)
+    assert_eq!(net["localservices"], "0000000000000005", "{net}");
     // -externalip at the listen port, LOCAL_MANUAL (4); port and score as strings
     assert_eq!(
         net["localaddresses"],
@@ -229,8 +230,9 @@ fn getnetworkinfo_and_version_message_as_divid() {
     let me: SocketAddr = format!("1.2.3.4:{port}").parse().unwrap();
     let (_s, v) = handshake(&d, me);
     assert_eq!(v.version, 70915);
-    assert_eq!(v.services, 1);
-    assert_eq!(v.addr_from, (1, me), "our address");
+    assert_eq!(v.services, 5);
+    // Our address carries our services too (NetworkLocalAddressHelpers.cpp:210)
+    assert_eq!(v.addr_from, (5, me), "our address");
     assert_eq!(v.addr_recv.1, "0.0.0.0:0".parse::<SocketAddr>().unwrap());
     // The inbound peer named our address: score 5 (Divi Core SeenLocal)
     let deadline = Instant::now() + WAIT;
@@ -248,7 +250,7 @@ fn without_a_local_address_the_version_names_the_listen_port() {
     assert_eq!(local_addresses(&d), json!([]));
     let (_s, v) = handshake(&d, "0.0.0.0:0".parse().unwrap());
     let any: SocketAddr = format!("0.0.0.0:{}", d.p2p_port).parse().unwrap();
-    assert_eq!(v.addr_from, (1, any), "0.0.0.0 with our listen port");
+    assert_eq!(v.addr_from, (5, any), "0.0.0.0 with our listen port");
 }
 
 #[test]
