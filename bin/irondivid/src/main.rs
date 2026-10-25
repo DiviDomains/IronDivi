@@ -3661,9 +3661,23 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
         });
     }
 
-    // Set up signal handler
+    // Set up signal handler. On unix both handlers are installed here, before
+    // the start writes its pid file, as divid installs them (init.cpp:1390-1394)
+    // before CreatePidFile (:1470): a signal sent once the pid file is there
+    // stops the node, never the default action
+    #[cfg(unix)]
+    let mut interrupt = signal::unix::signal(signal::unix::SignalKind::interrupt())
+        .context("Failed to install SIGINT handler")?;
+    #[cfg(unix)]
+    let mut terminate_signal = signal::unix::signal(signal::unix::SignalKind::terminate())
+        .context("Failed to install SIGTERM handler")?;
     let shutdown_tx_clone = shutdown_tx.clone();
     tokio::spawn(async move {
+        #[cfg(unix)]
+        let ctrl_c = async {
+            interrupt.recv().await;
+        };
+        #[cfg(not(unix))]
         let ctrl_c = async {
             signal::ctrl_c()
                 .await
@@ -3672,10 +3686,7 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
 
         #[cfg(unix)]
         let terminate = async {
-            signal::unix::signal(signal::unix::SignalKind::terminate())
-                .expect("Failed to install signal handler")
-                .recv()
-                .await;
+            terminate_signal.recv().await;
         };
 
         #[cfg(not(unix))]

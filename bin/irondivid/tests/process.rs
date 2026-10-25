@@ -358,3 +358,36 @@ fn a_signal_during_start_exits_with_one_with_stopafterblockimport() {
     let _ = child.wait();
     assert_eq!(code, Some(1));
 }
+
+/// A SIGINT or SIGTERM sent as soon as the pid file is there reaches the
+/// node's handler and stops it (exit 0 or 1), never the signal's default
+/// action: divid installs its handlers (init.cpp:1390-1394) before it writes
+/// its pid file (:1470)
+#[test]
+fn a_signal_once_the_pid_file_is_there_is_handled() {
+    for (round, sig) in [libc::SIGINT, libc::SIGTERM]
+        .repeat(5)
+        .into_iter()
+        .enumerate()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("divid.pid");
+        let mut child = irondivid(dir.path(), free_port())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !pid_file.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_micros(200));
+        }
+        unsafe { libc::kill(child.id() as i32, sig) };
+        let code = wait_exit(&mut child, 120);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            matches!(code, Some(0) | Some(1)),
+            "round {round}, signal {sig}: {code:?}"
+        );
+    }
+}
