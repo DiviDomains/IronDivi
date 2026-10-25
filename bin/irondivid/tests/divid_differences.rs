@@ -83,7 +83,10 @@ fn unknown_and_unsupported_options_start_with_a_log_line() {
         |rpc_port, p2p_port| {
             let mut a = args(dir.path(), rpc_port, p2p_port);
             a.push("-bogusflag=1".into());
+            a.push("-par=2".into());
+            // Applied (-dbcache) or only in divid's help (-mining): no line
             a.push("-dbcache=100".into());
+            a.push("-mining=1".into());
             let mut cmd = Command::new(env!("CARGO_BIN_EXE_irondivid"));
             cmd.args(&a).stdout(Stdio::null()).stderr(Stdio::null());
             cmd
@@ -97,9 +100,11 @@ fn unknown_and_unsupported_options_start_with_a_log_line() {
         "no line for the unknown option"
     );
     assert!(
-        log.contains("Option -dbcache is not supported by irondivid; ignored"),
+        log.contains("Option -par is not supported by irondivid; ignored"),
         "no line for the unsupported option"
     );
+    assert!(!log.contains("-dbcache"), "a line for -dbcache: {log}");
+    assert!(!log.contains("-mining"), "a line for -mining: {log}");
     // -alertnotify is taken: irondivid runs it for its own warning
     // (start_rpc_options.rs), so it is not named as unsupported
 }
