@@ -65,6 +65,7 @@ mod wire;
 
 // P2P networking
 pub mod addrbook;
+pub mod buffers;
 pub mod codec;
 pub mod connection;
 pub mod local;

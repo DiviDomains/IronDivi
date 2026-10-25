@@ -574,6 +574,9 @@ impl Connection {
 
         loop {
             info.publish(&stats);
+            // Not read while its messages the node has not taken pass the
+            // limits (Divi Core IsAvailableToReceive, Node.cpp:335-339)
+            let can_receive = stats.can_receive();
             tokio::select! {
                 biased;
 
@@ -627,8 +630,11 @@ impl Connection {
                     }
                 }
 
+                // The node took a message: read again if there is room
+                _ = stats.recv_space.notified(), if !can_receive => {}
+
                 // Handle incoming messages - framed.next() IS CANCELLATION SAFE!
-                result = timeout(READ_TIMEOUT, framed.next()) => {
+                result = timeout(READ_TIMEOUT, framed.next()), if can_receive => {
                     match result {
                         Ok(Some(Ok(Decoded::Malformed { command, .. }))) if command == "version" => {
                             let bytes_received = framed.decoder_mut().take_bytes_consumed();
@@ -668,7 +674,7 @@ impl Connection {
                             trace!("Received {} from {}", msg.command(), info.addr);
 
                             if let Err(e) = Self::handle_message(
-                                &mut writer, &mut info, magic, &total_bytes_sent, peer_id, &event_tx, msg
+                                &mut writer, &mut info, magic, &total_bytes_sent, peer_id, &event_tx, &stats, msg, bytes_received
                             ).await {
                                 warn!("Error handling message from {}: {}", crate::peer_log::peer(peer_id, info.addr), e);
                             }
@@ -705,6 +711,7 @@ impl Connection {
     }
 
     /// Handle a received message
+    #[allow(clippy::too_many_arguments)]
     async fn handle_message<W: AsyncWriteExt + Unpin>(
         writer: &mut W,
         info: &mut PeerInfo,
@@ -712,7 +719,9 @@ impl Connection {
         total_bytes_sent: &Arc<AtomicU64>,
         peer_id: PeerId,
         event_tx: &broadcast::Sender<PeerEvent>,
+        stats: &LivePeerStats,
         msg: NetworkMessage,
+        size: u64,
     ) -> Result<(), NetworkError> {
         match &msg {
             // Divi Core: one version per connection
@@ -756,10 +765,13 @@ impl Connection {
                 // Log all messages for debugging
                 trace!("Received {} message from peer {}", msg.command(), peer_id);
 
-                // Forward to event handler for processing
+                // Forward to event handler for processing; counted until
+                // the node takes it
+                stats.message_queued(size);
                 let _ = event_tx.send(PeerEvent::Message {
                     peer_id,
                     message: msg,
+                    size,
                 });
             }
         }

@@ -190,6 +190,8 @@ pub enum PeerEvent {
     Message {
         peer_id: PeerId,
         message: NetworkMessage,
+        /// Its size on the wire, header included
+        size: u64,
     },
     /// Peer misbehaved
     Misbehavior {
@@ -226,6 +228,54 @@ pub struct LivePeerStats {
     pub start_height: AtomicI64,
     /// Peer's user agent
     pub subver: parking_lot::Mutex<String>,
+    /// Bytes and number of this peer's messages handed to the node and not
+    /// yet taken: the peer is not read while they pass the limits
+    /// (crate::buffers)
+    pub recv_queued_bytes: AtomicU64,
+    pub recv_queued_msgs: AtomicU64,
+    /// Woken when the node takes one of this peer's messages
+    pub recv_space: tokio::sync::Notify,
+}
+
+impl LivePeerStats {
+    /// Whether the peer may be read: its waiting messages are within
+    /// -maxreceivebuffer and MAX_QUEUED_MESSAGES
+    pub fn can_receive(&self) -> bool {
+        self.recv_queued_bytes.load(Ordering::Relaxed) <= crate::buffers::max_receive_buffer()
+            && self.recv_queued_msgs.load(Ordering::Relaxed) < crate::buffers::MAX_QUEUED_MESSAGES
+    }
+
+    /// A message of `bytes` handed to the node
+    pub fn message_queued(&self, bytes: u64) {
+        self.recv_queued_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.recv_queued_msgs.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The node took a message of `bytes`
+    pub fn message_taken(&self, bytes: u64) {
+        // Never below 0: a count cleared after missed messages may be smaller
+        let sub = |a: &AtomicU64, n: u64| {
+            let mut v = a.load(Ordering::Relaxed);
+            while let Err(now) = a.compare_exchange_weak(
+                v,
+                v.saturating_sub(n),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                v = now;
+            }
+        };
+        sub(&self.recv_queued_bytes, bytes);
+        sub(&self.recv_queued_msgs, 1);
+        self.recv_space.notify_one();
+    }
+
+    /// Forget what is waiting (the node missed messages it cannot count)
+    pub fn clear_queued(&self) {
+        self.recv_queued_bytes.store(0, Ordering::Relaxed);
+        self.recv_queued_msgs.store(0, Ordering::Relaxed);
+        self.recv_space.notify_one();
+    }
 }
 
 /// The node's clock in Unix seconds (mocked by setmocktime)
@@ -310,6 +360,28 @@ impl PeerHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_peer_is_not_read_while_the_node_has_its_messages_waiting() {
+        let stats = LivePeerStats::default();
+        assert!(stats.can_receive());
+        for _ in 0..crate::buffers::MAX_QUEUED_MESSAGES {
+            stats.message_queued(100);
+        }
+        assert!(!stats.can_receive());
+        stats.message_taken(100);
+        assert!(stats.can_receive());
+        // Over -maxreceivebuffer in bytes with one message waiting
+        stats.clear_queued();
+        stats.message_queued(crate::buffers::max_receive_buffer() + 1);
+        assert!(!stats.can_receive());
+        stats.message_taken(crate::buffers::max_receive_buffer() + 1);
+        assert!(stats.can_receive());
+        // A count cleared after missed messages does not go below zero
+        stats.message_taken(500);
+        assert_eq!(stats.recv_queued_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.recv_queued_msgs.load(Ordering::Relaxed), 0);
+    }
 
     #[test]
     fn test_peer_id_generation() {

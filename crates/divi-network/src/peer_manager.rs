@@ -1109,6 +1109,21 @@ impl PeerManager {
         );
     }
 
+    /// The node took a message of `size` bytes from `peer_id`: that peer may
+    /// be read again once it is within the receive limits
+    pub fn message_taken(&self, peer_id: PeerId, size: u64) {
+        if let Some(handle) = self.peers.read().get(&peer_id) {
+            handle.stats.message_taken(size);
+        }
+    }
+
+    /// The node missed messages it cannot count: every peer may be read again
+    pub fn clear_receive_queues(&self) {
+        for handle in self.peers.read().values() {
+            handle.stats.clear_queued();
+        }
+    }
+
     /// Send a full block to a specific peer (in response to a getdata request).
     ///
     /// Uses async `send` with a timeout for reliable delivery.

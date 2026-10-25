@@ -825,6 +825,7 @@ impl Node {
         divi_network::constants::set_protocol_version(self.config.network.protocol_version as i32);
         self.peer_manager
             .set_local_addresses(self.local_addresses());
+        divi_network::buffers::set_max_receive_buffer(self.config.p2p.max_receive_buffer);
 
         // Start peer event handler
         let event_tx = self.event_tx.clone();
@@ -863,7 +864,21 @@ impl Node {
             // Masternode broadcasts and pings already asked for (Divi Core's
             // AlreadyHave for MSG_MASTERNODE_ANNOUNCE / _PING)
             let mut masternode_items_asked: HashSet<Hash256> = HashSet::new();
-            while let Ok(event) = peer_events.recv().await {
+            loop {
+                // A message is taken off the queue here; falling behind the
+                // queue drops messages, and the loop goes on
+                let event = match peer_events.recv().await {
+                    Ok(event) => event,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
+                        tracing::warn!("Peer messages came faster than they were handled: {} missed", missed);
+                        peer_manager.clear_receive_queues();
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                };
+                if let PeerEvent::Message { peer_id, size, .. } = &event {
+                    peer_manager.message_taken(*peer_id, *size);
+                }
                 match event {
                     PeerEvent::Connected {
                         peer_id,
@@ -901,7 +916,9 @@ impl Node {
                         hash_continue.remove(&peer_id);
                         alerts_known.remove(&peer_id);
                     }
-                    PeerEvent::Message { peer_id, message } => {
+                    PeerEvent::Message {
+                        peer_id, message, ..
+                    } => {
                         // Log all message types at INFO for debugging sync issues
                         let cmd = message.command();
                         if cmd == "block" || cmd == "notfound" {
