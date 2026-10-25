@@ -873,3 +873,90 @@ async fn usdc_claim_never_goes_over_the_cap_for_any_node_price_bump() {
         }
     }
 }
+
+#[tokio::test]
+async fn ltc_claim_replacing_its_child_keeps_climbing_after_a_crash_where_the_node_takes_no_child_replacement(
+) {
+    // Switched on, on a node that refuses child replacements (the mock's default): the
+    // crash loses the replacement after the record dropped the child it replaced.
+    let esc = FeeEscalation {
+        replace_cpfp_child: true,
+        ..FeeEscalation::builtin(Chain::Ltc).unwrap()
+    };
+    let w = world(Chain::Ltc, 150, FeeBump::Cpfp);
+    w.ml.set_child_replacement(false);
+    let store = Store::in_memory().unwrap();
+    let maker = maker(&w, &store);
+    let (tid, view, held) = {
+        let taker = taker(&w, &store).with_fee_escalation(Chain::Ltc, Some(esc));
+        let (tid, view) = to_claimed(&w, &maker, &taker).await;
+        // Ride to the first child, which the node holds.
+        while store
+            .get_taker_swap(&tid)
+            .unwrap()
+            .unwrap()
+            .claim_children
+            .is_empty()
+        {
+            assert!(w.ml.mtp() + 150 < locktime(&view));
+            w.ml.advance_time(150);
+            taker.step(&tid, Some(&view)).await.unwrap();
+        }
+        let held = store.get_taker_swap(&tid).unwrap().unwrap().claim_children;
+        assert!(held.iter().all(|c| w.ml.feerate_of(&c.txid).is_some()));
+        // The next bump, a replacement of the held child, is written ahead and never sent.
+        w.ml.lose_next_new_broadcast();
+        loop {
+            assert!(w.ml.mtp() + 150 < locktime(&view));
+            w.ml.advance_time(150);
+            let _ = taker.step(&tid, Some(&view)).await;
+            let rec = store.get_taker_swap(&tid).unwrap().unwrap();
+            if rec
+                .claim_children
+                .iter()
+                .any(|c| w.ml.feerate_of(&c.txid).is_none())
+            {
+                break;
+            }
+        }
+        (tid, view, held)
+    };
+    let rec = store.get_taker_swap(&tid).unwrap().unwrap();
+    let at_crash = rec.claim_feerate.unwrap();
+
+    // Restart on the same store; the refused replacement gives the held child back and the
+    // climb resumes on top of it.
+    let taker = taker(&w, &store).with_fee_escalation(Chain::Ltc, Some(esc));
+    let seen = ride_to_locktime(&w, &store, &taker, &tid, &view, 150).await;
+    let rec = store.get_taker_swap(&tid).unwrap().unwrap();
+    let after = rec.claim_feerate.unwrap();
+    assert!(
+        after > at_crash,
+        "{after} after the restart, {at_crash} at the crash: {seen:?}"
+    );
+    let n = rec.claim_children.len();
+    assert!(
+        n >= held.len() + 2,
+        "{n} children, {} before the crash: {seen:?}",
+        held.len()
+    );
+    for (i, child) in rec.claim_children.iter().enumerate() {
+        assert!(
+            w.ml.feerate_of(&child.txid).is_some(),
+            "child {i} of {n} not relayed: {seen:?}"
+        );
+    }
+    for child in &held {
+        assert!(
+            rec.claim_children.contains(child),
+            "the held child stays in the package"
+        );
+    }
+    assert_eq!(w.ml.longest_unconfirmed_chain(), n as u64 + 1);
+
+    w.ml.mine(1);
+    assert_eq!(
+        taker.step(&tid, Some(&view)).await.unwrap(),
+        TakerState::Done
+    );
+}

@@ -91,6 +91,7 @@ fn taker() -> TakerRecord {
         claim_feerate: None,
         claim_replaced: Vec::new(),
         claim_children: Vec::new(),
+        claim_child_replaced: None,
         claim_underpriced: 0,
         last_error: None,
     }
@@ -312,4 +313,35 @@ fn a_lost_maker_record_round_trips_through_the_store() {
         .unwrap();
     assert_eq!(col, "lost");
     assert_eq!(stored, json);
+}
+
+/// A pending CPFP child replacement's predecessor (`claim_child_replaced`) goes through the
+/// store on both records under that key and is left out while empty, so records from before
+/// the field read and write back unchanged.
+#[test]
+fn a_replaced_cpfp_child_round_trips_and_is_left_out_while_empty() {
+    let child = divi_swap::SignedTx {
+        txid: divi_swap::Txid([7; 32]),
+        raw: vec![1, 2, 3],
+    };
+    let mut t = taker();
+    assert!(!serde_json::to_string(&t)
+        .unwrap()
+        .contains("claim_child_replaced"));
+    t.claim_child_replaced = Some((child.clone(), 42));
+    let mut m = maker();
+    assert!(!serde_json::to_string(&m)
+        .unwrap()
+        .contains("claim_child_replaced"));
+    m.claim_fees.claim_child_replaced = Some((child.clone(), 42));
+    assert!(serde_json::to_string(&m)
+        .unwrap()
+        .contains("\"claim_child_replaced\":"));
+    let store = Store::in_memory().unwrap();
+    store.put_taker_swap(&t).unwrap();
+    store.put_maker_swap(&m).unwrap();
+    let back = store.get_taker_swap("t1").unwrap().unwrap();
+    assert_eq!(back.claim_child_replaced, Some((child.clone(), 42)));
+    let back = store.get_maker_swap("m1").unwrap().unwrap();
+    assert_eq!(back.claim_fees.claim_child_replaced, Some((child, 42)));
 }

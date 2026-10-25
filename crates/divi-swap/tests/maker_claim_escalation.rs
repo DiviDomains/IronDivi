@@ -251,3 +251,139 @@ async fn a_won_claim_stays_done_and_is_not_resent() {
     assert_eq!(o.broadcasts.0, o.broadcasts.1);
     assert_eq!(o.after, (SwapState::Done, SwapState::Done));
 }
+
+#[tokio::test]
+async fn an_ltc_maker_claim_replacing_its_child_keeps_climbing_after_a_crash_where_the_node_takes_no_child_replacement(
+) {
+    // Switched on, on a node that refuses child replacements: the crash loses the
+    // replacement after the record dropped the child it replaced.
+    let chain = Chain::Ltc;
+    let esc = FeeEscalation {
+        replace_cpfp_child: true,
+        ..FeeEscalation::builtin(chain).unwrap()
+    };
+    let step = block_secs(chain);
+    let divi = MockChain::new(Chain::Divi, T0, 60);
+    let tl = MockChain::new(chain, T0, step);
+    tl.set_fee_bump(FeeBump::Cpfp);
+    tl.set_child_replacement(false);
+    let (tdivi, ttl) = (divi.backend(3, Amount(FUNDS)), tl.backend(4, Amount(FUNDS)));
+    let mtl = tl.backend(2, Amount(FUNDS));
+    let mdivi = divi.backend(1, Amount(FUNDS));
+    let store = Store::in_memory().unwrap();
+    let new_maker = || {
+        Maker::new(
+            SwapConfig::profile(Profile::Testnet),
+            Arc::new(mdivi.clone()),
+            Arc::new(mtl.clone()),
+            store.clone(),
+            vec![Offer {
+                id: "o".into(),
+                direction: Direction::TakerPaysBtc,
+                counter_chain: chain,
+                divi_sats_per_btc: 50_000_000_000,
+                min_btc_sats: 10_000,
+                max_btc_sats: 5_000_000,
+            }],
+        )
+        .unwrap()
+        .with_fee_escalation(chain, Some(esc))
+    };
+    let taker = Taker::new(Arc::new(tdivi), Arc::new(ttl), store.clone());
+    let fees = |mid: &str| store.get_maker_swap(mid).unwrap().unwrap().claim_fees;
+
+    let (mid, locktime, held) = {
+        let maker = new_maker();
+        let q = maker.quote("o", SATS).await.unwrap();
+        let (tid, req) = taker.prepare(&q).await.unwrap();
+        let v = maker.accept(req).await.unwrap();
+        taker.accepted(&tid, &v).await.unwrap();
+        let notice = taker.lock(&tid).await.unwrap();
+        let mid = maker.notify_lock(&v.id, notice).await.unwrap().id;
+        for _ in 0..40 {
+            divi.mine(1);
+            tl.mine(1);
+            maker.tick().await.unwrap();
+            if maker.view(&mid).unwrap().unwrap().state == SwapState::MakerLockConfirmed {
+                break;
+            }
+        }
+        let view = maker.view(&mid).unwrap().unwrap();
+        assert_eq!(view.state, SwapState::MakerLockConfirmed);
+        let mut state = TakerState::Locked;
+        for _ in 0..3 {
+            state = taker.step(&tid, Some(&view)).await.unwrap();
+            if state == TakerState::Claimed {
+                break;
+            }
+        }
+        assert_eq!(state, TakerState::Claimed);
+        // From here nothing on the taker-leg chain is mined until the end.
+        divi.mine(1);
+        for _ in 0..3 {
+            let _ = maker.tick().await;
+        }
+        let rec = store.get_maker_swap(&mid).unwrap().unwrap();
+        assert_eq!(rec.state, SwapState::MakerClaimed);
+        let locktime = rec.taker_leg_htlc.locktime;
+        // Ride to the first child, which the node holds.
+        while fees(&mid).claim_children.is_empty() {
+            assert!(tl.mtp() + step < locktime);
+            tl.advance_time(step);
+            maker.step(&mid).await.unwrap();
+        }
+        let held = fees(&mid).claim_children;
+        assert!(held.iter().all(|c| tl.feerate_of(&c.txid).is_some()));
+        // The next bump, a replacement of the held child, is written ahead and never sent.
+        tl.lose_next_new_broadcast();
+        loop {
+            assert!(tl.mtp() + step < locktime);
+            tl.advance_time(step);
+            let _ = maker.step(&mid).await;
+            if fees(&mid)
+                .claim_children
+                .iter()
+                .any(|c| tl.feerate_of(&c.txid).is_none())
+            {
+                break;
+            }
+        }
+        (mid, locktime, held)
+    };
+    let at_crash = fees(&mid).claim_feerate.unwrap();
+
+    // Restart on the same store; the climb resumes on top of the held child.
+    let maker = new_maker();
+    let mut seen = Vec::new();
+    while tl.mtp() + step < locktime {
+        tl.advance_time(step);
+        let _ = maker.step(&mid).await;
+        let rec = store.get_maker_swap(&mid).unwrap().unwrap();
+        assert_eq!(rec.state, SwapState::MakerClaimed);
+        seen.push(rec.claim_fees.claim_feerate.unwrap());
+    }
+    let f = fees(&mid);
+    let after = f.claim_feerate.unwrap();
+    assert!(
+        after > at_crash,
+        "{after} after the restart, {at_crash} at the crash: {seen:?}"
+    );
+    let n = f.claim_children.len();
+    assert!(n >= held.len() + 2, "{n} children: {seen:?}");
+    for (i, child) in f.claim_children.iter().enumerate() {
+        assert!(
+            tl.feerate_of(&child.txid).is_some(),
+            "child {i} of {n} not relayed: {seen:?}"
+        );
+    }
+    for child in &held {
+        assert!(
+            f.claim_children.contains(child),
+            "the held child stays in the package"
+        );
+    }
+    assert_eq!(tl.longest_unconfirmed_chain(), n as u64 + 1);
+
+    tl.mine(1);
+    assert_eq!(maker.step(&mid).await.unwrap(), SwapState::Done);
+}
