@@ -68,7 +68,12 @@ fn wallet_network(chain: &Chain) -> Network {
 }
 
 /// Secret key for a public key the wallet owns
+/// The wallet's secret for `pubkey`, only while fully unlocked: a staking-only
+/// unlock keeps keys in memory for staking, not for signing collateral messages
 fn wallet_secret(wallet: &WalletDb, pubkey: &[u8]) -> Option<SecretKey> {
+    if !wallet.is_fully_unlocked() {
+        return None;
+    }
     let id = hash160(pubkey);
     wallet.keystore().get_key(&id).and_then(|e| e.secret)
 }
@@ -526,6 +531,30 @@ mod tests {
         }
     }
 
+    /// NODE-5: the collateral key is not handed out while locked or unlocked
+    /// for staking only
+    #[test]
+    fn node05_collateral_key_needs_full_unlock() {
+        let dir = tempfile::tempdir().unwrap();
+        let wallet = WalletDb::create_persistent(
+            &dir.path().join("w"),
+            Network::Testnet,
+            divi_wallet::HdWallet::new(divi_primitives::ChainMode::Divi).unwrap(),
+        )
+        .unwrap();
+        let addr = wallet.new_receiving_address().unwrap();
+        let pubkey = wallet.get_key_by_address(&addr).unwrap().pubkey_bytes();
+        assert!(wallet_secret(&wallet, &pubkey).is_some());
+        wallet.encrypt_wallet("pw").unwrap();
+        wallet.lock();
+        assert!(wallet_secret(&wallet, &pubkey).is_none());
+        wallet.unlock_for("pw", 60, true).unwrap();
+        assert!(wallet_secret(&wallet, &pubkey).is_none());
+        wallet.lock();
+        wallet.unlock("pw", 60).unwrap();
+        assert!(wallet_secret(&wallet, &pubkey).is_some());
+    }
+
     #[test]
     fn store_roundtrip_and_persistence() {
         let dir = tempfile::tempdir().unwrap();
@@ -545,6 +574,35 @@ mod tests {
         let listed = list_broadcasts(&reloaded);
         assert_eq!(listed.as_array().unwrap().len(), 2);
         assert_eq!(listed[0]["outidx"], 1);
+    }
+
+    #[test]
+    fn node22_cache_is_replaced_atomically_and_privately() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mnbroadcasts.json");
+        // A cache left readable by an older version
+        std::fs::write(&path, "[]").unwrap();
+        let store = BroadcastStore::default();
+        store.set_path(path.clone());
+        assert!(store.add(&bcast(1)));
+        // A stale temporary file from a crash does not block the next save
+        std::fs::write(dir.path().join("mnbroadcasts.json.tmp"), "junk").unwrap();
+        assert!(store.add(&bcast(2)));
+
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("mnbroadcasts.json")]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        let reloaded = BroadcastStore::default();
+        reloaded.set_path(path);
+        assert_eq!(reloaded.list().len(), 2);
     }
 
     #[test]
@@ -576,35 +634,6 @@ mod tests {
             .starts_with("Could not create MN broadcast"));
         let r = start_masternode(&conf, "mn1", &store, true);
         assert_eq!(r["error"], "No broadcast message available");
-    }
-
-    #[test]
-    fn node22_cache_is_replaced_atomically_and_privately() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("mnbroadcasts.json");
-        // A cache left readable by an older version
-        std::fs::write(&path, "[]").unwrap();
-        let store = BroadcastStore::default();
-        store.set_path(path.clone());
-        assert!(store.add(&bcast(1)));
-        // A stale temporary file from a crash does not block the next save
-        std::fs::write(dir.path().join("mnbroadcasts.json.tmp"), "junk").unwrap();
-        assert!(store.add(&bcast(2)));
-
-        let names: Vec<_> = std::fs::read_dir(dir.path())
-            .unwrap()
-            .map(|e| e.unwrap().file_name())
-            .collect();
-        assert_eq!(names, vec![std::ffi::OsString::from("mnbroadcasts.json")]);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o600);
-        }
-        let reloaded = BroadcastStore::default();
-        reloaded.set_path(path);
-        assert_eq!(reloaded.list().len(), 2);
     }
 
     #[test]

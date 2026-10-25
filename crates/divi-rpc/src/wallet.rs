@@ -1102,7 +1102,13 @@ impl WalletRpc {
         }
 
         wallet
-            .unlock_for(passphrase, timeout as u32, staking_only)
+            // Longer than u32 seconds (136 years) is as good as unlimited; a plain
+            // cast would wrap a huge timeout to a short one
+            .unlock_for(
+                passphrase,
+                timeout.min(u32::MAX as u64) as u32,
+                staking_only,
+            )
             .map_err(|e| match e {
                 divi_wallet::WalletError::WrongPassphrase
                 | divi_wallet::WalletError::InvalidPassphrase => RpcError::new(
@@ -1749,7 +1755,8 @@ impl WalletRpc {
     /// signtransactionwithaddresskey - sign one input with the wallet key of an address.
     ///
     /// Mirrors C++: SIGHASH_SINGLE over a `<pubkey> OP_CHECKSIG` dummy script, and the result is
-    /// the asm of the resulting scriptSig (the bare signature).
+    /// the asm of the resulting scriptSig (the bare signature). Unlike C++ it needs a full
+    /// unlock and refuses an input with no matching output.
     pub fn sign_transaction_with_address_key(
         &self,
         params: &Params,
@@ -1782,6 +1789,7 @@ impl WalletRpc {
                 RpcError::new(codes::WALLET_ERROR, "Unable to sign for unknown address")
             })?;
         let wallet = self.get_wallet()?;
+        ensure_fully_unlocked(&wallet)?;
         let entry = wallet
             .keystore()
             .get_key_by_address(&address)
@@ -1789,6 +1797,16 @@ impl WalletRpc {
                 RpcError::new(codes::WALLET_ERROR, "Unable to sign for unknown address")
             })?;
         let unable = || RpcError::new(codes::WALLET_ERROR, "Unable to sign for input");
+        // SIGHASH_SINGLE with no output at the input's index hashes to the
+        // constant 1, so that signature would spend any coin of this key.
+        // Divi Core signs it; IronDivi refuses.
+        if input_index >= 0 && input_index as usize >= tx.vout.len() {
+            return Err(RpcError::new(
+                codes::INVALID_PARAMETER,
+                "Invalid parameter, SIGHASH_SINGLE needs an output at the input's index",
+            )
+            .into());
+        }
         let secret = entry
             .secret
             .as_ref()
@@ -4587,6 +4605,35 @@ mod tests {
         );
     }
 
+    /// NODE-5: SIGHASH_SINGLE on an input with no output at its index signs the
+    /// constant hash 1, which would let anyone spend every coin of the key
+    #[test]
+    fn node05_signtransactionwithaddresskey_refuses_hash_one() {
+        use divi_primitives::transaction::{TxIn, TxOut};
+        let rpc = create_test_wallet_rpc();
+        let addr = rpc.get_new_address(&Params::None).unwrap();
+        let input = |n| {
+            TxIn::new(
+                OutPoint::new(Hash256::from_bytes([n; 32]), 0),
+                Script::new(),
+                0xffff_ffff,
+            )
+        };
+        let tx = Transaction {
+            version: 1,
+            vin: vec![input(1), input(2)],
+            vout: vec![TxOut::new(Amount::from_sat(1000), Script::new())],
+            lock_time: 0,
+        };
+        let hex = hex::encode(serialize(&tx));
+        let at = |i: i64| Params::Array(vec![json!(hex), addr.clone(), json!(i)]);
+        assert!(rpc.sign_transaction_with_address_key(&at(0)).is_ok());
+        assert_eq!(
+            rpc_code(rpc.sign_transaction_with_address_key(&at(1)).unwrap_err()),
+            codes::INVALID_PARAMETER
+        );
+    }
+
     /// loadwallet used to say "restart IronDivi with the -wallet=<filename> option", but
     /// irondivid's option is --wallet=<directory>. The refusal must name the real option
     /// and the wallet in use, and must not switch or create anything.
@@ -5325,6 +5372,88 @@ mod send_unlock_regression {
         rpc.wallet_passphrase(&p(vec![json!(PASS), json!(timeout), json!(staking_only)]))
     }
 
+    /// NODE-5: signtransactionwithaddresskey needs a full unlock like every
+    /// other signing call
+    #[test]
+    fn node05_signtransactionwithaddresskey_needs_full_unlock() {
+        use divi_primitives::transaction::{TxIn, TxOut};
+        let (_dir, rpc, db, _) = encrypted_rpc();
+        unlock(&rpc, 0, false).unwrap();
+        let addr = rpc.get_new_address(&Params::None).unwrap();
+        db.lock();
+        let tx = Transaction {
+            version: 1,
+            vin: vec![TxIn::new(
+                OutPoint::new(Hash256::from_bytes([7; 32]), 0),
+                Script::new(),
+                0xffff_ffff,
+            )],
+            vout: vec![TxOut::new(Amount::from_sat(1000), Script::new())],
+            lock_time: 0,
+        };
+        let params = p(vec![json!(hex::encode(serialize(&tx))), addr, json!(0)]);
+        let need_unlock = codes::WALLET_UNLOCK_NEEDED;
+        assert_eq!(
+            err(rpc.sign_transaction_with_address_key(&params)).0,
+            need_unlock
+        );
+        unlock(&rpc, 0, true).unwrap();
+        assert_eq!(
+            err(rpc.sign_transaction_with_address_key(&params)).0,
+            need_unlock
+        );
+        db.lock();
+        unlock(&rpc, 0, false).unwrap();
+        assert!(rpc.sign_transaction_with_address_key(&params).is_ok());
+    }
+
+    /// NODE-14: backupwallet writes a consistent, owner-only checkpoint that
+    /// opens as a wallet, and never overwrites an existing backup
+    #[test]
+    fn node14_backupwallet_checkpoint_is_private_and_never_overwrites() {
+        let (_dir, rpc, db, _) = encrypted_rpc();
+        let out = tempfile::tempdir().unwrap();
+        let dst = out.path().join("bk");
+        let arg = |path: &std::path::Path| p(vec![json!(path.to_str().unwrap())]);
+        rpc.backup_wallet(&arg(&dst)).unwrap();
+        assert!(rpc.backup_wallet(&arg(&dst)).is_err());
+        // A directory destination gets the backup inside it, once
+        rpc.backup_wallet(&arg(out.path())).unwrap();
+        let inside = out.path().join(db.database_path().file_name().unwrap());
+        assert!(inside.is_dir());
+        assert!(rpc.backup_wallet(&arg(out.path())).is_err());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode();
+            assert_eq!(mode(&dst) & 0o777, 0o700);
+            for entry in std::fs::read_dir(&dst).unwrap() {
+                assert_eq!(mode(&entry.unwrap().path()) & 0o077, 0);
+            }
+        }
+        let restored = WalletDb::open(&dst, Network::Testnet).unwrap();
+        assert!(restored.is_encrypted());
+        let sorted = |w: &WalletDb| {
+            let mut a: Vec<String> = w.get_addresses().iter().map(|a| a.to_string()).collect();
+            a.sort();
+            a
+        };
+        assert_eq!(sorted(&restored), sorted(&db));
+    }
+
+    /// NODE-11: a timeout past u32 seconds must not wrap to a short unlock or to
+    /// 0 (unlimited by accident); it is capped
+    #[test]
+    fn node11_huge_unlock_timeout_does_not_wrap() {
+        let (_dir, rpc, db, _) = encrypted_rpc();
+        // 2^32 would wrap to 0, 2^32 + 1 to one second
+        unlock(&rpc, (1u64 << 32) + 1, false).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        assert!(!db.is_locked());
+        assert!(db.unlocked_until() > 0, "capped, not unlimited");
+    }
+
     #[test]
     fn staking_only_unlock_refuses_sends_and_exports() {
         let (_dir, rpc, db, sent) = encrypted_rpc();
@@ -5375,41 +5504,6 @@ mod send_unlock_regression {
         assert_eq!(locked, unlocked);
     }
 
-
-    /// NODE-14: backupwallet writes a consistent, owner-only checkpoint that
-    /// opens as a wallet, and never overwrites an existing backup
-    #[test]
-    fn node14_backupwallet_checkpoint_is_private_and_never_overwrites() {
-        let (_dir, rpc, db, _) = encrypted_rpc();
-        let out = tempfile::tempdir().unwrap();
-        let dst = out.path().join("bk");
-        let arg = |path: &std::path::Path| p(vec![json!(path.to_str().unwrap())]);
-        rpc.backup_wallet(&arg(&dst)).unwrap();
-        assert!(rpc.backup_wallet(&arg(&dst)).is_err());
-        // A directory destination gets the backup inside it, once
-        rpc.backup_wallet(&arg(out.path())).unwrap();
-        let inside = out.path().join(db.database_path().file_name().unwrap());
-        assert!(inside.is_dir());
-        assert!(rpc.backup_wallet(&arg(out.path())).is_err());
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode();
-            assert_eq!(mode(&dst) & 0o777, 0o700);
-            for entry in std::fs::read_dir(&dst).unwrap() {
-                assert_eq!(mode(&entry.unwrap().path()) & 0o077, 0);
-            }
-        }
-        let restored = WalletDb::open(&dst, Network::Testnet).unwrap();
-        assert!(restored.is_encrypted());
-        let sorted = |w: &WalletDb| {
-            let mut a: Vec<String> = w.get_addresses().iter().map(|a| a.to_string()).collect();
-            a.sort();
-            a
-        };
-        assert_eq!(sorted(&restored), sorted(&db));
-    }
     #[test]
     fn short_unlock_falls_back_to_staking_only() {
         let (_dir, rpc, db, _sent) = encrypted_rpc();

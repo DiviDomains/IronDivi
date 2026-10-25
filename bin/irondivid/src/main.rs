@@ -1405,6 +1405,10 @@ async fn run_daemon(
             wallet_network,
             config.network.chain_mode,
         )?);
+        if let Some(ref wallet_arc) = wallet {
+            // Timed unlocks drop their keys when they run out (NODE-6)
+            WalletDb::start_auto_lock(wallet_arc);
+        }
 
         // Register unified block-connected callback (mempool cleanup + fee estimation + wallet scan)
         if let Some(ref wallet_arc) = wallet {

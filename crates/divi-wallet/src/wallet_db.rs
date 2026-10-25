@@ -1133,6 +1133,9 @@ impl WalletDb {
     /// unlocked wallet derives the key and tops the keypool up. The key and the
     /// advanced index are stored before the address is returned.
     fn new_address(&self, is_change: bool) -> Result<Address, WalletError> {
+        // Apply an expired timeout before reading the flag, so a timed-out
+        // wallet does not derive from the seed it should have dropped
+        self.is_locked();
         // Held until the key is stored, so a concurrent lock() cannot strip it first
         let locked = self.locked.read();
         let mut store = Vec::new();
@@ -1907,6 +1910,30 @@ impl WalletDb {
         *self.locked.read()
     }
 
+    /// Apply timed unlocks when they run out, not only at the next call that
+    /// checks: a thread looks twice a second and locks the wallet (dropping its
+    /// secrets) once the timeout has passed. It holds a weak reference and ends
+    /// with the wallet.
+    pub fn start_auto_lock(wallet: &Arc<WalletDb>) {
+        let weak = Arc::downgrade(wallet);
+        let spawned = std::thread::Builder::new()
+            .name("wallet-autolock".into())
+            .spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                match weak.upgrade() {
+                    Some(wallet) => {
+                        if wallet.is_auto_lock_expired() {
+                            wallet.is_locked();
+                        }
+                    }
+                    None => break,
+                }
+            });
+        if let Err(e) = spawned {
+            error!("Could not start the wallet auto-lock thread: {}", e);
+        }
+    }
+
     /// Check if the auto-lock timeout has expired
     pub fn is_auto_lock_expired(&self) -> bool {
         if let Some(unlock_until) = self.unlock.read().until {
@@ -2120,9 +2147,10 @@ impl WalletDb {
         address
     }
 
-    /// Get mnemonic (if available and unlocked)
+    /// Get mnemonic (if available and fully unlocked)
     pub fn mnemonic(&self) -> Option<String> {
-        if *self.locked.read() {
+        // is_fully_unlocked() applies an expired timeout first
+        if !self.is_fully_unlocked() {
             return None;
         }
         self.keystore.mnemonic()
@@ -4701,6 +4729,70 @@ mod tests {
             register(&wallet, [0x55; 20], &manager, &vault);
             assert_eq!(wallet.vault_role(&vault), Some(VaultRole::Managed));
         }
+    }
+
+    fn timed_encrypted_wallet(dir: &std::path::Path) -> (Arc<WalletDb>, Address) {
+        let hd = HdWallet::from_mnemonic(TEST_MNEMONIC, None, ChainMode::Divi).unwrap();
+        let wallet =
+            WalletDb::create_persistent(&dir.join("wallet"), Network::Testnet, hd).unwrap();
+        wallet.save().unwrap();
+        wallet.encrypt_wallet("pw").unwrap();
+        wallet.unlock("pw", 60).unwrap();
+        let addr = wallet.new_receiving_address().unwrap();
+        wallet.lock();
+        (Arc::new(wallet), addr)
+    }
+
+    /// NODE-6: a timed unlock drops the secrets when it runs out, even if no
+    /// RPC call comes along to check the lock.
+    #[test]
+    fn node06_timed_unlock_relocks_without_a_caller() {
+        let dir = tempfile::tempdir().unwrap();
+        let (wallet, addr) = timed_encrypted_wallet(dir.path());
+        wallet.unlock("pw", 1).unwrap();
+        assert!(wallet.get_key_by_address(&addr).unwrap().secret.is_some());
+        WalletDb::start_auto_lock(&wallet);
+        std::thread::sleep(std::time::Duration::from_millis(2_200));
+        // Read the keystore directly: is_locked() would lock it itself
+        assert!(wallet.get_key_by_address(&addr).unwrap().secret.is_none());
+        assert!(*wallet.locked.read());
+    }
+
+    /// NODE-6: the auto-lock thread ends with the wallet.
+    #[test]
+    fn node06_auto_lock_thread_lets_the_wallet_go() {
+        let dir = tempfile::tempdir().unwrap();
+        let (wallet, _) = timed_encrypted_wallet(dir.path());
+        WalletDb::start_auto_lock(&wallet);
+        let weak = Arc::downgrade(&wallet);
+        drop(wallet);
+        assert!(weak.upgrade().is_none());
+    }
+
+    /// NODE-16: the mnemonic is not given out after the unlock has run out,
+    /// nor while unlocked for staking only.
+    #[test]
+    fn node16_mnemonic_needs_a_live_full_unlock() {
+        let dir = tempfile::tempdir().unwrap();
+        let (wallet, _) = timed_encrypted_wallet(dir.path());
+        wallet.unlock_for("pw", 60, true).unwrap();
+        assert!(wallet.mnemonic().is_none());
+        wallet.lock();
+        wallet.unlock("pw", 1).unwrap();
+        assert!(wallet.mnemonic().is_some());
+        std::thread::sleep(std::time::Duration::from_millis(1_200));
+        assert!(wallet.mnemonic().is_none());
+    }
+
+    /// NODE-16: no new address is derived after the unlock has run out.
+    #[test]
+    fn node16_new_address_after_timeout_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (wallet, _) = timed_encrypted_wallet(dir.path());
+        wallet.unlock("pw", 1).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1_200));
+        assert!(wallet.new_receiving_address().is_err());
+        assert!(*wallet.locked.read());
     }
 
     fn files_containing(dir: &std::path::Path, needle: &[u8]) -> Vec<std::path::PathBuf> {
