@@ -185,10 +185,33 @@ impl BroadcastStore {
         };
         let list: Vec<String> = self.entries.lock().values().map(hex::encode).collect();
         match serde_json::to_string(&list) {
-            Ok(text) => std::fs::write(path, text).is_ok(),
+            Ok(text) => write_private(&path, text.as_bytes()).is_ok(),
             Err(_) => false,
         }
     }
+}
+
+/// Replace `path` with `contents`, mode 0600, through a synced temporary file
+/// and a rename, so a crash never leaves half a cache (NODE-22).
+fn write_private(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = std::path::PathBuf::from(tmp);
+    let _ = std::fs::remove_file(&tmp);
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&tmp)?;
+    file.write_all(contents)?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&tmp, path)
 }
 
 /// One `masternode.conf` line: `alias ip:port masternodePrivKey txhash outidx`
@@ -553,6 +576,35 @@ mod tests {
             .starts_with("Could not create MN broadcast"));
         let r = start_masternode(&conf, "mn1", &store, true);
         assert_eq!(r["error"], "No broadcast message available");
+    }
+
+    #[test]
+    fn node22_cache_is_replaced_atomically_and_privately() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mnbroadcasts.json");
+        // A cache left readable by an older version
+        std::fs::write(&path, "[]").unwrap();
+        let store = BroadcastStore::default();
+        store.set_path(path.clone());
+        assert!(store.add(&bcast(1)));
+        // A stale temporary file from a crash does not block the next save
+        std::fs::write(dir.path().join("mnbroadcasts.json.tmp"), "junk").unwrap();
+        assert!(store.add(&bcast(2)));
+
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("mnbroadcasts.json")]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        let reloaded = BroadcastStore::default();
+        reloaded.set_path(path);
+        assert_eq!(reloaded.list().len(), 2);
     }
 
     #[test]
