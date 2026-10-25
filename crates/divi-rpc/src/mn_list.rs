@@ -140,6 +140,8 @@ pub struct MasternodeList {
     /// (mapSeenMasternodeBroadcast, mapSeenMasternodePing)
     seen_broadcasts: RwLock<HashMap<[u8; 32], CppBroadcast>>,
     seen_pings: RwLock<HashMap<[u8; 32], CppPing>>,
+    /// IsBlockchainSynced's state: synced once, and when it was last checked
+    chain_synced: Mutex<(bool, i64)>,
     /// When each masternode may be asked for again
     /// (mWeAskedForMasternodeListEntry, MasternodeNetworkMessageManager.cpp:191-205)
     asked_entries: Mutex<HashMap<([u8; 32], u32), i64>>,
@@ -366,6 +368,24 @@ impl MasternodeList {
         if let Some(seen) = self.seen_broadcasts.write().get_mut(&mnb.hash()) {
             seen.last_ping = mnb.last_ping.clone();
         }
+    }
+
+    /// IsBlockchainSynced, which divid's masternode messages wait for: the tip
+    /// at most ten minutes old; once so it stays so, unless more than an hour
+    /// passes between two checks (MasternodeHelpers.cpp:27-66,
+    /// MasternodeModule.cpp:371-382)
+    pub fn blockchain_synced(&self, chain: &Chain) -> bool {
+        let now = now();
+        let mut state = self.chain_synced.lock();
+        let stalled = state.1 != 0 && now - state.1 > 3600;
+        state.1 = now;
+        if stalled {
+            state.0 = false;
+        }
+        if !state.0 {
+            state.0 = chain.tip().is_some_and(|t| t.time as i64 + 600 >= now);
+        }
+        state.0
     }
 
     /// recordMasternodeEntryRequestAttempt: the `dseg` payload asking for the

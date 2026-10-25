@@ -101,12 +101,17 @@ impl Node {
 
     /// Mine a block with the transactions sent so far; the coinbase pays the wallet
     fn mine(&self) {
+        self.mine_at(self.chain.tip().unwrap().time + 60);
+    }
+
+    /// Mine a block with the time `time`
+    fn mine_at(&self, time: u32) {
         let tip = self.chain.tip().unwrap();
         let height = tip.height + 1;
         let mut block = Block::default();
         block.header.version = 4;
         block.header.prev_block = tip.hash;
-        block.header.time = tip.time + 60;
+        block.header.time = time;
         block.header.bits = 0x207fffff;
         let mut cb_sig = divi_storage::bip34_height_script(height);
         cb_sig.extend_from_slice(&height.to_le_bytes());
@@ -734,4 +739,23 @@ fn votes_follow_the_masternode_sync_as_divid() {
     n.votes.set_sync_finished(false);
     assert_eq!(vote(7, payee_script(&mnb), &other).unwrap_err().dos, 0);
     assert_eq!(vote(8, vec![0x51], &mn_key), Ok(true));
+}
+
+/// Masternode messages wait for the chain to be synced: a tip at most ten
+/// minutes old; once it has been, an older tip does not undo it
+/// (MasternodeHelpers.cpp:27-66)
+#[test]
+fn masternode_messages_wait_for_a_recent_tip() {
+    let n = funded();
+    assert!(!n.list.blockchain_synced(&n.chain), "a tip from 2014");
+    n.mine_at(now() as u32 - 300);
+    assert!(n.list.blockchain_synced(&n.chain));
+    n.mine_at(now() as u32 - 250);
+    assert!(n.list.blockchain_synced(&n.chain));
+    let fresh = node();
+    fresh.mine_at(now() as u32 - 900);
+    assert!(
+        !fresh.list.blockchain_synced(&fresh.chain),
+        "a tip 15 minutes old"
+    );
 }

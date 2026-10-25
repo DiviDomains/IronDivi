@@ -1231,6 +1231,19 @@ impl Node {
                             NetworkMessage::RequestMasternodeList(_) => {
                                 tracing::debug!("dseg from peer {} not answered", peer_id);
                             }
+                            // Masternode messages are read once the chain is
+                            // synced (ProcessMasternodeMessages,
+                            // MasternodeModule.cpp:371-382)
+                            NetworkMessage::MasternodeBroadcast(_)
+                            | NetworkMessage::MasternodePing(_)
+                            | NetworkMessage::MasternodeWinner(_)
+                                if !masternode_list.blockchain_synced(&chain) =>
+                            {
+                                tracing::debug!(
+                                    "Masternode message from peer {} not read: the chain is not synced",
+                                    peer_id
+                                );
+                            }
                             // Broadcasts and pings in Divi Core's wire format, kept
                             // when they pass its checks (mn_list)
                             NetworkMessage::MasternodeBroadcast(payload) => {
