@@ -302,21 +302,31 @@ fn basic_select<'a>(
         return Vec::new();
     }
 
-    // Core's priority (MinimumFeeCoinSelectionAlgorithm.cpp:127-140): for vault
-    // change the least confirmed coin first; then coins that cover the need
-    // alone, the smaller scriptSig first; then the larger value net of its own
-    // input fee first
-    let gap = |c: &SendCoin| c.utxo.value.as_sat() - fee(c.input_bytes);
+    // The coins in the order Divi Core hands them over: AvailableCoins walks
+    // the wallet's map of transactions, by txid, confirmed coins first and then
+    // (with -spendzeroconfchange) unconfirmed ones (AvailableUtxoCollector.cpp:26-35)
     candidates.sort_by_key(|c| {
-        let depth = if change == ChangeKind::Vault {
-            c.depth
-        } else {
-            0
-        };
-        let covers = gap(c) >= needed;
-        let rank = if covers { 0 } else { -gap(c) };
-        (depth, !covers, rank, c.input_bytes)
+        let outpoint = c.utxo.outpoint();
+        (c.depth == 0, outpoint.txid.to_string(), outpoint.vout)
     });
+    // Core's priority (MinimumFeeCoinSelectionAlgorithm.cpp:127-140): for vault
+    // change the least confirmed coin first; of two coins that each cover the
+    // need alone, the smaller scriptSig first; otherwise the larger value net
+    // of its own input fee first, then the smaller scriptSig. Coins it ranks
+    // alike keep no order of their own: they come where std::sort leaves them.
+    let gap = |c: &SendCoin| c.utxo.value.as_sat() - fee(c.input_bytes);
+    let before = |a: &&SendCoin, b: &&SendCoin| {
+        if change == ChangeKind::Vault && a.depth != b.depth {
+            return a.depth < b.depth;
+        }
+        let (gap_a, gap_b) = (gap(a), gap(b));
+        if gap_a >= needed && gap_b >= needed {
+            a.input_bytes < b.input_bytes
+        } else {
+            gap_a > gap_b || (gap_a == gap_b && a.input_bytes < b.input_bytes)
+        }
+    };
+    std_sort(&mut candidates, before);
 
     let mut selected = Vec::new();
     let mut covered = 0i64;
@@ -480,6 +490,198 @@ pub fn check_signed(tx: &Transaction, fee: Amount, policy: FeePolicy) -> Result<
     Ok(())
 }
 
+/// libstdc++'s `std::sort` (bits/stl_algo.h), which Divi Core's selection
+/// sorts its coins with: an introsort that ends in an insertion sort, so
+/// elements `less` ranks alike come out in the order it leaves them, the
+/// same order every time for the same input. Ported step by step, so the
+/// order of such elements is libstdc++'s.
+fn std_sort<T>(v: &mut [T], less: impl Fn(&T, &T) -> bool) {
+    let n = v.len();
+    if n < 2 {
+        return;
+    }
+    let depth_limit = 2 * (usize::BITS - 1 - n.leading_zeros()) as usize;
+    introsort_loop(v, 0, n, depth_limit, &less);
+    final_insertion_sort(v, 0, n, &less);
+}
+
+/// `_S_threshold`: ranges this short are left to the insertion sort
+const SORT_THRESHOLD: usize = 16;
+
+fn introsort_loop<T>(
+    v: &mut [T],
+    first: usize,
+    mut last: usize,
+    mut depth_limit: usize,
+    less: &impl Fn(&T, &T) -> bool,
+) {
+    while last - first > SORT_THRESHOLD {
+        if depth_limit == 0 {
+            heap_sort(v, first, last, less);
+            return;
+        }
+        depth_limit -= 1;
+        let cut = unguarded_partition_pivot(v, first, last, less);
+        introsort_loop(v, cut, last, depth_limit, less);
+        last = cut;
+    }
+}
+
+fn unguarded_partition_pivot<T>(
+    v: &mut [T],
+    first: usize,
+    last: usize,
+    less: &impl Fn(&T, &T) -> bool,
+) -> usize {
+    let mid = first + (last - first) / 2;
+    move_median_to_first(v, first, first + 1, mid, last - 1, less);
+    unguarded_partition(v, first + 1, last, first, less)
+}
+
+fn move_median_to_first<T>(
+    v: &mut [T],
+    result: usize,
+    a: usize,
+    b: usize,
+    c: usize,
+    less: &impl Fn(&T, &T) -> bool,
+) {
+    let pick = if less(&v[a], &v[b]) {
+        if less(&v[b], &v[c]) {
+            b
+        } else if less(&v[a], &v[c]) {
+            c
+        } else {
+            a
+        }
+    } else if less(&v[a], &v[c]) {
+        a
+    } else if less(&v[b], &v[c]) {
+        c
+    } else {
+        b
+    };
+    v.swap(result, pick);
+}
+
+fn unguarded_partition<T>(
+    v: &mut [T],
+    mut first: usize,
+    mut last: usize,
+    pivot: usize,
+    less: &impl Fn(&T, &T) -> bool,
+) -> usize {
+    loop {
+        while first < v.len() && less(&v[first], &v[pivot]) {
+            first += 1;
+        }
+        last -= 1;
+        while last > 0 && less(&v[pivot], &v[last]) {
+            last -= 1;
+        }
+        if first >= last {
+            return first;
+        }
+        v.swap(first, last);
+        first += 1;
+    }
+}
+
+fn final_insertion_sort<T>(v: &mut [T], first: usize, last: usize, less: &impl Fn(&T, &T) -> bool) {
+    if last - first > SORT_THRESHOLD {
+        insertion_sort(v, first, first + SORT_THRESHOLD, less);
+        for i in first + SORT_THRESHOLD..last {
+            unguarded_linear_insert(v, i, first, less);
+        }
+    } else {
+        insertion_sort(v, first, last, less);
+    }
+}
+
+fn insertion_sort<T>(v: &mut [T], first: usize, last: usize, less: &impl Fn(&T, &T) -> bool) {
+    for i in first + 1..last {
+        if less(&v[i], &v[first]) {
+            // move_backward: v[i] to the front, the rest one place up
+            v[first..=i].rotate_right(1);
+        } else {
+            unguarded_linear_insert(v, i, first, less);
+        }
+    }
+}
+
+/// Move v[i] down past every element it ranks before; `floor` only keeps the
+/// index in bounds (libstdc++ relies on an element at or before it that stops)
+fn unguarded_linear_insert<T>(
+    v: &mut [T],
+    mut i: usize,
+    floor: usize,
+    less: &impl Fn(&T, &T) -> bool,
+) {
+    while i > floor && less(&v[i], &v[i - 1]) {
+        v.swap(i, i - 1);
+        i -= 1;
+    }
+}
+
+/// `std::__partial_sort(first, last, last)`: make_heap, then sort_heap
+fn heap_sort<T>(v: &mut [T], first: usize, last: usize, less: &impl Fn(&T, &T) -> bool) {
+    let len = last - first;
+    if len < 2 {
+        return;
+    }
+    let mut parent = (len - 2) / 2;
+    loop {
+        adjust_heap(v, first, parent, len, less);
+        if parent == 0 {
+            break;
+        }
+        parent -= 1;
+    }
+    let mut end = len;
+    while end > 1 {
+        end -= 1;
+        // __pop_heap: the top to the end, the old end element sifted from the top
+        v.swap(first, first + end);
+        adjust_heap(v, first, 0, end, less);
+    }
+}
+
+/// `std::__adjust_heap` with `__push_heap`: sift the element at `hole` down to
+/// a leaf along the larger children, then back up to its place
+fn adjust_heap<T>(
+    v: &mut [T],
+    base: usize,
+    mut hole: usize,
+    len: usize,
+    less: &impl Fn(&T, &T) -> bool,
+) {
+    let top = hole;
+    let mut child = hole;
+    while child < (len - 1) / 2 {
+        child = 2 * (child + 1);
+        if less(&v[base + child], &v[base + child - 1]) {
+            child -= 1;
+        }
+        v.swap(base + hole, base + child);
+        hole = child;
+    }
+    if len.is_multiple_of(2) && child == (len - 2) / 2 {
+        child = 2 * (child + 1);
+        v.swap(base + hole, base + child - 1);
+        hole = child - 1;
+    }
+    // __push_heap: the value now at `hole` rises while its parent ranks before it
+    while hole > top {
+        let parent = (hole - 1) / 2;
+        if less(&v[base + parent], &v[base + hole]) {
+            v.swap(base + parent, base + hole);
+            hole = parent;
+        } else {
+            break;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -522,6 +724,101 @@ mod tests {
 
     fn pay(sats: i64) -> TxOut {
         TxOut::new(Amount::from_sat(sats), p2pkh(0xbb))
+    }
+
+    /// Of coins that each cover a send alone, Divi Core spends the one its
+    /// wallet map lists first, the lowest txid, whatever order the wallet keeps
+    /// them in (AvailableUtxoCollector.cpp:26-35, then std::sort)
+    #[test]
+    fn a_tie_goes_to_the_coin_of_the_lowest_txid() {
+        let coins = [
+            coin(9, 100 * COIN, 6),
+            coin(7, 100 * COIN, 6),
+            coin(5, 100 * COIN, 6),
+        ];
+        let plan = plan(&[pay(COIN)], &coins, FeeMode::SenderPays).unwrap();
+        let spent: Vec<_> = plan.inputs.iter().map(|u| u.outpoint().txid).collect();
+        assert_eq!(spent, vec![Hash256::from_bytes([5; 32])]);
+    }
+
+    /// Equal coins that do not cover the send alone are taken in the same
+    /// order: ten coins of 0.1, a send of 0.25 spends the three lowest txids
+    #[test]
+    fn equal_small_coins_are_taken_in_txid_order() {
+        let coins: Vec<SendCoin> = (1..=10u8).rev().map(|t| coin(t, COIN / 10, 6)).collect();
+        let plan = plan(&[pay(COIN / 4)], &coins, FeeMode::SenderPays).unwrap();
+        let mut spent: Vec<_> = plan.inputs.iter().map(|u| u.outpoint().txid).collect();
+        spent.sort_by_key(|t| t.to_string());
+        let want: Vec<_> = (1..=3u8).map(|t| Hash256::from_bytes([t; 32])).collect();
+        assert_eq!(spent, want);
+    }
+
+    /// The order libstdc++'s std::sort (GCC 11, the same algorithm as the
+    /// GCC 7.5 Divi Core 3.0.0 is built with) leaves elements with equal keys
+    /// in: keys 0-3 from the C library's rand() recurrence, sorted by key
+    /// only, then sorted by std::partial_sort(first, last, last), the heap
+    /// sort an introsort falls back to
+    #[test]
+    fn std_sort_leaves_ties_where_libstdcxx_does() {
+        let mut seed: u32 = 12345;
+        let mut next = move || {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            (seed >> 16) & 0x7fff
+        };
+        let mut keys =
+            |n: usize| -> Vec<(u32, usize)> { (0..n).map(|i| (next() % 4, i)).collect() };
+        let ids = |v: &[(u32, usize)]| v.iter().map(|p| p.1).collect::<Vec<_>>();
+        let by_key = |a: &(u32, usize), b: &(u32, usize)| a.0 < b.0;
+        let sorted: [(usize, &[usize]); 5] = [
+            (10, &[0, 1, 2, 5, 6, 9, 3, 7, 8, 4]),
+            (
+                17,
+                &[16, 15, 13, 5, 7, 0, 9, 8, 14, 11, 6, 2, 10, 12, 4, 3, 1],
+            ),
+            (
+                25,
+                &[
+                    0, 23, 5, 20, 18, 13, 1, 24, 22, 21, 17, 15, 14, 11, 16, 8, 7, 4, 2, 12, 10, 9,
+                    19, 6, 3,
+                ],
+            ),
+            (
+                40,
+                &[
+                    39, 38, 37, 34, 8, 28, 27, 18, 13, 14, 17, 1, 32, 30, 29, 26, 9, 0, 16, 10, 11,
+                    6, 15, 3, 35, 4, 5, 31, 21, 20, 25, 22, 7, 12, 19, 33, 24, 36, 23, 2,
+                ],
+            ),
+            (
+                64,
+                &[
+                    51, 40, 28, 41, 43, 45, 48, 32, 16, 52, 55, 12, 58, 33, 8, 59, 4, 5, 61, 3, 42,
+                    24, 6, 20, 19, 9, 39, 37, 35, 1, 47, 49, 50, 57, 60, 34, 15, 17, 18, 11, 10, 7,
+                    2, 25, 26, 27, 29, 30, 56, 0, 62, 63, 13, 54, 53, 14, 21, 22, 46, 23, 44, 38,
+                    31, 36,
+                ],
+            ),
+        ];
+        for (n, want) in sorted {
+            let mut v = keys(n);
+            std_sort(&mut v, by_key);
+            assert_eq!(ids(&v), want, "std::sort of {n}");
+        }
+        let heaped: [(usize, &[usize]); 2] = [
+            (9, &[4, 2, 1, 8, 0, 7, 5, 3, 6]),
+            (
+                25,
+                &[
+                    16, 0, 20, 14, 19, 23, 18, 3, 1, 9, 24, 2, 6, 13, 15, 8, 4, 22, 11, 12, 7, 17,
+                    10, 21, 5,
+                ],
+            ),
+        ];
+        for (n, want) in heaped {
+            let mut v = keys(n);
+            heap_sort(&mut v, 0, n, &by_key);
+            assert_eq!(ids(&v), want, "std::partial_sort of {n}");
+        }
     }
 
     /// The fees a Divi Core 3.0.0 regtest wallet paid: 2,260 sat for one input
