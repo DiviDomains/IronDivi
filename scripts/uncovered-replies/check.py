@@ -25,6 +25,9 @@ import time
 import urllib.error
 import urllib.request
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "lib"))
+import member_order  # noqa: E402  (scripts/lib: the order check the replies scripts share)
+
 IRONDIVID, DIVID, PORT_BASE, WORK = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
 # For the proof that a difference is caught: irondivid's reply of the named row is
 # changed before it is compared
@@ -56,8 +59,13 @@ fails = 0
 counts = {"PASS": 0, "KNOWN": 0, "FAIL": 0}
 
 
-def row(name, core, iron, same):
+def row(name, core, iron, same, moved=None):
     global fails
+    if moved:
+        # The same members or items in another order than divid's: a FAIL of its own kind
+        fails += 1
+        print(f"ORDER  {name}  {moved}  divid={core}  irondivid={iron}"[:400], flush=True)
+        return
     reason = KNOWN.get(name)
     if reason:
         word = "KNOWN" if not same else "FAIL"
@@ -219,10 +227,11 @@ def compare(name, method, core, iron):
             dump(name, core, iron)
         row(name, short(core), short(iron), same)
         return
+    moved = member_order.difference(core[1], iron[1])
     d = first_difference(core[1], iron[1])
     if d:
         dump(name, core, iron)
-    row(name, short(core), d or short(iron), d is None)
+    row(name, short(core), d or short(iron), d is None, moved=moved)
 
 
 def both(name, method, *params):

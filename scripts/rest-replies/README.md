@@ -7,6 +7,8 @@ Then it restarts both with `-rest=0` and asks again. Each row prints one line:
 - `PASS`: same as divid;
 - `KNOWN`: differs, and the difference is listed below with the reason;
 - `FAIL`: differs and should not, or a `KNOWN` row that now matches divid (the list below is out of date).
+- `ORDER`: the same members or list items as divid's, in another order (a FAIL, counted in `FAILS`). The line
+  names the first object or list that differs and both orders (`scripts/lib/member_order.py`).
 
 The run ends with `FAILS <n>`; the exit code is the number of FAILs (255: usage error, interrupted, or over 10 minutes).
 
@@ -99,7 +101,7 @@ How a row compares:
 - the same status and the same `Content-Type`;
 - `.hex`, `.bin` and every text body: byte for byte;
 - JSON bodies: field by field, reals as each node writes them (the text of the number), and both ending in a
-  newline. Members are compared in any order: irondivid writes them in name order, as all its JSON replies.
+  newline. The order of members and list items is compared too (the `ORDER` rows).
 
 ## KNOWN differences
 

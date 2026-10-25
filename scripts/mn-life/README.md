@@ -68,7 +68,8 @@ divid, but their masternodes were set up and started by different controllers.
 
 How a row compares:
 - the same outcome; an error with the same code and first line;
-- a result with the same fields, JSON types and values, the members compared as sets (see KNOWN for their order).
+- a result with the same fields, JSON types and values, the members compared as sets; the order of the members
+  is compared once, for `setupmasternode`.
 - Left out, because they change from one moment to the next: `lastseen`, `activetime`, `lastpaid`, `sigtime`,
   `timestamp`.
 - `mnsync status` is compared by its fields and by `IsBlockchainSynced` and `currentMasternodeSyncStatus`; its counters
@@ -117,8 +118,6 @@ What the payment rows check (Divi Core 3.0.0):
 
 ## KNOWN differences
 
-- **Member order** (one row, for `setupmasternode`): irondivid writes a result's members in name order
-  (`docs/divid-differences.md` R6). Every other row compares the members as sets.
 - **`getmasternodecount: tier counts divid lacks`**: irondivid adds `copper`, `silver`, `gold`, `platinum`,
   `diamond`, as in scripts/masternode-replies.
 - **`mnsync status`, while divid is still in a sync stage** (the rows before the network is up and right after the
