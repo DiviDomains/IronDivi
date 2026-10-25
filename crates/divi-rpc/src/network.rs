@@ -664,20 +664,34 @@ mod tests {
         }
     }
 
+    /// A peer manager listening on a port from `free_port`. The listener is
+    /// bound before `start` runs (`bind_listeners`), so a port that was taken
+    /// since is reported at once, and the manager built again on another port.
+    async fn listening_server() -> (Arc<PeerManager>, std::net::SocketAddr) {
+        for _ in 0..5 {
+            let listen =
+                std::net::SocketAddr::from(([127, 0, 0, 1], divi_test_support::free_port()));
+            let server = PeerManager::new(divi_network::PeerManagerConfig {
+                listen_addr: Some(listen),
+                ..quiet_config()
+            });
+            if let Err(e) = server.bind_listeners().await {
+                eprintln!("{e}: trying another port");
+                continue;
+            }
+            tokio::spawn(Arc::clone(&server).start());
+            return (server, listen);
+        }
+        panic!("no listening port could be bound in 5 tries");
+    }
+
     /// Two nodes on localhost: the per-peer counters and the in/out split must be real.
     /// getpeerinfo used to show pingtime 0 (no ping until 30 s in, then rounded to whole
     /// milliseconds) and getnetworkinfo had no in/out split, so `-getinfo` printed 0/0.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_peer_counters_and_connection_split_are_real() {
         use std::time::Duration;
-        let listen: std::net::SocketAddr = format!("127.0.0.1:{}", divi_test_support::free_port())
-            .parse()
-            .unwrap();
-        let server = PeerManager::new(divi_network::PeerManagerConfig {
-            listen_addr: Some(listen),
-            ..quiet_config()
-        });
-        tokio::spawn(Arc::clone(&server).start());
+        let (server, listen) = listening_server().await;
         let client = PeerManager::new(quiet_config());
         let mut connected = false;
         for _ in 0..50 {
@@ -736,14 +750,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_ping_rpc_pings_every_peer() {
         use std::time::Duration;
-        let listen: std::net::SocketAddr = format!("127.0.0.1:{}", divi_test_support::free_port())
-            .parse()
-            .unwrap();
-        let server = PeerManager::new(divi_network::PeerManagerConfig {
-            listen_addr: Some(listen),
-            ..quiet_config()
-        });
-        tokio::spawn(Arc::clone(&server).start());
+        let (server, listen) = listening_server().await;
         let client = PeerManager::new(quiet_config());
         let mut connected = false;
         for _ in 0..50 {
@@ -815,14 +822,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_addnode_onetry_dials_once_now() {
         use std::time::Duration;
-        let listen: std::net::SocketAddr = format!("127.0.0.1:{}", divi_test_support::free_port())
-            .parse()
-            .unwrap();
-        let server = PeerManager::new(divi_network::PeerManagerConfig {
-            listen_addr: Some(listen),
-            ..quiet_config()
-        });
-        tokio::spawn(Arc::clone(&server).start());
+        let (server, listen) = listening_server().await;
         let client = PeerManager::new(quiet_config());
         let mut connected = false;
         for _ in 0..50 {
@@ -1067,14 +1067,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_peer_info_members_are_in_cores_order() {
         use std::time::Duration;
-        let listen: std::net::SocketAddr = format!("127.0.0.1:{}", divi_test_support::free_port())
-            .parse()
-            .unwrap();
-        let server = PeerManager::new(divi_network::PeerManagerConfig {
-            listen_addr: Some(listen),
-            ..quiet_config()
-        });
-        tokio::spawn(Arc::clone(&server).start());
+        let (server, listen) = listening_server().await;
         let client = PeerManager::new(quiet_config());
         let mut connected = false;
         for _ in 0..50 {
