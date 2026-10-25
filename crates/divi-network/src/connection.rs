@@ -338,6 +338,9 @@ impl Connection {
         }
         self.info.services = their_version.services;
         self.info.start_height = their_version.start_height;
+        // fRelayTxes from the version message, true when it names none
+        // (Divi Core main.cpp:388-391)
+        self.stats.bloom.set_relay(their_version.relay);
         self.info.version = Some(their_version);
         self.info.state = PeerState::VersionReceived;
 

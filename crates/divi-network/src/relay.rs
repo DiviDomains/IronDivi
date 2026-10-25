@@ -88,7 +88,14 @@ pub struct TxRelay {
 
     /// Event channel for received transactions
     event_tx: broadcast::Sender<TxRelayEvent>,
+
+    /// The mempool's transaction by txid, so an announcement can be held to
+    /// each peer's bloom filter
+    tx_source: RwLock<Option<TxSource>>,
 }
+
+/// Looks a transaction up by txid (the node's mempool)
+pub type TxSource = Arc<dyn Fn(&Hash256) -> Option<Transaction> + Send + Sync>;
 
 impl TxRelay {
     /// Create a new transaction relay manager
@@ -104,7 +111,13 @@ impl TxRelay {
             request_queue: RwLock::new(VecDeque::new()),
             recently_announced: RwLock::new(HashMap::new()),
             event_tx,
+            tx_source: RwLock::new(None),
         })
+    }
+
+    /// Where announcements find the transaction to test peers' filters with
+    pub fn set_tx_source(&self, source: TxSource) {
+        *self.tx_source.write() = Some(source);
     }
 
     /// Subscribe to transaction events
@@ -375,8 +388,12 @@ impl TxRelay {
         self.relay_tx(txid, None).await;
     }
 
-    /// Relay a transaction to peers that don't have it
+    /// Relay a transaction to peers that don't have it: only to a peer that
+    /// wants transactions, and that one's bloom filter matches (which the match
+    /// updates), as Divi Core's RelayTransaction (net.cpp:1593-1606)
     async fn relay_tx(&self, txid: Hash256, exclude_peer: Option<PeerId>) {
+        let source = self.tx_source.read().clone();
+        let tx = source.and_then(|lookup| lookup(&txid));
         let peers_to_notify: Vec<PeerId> = {
             let peer_inventory = self.peer_inventory.read();
             let all_peers = self.peer_manager.connected_peers();
@@ -396,7 +413,16 @@ impl TxRelay {
                         }
                     }
 
-                    true
+                    let Some(stats) = self.peer_manager.peer_stats(peer_id) else {
+                        return true;
+                    };
+                    if !stats.bloom.relays_txs() {
+                        return false;
+                    }
+                    match &tx {
+                        Some(tx) => stats.bloom.filter().is_relevant_and_update(tx),
+                        None => true,
+                    }
                 })
                 .collect()
         };

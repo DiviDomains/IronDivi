@@ -444,3 +444,51 @@ fn filtered_block_getdata_gets_a_merkleblock_and_the_matched_transactions() {
         }
     }
 }
+
+/// Whether an inv of `txid` (display hex) came within the messages
+fn inv_of(got: &[(String, Vec<u8>)], txid: &str) -> bool {
+    let mut hash = hex::decode(txid).unwrap();
+    hash.reverse();
+    got.iter()
+        .any(|(c, p)| c == "inv" && p.windows(32).any(|w| w == hash.as_slice()))
+}
+
+/// A new transaction is announced as Divi Core announces it
+/// (net.cpp:1593-1606, main.cpp:388-391): not to a peer whose version asked
+/// for no relay, nor to one whose filter does not match it; to a peer with no
+/// filter message, and again after filterclear
+#[test]
+fn transactions_are_announced_by_each_peer_s_relay_flag_and_filter() {
+    let daemon = Daemon::start(&[]);
+    daemon.rpc("setgenerate", json!([21]));
+    let mut quiet = Peer::connect(daemon.p2p_port, false);
+    let mut plain = Peer::connect(daemon.p2p_port, true);
+    let mut filtered = Peer::connect(daemon.p2p_port, true);
+    filtered.send("filterload", &filterload(10, 0));
+    std::thread::sleep(Duration::from_secs(1));
+
+    let to = daemon.rpc("getnewaddress", json!([]));
+    let txid = daemon.rpc("sendtoaddress", json!([to, 1]));
+    let txid = txid.as_str().unwrap();
+    assert!(
+        inv_of(&plain.drain(Duration::from_secs(5)), txid),
+        "no inv to a plain peer"
+    );
+    assert!(
+        !inv_of(&quiet.drain(Duration::from_secs(1)), txid),
+        "inv to a relay=0 peer"
+    );
+    assert!(
+        !inv_of(&filtered.drain(Duration::from_secs(1)), txid),
+        "inv past a filter"
+    );
+
+    filtered.send("filterclear", &[]);
+    std::thread::sleep(Duration::from_secs(1));
+    let second = daemon.rpc("sendtoaddress", json!([to, 1]));
+    let second = second.as_str().unwrap();
+    assert!(
+        inv_of(&filtered.drain(Duration::from_secs(5)), second),
+        "no inv after filterclear"
+    );
+}

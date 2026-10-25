@@ -624,6 +624,10 @@ impl Node {
 
         // Create transaction relay manager
         let tx_relay = TxRelay::new(Arc::clone(&peer_manager));
+        let mempool_for_filters = Arc::clone(&mempool);
+        tx_relay.set_tx_source(Arc::new(move |txid| {
+            mempool_for_filters.get(txid).map(|entry| entry.tx.clone())
+        }));
 
         // Create spork synchronization manager; sporks are kept in the chain
         // database across restarts, as Divi Core keeps them in its spork database
