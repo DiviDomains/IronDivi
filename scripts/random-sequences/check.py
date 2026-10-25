@@ -19,6 +19,7 @@ command line.
 """
 
 import base64
+import hashlib
 import json
 import os
 import random
@@ -51,6 +52,9 @@ LOGS = os.environ.get("RANDOM_SEQUENCES_LOGS", "")
 IRON_DEBUG = ["debug=1"] if os.environ.get("RANDOM_SEQUENCES_DEBUG", "") == "1" else []
 CORE_DEBUG = ["debug=mempool"] if os.environ.get("RANDOM_SEQUENCES_DEBUG", "") == "1" else []
 HOST = "127.0.0.2"
+# RANDOM_SEQUENCES_TWIN=1: the second pair runs divid too (run.sh passes it in
+# irondivid's place), to see the differences divid has with itself
+TWIN = os.environ.get("RANDOM_SEQUENCES_TWIN", "") == "1"
 RPC_TIMEOUT = 120
 START_TIMEOUT = 180
 SETTLE_TIMEOUT = 45
@@ -81,6 +85,8 @@ class Node:
             f"rpcuser=seq{index}", f"rpcpassword={password}",
             "daemon=0", "printtoconsole=0", "server=1", "discover=0", "listenonion=0",
             f"bind={HOST}", f"rpcbind={HOST}", "rpcallowip=127.0.0.0/8", "dnsseed=0", "staking=0",
+            # a small keypool, so a locked wallet runs out of keys within a few calls
+            f"keypool={KEYPOOL}",
         ] + list(extra_conf)
         fd = os.open(os.path.join(self.dir, "divi.conf"), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w") as f:
@@ -180,7 +186,9 @@ class Pair:
         self.last_tx = None  # (node, txid) of the step's wallet send
         self.note = None  # what the step needed besides itself
         self.restarted = set()  # nodes stopped and started again in this episode
+        self.imported = {1: [], 2: []}  # addresses importprivkey steps brought in, per node
         self.pool_before = {}  # an invalidate's node: its mempool before, txid -> inputs
+        self.height_before = None  # the step's node: its height before the step
 
     def node(self, n):
         return self.nodes[n - 1]
@@ -228,7 +236,14 @@ def snapshot(node):
         return sorted(str(u["amount"]) for u in items)
     unspent = node.call("listunspent", 0)
     locked = node.call("listlockunspent")
+    info = node.call("getwalletinfo")
+    wallet = info[1] if info[0] == "ok" else {}
     return {
+        "immature balance": wallet.get("immature_balance"),
+        "keypoolsize": wallet.get("keypoolsize"),
+        "encryption status": wallet.get("encryption_status"),
+        # unlocked_until is a time: compared as whether it is set and not past
+        "unlocked_until set": None if "unlocked_until" not in wallet else bool(wallet["unlocked_until"]),
         "height": node.call("getblockcount"),
         "getbalance * 0": node.call("getbalance", "*", 0),
         "getbalance * 1": node.call("getbalance", "*", 1),
@@ -259,6 +274,31 @@ def code_only(text):
 
 AMOUNTS = ("dust", "tiny", "small", "large", "whole", "whole sweep_funds", "small receiver_pays")
 PASSPHRASE = secrets.token_hex(16)
+KEYPOOL = 5
+# A salt made fresh for the run: the keys importprivkey steps import are
+# derived from it and the step number, so both pairs import the same
+# throwaway key; it is never printed
+KEY_SALT = secrets.token_bytes(32)
+B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+
+def step_key(i):
+    """The compressed regtest WIF (prefix 239, chainparams.cpp, testnet's) of
+    the key a step imports"""
+    secret = hashlib.sha256(KEY_SALT + i.to_bytes(4, "little")).digest()
+    data = bytes([239]) + secret + b"\x01"
+    data += hashlib.sha256(hashlib.sha256(data).digest()).digest()[:4]
+    n = int.from_bytes(data, "big")
+    out = ""
+    while n:
+        n, r = divmod(n, 58)
+        out = B58[r] + out
+    return out
+
+
+# The nodes (1, 2) whose encryptwallet step has run: a later episode encrypts
+# them at its setup, so the wallet states go on as the steps left them
+ENCRYPTED = set()
 
 
 def amount_args(pair, n, kind, draw):
@@ -440,6 +480,54 @@ def run_step(pair, step):
         return outcome(node.call("walletlock")), None
     if kind == "walletpassphrase":
         return outcome(node.call("walletpassphrase", PASSPHRASE, 99999)), None
+    if kind == "walletpassphrase timeout":
+        # long enough not to run out within a step and its settle
+        return outcome(node.call("walletpassphrase", PASSPHRASE, 120 + draw % 600)), None
+    if kind == "walletpassphrase staking":
+        return outcome(node.call("walletpassphrase", PASSPHRASE, 99999, True)), None
+    if kind == "encryptwallet":
+        out = node.call("encryptwallet", PASSPHRASE)
+        ENCRYPTED.add(n)
+        # then a restart, as the brief of a wallet encryption asks
+        pair.restarted.add(n)
+        if node.call("getblockcount")[0] == "down":
+            node.proc.wait(timeout=120)
+        else:
+            node.stop()
+        node.start()
+        return outcome(out), None
+    if kind == "keypoolrefill":
+        return outcome(node.call("keypoolrefill", 1 + draw % (2 * KEYPOOL))), None
+    if kind in ("drain getnewaddress", "drain getrawchangeaddress"):
+        # until the keypool runs out, or 3 keypools' worth (an unlocked
+        # wallet tops it up each time)
+        method = kind.split()[1]
+        for count in range(1, 3 * KEYPOOL + 1):
+            out = node.call(method)
+            if out[0] != "ok":
+                return f"{outcome(out)} at call {count}", None
+        return f"ok x{3 * KEYPOOL}", None
+    if kind == "importprivkey":
+        rescan = draw % 2 == 0
+
+        def imported_now():
+            out = node.call("getaddressesbyaccount", "imported")
+            return set(out[1]) if out[0] == "ok" else set()
+        before = imported_now()
+        out = node.call("importprivkey", step_key(i), "imported", rescan)
+        new = imported_now() - before
+        if out[0] == "ok" and len(new) == 1:
+            pair.imported[n].append(new.pop())
+        return outcome(out), None
+    if kind == "send imported":
+        # to a key an importprivkey step of this node brought in
+        if not pair.imported[n]:
+            return "nothing imported", None
+        target = pair.imported[n][draw % len(pair.imported[n])]
+        args = as_number(amount_args(pair, n, "small", draw))
+        return sent(pair, node, node.call("sendtoaddress", target, *args)), None
+    if kind == "generateblock":
+        return outcome(node.call("generateblock", {})), None
     if kind == "rawtx":
         coin = coin_at(node, draw)
         if coin is None:
@@ -467,8 +555,12 @@ def run_step(pair, step):
 KINDS = [
     ("getnewaddress", 4), ("send own", 10), ("send other", 10), ("sendmany", 5), ("lock", 6),
     ("unlock one", 3), ("unlock all", 2), ("fundvault", 4), ("reclaim", 3), ("mine", 14),
-    ("invalidate", 5), ("restart", 3), ("kill", 2), ("walletlock", 2), ("walletpassphrase", 4),
+    ("invalidate", 5), ("restart", 3), ("kill", 2), ("walletlock", 4), ("walletpassphrase", 4),
     ("rawtx", 5),
+    # wallet states: unlocks, the keypool, imported keys, generateblock
+    ("walletpassphrase timeout", 2), ("walletpassphrase staking", 3), ("keypoolrefill", 2),
+    ("drain getnewaddress", 2), ("drain getrawchangeaddress", 2), ("importprivkey", 3),
+    ("send imported", 3), ("generateblock", 3),
 ]
 
 
@@ -483,6 +575,12 @@ def draw_steps(seed, count):
         if kind in ("send own", "send other"):
             step["amount"] = rng.choice(AMOUNTS)
         steps.append(step)
+    # Each node's wallet is encrypted once, at a step drawn from the seed
+    for n in (1, 2):
+        at = rng.randrange(count)
+        while steps[at]["kind"] == "encryptwallet":
+            at = (at + 1) % count
+        steps[at] = {"i": steps[at]["i"], "kind": "encryptwallet", "node": n, "draw": steps[at]["draw"]}
     return steps
 
 
@@ -512,10 +610,13 @@ def setup(pair):
         node.rpc("setgenerate", blocks)
         if not pair.settle():
             raise RuntimeError(f"{pair.name} pair did not settle after the first blocks")
-    for node in (a, b):
-        node.rpc("encryptwallet", PASSPHRASE)
-        wait_for(lambda: node.call("getwalletinfo")[0] == "ok", 60)
-        node.rpc("walletpassphrase", PASSPHRASE, 99999)
+    # A wallet whose encryptwallet step has run (in an earlier episode) is
+    # encrypted again and unlocked
+    for n, node in ((1, a), (2, b)):
+        if n in ENCRYPTED:
+            node.rpc("encryptwallet", PASSPHRASE)
+            wait_for(lambda: node.call("getwalletinfo")[0] == "ok", 60)
+            node.rpc("walletpassphrase", PASSPHRASE, 99999)
     return True
 
 
@@ -548,9 +649,24 @@ def new_episode():
     c1 = Node("divid1", DIVID, 0, ["listen=1"] + CORE_DEBUG)
     c2 = Node("divid2", DIVID, 1, ["listen=0", f"connect={HOST}:{PORT_BASE}"] + CORE_DEBUG)
     phrases = [c1.rpc("dumphdinfo")["mnemonic"], c2.rpc("dumphdinfo")["mnemonic"]]
-    i1 = Node("irondivid1", IRONDIVID, 2, ["listen=1"] + IRON_DEBUG, env={"WALLET_MNEMONIC": phrases[0]})
-    i2 = Node("irondivid2", IRONDIVID, 3, ["listen=0", f"connect={HOST}:{PORT_BASE + 4}"] + IRON_DEBUG,
-              env={"WALLET_MNEMONIC": phrases[1]})
+    if TWIN:
+        # divid against divid: the second pair restores the phrases from
+        # -mnemonic (init.cpp:877), a line of its 0600 divi.conf
+        i1 = Node("irondivid1", IRONDIVID, 2, ["listen=1", f"mnemonic={phrases[0]}"] + CORE_DEBUG)
+        i2 = Node("irondivid2", IRONDIVID, 3, ["listen=0", f"connect={HOST}:{PORT_BASE + 4}",
+                                               f"mnemonic={phrases[1]}"] + CORE_DEBUG)
+        # divid reads -mnemonic at every start, not only when it makes the
+        # wallet: the line goes once the wallet is there
+        for node in (i1, i2):
+            conf = os.path.join(node.dir, "divi.conf")
+            with open(conf) as f:
+                kept = [line for line in f if not line.startswith("mnemonic=")]
+            with open(conf, "w") as f:
+                f.writelines(kept)
+    else:
+        i1 = Node("irondivid1", IRONDIVID, 2, ["listen=1"] + IRON_DEBUG, env={"WALLET_MNEMONIC": phrases[0]})
+        i2 = Node("irondivid2", IRONDIVID, 3, ["listen=0", f"connect={HOST}:{PORT_BASE + 4}"] + IRON_DEBUG,
+                  env={"WALLET_MNEMONIC": phrases[1]})
     del phrases
     PAIRS = [Pair("divid", [c1, c2]), Pair("irondivid", [i1, i2])]
     both(setup)
@@ -598,12 +714,35 @@ EXPLAINED = {
         "spent different coins of that value (divid's choice among equal coins is by txid order), and with "
         "the tip lowered one of them sits in the block between the mempool's coinbase maturity (20, "
         "txmempool.cpp:151) and the wallet's (21, MerkleTxConfirmationNumberCalculator.cpp:54-59)"),
+    "divid loses a key imported into an encrypted wallet": (
+        "divid no longer holds a key importprivkey brought into its encrypted wallet, and irondivid does: "
+        "CWallet::AddKeyPubKey writes a key to the wallet file only when the wallet is not encrypted "
+        "(wallet.cpp:611-613); on an encrypted one CCryptoKeyStore::AddCryptedKey keeps it in memory alone "
+        "(crypter.cpp:295-305), so the next start no longer has it, nor the coins paid to it. irondivid "
+        "stores the key"),
+    "stake coin choice": (
+        "each side staked a coin of a different value, and each node's balance plus immature balance "
+        "agree: divid tries its stake set in outpoint order (StakableCoin.h:20-23, "
+        "PoSTransactionCreator.cpp:261), and the two pairs' txids differ, so the first coin whose kernel "
+        "meets the target differs"),
     "maturity after a reorg": (
         "after invalidateblock the dropped mempool transactions all spend a coinbase or coinstake "
         "output that is immature at the new height, which divid's removeCoinbaseSpends drops too "
         "(txmempool.cpp:139-157); the other side spent an older coin of the same value, divid's coin "
         "choice among equal coins being by txid order (MinimumFeeCoinSelectionAlgorithm.cpp:127-139)"),
 }
+
+
+def lost_imported_key():
+    """divid's node no longer holds an address an importprivkey step of this
+    episode brought in, while irondivid's still does"""
+    for m in (1, 2):
+        for address in PAIRS[1].imported[m]:
+            c = PAIRS[0].node(m).call("validateaddress", address)
+            i = PAIRS[1].node(m).call("validateaddress", address)
+            if c[0] == i[0] == "ok" and not c[1].get("ismine") and i[1].get("ismine"):
+                return True
+    return False
 
 
 def coin_choice_differs():
@@ -616,6 +755,44 @@ def coin_choice_differs():
     except RuntimeError:
         return False
     return len(spent[0]) == len(spent[1]) == 1 and spent[0] != spent[1]
+
+
+def stake_kernels(pair, n):
+    """The values of the coins the blocks node n made in this step staked"""
+    node = pair.node(n)
+    kernels = []
+    for height in range(pair.height_before + 1, node.rpc("getblockcount") + 1):
+        block = node.rpc("getblock", node.rpc("getblockhash", height))
+        if len(block["tx"]) > 1:
+            kernels.append(input_values(node, block["tx"][1]))
+    return kernels
+
+
+def stake_choice_differs(n, diff):
+    """A mine or generateblock step whose only differences are balances and
+    coins, with each node's balance plus immature balance the same on both
+    sides, and the two sides' new blocks staking coins of different values"""
+    if any(k.split(": ")[-1] not in ("getbalance * 0", "getbalance * 1", "immature balance", "listunspent 0 amounts")
+           for k in diff):
+        return False
+    for m in (1, 2):
+        totals = []
+        for pair in PAIRS:
+            info = pair.node(m).call("getwalletinfo")
+            balance = pair.node(m).call("getbalance", "*", 0)
+            if info[0] != "ok" or balance[0] != "ok":
+                return False
+            totals.append(round(float(balance[1]) + float(info[1].get("immature_balance", 0)), 8))
+        if totals[0] != totals[1]:
+            return False
+    try:
+        if None in (p.height_before for p in PAIRS):
+            return False
+        kernels = [stake_kernels(p, n) for p in PAIRS]
+    except RuntimeError:
+        return False
+    log(f"#   stake rule: kernels {kernels}")
+    return any(kernels) and kernels[0] != kernels[1]
 
 
 def pool_inputs(node):
@@ -743,10 +920,20 @@ def maturity_window_explains(c_mid, i_mid, diff):
     among equal coins is by txid order), and in the middle that coin sits in
     the block between the mempool's maturity (20, txmempool.cpp:151) and the
     wallet's (21, MerkleTxConfirmationNumberCalculator.cpp:54-59)"""
-    allowed = {"after invalidateblock: " + k for k in ("getbalance * 0", "getbalance * 1", "listunspent 0 amounts")}
+    allowed = {"after invalidateblock: " + k
+               for k in ("getbalance * 0", "getbalance * 1", "listunspent 0 amounts", "immature balance")}
     if not diff or any(k not in allowed for k in diff):
         return False
     if c_mid["mempool size"] != i_mid["mempool size"]:
+        return False
+    # the coin moved between mature and immature: the sum is the same
+
+    def total(mid):
+        try:
+            return round(float(mid["getbalance * 0"][1]) + float(mid["immature balance"]), 8)
+        except (TypeError, ValueError, IndexError):
+            return None
+    if total(c_mid) is None or total(c_mid) != total(i_mid):
         return False
     a, b = c_mid["listunspent 0 amounts"], i_mid["listunspent 0 amounts"]
     if a[0] != "ok" or b[0] != "ok":
@@ -785,10 +972,14 @@ for step in steps:
         pair.last_tx = None
         pair.note = None
         pair.pool_before = {}
+        height = pair.node(step["node"]).call("getblockcount")
+        pair.height_before = height[1] if height[0] == "ok" else None
         try:
             result = run_step(pair, step)
         except RuntimeError as e:
-            result = (f"call failed: {e}"[:1500], None)
+            # without the node's name, which differs between the pairs
+            import re
+            result = ("call failed: " + re.sub(r"^(irondivid|divid)[12] ", "", str(e)))[:1500], None
         settled = pair.settle()
         return result, settled
 
@@ -802,7 +993,7 @@ for step in steps:
     while True:
         snaps = [snapshot(p.node(n)) for p in PAIRS] + [snapshot(p.other(n)) for p in PAIRS]
         diff = []
-        if code_only(c_res[0]) != code_only(i_res[0]):
+        if c_res[0] != i_res[0]:
             diff.append("outcome")
         if c_res[1] is not None and i_res[1] is not None:
             diff += ["after invalidateblock: " + k for k in differs(c_res[1], i_res[1])]
@@ -818,9 +1009,13 @@ for step in steps:
     if not c_settled or not i_settled:
         line += f"  [settled: divid {c_settled}, irondivid {i_settled}]"
     explained = None
-    if diff and "outcome" not in diff:
+    if diff and lost_imported_key():
+        explained = "divid loses a key imported into an encrypted wallet"
+    elif diff and "outcome" not in diff:
         if coin_choice_differs():
             explained = "coin choice"
+        elif step["kind"] in ("mine", "generateblock") and stake_choice_differs(n, diff):
+            explained = "stake coin choice"
         elif step["kind"] == "invalidate" and c_res[1] and i_res[1] \
                 and c_res[1]["height"][0] == i_res[1]["height"][0] == "ok" \
                 and maturity_explains(n, [c_res[1]["height"][1], i_res[1]["height"][1]]):
@@ -835,7 +1030,8 @@ for step in steps:
                 or PAIRS[0].node(n).call("getblockcount")[1:] < PAIRS[1].node(n).call("getblockcount")[1:]):
             explained = "divid wallet after a kill"
         elif all(k.split(": ")[-1].startswith("getbalance") or k == "after invalidateblock: listunspent 0 amounts"
-                 for k in diff) and any(not k.startswith("after") for k in diff) and balance_cache_explains():
+                 or k.endswith("immature balance") for k in diff) \
+                and any(not k.startswith("after") for k in diff) and balance_cache_explains():
             explained = "divid balance cache"
         else:
             # a node restarted earlier in the episode holds fewer of its peer's

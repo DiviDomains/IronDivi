@@ -13,12 +13,20 @@ Each step is drawn from a seeded list and applied to node n of both pairs the sa
 every step each pair settles, and node n and the other node of pair C are compared with their twins in pair I. Only
 what does not depend on keys or hashes is compared:
 
-- the step's outcome: success, or the error code (for a raw transaction, of the call that failed);
-- `getbalance "*" 0`, `getbalance "*" 1`, `getunconfirmedbalance`;
+- the step's outcome: success, or the error code and its text (for a raw transaction, of the call that failed; for a
+  helper call that failed, without the node's name);
+- `getbalance "*" 0`, `getbalance "*" 1`, `getunconfirmedbalance`, and `getwalletinfo`'s `immature_balance`;
 - the amounts of `listunspent 0`, as a sorted list (so their number too);
 - the number of locked coins (`listlockunspent`);
+- `getwalletinfo`'s `keypoolsize` and `encryption_status`, and whether `unlocked_until` is there and set (it is a
+  time, so its value is not compared);
 - the mempool size and the height;
 - for `invalidate`, all of these also between `invalidateblock` and `reconsiderblock`.
+
+Txids and block hashes differ between the pairs, so which coin a send spends or which coin stakes can differ, and with
+it the change values and which stake outputs are still immature. Those fields are still compared exactly. A difference
+that one of divid's accidental choices explains (below) is logged as `KNOWN`, with its reason, and the run goes on
+with four fresh nodes. For the stake outputs, the rules check that each side's balance plus immature balance agree.
 
 The first difference ends the run with one `FAIL` line naming the seed, the episode and the step, both values, the
 coins and mempools of both pairs, and the steps of the episode. The run ends with `FAILS <n>`; the exit code is the
@@ -45,6 +53,7 @@ SEED=7 scripts/random-sequences/run.sh target/release ~/divi-3.0.0/bin 53850 /va
 | `RANDOM_SEQUENCES_TIMEOUT` | seconds before the run is stopped (1500) |
 | `RANDOM_SEQUENCES_LOGS` | a folder to copy the four logs to, for each episode and on a FAIL |
 | `RANDOM_SEQUENCES_DEBUG` | `1`: irondivid logs at debug level and divid with `debug=mempool` |
+| `RANDOM_SEQUENCES_TWIN` | `1`: the second pair runs divid too, in irondivid's place, to see the differences divid has with itself on the same seed. The twins restore the phrases from `-mnemonic`, a line of their 0600 `divi.conf`. The line is taken out again once the wallet is made, as divid reads it at every start |
 | `RANDOM_SEQUENCES_TRACE` | `1`: before and after each `invalidateblock`, the node's mempool is printed, each transaction with its inputs (`txid:vout@height/kind`) and its outputs |
 
 A run of 200 steps takes 2 to 10 minutes. However it ends, all nodes are stopped and their directories deleted. It
@@ -55,12 +64,17 @@ Secrets:
   (`WALLET_MNEMONIC`).
 - The wallet passphrase is made at random and sent only in RPC requests.
 - RPC passwords are made at random and kept in each node's 0600 `divi.conf`.
-- None of them is printed, written to a file or put on a command line.
+- The keys `importprivkey` steps import are derived from a salt made fresh for the run, and sent only in RPC requests.
+- None of them is printed or put on a command line. The only file one goes to is a twin's 0600 `divi.conf` in
+  `RANDOM_SEQUENCES_TWIN` runs: it holds the phrase for the twin's first start and is rewritten without it right after.
 
 ## Setup of each episode
 
 1. Node 1 mines 15 blocks, node 2 mines 15, node 1 mines 25, so both nodes have mature coins.
-2. Every wallet is encrypted and unlocked for 99999 s. The nodes run with `staking=0`; blocks come from `setgenerate`.
+2. The wallets start unencrypted. Each node's wallet is encrypted by one `encryptwallet` step at a point drawn from the
+   seed. A node whose step has already run in an earlier episode is encrypted at the setup and unlocked for 99999 s.
+3. The nodes run with `staking=0` (blocks come from `setgenerate` and `generateblock`) and `keypool=5`, so a locked
+   wallet runs out of keypool keys within a few calls.
 
 ## Steps
 
@@ -80,6 +94,18 @@ Each step names a node (1 or 2) and a random number `draw`, which picks amounts,
 | `restart` | `stop`, then a start on the same datadir |
 | `kill` | `kill -9`, then a start (see below for divid) |
 | `walletlock`, `walletpassphrase` | lock the wallet, or unlock it for 99999 s |
+| `walletpassphrase timeout` | unlock it for 120 to 720 s |
+| `walletpassphrase staking` | unlock it for staking only (`walletpassphrase … 99999 true`) |
+| `encryptwallet` | once per node and run (see the setup), then a restart |
+| `keypoolrefill` | `keypoolrefill <1 to 10>` |
+| `drain getnewaddress`, `drain getrawchangeaddress` | the call until the keypool runs out (-12), or 15 times: an unlocked wallet tops the keypool up each time |
+| `importprivkey` | a throwaway key, derived from a salt made fresh for the run and the step number, so both pairs import the same key; with rescan for an even `draw`. Neither the salt nor the key is printed |
+| `send imported` | a small `sendtoaddress` to a key an `importprivkey` step of this episode brought in |
+| `generateblock` | `generateblock {}` |
+
+Every step runs whatever the wallet's state is: locked, unlocked for staking only, unlocked, or not encrypted. So the
+sends, stakes, key handouts and imports also show their refusals (-13, -15, -17, -12, -25, and -1 for a stake signed
+with a key of the locked HD seed).
 | `rawtx` | a coin of `listunspent` (picked by `draw`, unlocked) spent to a new address of node n by `createrawtransaction`, `signrawtransaction` and `sendrawtransaction`, with a fee of 0.001 |
 
 ## Differences that come from divid's accidental choices
@@ -91,6 +117,11 @@ episode) and the remaining steps, so every comparison stays exact:
 - **coin choice:** a send where each side spent one coin, of different values. divid ranks the coins that each cover
   a send by signature size alone (`MinimumFeeCoinSelectionAlgorithm.cpp:127-139`), so among them it takes the first
   in its wallet map, ordered by txid.
+- **stake coin choice:** a `mine` or `generateblock` step where each side's new blocks staked coins of different
+  values, only balances and coins differ, and each node's balance plus immature balance agree. divid tries its stake
+  set in outpoint order (`StakableCoin.h:20-23`, `PoSTransactionCreator.cpp:261`), so the first coin whose kernel
+  meets the target depends on the txids, which differ between the pairs. The staked coin and its reward move from
+  the balance to the immature balance, so the two fields are compared here by their total.
 - **maturity after a reorg:** after an `invalidateblock`, the two sides dropped different mempool transactions, and
   every one of them spends a coinbase or coinstake output that is immature at the new height. divid's
   `removeCoinbaseSpends` drops these too (`txmempool.cpp:139-157`), at each block it disconnects
@@ -115,6 +146,12 @@ episode) and the remaining steps, so every comparison stays exact:
   divid writes its wallet to disk 2 s after the last change (`ThreadFlushWalletDB`,
   `LegacyWalletDatabaseEndpointFactory.cpp:23-50`), so a send made just before a `kill -9` is lost. irondivid stores
   a send before the RPC that made it answers.
+- **divid loses a key imported into an encrypted wallet:** divid's node no longer holds an address an
+  `importprivkey` step brought in, and irondivid's does. `CWallet::AddKeyPubKey` writes a key to the wallet file only
+  when the wallet is not encrypted (`wallet.cpp:611-613`). On an encrypted wallet, `CCryptoKeyStore::AddCryptedKey`
+  keeps it in memory alone (`crypter.cpp:295-305`). So divid's next start no longer has the key, nor the coins paid to
+  it. irondivid stores the key, and copying divid would throw a private key and its coins away. In a twin run both
+  divid pairs lose the key alike.
 - **rebroadcast timing:** after a restart, only the restarted node's mempool, unconfirmed balance or unconfirmed coins
   differ, and each side's restarted node holds only transactions its peer holds too. divid sends some mempool
   transactions to its peers again at a random time within 30 minutes (`PeriodicallyRebroadcastMempoolTxs`,

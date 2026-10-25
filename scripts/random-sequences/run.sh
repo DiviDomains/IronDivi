@@ -18,6 +18,8 @@ if [ $# -lt 3 ]; then
 fi
 IRD="$(cd "$1" && pwd)/irondivid"
 DIVID="$(cd "$2" && pwd)/divid"
+# divid against divid: the second pair runs divid as well
+[ "${RANDOM_SEQUENCES_TWIN:-}" = 1 ] && IRD=$DIVID
 BASE=$3
 ROOT=${4:-${TMPDIR:-/tmp}}
 HERE=$(cd "$(dirname "$0")" && pwd)
