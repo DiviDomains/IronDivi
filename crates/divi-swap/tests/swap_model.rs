@@ -8,8 +8,9 @@
 
 //! Model-based property tests of the swap state machine: random sequences of accept, fund,
 //! confirm, timeout, refund and restart (drop both engines and reopen the database, as the
-//! restart matrix in `engine.rs` does), plus engine passes, crashes and second-claim probes,
-//! driven through the real maker and taker on two mock chains. After every op each leg is
+//! restart matrix in `engine.rs` does), plus engine passes, crashes, second-claim probes,
+//! mempool evictions of the taker's claim and a hostile maker refund, driven through the real
+//! maker and taker on two mock chains. After every op each leg is
 //! checked against a reference model (`Unfunded → Funded → Claimed | Refunded`, who may move
 //! it and when), and two invariants hold:
 //!
@@ -17,6 +18,10 @@
 //!    refused or is a no-op, and the engines never sign two different claims of one leg.
 //! 2. After the sequence, with time past every locktime and the engines run to quiescence,
 //!    every funded leg is claimed or refunded — never stuck, never both.
+//!
+//! An evicted claim of the maker leg has leaked the preimage, so the maker may then claim the
+//! taker leg while the maker leg is refunded: the taker may end `Lost`, but only after such a
+//! leak and only with the taker leg claimed and the maker leg refunded.
 //!
 //! `PROPTEST_CASES=2000` runs a longer search than the default.
 
@@ -75,6 +80,12 @@ enum Op {
     Step(u8),
     /// Try to claim each already-claimed leg of swap `i` again.
     ReClaim(u8),
+    /// Drop the taker's claim of swap `i`'s maker leg from the mempool if it is unmined
+    /// there: the preimage has leaked, the leg is unspent again.
+    Evict(u8),
+    /// The maker's key refunds swap `i`'s maker leg on its own, without its engine (a
+    /// hostile or out-of-band maker), first letting time pass to the locktime if needed.
+    HostileRefund(u8),
 }
 
 /// The reference model of one HTLC leg.
@@ -97,6 +108,10 @@ enum By {
     Both,
     /// Nobody: chain-only ops, restarts and probes must not move any leg.
     Nobody,
+    /// [`Op::Evict`]: only an unmined maker-leg claim may go back to `Funded`.
+    Evict,
+    /// [`Op::HostileRefund`]: time passes, then only a maker-leg refund past its locktime.
+    HostileRefund,
 }
 
 impl By {
@@ -119,6 +134,8 @@ struct Swap {
     legs: [Leg; 2],
     /// A probe built a second, different claim of this leg ([`Op::ReClaim`]).
     probed: [bool; 2],
+    /// A claim of the maker leg was evicted after revealing the preimage ([`Op::Evict`]).
+    leaked: bool,
 }
 
 struct World {
@@ -356,6 +373,18 @@ impl World {
                 }
                 By::Nobody
             }
+            Op::Evict(i) => {
+                if let Some(i) = self.pick(i) {
+                    self.evict(i).await;
+                }
+                By::Evict
+            }
+            Op::HostileRefund(i) => {
+                if let Some(i) = self.pick(i) {
+                    self.hostile_refund(i).await;
+                }
+                By::HostileRefund
+            }
         };
         self.check(by).await;
     }
@@ -379,6 +408,7 @@ impl World {
             maker_id: view.id,
             legs: [Leg::Unfunded; 2],
             probed: [false; 2],
+            leaked: false,
         });
     }
 
@@ -425,6 +455,34 @@ impl World {
                 res.is_err(),
                 "invariant 1: a second, different claim of swap {i} leg {leg} was accepted"
             );
+        }
+    }
+
+    async fn evict(&mut self, i: usize) {
+        let Some(claim) = self.taker_rec(&self.swaps[i]).maker_leg_claim else {
+            return;
+        };
+        let (taker, _) = self.claimer(MAKER_LEG);
+        if taker.confirmations(&claim.txid).await.unwrap() == Some(0) {
+            self.chain(MAKER_LEG).forget(&claim.txid);
+            self.swaps[i].leaked = true;
+        }
+    }
+
+    async fn hostile_refund(&self, i: usize) {
+        let m = self.maker_rec(&self.swaps[i]);
+        let (Some(htlc), Some(f)) = (m.maker_leg_htlc, m.maker_leg_funding) else {
+            return;
+        };
+        let wait = htlc.locktime.saturating_sub(self.chain(MAKER_LEG).mtp());
+        self.chain(MAKER_LEG).advance_time(wait);
+        self.clock.fetch_add(wait as u64, Ordering::SeqCst);
+        let maker = match self.dir.maker_chain() {
+            Chain::Divi => &self.mdivi,
+            _ => &self.mbtc,
+        };
+        if let Ok(tx) = maker.build_refund(&htlc, &f.outpoint, f.amount).await {
+            let _ = maker.broadcast(&tx).await;
         }
     }
 
@@ -510,12 +568,18 @@ impl World {
             }
             // The taker claims the maker leg; never through its refund-only path.
             (Leg::Funded, Leg::Claimed, MAKER_LEG) => by.taker(),
-            // The maker claims the taker leg, and only with the preimage the taker revealed.
-            (Leg::Funded, Leg::Claimed, _) => by.maker() && now[MAKER_LEG] == Leg::Claimed,
+            // The maker claims the taker leg, and only with the preimage the taker revealed:
+            // in a claim of the maker leg on chain, or in one evicted from the mempool.
+            (Leg::Funded, Leg::Claimed, _) => {
+                by.maker() && (now[MAKER_LEG] == Leg::Claimed || s.leaked)
+            }
+            (Leg::Claimed, Leg::Funded, MAKER_LEG) => by == By::Evict,
             (Leg::Funded, Leg::Refunded, TAKER_LEG) => {
                 (by.taker() || by == By::TakerRefund) && mtp_past_locktime()
             }
-            (Leg::Funded, Leg::Refunded, _) => by.maker() && mtp_past_locktime(),
+            (Leg::Funded, Leg::Refunded, _) => {
+                (by.maker() || by == By::HostileRefund) && mtp_past_locktime()
+            }
             _ => false,
         };
         assert!(ok, "model: {what} is not allowed");
@@ -537,6 +601,11 @@ impl World {
             TakerState::Done => assert!(
                 ml == Leg::Claimed || tl == Leg::Refunded,
                 "swap {i}: taker Done with taker leg {tl:?}, maker leg {ml:?}"
+            ),
+            TakerState::Lost => assert!(
+                s.leaked && tl == Leg::Claimed && ml == Leg::Refunded,
+                "swap {i}: taker Lost with taker leg {tl:?}, maker leg {ml:?}, leaked {}",
+                s.leaked
             ),
             _ => {}
         }
@@ -593,8 +662,12 @@ impl World {
                 );
             }
             if s.legs[TAKER_LEG] != Leg::Unfunded {
+                // Lost is checked against the legs by `states_match`.
                 let t = self.taker_rec(s).state;
-                assert_eq!(t, TakerState::Done, "swap {i}: taker stuck in {t:?}");
+                assert!(
+                    matches!(t, TakerState::Done | TakerState::Lost),
+                    "swap {i}: taker stuck in {t:?}"
+                );
             }
             if s.legs[MAKER_LEG] != Leg::Unfunded {
                 let m = self.maker_rec(s).state;
@@ -641,6 +714,7 @@ fn crash_at() -> impl Strategy<Value = CrashAt> {
             TakerState::MakerLockConfirmed,
             TakerState::Claimed,
             TakerState::Refunded,
+            TakerState::Lost,
         ])
         .prop_map(CrashAt::Taker),
     ]
@@ -659,7 +733,27 @@ fn op() -> impl Strategy<Value = Op> {
         4 => Just(Op::Tick),
         4 => (0u8..2).prop_map(Op::Step),
         1 => (0u8..2).prop_map(Op::ReClaim),
+        4 => (0u8..2).prop_map(Op::Evict),
+        2 => (0u8..2).prop_map(Op::HostileRefund),
     ]
+}
+
+/// Fund one swap and step the taker until its maker-leg claim is broadcast, evicting the
+/// claim after every step: random ops then start from a leaked preimage, which the plain
+/// sequences reach only rarely. A claim evicted on the last round is resent by the next step
+/// unless the maker refunds first, so these runs end both `Done` and `Lost`.
+fn leaked_prefix() -> Vec<Op> {
+    let mut ops = vec![Op::Accept, Op::Fund(0)];
+    for _ in 0..4 {
+        ops.extend([
+            Op::Confirm(2),
+            Op::Tick,
+            Op::Step(0),
+            Op::Tick,
+            Op::Evict(0),
+        ]);
+    }
+    ops
 }
 
 fn run(dir: Direction, ops: &[Op]) {
@@ -687,5 +781,15 @@ proptest! {
     #[test]
     fn model_rev(ops in proptest::collection::vec(op(), 1..40)) {
         run(Direction::TakerPaysDivi, &ops);
+    }
+
+    #[test]
+    fn leaked_fwd(ops in proptest::collection::vec(op(), 0..20)) {
+        run(Direction::TakerPaysBtc, &[leaked_prefix(), ops].concat());
+    }
+
+    #[test]
+    fn leaked_rev(ops in proptest::collection::vec(op(), 0..20)) {
+        run(Direction::TakerPaysDivi, &[leaked_prefix(), ops].concat());
     }
 }
