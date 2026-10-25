@@ -95,7 +95,9 @@ the data directory) for whatever the command line left unset. Among them:\n  \
 -rpcpassword=<pw> -txindex -addressindex -spentindex -checkblocks=<n>\n  \
 -maxreorg=<n> -maxorphantx=<n> -minrelaytxfee=<amt> -staking\n  \
 -blockmaxsize=<n> -blockprioritysize=<n> -blockminsize=<n>\n  \
--blocknotify=<cmd> -walletnotify=<cmd>\n\
+-blocknotify=<cmd> -walletnotify=<cmd>\n  \
+-zmqpubhashblock=<address> -zmqpubhashtx=<address>\n  \
+-zmqpubrawblock=<address> -zmqpubrawtx=<address>\n\
 IronDivi's own: -fullnode=<ip> -stakeonstaletip -stakesplitthreshold=<n>\n  \
 -utxocachesize=<n> -expire=<age> -maxlogsize=<MB> -maxlogfiles=<n>\n  \
 --export-chain --export-start N --export-end N --export-output DIR\n  \
@@ -256,7 +258,8 @@ impl std::fmt::Display for ConfigFileError {
 
 impl std::error::Error for ConfigFileError {}
 
-/// Read the config file into the settings: irondivid's TOML, else divid's
+/// Read the config file into the settings: irondivid's TOML when the file is
+/// its own (`irondivi.conf` or `*.toml`) and parses as TOML, else divid's
 /// `name=value` format. Values the command line set are kept. Pins `conf` to
 /// the file read, so a network chosen by the file does not move it.
 fn resolve_args(mut args: Args) -> Result<Args> {
@@ -267,9 +270,13 @@ fn resolve_args(mut args: Args) -> Result<Args> {
     if path.exists() {
         let content = std::fs::read_to_string(&path)
             .with_context(|| format!("Error reading configuration file: {:?}", path))?;
+        // Only irondivid's own file may be TOML: a divi.conf that happens to
+        // parse as TOML still means what it means to divid
+        let own = path.file_name().is_some_and(|n| n == "irondivi.conf")
+            || path.extension().is_some_and(|e| e == "toml");
         match content.parse::<toml::Table>() {
-            Ok(table) => args.settings.read_toml(&table),
-            Err(_) => args
+            Ok(table) if own => args.settings.read_toml(&table),
+            _ => args
                 .settings
                 .read_config(&content)
                 .map_err(ConfigFileError)?,
@@ -305,7 +312,6 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "masternodeprivkey",
     "maxreceivebuffer",
     "maxsendbuffer",
-    "maxtxfee",
     "mining",
     "mnconf",
     "mnconflock",
@@ -316,9 +322,7 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "peerbloomfilters",
     "permitbaremultisig",
     "proxyrandomize",
-    "rest",
     "resync",
-    "rpckeepalive",
     "rpcthreads",
     "seednode",
     "sendfreetransactions",
@@ -329,10 +333,6 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "txconfirmtarget",
     "upnp",
     "vault_min",
-    "zmqpubhashblock",
-    "zmqpubhashtx",
-    "zmqpubrawblock",
-    "zmqpubrawtx",
 ];
 
 /// Options read elsewhere (before the node config is built, or by a command)
@@ -446,6 +446,8 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     }
     // divid serves RPC unless -server=0 (divid.cpp:139)
     config.rpc.enabled = s.get_bool("server", true);
+    // The REST interface, off unless asked for (Divi Core -rest, rpcserver.cpp:1025)
+    config.rpc.rest = s.get_bool("rest", false);
     // The RPC server listens on the loopback unless -rpcallowip lets others
     // in; then on -rpcbind, else on every interface (rpcserver.cpp:633-706)
     let allowed = s.get_multi("rpcallowip").to_vec();
@@ -492,6 +494,9 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         config.rpc.listen_addr = "[::]".to_string();
     }
     config.rpc.allowed_ips = allowed;
+    // -rpckeepalive=0: each RPC connection is closed after its reply
+    // (rpcserver.cpp:1014-1017)
+    config.rpc.keep_alive = s.get_bool("rpckeepalive", true);
 
     if let Some(p) = port("port") {
         config.p2p.port = p;
@@ -527,6 +532,7 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         config.p2p.connect.extend(connect.iter().cloned());
         config.p2p.enable_discovery = false;
     }
+    config.p2p.addnode = s.get_multi("addnode").to_vec();
     config
         .network
         .static_peers
@@ -610,6 +616,7 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
                 relay % 100_000_000
             );
         }
+        config.mempool.max_tx_fee = max_fee;
     }
     // -onlynet: each one of Divi Core's network names (ParseNetwork,
     // netbase.cpp:70-77; init.cpp:1734-1740)
@@ -686,6 +693,15 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         .get("walletnotify")
         .filter(|c| !c.is_empty())
         .map(String::from);
+    // Divi Core takes each -zmqpub* that is set, even empty (its bind then
+    // fails), as given (zmqnotificationinterface.cpp:38-50)
+    let zmq_address = |key: &str| s.get(key).map(String::from);
+    config.zmq = divi_node::zmq::ZmqConfig {
+        hashblock: zmq_address("zmqpubhashblock"),
+        hashtx: zmq_address("zmqpubhashtx"),
+        rawblock: zmq_address("zmqpubrawblock"),
+        rawtx: zmq_address("zmqpubrawtx"),
+    };
     config.vault = s.get_bool("vault", false);
 
     const APPLIED: &[&str] = &[
@@ -699,8 +715,10 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         "rpcpassword",
         "rpcport",
         "server",
+        "rest",
         "rpcallowip",
         "rpcbind",
+        "rpckeepalive",
         "port",
         "bind",
         "listen",
@@ -723,6 +741,7 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         "maxorphantx",
         "minrelaytxfee",
         "acceptnonstandard",
+        "maxtxfee",
         "sporkkey",
         "staking",
         "stakeonstaletip",
@@ -738,6 +757,10 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         "expire",
         "blocknotify",
         "walletnotify",
+        "zmqpubhashblock",
+        "zmqpubhashtx",
+        "zmqpubrawblock",
+        "zmqpubrawtx",
         "whitelist",
         "whitebind",
     ];
@@ -1569,6 +1592,8 @@ async fn run_daemon(
     // One process per data directory, held until this one exits
     // (TryLockDataDirectory, init.cpp:850-862)
     let _datadir_lock = lock_data_dir(&config.data_dir)?;
+    // divid reads masternode.conf at every start and makes it when missing
+    core_files::ensure_masternode_conf(&config.data_dir);
 
     // Divi Core Discover: the interfaces' addresses (net.cpp:1385-1425)
     if config.p2p.discover {
@@ -1585,6 +1610,10 @@ async fn run_daemon(
     if let Some(cmd) = config.blocknotify.clone() {
         spawn_block_notify(node.chain().clone(), cmd);
     }
+
+    // The ZMQ notifiers, before the chain takes blocks (init.cpp:1495-1500).
+    // Kept for the life of the node; none if an address cannot be bound.
+    let _zmq = divi_node::zmq::ZmqNotifier::start(&config.zmq, node.chain(), node.mempool());
 
     // Start the node
     node.start().await.with_context(|| "Failed to start node")?;
@@ -1650,6 +1679,7 @@ async fn run_daemon(
             w.set_vault_mode(config.vault);
             w.set_spend_zero_conf_change(wallet_options.spend_zero_conf_change);
             w.set_relay_fee_per_kb(config.mempool.min_relay_fee_per_kb);
+            w.set_max_tx_fee(config.mempool.max_tx_fee);
             // -walletnotify, before the wallet catches up with the chain
             // (init.cpp:1199, before the rescan at :1242)
             if let Some(cmd) = config.walletnotify.clone() {
@@ -1707,7 +1737,7 @@ async fn run_daemon(
             {
                 let wallet_for_added = Arc::clone(wallet_arc);
                 node.mempool()
-                    .set_added_listener(Arc::new(move |tx: &Transaction| {
+                    .add_added_listener(Arc::new(move |tx: &Transaction| {
                         if wallet_for_added.add_mempool_tx(tx) {
                             info!("Wallet sees unconfirmed tx {}", tx.txid());
                         }
@@ -2005,6 +2035,8 @@ async fn run_daemon(
         bind_address: config.rpc.socket_addr(),
         username: Some(rpc_user),
         password: Some(rpc_password),
+        keep_alive: config.rpc.keep_alive,
+        rest: config.rpc.rest,
     };
 
     info!("Starting RPC server on {}...", rpc_config.bind_address);
@@ -2039,6 +2071,7 @@ async fn run_daemon(
         let peers_for_staking_status = Arc::clone(&peer_manager);
         let split_threshold_divi = config.staking.split_threshold as f64 / 100_000_000.0;
         let mempool_for_rpc = node.mempool().clone();
+        let reorg_hook_for_rpc = mempool_reorg_hook(&node, Some(Arc::clone(&wallet)));
         let spork_for_rpc = node.spork_manager().clone();
         let history_for_rpc = node.history_fetcher();
         let block_sync_for_rpc = node.block_sync().clone();
@@ -2046,6 +2079,9 @@ async fn run_daemon(
         let tx_relay_for_tx = node.tx_relay().clone();
         let datadir_for_mn = config.data_dir.clone();
         let pm_for_mn = node.peer_manager().clone();
+        // The node's own masternode list, which the network fills from mnb/mnp
+        let mn_for_rpc = node.masternode_manager().as_ref().clone();
+        let mn_list_for_rpc = Arc::clone(node.masternode_list());
         let log_config_for_rpc = divi_rpc::LogConfigInfo {
             max_file_size: config.log.max_file_size,
             max_files: config.log.max_files,
@@ -2062,14 +2098,15 @@ async fn run_daemon(
                 move |rpc_server| {
                     rpc_server.set_shutdown_callback(rpc_stop);
                     rpc_server.set_mempool(mempool_for_rpc);
+                    rpc_server.set_reorg_hook(reorg_hook_for_rpc);
                     rpc_server.set_block_fetcher(history_for_rpc);
                     rpc_server.set_block_sync(block_sync_for_rpc);
                     rpc_server.set_spork_manager(spork_for_rpc);
                     rpc_server.set_log_config(log_config_for_rpc);
 
-                    // Initialize masternode manager
-                    let mn_manager = divi_masternode::MasternodeManager::new();
-                    rpc_server.set_masternode_manager(mn_manager);
+                    // The masternode RPCs read the node's masternode list
+                    rpc_server.set_masternode_manager(mn_for_rpc);
+                    rpc_server.set_masternode_list(mn_list_for_rpc);
                     rpc_server.set_masternode_datadir(datadir_for_mn);
                     rpc_server.set_masternode_relay(Arc::new(move |bytes: Vec<u8>| {
                         pm_for_mn.broadcast_masternode_broadcast(bytes);
@@ -2192,11 +2229,15 @@ async fn run_daemon(
         }
     } else {
         let mempool_for_rpc = node.mempool().clone();
+        let reorg_hook_for_rpc = mempool_reorg_hook(&node, None);
         let spork_for_rpc = node.spork_manager().clone();
         let history_for_rpc = node.history_fetcher();
         let block_sync_for_rpc = node.block_sync().clone();
         let datadir_for_mn = config.data_dir.clone();
         let pm_for_mn = node.peer_manager().clone();
+        // The node's own masternode list, which the network fills from mnb/mnp
+        let mn_for_rpc = node.masternode_manager().as_ref().clone();
+        let mn_list_for_rpc = Arc::clone(node.masternode_list());
         let log_config_for_rpc = divi_rpc::LogConfigInfo {
             max_file_size: config.log.max_file_size,
             max_files: config.log.max_files,
@@ -2212,14 +2253,15 @@ async fn run_daemon(
                 move |rpc_server| {
                     rpc_server.set_shutdown_callback(rpc_stop);
                     rpc_server.set_mempool(mempool_for_rpc);
+                    rpc_server.set_reorg_hook(reorg_hook_for_rpc);
                     rpc_server.set_block_fetcher(history_for_rpc);
                     rpc_server.set_block_sync(block_sync_for_rpc);
                     rpc_server.set_spork_manager(spork_for_rpc);
                     rpc_server.set_log_config(log_config_for_rpc);
 
-                    // Initialize masternode manager
-                    let mn_manager = divi_masternode::MasternodeManager::new();
-                    rpc_server.set_masternode_manager(mn_manager);
+                    // The masternode RPCs read the node's masternode list
+                    rpc_server.set_masternode_manager(mn_for_rpc);
+                    rpc_server.set_masternode_list(mn_list_for_rpc);
                     rpc_server.set_masternode_datadir(datadir_for_mn);
                     rpc_server.set_masternode_relay(Arc::new(move |bytes: Vec<u8>| {
                         pm_for_mn.broadcast_masternode_broadcast(bytes);
@@ -2291,7 +2333,7 @@ fn run_notify(cmd: &str, value: &str) {
 /// -blocknotify: run the command each time the best block changes, with the
 /// new tip's hash (divid's UpdatedBlockTip, init.cpp:113-117, :518-523)
 fn spawn_block_notify(chain: Arc<divi_storage::Chain>, cmd: String) {
-    chain.set_tip_listener(Arc::new(move |tip| run_notify(&cmd, &tip.hash.to_string())));
+    chain.add_tip_listener(Arc::new(move |tip| run_notify(&cmd, &tip.hash.to_string())));
 }
 
 /// The staker's settings. The minimum coin age is the network's (Divi Core
@@ -2369,6 +2411,7 @@ fn staking_info(
         // IronDivi keeps no masternode list sync of its own; Divi Core's
         // starts once the chain is synced
         mnsync: synced,
+        recently_attempted: status.recently_attempted,
         blocks: status.blocks,
         stake_split_threshold: split_threshold_divi,
     }
@@ -2398,6 +2441,31 @@ fn block_is_active(chain: &divi_storage::Chain, block: &divi_primitives::block::
         .flatten()
         .and_then(|index| chain.get_block_index_by_height(index.height).ok().flatten())
         .is_some_and(|index| index.hash == hash)
+}
+
+/// The mempool side of invalidateblock and its family: the disconnected
+/// blocks' transactions go back to the mempool and what the chain now spends
+/// leaves it, as after any reorganization. The wallet is brought to the tip
+/// first, as Divi Core's disconnectTip and connectTip tell it of every block
+/// that leaves or joins the chain (SyncTransactions, ChainTipManager.cpp:189,
+/// :150): blocks that left are rolled back, blocks that joined are scanned.
+/// Before the mempool, so a returned transaction reaches a wallet that no
+/// longer holds it as confirmed.
+fn mempool_reorg_hook(
+    node: &Node,
+    wallet: Option<Arc<WalletDb>>,
+) -> divi_rpc::blockchain::ReorgHook {
+    let chain = node.chain().clone();
+    let mempool = node.mempool().clone();
+    Arc::new(move |disconnected| {
+        if let Some(wallet) = &wallet {
+            sync_wallet_to_tip(wallet, &chain);
+            if let Err(e) = wallet.save_incremental() {
+                error!("Failed to save the wallet after the chain moved: {}", e);
+            }
+        }
+        divi_node::update_mempool_after_reorg(&chain, &mempool, disconnected)
+    })
 }
 
 /// The mempool side of a block handed over by the sync layer or the staker.
@@ -3109,6 +3177,24 @@ mod config_format_tests {
         assert_eq!(a.chain_mode(), ChainMode::Divi);
     }
 
+    /// -rpckeepalive is read, on by default (rpcserver.cpp:1014-1017)
+    #[test]
+    fn rpckeepalive_is_read() {
+        assert!(cfg("regtest=1\n", &[]).unwrap().rpc.keep_alive);
+        assert!(
+            !cfg("regtest=1\nrpckeepalive=0\n", &[])
+                .unwrap()
+                .rpc
+                .keep_alive
+        );
+        assert!(
+            !cfg("regtest=1\n", &["--rpckeepalive=0"])
+                .unwrap()
+                .rpc
+                .keep_alive
+        );
+    }
+
     /// -whitelist and -whitebind as divid reads them: a bad network or a
     /// -whitebind without a port stops the start, and -whitebind alone means
     /// listening only there (net.cpp:1749-1755, :1808-1823)
@@ -3498,6 +3584,7 @@ mod staking_status_tests {
             expected_time: None,
             last_stake_time: 0,
             blocks: 100,
+            recently_attempted: false,
         };
         let info = staking_info(&status, true, 0, 0, false, 5000.0);
         assert!(!info.wallet_unlocked, "locked wallet reported unlocked");
@@ -3884,6 +3971,46 @@ mod divid_option_tests {
         assert_eq!(c.rpc.username.as_deref(), Some("u"));
     }
 
+    /// A divi.conf that happens to be valid TOML still means what it means to
+    /// divid: a [section] line does not hide the keys after it
+    /// (Settings.cpp:159-184) and quotes stay in the value. Only irondivid's
+    /// own file, irondivi.conf or a .toml file, is read as TOML.
+    #[test]
+    fn divi_conf_is_read_as_divid_reads_it_even_when_it_is_toml() {
+        let conf = "rpcuser=1\nrpcpassword=2\nrpcport=1234\n[test]\nrpcport=5\ntimeout=7\n";
+        for file in ["divi.conf", "other.conf"] {
+            let extra = format!("--conf={file}");
+            let c = cfg_in(file, conf, &[&extra]).unwrap();
+            assert_eq!(c.rpc.port, 1234, "{file}: the first value wins");
+            assert_eq!(c.p2p.connect_timeout_ms, 7, "{file}: [test] keys apply");
+        }
+        let c = cfg_in("divi.conf", "rpcuser=\"u\"\nrpcpassword=2\n", &[]).unwrap();
+        assert_eq!(c.rpc.username.as_deref(), Some("\"u\""));
+
+        for file in ["irondivi.conf", "node.toml"] {
+            let extra = format!("--conf={file}");
+            let c = cfg_in(file, "rpcuser = \"u\"\nrpcport = 1236\n", &[&extra]).unwrap();
+            assert_eq!(c.rpc.username.as_deref(), Some("u"), "{file}");
+            assert_eq!(c.rpc.port, 1236, "{file}");
+        }
+    }
+
+    /// -addnode keeps every value, the command line's first, for the added
+    /// node list as well as the peers dialled
+    #[test]
+    fn addnode_values_in_order_command_line_first() {
+        let c = cfg_in(
+            "divi.conf",
+            "rpcuser=u\naddnode=127.0.0.2:11\naddnode=127.0.0.2:12\n",
+            &["-addnode=127.0.0.2:10"],
+        )
+        .unwrap();
+        assert_eq!(
+            c.p2p.addnode,
+            ["127.0.0.2:10", "127.0.0.2:11", "127.0.0.2:12"]
+        );
+    }
+
     /// -conf is relative to the data directory (Settings::GetConfigFile)
     #[test]
     fn conf_is_relative_to_the_data_directory() {
@@ -4112,7 +4239,14 @@ mod start_errors {
             "Invalid amount for -maxtxfee=<amount>: '0.00001' (must be at least the minrelay \
              fee of 0.00010000 DIV/kB to prevent stuck transactions)"
         );
-        assert!(start(CONF, &["-maxtxfee=0.5"]).is_ok());
+        assert_eq!(
+            start(CONF, &["-maxtxfee=0.5"]).unwrap().mempool.max_tx_fee,
+            50_000_000
+        );
+        assert_eq!(
+            start(CONF, &[]).unwrap().mempool.max_tx_fee,
+            100 * 100_000_000
+        );
         assert!(
             start(CONF, &["-maxtxfee=100"]).is_ok(),
             "very high is a warning only"

@@ -303,8 +303,18 @@ pub struct ChainTip {
     pub status: ChainTipStatus,
 }
 
-/// A listener for a new chain tip (see `Chain::set_tip_listener`)
+/// A listener for a new chain tip (see `Chain::add_tip_listener`)
 pub type TipListener = Arc<dyn Fn(&BlockIndex) + Send + Sync>;
+
+/// A block the active chain took or gave up (see `Chain::add_block_listener`)
+#[derive(Debug, Clone)]
+pub enum ChainEvent {
+    Connected(Block),
+    Disconnected(Block),
+}
+
+/// A listener for connected and disconnected blocks
+pub type BlockListener = Arc<dyn Fn(&ChainEvent) + Send + Sync>;
 
 /// Chain state
 pub struct Chain {
@@ -318,7 +328,14 @@ pub struct Chain {
     tip: RwLock<Option<BlockIndex>>,
     /// Called with the new tip when a chain operation ends with another tip
     /// than it started with (Divi Core's UpdatedBlockTip, for -blocknotify)
-    tip_listener: RwLock<Option<TipListener>>,
+    tip_listeners: RwLock<Vec<TipListener>>,
+    /// Called with each block connected or disconnected, in order, when the
+    /// chain operation ends and before the tip listeners
+    block_listeners: RwLock<Vec<BlockListener>>,
+    /// Blocks connected or disconnected by the running operation
+    pending_events: Mutex<Vec<ChainEvent>>,
+    /// Whether this start wrote the genesis block (a new data directory)
+    created_genesis: std::sync::atomic::AtomicBool,
     /// Best known block index (block with the highest chain work we've seen).
     /// Used by `activate_best_chain` to detect when a side-chain has accumulated
     /// more work than the current tip and a reorganization is needed.
@@ -392,7 +409,10 @@ impl Chain {
             tx_index: None,
             search_index: None,
             tip: RwLock::new(None),
-            tip_listener: RwLock::new(None),
+            tip_listeners: RwLock::new(Vec::new()),
+            block_listeners: RwLock::new(Vec::new()),
+            pending_events: Mutex::new(Vec::new()),
+            created_genesis: std::sync::atomic::AtomicBool::new(false),
             best_known_block: RwLock::new(None),
             params,
             chain_lock: Mutex::new(()),
@@ -414,6 +434,9 @@ impl Chain {
                 ));
             }
             chain.init_genesis()?;
+            chain
+                .created_genesis
+                .store(true, std::sync::atomic::Ordering::SeqCst);
             chain.db.put_metadata(HEIGHT_INDEX_REPAIR_KEY, b"1")?;
         } else if chain.db.get_metadata(HEIGHT_INDEX_REPAIR_KEY)?.is_none() {
             // One-time repair of height -> hash entries written for side-chain
@@ -697,6 +720,7 @@ impl Chain {
                 (Some(search), Some(updates)) => search.add_to_batch(wb, updates, false),
                 _ => Ok(()),
             })?;
+        self.record_event(|| ChainEvent::Connected(block.clone()));
         stop_point!("block connected");
         Ok(())
     }
@@ -1721,18 +1745,50 @@ impl Chain {
 
     /// Call `listener` with the new tip whenever an operation on the chain
     /// ends with a different tip
-    pub fn set_tip_listener(&self, listener: TipListener) {
-        *self.tip_listener.write() = Some(listener);
+    pub fn add_tip_listener(&self, listener: TipListener) {
+        self.tip_listeners.write().push(listener);
     }
 
-    /// Run `op`, then tell the tip listener if the tip moved
+    /// Call `listener` with each block the active chain connects or
+    /// disconnects, in the order the chain did it, when the operation ends
+    pub fn add_block_listener(&self, listener: BlockListener) {
+        self.block_listeners.write().push(listener);
+    }
+
+    /// Whether this start wrote the genesis block, as on a new data directory
+    pub fn created_genesis(&self) -> bool {
+        self.created_genesis
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Keep `event` for the block listeners, if there are any
+    fn record_event(&self, event: impl FnOnce() -> ChainEvent) {
+        if !self.block_listeners.read().is_empty() {
+            self.pending_events.lock().push(event());
+        }
+    }
+
+    /// Run `op`, then give the block listeners the blocks it connected and
+    /// disconnected, and tell the tip listeners if the tip moved
     fn notifying_tip<T>(&self, op: impl FnOnce() -> T) -> T {
         let before = self.tip.read().as_ref().map(|t| t.hash);
         let result = op();
+        let events = std::mem::take(&mut *self.pending_events.lock());
+        if !events.is_empty() {
+            let listeners = self.block_listeners.read().clone();
+            for event in &events {
+                for listener in &listeners {
+                    listener(event);
+                }
+            }
+        }
         let after = self.tip.read().clone();
         if after.as_ref().map(|t| t.hash) != before {
-            if let (Some(tip), Some(listener)) = (after, self.tip_listener.read().clone()) {
-                listener(&tip);
+            if let Some(tip) = after {
+                let listeners = self.tip_listeners.read().clone();
+                for listener in &listeners {
+                    listener(&tip);
+                }
             }
         }
         result
@@ -2526,17 +2582,21 @@ impl Chain {
     /// `invalidateblock` RPC does. If the block is on the active chain the tip
     /// is rolled back to its parent, then the best remaining valid chain is
     /// activated.
-    pub fn invalidate_block(&self, hash: &Hash256) -> Result<(), StorageError> {
+    pub fn invalidate_block(&self, hash: &Hash256) -> Result<Vec<Transaction>, StorageError> {
         self.notifying_tip(|| self.invalidate_block_unnotified(hash, true))
     }
 
     /// Mark the block failed and disconnect it and the blocks above it; with
-    /// `activate`, then move to the best valid chain left
+    /// `activate`, then move to the best valid chain left. Returns the
+    /// transactions of the disconnected blocks, coinbases and coinstakes left
+    /// out, from the lowest block up, for the mempool to take back as Divi
+    /// Core's disconnectTip does (ChainTipManager.cpp disconnectTip:
+    /// "Resurrect mempool transactions from the disconnected block").
     fn invalidate_block_unnotified(
         &self,
         hash: &Hash256,
         activate: bool,
-    ) -> Result<(), StorageError> {
+    ) -> Result<Vec<Transaction>, StorageError> {
         let _chain_guard = self.chain_lock.lock();
         let target = self
             .db
@@ -2550,6 +2610,7 @@ impl Chain {
         }
         self.mark_block_failed(hash)?;
 
+        let mut disconnected: Vec<Vec<Transaction>> = Vec::new();
         if target.is_on_main_chain() {
             if self.db.has_utxo_cache() {
                 self.db.flush_utxo_cache()?;
@@ -2570,6 +2631,14 @@ impl Chain {
                     .unwrap_or_else(|| tip.clone());
                 self.disconnect_block(&block, &mut stored)?;
                 self.mark_block_failed(&tip.hash)?;
+                disconnected.push(
+                    block
+                        .transactions
+                        .iter()
+                        .filter(|tx| !tx.is_coinbase() && !tx.is_coinstake())
+                        .cloned()
+                        .collect(),
+                );
                 let parent = self
                     .db
                     .get_block_index(&block.header.prev_block)?
@@ -2589,7 +2658,7 @@ impl Chain {
         if activate {
             self.activate_best_valid_chain()?;
         }
-        Ok(())
+        Ok(disconnected.into_iter().rev().flatten().collect())
     }
 
     /// Record that a node now runs on this database. Returns whether the run
@@ -2673,11 +2742,32 @@ impl Chain {
     /// clear the invalid mark again without moving the tip, as Core's
     /// reconsiderBlock (ChainExtensionService.cpp:662-689) does there. The
     /// tip stays at the block's parent until another block is connected.
-    pub fn reverse_block_transactions(&self, hash: &Hash256) -> Result<(), StorageError> {
+    ///
+    /// For the genesis block Core disconnects every block above it, fails to
+    /// disconnect the genesis block itself and still answers null
+    /// (BlockInvalidationHelpers.cpp:134-143, rpcblockchain.cpp:605-609): the
+    /// tip is the genesis block, so here the reversal starts at block 1.
+    pub fn reverse_block_transactions(
+        &self,
+        hash: &Hash256,
+    ) -> Result<Vec<Transaction>, StorageError> {
         self.notifying_tip(|| {
-            self.invalidate_block_unnotified(hash, false)?;
+            let target = self
+                .db
+                .get_block_index(hash)?
+                .ok_or_else(|| StorageError::BlockNotFound(hash.to_string()))?;
+            let first = if target.height == 0 {
+                match self.get_block_index_by_height(1)? {
+                    Some(block_1) => block_1.hash,
+                    None => return Ok(Vec::new()),
+                }
+            } else {
+                *hash
+            };
+            let disconnected = self.invalidate_block_unnotified(&first, false)?;
             let _chain_guard = self.chain_lock.lock();
-            self.clear_failed_marks(hash)
+            self.clear_failed_marks(&first)?;
+            Ok(disconnected)
         })
     }
 
@@ -2860,14 +2950,25 @@ impl Chain {
         }
 
         // Divi Core DisconnectBlock: reverse the block's address and spent
-        // index entries from the outputs its inputs spent
+        // index entries from the outputs its inputs spent. A coin made and
+        // spent in the block is not restored, but Core's view still holds it
+        // when the spender is reversed, so its spend is erased too
         let updates = match self.search_index {
             Some(ref search) => {
-                let prevouts: HashMap<OutPoint, search_index::PrevOut> = utxo_batch
+                let mut prevouts: HashMap<OutPoint, search_index::PrevOut> = utxo_batch
                     .adds
                     .iter()
                     .map(|(outpoint, utxo)| (*outpoint, (utxo.value, utxo.script_pubkey.clone())))
                     .collect();
+                for tx in &block.transactions {
+                    let txid = self.compute_txid(tx);
+                    for (k, out) in tx.vout.iter().enumerate() {
+                        prevouts.insert(
+                            OutPoint::new(txid, k as u32),
+                            (out.value, out.script_pubkey.clone()),
+                        );
+                    }
+                }
                 Some(search_index::collect_disconnect(
                     block,
                     index.height,
@@ -2927,6 +3028,7 @@ impl Chain {
             "Disconnected block {} at height {}",
             index.hash, index.height
         );
+        self.record_event(|| ChainEvent::Disconnected(block.clone()));
         stop_point!("block disconnected");
         Ok(())
     }
@@ -3068,11 +3170,8 @@ impl Chain {
 
         // Divi Core CheckBlock (BlockCheckingHelpers.cpp:29-31): at most 180 s in the
         // future for a PoS block (MaxFutureBlockDrift, Settings.cpp:215-218), 2 hours
-        // for a PoW block
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| StorageError::ChainState(format!("System time error: {}", e)))?
-            .as_secs();
+        // for a PoW block, past GetAdjustedTime (the clock setmocktime sets)
+        let now = divi_primitives::clock::now().max(0) as u64;
         let max_drift = if block.is_proof_of_stake() {
             MAX_FUTURE_BLOCK_DRIFT_POS
         } else {
@@ -3958,15 +4057,6 @@ impl Chain {
             }
         }
 
-        // IMPORTANT: Validate treasury payments BEFORE modifying any state
-        // This prevents UTXO corruption if validation fails
-        debug!(
-            "  ├─ Treasury validation check (network: {:?})",
-            self.network_type()
-        );
-        self.validate_treasury_payments(block, index)?;
-        debug!("  ├─ Treasury validation: ✅ PASS");
-
         debug!("  ├─ Processing {} transactions", block.transactions.len());
         let mut total_inputs = 0;
         let mut total_outputs = 0;
@@ -4376,11 +4466,9 @@ impl Chain {
             return Ok(());
         }
 
+        // Regtest pays testnet's treasury and charity addresses, as every
+        // network but mainnet does (BlockIncentivesPopulator.cpp:34-42)
         let is_mainnet = matches!(network_type, NetworkType::Mainnet);
-
-        if matches!(network_type, NetworkType::Regtest) {
-            return Ok(());
-        }
 
         let halving_interval = match network_type {
             NetworkType::Mainnet => 525_600u32,
@@ -4405,54 +4493,31 @@ impl Chain {
                 halving_interval,
             );
 
-        let mut treasury_found = None;
-        let mut charity_found = None;
-
-        for output in &coinstake.vout {
-            if output.script_pubkey == treasury_script {
-                treasury_found = Some(output.value);
-            }
-            if output.script_pubkey == charity_script {
-                charity_found = Some(output.value);
-            }
+        // Divi Core's IsValidTreasuryPayment (BlockIncentivesPopulator.cpp:66-90):
+        // an output of exactly the amount to exactly the script, for each
+        let pays = |script: &divi_primitives::script::Script, amount| {
+            coinstake
+                .vout
+                .iter()
+                .any(|o| o.script_pubkey == *script && o.value == amount)
+        };
+        if !pays(&treasury_script, expected_treasury) {
+            return Err(StorageError::invalid_block_scored(
+                0,
+                format!(
+                    "Treasury block {} does not pay the treasury {}",
+                    height, expected_treasury
+                ),
+            ));
         }
-
-        match treasury_found {
-            None => {
-                return Err(StorageError::invalid_block_scored(
-                    0,
-                    format!("Treasury block {} missing treasury payment", height),
-                ));
-            }
-            Some(actual) if actual != expected_treasury => {
-                return Err(StorageError::invalid_block_scored(
-                    0,
-                    format!(
-                        "Treasury block {} has incorrect treasury payment: expected {}, got {}",
-                        height, expected_treasury, actual
-                    ),
-                ));
-            }
-            Some(_) => {}
-        }
-
-        match charity_found {
-            None => {
-                return Err(StorageError::invalid_block_scored(
-                    0,
-                    format!("Treasury block {} missing charity payment", height),
-                ));
-            }
-            Some(actual) if actual != expected_charity => {
-                return Err(StorageError::invalid_block_scored(
-                    0,
-                    format!(
-                        "Treasury block {} has incorrect charity payment: expected {}, got {}",
-                        height, expected_charity, actual
-                    ),
-                ));
-            }
-            Some(_) => {}
+        if !pays(&charity_script, expected_charity) {
+            return Err(StorageError::invalid_block_scored(
+                0,
+                format!(
+                    "Treasury block {} does not pay the charity {}",
+                    height, expected_charity
+                ),
+            ));
         }
 
         Ok(())
@@ -4625,6 +4690,12 @@ impl Chain {
                 mint, expected_mint, height
             )));
         }
+
+        // The payees after the amount, as Divi Core's
+        // CheckMintTotalsAndBlockPayees (BlockConnectionService.cpp:77-98): a
+        // block paying too much is refused with DoS 100 even when it also
+        // pays the wrong payee (DoS 0); the UTXO changes are not written yet
+        self.validate_treasury_payments(block, index)?;
 
         // Validate lottery payments on lottery blocks
         if is_lottery {
@@ -5629,6 +5700,100 @@ mod tests {
         )
         .unwrap();
         (chain, dir)
+    }
+
+    /// A regtest treasury block pays exactly the treasury and the charity, as
+    /// Divi Core checks on every network (BlockIncentivesPopulator.cpp:66-90,
+    /// :180-185): at block 150 divid pays 9600 and 600 DIVI to testnet's
+    /// treasury and charity addresses
+    #[test]
+    fn regtest_treasury_payments_are_checked() {
+        use divi_primitives::script::Script;
+        use divi_primitives::transaction::{TxIn, TxOut};
+        let (chain, _dir) = create_test_chain();
+        let mut index = chain.tip().unwrap();
+        index.height = 150;
+        let treasury = divi_consensus::treasury::get_treasury_script(false);
+        let charity = divi_consensus::treasury::get_charity_script(false);
+        let block_paying = |outputs: Vec<TxOut>| {
+            let mut vout = vec![
+                TxOut::new(Amount::ZERO, Script::new()),
+                TxOut::new(Amount::from_divi(1696), Script::new_p2pkh(&[7u8; 20])),
+            ];
+            vout.extend(outputs);
+            Block {
+                transactions: vec![
+                    Transaction::default(),
+                    Transaction {
+                        version: 1,
+                        vin: vec![TxIn::new(
+                            OutPoint::new(Hash256::from_bytes([3u8; 32]), 1),
+                            Script::new(),
+                            0xffff_ffff,
+                        )],
+                        vout,
+                        lock_time: 0,
+                    },
+                ],
+                ..Block::default()
+            }
+        };
+        let t = Amount::from_divi(9600);
+        let c = Amount::from_divi(600);
+        let pay = |script: &Script, amount: Amount| TxOut::new(amount, script.clone());
+        let less = Amount::from_sat(t.as_sat() - 1);
+        let other = Script::new_p2pkh(&[9u8; 20]);
+
+        let ok = block_paying(vec![pay(&treasury, t), pay(&charity, c)]);
+        assert!(chain.validate_treasury_payments(&ok, &index).is_ok());
+        // Another output to the treasury script beside the exact one is fine
+        let also = block_paying(vec![
+            pay(&treasury, less),
+            pay(&treasury, t),
+            pay(&charity, c),
+        ]);
+        assert!(chain.validate_treasury_payments(&also, &index).is_ok());
+        for (what, outputs) in [
+            (
+                "one satoshi less",
+                vec![pay(&treasury, less), pay(&charity, c)],
+            ),
+            (
+                "one satoshi more",
+                vec![
+                    pay(&treasury, Amount::from_sat(t.as_sat() + 1)),
+                    pay(&charity, c),
+                ],
+            ),
+            ("to another script", vec![pay(&other, t), pay(&charity, c)]),
+            ("no charity", vec![pay(&treasury, t)]),
+        ] {
+            let err = chain
+                .validate_treasury_payments(&block_paying(outputs), &index)
+                .expect_err(what);
+            assert_eq!(err.misbehaviour_score(), 0, "{what}: bad-cb-payee scores 0");
+        }
+
+        // In the block's value check: the payees are checked there, after the
+        // amount, so paying too much is bad-cb-amount (DoS 100) first
+        // (BlockConnectionService.cpp:84-97)
+        let limit = Chain::stake_reward(&chain.block_rewards(150)) + t + c;
+        let under = block_paying(vec![pay(&treasury, less), pay(&charity, c)]);
+        let err = chain
+            .validate_block_value(&under, &index, limit, Amount::ZERO)
+            .expect_err("a treasury paid one satoshi less");
+        assert_eq!(err.misbehaviour_score(), 0);
+        let over = block_paying(vec![
+            pay(&treasury, Amount::from_sat(t.as_sat() + 1)),
+            pay(&charity, c),
+        ]);
+        let err = chain
+            .validate_block_value(&over, &index, limit + Amount::from_sat(1), Amount::ZERO)
+            .expect_err("a treasury paid one satoshi more");
+        assert_eq!(err.misbehaviour_score(), 100, "{err}");
+        assert!(chain
+            .validate_block_value(&ok, &index, limit, Amount::ZERO)
+            .is_ok());
     }
 
     thread_local! {

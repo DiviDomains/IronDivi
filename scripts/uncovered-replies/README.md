@@ -215,10 +215,6 @@ Core paths are under `divi/src/` of the Divi Core source at v3.0.0 (commit 9e2f7
   check and reads `params[0..2]` (rpcrawtransaction.cpp:566-572). With two or one argument it reads past the list
   and answers with whatever it finds there (for example "value is type obj, expected int"); with none it stops on a
   segmentation fault. irondivid answers -1 with the call's usage; the rows show it only.
-- **`setmocktime`, the next block's time, and `setmocktime 0`:** irondivid has no mock clock. Each part reads the
-  system clock (block times, mempool, peers), so the call is refused on regtest too, and a block irondivid mines
-  keeps the real time. divid sets one clock for the whole node (SetMockTime, rpcmisc.cpp:526-541). The argument
-  errors (a text, a real, a wrong count) are the same as divid's.
 - **`loadwallet` a file:** irondivid opens one wallet at start and keeps it; the call is refused with a message
   naming `--wallet` and the wallet in use (docs/divid-differences.md R2). divid switches to the named wallet. The
   argument errors are the same as divid's.

@@ -28,6 +28,8 @@ use std::sync::Arc;
 pub struct BlockchainRpc {
     chain: Arc<Chain>,
     mempool: RwLock<Option<Arc<dyn MempoolProvider>>>,
+    /// The mempool's side of invalidateblock and its family
+    reorg_hook: RwLock<Option<ReorgHook>>,
     /// Money supply cached against the tip hash it was computed for
     money_supply_cache: RwLock<Option<(Hash256, f64)>>,
     /// Fetches blocks this node has pruned from full-history peers
@@ -109,6 +111,11 @@ pub struct FeeEstimate {
     pub blocks: u32,
 }
 
+/// Takes the transactions of blocks `invalidateblock` or
+/// `reverseblocktransactions` disconnected back into the mempool and drops
+/// what the chain now spends (called with none after `reconsiderblock`)
+pub type ReorgHook = Arc<dyn Fn(Vec<divi_primitives::transaction::Transaction>) + Send + Sync>;
+
 /// Trait for mempool access (to avoid circular dependency)
 pub trait MempoolProvider: Send + Sync {
     fn get_txids(&self) -> Vec<Hash256>;
@@ -148,6 +155,12 @@ pub trait MempoolProvider: Send + Sync {
     /// Get mempool statistics
     fn get_stats(&self) -> MempoolStats {
         MempoolStats::default()
+    }
+
+    /// The highest fee sendrawtransaction takes without allowhighfees
+    /// (-maxtxfee; Divi Core's DEFAULT_TRANSACTION_MAXFEE, defaultValues.h:34)
+    fn max_tx_fee(&self) -> divi_primitives::amount::Amount {
+        divi_primitives::amount::Amount::from_sat(100 * 100_000_000)
     }
 
     /// Estimate fee for confirmation within target blocks
@@ -205,6 +218,7 @@ impl BlockchainRpc {
         BlockchainRpc {
             chain,
             mempool: RwLock::new(None),
+            reorg_hook: RwLock::new(None),
             money_supply_cache: RwLock::new(None),
             block_fetcher: RwLock::new(None),
             block_sync: RwLock::new(None),
@@ -355,6 +369,12 @@ impl BlockchainRpc {
     /// Set the mempool provider
     pub fn set_mempool(&self, mempool: Arc<dyn MempoolProvider>) {
         *self.mempool.write() = Some(mempool);
+    }
+
+    /// Set what invalidateblock, reconsiderblock and reverseblocktransactions
+    /// do to the mempool
+    pub fn set_reorg_hook(&self, hook: ReorgHook) {
+        *self.reorg_hook.write() = Some(hook);
     }
 
     /// The minimum relay fee in DIVI/kB that getinfo and getnetworkinfo
@@ -735,8 +755,11 @@ impl BlockchainRpc {
             return Err(usage().into());
         }
         let hash_str = params.get_str(0).ok_or_else(usage)?;
-        // C++ uint256S: an unparseable hash becomes the zero hash, which is never found
-        let hash = Hash256::from_hex(hash_str).unwrap_or_else(|_| Hash256::zero());
+        // As Divi Core reads it, uint256(strHash) or uint256S: leading space
+        // and "0x" skipped, a short hash read as a number, text without
+        // digits the zero hash, which is never found (rpcblockchain.cpp:589,
+        // :625, :663)
+        let hash = crate::wallet::uint256_set_hex(hash_str);
         let map_err = |e: divi_storage::StorageError| -> Error {
             match e {
                 divi_storage::StorageError::BlockNotFound(_) => {
@@ -745,18 +768,26 @@ impl BlockchainRpc {
                 other => RpcError::database_error(other.to_string()).into(),
             }
         };
-        match method {
+        // The disconnected blocks' transactions go back to the mempool, as
+        // Divi Core's disconnectTip puts them back; after a reconsider the
+        // mempool drops what the chain now holds
+        let returned = match method {
             "invalidateblock" => self.chain.invalidate_block(&hash).map_err(map_err)?,
-            "reconsiderblock" => self.chain.reconsider_block(&hash).map_err(map_err)?,
-            _ => {
-                // C++ reverseblocktransactions invalidates (reversing the block's
-                // transactions in the coin DB) then clears the invalid mark
-                // without moving the tip, which stays at the block's parent
-                // until another block comes (rpcblockchain.cpp:577-603)
-                self.chain
-                    .reverse_block_transactions(&hash)
-                    .map_err(map_err)?;
+            "reconsiderblock" => {
+                self.chain.reconsider_block(&hash).map_err(map_err)?;
+                Vec::new()
             }
+            // C++ reverseblocktransactions invalidates (reversing the block's
+            // transactions in the coin DB) then clears the invalid mark
+            // without moving the tip, which stays at the block's parent
+            // until another block comes (rpcblockchain.cpp:577-603)
+            _ => self
+                .chain
+                .reverse_block_transactions(&hash)
+                .map_err(map_err)?,
+        };
+        if let Some(hook) = self.reorg_hook.read().clone() {
+            hook(returned);
         }
         Ok(Value::Null)
     }
@@ -1111,8 +1142,8 @@ impl BlockchainRpc {
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
                 match (
-                    obj.get("start").and_then(|v| v.as_i64()),
-                    obj.get("end").and_then(|v| v.as_i64()),
+                    obj.get("start").and_then(json_spirit_int),
+                    obj.get("end").and_then(json_spirit_int),
                 ) {
                     (Some(start), Some(end)) => {
                         if start <= 0 || end <= 0 {
@@ -1187,7 +1218,12 @@ impl BlockchainRpc {
         let (start, end) = params
             .get(0)
             .and_then(|p| p.as_object())
-            .and_then(|obj| Some((obj.get("start")?.as_i64()?, obj.get("end")?.as_i64()?)))
+            .and_then(|obj| {
+                Some((
+                    json_spirit_int(obj.get("start")?)?,
+                    json_spirit_int(obj.get("end")?)?,
+                ))
+            })
             .filter(|(start, end)| *start > 0 && *end > 0)
             .unwrap_or((0, 0));
         let index = self.address_index()?;
@@ -1277,10 +1313,8 @@ impl BlockchainRpc {
             (1, Some(Value::Object(obj))) => obj,
             _ => return Err(RpcError::invalid_params("getspentinfo {txid:,index:}").into()),
         };
-        let (txid, index) = match (obj.get("txid"), obj.get("index")) {
-            (Some(Value::String(txid)), Some(Value::Number(n))) if n.is_i64() || n.is_u64() => {
-                (txid.as_str(), n.as_i64().unwrap_or(i64::MAX))
-            }
+        let (txid, index) = match (obj.get("txid"), obj.get("index").and_then(json_spirit_int)) {
+            (Some(Value::String(txid)), Some(index)) => (txid.as_str(), index),
             _ => {
                 return Err(
                     RpcError::new(codes::INVALID_ADDRESS_OR_KEY, "Invalid txid or index").into(),
@@ -1511,6 +1545,21 @@ fn core_parse_hash_str(s: &str, name: &str) -> Result<Hash256, RpcError> {
     }
     let tail = &s[s.len().saturating_sub(64)..];
     Hash256::from_hex(&format!("{tail:0>64}")).map_err(|_| not_hex())
+}
+
+/// json_spirit's `get_int()` of an integer: its 64 bits cut to a C++ `int`
+/// (json_spirit_value.h, `static_cast<int>`), so 2^32 + 5 reads as 5; None for
+/// anything but an integer
+fn json_spirit_int(v: &Value) -> Option<i64> {
+    match v {
+        Value::Number(n) if n.is_i64() || n.is_u64() => {
+            let wide = n
+                .as_i64()
+                .unwrap_or_else(|| n.as_u64().unwrap_or_default() as i64);
+            Some(i64::from(wide as i32))
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]

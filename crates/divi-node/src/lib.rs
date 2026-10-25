@@ -59,6 +59,7 @@ pub mod mempool;
 pub mod node;
 pub mod orphans;
 pub mod staker;
+pub mod zmq;
 
 pub use config::{NetworkConfig, NetworkType, NodeConfig, P2pConfig, RpcConfig};
 pub use error::NodeError;

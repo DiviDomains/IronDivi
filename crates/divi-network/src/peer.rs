@@ -72,14 +72,21 @@ pub struct PeerInfo {
     pub version: Option<VersionMessage>,
     /// Services offered by the peer
     pub services: u64,
-    /// Best block height known by peer
-    pub start_height: u32,
+    /// The height the peer named in its version message; -1 before one
+    /// came or when it named none (Divi Core nStartingHeight, Node.cpp:561)
+    pub start_height: i32,
     /// Time of connection
     pub connected_at: Instant,
     /// Last message received time
     pub last_recv: Instant,
     /// Last message sent time
     pub last_send: Instant,
+    /// The node's clock at the connection, the last message received and the
+    /// last sent, in Unix seconds (Core's nTimeConnected, nLastRecv, nLastSend
+    /// from GetTime, which setmocktime sets)
+    pub conn_unix: u64,
+    pub last_recv_unix: u64,
+    pub last_send_unix: u64,
     /// Bytes received
     pub bytes_recv: u64,
     /// Bytes sent
@@ -111,10 +118,13 @@ impl PeerInfo {
             state: PeerState::Connecting,
             version: None,
             services: 0,
-            start_height: 0,
+            start_height: -1,
             connected_at: now,
             last_recv: now,
             last_send: now,
+            conn_unix: unix_now(),
+            last_recv_unix: unix_now(),
+            last_send_unix: unix_now(),
             bytes_recv: 0,
             bytes_sent: 0,
             ping_nonce: None,
@@ -212,14 +222,15 @@ pub struct LivePeerStats {
     pub version: AtomicU64,
     /// Peer's advertised services
     pub services: AtomicU64,
-    /// Peer's advertised start height
-    pub start_height: AtomicU64,
+    /// Peer's advertised start height (-1 when it named none)
+    pub start_height: AtomicI64,
     /// Peer's user agent
     pub subver: parking_lot::Mutex<String>,
 }
 
-fn unix_now() -> u64 {
-    unix_now_us() / 1_000_000
+/// The node's clock in Unix seconds (mocked by setmocktime)
+pub fn unix_now() -> u64 {
+    divi_primitives::clock::now().max(0) as u64
 }
 
 /// Current Unix time in microseconds
@@ -233,17 +244,11 @@ pub fn unix_now_us() -> u64 {
 impl PeerInfo {
     /// Publish this connection's counters to the shared stats
     pub fn publish(&self, live: &LivePeerStats) {
-        let now = unix_now();
-        let ago = |t: Instant| now.saturating_sub(t.elapsed().as_secs());
         live.bytes_sent.store(self.bytes_sent, Ordering::Relaxed);
         live.bytes_recv.store(self.bytes_recv, Ordering::Relaxed);
-        live.last_send.store(ago(self.last_send), Ordering::Relaxed);
-        live.last_recv.store(ago(self.last_recv), Ordering::Relaxed);
-        // Set once: recomputing from an Instant each time would jitter by a second
-        if live.conn_time.load(Ordering::Relaxed) == 0 {
-            live.conn_time
-                .store(ago(self.connected_at), Ordering::Relaxed);
-        }
+        live.last_send.store(self.last_send_unix, Ordering::Relaxed);
+        live.last_recv.store(self.last_recv_unix, Ordering::Relaxed);
+        live.conn_time.store(self.conn_unix, Ordering::Relaxed);
         live.ping_us
             .store(self.ping_latency_us.unwrap_or(0), Ordering::Relaxed);
         let now_us = unix_now_us();
@@ -255,7 +260,7 @@ impl PeerInfo {
         live.time_offset.store(self.time_offset, Ordering::Relaxed);
         live.services.store(self.services, Ordering::Relaxed);
         live.start_height
-            .store(self.start_height as u64, Ordering::Relaxed);
+            .store(self.start_height as i64, Ordering::Relaxed);
         if let Some(v) = &self.version {
             live.version.store(v.version as u64, Ordering::Relaxed);
             let mut sv = live.subver.lock();

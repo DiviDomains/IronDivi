@@ -268,7 +268,16 @@ impl Settings {
                 Some((net, rest)) if !net.is_empty() => rest.to_string(),
                 _ => full,
             };
-            self.set(&key, value.trim_matches('"'), true);
+            // divid puts a dash in front and SetParameter cuts one doubled
+            // dash and drops a tripled one, so `-key` is `key` and `--key` is
+            // nothing (Settings.cpp:96-109, :200)
+            let key = match key.strip_prefix('-') {
+                Some(rest) if rest.starts_with('-') => continue,
+                Some(rest) => rest.to_string(),
+                None => key,
+            };
+            // Quotes are part of the value, as boost's parser keeps them
+            self.set(&key, value, true);
         }
         Ok(())
     }
@@ -376,6 +385,33 @@ mod tests {
         );
         let mut s = cli(&[]);
         assert!(s.read_config("# only\n\n[main]\nport=2\n").is_ok());
+    }
+
+    /// The file's key goes through SetParameter with a dash in front
+    /// (Settings.cpp:96-117, :200): `-key` is the key, `--key` is dropped
+    #[test]
+    fn config_file_keys_spelled_with_dashes_as_divid() {
+        let mut s = Settings::default();
+        s.read_config("-rpcport=5\n--port=6\n-nolisten=1\n")
+            .unwrap();
+        assert_eq!(s.get("rpcport"), Some("5"));
+        assert_eq!(s.get("port"), None);
+        assert!(
+            s.keys().all(|k| !k.starts_with('-')),
+            "{:?}",
+            s.keys().collect::<Vec<_>>()
+        );
+        assert!(!s.get_bool("listen", true));
+    }
+
+    /// boost's parser keeps quotes: they are part of the value
+    #[test]
+    fn config_file_keeps_quotes_in_a_value() {
+        let mut s = Settings::default();
+        s.read_config("rpcuser=\"u\"\nminrelaytxfee=\"0.0002\"\n")
+            .unwrap();
+        assert_eq!(s.get("rpcuser"), Some("\"u\""));
+        assert_eq!(s.get("minrelaytxfee"), Some("\"0.0002\""));
     }
 
     #[test]
