@@ -42,12 +42,13 @@ fn try_rpc(port: u16, method: &str, params: &Value) -> Option<Value> {
 struct Node {
     child: Child,
     port: u16,
+    p2p_port: u16,
 }
 
 impl Node {
     /// A regtest node with `extra` options and 101 blocks: a mature coinbase
     fn funded(datadir: &std::path::Path, extra: &[&str]) -> Node {
-        let (child, port, _) = start_node(
+        let (child, port, p2p_port) = start_node(
             datadir,
             |rpc_port, p2p_port| {
                 let mut cmd = Command::new(env!("CARGO_BIN_EXE_irondivid"));
@@ -66,7 +67,11 @@ impl Node {
             },
             |rpc_port| try_rpc(rpc_port, "getblockcount", &json!([])).is_some(),
         );
-        let node = Node { child, port };
+        let node = Node {
+            child,
+            port,
+            p2p_port,
+        };
         node.rpc("setgenerate", json!([101]));
         node
     }
@@ -296,6 +301,128 @@ fn relaypriority_off_takes_a_free_low_priority_spend() {
                 Err((-26, "66: insufficient priority".to_string())),
                 "{option:?}"
             );
+        }
+    }
+}
+
+/// One p2p message: regtest magic, command, length, checksum, payload
+fn message(command: &str, payload: &[u8]) -> Vec<u8> {
+    let mut m = vec![0xa1, 0xcf, 0x7e, 0xac];
+    let mut name = command.as_bytes().to_vec();
+    name.resize(12, 0);
+    m.extend(name);
+    m.extend((payload.len() as u32).to_le_bytes());
+    m.extend(&divi_crypto::double_sha256(payload)[..4]);
+    m.extend(payload);
+    m
+}
+
+fn read_message(stream: &mut TcpStream) -> std::io::Result<(String, Vec<u8>)> {
+    let mut head = [0u8; 24];
+    stream.read_exact(&mut head)?;
+    let command = String::from_utf8_lossy(&head[4..16])
+        .trim_end_matches('\0')
+        .to_string();
+    let len = u32::from_le_bytes(head[16..20].try_into().unwrap()) as usize;
+    let mut payload = vec![0u8; len];
+    stream.read_exact(&mut payload)?;
+    Ok((command, payload))
+}
+
+fn net_address(port: u16) -> Vec<u8> {
+    let mut a = 1u64.to_le_bytes().to_vec();
+    a.extend([0u8; 10]);
+    a.extend([0xff, 0xff, 127, 0, 0, 1]);
+    a.extend(port.to_be_bytes());
+    a
+}
+
+/// Relay `hex` from a raw peer: the node's `reject` for it (code, reason), if
+/// it sends one within 5 seconds
+fn relay(port: u16, hex_tx: &str) -> Option<(u8, String)> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut version = 70920i32.to_le_bytes().to_vec();
+    version.extend(1u64.to_le_bytes());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    version.extend(now.to_le_bytes());
+    version.extend(net_address(port));
+    version.extend(net_address(0));
+    version.extend(0x5eed_u64.to_le_bytes());
+    version.push(4);
+    version.extend(b"/rp/");
+    version.extend(0i32.to_le_bytes());
+    version.push(1);
+    stream.write_all(&message("version", &version)).unwrap();
+    let (mut got_version, mut got_verack) = (false, false);
+    while !(got_version && got_verack) {
+        let (command, _) = read_message(&mut stream).expect("handshake");
+        if command == "version" {
+            got_version = true;
+            stream.write_all(&message("verack", &[])).unwrap();
+        } else if command == "verack" {
+            got_verack = true;
+        }
+    }
+    stream.write_all(&message("tx", &hex(hex_tx))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        match read_message(&mut stream) {
+            Ok((command, payload)) if command == "reject" => {
+                let n = payload[0] as usize;
+                let code = payload[1 + n];
+                let m = payload[2 + n] as usize;
+                let reason = String::from_utf8_lossy(&payload[3 + n..3 + n + m]).to_string();
+                return Some((code, reason));
+            }
+            Ok((command, payload)) if command == "ping" => {
+                stream.write_all(&message("pong", &payload)).unwrap();
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// A free transaction from a peer counts against -limitfreerelay thousand
+/// bytes a minute; at 0 none is taken: 66 "rate limited free transaction"
+/// (MempoolConsensus.cpp:211-234, :260-263). By default (30) it is taken.
+#[test]
+fn limitfreerelay_zero_refuses_free_transactions_from_peers() {
+    for (option, limited) in [(None, false), (Some("-limitfreerelay=0"), true)] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut extra = vec!["-listen=1"];
+        extra.extend(option);
+        let node = Node::funded(dir.path(), &extra);
+        // A coinbase of 1250 DIVI, about 100 blocks old: priority to spare
+        let coin = node.coin(1000 * COIN, None);
+        let tx = node.signed(&coin, &[(coin.2, node.script())]);
+        let reject = relay(node.p2p_port, &tx);
+        std::thread::sleep(Duration::from_millis(500));
+        let pool = node.rpc("getrawmempool", json!([]));
+        let in_pool = pool.as_array().unwrap().iter().any(|t| {
+            let mut id = divi_crypto::double_sha256(&hex(&tx)).to_vec();
+            id.reverse();
+            t == &json!(to_hex(&id))
+        });
+        if limited {
+            assert_eq!(
+                reject,
+                Some((66, "rate limited free transaction".to_string())),
+                "{option:?}"
+            );
+            assert!(!in_pool, "{option:?}");
+        } else {
+            assert_eq!(reject, None, "{option:?}");
+            assert!(in_pool, "{option:?}: {pool}");
         }
     }
 }

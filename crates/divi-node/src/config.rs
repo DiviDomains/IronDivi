@@ -731,6 +731,12 @@ pub struct MempoolConfig {
     /// Core's `-relaypriority`, on by default; MempoolConsensus.cpp:254-259)
     #[serde(default = "default_true")]
     pub relay_priority: bool,
+
+    /// The free-relay rate limit for transactions from peers, in thousands of
+    /// bytes per minute (Divi Core's `-limitfreerelay`, 30 by default;
+    /// MempoolConsensus.cpp:211-234)
+    #[serde(default = "default_limit_free_relay")]
+    pub limit_free_relay: i64,
 }
 
 impl Default for MempoolConfig {
@@ -745,12 +751,18 @@ impl Default for MempoolConfig {
             permit_bare_multisig: true,
             max_datacarrier_bytes: default_max_datacarrier_bytes(),
             relay_priority: true,
+            limit_free_relay: default_limit_free_relay(),
         }
     }
 }
 
 fn default_true() -> bool {
     true
+}
+
+/// Divi Core's -limitfreerelay default (MempoolConsensus.cpp:228)
+fn default_limit_free_relay() -> i64 {
+    30
 }
 
 /// Divi Core MAX_OP_META_RELAY (defaultValues.h:40)

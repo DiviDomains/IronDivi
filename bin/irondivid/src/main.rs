@@ -603,6 +603,9 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     // GetBoolArg("-relaypriority", true), read for each transaction in Core;
     // the options do not change while a node runs (MempoolConsensus.cpp:255)
     config.mempool.relay_priority = s.get_bool("relaypriority", true);
+    // GetArg("-limitfreerelay", 30), thousands of bytes per minute, read for
+    // each free transaction from a peer (MempoolConsensus.cpp:228)
+    config.mempool.limit_free_relay = s.get("limitfreerelay").map_or(30, settings::atoi);
     config.mempool.max_datacarrier_bytes = if s.get_bool("datacarrier", true) {
         s.get("datacarriersize")
             .map_or(603, |text| settings::atoi(text) as u32)
@@ -755,6 +758,7 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         "datacarrier",
         "datacarriersize",
         "relaypriority",
+        "limitfreerelay",
         "maxtxfee",
         "sporkkey",
         "staking",

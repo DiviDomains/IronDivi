@@ -207,10 +207,6 @@ pub struct Admission {
 /// Divi Core `DEFAULT_BLOCK_PRIORITY_SIZE` (defaultValues.h:50)
 pub const DEFAULT_BLOCK_PRIORITY_SIZE: usize = 50_000;
 
-/// Divi Core `-limitfreerelay` default (MempoolConsensus.cpp:228), thousands of
-/// bytes per minute
-const LIMIT_FREE_RELAY: f64 = 30.0;
-
 /// Divi Core `CTxMemPoolEntry::AllowFreeThreshold` (MemPoolEntry.h:18-21)
 const ALLOW_FREE_THRESHOLD: f64 = (100_000_000i64 * 1440 / 250) as f64;
 
@@ -564,14 +560,15 @@ impl Mempool {
     }
 
     /// Divi Core `RateLimiterAllowsFreeTransaction` (MempoolConsensus.cpp:211-234):
-    /// an exponentially decaying ~10-minute window of free bytes
+    /// an exponentially decaying ~10-minute window of free bytes, full at
+    /// `-limitfreerelay` times 10,000 bytes
     fn free_relay_allows(&self, size: usize) -> bool {
         let now = unix_now() as i64;
         let mut limiter = self.free_limiter.lock();
         let (count, last) = &mut *limiter;
         *count *= (1.0 - 1.0 / 600.0f64).powf((now - *last) as f64);
         *last = now;
-        if *count >= LIMIT_FREE_RELAY * 10.0 * 1000.0 {
+        if *count >= self.config.limit_free_relay as f64 * 10.0 * 1000.0 {
             return false;
         }
         *count += size as f64;
