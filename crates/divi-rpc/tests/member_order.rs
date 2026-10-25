@@ -184,3 +184,163 @@ fn getblockheader_members_are_in_cores_order() {
         ]
     );
 }
+
+/// A wallet with `n` mature coins of 1250 DIVI on new address-book addresses
+fn funded(n: usize) -> (Node, Vec<Transaction>) {
+    let node = node();
+    let coinbases = (0..n)
+        .map(|_| {
+            let to = node.wallet.new_receiving_address().unwrap();
+            node.wallet.set_label(&to, "").unwrap();
+            node.mine(vec![], &to)
+        })
+        .collect();
+    // Coinbase maturity 20 on regtest
+    for _ in 0..20 {
+        node.mine(vec![], &nobody());
+    }
+    (node, coinbases)
+}
+
+/// listunspent: an item's members as rpcrawtransaction.cpp:330-352 pushes them
+/// (account after address), then irondivid's solvable and ischange
+#[test]
+fn listunspent_members_are_in_cores_order() {
+    let (n, _) = funded(1);
+    let list = n.ok("listunspent", vec![]);
+    assert_eq!(
+        keys(&list[0]),
+        [
+            "txid",
+            "vout",
+            "address",
+            "account",
+            "scriptPubKey",
+            "amount",
+            "confirmations",
+            "spendable",
+            "solvable",
+            "ischange"
+        ]
+    );
+}
+
+/// listunspent: the confirmed coins, then the unconfirmed ones
+/// (AvailableUtxoCollector.cpp:33-41), each in txid order
+#[test]
+fn listunspent_lists_confirmed_coins_before_unconfirmed() {
+    let (n, coinbases) = funded(3);
+    let confirmed: Vec<String> = coinbases[1..]
+        .iter()
+        .map(|c| c.txid().to_string())
+        .collect();
+    // A send from the first coin to the wallet whose txid comes before a
+    // confirmed coin's, so txid order alone would put it among them
+    let to = n.wallet.new_receiving_address().unwrap();
+    let send = (1..200)
+        .map(|fee| {
+            let (mut tx, prev) = divi_wallet::TransactionBuilder::new()
+                .add_input(
+                    divi_primitives::transaction::OutPoint::new(coinbases[0].txid(), 0),
+                    coinbases[0].vout[0].script_pubkey.clone(),
+                )
+                .add_output_to_address(Amount::from_sat(1250 * COIN - fee * 10_000), &to)
+                .build();
+            divi_wallet::TransactionSigner::new(n.wallet.keystore())
+                .sign_all_inputs(&mut tx, &prev)
+                .unwrap();
+            tx
+        })
+        .find(|tx| confirmed.iter().any(|c| tx.txid().to_string() < *c))
+        .unwrap();
+    assert!(n.wallet.add_mempool_tx(&send));
+    let list = n.ok("listunspent", vec![json!(0)]);
+    let txids: Vec<&str> = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|u| u["txid"].as_str().unwrap())
+        .collect();
+    let mut expected: Vec<&str> = confirmed.iter().map(String::as_str).collect();
+    expected.sort();
+    let send_txid = send.txid().to_string();
+    expected.push(&send_txid);
+    assert_eq!(txids, expected);
+}
+
+/// getwalletinfo: rpcwallet.cpp:2894-2906, then irondivid's own members
+#[test]
+fn getwalletinfo_members_are_in_cores_order() {
+    let (n, _) = funded(1);
+    assert_eq!(
+        keys(&n.ok("getwalletinfo", vec![])),
+        [
+            "active_wallet",
+            "walletversion",
+            "balance",
+            "unconfirmed_balance",
+            "immature_balance",
+            "spendable_balance",
+            "vaulted_balance",
+            "txcount",
+            "keypoolsize",
+            "encryption_status",
+            "walletname",
+            "keypoololdest",
+            "paytxfee",
+            "hdmasterkeyid"
+        ]
+    );
+}
+
+/// validateaddress of a wallet key: the pubkey with the visitor's members,
+/// before the account (rpcmisc.cpp:236-247, :349-372)
+#[test]
+fn validateaddress_members_are_in_cores_order() {
+    let n = node();
+    let address = n.wallet.new_receiving_address().unwrap();
+    n.wallet.set_label(&address, "").unwrap();
+    let reply = n.ok("validateaddress", vec![json!(address.to_string())]);
+    let order: Vec<&str> = keys(&reply)
+        .into_iter()
+        .filter(|k| !["hdkeypath", "hdchainid"].contains(k))
+        .collect();
+    assert_eq!(
+        order,
+        [
+            "isvalid",
+            "address",
+            "scriptPubKey",
+            "ismine",
+            "iswatchonly",
+            "isscript",
+            "pubkey",
+            "iscompressed",
+            "account"
+        ]
+    );
+}
+
+/// getaddressesbyaccount: in the order of divid's address book, a std::map
+/// keyed by CTxDestination: key hashes by their uint160, compared from the last
+/// byte (rpcwallet.cpp:670, uint256.cpp:139-148)
+#[test]
+fn getaddressesbyaccount_is_in_address_book_order() {
+    let n = node();
+    let mut made: Vec<Address> = (0..8)
+        .map(|_| n.wallet.new_receiving_address().unwrap())
+        .collect();
+    for a in &made {
+        n.wallet.set_label(a, "acct").unwrap();
+    }
+    made.sort_by_key(|a| {
+        let mut h = a.hash.as_bytes().to_vec();
+        h.reverse();
+        h
+    });
+    let expected: Vec<String> = made.iter().map(|a| a.to_string()).collect();
+    assert_eq!(
+        n.ok("getaddressesbyaccount", vec![json!("acct")]),
+        json!(expected)
+    );
+}
