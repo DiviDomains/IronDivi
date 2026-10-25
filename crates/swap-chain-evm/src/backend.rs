@@ -124,8 +124,10 @@ fn is_already_known(msg: &str) -> bool {
 /// A non-retryable RPC rejection that means *some* transaction already occupies this
 /// nonce — but, unlike [`is_already_known`], not necessarily *this* one. The common case is
 /// genuinely safe (our own earlier broadcast already mined, and the chain caught up between
-/// retries — the write-ahead design here only ever signs a claim/refund once and keeps
-/// rebroadcasting the identical bytes, so nothing else should normally touch this nonce).
+/// retries — the write-ahead design rebroadcasts identical bytes, and the only other thing
+/// it signs at a claim's nonce is a same-nonce replacement of it, `FeeBump::SameNonce`, so
+/// either the message means another version of the same claim holds the nonce or nothing
+/// of ours should touch it).
 /// But it is not the only case: a stale read from a load-balanced public RPC, or the same
 /// key used by a second process at once (both explicitly against this lane's own
 /// conventions, but not impossible), can mean a *different* transaction took the nonce —
