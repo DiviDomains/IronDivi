@@ -11,7 +11,7 @@
 use async_trait::async_trait;
 use divi_swap::api::{AcceptRequest, Direction, LockNotice, Offer, Quote};
 use divi_swap::htlc::ScriptVersion;
-use divi_swap::mock::{MockBackend, MockChain, TxCounts, TxKind};
+use divi_swap::mock::{MockBackend, MockChain, TxCounts, TxKind, MOCK_FEE};
 use divi_swap::store::{MakerRecord, TakerRecord};
 use divi_swap::{
     Amount, Chain, ChainBackend, Funding, HtlcParams, LockedOutput, Maker, Outpoint, Profile,
@@ -116,7 +116,8 @@ struct DropPlan {
 enum Scn {
     /// Taker claims; both sides complete.
     Happy,
-    /// Taker goes silent after locking; both sides time out and refund.
+    /// Taker goes silent after locking (it keeps its own funding tx alive but never looks
+    /// at the maker's lock, so never claims); both sides time out and refund.
     Refund,
 }
 
@@ -402,6 +403,11 @@ impl H {
         if scn == Scn::Happy || *timed_out {
             let view = self.maker.view(&self.maker_id).unwrap();
             let _ = self.taker.step(&self.taker_id, view.as_ref()).await;
+            self.maybe_crash(crash);
+        } else {
+            // The silent taker: a real step (`on_locked` re-sends the persisted funding tx,
+            // same bytes, same txid) with no maker view, so it never sees a lock to claim.
+            let _ = self.taker.step(&self.taker_id, None).await;
             self.maybe_crash(crash);
         }
         self.note_states();
@@ -1112,11 +1118,6 @@ async fn mempool_drop_matrix_body(dir: Direction) {
         let mut runs = 0;
         for leg in [Leg::Taker, Leg::Maker] {
             for kind in [TxKind::Fund, spend] {
-                if scn == Scn::Refund && leg == Leg::Taker && kind == TxKind::Fund {
-                    // The silent taker is the only party holding its funding tx: evicted,
-                    // it is never sent again and the maker aborts. Not a resend question.
-                    continue;
-                }
                 for times in [1, 3] {
                     for restart in [false, true] {
                         let what = format!(
@@ -1649,6 +1650,132 @@ async fn refund_on_claimed_does_nothing_body(dir: Direction) {
     );
 }
 
+/// A refund before its timelock is refused the way a node refuses it, and the engine does
+/// not count a refused refund as done. Each leg's refund (nLockTime = that HTLC's locktime
+/// L) is sent at MTP L-1 and at MTP L, where BIP113 (`IsFinalTx`: nLockTime must be below
+/// the tip's MTP) makes it non-final, then at L+1, where it is accepted. While refused, the
+/// side stays refunding (maker `MakerRefundable`, taker `Refunded`), the chain has no refund
+/// and the refunder's balance is unchanged; accepted and mined, both end `Done` with the
+/// lock paid back. MTP moves with `advance_time` only, never a block, so
+/// each point is exact.
+async fn refund_at_timelock_boundary_body(dir: Direction) {
+    let mut h = H::with(dir);
+    h.accept(None).await;
+    h.lock_and_notify(None).await;
+    for _ in 0..40 {
+        let _ = h.maker.tick().await;
+        if h.maker_state() == SwapState::MakerLockConfirmed {
+            break;
+        }
+        h.mine_all(1);
+    }
+    assert_eq!(h.maker_state(), SwapState::MakerLockConfirmed, "setup");
+    let refunds = |c: &MockChain| {
+        c.accepted()
+            .into_iter()
+            .filter(|(_, k)| *k == TxKind::Refund)
+            .count()
+    };
+
+    // Maker leg.
+    let rec = h.store.get_maker_swap(&h.maker_id).unwrap().unwrap();
+    let (htlc, f) = (rec.maker_leg_htlc.unwrap(), rec.maker_leg_funding.unwrap());
+    let l = htlc.locktime;
+    let ml = h.ml_chain().clone();
+    let bal = ml.balance(&h.m_ml().pubkey());
+    assert!(ml.mtp() < l - 1, "setup: mtp {} locktime {l}", ml.mtp());
+    ml.advance_time(l - 1 - ml.mtp());
+    let own = h
+        .m_ml()
+        .build_refund(&htlc, &f.outpoint, f.amount)
+        .await
+        .unwrap();
+    // At L-1 the engine has not timed out (its gate is MTP >= L) and sends nothing; at L
+    // it sends the refund (the same bytes as `own`) and the node refuses it.
+    let points = [
+        (l - 1, SwapState::MakerLockConfirmed, None),
+        (l, SwapState::MakerRefundable, Some(own.txid)),
+    ];
+    for (at, want, sent) in points {
+        assert_eq!(ml.mtp(), at);
+        match h.m_ml().broadcast(&own).await {
+            Err(SwapError::Premature(m)) => assert!(m.starts_with("non-final"), "{at}: {m}"),
+            other => panic!("maker refund at mtp {at}: {other:?}"),
+        }
+        let state = h.maker.step(&h.maker_id).await.unwrap();
+        assert_eq!(state, want, "maker at mtp {at}");
+        let rec = h.store.get_maker_swap(&h.maker_id).unwrap().unwrap();
+        assert_eq!(
+            rec.maker_leg_refund.map(|t| t.txid),
+            sent,
+            "maker at mtp {at}"
+        );
+        assert_eq!(refunds(&ml), 0, "maker refund accepted at mtp {at}");
+        assert_eq!(ml.balance(&h.m_ml().pubkey()), bal, "maker at mtp {at}");
+        ml.advance_time(1);
+    }
+    assert_eq!(
+        h.maker.step(&h.maker_id).await.unwrap(),
+        SwapState::MakerRefundable
+    );
+    assert_eq!(ml.mempool(), vec![(own.txid, TxKind::Refund)]);
+    ml.mine(1);
+    // One step: MakerRefundable → MakerRefunded (refund confirmed) → Done.
+    assert_eq!(h.maker.step(&h.maker_id).await.unwrap(), SwapState::Done);
+    assert_eq!(
+        ml.balance(&h.m_ml().pubkey()).0,
+        bal.0 + f.amount.0 - MOCK_FEE.0
+    );
+
+    // Taker leg: the taker never claimed (it is never shown the maker's lock).
+    assert_eq!(h.taker_state(), TakerState::Locked);
+    let rec = h.store.get_taker_swap(&h.taker_id).unwrap().unwrap();
+    let (htlc, f) = (rec.taker_leg_htlc.unwrap(), rec.taker_leg_funding.unwrap());
+    let l = htlc.locktime;
+    let tl = h.tl_chain().clone();
+    let bal = tl.balance(&h.t_tl().pubkey());
+    assert!(tl.mtp() < l - 1, "setup: mtp {} locktime {l}", tl.mtp());
+    tl.advance_time(l - 1 - tl.mtp());
+    let own = h
+        .t_tl()
+        .build_refund(&htlc, &f.outpoint, f.amount)
+        .await
+        .unwrap();
+    for (at, want) in [(l - 1, TakerState::Locked), (l, TakerState::Refunded)] {
+        assert_eq!(tl.mtp(), at);
+        match h.t_tl().broadcast(&own).await {
+            Err(SwapError::Premature(m)) => assert!(m.starts_with("non-final"), "{at}: {m}"),
+            other => panic!("taker refund at mtp {at}: {other:?}"),
+        }
+        let state = h.taker.step(&h.taker_id, None).await.unwrap();
+        assert_eq!(state, want, "taker at mtp {at}");
+        assert_eq!(refunds(&tl), 0, "taker refund accepted at mtp {at}");
+        assert_eq!(tl.balance(&h.t_tl().pubkey()), bal, "taker at mtp {at}");
+        tl.advance_time(1);
+    }
+    let rec = h.store.get_taker_swap(&h.taker_id).unwrap().unwrap();
+    assert_eq!(rec.taker_leg_refund.map(|t| t.txid), Some(own.txid));
+    assert_eq!(
+        h.taker.step(&h.taker_id, None).await.unwrap(),
+        TakerState::Refunded
+    );
+    assert_eq!(tl.mempool(), vec![(own.txid, TxKind::Refund)]);
+    tl.mine(1);
+    assert_eq!(
+        h.taker.step(&h.taker_id, None).await.unwrap(),
+        TakerState::Done
+    );
+    assert_eq!(
+        tl.balance(&h.t_tl().pubkey()).0,
+        bal.0 + f.amount.0 - MOCK_FEE.0
+    );
+}
+
+both!(
+    refund_at_timelock_boundary,
+    rev_refund_at_timelock_boundary,
+    refund_at_timelock_boundary_body
+);
 both!(
     refund_never_claims,
     rev_refund_never_claims,

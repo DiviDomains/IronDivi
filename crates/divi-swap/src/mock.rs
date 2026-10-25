@@ -9,9 +9,10 @@
 //! In-memory chain for engine and daemon tests.
 //!
 //! One [`MockChain`] is one chain; any number of [`MockBackend`]s (one per key) share it.
-//! It enforces the HTLC rules that matter to the engine — hashlock, CLTV against median
-//! time past, double spends — and counts coin selections so tests can assert the staking
-//! invariant (no `build_funding` before `TakerLockConfirmed`).
+//! It enforces the HTLC rules that matter to the engine — hashlock, double spends and a
+//! refund's timelocks as a Bitcoin Core node checks them (see [`refund_premature`]) — and
+//! counts coin selections so tests can assert the staking invariant (no `build_funding`
+//! before `TakerLockConfirmed`).
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
@@ -23,7 +24,7 @@ use std::sync::Arc;
 
 use crate::backend::ChainBackend;
 use crate::error::{Result, SwapError};
-use crate::htlc::HtlcParams;
+use crate::htlc::{HtlcParams, LOCKTIME_THRESHOLD, REFUND_SEQUENCE};
 use crate::types::{Amount, Chain, Funding, LockedOutput, Outpoint, SignedTx, SpendInfo, Txid};
 
 /// Flat fee every mock transaction pays.
@@ -44,18 +45,34 @@ enum MockTx {
         amount: Amount,
         preimage: [u8; 32],
     },
+    /// Spends the HTLC through its `OP_CHECKLOCKTIMEVERIFY` branch; a version-2 tx with
+    /// one input, so `lock_time` and `sequence` are the tx's nLockTime and the input's
+    /// nSequence.
     Refund {
         to: String,
         htlc: HtlcParams,
         at: Outpoint,
         amount: Amount,
+        lock_time: u32,
+        sequence: u32,
     },
 }
+
+/// nSequence that makes an input final: no nLockTime, no CLTV, no BIP68.
+const SEQUENCE_FINAL: u32 = 0xffff_ffff;
+/// BIP68: set, the input has no relative lock.
+const SEQUENCE_LOCKTIME_DISABLE_FLAG: u32 = 1 << 31;
+/// BIP68: set, the relative lock counts 512-second units of MTP, else blocks.
+const SEQUENCE_LOCKTIME_TYPE_FLAG: u32 = 1 << 22;
+const SEQUENCE_LOCKTIME_MASK: u32 = 0x0000_ffff;
+const SEQUENCE_LOCKTIME_GRANULARITY: u32 = 9;
 
 #[derive(Debug, Default)]
 struct ChainState {
     height: u64,
     mtp: u32,
+    /// MTP of the block at each height (the tip's entry moves with `advance_time`).
+    mtp_hist: Vec<u32>,
     balances: HashMap<String, u64>,
     /// txid → (tx, height when mined)
     txs: HashMap<Txid, (MockTx, Option<u64>)>,
@@ -115,6 +132,7 @@ impl MockChain {
     pub fn new(chain: Chain, mtp: u32, block_secs: u32) -> Self {
         let state = ChainState {
             mtp,
+            mtp_hist: vec![mtp],
             ..ChainState::default()
         };
         MockChain {
@@ -130,6 +148,8 @@ impl MockChain {
         for _ in 0..n {
             s.height += 1;
             s.mtp += self.block_secs;
+            let mtp = s.mtp;
+            s.mtp_hist.push(mtp);
             let h = s.height;
             for (_, mined) in s.txs.values_mut() {
                 if mined.is_none() {
@@ -239,7 +259,10 @@ impl MockChain {
 
     /// Move MTP forward without mining (models a slow chain).
     pub fn advance_time(&self, secs: u32) {
-        self.state.lock().mtp += secs;
+        let mut s = self.state.lock();
+        s.mtp += secs;
+        let mtp = s.mtp;
+        *s.mtp_hist.last_mut().expect("genesis entry") = mtp;
     }
 
     /// While offline every backend call fails with `SwapError::Transient`.
@@ -379,6 +402,61 @@ impl MockBackend {
     }
 }
 
+/// Why a node refuses `tx` spending the HTLC at `at` into the next block, if it does: the
+/// checks and reject strings of Bitcoin Core's mempool, in its order. `IsFinalTx` (BIP113:
+/// a time nLockTime must be *below* the tip's MTP, a height one below the next height;
+/// skipped when the input is final), then BIP68 relative locks (only when the sequence's
+/// disable bit is clear; a mempool parent counts as mined in the next block), then the
+/// script's `OP_CHECKLOCKTIMEVERIFY` (nLockTime of the HTLC's type and at least its
+/// locktime, input not final). The BTC backend maps all three to `SwapError::Premature`
+/// (`classify_broadcast_error`), and so does the mock.
+fn refund_premature(
+    s: &ChainState,
+    htlc: &HtlcParams,
+    at: &Outpoint,
+    lock_time: u32,
+    sequence: u32,
+) -> Option<String> {
+    let next = s.height + 1;
+    if sequence != SEQUENCE_FINAL && lock_time != 0 {
+        let (cutoff, now) = if lock_time < LOCKTIME_THRESHOLD {
+            (lock_time as u64, next)
+        } else {
+            (lock_time as u64, s.mtp as u64)
+        };
+        if cutoff >= now {
+            return Some(format!(
+                "non-final (nLockTime {lock_time}, tip mtp {}, next height {next})",
+                s.mtp
+            ));
+        }
+    }
+    if sequence & SEQUENCE_LOCKTIME_DISABLE_FLAG == 0 {
+        let parent = s.txs.get(&at.txid).and_then(|(_, h)| *h).unwrap_or(next);
+        let n = sequence & SEQUENCE_LOCKTIME_MASK;
+        let ok = if sequence & SEQUENCE_LOCKTIME_TYPE_FLAG != 0 {
+            let base = s.mtp_hist[parent.saturating_sub(1) as usize] as u64;
+            base + ((n as u64) << SEQUENCE_LOCKTIME_GRANULARITY) <= s.mtp as u64
+        } else {
+            parent + n as u64 <= next
+        };
+        if !ok {
+            return Some(format!(
+                "non-BIP68-final (sequence {sequence:#x}, parent height {parent})"
+            ));
+        }
+    }
+    let same_type = (lock_time < LOCKTIME_THRESHOLD) == (htlc.locktime < LOCKTIME_THRESHOLD);
+    if sequence == SEQUENCE_FINAL || !same_type || lock_time < htlc.locktime {
+        return Some(format!(
+            "mandatory-script-verify-flag-failed (Locktime requirement not satisfied) \
+             (nLockTime {lock_time}, CLTV {}, sequence {sequence:#x})",
+            htlc.locktime
+        ));
+    }
+    None
+}
+
 fn htlc_amount(s: &ChainState, htlc: &HtlcParams, at: &Outpoint) -> Option<Amount> {
     match s.txs.get(&at.txid) {
         Some((
@@ -476,6 +554,8 @@ impl ChainBackend for MockBackend {
             htlc: *htlc,
             at: *at,
             amount,
+            lock_time: htlc.locktime,
+            sequence: REFUND_SEQUENCE,
         }))
     }
 
@@ -528,17 +608,16 @@ impl ChainBackend for MockBackend {
                 htlc,
                 at,
                 amount,
+                lock_time,
+                sequence,
             } => {
                 let locked = htlc_amount(&s, htlc, at)
                     .ok_or_else(|| SwapError::Rejected("missing inputs".into()))?;
                 if locked != *amount {
                     return Err(SwapError::Rejected("amount mismatch".into()));
                 }
-                if s.mtp < htlc.locktime {
-                    return Err(SwapError::Premature(format!(
-                        "non-final: mtp {} < locktime {}",
-                        s.mtp, htlc.locktime
-                    )));
+                if let Some(why) = refund_premature(&s, htlc, at, *lock_time, *sequence) {
+                    return Err(SwapError::Premature(why));
                 }
                 if s.spends.contains_key(at) {
                     return Err(SwapError::Rejected("double spend".into()));
@@ -665,6 +744,34 @@ mod tests {
         assert_eq!(chain.balance(&taker.pubkey()), Amount(5_000_000 - 1_000));
     }
 
+    fn premature(r: Result<Txid>) -> String {
+        match r {
+            Err(SwapError::Premature(m)) => m,
+            other => panic!("want Premature, got {other:?}"),
+        }
+    }
+
+    /// A refund of the HTLC at `f` with any nLockTime and nSequence (the engine's builder
+    /// always uses the HTLC's locktime and `REFUND_SEQUENCE`).
+    fn refund_with(
+        b: &MockBackend,
+        h: &HtlcParams,
+        f: &Funding,
+        lock_time: u32,
+        seq: u32,
+    ) -> SignedTx {
+        MockBackend::sign(&MockTx::Refund {
+            to: b.owner(),
+            htlc: *h,
+            at: f.outpoint,
+            amount: f.amount,
+            lock_time,
+            sequence: seq,
+        })
+    }
+
+    /// BIP113 as Bitcoin Core applies it: the refund (nLockTime = locktime L) is non-final
+    /// while the tip's MTP is L-1 and still at MTP == L, and accepted from L+1 on.
     #[tokio::test]
     async fn refund_waits_for_mtp() {
         let chain = MockChain::new(Chain::Btc, 1_800_000_000, 600);
@@ -674,13 +781,107 @@ mod tests {
         let f = taker.build_funding(&h, Amount(100_000)).await.unwrap();
         taker.broadcast(&f.tx).await.unwrap();
         let r = taker.build_refund(&h, &f.outpoint, f.amount).await.unwrap();
-        assert!(matches!(
-            taker.broadcast(&r).await,
-            Err(SwapError::Premature(_))
-        ));
-        chain.mine(2);
+        assert!(premature(taker.broadcast(&r).await).starts_with("non-final"));
+        chain.mine(1);
+        chain.advance_time(599); // MTP = L-1
+        assert!(premature(taker.broadcast(&r).await).starts_with("non-final"));
+        chain.advance_time(1); // MTP = L
+        assert!(premature(taker.broadcast(&r).await).starts_with("non-final"));
+        assert!(!chain.contains(&r.txid));
+        chain.advance_time(1); // MTP = L+1
         taker.broadcast(&r).await.unwrap();
         let spend = taker.find_spend(&f.outpoint, 0).await.unwrap().unwrap();
         assert_eq!(spend.extract_preimage(&hash), None);
+    }
+
+    /// The script's CLTV: an nLockTime below the HTLC's, of the other type, or a final
+    /// input fails it however late, with the node's script error.
+    #[tokio::test]
+    async fn refund_cltv_needs_locktime_and_non_final_input() {
+        let chain = MockChain::new(Chain::Btc, 1_800_000_000, 600);
+        let taker = chain.backend(3, Amount(1_000_000));
+        let (_, hash) = new_preimage();
+        let l = 1_800_001_200;
+        let h = htlc([2; 33], taker.pubkey(), hash, l);
+        let f = taker.build_funding(&h, Amount(100_000)).await.unwrap();
+        taker.broadcast(&f.tx).await.unwrap();
+        chain.mine(1);
+        chain.advance_time(10 * 3600);
+        let cltv = "mandatory-script-verify-flag-failed (Locktime requirement not satisfied)";
+        let m = premature(
+            taker
+                .broadcast(&refund_with(&taker, &h, &f, l - 1, REFUND_SEQUENCE))
+                .await,
+        );
+        assert!(m.starts_with(cltv), "{m}");
+        // A final input skips the nLockTime check but fails CLTV.
+        let m = premature(
+            taker
+                .broadcast(&refund_with(&taker, &h, &f, l, SEQUENCE_FINAL))
+                .await,
+        );
+        assert!(m.starts_with(cltv), "{m}");
+        // A height nLockTime is final against the next height, then fails the time CLTV.
+        let m = premature(
+            taker
+                .broadcast(&refund_with(&taker, &h, &f, 3, REFUND_SEQUENCE))
+                .await,
+        );
+        assert!(m.starts_with("non-final"), "{m}");
+        chain.mine(2);
+        let m = premature(
+            taker
+                .broadcast(&refund_with(&taker, &h, &f, 3, REFUND_SEQUENCE))
+                .await,
+        );
+        assert!(m.starts_with(cltv), "{m}");
+        assert!(chain.mempool().iter().all(|(_, k)| *k != TxKind::Refund));
+        taker
+            .broadcast(&refund_with(&taker, &h, &f, l + 7, REFUND_SEQUENCE))
+            .await
+            .unwrap();
+    }
+
+    /// BIP68 (CSV): with the disable bit clear the input's sequence is a relative lock on
+    /// its parent, in blocks or in 512 s of MTP since the block before the parent's.
+    #[tokio::test]
+    async fn refund_bip68_relative_locks() {
+        let chain = MockChain::new(Chain::Btc, 1_800_000_000, 600);
+        let taker = chain.backend(3, Amount(1_000_000));
+        let (_, hash) = new_preimage();
+        let l = 1_800_000_000;
+        let h = htlc([2; 33], taker.pubkey(), hash, l);
+        // Blocks: 3 confirmations of the parent.
+        let f = taker.build_funding(&h, Amount(100_000)).await.unwrap();
+        taker.broadcast(&f.tx).await.unwrap();
+        let r = refund_with(&taker, &h, &f, l, 3);
+        chain.mine(1); // parent at height 1, MTP > L
+        assert!(premature(taker.broadcast(&r).await).starts_with("non-BIP68-final"));
+        chain.mine(1);
+        assert!(premature(taker.broadcast(&r).await).starts_with("non-BIP68-final"));
+        chain.mine(1); // the parent has 3 confirmations
+        taker.broadcast(&r).await.unwrap();
+        // Time: 2 units = 1024 s of MTP since the block before the parent's.
+        let g = taker.build_funding(&h, Amount(100_000)).await.unwrap();
+        taker.broadcast(&g.tx).await.unwrap();
+        let r = refund_with(&taker, &h, &g, l, SEQUENCE_LOCKTIME_TYPE_FLAG | 2);
+        assert!(premature(taker.broadcast(&r).await).starts_with("non-BIP68-final"));
+        chain.mine(1); // parent's block; the block before it had MTP base
+        let base = chain.mtp() - 600;
+        chain.advance_time(base + 1023 - chain.mtp());
+        assert!(premature(taker.broadcast(&r).await).starts_with("non-BIP68-final"));
+        chain.advance_time(1);
+        taker.broadcast(&r).await.unwrap();
+        // The disable bit turns the lock off.
+        let k = taker.build_funding(&h, Amount(100_000)).await.unwrap();
+        taker.broadcast(&k.tx).await.unwrap();
+        let r = refund_with(
+            &taker,
+            &h,
+            &k,
+            l + 1,
+            SEQUENCE_LOCKTIME_DISABLE_FLAG | 0xffff,
+        );
+        taker.broadcast(&r).await.unwrap();
     }
 }
