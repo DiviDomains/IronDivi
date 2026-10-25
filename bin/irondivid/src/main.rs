@@ -2148,7 +2148,7 @@ async fn run_daemon(
 
     // Load or create wallet (unless disabled)
     let wallet = if disable_wallet {
-        info!("Wallet disabled");
+        info!("Wallet disabled!");
 
         // Still need mempool cleanup + fee estimation callback even without wallet
         let block_sync = node.block_sync();
@@ -4018,6 +4018,7 @@ mod wallet_log_tests {
     /// -mnemonic or -hdseed the wallet there is loaded
     #[test]
     fn a_mnemonic_moves_a_wallet_already_there() {
+        let _env = WALLET_ENV.lock().unwrap_or_else(|e| e.into_inner());
         let mnemonic = "abandon abandon abandon abandon abandon abandon \
                         abandon abandon abandon abandon abandon about";
         let mnemonic = mnemonic.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -4073,6 +4074,7 @@ mod wallet_log_tests {
     /// moved, and leave no new wallet
     #[test]
     fn invalid_mnemonic_words_stop_the_start() {
+        let _env = WALLET_ENV.lock().unwrap_or_else(|e| e.into_inner());
         // "abandon" twelve times: every word is in the list, the checksum fails
         let words = ["abandon"; 12].join(" ");
         let dir = tempfile::tempdir().unwrap();
@@ -4636,6 +4638,12 @@ mod submit_error_tests {
     }
 }
 
+/// Held by the tests that set the WALLET_* environment variables or call
+/// `load_or_create_wallet`, which reads them: tests run in parallel threads
+/// of one process
+#[cfg(test)]
+static WALLET_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod wallet_move_tests {
     use super::*;
@@ -4645,9 +4653,11 @@ mod wallet_move_tests {
     const CORE_FIRST_ADDRESS: &str = "y7VQ7R3SDRxzNuUsUuFzuq2FT1uVtW8iBz";
 
     /// WALLET_HDSEED restores a wallet from a hex seed, as Core's -hdseed, and
-    /// is taken over WALLET_MNEMONIC (the only test here that sets them)
+    /// is taken over WALLET_MNEMONIC (the only test here that sets them; it
+    /// holds `WALLET_ENV`)
     #[test]
     fn hex_seed_restores_cores_first_address() {
+        let _env = WALLET_ENV.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wallet");
         std::env::set_var("WALLET_HDSEED", "000102030405060708090a0b0c0d0e0f");
