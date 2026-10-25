@@ -2991,7 +2991,7 @@ impl WalletDb {
     /// records the transaction once it confirms.
     pub fn add_mempool_tx(&self, tx: &divi_primitives::transaction::Transaction) -> bool {
         let added = self.track_mempool_tx(tx, None);
-        if added && !self.reorg_accepted.write().remove(&tx.txid()) {
+        if added && !self.reorg_accepted.read().contains(&tx.txid()) {
             self.tx_changed(&tx.txid());
         }
         added
@@ -3525,8 +3525,23 @@ impl WalletDb {
             }
             self.set_last_scan_height(height);
         }
-        self.reorg_accepted.write().clear();
+        self.tell_of_dropped_after_reorg();
         missing
+    }
+
+    /// A transaction of a disconnected block that the new branch neither mined
+    /// again nor left in the mempool was removed from Divi Core's mempool as
+    /// conflicted when the new branch was connected, and the wallet was told of
+    /// it a third time (ChainTipManager.cpp:143-148); tell of each such one now
+    fn tell_of_dropped_after_reorg(&self) {
+        let waiting: Vec<Hash256> = std::mem::take(&mut *self.reorg_accepted.write())
+            .into_iter()
+            .collect();
+        for txid in waiting {
+            if !self.is_recorded(&txid) {
+                self.tx_changed(&txid);
+            }
+        }
     }
 
     /// Highest height below `last` whose scanned block is still active, if
@@ -5529,6 +5544,65 @@ mod tests {
                 "the mempool adding it is not a third"
             );
             assert_eq!(count(fund.txid()), 1, "below the fork, untouched");
+        }
+
+        /// A payment of a disconnected block that the new branch drops is told
+        /// of a third time, when Divi Core removes it from its mempool as
+        /// conflicted (ChainTipManager.cpp:143-148); one the new branch mines
+        /// again is told of when that block is connected. Four calls either way.
+        #[test]
+        fn reorg_tells_of_a_dropped_payment_a_third_time() {
+            let wallet = create_test_wallet();
+            let (fund, send) = fixture(&wallet);
+            let heard = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let into = std::sync::Arc::clone(&heard);
+            wallet.set_tx_listener(std::sync::Arc::new(move |txid: &Hash256| {
+                into.lock().unwrap().push(*txid)
+            }));
+            let count =
+                |txid: Hash256| heard.lock().unwrap().iter().filter(|t| **t == txid).count();
+            let hash_at = |h: u32| Some(block_hash(h, 1));
+            let branch = |with: Option<Transaction>| {
+                move |h: u32| {
+                    let mut block = divi_primitives::block::Block::default();
+                    if h == 2 {
+                        block.transactions = with.iter().cloned().collect();
+                    }
+                    Some((block_hash(h, 1), block))
+                }
+            };
+            scan(&wallet, 1, std::slice::from_ref(&fund));
+            scan(&wallet, 2, std::slice::from_ref(&send));
+            assert_eq!(count(send.txid()), 1);
+            wallet.handle_reorg(1);
+            assert_eq!(
+                count(send.txid()),
+                3,
+                "disconnected, then back in the mempool"
+            );
+            wallet.sync_to_tip(2, hash_at, branch(None));
+            assert_eq!(count(send.txid()), 4, "dropped by the new branch");
+            assert_eq!(count(fund.txid()), 1, "below the fork, untouched");
+
+            // The same, with the new branch mining it again
+            let wallet = create_test_wallet();
+            let (fund, send) = fixture(&wallet);
+            let heard2 = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let into = std::sync::Arc::clone(&heard2);
+            wallet.set_tx_listener(std::sync::Arc::new(move |txid: &Hash256| {
+                into.lock().unwrap().push(*txid)
+            }));
+            scan(&wallet, 1, std::slice::from_ref(&fund));
+            scan(&wallet, 2, std::slice::from_ref(&send));
+            wallet.handle_reorg(1);
+            wallet.sync_to_tip(2, hash_at, branch(Some(send.clone())));
+            let again = heard2
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|t| **t == send.txid())
+                .count();
+            assert_eq!(again, 4, "mined again by the new branch");
         }
 
         #[test]
