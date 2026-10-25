@@ -14,10 +14,14 @@
 //! Persistent storage for wallet data including keys, addresses, and UTXOs.
 
 use crate::address::{Address, Network};
+use crate::at_rest::{self, KdfParams, MasterKey};
 use crate::error::WalletError;
 use crate::hd::HdWallet;
 use crate::keystore::KeyStore;
-use crate::persistence::WalletDatabase;
+use crate::persistence::{
+    WalletDatabase, KEY_ENCRYPTED_MASTER_KEY, KEY_ENCRYPTED_MNEMONIC, KEY_ENCRYPTION_SALT,
+    KEY_KDF_PARAMS,
+};
 
 use divi_primitives::amount::Amount;
 use divi_primitives::hash::{Hash160, Hash256};
@@ -266,8 +270,10 @@ pub struct WalletDb {
     vaults: RwLock<HashMap<Vec<u8>, VaultMetadata>>,
     /// How the wallet is unlocked: timer and staking-only flag
     unlock: RwLock<UnlockState>,
-    /// Decrypted master key (in memory only when unlocked)
-    decrypted_master_key: RwLock<Option<Zeroizing<Vec<u8>>>>,
+    /// Decrypted master key (in memory only when unlocked). Unlock and
+    /// change_passphrase hold the write lock while they rewrite records, so no
+    /// key is written in a format that is being replaced.
+    decrypted_master_key: RwLock<Option<MasterKey>>,
     /// Tracks which data categories have been modified since last save
     dirty: RwLock<DirtyFlags>,
     /// Spent UTXOs with spending height - for reorg restoration (in-memory only)
@@ -748,11 +754,8 @@ impl WalletDb {
                 Some(master) => {
                     let mut suffixed = hash.as_bytes().to_vec();
                     suffixed.push(ENCRYPTED_SECRET_SUFFIX);
-                    batch.put_cf(
-                        db.cf_keys(),
-                        &suffixed,
-                        encrypt_blob(master, secret.as_bytes()),
-                    );
+                    let blob = master.seal_record(&suffixed, secret.as_bytes());
+                    batch.put_cf(db.cf_keys(), &suffixed, blob);
                 }
                 None => tracing::warn!("Refusing to write a private key unencrypted"),
             }
@@ -1775,36 +1778,57 @@ impl WalletDb {
             WalletError::Storage("Cannot unlock wallet without database".to_string())
         })?;
 
-        let (salt, encrypted_master_key) = db
-            .load_encryption_metadata()?
-            .ok_or(WalletError::WrongPassphrase)?;
-
-        // Derive decryption key from passphrase using PBKDF2 and open the master key
-        let decryption_key = Zeroizing::new(derive_key_from_passphrase(passphrase, &salt));
-        let master_key = open_master_key(&encrypted_master_key, &decryption_key)?;
+        // Held until the master key is installed: a key written meanwhile by
+        // another thread would use the format this unlock may be replacing
+        let mut master_slot = self.decrypted_master_key.write();
+        let mut master = open_master(db, passphrase)?;
 
         // Decrypt everything first so a corrupt wallet is not left half-unlocked
-        let hd_wallet = match db.load_encrypted_mnemonic()? {
-            Some(blob) => {
-                let mnemonic = Zeroizing::new(decrypt_blob(&blob, &master_key)?);
-                let mnemonic = std::str::from_utf8(&mnemonic)
+        let (mnemonic, secrets) = decrypt_records(db, &master)?;
+        let hd_wallet = match &mnemonic {
+            Some(mnemonic) => {
+                let mnemonic = std::str::from_utf8(mnemonic)
                     .map_err(|_| WalletError::Storage("corrupt encrypted mnemonic".into()))?;
                 let chain_mode = db.load_chain_mode()?.unwrap_or(ChainMode::Divi);
                 Some(HdWallet::from_mnemonic(mnemonic, None, chain_mode)?)
             }
             None => None,
         };
-        let mut secrets = Vec::new();
-        for (hash, blob) in db.load_encrypted_secrets()? {
-            let bytes = Zeroizing::new(decrypt_blob(&blob, &master_key)?);
-            let arr: [u8; 32] = bytes
-                .as_slice()
-                .try_into()
-                .map_err(|_| WalletError::Storage("corrupt encrypted private key".into()))?;
-            let secret = divi_crypto::keys::SecretKey::from_bytes(&arr)
-                .map_err(|e| WalletError::Storage(format!("corrupt private key: {}", e)))?;
-            secrets.push((hash, secret));
+        // A secret stored for another address would sign for the wrong key
+        for (hash, secret) in &secrets {
+            if let Some(entry) = self.keystore.get_key(hash) {
+                if secret.public_key() != entry.public {
+                    return Err(WalletError::Storage(format!(
+                        "the encrypted private key for {} does not match its public key",
+                        hex::encode(hash.as_bytes())
+                    )));
+                }
+            }
         }
+
+        // Wallets from older builds move to Argon2id and authenticated records
+        if !master.aead {
+            match migrate_legacy(
+                db,
+                passphrase,
+                &master.key,
+                mnemonic.as_ref().map(|m| m.as_slice()),
+                &secrets,
+            ) {
+                Ok(()) => {
+                    master.aead = true;
+                    info!("Wallet encryption upgraded to Argon2id and XChaCha20-Poly1305");
+                }
+                Err(e) => warn!(
+                    "Wallet encryption not upgraded, still readable as before: {}",
+                    e
+                ),
+            }
+        }
+        // Keep the decrypted master key in memory so new keys can be stored encrypted
+        *master_slot = Some(master);
+        drop(master_slot);
+        drop(mnemonic);
 
         if let Some(hd) = hd_wallet {
             self.keystore.set_hd_wallet(hd);
@@ -1818,9 +1842,6 @@ impl WalletDb {
         for (hash, secret) in secrets {
             self.keystore.restore_secret(&hash, secret);
         }
-
-        // Keep the decrypted master key in memory so new keys can be stored encrypted
-        *self.decrypted_master_key.write() = Some(master_key);
 
         // HD keys stored without their secret by older builds: derive them again
         let healed = self.keystore.restore_missing_hd_secrets();
@@ -1996,8 +2017,8 @@ impl WalletDb {
     /// Encrypt the wallet with `passphrase`.
     ///
     /// A random 256-bit master key is generated and sealed under a key derived from
-    /// the passphrase (PBKDF2-HMAC-SHA512, random salt). The mnemonic and every
-    /// private key are re-written encrypted under the master key, the plaintext
+    /// the passphrase (Argon2id, random salt). The mnemonic and every private key
+    /// are re-written encrypted under the master key (XChaCha20-Poly1305), the plaintext
     /// copies are deleted and compacted away, and the wallet is left locked.
     pub fn encrypt_wallet(&self, passphrase: &str) -> Result<(), WalletError> {
         use rand::RngCore;
@@ -2018,8 +2039,12 @@ impl WalletDb {
         rand::rngs::OsRng.fill_bytes(&mut salt);
         rand::rngs::OsRng.fill_bytes(&mut master_key);
 
-        let passphrase_key = Zeroizing::new(derive_key_from_passphrase(passphrase, &salt));
-        let sealed_master = seal_master_key(&master_key, &passphrase_key);
+        let params = KdfParams::DEFAULT;
+        let sealed_master = at_rest::seal_master_key(&master_key, passphrase, &salt, &params)?;
+        let master = MasterKey {
+            key: master_key,
+            aead: true,
+        };
 
         // Fill the keypool while the seed is still in the clear: the pool keys go
         // into the batch below, and a locked wallet hands out only pool keys
@@ -2039,19 +2064,16 @@ impl WalletDb {
             if let Some(secret) = secret {
                 let mut suffixed = hash.as_bytes().to_vec();
                 suffixed.push(crate::persistence::ENCRYPTED_SECRET_SUFFIX);
-                batch.put_cf(
-                    db.cf_keys(),
-                    &suffixed,
-                    encrypt_blob(&master_key, secret.as_bytes()),
-                );
+                let blob = master.seal_record(&suffixed, secret.as_bytes());
+                batch.put_cf(db.cf_keys(), &suffixed, blob);
             }
         }
         if let Some(mnemonic) = self.keystore.mnemonic() {
             let mnemonic = Zeroizing::new(mnemonic);
             batch.put_cf(
                 db.cf_metadata(),
-                b"encrypted_mnemonic",
-                encrypt_blob(&master_key, mnemonic.as_bytes()),
+                KEY_ENCRYPTED_MNEMONIC,
+                master.seal_record(KEY_ENCRYPTED_MNEMONIC, mnemonic.as_bytes()),
             );
             batch.delete_cf(db.cf_metadata(), b"mnemonic");
         }
@@ -2070,8 +2092,9 @@ impl WalletDb {
                 crate::persistence::encode_hd_public_ids(&ids),
             );
         }
-        batch.put_cf(db.cf_metadata(), b"encryption_salt", &salt);
-        batch.put_cf(db.cf_metadata(), b"encrypted_master_key", &sealed_master);
+        batch.put_cf(db.cf_metadata(), KEY_KDF_PARAMS, params.encode());
+        batch.put_cf(db.cf_metadata(), KEY_ENCRYPTION_SALT, &salt);
+        batch.put_cf(db.cf_metadata(), KEY_ENCRYPTED_MASTER_KEY, &sealed_master);
         batch.put_cf(db.cf_metadata(), b"encrypted", [1u8]);
         db.write_batch(batch)?;
         db.flush()?;
@@ -2089,8 +2112,6 @@ impl WalletDb {
 
     /// Change the wallet passphrase. Does not require the wallet to be unlocked.
     pub fn change_passphrase(&self, old_pass: &str, new_pass: &str) -> Result<(), WalletError> {
-        use rand::RngCore;
-
         if !*self.encrypted.read() {
             return Err(WalletError::WalletNotEncrypted);
         }
@@ -2101,17 +2122,28 @@ impl WalletDb {
             WalletError::Storage("Cannot change passphrase without database".to_string())
         })?;
 
-        let (salt, sealed) = db
-            .load_encryption_metadata()?
-            .ok_or(WalletError::WrongPassphrase)?;
-        let old_key = Zeroizing::new(derive_key_from_passphrase(old_pass, &salt));
-        let master_key = open_master_key(&sealed, &old_key)?;
-
-        let mut new_salt = vec![0u8; 16];
-        rand::rngs::OsRng.fill_bytes(&mut new_salt);
-        let new_key = Zeroizing::new(derive_key_from_passphrase(new_pass, &new_salt));
-        db.store_encryption_metadata(&new_salt, &seal_master_key(&master_key, &new_key))?;
-        db.flush()?;
+        let mut master_slot = self.decrypted_master_key.write();
+        let master = open_master(db, old_pass)?;
+        if master.aead {
+            let mut batch = db.create_batch();
+            put_sealed_master(&mut batch, db, &master.key, new_pass)?;
+            db.write_batch_sync(batch)?;
+        } else {
+            // An older wallet: every record moves to the new format with the new
+            // passphrase, so the old one can open nothing afterwards
+            let (mnemonic, secrets) = decrypt_records(db, &master)?;
+            migrate_legacy(
+                db,
+                new_pass,
+                &master.key,
+                mnemonic.as_ref().map(|m| m.as_slice()),
+                &secrets,
+            )?;
+            if let Some(unlocked) = master_slot.as_mut() {
+                unlocked.aead = true;
+            }
+        }
+        drop(master_slot);
 
         info!("Wallet passphrase changed successfully");
         Ok(())
@@ -3116,88 +3148,115 @@ impl WalletDb {
     }
 }
 
-// Encryption helpers.
-// These use AES-256-CBC with PBKDF2-HMAC-SHA512 for key derivation.
-
-/// Number of PBKDF2 iterations (matches C++ Divi)
-const PBKDF2_ITERATIONS: u32 = 25000;
-
-/// Derive encryption key from passphrase using PBKDF2-HMAC-SHA512
-fn derive_key_from_passphrase(passphrase: &str, salt: &[u8]) -> Vec<u8> {
-    use pbkdf2::pbkdf2_hmac;
-    use sha2::Sha512;
-
-    let mut key = vec![0u8; 32]; // AES-256 needs 32 bytes
-    pbkdf2_hmac::<Sha512>(passphrase.as_bytes(), salt, PBKDF2_ITERATIONS, &mut key);
+/// The database key of a private key's encrypted record: `hash160 || 0x01`
+fn secret_record_key(hash: &Hash160) -> Vec<u8> {
+    let mut key = hash.as_bytes().to_vec();
+    key.push(crate::persistence::ENCRYPTED_SECRET_SUFFIX);
     key
 }
 
-/// Seal a master key for storage: AES-256-CBC of `master || sha256(master)[..4]`.
-/// The checksum makes a wrong passphrase detectable with certainty (padding alone
-/// accepts a wrong key about 1 time in 256).
-fn seal_master_key(master_key: &[u8], key: &[u8]) -> Vec<u8> {
-    use sha2::{Digest, Sha256};
-    let mut plain = Zeroizing::new(master_key.to_vec());
-    plain.extend_from_slice(&Sha256::digest(master_key)[..4]);
-    encrypt_blob(key, &plain)
-}
-
-/// Open a sealed master key; any wrong key yields `WrongPassphrase`.
-fn open_master_key(sealed: &[u8], key: &[u8]) -> Result<Zeroizing<Vec<u8>>, WalletError> {
-    use sha2::{Digest, Sha256};
-    let plain = Zeroizing::new(decrypt_blob(sealed, key)?);
-    if plain.len() != 36 || Sha256::digest(&plain[..32])[..4] != plain[32..] {
-        return Err(WalletError::WrongPassphrase);
+/// Open the wallet's master key with `passphrase`, in whichever format it is stored
+fn open_master(db: &WalletDatabase, passphrase: &str) -> Result<MasterKey, WalletError> {
+    let (salt, sealed) = db
+        .load_encryption_metadata()?
+        .ok_or(WalletError::WrongPassphrase)?;
+    match db.load_kdf_params()? {
+        Some(params) => Ok(MasterKey {
+            key: at_rest::open_master_key(&sealed, passphrase, &salt, &params)?,
+            aead: true,
+        }),
+        None => {
+            let key = at_rest::legacy::derive_key_from_passphrase(passphrase, &salt);
+            Ok(MasterKey {
+                key: at_rest::legacy::open_master_key(&sealed, &key)?,
+                aead: false,
+            })
+        }
     }
-    Ok(Zeroizing::new(plain[..32].to_vec()))
 }
 
-/// AES-256-CBC (PKCS7) with a fresh random IV; output is `[IV (16)] [ciphertext]`
-fn encrypt_blob(key: &[u8], plaintext: &[u8]) -> Vec<u8> {
-    use aes::Aes256;
-    use cbc::cipher::{BlockEncryptMut, KeyIvInit};
+/// Decrypt the mnemonic and every private key stored encrypted
+#[allow(clippy::type_complexity)]
+fn decrypt_records(
+    db: &WalletDatabase,
+    master: &MasterKey,
+) -> Result<
+    (
+        Option<Zeroizing<Vec<u8>>>,
+        Vec<(Hash160, divi_crypto::keys::SecretKey)>,
+    ),
+    WalletError,
+> {
+    let mnemonic = match db.load_encrypted_mnemonic()? {
+        Some(blob) => Some(master.open_record(KEY_ENCRYPTED_MNEMONIC, &blob)?),
+        None => None,
+    };
+    let mut secrets = Vec::new();
+    for (hash, blob) in db.load_encrypted_secrets()? {
+        let bytes = master.open_record(&secret_record_key(&hash), &blob)?;
+        let arr: [u8; 32] = bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| WalletError::Storage("corrupt encrypted private key".into()))?;
+        let secret = divi_crypto::keys::SecretKey::from_bytes(&arr)
+            .map_err(|e| WalletError::Storage(format!("corrupt private key: {}", e)))?;
+        secrets.push((hash, secret));
+    }
+    Ok((mnemonic, secrets))
+}
+
+/// Add the master key, sealed under `passphrase` with a fresh salt at the
+/// default cost, to `batch`
+fn put_sealed_master(
+    batch: &mut rocksdb::WriteBatch,
+    db: &WalletDatabase,
+    master_key: &[u8],
+    passphrase: &str,
+) -> Result<(), WalletError> {
     use rand::RngCore;
-
-    let mut iv = [0u8; 16];
-    rand::rngs::OsRng.fill_bytes(&mut iv);
-    let cipher = cbc::Encryptor::<Aes256>::new_from_slices(key, &iv)
-        .expect("AES-256 key is 32 bytes and IV is 16 bytes");
-    let mut out = iv.to_vec();
-    out.extend_from_slice(
-        &cipher.encrypt_padded_vec_mut::<cbc::cipher::block_padding::Pkcs7>(plaintext),
-    );
-    out
+    let mut salt = vec![0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut salt);
+    let params = KdfParams::DEFAULT;
+    let sealed = at_rest::seal_master_key(master_key, passphrase, &salt, &params)?;
+    batch.put_cf(db.cf_metadata(), KEY_KDF_PARAMS, params.encode());
+    batch.put_cf(db.cf_metadata(), KEY_ENCRYPTION_SALT, &salt);
+    batch.put_cf(db.cf_metadata(), KEY_ENCRYPTED_MASTER_KEY, sealed);
+    Ok(())
 }
 
-/// Inverse of `encrypt_blob`
-fn decrypt_blob(encrypted: &[u8], key: &[u8]) -> Result<Vec<u8>, WalletError> {
-    decrypt_master_key(encrypted, key)
-}
-
-/// Decrypt an `[IV][ciphertext]` blob using the derived key
-fn decrypt_master_key(encrypted: &[u8], key: &[u8]) -> Result<Vec<u8>, WalletError> {
-    use aes::Aes256;
-    use cbc::cipher::{BlockDecryptMut, KeyIvInit};
-
-    // Encrypted data format: [IV (16 bytes)] [encrypted_data]
-    if encrypted.len() < 16 {
-        return Err(WalletError::WrongPassphrase);
+/// Rewrite an older wallet's encrypted records in the current format, keeping
+/// its master key: Argon2id for the passphrase key, XChaCha20-Poly1305 for every
+/// record. One synced batch, so a crash leaves either format whole.
+fn migrate_legacy(
+    db: &WalletDatabase,
+    passphrase: &str,
+    master_key: &[u8],
+    mnemonic: Option<&[u8]>,
+    secrets: &[(Hash160, divi_crypto::keys::SecretKey)],
+) -> Result<(), WalletError> {
+    let master = MasterKey {
+        key: Zeroizing::new(master_key.to_vec()),
+        aead: true,
+    };
+    let mut batch = db.create_batch();
+    put_sealed_master(&mut batch, db, master_key, passphrase)?;
+    if let Some(mnemonic) = mnemonic {
+        batch.put_cf(
+            db.cf_metadata(),
+            KEY_ENCRYPTED_MNEMONIC,
+            master.seal_record(KEY_ENCRYPTED_MNEMONIC, mnemonic),
+        );
     }
-
-    let (iv, ciphertext) = encrypted.split_at(16);
-
-    // Create cipher
-    type Aes256CbcDec = cbc::Decryptor<Aes256>;
-    let cipher =
-        Aes256CbcDec::new_from_slices(key, iv).map_err(|_| WalletError::WrongPassphrase)?;
-
-    // Decrypt (need to create owned copy for in-place decryption)
-    let mut buffer = ciphertext.to_vec();
-    let decrypted = cipher
-        .decrypt_padded_mut::<cbc::cipher::block_padding::Pkcs7>(&mut buffer)
-        .map_err(|_| WalletError::WrongPassphrase)?;
-
-    Ok(decrypted.to_vec())
+    for (hash, secret) in secrets {
+        let record_key = secret_record_key(hash);
+        let blob = master.seal_record(&record_key, secret.as_bytes());
+        batch.put_cf(db.cf_keys(), &record_key, blob);
+    }
+    db.write_batch_sync(batch)?;
+    db.flush()?;
+    // The old records were readable with the old passphrase alone
+    db.compact_secret_cfs();
+    Ok(())
 }
 
 /// Order transactions oldest first, moving each child after the parents it
@@ -4842,5 +4901,298 @@ mod tests {
         let wallet = WalletDb::open(&path, Network::Testnet).unwrap();
         wallet.unlock("pw", 60).unwrap();
         assert_eq!(wallet.mnemonic().as_deref(), Some(TEST_MNEMONIC));
+    }
+
+    // Wallet encryption at rest (NODE-7, NODE-8, NODE-19)
+
+    const LEGACY_PASSPHRASE: &str = "legacy fixture passphrase";
+
+    /// A copy of a wallet written by a build before Argon2id (PBKDF2 and
+    /// AES-256-CBC): the test mnemonic, two receiving addresses, one change
+    /// address, and imported keys 0x11.. (compressed) and 0x22.. (uncompressed)
+    fn legacy_wallet() -> (tempfile::TempDir, std::path::PathBuf) {
+        fn copy(from: &std::path::Path, to: &std::path::Path) {
+            std::fs::create_dir_all(to).unwrap();
+            for entry in std::fs::read_dir(from).unwrap() {
+                let entry = entry.unwrap();
+                let target = to.join(entry.file_name());
+                if entry.file_type().unwrap().is_dir() {
+                    copy(&entry.path(), &target);
+                } else {
+                    std::fs::copy(entry.path(), target).unwrap();
+                }
+            }
+        }
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/legacy_wallet_v1");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wallet");
+        copy(&fixture.join("walletdb"), &path);
+        (dir, path)
+    }
+
+    fn legacy_fixture_addresses() -> Vec<String> {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/legacy_wallet_v1/addresses.txt");
+        std::fs::read_to_string(fixture)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Every address of the fixture is there, and every key has its secret
+    fn assert_fixture_keys_whole(wallet: &WalletDb) {
+        let mut addresses: Vec<String> = wallet
+            .get_addresses()
+            .iter()
+            .map(|a| a.to_string())
+            .collect();
+        addresses.sort();
+        for expected in legacy_fixture_addresses() {
+            assert!(addresses.contains(&expected), "missing {expected}");
+        }
+        assert_eq!(wallet.mnemonic().as_deref(), Some(TEST_MNEMONIC));
+        let keys = wallet.keystore.get_all_keys_with_hashes();
+        for (_, entry) in &keys {
+            if !entry.is_watch_only {
+                let secret = entry.secret.as_ref().expect("secret restored");
+                assert!(secret.public_key() == entry.public);
+            }
+        }
+        for byte in [0x11u8, 0x22] {
+            let secret = divi_crypto::keys::SecretKey::from_bytes(&[byte; 32]).unwrap();
+            let entry = keys
+                .iter()
+                .find(|(_, e)| e.public == secret.public_key())
+                .expect("imported key present");
+            assert_eq!(
+                entry.1.secret.as_ref().unwrap().as_bytes(),
+                secret.as_bytes()
+            );
+            assert_eq!(entry.1.compressed, byte == 0x11);
+        }
+    }
+
+    /// Replace the stored blob of each encrypted private key with `f(index, blob)`
+    fn rewrite_secret_blobs(wallet: &WalletDb, f: impl Fn(usize, &[Vec<u8>]) -> Vec<u8>) {
+        let db = wallet.db.as_ref().unwrap();
+        let secrets = db.load_encrypted_secrets().unwrap();
+        let blobs: Vec<Vec<u8>> = secrets.iter().map(|(_, b)| b.clone()).collect();
+        let mut batch = db.create_batch();
+        for (i, (hash, _)) in secrets.iter().enumerate() {
+            batch.put_cf(db.cf_keys(), secret_record_key(hash), f(i, &blobs));
+        }
+        db.write_batch_sync(batch).unwrap();
+    }
+
+    #[test]
+    fn node07_legacy_wallet_opens_and_moves_to_argon2id() {
+        let (_dir, path) = legacy_wallet();
+        let wallet = WalletDb::open(&path, Network::Testnet).unwrap();
+        let db = wallet.db.as_ref().unwrap();
+        assert_eq!(
+            db.load_kdf_params().unwrap(),
+            None,
+            "fixture is the old format"
+        );
+        let (old_salt, _) = db.load_encryption_metadata().unwrap().unwrap();
+        assert!(matches!(
+            wallet.unlock("not the passphrase", 0),
+            Err(WalletError::WrongPassphrase)
+        ));
+        assert_eq!(db.load_kdf_params().unwrap(), None);
+
+        wallet.unlock(LEGACY_PASSPHRASE, 0).unwrap();
+        assert_fixture_keys_whole(&wallet);
+        let db = wallet.db.as_ref().unwrap();
+        assert_eq!(db.load_kdf_params().unwrap(), Some(KdfParams::DEFAULT));
+        assert_ne!(db.load_encryption_metadata().unwrap().unwrap().0, old_salt);
+        // A key made after the upgrade is stored in the new format too
+        let fresh = wallet.new_receiving_address().unwrap();
+        wallet.lock();
+        drop(wallet);
+
+        let wallet = WalletDb::open(&path, Network::Testnet).unwrap();
+        assert!(matches!(
+            wallet.unlock("not the passphrase", 0),
+            Err(WalletError::WrongPassphrase)
+        ));
+        wallet.unlock(LEGACY_PASSPHRASE, 0).unwrap();
+        assert_fixture_keys_whole(&wallet);
+        let entry = wallet.keystore.get_key(&fresh.hash).unwrap();
+        assert!(entry.secret.is_some());
+        // Every record now opens only as an authenticated record
+        let master = MasterKey {
+            key: Zeroizing::new(
+                wallet
+                    .decrypted_master_key
+                    .read()
+                    .as_ref()
+                    .unwrap()
+                    .key
+                    .to_vec(),
+            ),
+            aead: false,
+        };
+        let db = wallet.db.as_ref().unwrap();
+        for (hash, blob) in db.load_encrypted_secrets().unwrap() {
+            assert!(master
+                .open_record(&secret_record_key(&hash), &blob)
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn node07_change_passphrase_moves_a_legacy_wallet() {
+        let (_dir, path) = legacy_wallet();
+        let wallet = WalletDb::open(&path, Network::Testnet).unwrap();
+        assert!(matches!(
+            wallet.change_passphrase("not the passphrase", "new passphrase"),
+            Err(WalletError::WrongPassphrase)
+        ));
+        wallet
+            .change_passphrase(LEGACY_PASSPHRASE, "new passphrase")
+            .unwrap();
+        let db = wallet.db.as_ref().unwrap();
+        assert_eq!(db.load_kdf_params().unwrap(), Some(KdfParams::DEFAULT));
+        drop(wallet);
+
+        let wallet = WalletDb::open(&path, Network::Testnet).unwrap();
+        assert!(matches!(
+            wallet.unlock(LEGACY_PASSPHRASE, 0),
+            Err(WalletError::WrongPassphrase)
+        ));
+        wallet.unlock("new passphrase", 0).unwrap();
+        assert_fixture_keys_whole(&wallet);
+    }
+
+    #[test]
+    fn node07_new_wallets_store_the_argon2id_cost() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wallet");
+        let hd = HdWallet::from_mnemonic(TEST_MNEMONIC, None, ChainMode::Divi).unwrap();
+        let wallet = WalletDb::create_persistent(&path, Network::Testnet, hd).unwrap();
+        wallet.new_receiving_address().unwrap();
+        wallet.encrypt_wallet("pw").unwrap();
+        let db = wallet.db.as_ref().unwrap();
+        assert_eq!(db.load_kdf_params().unwrap(), Some(KdfParams::DEFAULT));
+        assert!(matches!(
+            wallet.unlock("wrong", 0),
+            Err(WalletError::WrongPassphrase)
+        ));
+        wallet.change_passphrase("pw", "pw2").unwrap();
+        assert!(matches!(
+            wallet.unlock("pw", 0),
+            Err(WalletError::WrongPassphrase)
+        ));
+        wallet.unlock("pw2", 0).unwrap();
+        assert_eq!(wallet.mnemonic().as_deref(), Some(TEST_MNEMONIC));
+
+        // A cost record this build does not know is refused, not guessed at
+        let mut batch = db.create_batch();
+        batch.put_cf(db.cf_metadata(), KEY_KDF_PARAMS, [9u8; 13]);
+        db.write_batch_sync(batch).unwrap();
+        wallet.lock();
+        assert!(matches!(
+            wallet.unlock("pw2", 0),
+            Err(WalletError::Storage(_))
+        ));
+    }
+
+    #[test]
+    fn node08_changed_or_swapped_records_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wallet");
+        let hd = HdWallet::from_mnemonic(TEST_MNEMONIC, None, ChainMode::Divi).unwrap();
+        let wallet = WalletDb::create_persistent(&path, Network::Testnet, hd).unwrap();
+        wallet.new_receiving_address().unwrap();
+        wallet.new_receiving_address().unwrap();
+        wallet.encrypt_wallet("pw").unwrap();
+        let db = wallet.db.as_ref().unwrap();
+        let original = db.load_encrypted_secrets().unwrap();
+        assert!(original.len() >= 2);
+        let restore = |wallet: &WalletDb| {
+            let db = wallet.db.as_ref().unwrap();
+            let mut batch = db.create_batch();
+            for (hash, blob) in &original {
+                batch.put_cf(db.cf_keys(), secret_record_key(hash), blob);
+            }
+            db.write_batch_sync(batch).unwrap();
+        };
+
+        // One flipped bit in a private key record
+        rewrite_secret_blobs(&wallet, |i, blobs| {
+            let mut blob = blobs[i].clone();
+            if i == 0 {
+                let last = blob.len() - 1;
+                blob[last] ^= 0x01;
+            }
+            blob
+        });
+        assert!(matches!(
+            wallet.unlock("pw", 0),
+            Err(WalletError::Storage(_))
+        ));
+        assert!(wallet.is_locked());
+
+        // Two records swapped
+        restore(&wallet);
+        rewrite_secret_blobs(&wallet, |i, blobs| blobs[(i + 1) % blobs.len()].clone());
+        assert!(matches!(
+            wallet.unlock("pw", 0),
+            Err(WalletError::Storage(_))
+        ));
+
+        // The mnemonic changed, or moved into a key's record
+        restore(&wallet);
+        let mnemonic = db.load_encrypted_mnemonic().unwrap().unwrap();
+        let mut flipped = mnemonic.clone();
+        flipped[30] ^= 0x80;
+        let mut batch = db.create_batch();
+        batch.put_cf(db.cf_metadata(), KEY_ENCRYPTED_MNEMONIC, &flipped);
+        db.write_batch_sync(batch).unwrap();
+        assert!(matches!(
+            wallet.unlock("pw", 0),
+            Err(WalletError::Storage(_))
+        ));
+        let mut batch = db.create_batch();
+        batch.put_cf(db.cf_metadata(), KEY_ENCRYPTED_MNEMONIC, &mnemonic);
+        db.write_batch_sync(batch).unwrap();
+
+        // The sealed master key changed
+        let (salt, sealed) = db.load_encryption_metadata().unwrap().unwrap();
+        let mut bad = sealed.clone();
+        bad[40] ^= 0x01;
+        db.store_encryption_metadata(&salt, &bad).unwrap();
+        assert!(matches!(
+            wallet.unlock("pw", 0),
+            Err(WalletError::WrongPassphrase)
+        ));
+        db.store_encryption_metadata(&salt, &sealed).unwrap();
+
+        wallet.unlock("pw", 0).unwrap();
+        assert_eq!(wallet.mnemonic().as_deref(), Some(TEST_MNEMONIC));
+    }
+
+    #[test]
+    fn node19_secret_under_another_address_is_refused() {
+        // The old format has no authentication, so swapped records decrypt;
+        // the public key check is what catches them
+        let (_dir, path) = legacy_wallet();
+        let wallet = WalletDb::open(&path, Network::Testnet).unwrap();
+        rewrite_secret_blobs(&wallet, |i, blobs| blobs[(i + 1) % blobs.len()].clone());
+        match wallet.unlock(LEGACY_PASSPHRASE, 0) {
+            Err(WalletError::Storage(message)) => {
+                assert!(
+                    message.contains("does not match its public key"),
+                    "{message}"
+                )
+            }
+            other => panic!("expected a storage error, got {:?}", other.err()),
+        }
+        assert!(wallet.is_locked());
+        // Nothing was migrated from the bad records
+        assert_eq!(wallet.db.as_ref().unwrap().load_kdf_params().unwrap(), None);
     }
 }

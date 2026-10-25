@@ -47,3 +47,6 @@ LOCK
 LOG
 LOG.old.*
 __pycache__/
+
+# A wallet in the format before Argon2id, kept as a test fixture
+!/crates/divi-wallet/tests/fixtures/legacy_wallet_v1/walletdb/*

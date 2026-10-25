@@ -38,6 +38,7 @@
 //! ```
 
 pub mod address;
+mod at_rest;
 pub mod coin_selection;
 pub mod coinstake;
 pub mod error;

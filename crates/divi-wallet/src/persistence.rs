@@ -66,10 +66,13 @@ const KEY_ENCRYPTED: &[u8] = b"encrypted";
 const KEY_RECEIVING_INDEX: &[u8] = b"receiving_index";
 const KEY_CHANGE_INDEX: &[u8] = b"change_index";
 const KEY_LAST_SCAN_HEIGHT: &[u8] = b"last_scan_height";
-const KEY_ENCRYPTION_SALT: &[u8] = b"encryption_salt";
-const KEY_ENCRYPTED_MASTER_KEY: &[u8] = b"encrypted_master_key";
+pub(crate) const KEY_ENCRYPTION_SALT: &[u8] = b"encryption_salt";
+pub(crate) const KEY_ENCRYPTED_MASTER_KEY: &[u8] = b"encrypted_master_key";
+/// Argon2id cost of the passphrase key; absent in wallets written by older
+/// builds, whose records use PBKDF2 and AES-256-CBC
+pub(crate) const KEY_KDF_PARAMS: &[u8] = b"kdf_params";
 const KEY_CHAIN_MODE: &[u8] = b"chain_mode";
-const KEY_ENCRYPTED_MNEMONIC: &[u8] = b"encrypted_mnemonic";
+pub(crate) const KEY_ENCRYPTED_MNEMONIC: &[u8] = b"encrypted_mnemonic";
 pub(crate) const KEY_HD_PUBLIC_IDS: &[u8] = b"hd_public_ids";
 
 /// Suffix byte on a 20-byte key hash marking an encrypted private-key blob in the keys CF
@@ -337,6 +340,16 @@ impl WalletDatabase {
             .put_cf(cf, KEY_ENCRYPTED_MASTER_KEY, encrypted_master_key)
             .map_err(|e| WalletError::Storage(e.to_string()))?;
         Ok(())
+    }
+
+    /// The Argon2id cost of the passphrase key, or None for an older wallet
+    pub(crate) fn load_kdf_params(&self) -> Result<Option<crate::at_rest::KdfParams>, WalletError> {
+        let cf = self.db.cf_handle(CF_METADATA).unwrap();
+        self.db
+            .get_cf(cf, KEY_KDF_PARAMS)
+            .map_err(|e| WalletError::Storage(e.to_string()))?
+            .map(|data| crate::at_rest::KdfParams::decode(&data))
+            .transpose()
     }
 
     /// Load encryption metadata (salt and encrypted master key)
