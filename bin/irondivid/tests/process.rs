@@ -278,3 +278,83 @@ fn a_start_and_a_stop_write_only_divids_warning_on_stderr() {
         "Warning: Make sure to encrypt your wallet and delete all non-encrypted backups after you verified that wallet works!\n"
     );
 }
+
+/// `datadir`'s chain written as a block file (--export-chain writes
+/// bootstrap.dat in Divi Core's format) to `out`
+fn export_chain(datadir: &Path, height: u64, out: &Path) -> std::path::PathBuf {
+    let mut child = irondivid(datadir, free_port())
+        .args(["--export-chain", "--export-start", "0", "--export-end"])
+        .arg(height.to_string())
+        .arg("--export-output")
+        .arg(out)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    assert!(
+        wait_exit(&mut child, 120).is_some(),
+        "--export-chain did not finish"
+    );
+    out.join("bootstrap.dat")
+}
+
+/// -stopafterblockimport stops the node once its -loadblock file is read,
+/// with exit code 0: divid's import thread starts once its chain and wallet
+/// are loaded (init.cpp:1578), so its stop (:725-727) comes after its init
+/// has returned true (:1661, divid.cpp:146-180)
+#[test]
+fn stopafterblockimport_exits_with_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    std::fs::create_dir_all(&source).unwrap();
+    let daemon = Daemon::start(&source);
+    try_rpc(daemon.rpc_port, "setgenerate", &json!([20])).expect("setgenerate");
+    daemon.stop();
+    let file = export_chain(&source, 20, &dir.path().join("export"));
+
+    let fresh = dir.path().join("fresh");
+    std::fs::create_dir_all(&fresh).unwrap();
+    let mut child = irondivid(&fresh, free_port())
+        .arg(format!("-loadblock={}", file.display()))
+        .arg("-stopafterblockimport")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let code = wait_exit(&mut child, 120);
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(code, Some(0));
+    let log = std::fs::read_to_string(fresh.join("debug.log")).unwrap_or_default();
+    assert!(log.contains("Loaded 20 blocks from external file"), "{log}");
+    assert!(log.contains("Stopping after block import"), "{log}");
+}
+
+/// A SIGTERM while the node is still starting keeps its exit code 1 when
+/// -stopafterblockimport is given too: only the import's own stop waits for
+/// the start to be done
+#[test]
+fn a_signal_during_start_exits_with_one_with_stopafterblockimport() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(dir.path());
+    for _ in 0..8 {
+        try_rpc(daemon.rpc_port, "setgenerate", &json!([50])).expect("setgenerate");
+    }
+    daemon.stop();
+    let pid_file = dir.path().join("divid.pid");
+    let mut child = irondivid(dir.path(), free_port())
+        .args(["-rescan", "-stopafterblockimport"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !pid_file.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    let code = wait_exit(&mut child, 120);
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(code, Some(1));
+}
