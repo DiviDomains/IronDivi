@@ -12,6 +12,7 @@
 //! proof (`examples/*_cltv_proof.rs`) shows the transaction shapes that signet accepts.
 
 mod client;
+mod send;
 mod tx;
 
 pub use client::{ClientError, EsploraClient, RetryPolicy};
@@ -31,6 +32,8 @@ use divi_swap::{
     SwapError, Txid,
 };
 use serde_json::Value;
+
+use crate::send::build_send_tx;
 
 type Result<T> = std::result::Result<T, SwapError>;
 
@@ -98,6 +101,7 @@ pub struct BtcBackend {
     key: SecretKey,
     pubkey: CompressedPublicKey,
     address: Address,
+    network: Network,
     fees: FeePolicy,
 }
 
@@ -126,6 +130,7 @@ impl BtcBackend {
             key,
             pubkey,
             address,
+            network: Network::Signet,
             fees,
         })
     }
@@ -149,6 +154,7 @@ impl BtcBackend {
     /// Use the address encoding of `network` (`new` defaults to signet's `tb1`).
     pub fn with_network(mut self, network: Network) -> Self {
         self.address = Address::p2wpkh(&self.pubkey, network);
+        self.network = network;
         self
     }
 
@@ -186,6 +192,64 @@ impl BtcBackend {
             Some(b) => Ok(Some(parse_json(&b)?)),
             None => Ok(None),
         }
+    }
+
+    /// This backend's own UTXOs, from the Esplora address endpoint.
+    async fn my_utxos(&self) -> Result<Vec<Coin>> {
+        let utxos = self
+            .get_json(&format!("/address/{}/utxo", self.address))
+            .await?;
+        utxos
+            .as_array()
+            .ok_or_else(|| {
+                SwapError::Transient("utxo response is not an array (malformed?)".into())
+            })?
+            .iter()
+            .map(|u| {
+                Ok(Coin {
+                    outpoint: OutPoint::new(
+                        bitcoin::Txid::from_str(u["txid"].as_str().unwrap_or(""))
+                            .map_err(|e| SwapError::Other(format!("utxo txid: {e}")))?,
+                        u["vout"].as_u64().unwrap_or(u64::MAX) as u32,
+                    ),
+                    value: u["value"].as_u64().unwrap_or(0),
+                    confirmed: u["status"]["confirmed"].as_bool().unwrap_or(false),
+                })
+            })
+            .collect()
+    }
+
+    /// Build, sign and consensus-verify a plain P2WPKH send of `sats` to `to` (a P2WPKH
+    /// address on this backend's network), change back to this backend's own address.
+    /// **Does not broadcast** — call [`ChainBackend::broadcast`] on the result.
+    ///
+    /// Not part of [`ChainBackend`] (that trait only funds/claims/refunds HTLCs); for
+    /// moving funds directly between wallets, e.g. to fund a test wallet from one a faucet
+    /// paid (`docs/plans/swap-poc/funding.md`).
+    pub async fn build_send(&self, to: &str, sats: u64) -> Result<SignedTx> {
+        let to_spk = Address::from_str(to)
+            .map_err(|e| SwapError::InvalidParams(format!("bad address {to:?}: {e}")))?
+            .require_network(self.network)
+            .map_err(|e| SwapError::InvalidParams(format!("address {to:?}: {e}")))?
+            .script_pubkey();
+        if !to_spk.is_p2wpkh() {
+            return Err(SwapError::InvalidParams(
+                "destination is not a P2WPKH (20-byte) address".into(),
+            ));
+        }
+        let to_program: [u8; 20] = to_spk.as_bytes()[2..22]
+            .try_into()
+            .expect("a P2WPKH script carries a 20-byte program");
+        let coins = self.my_utxos().await?;
+        let tx = build_send_tx(
+            &self.secp,
+            &self.key,
+            &coins,
+            to_program,
+            sats,
+            self.sat_per_vb().await,
+        )?;
+        Ok(Self::to_signed(&tx))
     }
 
     fn to_signed(tx: &bitcoin::Transaction) -> SignedTx {
@@ -352,27 +416,7 @@ impl ChainBackend for BtcBackend {
     }
 
     async fn build_funding(&self, htlc: &HtlcParams, amount: Amount) -> Result<Funding> {
-        let utxos = self
-            .get_json(&format!("/address/{}/utxo", self.address))
-            .await?;
-        let coins = utxos
-            .as_array()
-            .ok_or_else(|| {
-                SwapError::Transient("utxo response is not an array (malformed?)".into())
-            })?
-            .iter()
-            .map(|u| {
-                Ok(Coin {
-                    outpoint: OutPoint::new(
-                        bitcoin::Txid::from_str(u["txid"].as_str().unwrap_or(""))
-                            .map_err(|e| SwapError::Other(format!("utxo txid: {e}")))?,
-                        u["vout"].as_u64().unwrap_or(u64::MAX) as u32,
-                    ),
-                    value: u["value"].as_u64().unwrap_or(0),
-                    confirmed: u["status"]["confirmed"].as_bool().unwrap_or(false),
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let coins = self.my_utxos().await?;
         let built = build_funding_tx(
             &self.secp,
             &self.key,
