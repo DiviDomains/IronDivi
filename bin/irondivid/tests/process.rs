@@ -250,3 +250,31 @@ fn daemon_child_keeps_its_directory_and_streams() {
     assert_eq!(where_, Some(cwd.path().to_path_buf()));
     assert_eq!(stdout, Some(cwd.path().join("out")));
 }
+
+/// A start and a clean stop write on stderr only what divid writes there:
+/// its warnings and errors (InitWarning, InitError, noui.cpp:38-40), here the
+/// warning about an unencrypted wallet it gives at every start (init.cpp:1227-1232)
+#[test]
+fn a_start_and_a_stop_write_only_divids_warning_on_stderr() {
+    let dir = tempfile::tempdir().unwrap();
+    let rpc_port = free_port();
+    let err = dir.path().join("stderr");
+    let mut child = irondivid(dir.path(), rpc_port)
+        .stdout(Stdio::null())
+        .stderr(std::fs::File::create(&err).unwrap())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while try_rpc(rpc_port, "getblockcount", &json!([])).is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let _ = try_rpc(rpc_port, "stop", &json!([]));
+    let code = wait_exit(&mut child, 60);
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(code, Some(0));
+    assert_eq!(
+        std::fs::read_to_string(&err).unwrap(),
+        "Warning: Make sure to encrypt your wallet and delete all non-encrypted backups after you verified that wallet works!\n"
+    );
+}

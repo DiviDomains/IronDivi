@@ -1392,11 +1392,9 @@ fn init_logging(log_config: &LogConfig, data_dir: &PathBuf) {
             .with(filter)
             .init();
 
-        eprintln!("Logging to {:?}", data_dir.join("debug.log"));
-        eprintln!(
-            "Log rotation: max {} bytes per file, {} files kept",
-            log_config.max_file_size, log_config.max_files
-        );
+        // Nothing more on stderr: divid writes there only its warnings and
+        // errors (InitWarning, InitError, noui.cpp:38-40), and a -daemon child
+        // keeps the stderr of the terminal it was started from
     }
 }
 
