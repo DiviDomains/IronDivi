@@ -324,3 +324,31 @@ fn whitelisted_vaults_are_registered_as_divid_registers_them() {
     assert_eq!(registered(), 1);
     stop(node, rpc);
 }
+
+/// -hdseed is logged with divid's texts: a hex seed with -mnemonic is
+/// preferred, logged at every start, a wallet there or not (init.cpp:945-951);
+/// a seed that is not hex is logged when a new wallet is made
+/// (wallet.cpp:2295-2297)
+#[test]
+fn hdseed_is_logged_as_divid_logs_it() {
+    const PREFER: &str = "parameter interaction: can't use -hdseed and -mnemonic/-mnemonicpassphrase together, will prefer -seed";
+    const INCORRECT: &str = "Incorrect seed, generating random one instead";
+    let log = |dir: &Path| std::fs::read_to_string(dir.join("debug.log")).unwrap_or_default();
+    let seed = format!("-hdseed={}", "5a".repeat(32));
+    let words = "-mnemonic=these words are dropped unread";
+    let (rpc, p2p) = (free_port(), free_port());
+
+    let dir = tempfile::tempdir().unwrap();
+    stop(start(dir.path(), rpc, p2p, &[&seed, words]), rpc);
+    assert!(log(dir.path()).contains(PREFER), "{}", log(dir.path()));
+    assert!(!log(dir.path()).contains(INCORRECT), "{}", log(dir.path()));
+    // A wallet already there: logged all the same
+    std::fs::remove_file(dir.path().join("debug.log")).unwrap();
+    stop(start(dir.path(), rpc, p2p, &[&seed, words]), rpc);
+    assert!(log(dir.path()).contains(PREFER), "{}", log(dir.path()));
+
+    let dir = tempfile::tempdir().unwrap();
+    stop(start(dir.path(), rpc, p2p, &["-hdseed=nothex"]), rpc);
+    assert!(log(dir.path()).contains(INCORRECT), "{}", log(dir.path()));
+    assert!(!log(dir.path()).contains(PREFER), "{}", log(dir.path()));
+}

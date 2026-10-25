@@ -1552,6 +1552,12 @@ struct WalletOptions {
     whitelisted_vaults: Vec<Vec<u8>>,
 }
 
+/// Divi Core's IsHex (utilstrencodings.cpp:64-71): an even number of hex
+/// digits, at least two, and nothing else
+fn core_is_hex(text: &str) -> bool {
+    !text.is_empty() && text.len().is_multiple_of(2) && text.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 /// Divi Core's ParseHex (utilstrencodings.cpp:73-91): pairs of hex digits,
 /// spaces skipped before each pair, up to the first pair that is not one
 fn parse_hex_prefix(text: &str) -> Vec<u8> {
@@ -1634,6 +1640,13 @@ fn load_or_create_wallet(
     seed: WalletSeed,
     options: &WalletOptions,
 ) -> Result<Arc<WalletDb>> {
+    // A hex -hdseed is preferred over -mnemonic and -mnemonicpassphrase,
+    // logged at every start, a wallet there or not (init.cpp:945-951)
+    if seed.hdseed.as_deref().is_some_and(core_is_hex)
+        && (seed.mnemonic.is_some() || seed.passphrase.is_some())
+    {
+        info!("PruneHDSeedParameterInteraction: parameter interaction: can't use -hdseed and -mnemonic/-mnemonicpassphrase together, will prefer -seed");
+    }
     let env = |name: &str| std::env::var(name).ok();
     // An empty mnemonic asks for a new one, as in Core
     let mnemonic = seed
@@ -1643,7 +1656,6 @@ fn load_or_create_wallet(
     let passphrase = seed
         .passphrase
         .or_else(|| env("WALLET_MNEMONIC_PASSPHRASE"));
-    // -hdseed is preferred over a mnemonic (init.cpp:947-951)
     let hdseed = seed.hdseed.or_else(|| env("WALLET_HDSEED"));
     load_or_restore_wallet_with_seed(
         wallet_path,
@@ -1770,18 +1782,13 @@ fn load_or_restore_wallet_with_seed(
     // Divi Core takes -hdseed when it is hex and logs anything else, then
     // goes on with the mnemonic or a new seed (wallet.cpp:2286-2297)
     let seed = match seed {
-        Some(hex_seed) => match hex::decode(hex_seed.trim()) {
-            Ok(bytes) if !bytes.is_empty() => Some(bytes),
-            _ => {
-                warn!("-hdseed is not a hex seed; not using it");
-                None
-            }
-        },
+        Some(hex_seed) if core_is_hex(&hex_seed) => hex::decode(&hex_seed).ok(),
+        Some(_) => {
+            info!("CWallet::GenerateNewHDChain -- Incorrect seed, generating random one instead");
+            None
+        }
         None => None,
     };
-    if seed.is_some() && (restoring.is_some() || passphrase.is_some()) {
-        warn!("-hdseed and -mnemonic/-mnemonicpassphrase together: using the seed");
-    }
     let restoring = if seed.is_some() { None } else { restoring };
     let passphrase = if seed.is_some() { None } else { passphrase };
     // The version limit is checked before the seed is made
