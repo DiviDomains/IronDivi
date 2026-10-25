@@ -66,7 +66,10 @@ With an `[xmr]` section the daemon asks the configured `monerod` for its `nettyp
 The quote and XMR setup routes are limited to 20 requests a minute per client address; accept
 and lock (`POST /swaps`, `POST /swaps/:id/lock`) to 20 a minute in their own bucket; and
 `GET /swaps` and `GET /swaps/:id` to 300 a minute in a third, so a taker's status polling cannot
-use up its accept/lock budget. `/healthz` and `GET /offers` are unlimited. By default the
+use up its accept/lock budget. `/healthz` and `GET /offers` share a public bucket of 600 a minute.
+The XMR `:id` routes (`GET /xmr/swaps/:id`, `/j`, `/sigs`, `/xmr-lock`) share one of 300 a minute,
+and 20 token misses (404s) a minute: past that, every XMR `:id` request from the address is a 429
+until the window ends. `nginx-swap.conf` carries a commented `limit_req` example. By default the
 address is the socket peer, so behind nginx every client shares the proxy's bucket.
 Set `trust_proxy_headers = true` in `divi-swapd.toml` and the limiter keys on the LAST address in
 `X-Forwarded-For` (else `X-Real-IP`; an unparseable value falls back to the socket peer). The
