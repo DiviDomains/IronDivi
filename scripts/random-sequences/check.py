@@ -297,8 +297,10 @@ def step_key(i):
 
 
 # The nodes (1, 2) whose encryptwallet step has run: a later episode encrypts
-# them at its setup, so the wallet states go on as the steps left them
-ENCRYPTED = set()
+# them at its setup, so the wallet states go on as the steps left them. A
+# replay takes the set its episode started with from RANDOM_SEQUENCES_ENCRYPTED
+ENCRYPTED = {int(n) for n in os.environ.get("RANDOM_SEQUENCES_ENCRYPTED", "").split(",") if n}
+episode_encrypted = set()  # ENCRYPTED when the current episode started
 
 
 def amount_args(pair, n, kind, draw):
@@ -636,7 +638,7 @@ def keep_logs(tag):
 def new_episode():
     """Four fresh nodes and their first blocks: the start of the run, and the
     restart after an accidental difference of divid's (see EXPLAINED)"""
-    global PAIRS, episode
+    global PAIRS, episode, episode_encrypted
     keep_logs(f"episode{episode}")
     for pair in PAIRS:
         for node in pair.nodes:
@@ -646,6 +648,7 @@ def new_episode():
         for name in ("divid1", "divid2", "irondivid1", "irondivid2"):
             shutil.rmtree(os.path.join(WORK, name), ignore_errors=True)
     episode += 1
+    episode_encrypted = set(ENCRYPTED)
     c1 = Node("divid1", DIVID, 0, ["listen=1"] + CORE_DEBUG)
     c2 = Node("divid2", DIVID, 1, ["listen=0", f"connect={HOST}:{PORT_BASE}"] + CORE_DEBUG)
     phrases = [c1.rpc("dumphdinfo")["mnemonic"], c2.rpc("dumphdinfo")["mnemonic"]]
@@ -851,33 +854,42 @@ def maturity_explains(n, mid_heights):
     immature at the height after the one the invalidate left (`mid_heights`,
     per side), and node n holds none of those itself. Node n's own sends
     count too: the other node may never have had them (it was restarted, and
-    a send reaches it again only by the random rebroadcast)"""
-    dropped = []
+    a send reaches it again only by the random rebroadcast). A transaction
+    node n lacks that spends no immature coin is allowed when node n of the
+    other side lacks one with the same output values: a restarted node gets
+    its peer's sends back only by that rebroadcast, on both sides alike"""
+    dropped, mature = [], []
     for pair, mid in zip(PAIRS, mid_heights):
         node, other = pair.node(n), pair.other(n)
         mine, theirs = set(node.rpc("getrawmempool")), set(other.rpc("getrawmempool"))
         before = pair.pool_before
         next_height = mid + 1
-        values = []
+        values, lacked = [], []
         for txid in (theirs | set(before)) - mine:
             known = node.call("getrawtransaction", txid, 1)
             if known[0] == "ok" and known[1].get("confirmations", 0) > 0:
                 continue
             holder = other if txid in theirs else node
-            if not spends_immature(pair, holder, txid, next_height, None if txid in theirs else before[txid]):
-                log(f"#   maturity rule: {pair.name} node {n} lacks {txid[:8]}, not immature at {next_height}")
-                return False
             tx = holder.call("getrawtransaction", txid, 1) if txid in theirs else node.call("gettransaction", txid)
             if txid in theirs:
-                values.append(sorted(str(o["value"]) for o in tx[1]["vout"]) if tx[0] == "ok" else [])
+                outs = sorted(str(o["value"]) for o in tx[1]["vout"]) if tx[0] == "ok" else []
             else:
                 decoded = node.call("decoderawtransaction", tx[1]["hex"]) if tx[0] == "ok" else tx
-                values.append(sorted(str(o["value"]) for o in decoded[1]["vout"]) if decoded[0] == "ok" else [])
+                outs = sorted(str(o["value"]) for o in decoded[1]["vout"]) if decoded[0] == "ok" else []
+            if spends_immature(pair, holder, txid, next_height, None if txid in theirs else before[txid]):
+                values.append(outs)
+            else:
+                log(f"#   maturity rule: {pair.name} node {n} lacks {txid[:8]}, not immature at {next_height}")
+                lacked.append(outs)
         for txid in mine:
             if spends_immature(pair, node, txid, next_height):
                 log(f"#   maturity rule: {pair.name} node {n} holds {txid[:8]}, immature at {next_height}")
                 return False
         dropped.append(sorted(values))
+        mature.append(sorted(lacked))
+    if mature[0] != mature[1]:
+        log(f"#   maturity rule: the two sides lack different transactions that spend no immature coin: {mature}")
+        return False
     # explained only when the two sides dropped different transactions (each
     # spent a different coin); the same drops on both sides leave nothing to
     # explain a difference
@@ -1123,6 +1135,8 @@ for step in steps:
         # The steps of this episode: replayed with REPLAY on four fresh nodes,
         # they reach the same point
         log(f"#   episode steps: {json.dumps(episode_steps)}"[:30000])
+        log(f"#   encrypted at the episode's start: RANDOM_SEQUENCES_ENCRYPTED="
+            f"{','.join(str(m) for m in sorted(episode_encrypted))}")
         if GO_ON:
             continue
         break

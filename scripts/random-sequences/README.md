@@ -48,6 +48,7 @@ SEED=7 scripts/random-sequences/run.sh target/release ~/divi-3.0.0/bin 53850 /va
 | `SEED` | the seed of the steps (random when not set; the first line prints it) |
 | `STEPS` | number of steps (200) |
 | `REPLAY` | a file with a JSON list of steps, as a FAIL line prints them, run instead of drawn ones |
+| `RANDOM_SEQUENCES_ENCRYPTED` | for a replay: the nodes (`1,2`) whose wallets were encrypted when the episode started, as the FAIL lines print it |
 | `RANDOM_SEQUENCES_INJECT` | a step number whose irondivid outcome is changed, to show a difference is caught |
 | `RANDOM_SEQUENCES_GO_ON` | `1`: go on after a FAIL (for looking into a difference) |
 | `RANDOM_SEQUENCES_TIMEOUT` | seconds before the run is stopped (1500) |
@@ -127,8 +128,11 @@ episode) and the remaining steps, so every comparison stays exact:
   `removeCoinbaseSpends` drops these too (`txmempool.cpp:139-157`), at each block it disconnects
   (`ChainTipManager.cpp:175-182`). Each side had spent a different coin of the same value, since divid's coin choice
   among equal coins is by txid order. The dropped transactions are those the invalidated node held before the
-  invalidate (its own sends count: the other node may never have had them, when it was restarted and a send reaches
-  it again only by the random rebroadcast) and those the other node holds, less what the chain confirms again.
+  invalidate (its own sends count: the other node may never have had them, when it was restarted and a send reaches it
+  again only by the random rebroadcast) and those the other node holds, less what the chain confirms again. A
+  transaction it lacks that spends no immature coin is allowed only when the other side's node lacks one with the same
+  output values: a node restarted earlier gets its peer's sends back only by divid's random rebroadcast
+  (`main.cpp:1280-1294`), on both sides alike.
 - **divid balance cache:** divid's `getbalance` disagrees with its own unspent coins (`listunspent 1`), while
   irondivid's agrees with the same coins. divid keeps each wallet transaction's balance in
   `CachedUtxoBalanceCalculator` (`CachedUtxoBalanceCalculator.cpp:13-30`), recomputed only when a wallet transaction
@@ -172,5 +176,6 @@ empty at present.
 ## Shortening a difference
 
 A `FAIL` prints the steps of its episode as JSON. Saved to a file and run with `REPLAY=<file>`, they reach the same
-point on four fresh nodes. Removing steps from the file and running it again finds the shortest list that still shows
+point on four fresh nodes, with `RANDOM_SEQUENCES_ENCRYPTED` set as the FAIL prints it (a wallet encrypted in an
+earlier episode is encrypted again at the next one's setup). Removing steps from the file and running it again finds the shortest list that still shows
 the difference. Some differences need a particular coin choice, so a replay can take a few tries.
