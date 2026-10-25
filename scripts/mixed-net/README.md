@@ -85,7 +85,7 @@ and ban scores. The best hash must then agree in each connected part.
   fails with `Error: Error loading block database : Block database corruption detected! Failed to find best block in
   block index`. As in `scripts/unclean-stop`, a node that refuses to start after a kill and names a damaged database
   or `-reindex` is started with `-reindex`. The summary counts this per kind (`started with -reindex after a kill`);
-  it is not a disagreement. In the campaigns on 41e8496 and on the fix it happened 2–10 times per seed, always on
+  it is not a disagreement. In the campaigns on 41e8496 and on the fix it happened 1–17 times per seed, always on
   divid and never on irondivid.
 
 ## Not covered
