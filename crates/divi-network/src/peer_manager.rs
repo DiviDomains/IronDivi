@@ -1231,7 +1231,9 @@ impl PeerManager {
             return;
         }
         let pause = Duration::from_millis(500);
-        for round in 0u32.. {
+        // earlier rounds, counted up to the cap of the pause
+        let mut round = 0u32;
+        loop {
             for addr in self.config.static_peers.clone() {
                 if self.claim_dial(addr, DialRule::ByName) {
                     let self_clone = Arc::clone(&self);
@@ -1241,11 +1243,12 @@ impl PeerManager {
                         }
                     });
                 }
-                for _ in 0..round.min(10) {
+                for _ in 0..round {
                     tokio::time::sleep(pause).await;
                 }
             }
             tokio::time::sleep(pause).await;
+            round = (round + 1).min(10);
         }
     }
 
