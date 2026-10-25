@@ -32,7 +32,7 @@ cargo build --release -p irondivid
 SEED=7 scripts/random-sequences/run.sh target/release ~/divi-3.0.0/bin 53850 /var/tmp
 ```
 
-- `<port-base>`: ports `<port-base>` to `<port-base>+7` on 127.0.0.1 (p2p and RPC of C1, C2, I1, I2).
+- `<port-base>`: ports `<port-base>` to `<port-base>+7` on 127.0.0.2 (p2p and RPC of C1, C2, I1, I2).
 - `[root]`: a fresh directory is made under it (default `$TMPDIR`, else `/tmp`) and deleted at the end.
 
 | Variable | Meaning |
@@ -43,6 +43,8 @@ SEED=7 scripts/random-sequences/run.sh target/release ~/divi-3.0.0/bin 53850 /va
 | `RANDOM_SEQUENCES_INJECT` | a step number whose irondivid outcome is changed, to show a difference is caught |
 | `RANDOM_SEQUENCES_GO_ON` | `1`: go on after a FAIL (for looking into a difference) |
 | `RANDOM_SEQUENCES_TIMEOUT` | seconds before the run is stopped (1500) |
+| `RANDOM_SEQUENCES_LOGS` | a folder to copy the four logs to, for each episode and on a FAIL |
+| `RANDOM_SEQUENCES_DEBUG` | `1`: irondivid logs at debug level and divid with `debug=mempool` |
 
 A run of 200 steps takes 2 to 10 minutes. However it ends, all nodes are stopped and their directories deleted. It
 needs bash and python3 (standard library only).
