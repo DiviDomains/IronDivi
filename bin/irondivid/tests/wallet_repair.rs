@@ -119,6 +119,20 @@ fn damage(datadir: &Path, cf: &str, key: &[u8], value: &[u8]) {
     db.put_cf(handle, key, value).expect("write");
 }
 
+/// The first key in `cf` of the stopped node's wallet whose length is `len`
+fn some_key(datadir: &Path, cf: &str, len: usize) -> Vec<u8> {
+    let path = wallet_dir(datadir);
+    let opts = rocksdb::Options::default();
+    let cfs = rocksdb::DB::list_cf(&opts, &path).expect("column families");
+    let db = rocksdb::DB::open_cf(&opts, &path, &cfs).expect("open the wallet");
+    let handle = db.cf_handle(cf).expect("column family");
+    let found = db
+        .iterator_cf(handle, rocksdb::IteratorMode::Start)
+        .map(|item| item.unwrap().0.to_vec())
+        .find(|k| k.len() == len);
+    found.unwrap_or_else(|| panic!("no key of {len} bytes in {cf}"))
+}
+
 /// A node made and stopped, with `blocks` mined
 fn made(datadir: &Path, rpc_port: u16, p2p_port: u16, blocks: u32) {
     let n = start(datadir, rpc_port, p2p_port, &[]);
@@ -240,4 +254,46 @@ fn an_unreadable_address_book_entry_is_a_warning() {
     let stderr = std::fs::read_to_string(err).unwrap();
     assert!(stderr.contains(WARNING), "stderr: {stderr}");
     assert!(log(dir.path()).contains("Errors detected during wallet loading"));
+}
+
+/// A transaction record that cannot be read: the warning, and the chain is
+/// scanned again so the transaction comes back (walletdb.cpp:505-508); not
+/// with -rescan=0, which is given
+#[test]
+fn an_unreadable_transaction_is_found_again_by_a_rescan() {
+    let dir = tempfile::tempdir().unwrap();
+    let (rpc_port, p2p_port) = (free_port(), free_port());
+    made(dir.path(), rpc_port, p2p_port, 3);
+    let txid = some_key(dir.path(), "wallet_transactions", 32);
+    damage(dir.path(), "wallet_transactions", &txid, &[0xff; 5]);
+    let from = log(dir.path()).len();
+    let (child, err) = start_with_stderr(dir.path(), rpc_port, p2p_port, &[]);
+    let node = Node(child);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while ok(rpc_port, "listtransactions", json!(["*", 100]))
+        .as_array()
+        .map_or(0, |l| l.len())
+        < 3
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the transaction did not come back"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    stop(node, rpc_port);
+    assert!(std::fs::read_to_string(err).unwrap().contains(WARNING));
+    assert!(
+        log(dir.path())[from..].contains("Rescanning... from height 0"),
+        "{}",
+        log_tail(dir.path())
+    );
+
+    // With -rescan=0 given, no rescan
+    let txid = some_key(dir.path(), "wallet_transactions", 32);
+    damage(dir.path(), "wallet_transactions", &txid, &[0xff; 5]);
+    let from = log(dir.path()).len();
+    let node = start(dir.path(), rpc_port, p2p_port, &["-rescan=0"]);
+    stop(node, rpc_port);
+    assert!(!log(dir.path())[from..].contains("Rescanning... from height 0"));
 }

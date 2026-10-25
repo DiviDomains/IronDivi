@@ -1374,6 +1374,9 @@ struct WalletOptions {
     /// -rescan: scan the whole chain at the start; -salvagewallet sets it
     /// unless it is given (init.cpp:763-766, :1242)
     rescan: bool,
+    /// Whether -rescan is given: a transaction record that cannot be read
+    /// asks for a rescan only when it is not (SoftSetBoolArg, walletdb.cpp:508)
+    rescan_given: bool,
     /// -spendzeroconfchange: sends may use unconfirmed outputs of our own
     /// transactions (wallet.cpp:1848)
     spend_zero_conf_change: bool,
@@ -1407,6 +1410,7 @@ impl WalletOptions {
     fn from_settings(settings: &Settings) -> Self {
         WalletOptions {
             rescan: settings.get_bool("rescan", settings.get_bool("salvagewallet", false)),
+            rescan_given: settings.get("rescan").is_some(),
             spend_zero_conf_change: settings.get_bool("spendzeroconfchange", false),
             keypool: settings
                 .get("keypool")
@@ -2014,7 +2018,11 @@ async fn run_daemon(
             // wallet holds, as Divi Core's verifySyncToActiveChain from the
             // genesis block (init.cpp:1242, wallet.cpp:279-313)
             let chain_height = node.chain().height();
-            if wallet_options.rescan {
+            // A transaction record that could not be read asks for a rescan,
+            // unless -rescan is given (walletdb.cpp:505-508)
+            let rescan = wallet_options.rescan
+                || (!wallet_options.rescan_given && wallet_arc.load_problems().transactions > 0);
+            if rescan {
                 info!("Rescanning... from height 0 to {}", chain_height);
                 wallet_arc.set_last_scan_height(0);
             } else {
