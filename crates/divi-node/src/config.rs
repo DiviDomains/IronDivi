@@ -792,6 +792,11 @@ pub struct StakingConfig {
     pub block_priority_size: usize,
     #[serde(default)]
     pub block_min_size: usize,
+
+    /// Divi Core `-blockversion`, read on regtest only: the version of the
+    /// blocks made (BlockFactory.cpp:90-95)
+    #[serde(default)]
+    pub block_version: Option<i32>,
 }
 
 fn default_block_max_size() -> usize {
@@ -814,6 +819,7 @@ impl Default for StakingConfig {
             block_max_size: default_block_max_size(),
             block_priority_size: default_block_priority_size(),
             block_min_size: crate::staker::DEFAULT_BLOCK_MIN_SIZE,
+            block_version: None,
         }
     }
 }

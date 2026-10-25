@@ -456,6 +456,7 @@ const APPLIED: &[&str] = &[
     "staking",
     "stakeonstaletip",
     "stakesplitthreshold",
+    "blockversion",
     "blockmaxsize",
     "blockprioritysize",
     "blockminsize",
@@ -835,6 +836,13 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
                 config.staking.split_threshold = (d * 100_000_000.0).round() as i64
             }
             _ => warn!("Invalid stakesplitthreshold value, expected DIVI"),
+        }
+    }
+    // -blockversion: the version of the blocks made, on regtest only, read
+    // as a number into the header's int (BlockFactory.cpp:90-95)
+    if regtest {
+        if let Some(text) = s.get("blockversion") {
+            config.staking.block_version = Some(atoi(text) as i32);
         }
     }
     // Divi Core reads these as unsigned int (BlockMemoryPoolTransactionCollector.cpp:18-42)
@@ -2913,6 +2921,7 @@ fn staking_config(config: &NodeConfig, chain: &divi_storage::ChainParams) -> Sta
         max_block_size: config.staking.block_max_size,
         block_priority_size: config.staking.block_priority_size,
         block_min_size: config.staking.block_min_size,
+        block_version: config.staking.block_version,
         ..StakingConfig::default()
     }
 }

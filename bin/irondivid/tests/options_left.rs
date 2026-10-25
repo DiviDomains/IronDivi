@@ -264,3 +264,24 @@ fn mocktime_sets_the_clock_a_block_is_made_with() {
         }
     }
 }
+
+/// -blockversion sets the version of the blocks made on regtest
+/// (BlockFactory.cpp:90-95); one below 3 makes a block the node refuses
+/// (bad-version, ChainExtensionService.cpp:350-352), so setgenerate fails
+#[test]
+fn blockversion_is_the_version_of_the_blocks_made() {
+    let dir = tempfile::tempdir().unwrap();
+    let (node, port) = start(dir.path(), &["-blockversion=7".into()]);
+    let made = rpc(port, "setgenerate", json!([1])).unwrap();
+    assert!(made["error"].is_null(), "{made}");
+    let best = rpc(port, "getbestblockhash", json!([])).unwrap()["result"].clone();
+    let block = rpc(port, "getblock", json!([best])).unwrap()["result"].clone();
+    assert_eq!(block["version"], 7, "{block}");
+    drop(node);
+
+    let dir = tempfile::tempdir().unwrap();
+    let (_node, port) = start(dir.path(), &["-blockversion=1".into()]);
+    let made = rpc(port, "setgenerate", json!([1])).unwrap();
+    assert_eq!(made["error"]["code"], -25, "{made}");
+    assert_eq!(made["error"]["message"], "failed to generate a valid block");
+}
