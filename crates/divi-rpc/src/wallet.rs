@@ -956,6 +956,10 @@ impl WalletRpc {
         &self,
         send: impl FnOnce() -> Result<serde_json::Value, Error>,
     ) -> Result<serde_json::Value, Error> {
+        // A walletlock, or the unlock timer ending, during the send leaves the
+        // keys for it, as Divi Core's come before or after the send
+        let wallet = self.get_wallet().ok();
+        let _spend = wallet.as_ref().map(|w| w.begin_spend());
         let Some(mempool) = self.mempool.read().clone() else {
             return send();
         };

@@ -318,6 +318,13 @@ pub struct WalletDb {
     /// catch-up, reorg rollback and rescans must not interleave, or a spend
     /// can be scanned before the coin it spends and be lost
     scan_lock: Mutex<()>,
+    /// Held while a key is made and stored with the HD indices, as Divi Core
+    /// makes keys under cs_wallet (wallet.cpp:2122-2195): two callers never get
+    /// the same index, and the indices are stored in the order they advanced.
+    /// Taken after `locked`.
+    key_lock: Mutex<()>,
+    /// Sends in progress (`begin_spend`), so that a lock lets them finish
+    spends: Mutex<SpendState>,
     /// Told each wallet transaction added or seen again (-walletnotify)
     tx_listener: RwLock<Option<TxListener>>,
     /// Transactions that left their block in a reorg and were told to the
@@ -356,6 +363,32 @@ pub struct WalletDb {
     /// Notes kept with a transaction by the call that sent it (Divi Core's
     /// mapValue: comment, to, FromAccount), in key order as Core's std::map
     tx_notes: RwLock<HashMap<Hash256, BTreeMap<String, String>>>,
+}
+
+/// Sends in progress, and whether a lock waits for them to finish
+#[derive(Debug, Default)]
+struct SpendState {
+    in_flight: u32,
+    lock_deferred: bool,
+}
+
+/// A send in progress (`WalletDb::begin_spend`). While one is held, a lock
+/// leaves the keys in memory for it; the last one dropped takes them out.
+pub struct SpendGuard<'a> {
+    wallet: &'a WalletDb,
+}
+
+impl Drop for SpendGuard<'_> {
+    fn drop(&mut self) {
+        let mut spends = self.wallet.spends.lock();
+        spends.in_flight -= 1;
+        if spends.in_flight == 0 && std::mem::take(&mut spends.lock_deferred) {
+            let still_locked = *self.wallet.locked.read();
+            if still_locked {
+                self.wallet.lock_now();
+            }
+        }
+    }
 }
 
 /// Unlock state of an encrypted wallet (Divi Core `walletStakingOnly` plus the
@@ -408,6 +441,8 @@ impl WalletDb {
             mempool_txs: RwLock::new(HashMap::new()),
             detached_txs: RwLock::new(HashMap::new()),
             scan_lock: Mutex::new(()),
+            key_lock: Mutex::new(()),
+            spends: Mutex::new(SpendState::default()),
             tx_listener: RwLock::new(None),
             reorg_accepted: RwLock::new(HashSet::new()),
             pending_deletes: RwLock::new(PendingDeletes::default()),
@@ -449,6 +484,8 @@ impl WalletDb {
             mempool_txs: RwLock::new(HashMap::new()),
             detached_txs: RwLock::new(HashMap::new()),
             scan_lock: Mutex::new(()),
+            key_lock: Mutex::new(()),
+            spends: Mutex::new(SpendState::default()),
             tx_listener: RwLock::new(None),
             reorg_accepted: RwLock::new(HashSet::new()),
             pending_deletes: RwLock::new(PendingDeletes::default()),
@@ -494,6 +531,8 @@ impl WalletDb {
             mempool_txs: RwLock::new(HashMap::new()),
             detached_txs: RwLock::new(HashMap::new()),
             scan_lock: Mutex::new(()),
+            key_lock: Mutex::new(()),
+            spends: Mutex::new(SpendState::default()),
             tx_listener: RwLock::new(None),
             reorg_accepted: RwLock::new(HashSet::new()),
             pending_deletes: RwLock::new(PendingDeletes::default()),
@@ -838,6 +877,8 @@ impl WalletDb {
             mempool_txs: RwLock::new(HashMap::new()),
             detached_txs: RwLock::new(HashMap::new()),
             scan_lock: Mutex::new(()),
+            key_lock: Mutex::new(()),
+            spends: Mutex::new(SpendState::default()),
             tx_listener: RwLock::new(None),
             reorg_accepted: RwLock::new(HashSet::new()),
             pending_deletes: RwLock::new(PendingDeletes::default()),
@@ -1607,6 +1648,7 @@ impl WalletDb {
     fn new_address(&self, is_change: bool) -> Result<Address, WalletError> {
         // Held until the key is stored, so a concurrent lock() cannot strip it first
         let locked = self.locked.read();
+        let _keys = self.key_lock.lock();
         let mut store = Vec::new();
         let addr = if *locked {
             self.keystore.take_from_keypool(is_change)?
@@ -1895,16 +1937,19 @@ impl WalletDb {
             .flat_map(|e| e.spends.iter().copied())
             .collect();
 
-        let mut result: Vec<(WalletUtxo, CoinSource)> = self
-            .utxos
-            .read()
+        let utxos = self.utxos.read();
+        let mut result: Vec<(WalletUtxo, CoinSource)> = utxos
             .values()
             .filter(|u| !spent.contains(&u.outpoint()))
             .map(|u| (u.clone(), CoinSource::Block))
             .collect();
         for entry in overlay.values() {
             for u in &entry.outputs {
-                if !spent.contains(&u.outpoint()) {
+                // A block scan adds a transaction's coins before it drops the
+                // transaction from the mempool overlay: the confirmed coin is
+                // the one, as in Divi Core, where the block's wallet update
+                // and a wallet call do not overlap (both under cs_main)
+                if !spent.contains(&u.outpoint()) && !utxos.contains_key(&u.outpoint()) {
                     result.push((
                         u.clone(),
                         CoinSource::Mempool {
@@ -2284,8 +2329,34 @@ impl WalletDb {
         self.used_addresses.read().contains(address)
     }
 
-    /// Lock the wallet
+    /// A send starts: until the guard is dropped, a lock (walletlock, or the
+    /// unlock timer ending) leaves the keys in memory for it. In Divi Core a
+    /// send runs under cs_main and cs_wallet, so walletlock and the timer's
+    /// relock come before or after it, never in the middle
+    /// (rpcserver.cpp:1060-1094, :1160-1174). Take it before the send checks
+    /// that the wallet is unlocked.
+    pub fn begin_spend(&self) -> SpendGuard<'_> {
+        self.spends.lock().in_flight += 1;
+        SpendGuard { wallet: self }
+    }
+
+    /// Lock the wallet. With a send in progress the wallet reads as locked at
+    /// once, so a later send is refused, and the keys go when the last send in
+    /// progress is done (`begin_spend`)
     pub fn lock(&self) {
+        let mut spends = self.spends.lock();
+        if spends.in_flight > 0 {
+            *self.locked.write() = true;
+            *self.unlock.write() = UnlockState::default();
+            spends.lock_deferred = true;
+            info!("Wallet locked; its keys stay in memory until the send in progress is done");
+            return;
+        }
+        self.lock_now();
+    }
+
+    /// Lock the wallet and take the keys out of memory now
+    fn lock_now(&self) {
         // Held throughout, so no key is created between storing and stripping
         let mut locked = self.locked.write();
         *locked = true;
@@ -2439,6 +2510,7 @@ impl WalletDb {
 
         // As Divi Core's walletpassphrase: top the keypool up while the seed is
         // here, so getnewaddress keeps working after the wallet is locked again
+        let keys = self.key_lock.lock();
         match self.keystore.top_up_keypool(None) {
             Ok(added) if !added.is_empty() => {
                 if let Err(e) = self.persist_keys(&added) {
@@ -2448,6 +2520,7 @@ impl WalletDb {
             Ok(_) => {}
             Err(e) => debug!("Keypool not topped up on unlock: {}", e),
         }
+        drop(keys);
 
         // Set unlock expiration time
         let expiration = if timeout_secs > 0 {
@@ -2865,6 +2938,7 @@ impl WalletDb {
     /// Returns the number of keys generated
     pub fn refill_keypool(&self, new_size: Option<u32>) -> Result<u32, WalletError> {
         let _locked = self.locked.read();
+        let _keys = self.key_lock.lock();
         let added = self.keystore.top_up_keypool(new_size)?;
         if !added.is_empty() {
             self.dirty.write().keys = true;
