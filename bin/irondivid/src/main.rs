@@ -330,7 +330,6 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "torpassword",
     "txconfirmtarget",
     "upnp",
-    "vault_min",
 ];
 
 /// Options read elsewhere (before the node config is built, or by a command)
@@ -713,6 +712,7 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         "upgradewallet",
         "createwalletbackups",
         "monthlybackups",
+        "vault_min",
         "rpcuser",
         "rpcpassword",
         "rpcport",
@@ -1277,6 +1277,9 @@ struct WalletOptions {
     /// 12 by default; 0 or less leaves the check off (init.cpp:1284,
     /// LegacyWalletDatabaseEndpointFactory.cpp:77)
     monthly_backups: usize,
+    /// -vault_min, whole DIVI read as a number: managed vault coins below it
+    /// are not staked (AvailableUtxoCollector.cpp:22)
+    vault_min: Amount,
 }
 
 /// divid's defaults: the options as when none is given
@@ -1305,6 +1308,11 @@ impl WalletOptions {
                 .map_or(divi_wallet::backup::MONTHLY_BACKUPS, |v| {
                     atoi(v).max(0) as usize
                 }),
+            vault_min: Amount::from_sat(
+                settings
+                    .get("vault_min")
+                    .map_or(0, |v| atoi(v).saturating_mul(100_000_000)),
+            ),
         }
     }
 
@@ -1707,6 +1715,7 @@ async fn run_daemon(
             core_files::lock_masternode_collateral(w, &config.data_dir);
             w.set_vault_mode(config.vault);
             w.set_spend_zero_conf_change(wallet_options.spend_zero_conf_change);
+            w.set_vault_min(wallet_options.vault_min);
             w.set_relay_fee_per_kb(config.mempool.min_relay_fee_per_kb);
             w.set_max_tx_fee(config.mempool.max_tx_fee);
             // -walletnotify, before the wallet catches up with the chain

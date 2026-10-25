@@ -208,3 +208,38 @@ fn monthlybackups_sets_the_count_and_zero_leaves_it_off() {
         "made on the mock date: {after:?}"
     );
 }
+
+/// What getcoinavailability counts stakable beyond the plain coins: the
+/// managed vault coins
+fn stakable_vault_coins(port: u16) -> i64 {
+    let coins = ok(port, "getcoinavailability", json!([]));
+    let divi = |v: &Value| (v.as_f64().unwrap() * 1e8).round() as i64;
+    (divi(&coins["Stakable"]) - divi(&coins["Spendable"])) / 100_000_000
+}
+
+/// -vault_min=<n>: managed vault coins below n DIVI are not stakable
+/// (AvailableUtxoCollector.cpp:22, AvailableUtxoCalculator.cpp:22-27)
+#[test]
+fn vault_min_leaves_smaller_vault_coins_out_of_staking() {
+    // An owner key the managing wallet does not hold
+    let other = tempfile::tempdir().unwrap();
+    let (rpc_port, p2p_port) = (free_port(), free_port());
+    let n = start(other.path(), rpc_port, p2p_port, &[]);
+    let owner = ok(rpc_port, "getnewaddress", json!([]));
+    stop(n, rpc_port);
+
+    let dir = tempfile::tempdir().unwrap();
+    let n = start(dir.path(), rpc_port, p2p_port, &[]);
+    ok(rpc_port, "setgenerate", json!([100]));
+    let manager = ok(rpc_port, "getnewaddress", json!([]));
+    let vault = format!("{}:{}", owner.as_str().unwrap(), manager.as_str().unwrap());
+    ok(rpc_port, "fundvault", json!([vault, 100]));
+    ok(rpc_port, "fundvault", json!([vault, 1000]));
+    ok(rpc_port, "setgenerate", json!([1]));
+    assert_eq!(stakable_vault_coins(rpc_port), 1100, "both by default");
+    stop(n, rpc_port);
+
+    let n = start(dir.path(), rpc_port, p2p_port, &["-vault_min=500"]);
+    assert_eq!(stakable_vault_coins(rpc_port), 1000, "the 100 left out");
+    stop(n, rpc_port);
+}
