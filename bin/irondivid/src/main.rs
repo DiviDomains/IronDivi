@@ -38,7 +38,7 @@ use divi_rpc::{start_server_with_wallet_peer_and_staker, RpcConfig};
 use divi_wallet::{HdWallet, Network as WalletNetwork, WalletDb};
 use settings::{atoi, Settings};
 use std::error::Error as StdError;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::signal;
 use tokio::sync::broadcast;
@@ -1485,6 +1485,9 @@ struct WalletSeed {
     mnemonic: Option<String>,
     passphrase: Option<String>,
     hdseed: Option<String>,
+    /// -hdseed or -mnemonic is set, even empty: a wallet already there is
+    /// moved out of the way for the restore (init.cpp:864-888)
+    restore: bool,
 }
 
 impl WalletSeed {
@@ -1494,6 +1497,7 @@ impl WalletSeed {
             mnemonic: get("mnemonic"),
             passphrase: get("mnemonicpassphrase"),
             hdseed: get("hdseed"),
+            restore: settings.is_set("hdseed") || settings.is_set("mnemonic"),
         }
     }
 }
@@ -1510,6 +1514,26 @@ impl std::fmt::Display for QuietExit {
 }
 
 impl std::error::Error for QuietExit {}
+
+/// Divi Core's CheckWalletFileExists (init.cpp:864-888): with -hdseed or
+/// -mnemonic set, a wallet already there is renamed to `<wallet><time>.moved`
+/// beside it, so a new one is made from the seed
+fn move_wallet_for_restore(wallet_path: &Path) -> Result<()> {
+    if !wallet_path.exists() {
+        return Ok(());
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let mut moved = wallet_path.as_os_str().to_os_string();
+    moved.push(format!("{now}.moved"));
+    std::fs::rename(wallet_path, &moved).map_err(|_| {
+        anyhow::anyhow!(
+            "Unable to move wallet out of the way for seed restore: {}",
+            wallet_path.display()
+        )
+    })
+}
 
 /// Wallet start options
 #[derive(Debug, Clone, Copy)]
@@ -1604,6 +1628,9 @@ fn load_or_create_wallet(
     seed: WalletSeed,
     options: &WalletOptions,
 ) -> Result<Arc<WalletDb>> {
+    if seed.restore {
+        move_wallet_for_restore(wallet_path)?;
+    }
     let env = |name: &str| std::env::var(name).ok();
     // An empty mnemonic asks for a new one, as in Core
     let mnemonic = seed
@@ -3886,6 +3913,70 @@ mod wallet_log_tests {
         assert_eq!(wallet.mnemonic().as_deref(), Some(mnemonic.as_str()));
         assert_mnemonic_not_logged(&logs, &mnemonic);
     }
+    /// The names in `dir` that end in ".moved"
+    fn moved_wallets(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".moved"))
+            .collect()
+    }
+
+    /// As init.cpp:864-888: -mnemonic with a wallet already there moves it to
+    /// `<wallet><time>.moved` and restores a new one from the words; without
+    /// -mnemonic or -hdseed the wallet there is loaded
+    #[test]
+    fn a_mnemonic_moves_a_wallet_already_there() {
+        let mnemonic = "abandon abandon abandon abandon abandon abandon \
+                        abandon abandon abandon abandon abandon about";
+        let mnemonic = mnemonic.split_whitespace().collect::<Vec<_>>().join(" ");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wallet");
+        let old = load_or_create_wallet_from(&path, WalletNetwork::Regtest, ChainMode::Divi, None)
+            .unwrap()
+            .mnemonic();
+        let open = |seed: WalletSeed| {
+            load_or_create_wallet(
+                &path,
+                WalletNetwork::Regtest,
+                ChainMode::Divi,
+                seed,
+                &WalletOptions::default(),
+            )
+            .unwrap()
+            .mnemonic()
+        };
+        // Compared without printing: the words are never shown
+        assert!(
+            open(WalletSeed::default()) == old,
+            "the wallet there was not loaded"
+        );
+        assert!(moved_wallets(dir.path()).is_empty());
+
+        let restored = open(WalletSeed {
+            mnemonic: Some(mnemonic.clone()),
+            restore: true,
+            ..WalletSeed::default()
+        });
+        assert!(
+            restored.as_deref() == Some(mnemonic.as_str()),
+            "the wallet was not restored from -mnemonic"
+        );
+        let moved = moved_wallets(dir.path());
+        assert_eq!(moved.len(), 1, "{moved:?}");
+        let time = moved[0]
+            .strip_prefix("wallet")
+            .and_then(|n| n.strip_suffix(".moved"))
+            .unwrap();
+        assert!(time.parse::<u64>().unwrap() > 1_600_000_000, "{moved:?}");
+        // The moved wallet is the old one, whole
+        let back = WalletDb::open(&dir.path().join(&moved[0]), WalletNetwork::Regtest).unwrap();
+        assert!(
+            back.mnemonic() == old,
+            "the moved wallet is not the old one"
+        );
+    }
+
     #[test]
     fn test_restored_wallet_issues_from_index_zero() {
         // Core's keypool hands out its oldest key, so a restored wallet's first
