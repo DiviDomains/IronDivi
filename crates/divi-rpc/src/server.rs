@@ -563,6 +563,13 @@ impl RpcServer {
             let help = self.help(&Params::Array(vec![serde_json::json!(method)]))?;
             return Err(RpcError::new(codes::MISC_ERROR, help.as_str().unwrap_or_default()).into());
         }
+        // signmessage and setupmasternode check that the wallet is unlocked
+        // before they read an argument (rpcwallet.cpp:1385, rpcmasternode.cpp:204)
+        if matches!(method, "signmessage" | "setupmasternode") {
+            if let Some(wallet) = self.wallet.wallet_db() {
+                crate::wallet::ensure_fully_unlocked(&wallet)?;
+            }
+        }
         rpc_type_check(method, params)?;
         // The wallet passphrase calls check the encryption state before they
         // read an argument (rpcwallet.cpp:2596, :2642, :2715)

@@ -170,7 +170,7 @@ fn parse_fee_mode(mode: Option<&str>, allow_metadata: bool) -> Result<FeeMode, E
 
 /// Divi Core `EnsureWalletIsUnlocked`: sends, signing and key exports need a full
 /// unlock, so a wallet unlocked for staking only is refused like a locked one.
-fn ensure_fully_unlocked(wallet: &WalletDb) -> Result<(), Error> {
+pub(crate) fn ensure_fully_unlocked(wallet: &WalletDb) -> Result<(), Error> {
     if !wallet.is_fully_unlocked() {
         return Err(RpcError::new(
             codes::WALLET_UNLOCK_NEEDED,
