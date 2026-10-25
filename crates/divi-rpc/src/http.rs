@@ -116,75 +116,136 @@ pub fn body_too_large(headers: &HeaderMap) -> bool {
 /// Parse JSON as Divi Core's json_spirit finds members: when a key appears
 /// twice in an object, the first one counts (find_value takes the first match)
 pub fn parse_json(text: &str) -> Result<Value, serde_json::Error> {
+    parse_json_members(text).map(|j| j.first_wins())
+}
+
+/// Parse JSON keeping every member of each object in order, as json_spirit's
+/// Object (a vector of pairs) holds them, equal keys included
+pub fn parse_json_members(text: &str) -> Result<Json, serde_json::Error> {
     let mut de = serde_json::Deserializer::from_str(text);
-    let FirstWins(value) = FirstWins::deserialize(&mut de)?;
+    let value = Json::deserialize(&mut de)?;
     de.end()?;
     Ok(value)
 }
 
-struct FirstWins(Value);
+/// A JSON value whose objects keep all their members, equal keys included
+#[derive(Debug, Clone, PartialEq)]
+pub enum Json {
+    /// Anything but an array or object
+    Scalar(Value),
+    Array(Vec<Json>),
+    Object(Vec<(String, Json)>),
+}
 
-impl<'de> Deserialize<'de> for FirstWins {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        d.deserialize_any(FirstWinsVisitor).map(FirstWins)
+impl Json {
+    /// The value as json_spirit's find_value reads it: of equal keys the first
+    pub fn first_wins(&self) -> Value {
+        match self {
+            Json::Scalar(v) => v.clone(),
+            Json::Array(items) => Value::Array(items.iter().map(Json::first_wins).collect()),
+            Json::Object(members) => {
+                let mut out = Map::new();
+                for (k, v) in members {
+                    out.entry(k.clone()).or_insert_with(|| v.first_wins());
+                }
+                Value::Object(out)
+            }
+        }
+    }
+
+    /// The first member named `key` of an object
+    pub fn member(&self, key: &str) -> Option<&Json> {
+        match self {
+            Json::Object(members) => members.iter().find(|(k, _)| k == key).map(|(_, v)| v),
+            _ => None,
+        }
+    }
+
+    /// Element `index` of an array
+    pub fn element(&self, index: usize) -> Option<&Json> {
+        match self {
+            Json::Array(items) => items.get(index),
+            _ => None,
+        }
+    }
+
+    /// Every member of an object, in order, each value read first-wins
+    pub fn members(&self) -> Option<Vec<(String, Value)>> {
+        match self {
+            Json::Object(members) => Some(
+                members
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.first_wins()))
+                    .collect(),
+            ),
+            _ => None,
+        }
     }
 }
 
-struct FirstWinsVisitor;
+impl<'de> Deserialize<'de> for Json {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        d.deserialize_any(JsonVisitor)
+    }
+}
 
-impl<'de> Visitor<'de> for FirstWinsVisitor {
-    type Value = Value;
+struct JsonVisitor;
+
+impl<'de> Visitor<'de> for JsonVisitor {
+    type Value = Json;
 
     fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.write_str("any JSON value")
     }
 
-    fn visit_bool<E>(self, v: bool) -> Result<Value, E> {
-        Ok(Value::Bool(v))
+    fn visit_bool<E>(self, v: bool) -> Result<Json, E> {
+        Ok(Json::Scalar(Value::Bool(v)))
     }
 
-    fn visit_i64<E>(self, v: i64) -> Result<Value, E> {
-        Ok(Value::from(v))
+    fn visit_i64<E>(self, v: i64) -> Result<Json, E> {
+        Ok(Json::Scalar(Value::from(v)))
     }
 
-    fn visit_u64<E>(self, v: u64) -> Result<Value, E> {
-        Ok(Value::from(v))
+    fn visit_u64<E>(self, v: u64) -> Result<Json, E> {
+        Ok(Json::Scalar(Value::from(v)))
     }
 
-    fn visit_f64<E>(self, v: f64) -> Result<Value, E> {
-        Ok(serde_json::Number::from_f64(v).map_or(Value::Null, Value::Number))
+    fn visit_f64<E>(self, v: f64) -> Result<Json, E> {
+        Ok(Json::Scalar(
+            serde_json::Number::from_f64(v).map_or(Value::Null, Value::Number),
+        ))
     }
 
-    fn visit_str<E>(self, v: &str) -> Result<Value, E> {
-        Ok(Value::String(v.to_string()))
+    fn visit_str<E>(self, v: &str) -> Result<Json, E> {
+        Ok(Json::Scalar(Value::String(v.to_string())))
     }
 
-    fn visit_string<E>(self, v: String) -> Result<Value, E> {
-        Ok(Value::String(v))
+    fn visit_string<E>(self, v: String) -> Result<Json, E> {
+        Ok(Json::Scalar(Value::String(v)))
     }
 
-    fn visit_unit<E>(self) -> Result<Value, E> {
-        Ok(Value::Null)
+    fn visit_unit<E>(self) -> Result<Json, E> {
+        Ok(Json::Scalar(Value::Null))
     }
 
-    fn visit_none<E>(self) -> Result<Value, E> {
-        Ok(Value::Null)
+    fn visit_none<E>(self) -> Result<Json, E> {
+        Ok(Json::Scalar(Value::Null))
     }
 
-    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Value, A::Error> {
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Json, A::Error> {
         let mut out = Vec::new();
-        while let Some(FirstWins(v)) = seq.next_element()? {
+        while let Some(v) = seq.next_element()? {
             out.push(v);
         }
-        Ok(Value::Array(out))
+        Ok(Json::Array(out))
     }
 
-    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Value, A::Error> {
-        let mut out = Map::new();
-        while let Some((k, FirstWins(v))) = map.next_entry::<String, FirstWins>()? {
-            out.entry(k).or_insert(v);
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Json, A::Error> {
+        let mut out = Vec::new();
+        while let Some(entry) = map.next_entry::<String, Json>()? {
+            out.push(entry);
         }
-        Ok(Value::Object(out))
+        Ok(Json::Object(out))
     }
 }
 
@@ -203,6 +264,20 @@ mod tests {
         assert_eq!(parse_json(" [] ").unwrap(), serde_json::json!([]));
         assert!(parse_json("{bad").is_err());
         assert!(parse_json(r#"{"a":1}x"#).is_err());
+    }
+
+    #[test]
+    fn json_members_keep_equal_keys() {
+        let j = parse_json_members(r#"{"params":["",{"a":1,"b":2,"a":{"x":1,"x":2}}]}"#).unwrap();
+        let amounts = j.member("params").and_then(|p| p.element(1)).unwrap();
+        assert_eq!(
+            amounts.members().unwrap(),
+            vec![
+                ("a".to_string(), serde_json::json!(1)),
+                ("b".to_string(), serde_json::json!(2)),
+                ("a".to_string(), serde_json::json!({"x": 1})),
+            ]
+        );
     }
 
     #[test]

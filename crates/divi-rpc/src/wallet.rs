@@ -992,7 +992,17 @@ impl WalletRpc {
 
     /// sendmany, picking its coins and committing with no relayed transaction let in between
     pub fn send_many(&self, params: &Params) -> Result<serde_json::Value, Error> {
-        self.exclusive(|| self.send_many_held(params))
+        self.send_many_with(params, None)
+    }
+
+    /// sendmany with its amounts object's pairs as the request wrote them,
+    /// equal addresses included; None reads them from `params`
+    pub fn send_many_with(
+        &self,
+        params: &Params,
+        amounts: Option<&[(String, serde_json::Value)]>,
+    ) -> Result<serde_json::Value, Error> {
+        self.exclusive(|| self.send_many_held(params, amounts))
     }
 
     /// sendfrom, picking its coins and committing with no relayed transaction let in between
@@ -3706,7 +3716,11 @@ impl WalletRpc {
     }
 
     /// sendmany - Send to multiple addresses in one transaction
-    fn send_many_held(&self, params: &Params) -> Result<serde_json::Value, Error> {
+    fn send_many_held(
+        &self,
+        params: &Params,
+        written: Option<&[(String, serde_json::Value)]>,
+    ) -> Result<serde_json::Value, Error> {
         // Divi Core spends only the named account's coins ("" for all)
         let account = account_from_value(
             params
@@ -3719,6 +3733,10 @@ impl WalletRpc {
             .get(1)
             .and_then(|v| v.as_object())
             .ok_or_else(|| RpcError::invalid_params("Amounts object required"))?;
+        let amounts: Vec<(&String, &serde_json::Value)> = match written {
+            Some(pairs) => pairs.iter().map(|(k, v)| (k, v)).collect(),
+            None => amounts.iter().collect(),
+        };
 
         // Divi Core's sendmany takes no minconf: the third argument is the
         // comment, whatever it reads as (rpcwallet.cpp:1716-1723), and the
@@ -3746,6 +3764,7 @@ impl WalletRpc {
         // {"amount": a, "repetitions": n} for n outputs of a
         let mut payees: Vec<TxOut> = Vec::new();
         let mut subtract_outputs: Vec<usize> = Vec::new();
+        let mut addresses = HashSet::new();
         for (addr_str, amount_value) in amounts {
             let addr = self.decode_address(addr_str).map_err(|_| {
                 RpcError::new(
@@ -3790,6 +3809,13 @@ impl WalletRpc {
                 }
                 None => (amount_from_value(amount_value, false)?, 1),
             };
+            if !addresses.insert(addr.to_base58()) {
+                return Err(RpcError::new(
+                    codes::INVALID_PARAMETER,
+                    format!("Invalid parameter, duplicated address: {}", addr_str),
+                )
+                .into());
+            }
             for _ in 0..repetitions {
                 if subtract_fee_from.contains(addr_str) {
                     subtract_outputs.push(payees.len());

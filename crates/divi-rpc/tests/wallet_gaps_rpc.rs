@@ -13,7 +13,8 @@
 //! behaviour (rpcwallet.cpp, rpcserver.cpp).
 
 use divi_primitives::ChainMode;
-use divi_rpc::{Params, WalletRpc};
+use divi_rpc::{Params, RpcServer, WalletRpc};
+use divi_storage::{Chain, ChainDatabase, ChainParams, NetworkType};
 use divi_wallet::{HdWallet, Network, WalletDb};
 use serde_json::{json, Value};
 use std::path::Path;
@@ -71,4 +72,49 @@ fn an_unlock_without_timeout_reports_its_time() {
         rpc.wallet_lock(&Params::None).unwrap();
         assert_eq!(unlocked_until(&rpc), 0);
     }
+}
+
+/// As rpcwallet.cpp parseMultiSendJson: json_spirit keeps both pairs of an
+/// address written twice in sendmany's amounts, and the second is refused with
+/// -8 before any coin is looked at
+#[test]
+fn sendmany_refuses_an_address_written_twice() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(ChainDatabase::open(dir.path().join("chain")).unwrap());
+    let chain = Arc::new(
+        Chain::new(
+            db,
+            ChainParams::for_network(NetworkType::Regtest, ChainMode::Divi),
+        )
+        .unwrap(),
+    );
+    let wallet = Arc::new(WalletDb::with_hd_wallet(
+        Network::Regtest,
+        HdWallet::new(ChainMode::Divi).unwrap(),
+    ));
+    let server = RpcServer::with_wallet(chain, wallet);
+    let reply = |body: String| -> Value {
+        let (_, reply) = server.handle_http_body(&body);
+        serde_json::from_str(&reply).unwrap()
+    };
+    let address = reply(r#"{"method":"getnewaddress","params":[],"id":1}"#.to_string())["result"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let other = reply(r#"{"method":"getnewaddress","params":[],"id":1}"#.to_string())["result"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let twice = format!(
+        r#"{{"method":"sendmany","params":["",{{"{address}":1,"{other}":2,"{address}":3}}],"id":1}}"#
+    );
+    let error = &reply(twice.clone())["error"];
+    assert_eq!(error["code"], -8, "{error}");
+    assert_eq!(
+        error["message"],
+        format!("Invalid parameter, duplicated address: {address}")
+    );
+    // The same in a batch
+    let batch: Value = reply(format!("[{twice}]"));
+    assert_eq!(batch[0]["error"], *error);
 }
