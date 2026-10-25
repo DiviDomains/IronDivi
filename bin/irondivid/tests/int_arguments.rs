@@ -266,3 +266,18 @@ fn wallet_calls_cut_counts_and_depths_to_an_int() {
         .count();
     assert_eq!(to_address, 2, "{tx}");
 }
+
+/// setgenerate's number of blocks (rpcmining.cpp:79-81)
+#[test]
+fn setgenerate_cuts_the_number_of_blocks_to_an_int() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::mined(dir.path(), 3);
+    let mined = node.ok("setgenerate", json!([TWO_32 + 1]));
+    assert_eq!(mined.as_array().map(Vec::len), Some(1), "{mined}");
+    // 2^32 + 2^31 is negative: none
+    assert_eq!(
+        node.ok("setgenerate", json!([TWO_32 + TWO_31])),
+        json!(null)
+    );
+    assert_eq!(node.ok("getblockcount", json!([])), json!(4));
+}

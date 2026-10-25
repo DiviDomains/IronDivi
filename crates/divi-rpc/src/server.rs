@@ -1340,6 +1340,8 @@ fn core_int_arguments(method: &str) -> &'static [usize] {
         }
         "listtransactions" => &[1, 2],
         "listsinceblock" => &[1],
+        // Mining (rpcmining.cpp:79)
+        "setgenerate" => &[0],
         _ => &[],
     }
 }
