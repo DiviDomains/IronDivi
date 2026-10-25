@@ -603,10 +603,18 @@ pub struct RpcConfig {
     /// Serve the REST interface (Divi Core's -rest, default off)
     #[serde(default)]
     pub rest: bool,
+
+    /// Connections served at once (Divi Core's -rpcthreads, default 4)
+    #[serde(default = "default_rpc_threads")]
+    pub threads: i64,
 }
 
 fn default_rpc_keep_alive() -> bool {
     true
+}
+
+fn default_rpc_threads() -> i64 {
+    4
 }
 
 impl Default for RpcConfig {
@@ -622,6 +630,7 @@ impl Default for RpcConfig {
             allowed_ips: Vec::new(),
             keep_alive: true,
             rest: false,
+            threads: 4,
         }
     }
 }

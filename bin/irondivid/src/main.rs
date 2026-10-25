@@ -324,7 +324,6 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "permitbaremultisig",
     "proxyrandomize",
     "resync",
-    "rpcthreads",
     "seednode",
     "sendfreetransactions",
     "shrinkdebugfile",
@@ -706,6 +705,10 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         rawtx: zmq_address("zmqpubrawtx"),
     };
     config.vault = s.get_bool("vault", false);
+    // GetArg("-rpcthreads", 4), an atoi64 of the text (rpcserver.cpp:756)
+    if let Some(n) = s.get("rpcthreads") {
+        config.rpc.threads = settings::atoi(n);
+    }
 
     const APPLIED: &[&str] = &[
         // divid's -forcestart skips the checks it makes after a stop that was
@@ -714,6 +717,7 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         // block's chain state in one batch, so after a kill it is at its last
         // whole block and has no such check to skip: the option is taken as is
         "forcestart",
+        "rpcthreads",
         "vault",
         "rescan",
         "salvagewallet",
@@ -2046,6 +2050,7 @@ async fn run_daemon(
         password: Some(rpc_password),
         keep_alive: config.rpc.keep_alive,
         rest: config.rpc.rest,
+        threads: config.rpc.threads,
     };
 
     info!("Starting RPC server on {}...", rpc_config.bind_address);

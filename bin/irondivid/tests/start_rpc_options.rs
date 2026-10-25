@@ -200,3 +200,81 @@ fn files_are_private_unless_sysperms_with_the_wallet_off() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// A getblockcount on `stream`, kept alive: whether it is answered within `secs`
+fn answered(stream: &mut TcpStream, secs: u64, send: bool) -> bool {
+    if send {
+        let body = r#"{"jsonrpc":"1.0","id":1,"method":"getblockcount","params":[]}"#;
+        let request = format!(
+            "POST / HTTP/1.1\r\nHost: x\r\nAuthorization: Basic dGVzdDp0ZXN0\r\nConnection: keep-alive\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        if stream.write_all(request.as_bytes()).is_err() {
+            return false;
+        }
+    }
+    stream
+        .set_read_timeout(Some(Duration::from_secs(secs)))
+        .unwrap();
+    let mut got = Vec::new();
+    let mut buf = [0u8; 4096];
+    while !String::from_utf8_lossy(&got).contains("\"result\"") {
+        match stream.read(&mut buf) {
+            Ok(0) | Err(_) => return false,
+            Ok(n) => got.extend_from_slice(&buf[..n]),
+        }
+    }
+    true
+}
+
+/// -rpcthreads: divid serves each connection on one of its N threads to the
+/// end, so connection N+1 waits until one closes, and with 0 none is served
+/// (rpcserver.cpp:755-757, :1000-1010)
+#[test]
+fn rpcthreads_is_how_many_connections_are_served_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = start(dir.path(), &["-rpcthreads=2"]);
+    let connect = || TcpStream::connect(("127.0.0.1", node.rpc_port)).unwrap();
+    let (mut first, mut second, mut third) = (connect(), connect(), connect());
+    assert!(answered(&mut first, 10, true));
+    assert!(answered(&mut second, 10, true));
+    assert!(!answered(&mut third, 3, true), "a third connection served");
+    drop(first);
+    assert!(
+        answered(&mut third, 10, false),
+        "not served once one closed"
+    );
+    drop((second, third));
+    node.stop();
+
+    // With 0 the node runs and serves no call
+    let dir = tempfile::tempdir().unwrap();
+    let port = divi_test_support::free_port();
+    let mut child = command(
+        dir.path(),
+        port,
+        divi_test_support::free_port(),
+        &["-rpcthreads=0"],
+    )
+    .spawn()
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while !debug_log(dir.path()).contains("Starting RPC server on") && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    std::thread::sleep(Duration::from_secs(2));
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    assert!(
+        !answered(&mut stream, 3, true),
+        "a call served with -rpcthreads=0"
+    );
+    assert!(child.try_wait().unwrap().is_none(), "the node stopped");
+    unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}

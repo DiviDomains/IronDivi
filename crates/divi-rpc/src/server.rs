@@ -55,6 +55,9 @@ pub struct RpcConfig {
     pub keep_alive: bool,
     /// Serve the REST interface (Divi Core's -rest, default off)
     pub rest: bool,
+    /// Connections served at once (Divi Core's -rpcthreads, default 4); none
+    /// at 0 or below
+    pub threads: i64,
 }
 
 impl Default for RpcConfig {
@@ -66,6 +69,7 @@ impl Default for RpcConfig {
             allowed: Vec::new(),
             keep_alive: true,
             rest: false,
+            threads: 4,
         }
     }
 }
@@ -95,12 +99,84 @@ async fn serve(config: &RpcConfig, app: Router) -> Result<(), Error> {
         }
     }));
     let listener = tokio::net::TcpListener::bind(config.bind_address).await?;
+    let slots = config
+        .threads
+        .clamp(0, tokio::sync::Semaphore::MAX_PERMITS as i64) as usize;
     axum::serve(
         listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
+        ConnectionSlots {
+            inner: app.into_make_service_with_connect_info::<SocketAddr>(),
+            slots: Arc::new(tokio::sync::Semaphore::new(slots)),
+        },
     )
     .await?;
     Ok(())
+}
+
+/// Divi Core serves each RPC connection to its end on one of its -rpcthreads
+/// threads, idle keep-alive waits included (rpcserver.cpp:755-757, :1000-1010):
+/// a connection past them waits, accepted but unread, until one closes. Each
+/// connection here takes a slot before it is served and gives it back when it
+/// closes; the accept loop waits for the slot, as Divi Core's threads do.
+#[derive(Clone)]
+struct ConnectionSlots {
+    inner: axum::extract::connect_info::IntoMakeServiceWithConnectInfo<Router, SocketAddr>,
+    slots: Arc<tokio::sync::Semaphore>,
+}
+
+type SlotFuture<T> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<T, std::convert::Infallible>> + Send>,
+>;
+
+impl<'a> tower::Service<axum::serve::IncomingStream<'a>> for ConnectionSlots {
+    type Response =
+        Slotted<axum::middleware::AddExtension<Router, axum::extract::ConnectInfo<SocketAddr>>>;
+    type Error = std::convert::Infallible;
+    type Future = SlotFuture<Self::Response>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        tower::Service::<axum::serve::IncomingStream<'a>>::poll_ready(&mut self.inner, cx)
+    }
+
+    fn call(&mut self, stream: axum::serve::IncomingStream<'a>) -> Self::Future {
+        let made = self.inner.call(stream);
+        let slots = self.slots.clone();
+        Box::pin(async move {
+            // The semaphore is never closed
+            let slot = slots.acquire_owned().await.ok();
+            Ok(Slotted {
+                service: made.await?,
+                _slot: Arc::new(slot),
+            })
+        })
+    }
+}
+
+/// A connection's service, holding its slot until the connection closes
+#[derive(Clone)]
+struct Slotted<S> {
+    service: S,
+    _slot: Arc<Option<tokio::sync::OwnedSemaphorePermit>>,
+}
+
+impl<S: tower::Service<R>, R> tower::Service<R> for Slotted<S> {
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = S::Future;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.service.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: R) -> Self::Future {
+        self.service.call(request)
+    }
 }
 
 /// Log configuration for RPC queries
