@@ -572,6 +572,7 @@ impl Node {
             } else {
                 Vec::new()
             },
+            seed_nodes: config.p2p.seednode.clone(),
         };
         let peer_manager = PeerManager::new(peer_manager_config);
         // The -addnode values are the first added nodes (net.cpp:1218)
@@ -846,13 +847,23 @@ impl Node {
                             .begin_syncing_with_peer(peer_id, version.services)
                             .await;
 
+                        peer_manager
+                            .gossip()
+                            .connected(peer_id, peer_manager.is_one_shot(peer_id));
                         if peer_manager.is_inbound(peer_id) {
                             spork_manager.inbound_peer_connected(peer_id).await;
                         } else {
-                            // An outbound peer that answered (addrman Good, main.cpp:443)
-                            peer_manager
-                                .address_book()
-                                .connected(addr, version.services);
+                            // An outbound peer is asked for addresses after its
+                            // version (main.cpp:438-442), and counts as good
+                            // (addrman Good, main.cpp:443)
+                            peer_manager.gossip().asked(peer_id);
+                            if let Err(e) = peer_manager
+                                .send_to_peer(peer_id, NetworkMessage::GetAddr)
+                                .await
+                            {
+                                tracing::debug!("Failed to send getaddr to peer {}: {}", peer_id, e);
+                            }
+                            peer_manager.address_book().good(addr);
                         }
                     }
                     PeerEvent::Disconnected { peer_id, reason } => {
@@ -864,6 +875,7 @@ impl Node {
                         spork_manager.remove_peer(peer_id);
                         hash_continue.remove(&peer_id);
                         alerts_known.remove(&peer_id);
+                        peer_manager.gossip().disconnected(peer_id);
                     }
                     PeerEvent::Message { peer_id, message } => {
                         // Log all message types at INFO for debugging sync issues
@@ -1137,28 +1149,54 @@ impl Node {
                             }
                             NetworkMessage::Addr(addrs) => {
                                 // Kept in the address book, as Divi Core's addrman
-                                // keeps them (main.cpp:521-558)
-                                if addrs.len() > 1000 {
+                                // keeps them, and a short fresh one relayed
+                                // (main.cpp:521-558)
+                                if addrs.len() > divi_network::gossip::MAX_ADDR_MESSAGE {
                                     peer_manager.report_misbehavior_score(
                                         peer_id,
                                         20,
                                         "Requested too many addresses",
                                     );
                                 } else {
-                                    peer_manager.address_book().add(&addrs);
+                                    let now = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map(|d| d.as_secs() as u32)
+                                        .unwrap_or(0);
+                                    let got = peer_manager.gossip().received(
+                                        peer_id,
+                                        &addrs,
+                                        &peer_manager.connected_peers(),
+                                        now,
+                                    );
+                                    if let Some(from) = peer_manager.peer_addr(peer_id) {
+                                        peer_manager.address_book().add(&got.keep, from.ip());
+                                    }
+                                    for (to, relayed) in got.relay {
+                                        if let Err(e) = peer_manager
+                                            .send_to_peer(to, NetworkMessage::Addr(relayed))
+                                            .await
+                                        {
+                                            tracing::debug!("Failed to relay addr to peer {}: {}", to, e);
+                                        }
+                                    }
+                                    // A -seednode peer goes once it has answered (main.cpp:556-557)
+                                    if got.disconnect {
+                                        peer_manager.disconnect(peer_id);
+                                    }
                                 }
                             }
                             // An inbound peer asking for addresses gets a share of
-                            // the book (main.cpp:863-869), at most 1000 per message
+                            // the book it does not have yet, at most 1000
+                            // (main.cpp:863-869, :1087-1104)
                             NetworkMessage::GetAddr if peer_manager.is_inbound(peer_id) => {
                                 let sample = peer_manager.address_book().sample();
-                                for chunk in sample.chunks(1000) {
+                                let answer = peer_manager.gossip().answer(peer_id, sample);
+                                if !answer.is_empty() {
                                     if let Err(e) = peer_manager
-                                        .send_to_peer(peer_id, NetworkMessage::Addr(chunk.to_vec()))
+                                        .send_to_peer(peer_id, NetworkMessage::Addr(answer))
                                         .await
                                     {
                                         tracing::debug!("Failed to send addr to peer {}: {}", peer_id, e);
-                                        break;
                                     }
                                 }
                             }
