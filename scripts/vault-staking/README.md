@@ -80,7 +80,6 @@ mined by the owner instead), so each coinstake holds only the vault's payout.
 
 ## KNOWN differences
 
-- `getstakingstatus` member order: irondivid's members are in name order (docs/divid-differences.md R6).
 - `getstakingstatus`: irondivid adds `staking status text`, the string it gave before the member became a bool
   (docs/rpc-parity-audit.md: getstakingstatus).
 - `getstakingstatus mnsync (divid's masternode sync not finished)`: open: irondivid has no masternode sync and

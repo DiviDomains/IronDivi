@@ -68,6 +68,7 @@ pub mod addrbook;
 pub mod buffers;
 pub mod codec;
 pub mod connection;
+pub mod gossip;
 pub mod local;
 pub mod masternode_handler;
 pub mod peer;

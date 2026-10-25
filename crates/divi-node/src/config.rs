@@ -64,6 +64,12 @@ pub struct NodeConfig {
     #[serde(default)]
     pub max_reorg: Option<u32>,
 
+    /// Remove the chain's folders before the chain is opened, so it syncs again
+    /// from genesis (Divi Core -resync: blocks, chainstate and sporks,
+    /// init.cpp:901-930, :1480-1483); the wallet and the configuration stay
+    #[serde(default)]
+    pub resync: bool,
+
     /// Block files to import at start (-loadblock), after bootstrap.dat
     #[serde(default)]
     pub load_block: Vec<PathBuf>,
@@ -119,6 +125,7 @@ impl Default for NodeConfig {
             expire: divi_storage::prune::Expire::Never,
             check_blocks: DEFAULT_CHECK_BLOCKS,
             max_reorg: None,
+            resync: false,
             load_block: Vec::new(),
             bootstrap_dir: None,
             stop_after_block_import: false,
@@ -395,6 +402,11 @@ pub struct P2pConfig {
     #[serde(default)]
     pub addnode: Vec<String>,
 
+    /// `-seednode` peers: each dialled once, asked for addresses and dropped
+    /// after its answer (Divi Core net.cpp:1071-1084, main.cpp:556-557)
+    #[serde(default)]
+    pub seednode: Vec<String>,
+
     /// Accept inbound connections. `None` = default: listen unless `connect`
     /// is set (C++ soft-sets `-listen=0` under `-connect`).
     #[serde(default)]
@@ -531,6 +543,7 @@ impl Default for P2pConfig {
             enable_discovery: true,
             connect: Vec::new(),
             addnode: Vec::new(),
+            seednode: Vec::new(),
             listen: None,
             ban_time: 86400, // 24 hours
             ban_score: default_ban_score(),
@@ -739,6 +752,28 @@ pub struct MempoolConfig {
     /// Take transactions that are not standard (Divi Core's
     /// `-acceptnonstandard`, off by default; MempoolConsensus.cpp:274)
     pub accept_nonstandard: bool,
+
+    /// Bare multisig outputs are standard (Divi Core's `-permitbaremultisig`,
+    /// on by default; MempoolConsensus.cpp:31, :107-109)
+    #[serde(default = "default_true")]
+    pub permit_bare_multisig: bool,
+
+    /// The largest OP_META output script that is standard, in bytes: Divi
+    /// Core's `-datacarriersize` (603, MAX_OP_META_RELAY), or 0 with
+    /// `-datacarrier=0` (MempoolConsensus.cpp:32-33)
+    #[serde(default = "default_max_datacarrier_bytes")]
+    pub max_datacarrier_bytes: u32,
+
+    /// Below the relay fee a transaction needs enough coin-age priority (Divi
+    /// Core's `-relaypriority`, on by default; MempoolConsensus.cpp:254-259)
+    #[serde(default = "default_true")]
+    pub relay_priority: bool,
+
+    /// The free-relay rate limit for transactions from peers, in thousands of
+    /// bytes per minute (Divi Core's `-limitfreerelay`, 30 by default;
+    /// MempoolConsensus.cpp:211-234)
+    #[serde(default = "default_limit_free_relay")]
+    pub limit_free_relay: i64,
 }
 
 impl Default for MempoolConfig {
@@ -750,8 +785,26 @@ impl Default for MempoolConfig {
             max_orphan_txs: 100,
             expiry_time: 336 * 60 * 60, // 2 weeks
             accept_nonstandard: false,
+            permit_bare_multisig: true,
+            max_datacarrier_bytes: default_max_datacarrier_bytes(),
+            relay_priority: true,
+            limit_free_relay: default_limit_free_relay(),
         }
     }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Divi Core's -limitfreerelay default (MempoolConsensus.cpp:228)
+fn default_limit_free_relay() -> i64 {
+    30
+}
+
+/// Divi Core MAX_OP_META_RELAY (defaultValues.h:40)
+fn default_max_datacarrier_bytes() -> u32 {
+    603
 }
 
 /// Divi Core DEFAULT_TRANSACTION_MAXFEE, 100 DIVI (defaultValues.h:34)

@@ -44,9 +44,6 @@ START_TIMEOUT = 180
 # Each is listed in README.md with divid's source line; a KNOWN row that starts to
 # match divid is a FAIL, so the list stays true.
 KNOWN = {
-    "member order of an object (setupmasternode)":
-        "irondivid writes a result's members in name order (serde_json without preserve_order; "
-        "docs/divid-differences.md R6); the members are otherwise compared as sets",
     "getmasternodecount: tier counts divid lacks":
         "copper, silver, gold, platinum, diamond, kept on purpose (divid rpcmasternode.cpp:327-358 has the 8 "
         "counts only; scripts/masternode-replies README)",
@@ -571,6 +568,13 @@ views("after the copper collateral was spent")
 # 8. Payments (MN_LIFE_PAYMENTS=1): ranked 25 minutes after the broadcast was
 # signed; then each block is mined in turn by C and by I
 if PAYMENTS:
+    # I stakes ten blocks below. A stake combines the wallet's coins paying the
+    # kernel's script, and a coinstake output needs 20 confirmations before it
+    # stakes again (wallet.cpp:1452-1457), so I gets twelve coins of its own,
+    # each to a new address, well before they are needed
+    for _ in range(12):
+        C.rpc("sendtoaddress", I.rpc("getnewaddress"), 200)
+    mine(C, 1)
     ready = max(starts.values()) + 25 * 60 + 60
     info(f"waiting {max(0, ready - time.time()):.0f} s for the masternodes to be ranked")
     while time.time() < ready:
@@ -581,25 +585,54 @@ if PAYMENTS:
     while C.rpc("getblockcount") < 110:
         mine(C, 1)
     collateral_addresses = {mn[a]["address"]: a for a in mn}
-    paid = {C.name: [], I.name: []}
+
+    def coinstake_view(height):
+        """The masternode payments in the block (outputs to a masternode's
+        collateral address that is not one of the coinstake's own inputs, so a
+        staked collateral is not a payment) and what it minted"""
+        block = C.rpc("getblock", C.rpc("getblockhash", height))
+        tx = C.rpc("getrawtransaction", block["tx"][1], 1)
+        inputs, spent = set(), 0.0
+        for i in tx["vin"]:
+            prev = C.rpc("getrawtransaction", i["txid"], 1)["vout"][i["vout"]]
+            spent += float(prev["value"])
+            inputs.update(prev.get("scriptPubKey", {}).get("addresses", []))
+        payments, made = [], 0.0
+        for o in tx["vout"]:
+            made += float(o["value"])
+            for addr in o.get("scriptPubKey", {}).get("addresses", []):
+                if addr in collateral_addresses and addr not in inputs:
+                    payments.append((collateral_addresses[addr], o["value"]))
+        return payments, round(made - spent, 8)
+
+    # Divi Core pays no masternode once DeprecateMasternodes is active (median
+    # time past from 2023-08-23, ForkActivation.cpp:31; BlockIncentivesPopulator
+    # .cpp:142-152), so each block's masternode payments are compared, and what
+    # it minted; the votes still flow and are compared after each block
+    views_by = {C.name: [], I.name: []}
     for k in range(20):
         miner = (C, I)[k % 2]
         height = miner.rpc("getblockcount") + 1
-        winners = [n.call("getmasternodewinners", "1") for n in (C, I)]
-        mine(miner, 1)
-        block = C.rpc("getblock", C.rpc("getblockhash", height))
-        payees = []
-        for txid in block["tx"][:2]:
-            tx = C.rpc("getrawtransaction", txid, 1)
-            for o in tx["vout"]:
-                for addr in o.get("scriptPubKey", {}).get("addresses", []):
-                    if addr in collateral_addresses:
-                        payees.append((collateral_addresses[addr], o["value"]))
-        paid[miner.name].append(bool(payees))
-        info(f"height {height} mined by {miner.name}: masternode payment {payees}")
-        compare(f"payments: getmasternodewinners before height {height}", *winners)
-    row("payments: blocks that pay a masternode, of 10 mined by each", sum(paid[C.name]), sum(paid[I.name]),
-        sum(paid[C.name]) == sum(paid[I.name]))
+        out = miner.call("setgenerate", 1)
+        if out[0] != "ok":
+            row(f"payments: setgenerate by {miner.name} at height {height}", "ok", show(out), False)
+            break
+        need(synced(), f"the nodes did not follow {miner.name}'s block")
+        payments, minted = coinstake_view(height)
+        views_by[miner.name].append((payments, minted))
+        info(f"height {height} mined by {miner.name}: masternode payments {payments}, minted {minted}")
+        same = lambda: C.call("getmasternodewinners", "20") == I.call("getmasternodewinners", "20")
+        wait_for(same, 30)
+        compare(f"payments: getmasternodewinners 20 after height {height}",
+                C.call("getmasternodewinners", "20"), I.call("getmasternodewinners", "20"))
+    voted = C.call("getmasternodewinners", "20")
+    row("payments: divid's winners carry votes", any(
+        (w["winner"].get("nVotes", 0) if isinstance(w["winner"], dict) else 1) for w in voted[1])
+        if voted[0] == "ok" else voted, True, True)
+    pays = {n: sum(1 for p, _ in v if p) for n, v in views_by.items()}
+    row("payments: blocks that pay a masternode", pays[C.name], pays[I.name], pays[C.name] == pays[I.name])
+    minted = {n: sorted({m for _, m in v}) for n, v in views_by.items()}
+    row("payments: what a block mints", minted[C.name], minted[I.name], minted[C.name] == minted[I.name])
 
 for n in NODES:
     n.stop()

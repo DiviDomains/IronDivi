@@ -74,6 +74,10 @@ pub struct PeerManagerConfig {
     /// More listen addresses; every peer coming in on one is whitelisted
     /// (Divi Core -whitebind)
     pub white_listen: Vec<SocketAddr>,
+    /// `-seednode` peers: each dialled once, asked for addresses and dropped
+    /// after its answer, `-connect` or not (Divi Core AddOneShot,
+    /// net.cpp:1071-1084, :1096, :1112, :1842-1843)
+    pub seed_nodes: Vec<String>,
 }
 
 /// The check Divi Core makes before a dial (net.cpp OpenNetworkConnection,
@@ -151,6 +155,7 @@ impl Default for PeerManagerConfig {
             connect_only: false,
             whitelist: Vec::new(),
             white_listen: Vec::new(),
+            seed_nodes: Vec::new(),
         }
     }
 }
@@ -209,12 +214,19 @@ pub struct PeerManager {
     inbound_handshaking: AtomicUsize,
     /// Addresses of other nodes learnt from peers (Divi Core's addrman)
     address_book: Arc<crate::addrbook::AddressBook>,
+    /// What each peer is known to have of the address gossip
+    gossip: crate::gossip::Gossip,
+    /// `-seednode` peers not yet reached (Divi Core vOneShots)
+    one_shots: parking_lot::Mutex<std::collections::VecDeque<String>>,
+    /// Connected peers that go after their addr (Divi Core fOneShot)
+    one_shot_peers: RwLock<HashSet<PeerId>>,
 }
 
 impl PeerManager {
     /// Create a new peer manager
     pub fn new(config: PeerManagerConfig) -> Arc<Self> {
         let config_magic = config.magic;
+        let seed_nodes = config.seed_nodes.clone();
         let (event_tx, _) = broadcast::channel(1000);
         let (shutdown_tx, _) = broadcast::channel(1);
 
@@ -237,6 +249,9 @@ impl PeerManager {
             prebound: parking_lot::Mutex::new(None),
             inbound_handshaking: AtomicUsize::new(0),
             address_book: Arc::new(crate::addrbook::AddressBook::new(config_magic)),
+            gossip: crate::gossip::Gossip::new(),
+            one_shots: parking_lot::Mutex::new(seed_nodes.into()),
+            one_shot_peers: RwLock::new(HashSet::new()),
         })
     }
 
@@ -245,26 +260,59 @@ impl PeerManager {
         &self.address_book
     }
 
+    /// The address gossip of the connected peers
+    pub fn gossip(&self) -> &crate::gossip::Gossip {
+        &self.gossip
+    }
+
+    /// Whether a connected peer is a `-seednode` peer, dropped after its addr
+    pub fn is_one_shot(&self, peer_id: PeerId) -> bool {
+        self.one_shot_peers.read().contains(&peer_id)
+    }
+
     /// Dial addresses learnt from peers into free outbound slots, as Divi Core
-    /// dials from its address manager (net.cpp ThreadOpenConnections); not with
-    /// -connect, which dials only its own peers
+    /// dials from its address manager (net.cpp:1086-1179): an address the
+    /// book selects, not one tried in the last 10 minutes (until 30 tries)
+    /// nor off the network's port (until 50), at most 100 tries a slot; not
+    /// with -connect, which dials only its own peers
     fn dial_learnt(self: &Arc<Self>) {
-        if self.config.connect_only || !self.can_connect_outbound() {
+        if self.config.connect_only {
             return;
         }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
         let local = self.local_addresses();
-        for addr in self.address_book.candidates(self.config.max_outbound * 4) {
-            if !self.can_connect_outbound() {
+        let mut slots = self.config.max_outbound;
+        while slots > 0 && self.can_connect_outbound() {
+            slots -= 1;
+            let mut found = None;
+            for tries in 1..=100 {
+                let Some((addr, last_try)) = self.address_book.select() else {
+                    return;
+                };
+                // A network -onlynet left out is not dialled (net.cpp:1164-1165)
+                if local.is_limited(&addr.ip()) {
+                    continue;
+                }
+                if now - last_try < 600 && tries < 30 {
+                    continue;
+                }
+                if addr.port() != self.config.default_port && tries < 50 {
+                    continue;
+                }
+                if self.is_banned(&addr.ip()) || !self.claim_dial(addr, DialRule::Automatic) {
+                    continue;
+                }
+                found = Some(addr);
                 break;
             }
-            // A network -onlynet left out is not dialled (net.cpp:1164-1165)
-            if local.is_limited(&addr.ip())
-                || self.is_banned(&addr.ip())
-                || !self.claim_dial(addr, DialRule::Automatic)
-            {
-                continue;
-            }
+            let Some(addr) = found else {
+                return;
+            };
             debug!("Dialling learnt address {}", addr);
+            self.address_book.attempt(addr);
             let self_clone = Arc::clone(self);
             tokio::spawn(async move {
                 if let Err(e) = self_clone.connect_to_peer(addr).await {
@@ -272,6 +320,51 @@ impl PeerManager {
                 }
             });
         }
+    }
+
+    /// Dial the `-seednode` peers not reached yet, each as a one-shot peer;
+    /// one that cannot be reached is tried again on the next pass
+    fn dial_one_shots(self: &Arc<Self>) {
+        let pending: Vec<String> = self.one_shots.lock().drain(..).collect();
+        for dest in pending {
+            let self_clone = Arc::clone(self);
+            tokio::spawn(async move {
+                let reached = match self_clone.resolve(&dest).await {
+                    Some(addr) => {
+                        self_clone.claim_dial(addr, DialRule::ByName)
+                            && Arc::clone(&self_clone)
+                                .connect_peer(addr, true)
+                                .await
+                                .is_ok()
+                    }
+                    None => false,
+                };
+                if !reached {
+                    debug!("-seednode {} not reached; trying again later", dest);
+                    self_clone.one_shots.lock().push_back(dest);
+                }
+            });
+        }
+    }
+
+    /// `ip:port`, `ip` (the network's port) or a name to look up (not
+    /// through a proxy, which would see the lookup)
+    async fn resolve(&self, dest: &str) -> Option<SocketAddr> {
+        if let Ok(addr) = dest.parse::<SocketAddr>() {
+            return Some(addr);
+        }
+        if let Ok(ip) = dest.trim_matches(['[', ']']).parse::<IpAddr>() {
+            return Some(SocketAddr::new(ip, self.config.default_port));
+        }
+        if self.config.proxy.is_some() {
+            return None;
+        }
+        let with_port = if dest.contains(':') {
+            dest.to_string()
+        } else {
+            format!("{}:{}", dest, self.config.default_port)
+        };
+        tokio::net::lookup_host(with_port).await.ok()?.next()
     }
 
     /// The network magic of this peer manager's network
@@ -475,6 +568,11 @@ impl PeerManager {
         self.peers.read().contains_key(&peer_id)
     }
 
+    /// The address of a connected peer
+    pub fn peer_addr(&self, peer_id: PeerId) -> Option<SocketAddr> {
+        self.peers.read().get(&peer_id).map(|p| p.addr)
+    }
+
     /// Whether a connected peer dialled us
     pub fn is_inbound(&self, peer_id: PeerId) -> bool {
         self.peers.read().get(&peer_id).is_some_and(|p| p.inbound)
@@ -670,6 +768,9 @@ impl PeerManager {
             })
             .collect();
 
+        // -seednode peers, -connect or not (net.cpp:1096, :1112)
+        self.dial_one_shots();
+
         // Connect to static peers first (they report accurate heights)
         let rule = self.static_rule();
         let static_handles: Vec<_> = self
@@ -738,11 +839,14 @@ impl PeerManager {
 
             match tokio::net::lookup_host(format!("{}:{}", seed, self.config.default_port)).await {
                 Ok(addrs) => {
+                    // Into the book, as divid adds what a seed gives (net.cpp ThreadDNSAddressSeed)
+                    let addrs: Vec<SocketAddr> = addrs.collect();
+                    self.address_book.add_seeds(&addrs);
                     let local = self.local_addresses();
                     for addr in addrs {
                         if self.can_connect_outbound() {
-                            // Divi Core puts seed addresses in addrman, which
-                            // does not dial a network -onlynet left out
+                            // A seed address dialled at once: as from the
+                            // book, not in a network -onlynet left out
                             // (net.cpp:1164-1165)
                             if local.is_limited(&addr.ip())
                                 || !self.claim_dial(addr, DialRule::Automatic)
@@ -885,6 +989,15 @@ impl PeerManager {
         self: Arc<Self>,
         addr: SocketAddr,
     ) -> Result<PeerId, NetworkError> {
+        self.connect_peer(addr, false).await
+    }
+
+    /// Connect to a peer; a one-shot peer is dropped after its addr
+    async fn connect_peer(
+        self: Arc<Self>,
+        addr: SocketAddr,
+        one_shot: bool,
+    ) -> Result<PeerId, NetworkError> {
         // Check if IP is banned
         if self.is_banned(&addr.ip()) {
             self.connecting_addrs.write().remove(&addr);
@@ -930,6 +1043,9 @@ impl PeerManager {
 
         // Store the handle, then stop counting the address as being dialled
         self.peers.write().insert(peer_id, handle);
+        if one_shot {
+            self.one_shot_peers.write().insert(peer_id);
+        }
         self.connecting_addrs.write().remove(&addr);
 
         // Run the connection handler
@@ -941,6 +1057,7 @@ impl PeerManager {
             }
             // Remove peer on disconnect
             self_clone.peers.write().remove(&peer_id);
+            self_clone.one_shot_peers.write().remove(&peer_id);
             self_clone.scoring.unregister_peer(peer_id);
         });
 
@@ -1272,6 +1389,8 @@ impl PeerManager {
         let mut interval = tokio::time::interval(Duration::from_secs(30));
         loop {
             interval.tick().await;
+
+            self.dial_one_shots();
 
             let outbound = self.outbound_count();
             let target = self.config.max_outbound;

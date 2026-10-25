@@ -106,7 +106,7 @@ The brief this script was written for gave regtest's cycles as 200 and 201. Thos
 | `after a restart` | all three restarted: the winners at 109, 110, 119, 149, 150, 151, L−1, L, T−1, T and the tip |
 | `after -reindex` | A and irondivid restarted with `-reindex`: `getblockcount`, the winners at the same heights, and every superblock row again |
 | `getlotteryblockwinners <argument>` | no argument, 0, 100 (before the start), 101, 105, 110, 111, 150, the tip, above the tip, text, a real, two arguments |
-| `<call>: field order` | the order of the members of each kind of reply (see KNOWN) |
+| `<call>: field order` | the order of the members of each kind of reply |
 
 The number of rows varies a little from run to run: which coins stake, and so who wins and how many payees a
 superblock has, depends on the stake kernels found on that run (368 to 372 rows in three runs). The checks are the
@@ -123,9 +123,5 @@ Core paths are under `divi/src/` of the Divi Core source at v3.0.0 (commit 9e2f7
 
 - **`getlotteryblockwinners -1`:** not sent to divid. divid reads the block at height -1, a null pointer
   (`rpclottery.cpp:48-51`), and stops; irondivid's answer is shown only.
-- **`getlotteryblockwinners`, `getblock` and `getrawtransaction`: field order.** irondivid writes the members of a
-  result in name order; divid writes them in the order it adds them (json_spirit Object).
-  `docs/divid-differences.md` R6 keeps this on purpose. The values are compared in every row, and the order once per
-  kind of reply.
 
 No other row differs from divid.

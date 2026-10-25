@@ -9,6 +9,9 @@ prints one line:
 - `KNOWN`: differs, and the difference is listed below with the reason;
 - `FAIL`: differs and should not, or a `KNOWN` row that now matches divi-cli (the list below is out of date).
 
+The output is compared as text, line by line, so the order of members is compared with it (the other replies
+scripts compare it with `scripts/lib/member_order.py`).
+
 The run ends with `FAILS <n>`. The exit code is the number of FAILs. It is 255 for a usage error, an interrupted
 run, or a run over 10 minutes.
 
