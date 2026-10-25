@@ -747,14 +747,21 @@ const MAX_TX_FEE: Amount = Amount::from_sat(100 * 100_000_000);
 /// The notes a send keeps with its transaction (Divi Core's TxTextMetadata):
 /// FromAccount as given (also ""), comment and to when given and not empty
 fn send_notes(pairs: &[(&str, Option<&str>)]) -> std::collections::BTreeMap<String, String> {
-    pairs
+    let mut notes: std::collections::BTreeMap<String, String> = pairs
         .iter()
         .filter_map(|(key, value)| {
             value
                 .filter(|v| *key == "FromAccount" || !v.is_empty())
                 .map(|v| (key.to_string(), v.to_string()))
         })
-        .collect()
+        .collect();
+    // SendMoney erases the note named after the account, not FromAccount,
+    // so an account named "comment" or "to" loses that note
+    // (wallet.cpp:1915-1922)
+    if let Some(account) = notes.get("FromAccount").cloned() {
+        notes.remove(&account);
+    }
+    notes
 }
 
 /// addvault and removevault without Divi Core's -vault option

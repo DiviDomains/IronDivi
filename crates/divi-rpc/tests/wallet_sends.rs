@@ -450,3 +450,41 @@ fn a_send_the_mempool_refuses_stays_in_the_wallet() {
         .iter()
         .any(|(tx, _)| tx.txid() == detached[0].0));
 }
+
+/// sendfrom from an account named "comment" or "to" loses that note: Divi
+/// Core's SendMoney erases the note named after the account, not
+/// FromAccount (wallet.cpp:1915-1922, rpcwallet.cpp:1636-1646)
+#[test]
+fn an_account_named_after_a_note_loses_that_note() {
+    let net = Net::new();
+    let addresses = net.fund(&[10 * COIN, 10 * COIN, 10 * COIN]);
+    for (account, addr) in ["comment", "to", "shop"].iter().zip(&addresses) {
+        net.wallet.set_label(addr, account).unwrap();
+    }
+    let rpc = net.rpc();
+    let mut notes = Vec::new();
+    for account in ["comment", "to", "shop"] {
+        let txid = rpc
+            .send_from(&p(vec![
+                json!(account),
+                json!(dest().to_string()),
+                json!(1),
+                json!("a note"),
+                json!("a shop"),
+            ]))
+            .unwrap();
+        let txid = Hash256::from_hex(txid.as_str().unwrap()).unwrap();
+        notes.push(net.wallet.tx_notes(&txid));
+    }
+    let names = |n: &std::collections::BTreeMap<String, String>| {
+        n.iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(names(&notes[0]), ["FromAccount=comment", "to=a shop"]);
+    assert_eq!(names(&notes[1]), ["FromAccount=to", "comment=a note"]);
+    assert_eq!(
+        names(&notes[2]),
+        ["FromAccount=shop", "comment=a note", "to=a shop"]
+    );
+}
