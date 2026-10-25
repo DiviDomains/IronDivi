@@ -24,6 +24,9 @@ import time
 import urllib.error
 import urllib.request
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "lib"))
+import member_order  # noqa: E402  (scripts/lib: the order check the replies scripts share)
+
 IRONDIVID, DIVID, PORT_BASE, WORK = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
 # For the proof that a difference is caught: irondivid's reply of the named row is
 # changed before it is compared
@@ -62,8 +65,13 @@ def known(name):
     return KNOWN.get(name.split(": ", 1)[1]) if name.startswith("after restart: ") else None
 
 
-def row(name, core, iron, same):
+def row(name, core, iron, same, moved=None):
     global fails
+    if moved:
+        # The same members or items in another order than divid's: a FAIL of its own kind
+        fails += 1
+        print(f"ORDER  {name}  {moved}  divid={core}  irondivid={iron}"[:400], flush=True)
+        return
     reason = known(name)
     if reason:
         word = "KNOWN" if not same else "FAIL"
@@ -237,12 +245,13 @@ def compare(name, core, iron, drop=frozenset(), order=None):
         row(name, short(core), short(iron), same)
         return
     a, b = strip(core[1], drop), strip(iron[1], drop)
+    moved = member_order.difference(a, b)
     if order and isinstance(a, list) and isinstance(b, list):
         a, b = sorted(a, key=order), sorted(b, key=order)
     d = first_difference(a, b)
     if d and DUMP:
         dump(name, ("ok", a), ("ok", b))
-    row(name, short(core), d or short(iron), d is None)
+    row(name, short(core), d or short(iron), d is None, moved=moved)
 
 
 def usage_text(name, message):
@@ -392,8 +401,7 @@ outpoint = lambda c: {"txid": c["txid"], "vout": c["vout"]}
 # Private keys for the given-key forms: in memory and in RPC messages only
 wif = {a: C.rpc("dumpprivkey", a) for a in (A, B)}
 
-# Raw transactions, made on divid; outputs in name order (irondivid's RPC maps
-# keep names sorted; see README.md)
+# Raw transactions, made on divid; outputs in name order (see README.md)
 LO, HI = sorted((Y, Z))
 raw_a = C.rpc("createrawtransaction", [outpoint(coin["a"])], {Y: 49.99})
 raw_a_two = C.rpc("createrawtransaction", [outpoint(coin["a2"])], {LO: 10, HI: 19.99})

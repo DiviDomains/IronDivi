@@ -45,6 +45,7 @@ macro_rules! pause_point {
     };
 }
 
+pub mod abort;
 pub mod address_index;
 pub mod block_index;
 pub mod chain;
@@ -52,6 +53,7 @@ pub mod core_coins;
 pub mod database;
 pub mod datadir;
 pub mod difficulty;
+pub mod disk_space;
 pub mod error;
 pub mod export;
 #[cfg(test)]
@@ -75,8 +77,10 @@ pub mod utxo_cache;
 pub use address_index::{AddressHistoryEntry, AddressIndex, AddressUtxo, TxIndexEntry};
 pub use block_index::{BlockIndex, BlockStatus};
 pub use chain::{
-    bip34_height_script, check_transaction, AcceptBlockResult, BlockListener, Chain, ChainEvent,
-    ChainParams, ChainTip, ChainTipStatus, HeightIndexAudit, NetworkType, TipListener,
+    bip34_height_script, check_lottery_payments, check_transaction, check_treasury_payments,
+    treasury_payments_due, treasury_payments_due_with, AcceptBlockResult, BlockListener, Chain,
+    ChainEvent, ChainParams, ChainTip, ChainTipStatus, HeightIndexAudit, NetworkType, SharedSporks,
+    TipListener, TreasuryDue,
 };
 pub use database::{ChainDatabase, UtxoStats};
 pub use difficulty::{get_next_work_required, DifficultyParams};

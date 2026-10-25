@@ -26,7 +26,7 @@ use divi_primitives::transaction::OutPoint;
 use divi_primitives::ChainMode;
 use rocksdb::{ColumnFamilyDescriptor, Options, WriteBatch, DB};
 use std::path::Path;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Column family names
 const CF_DEFAULT: &str = "default";
@@ -102,9 +102,32 @@ fn decode_scanned_hashes(data: &[u8]) -> Vec<(u32, Hash256)> {
 /// Salt and encrypted master key pair
 type EncryptionMetadata = (Vec<u8>, Vec<u8>);
 
+/// Records a load could not read, by kind, as Divi Core's ReadKeyValue
+/// failures count (walletdb.cpp:495-511): a private key stops the load
+/// (DB_CORRUPT), a transaction asks for a rescan, anything else is a warning
+/// (DB_NONCRITICAL_ERROR)
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct LoadProblems {
+    /// Keys (Divi Core's key, wkey, mkey and ckey records, IsKeyType)
+    pub keys: usize,
+    /// Transactions and what the wallet keeps of them (its tx records)
+    pub transactions: usize,
+    /// Address book, vaults and the rest
+    pub others: usize,
+}
+
+/// The kind of a record that could not be read
+#[derive(Debug, Clone, Copy)]
+enum Kind {
+    Key,
+    Transaction,
+    Other,
+}
+
 /// Wallet database for persistence
 pub struct WalletDatabase {
     db: DB,
+    problems: std::sync::Mutex<LoadProblems>,
 }
 
 impl WalletDatabase {
@@ -145,7 +168,32 @@ impl WalletDatabase {
             .map_err(|e| WalletError::Storage(e.to_string()))?;
 
         info!("Wallet database opened");
-        Ok(WalletDatabase { db })
+        Ok(WalletDatabase {
+            db,
+            problems: std::sync::Mutex::new(LoadProblems::default()),
+        })
+    }
+
+    /// The records the loads so far could not read
+    pub fn load_problems(&self) -> LoadProblems {
+        *self.problems.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A record that could not be read: logged as Divi Core logs ReadKeyValue's
+    /// error (walletdb.cpp:509-510), counted, and left out
+    fn unreadable(&self, kind: Kind, what: &str, error: impl std::fmt::Display) {
+        warn!("Error reading wallet database: {} corrupt: {}", what, error);
+        let mut problems = self.problems.lock().unwrap_or_else(|e| e.into_inner());
+        match kind {
+            Kind::Key => problems.keys += 1,
+            Kind::Transaction => problems.transactions += 1,
+            Kind::Other => problems.others += 1,
+        }
+    }
+
+    /// Count a record that could not be read (for the loads of WalletDb)
+    pub(crate) fn note_unreadable_transaction(&self, what: &str, error: impl std::fmt::Display) {
+        self.unreadable(Kind::Transaction, what, error);
     }
 
     pub fn path(&self) -> &Path {
@@ -573,9 +621,7 @@ impl WalletDatabase {
                 let hash = Hash160::from_bytes(key[..20].try_into().unwrap());
                 match deserialize_key_entry(&value) {
                     Ok(entry) => keys.push((hash, entry)),
-                    Err(e) => {
-                        debug!("Failed to deserialize key: {}", e);
-                    }
+                    Err(e) => self.unreadable(Kind::Key, "key", e),
                 }
             }
         }
@@ -618,9 +664,7 @@ impl WalletDatabase {
                 let outpoint = outpoint_from_key(&key);
                 match deserialize_utxo(&value) {
                     Ok(utxo) => utxos.push((outpoint, utxo)),
-                    Err(e) => {
-                        debug!("Failed to deserialize UTXO: {}", e);
-                    }
+                    Err(e) => self.unreadable(Kind::Transaction, "coin", e),
                 }
             }
         }
@@ -679,9 +723,7 @@ impl WalletDatabase {
             let (_, value) = item.map_err(|e| WalletError::Storage(e.to_string()))?;
             match deserialize_tx(&value) {
                 Ok(tx) => transactions.push(tx),
-                Err(e) => {
-                    debug!("Failed to deserialize transaction: {}", e);
-                }
+                Err(e) => self.unreadable(Kind::Transaction, "transaction", e),
             }
         }
 
@@ -749,11 +791,10 @@ impl WalletDatabase {
             let (key, value) = item.map_err(|e| WalletError::Storage(e.to_string()))?;
             if let Ok(key_str) = String::from_utf8(key.to_vec()) {
                 if let Some(account) = key_str.strip_prefix("acc_") {
-                    let account = account.to_string();
-                    let addresses: Vec<String> = serde_json::from_slice(&value).map_err(|e| {
-                        WalletError::Storage(format!("Failed to deserialize account: {}", e))
-                    })?;
-                    accounts.push((account, addresses));
+                    match serde_json::from_slice::<Vec<String>>(&value) {
+                        Ok(addresses) => accounts.push((account.to_string(), addresses)),
+                        Err(e) => self.unreadable(Kind::Other, "account", e),
+                    }
                 }
             }
         }
@@ -771,10 +812,10 @@ impl WalletDatabase {
             let (key, value) = item.map_err(|e| WalletError::Storage(e.to_string()))?;
             if let Ok(key_str) = String::from_utf8(key.to_vec()) {
                 if let Some(address) = key_str.strip_prefix("addr_") {
-                    let address = address.to_string();
-                    let account = String::from_utf8(value.to_vec())
-                        .map_err(|e| WalletError::Storage(e.to_string()))?;
-                    mappings.push((address, account));
+                    match String::from_utf8(value.to_vec()) {
+                        Ok(account) => mappings.push((address.to_string(), account)),
+                        Err(e) => self.unreadable(Kind::Other, "address book entry", e),
+                    }
                 }
             }
         }
@@ -848,9 +889,7 @@ impl WalletDatabase {
             let (key, value) = item.map_err(|e| WalletError::Storage(e.to_string()))?;
             match deserialize_vault_metadata(&value) {
                 Ok(metadata) => vaults.push((key.to_vec(), metadata)),
-                Err(e) => {
-                    debug!("Failed to deserialize vault metadata: {}", e);
-                }
+                Err(e) => self.unreadable(Kind::Other, "vault", e),
             }
         }
 
@@ -1001,10 +1040,7 @@ impl WalletDatabase {
             let utxo_data = &value[..value.len() - 4];
             match deserialize_utxo(utxo_data) {
                 Ok(utxo) => results.push((outpoint, utxo, spent_height)),
-                Err(e) => {
-                    debug!("Skipping corrupt spent_utxo_data entry: {}", e);
-                    continue;
-                }
+                Err(e) => self.unreadable(Kind::Transaction, "spent coin", e),
             }
         }
 
@@ -1087,6 +1123,41 @@ impl WalletDatabase {
             .load_prefixed(Self::TX_ORDER_PREFIX)?
             .into_iter()
             .filter_map(|(txid, v)| Some((txid, u64::from_le_bytes(v.try_into().ok()?))))
+            .collect())
+    }
+
+    /// Key prefix of a transaction's received and smart times
+    const TX_TIMES_PREFIX: &'static [u8] = b"tx_times_";
+
+    /// Store a transaction's received and smart times (Divi Core
+    /// nTimeReceived, nTimeSmart)
+    pub fn store_tx_times(
+        &self,
+        txid: &Hash256,
+        received: u64,
+        smart: u64,
+    ) -> Result<(), WalletError> {
+        let mut value = received.to_le_bytes().to_vec();
+        value.extend_from_slice(&smart.to_le_bytes());
+        self.db
+            .put_cf(
+                self.cf(CF_DEFAULT),
+                Self::prefixed_txid_key(Self::TX_TIMES_PREFIX, txid),
+                value,
+            )
+            .map_err(|e| WalletError::Storage(e.to_string()))
+    }
+
+    /// Every stored transaction's (received, smart) times
+    pub fn load_tx_times(&self) -> Result<Vec<(Hash256, u64, u64)>, WalletError> {
+        Ok(self
+            .load_prefixed(Self::TX_TIMES_PREFIX)?
+            .into_iter()
+            .filter_map(|(txid, v)| {
+                let received = u64::from_le_bytes(v.get(..8)?.try_into().ok()?);
+                let smart = u64::from_le_bytes(v.get(8..16)?.try_into().ok()?);
+                Some((txid, received, smart))
+            })
             .collect())
     }
 

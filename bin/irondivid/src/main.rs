@@ -23,6 +23,7 @@
 
 mod core_files;
 mod interfaces;
+mod masternode_options;
 mod settings;
 mod snapshot_sig;
 
@@ -57,8 +58,12 @@ struct Args {
     daemon: bool,
     printtoconsole: bool,
     debug: bool,
+    logips: bool,
+    logtimestamps: bool,
+    shrinkdebugfile: bool,
     wallet: Option<PathBuf>,
     disablewallet: bool,
+    sysperms: bool,
     pid: Option<PathBuf>,
     export_chain: bool,
     export_start: Option<u32>,
@@ -95,7 +100,7 @@ the data directory) for whatever the command line left unset. Among them:\n  \
 -rpcpassword=<pw> -txindex -addressindex -spentindex -checkblocks=<n>\n  \
 -maxreorg=<n> -maxorphantx=<n> -minrelaytxfee=<amt> -staking\n  \
 -blockmaxsize=<n> -blockprioritysize=<n> -blockminsize=<n>\n  \
--blocknotify=<cmd> -walletnotify=<cmd>\n  \
+-blocknotify=<cmd> -walletnotify=<cmd> -alertnotify=<cmd>\n  \
 -zmqpubhashblock=<address> -zmqpubhashtx=<address>\n  \
 -zmqpubrawblock=<address> -zmqpubrawtx=<address>\n\
 IronDivi's own: -fullnode=<ip> -stakeonstaletip -stakesplitthreshold=<n>\n  \
@@ -171,8 +176,13 @@ impl Args {
         // -debug=<category> may repeat; -debug=0 is no debugging
         let debug = s.get_multi("debug");
         self.debug = !debug.is_empty() && !debug.iter().any(|c| c == "0");
+        self.logips = s.get_bool("logips", false);
+        self.logtimestamps = s.get_bool("logtimestamps", true);
+        // Default: shrink unless debugging (Logging.cpp:204)
+        self.shrinkdebugfile = s.get_bool("shrinkdebugfile", !self.debug);
         self.wallet = path("wallet");
         self.disablewallet = s.get_bool("disablewallet", false);
+        self.sysperms = s.get_bool("sysperms", false);
         self.pid = path("pid");
         self.export_chain = self.cli.get_bool("export-chain", false);
         self.export_start = number("export-start")?;
@@ -290,49 +300,147 @@ fn resolve_args(mut args: Args) -> Result<Args> {
 
 /// Options divid takes that irondivid has nothing for: accepted, with a warning
 const UNSUPPORTED_OPTIONS: &[&str] = &[
-    "alertnotify",
-    "alerts",
-    "budgetvotemode",
     "checklevel",
-    "createwalletbackups",
-    "datacarrier",
-    "datacarriersize",
-    "dbcache",
-    "disablesystemnotifications",
     "dns",
-    "forcednsseed",
-    "forcestart",
-    "genproclimit",
     "listenonion",
-    "litemode",
-    "logips",
-    "logtimestamps",
+    "onion",
+    "par",
+    "peerbloomfilters",
+    "proxyrandomize",
+    "torcontrol",
+    "torpassword",
+    "upnp",
+];
+
+/// Options divid takes and does nothing with, only naming them in its help:
+/// accepted without a word, as divid does (LicenseAndInfo.cpp:135, :143;
+/// -disablesystemnotifications :142, -mining and -genproclimit :186-187, :205;
+/// -checkpoints :165, -printpriority :201)
+const UNUSED_BY_DIVID: &[&str] = &[
+    "sendfreetransactions",
+    "txconfirmtarget",
+    "disablesystemnotifications",
+    "mining",
+    "genproclimit",
+    "checkpoints",
+    "printpriority",
+];
+
+/// Options divid reads for checks and test aids of its own that irondivid has
+/// no counterpart for, taken without a word as divid takes them: consistency
+/// checks of its block index and mempool (BlockCheckingHelpers.cpp:162,
+/// init.cpp:795), its wallet flush thread (init.cpp:1281) and signature cache
+/// size (script/sigcache.cpp:51), none of which shows outside, and its message
+/// fault injection (-dropmessagestest main.cpp:473, Node.cpp:479;
+/// -fuzzmessagestest Node.cpp:484-485), which irondivid does not do
+const NO_COUNTERPART: &[&str] = &[
+    "checkblockindex",
+    "checkmempool",
+    "flushwallet",
+    "maxsigcachesize",
+    "dropmessagestest",
+    "fuzzmessagestest",
+];
+
+/// Options apply_settings reads
+const APPLIED: &[&str] = &[
+    // divid's -forcestart skips the checks it makes after a stop that was
+    // not prepared: its best block in the block index, its coin database
+    // at that block (BlockIndexLoading.cpp:267-285). irondivid writes each
+    // block's chain state in one batch, so after a kill it is at its last
+    // whole block and has no such check to skip: the option is taken as is
+    "forcestart",
+    "rpcthreads",
+    "alerts",
+    "vault",
+    // read by masternode_options
     "masternode",
     "masternodeaddr",
     "masternodeprivkey",
-    "maxreceivebuffer",
-    "maxsendbuffer",
-    "mining",
     "mnconf",
     "mnconflock",
+    // only in divid's help: no code of divid reads them, and it says
+    // nothing about them (LicenseAndInfo.cpp:209, :226)
+    "litemode",
+    "budgetvotemode",
+    "rescan",
+    "salvagewallet",
+    "dbloadfailexit",
+    "allowunencryptedwallet",
+    "spendzeroconfchange",
+    "keypool",
+    "upgradewallet",
+    "createwalletbackups",
     "monthlybackups",
-    "onion",
-    "onlynet",
-    "par",
-    "peerbloomfilters",
-    "permitbaremultisig",
-    "proxyrandomize",
-    "resync",
-    "rpcthreads",
-    "seednode",
-    "sendfreetransactions",
-    "shrinkdebugfile",
-    "sysperms",
-    "torcontrol",
-    "torpassword",
-    "txconfirmtarget",
-    "upnp",
     "vault_min",
+    "rpcuser",
+    "rpcpassword",
+    "rpcport",
+    "server",
+    "rest",
+    "rpcallowip",
+    "rpcbind",
+    "rpckeepalive",
+    "port",
+    "bind",
+    "listen",
+    "connect",
+    "addnode",
+    "seednode",
+    "fullnode",
+    "dnsseed",
+    "maxconnections",
+    "timeout",
+    "proxy",
+    "discover",
+    "externalip",
+    "onlynet",
+    "maxreceivebuffer",
+    "maxsendbuffer",
+    "logips",
+    "logtimestamps",
+    "shrinkdebugfile",
+    "protocolversion",
+    "banscore",
+    "bantime",
+    "checkblocks",
+    "resync",
+    "loadblock",
+    "stopafterblockimport",
+    "maxreorg",
+    "maxorphantx",
+    "minrelaytxfee",
+    "acceptnonstandard",
+    "permitbaremultisig",
+    "datacarrier",
+    "datacarriersize",
+    "relaypriority",
+    "limitfreerelay",
+    "maxtxfee",
+    "sporkkey",
+    "staking",
+    "stakeonstaletip",
+    "stakesplitthreshold",
+    "blockmaxsize",
+    "blockprioritysize",
+    "blockminsize",
+    "txindex",
+    "spentindex",
+    "addressindex",
+    "reindex",
+    "utxocachesize",
+    "dbcache",
+    "forcednsseed",
+    "expire",
+    "blocknotify",
+    "alertnotify",
+    "walletnotify",
+    "zmqpubhashblock",
+    "zmqpubhashtx",
+    "zmqpubrawblock",
+    "zmqpubrawtx",
+    "whitelist",
+    "whitebind",
 ];
 
 /// Options read elsewhere (before the node config is built, or by a command)
@@ -350,6 +458,7 @@ const READ_ELSEWHERE: &[&str] = &[
     "debug",
     "wallet",
     "disablewallet",
+    "sysperms",
     "pid",
     "export-chain",
     "export-start",
@@ -414,11 +523,18 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         s.soft_set_bool("listen", true);
     }
     if !s.get_multi("connect").is_empty() {
-        s.soft_set_bool("dnsseed", false);
+        if s.soft_set_bool("dnsseed", false) {
+            info!("InitializeDivi : parameter interaction: -connect set -> setting -dnsseed=0");
+        }
         s.soft_set_bool("listen", false);
     }
     if s.is_set("proxy") {
         s.soft_set_bool("listen", false);
+    }
+    // -salvagewallet rewrites nothing in Divi Core 3.0.0: it sets -rescan
+    // (EnableWalletFeatures, init.cpp:763-766)
+    if s.get_bool("salvagewallet", false) && s.soft_set_bool("rescan", true) {
+        info!("InitializeDivi : parameter interaction: -salvagewallet=1 -> setting -rescan=1");
     }
     // -proxy, -listen=0 and -externalip each turn -discover off unless it is
     // given (net.cpp:1690-1716)
@@ -533,6 +649,7 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         config.p2p.enable_discovery = false;
     }
     config.p2p.addnode = s.get_multi("addnode").to_vec();
+    config.p2p.seednode = s.get_multi("seednode").to_vec();
     config
         .network
         .static_peers
@@ -544,6 +661,10 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     if !s.get_bool("dnsseed", true) {
         config.network.dns_seeds.clear();
     }
+    if s.is_set("dnsseed") {
+        config.p2p.dns_seed = Some(s.get_bool("dnsseed", true));
+    }
+    config.p2p.force_dns_seed = s.get_bool("forcednsseed", false);
     // -maxconnections counts inbound and outbound; at most 16 are outbound
     // (net.cpp:106, :757, :1727)
     if let Some(n) = number_option(&s, "maxconnections", 0..=i64::from(u32::MAX)) {
@@ -581,14 +702,19 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     // -loadblock files as given, relative to the working directory as in divid
     config.load_block = s.get_multi("loadblock").iter().map(PathBuf::from).collect();
     config.stop_after_block_import = s.get_bool("stopafterblockimport", false);
-    if let Some(n) = number_option(&s, "checkblocks", 0..=i64::from(u32::MAX)) {
-        config.check_blocks = n as u32;
+    // -resync: the chain's folders are removed before it loads (init.cpp:1480-1483)
+    config.resync = s.get_bool("resync", false);
+    // -checkblocks: atoi64; 0 or below checks every block (verifyDb.cpp:73-74)
+    if let Some(text) = s.get("checkblocks") {
+        config.check_blocks = settings::atoi(text).clamp(0, i64::from(u32::MAX)) as u32;
     }
     if let Some(n) = number_option(&s, "maxreorg", 0..=i64::from(u32::MAX)) {
         config.max_reorg = Some(n as u32);
     }
-    if let Some(n) = number_option(&s, "maxorphantx", 0..=i64::MAX) {
-        config.mempool.max_orphan_txs = n as usize;
+    // -maxorphantx: atoi64, below 0 read as 0, then kept as an unsigned int
+    // (main.cpp:790): a negative value, a text or an empty one keeps no orphan
+    if let Some(text) = s.get("maxorphantx") {
+        config.mempool.max_orphan_txs = settings::atoi(text).max(0) as u32 as usize;
     }
     if let Some(text) = s.get("minrelaytxfee") {
         // ParseMoney; refused unless it is an amount above zero, and kept in
@@ -599,6 +725,22 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         config.mempool.min_relay_fee_per_kb = sat;
     }
     config.mempool.accept_nonstandard = s.get_bool("acceptnonstandard", false);
+    // GetBoolArg("-permitbaremultisig", true), read once (MempoolConsensus.cpp:31)
+    config.mempool.permit_bare_multisig = s.get_bool("permitbaremultisig", true);
+    // -datacarrier ? GetArg("-datacarriersize", MAX_OP_META_RELAY) : 0, kept as
+    // an unsigned int, read once (MempoolConsensus.cpp:32-33)
+    // GetBoolArg("-relaypriority", true), read for each transaction in Core;
+    // the options do not change while a node runs (MempoolConsensus.cpp:255)
+    config.mempool.relay_priority = s.get_bool("relaypriority", true);
+    // GetArg("-limitfreerelay", 30), thousands of bytes per minute, read for
+    // each free transaction from a peer (MempoolConsensus.cpp:228)
+    config.mempool.limit_free_relay = s.get("limitfreerelay").map_or(30, settings::atoi);
+    config.mempool.max_datacarrier_bytes = if s.get_bool("datacarrier", true) {
+        s.get("datacarriersize")
+            .map_or(603, |text| settings::atoi(text) as u32)
+    } else {
+        0
+    };
     // -maxtxfee: an amount ParseMoney reads, at least the relay fee for 1 kB;
     // above 10 DIVI a warning (init.cpp:831-845)
     if let Some(text) = s.get("maxtxfee") {
@@ -621,12 +763,18 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     // -onlynet: each one of Divi Core's network names (ParseNetwork,
     // netbase.cpp:70-77; init.cpp:1734-1740)
     for net in s.get_multi("onlynet") {
-        if !matches!(
-            net.to_lowercase().as_str(),
-            "ipv4" | "ipv6" | "tor" | "onion"
-        ) {
+        if divi_network::local::Network::parse(net).is_none() {
             anyhow::bail!("Unknown network specified in -onlynet: '{}'", net);
         }
+        config.p2p.only_nets.push(net.to_lowercase());
+    }
+    // -maxreceivebuffer: thousands of bytes, read as divid's GetArg
+    if let Some(v) = s.get("maxreceivebuffer") {
+        config.p2p.max_receive_buffer = settings::atoi(v);
+    }
+    // -maxsendbuffer: thousands of bytes, read as divid's GetArg
+    if let Some(v) = s.get("maxsendbuffer") {
+        config.p2p.max_send_buffer = settings::atoi(v);
     }
     if let Some(wif) = s.get("sporkkey") {
         // Divi Core's SetSporkKey (init.cpp:968-975): a key that is not this
@@ -678,6 +826,15 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     if let Some(n) = number_option(&s, "maxlogfiles", 1..=100) {
         config.log.max_files = n as u32;
     }
+    // -dbcache in MiB, read as divid reads a number (atoi: 0 for a word) and
+    // split as divid splits it (init.cpp:1030, :1046-1056): the block tree and
+    // coin database caches make the chain database's block cache, the coins
+    // in memory the UTXO cache (unless -utxocachesize gives that)
+    if let Some(text) = s.get("dbcache") {
+        let sizes = divi_node::config::db_cache_sizes(settings::atoi(text), config.index.txindex);
+        config.block_cache_size = Some(sizes.block_tree + sizes.coin_db);
+        config.utxo_cache_size = sizes.coin_cache_entries;
+    }
     if let Some(n) = number_option(&s, "utxocachesize", 0..=i64::MAX) {
         config.utxo_cache_size = n as u64;
     }
@@ -687,6 +844,10 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     }
     config.blocknotify = s
         .get("blocknotify")
+        .filter(|c| !c.is_empty())
+        .map(String::from);
+    config.alertnotify = s
+        .get("alertnotify")
         .filter(|c| !c.is_empty())
         .map(String::from);
     config.walletnotify = s
@@ -703,100 +864,48 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         rawtx: zmq_address("zmqpubrawtx"),
     };
     config.vault = s.get_bool("vault", false);
+    // GetArg("-rpcthreads", 4), an atoi64 of the text (rpcserver.cpp:756)
+    if let Some(n) = s.get("rpcthreads") {
+        config.rpc.threads = settings::atoi(n);
+    }
+    config.p2p.alerts = s.get_bool("alerts", true);
 
-    const APPLIED: &[&str] = &[
-        "vault",
-        "rescan",
-        "salvagewallet",
-        "spendzeroconfchange",
-        "keypool",
-        "upgradewallet",
-        "rpcuser",
-        "rpcpassword",
-        "rpcport",
-        "server",
-        "rest",
-        "rpcallowip",
-        "rpcbind",
-        "rpckeepalive",
-        "port",
-        "bind",
-        "listen",
-        "connect",
-        "addnode",
-        "fullnode",
-        "dnsseed",
-        "maxconnections",
-        "timeout",
-        "proxy",
-        "discover",
-        "externalip",
-        "protocolversion",
-        "banscore",
-        "bantime",
-        "checkblocks",
-        "loadblock",
-        "stopafterblockimport",
-        "maxreorg",
-        "maxorphantx",
-        "minrelaytxfee",
-        "acceptnonstandard",
-        "maxtxfee",
-        "sporkkey",
-        "staking",
-        "stakeonstaletip",
-        "stakesplitthreshold",
-        "blockmaxsize",
-        "blockprioritysize",
-        "blockminsize",
-        "txindex",
-        "spentindex",
-        "addressindex",
-        "reindex",
-        "utxocachesize",
-        "expire",
-        "blocknotify",
-        "walletnotify",
-        "zmqpubhashblock",
-        "zmqpubhashtx",
-        "zmqpubrawblock",
-        "zmqpubrawtx",
-        "whitelist",
-        "whitebind",
-    ];
     let mut keys: Vec<&String> = settings.keys().collect();
     keys.sort();
     for key in keys {
         let k = key.as_str();
-        if APPLIED.contains(&k) || READ_ELSEWHERE.contains(&k) {
-            continue;
+        if k == "checklevel" {
+            // divid refuses any -checklevel: it always checks at level 4
+            // (init.cpp:782-784)
+            anyhow::bail!(
+                "Error: Unsupported argument -checklevel found. Checklevel must be level 4."
+            );
         }
-        if UNSUPPORTED_OPTIONS.contains(&k) {
-            if k == "masternode" {
-                // divid reads -masternode=<alias> as "run as the masternode
-                // <alias> of masternode.conf" and refuses to start without it
-                // (MasternodeModule.cpp:163-190); irondivid cannot run as one
-                anyhow::bail!(
-                    "-masternode={}: irondivid does not run as a masternode; remove the masternode= line to start it",
-                    settings.get("masternode").unwrap_or("")
-                );
-            } else if k == "checklevel" {
-                // divid refuses any -checklevel: it always checks at level 4
-                // (init.cpp:782-784)
-                anyhow::bail!(
-                    "Error: Unsupported argument -checklevel found. Checklevel must be level 4."
-                );
-            } else {
-                warn!(
-                    "Option -{} is not supported by irondivid; ignored",
-                    settings.written_name(k)
-                );
-            }
-        } else {
-            warn!("Unknown option -{}; ignored", settings.written_name(k));
+        if let Some(text) = option_warning(settings, k) {
+            warn!("{}", text);
         }
     }
     Ok(())
+}
+
+/// The warning an option read nowhere gets: one divid takes and irondivid
+/// has nothing for, or one neither knows; none for an option that is read
+fn option_warning(settings: &Settings, k: &str) -> Option<String> {
+    if APPLIED.contains(&k)
+        || READ_ELSEWHERE.contains(&k)
+        || UNUSED_BY_DIVID.contains(&k)
+        || NO_COUNTERPART.contains(&k)
+    {
+        return None;
+    }
+    Some(if UNSUPPORTED_OPTIONS.contains(&k) {
+        format!(
+            "Option -{} is not supported by irondivid; ignored",
+            settings.written_name(k)
+        )
+    } else {
+        format!("Unknown option -{}; ignored", settings.written_name(k))
+    })
 }
 
 /// A -whitebind value as Divi Core's Lookup reads it without name lookup:
@@ -1008,6 +1117,32 @@ struct RotatingLog {
     redirect_std: bool,
     file: Option<std::fs::File>,
     size: u64,
+    /// -shrinkdebugfile, and when the size was last checked for it
+    shrink: bool,
+    shrink_checked: std::time::Instant,
+}
+
+/// Over this size debug.log is shrunk (Logging.cpp:99)
+const SHRINK_ABOVE: u64 = 10 * 1_000_000;
+/// What a shrink keeps of the end of debug.log (Logging.cpp:105)
+const SHRINK_KEEP: u64 = 200_000;
+/// How often a running node checks whether to shrink (Logging.cpp:186)
+const SHRINK_EVERY: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// Divi Core ShrinkDebugFile (Logging.cpp:94-118): a debug.log over 10 MB is
+/// cut to its last 200 000 bytes
+fn shrink_debug_file(path: &std::path::Path) -> std::io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    let size = std::fs::metadata(path)?.len();
+    if size <= SHRINK_ABOVE {
+        return Ok(());
+    }
+    let mut file = std::fs::File::open(path)?;
+    file.seek(SeekFrom::End(-(SHRINK_KEEP as i64)))?;
+    let mut tail = Vec::with_capacity(SHRINK_KEEP as usize);
+    file.read_to_end(&mut tail)?;
+    drop(file);
+    std::fs::write(path, tail)
 }
 
 impl RotatingLog {
@@ -1016,6 +1151,7 @@ impl RotatingLog {
         max_size: u64,
         max_files: u32,
         redirect_std: bool,
+        shrink: bool,
     ) -> std::io::Result<Self> {
         let mut log = RotatingLog {
             dir: dir.to_path_buf(),
@@ -1024,7 +1160,14 @@ impl RotatingLog {
             redirect_std,
             file: None,
             size: 0,
+            shrink,
+            shrink_checked: std::time::Instant::now(),
         };
+        // Shrunk at start as divid does (Logging.cpp:205); a file that is
+        // still over the size limit after that is rotated
+        if shrink {
+            let _ = shrink_debug_file(&dir.join("debug.log"));
+        }
         log.reopen()?;
         // The log may already be too big from an earlier run
         if log.size >= max_size {
@@ -1067,6 +1210,15 @@ impl std::io::Write for RotatingLog {
         if REOPEN_LOG.swap(false, std::sync::atomic::Ordering::Relaxed) {
             self.file = None;
             self.reopen()?;
+        }
+        // And every five minutes while running (Logging.cpp:186-191)
+        if self.shrink && self.shrink_checked.elapsed() > SHRINK_EVERY {
+            self.shrink_checked = std::time::Instant::now();
+            if self.size > SHRINK_ABOVE {
+                self.file = None;
+                let _ = shrink_debug_file(&self.dir.join("debug.log"));
+                self.reopen()?;
+            }
         }
         if self.size > 0 && self.size + buf.len() as u64 > self.max_size {
             self.rotate()?;
@@ -1112,8 +1264,57 @@ fn stderr_is_file(_path: &std::path::Path) -> bool {
     false
 }
 
+/// Drop the writer's guard in `guard`: it hands the thread a shutdown behind
+/// the lines it holds and waits (up to about a second) until they are written
+fn flush_log_from(guard: &std::sync::Mutex<Option<tracing_appender::non_blocking::WorkerGuard>>) {
+    let guard = guard.lock().unwrap_or_else(|e| e.into_inner()).take();
+    drop(guard);
+}
+
+#[cfg(test)]
+mod flush_log_tests {
+    use super::*;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    /// A log file on a loaded host: each write takes a while
+    #[derive(Clone)]
+    struct SlowFile(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SlowFile {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Lines handed to the writer just before the process ends are in the
+    /// file once `flush_log_from` returns, however slow the writer is
+    #[test]
+    fn flush_writes_out_every_line_the_writer_holds() {
+        let file = SlowFile(Arc::new(Mutex::new(Vec::new())));
+        let (mut writer, guard) = tracing_appender::non_blocking(file.clone());
+        let slot = std::sync::Mutex::new(Some(guard));
+        for i in 0..5 {
+            writer.write_all(format!("line {i}\n").as_bytes()).unwrap();
+        }
+        flush_log_from(&slot);
+        let text = String::from_utf8(file.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(text.lines().count(), 5, "{text:?}");
+        assert!(slot.lock().unwrap().is_none());
+        // A second flush (the end of main after an exit path flushed) is a no-op
+        flush_log_from(&slot);
+    }
+}
+
 /// Initialize logging
 fn init_logging(log_config: &LogConfig, data_dir: &PathBuf) {
+    // -logips: whether log lines name peers by address too (Logging.cpp:202)
+    divi_network::peer_log::set_log_ips(log_config.log_ips);
     // Use RUST_LOG if set, otherwise use default based on debug config
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         if log_config.debug {
@@ -1154,6 +1355,7 @@ fn init_logging(log_config: &LogConfig, data_dir: &PathBuf) {
             log_config.max_file_size,
             log_config.max_files,
             std_is_log,
+            log_config.shrink,
         ) {
             Ok(log) => log,
             Err(e) => {
@@ -1177,10 +1379,15 @@ fn init_logging(log_config: &LogConfig, data_dir: &PathBuf) {
         // still holds
         *LOG_GUARD.lock().unwrap_or_else(|e| e.into_inner()) = Some(_guard);
 
-        // Set up file logging with timestamps
+        // Lines as divid writes them, without ANSI colours
         tracing_subscriber::registry()
             .with(
-                fmt::layer().with_writer(non_blocking).with_ansi(false), // No ANSI colors in file
+                fmt::layer()
+                    .with_writer(non_blocking)
+                    .with_ansi(false)
+                    .event_format(DividLogFormat {
+                        timestamps: log_config.timestamps,
+                    }),
             )
             .with(filter)
             .init();
@@ -1193,15 +1400,54 @@ fn init_logging(log_config: &LogConfig, data_dir: &PathBuf) {
     }
 }
 
+/// A debug.log line as Divi Core writes it (Logging.cpp:179-184): with
+/// -logtimestamps (default 1) the time, `%Y-%m-%d %H:%M:%S` in UTC, and a
+/// space; then the message. Warnings and errors begin `WARNING: ` and
+/// `ERROR: ` (divid's error() writes `ERROR: `); no level or module name.
+struct DividLogFormat {
+    timestamps: bool,
+}
+
+impl<S, N> fmt::FormatEvent<S, N> for DividLogFormat
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    N: for<'a> fmt::FormatFields<'a> + 'static,
+{
+    fn format_event(
+        &self,
+        ctx: &fmt::FmtContext<'_, S, N>,
+        mut writer: fmt::format::Writer<'_>,
+        event: &tracing::Event<'_>,
+    ) -> std::fmt::Result {
+        if self.timestamps {
+            write!(
+                writer,
+                "{} ",
+                chrono::Utc::now().format("%Y-%m-%d %H:%M:%S")
+            )?;
+        }
+        match *event.metadata().level() {
+            tracing::Level::ERROR => write!(writer, "ERROR: ")?,
+            tracing::Level::WARN => write!(writer, "WARNING: ")?,
+            _ => {}
+        }
+        ctx.field_format().format_fields(writer.by_ref(), event)?;
+        writeln!(writer)
+    }
+}
+
 /// The writer thread of debug.log (non-blocking): dropping its guard writes
 /// out the lines it still holds
 static LOG_GUARD: std::sync::Mutex<Option<tracing_appender::non_blocking::WorkerGuard>> =
     std::sync::Mutex::new(None);
 
-/// Write out the log lines not yet in debug.log (waits a second at most)
+/// Write out the log lines not yet in debug.log (waits a second at most).
+/// Neither `std::process::exit` nor the end of `main` drops a static, so every
+/// way out of the process after logging starts calls this first: otherwise the
+/// last lines, a start-up error among them, are lost whenever the writer
+/// thread has not run yet (a loaded host).
 fn flush_log() {
-    let guard = LOG_GUARD.lock().unwrap_or_else(|e| e.into_inner()).take();
-    drop(guard);
+    flush_log_from(&LOG_GUARD);
     use std::io::Write as _;
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
@@ -1252,12 +1498,34 @@ impl WalletSeed {
     }
 }
 
+/// A start that stops with exit code 1 and no error line, as Divi Core's
+/// AppInit2 returning false without an InitError (-dbloadfailexit)
+#[derive(Debug)]
+struct QuietExit;
+
+impl std::fmt::Display for QuietExit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the wallet loaded with a warning and -dbloadfailexit is set")
+    }
+}
+
+impl std::error::Error for QuietExit {}
+
 /// Wallet start options
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 struct WalletOptions {
     /// -rescan: scan the whole chain at the start; -salvagewallet sets it
     /// unless it is given (init.cpp:763-766, :1242)
     rescan: bool,
+    /// Whether -rescan is given: a transaction record that cannot be read
+    /// asks for a rescan only when it is not (SoftSetBoolArg, walletdb.cpp:508)
+    rescan_given: bool,
+    /// -dbloadfailexit, read as a number: a wallet that loads with a warning
+    /// stops the start (init.cpp:1307-1309)
+    db_load_fail_exit: bool,
+    /// -allowunencryptedwallet: no warning at start about an unencrypted
+    /// wallet (init.cpp:1228-1231)
+    allow_unencrypted: bool,
     /// -spendzeroconfchange: sends may use unconfirmed outputs of our own
     /// transactions (wallet.cpp:1848)
     spend_zero_conf_change: bool,
@@ -1267,17 +1535,53 @@ struct WalletOptions {
     /// -upgradewallet, read as a number: the highest wallet version a new
     /// wallet may have (wallet.cpp:1963-1971)
     upgrade_wallet: Option<i64>,
+    /// -createwalletbackups: backups kept in backups/ and monthlyBackups/ by
+    /// the backup at start, 20 by default, a negative count as 0
+    /// (init.cpp:124, :938; WalletBackupCreator.cpp:21)
+    wallet_backups: usize,
+    /// -monthlybackups: backups kept in monthlyBackups/ by the daily check,
+    /// 12 by default; 0 or less leaves the check off (init.cpp:1284,
+    /// LegacyWalletDatabaseEndpointFactory.cpp:77)
+    monthly_backups: usize,
+    /// -vault_min, whole DIVI read as a number: managed vault coins below it
+    /// are not staked (AvailableUtxoCollector.cpp:22)
+    vault_min: Amount,
+}
+
+/// divid's defaults: the options as when none is given
+impl Default for WalletOptions {
+    fn default() -> Self {
+        WalletOptions::from_settings(&Settings::default())
+    }
 }
 
 impl WalletOptions {
     fn from_settings(settings: &Settings) -> Self {
         WalletOptions {
             rescan: settings.get_bool("rescan", settings.get_bool("salvagewallet", false)),
+            rescan_given: settings.get("rescan").is_some(),
+            db_load_fail_exit: settings.get("dbloadfailexit").is_some_and(|v| atoi(v) != 0),
+            allow_unencrypted: settings.get_bool("allowunencryptedwallet", false),
             spend_zero_conf_change: settings.get_bool("spendzeroconfchange", false),
             keypool: settings
                 .get("keypool")
                 .map(|v| atoi(v).clamp(1, u32::MAX as i64) as u32),
             upgrade_wallet: settings.get("upgradewallet").map(atoi),
+            wallet_backups: settings
+                .get("createwalletbackups")
+                .map_or(divi_wallet::backup::STARTUP_BACKUPS, |v| {
+                    atoi(v).max(0) as usize
+                }),
+            monthly_backups: settings
+                .get("monthlybackups")
+                .map_or(divi_wallet::backup::MONTHLY_BACKUPS, |v| {
+                    atoi(v).max(0) as usize
+                }),
+            vault_min: Amount::from_sat(
+                settings
+                    .get("vault_min")
+                    .map_or(0, |v| atoi(v).saturating_mul(100_000_000)),
+            ),
         }
     }
 
@@ -1371,13 +1675,40 @@ fn load_or_restore_wallet_with_seed(
         // Divi Core copies the wallet into backups/ (and monthlyBackups/) at
         // every start, before it opens it (init.cpp:1479)
         if let Some(data_dir) = wallet_path.parent() {
-            if let Err(e) = divi_wallet::backup::backup_at_start(wallet_path, data_dir) {
+            if let Err(e) =
+                divi_wallet::backup::backup_at_start(wallet_path, data_dir, options.wallet_backups)
+            {
                 warn!("Failed to create backup: {}", e);
             }
         }
         info!("Loading wallet from {:?}", wallet_path);
-        let wallet = WalletDb::open(wallet_path, network)
-            .with_context(|| format!("Failed to open wallet at {:?}", wallet_path))?;
+        let wallet = match WalletDb::open(wallet_path, network) {
+            // A key record that cannot be read: Divi Core's DB_CORRUPT, an
+            // InitError (init.cpp:1153-1156, :1299-1305)
+            Err(divi_wallet::WalletError::Corrupt) => {
+                let message = divi_wallet::WalletError::Corrupt.to_string();
+                error!("Errors detected during wallet loading\n{}", message);
+                return Err(anyhow::Error::msg(message));
+            }
+            other => {
+                other.with_context(|| format!("Failed to open wallet at {:?}", wallet_path))?
+            }
+        };
+        // Other records that cannot be read: a warning, and the start goes
+        // on unless -dbloadfailexit (DB_NONCRITICAL_ERROR, init.cpp:1157-1162,
+        // :1299-1310)
+        let problems = wallet.load_problems();
+        if problems.transactions + problems.others > 0 {
+            let message = "Warning: error reading wallet.dat! All keys read correctly, but transaction data or address book entries might be missing or incorrect.";
+            info!("Errors detected during wallet loading\n{}", message);
+            // InitWarning: "Warning: " and the message, logged and on stderr
+            // (noui.cpp:38-40)
+            warn!("Warning: {}", message);
+            eprintln!("Warning: {}", message);
+            if options.db_load_fail_exit {
+                return Err(anyhow::Error::new(QuietExit));
+            }
+        }
 
         // Migrate chain_mode if needed (fixes wallets created before ChainMode was configurable)
         wallet
@@ -1426,7 +1757,11 @@ fn load_or_restore_wallet_with_seed(
     // The version limit is checked before the seed is made
     // (wallet.cpp:1963-1979), and before anything is written
     if options.refuses_new_wallet() {
-        anyhow::bail!("Error loading wallet.dat: database load failure");
+        // As Divi Core logs it (wallet.cpp:1969, init.cpp:1303)
+        info!("Unable to downgrade wallet version. -upgradewallet=<custom_version> might be incorrectly set");
+        let message = "Error loading wallet.dat: database load failure";
+        error!("Errors detected during wallet loading\n{}", message);
+        anyhow::bail!(message);
     }
     // Checked only when words make the wallet, before anything is written
     // (wallet.cpp:2302-2305, reported by init.cpp:1203-1209)
@@ -1507,21 +1842,25 @@ fn load_or_restore_wallet_with_seed(
 }
 
 /// Put the wallet's unconfirmed transactions back into the mempool after a
-/// restart (Core's ReacceptWalletTransactions), so a send made before the
-/// node stopped can still confirm. Runs after the catch-up scan, which has
+/// restart (Core's SubmitUnconfirmedWalletTransactionsToMempool,
+/// init.cpp:1262-1275), so a send made before the node stopped can still
+/// confirm. Those the mempool dropped earlier (detached, at depth -1) are
+/// offered too, as Core offers every wallet transaction with fewer than 0
+/// confirmations. Runs after the catch-up scan, which has
 /// already dropped the ones mined meanwhile. A transaction whose inputs are
 /// neither unspent on chain nor outputs of a transaction in the mempool can
 /// never confirm (spent by another transaction while we were down): the
-/// wallet forgets it, as it does when the mempool evicts one.
+/// wallet forgets it, as it does when the mempool evicts one. Nothing is
+/// announced to peers, as Core announces none of them then.
 fn resubmit_wallet_txs(node: &Node, wallet: &Arc<WalletDb>) {
-    let txs = wallet.unconfirmed_transactions();
+    let txs = wallet.transactions_to_resubmit();
     if txs.is_empty() {
         return;
     }
     let chain = node.chain();
     let mempool = node.mempool();
     let mut resubmitted = 0;
-    for tx in txs {
+    for (tx, detached) in txs {
         let txid = tx.txid();
         let inputs_available = tx.vin.iter().all(|input| {
             mempool.contains(&input.prevout.txid)
@@ -1534,12 +1873,17 @@ fn resubmit_wallet_txs(node: &Node, wallet: &Arc<WalletDb>) {
             Err("inputs no longer available".to_string())
         };
         match result {
+            // Added to the mempool only, not announced: Divi Core's
+            // SubmitTransactionToMempool runs AcceptToMemoryPool alone
+            // (init.cpp:1272, txmempool.cpp:408-415); peers hear of the
+            // transaction from the periodic mempool rebroadcast
             Ok(_) => {
                 resubmitted += 1;
-                let relay = node.tx_relay().clone();
-                tokio::spawn(async move {
-                    relay.announce_tx(txid).await;
-                });
+            }
+            // A detached transaction the mempool refuses stays as it is, at
+            // depth -1, as Divi Core's wallet keeps it
+            Err(e) if detached => {
+                debug!("Detached wallet tx {} not resubmitted: {}", txid, e);
             }
             Err(e) => {
                 warn!(
@@ -1577,12 +1921,14 @@ fn lock_data_dir(dir: &std::path::Path) -> Result<std::fs::File> {
 }
 
 /// Run the daemon
+#[allow(clippy::too_many_arguments)]
 async fn run_daemon(
     mut config: NodeConfig,
     wallet_path: Option<PathBuf>,
     wallet_seed: WalletSeed,
     disable_wallet: bool,
     wallet_options: WalletOptions,
+    mn_options: masternode_options::MasternodeOptions,
     shutdown_tx: broadcast::Sender<()>,
     shutdown_rx: broadcast::Receiver<()>,
 ) -> Result<()> {
@@ -1592,8 +1938,22 @@ async fn run_daemon(
     // One process per data directory, held until this one exits
     // (TryLockDataDirectory, init.cpp:850-862)
     let _datadir_lock = lock_data_dir(&config.data_dir)?;
-    // divid reads masternode.conf at every start and makes it when missing
-    core_files::ensure_masternode_conf(&config.data_dir);
+    // The clock warning of the network time offset goes where Divi Core's
+    // Warnings::setMiscWarning puts it: getinfo's and getmininginfo's "errors"
+    // (timedata.cpp:96-97)
+    divi_network::timedata::on_clock_warning(divi_rpc::warnings::set_misc_warning);
+    // divid reads masternode.conf (-mnconf) at every start, makes it when
+    // missing, and with -masternode checks the masternode's settings
+    // (MasternodeModule.cpp:210-240; init.cpp:1594-1597)
+    let mn_entries = mn_options.read_conf().map_err(|e| anyhow::anyhow!(e))?;
+    let mn_network = match config.network.network_type {
+        NetworkType::Mainnet => WalletNetwork::Mainnet,
+        NetworkType::Testnet => WalletNetwork::Testnet,
+        NetworkType::Regtest => WalletNetwork::Regtest,
+    };
+    mn_options
+        .check_start(&mn_entries, config.index.txindex, mn_network)
+        .map_err(|e| anyhow::anyhow!(e))?;
 
     // Divi Core Discover: the interfaces' addresses (net.cpp:1385-1425)
     if config.p2p.discover {
@@ -1610,10 +1970,18 @@ async fn run_daemon(
     if let Some(cmd) = config.blocknotify.clone() {
         spawn_block_notify(node.chain().clone(), cmd);
     }
+    spawn_version_warning(node.chain().clone(), config.alertnotify.clone());
 
     // The ZMQ notifiers, before the chain takes blocks (init.cpp:1495-1500).
     // Kept for the life of the node; none if an address cannot be bound.
     let _zmq = divi_node::zmq::ZmqNotifier::start(&config.zmq, node.chain(), node.mempool());
+
+    // Divi Core's last check before it starts the node: 50 MB free on the
+    // data directory's filesystem (init.cpp:1604-1605)
+    if !divi_storage::disk_space::check_disk_space(&config.data_dir, 0) {
+        divi_storage::abort::abort_node("Disk space is low!");
+        anyhow::bail!("Disk space is low!");
+    }
 
     // Start the node
     node.start().await.with_context(|| "Failed to start node")?;
@@ -1675,11 +2043,37 @@ async fn run_daemon(
             &wallet_options,
         )?);
         if let Some(ref w) = wallet {
-            core_files::lock_masternode_collateral(w, &config.data_dir);
+            // Divi Core warns at every start of a wallet that is not locked,
+            // unless -allowunencryptedwallet; not after the load's own warning,
+            // which returns first (init.cpp:1220-1231)
+            let problems = w.load_problems();
+            if !wallet_options.allow_unencrypted
+                && !w.is_locked()
+                && problems.transactions + problems.others == 0
+            {
+                let message = "Make sure to encrypt your wallet and delete all non-encrypted backups after you verified that wallet works!";
+                warn!("Warning: {}", message);
+                eprintln!("Warning: {}", message);
+            }
+            // -mnconflock, default on (MasternodeModule.cpp:454-466)
+            if mn_options.lock {
+                core_files::lock_masternode_collateral(w, &mn_options.conf_path);
+            }
             w.set_vault_mode(config.vault);
             w.set_spend_zero_conf_change(wallet_options.spend_zero_conf_change);
+            w.set_vault_min(wallet_options.vault_min);
             w.set_relay_fee_per_kb(config.mempool.min_relay_fee_per_kb);
             w.set_max_tx_fee(config.mempool.max_tx_fee);
+            // A spork 14 entry sets the fees the wallet's sends pay and may pay
+            {
+                let (w, chain) = (Arc::clone(w), node.chain().clone());
+                node.spork_manager().on_tx_fee_spork(Arc::new(move || {
+                    if let Some(fee) = chain.tx_fee_spork_at_tip() {
+                        w.set_relay_fee_per_kb(fee.min_fee_per_kb as i64);
+                        w.set_max_tx_fee(fee.max_fee as i64);
+                    }
+                }));
+            }
             // -walletnotify, before the wallet catches up with the chain
             // (init.cpp:1199, before the rescan at :1242)
             if let Some(cmd) = config.walletnotify.clone() {
@@ -1795,9 +2189,18 @@ async fn run_daemon(
             // wallet holds, as Divi Core's verifySyncToActiveChain from the
             // genesis block (init.cpp:1242, wallet.cpp:279-313)
             let chain_height = node.chain().height();
-            if wallet_options.rescan {
+            // A transaction record that could not be read asks for a rescan,
+            // unless -rescan is given (walletdb.cpp:505-508)
+            let rescan = wallet_options.rescan
+                || (!wallet_options.rescan_given && wallet_arc.load_problems().transactions > 0);
+            if rescan {
                 info!("Rescanning... from height 0 to {}", chain_height);
                 wallet_arc.set_last_scan_height(0);
+            } else {
+                // Divi Core scans from the wallet's stored best block, itself
+                // included (wallet.cpp:258-269, :279-313): the last block is
+                // scanned again at every start
+                divi_rpc::wallet::resume_wallet_scan(wallet_arc, node.chain());
             }
             let last_scan = wallet_arc.last_scan_height();
             if last_scan > chain_height {
@@ -1842,23 +2245,32 @@ async fn run_daemon(
 
             resubmit_wallet_txs(&node, wallet_arc);
 
-            // Divi Core checks once a day whether a monthly backup is due
-            // (LegacyWalletDatabaseEndpointFactory.cpp:111-121; on regtest
-            // that loop runs on mock time)
-            if config.network.network_type != NetworkType::Regtest {
+            // Divi Core checks a day after start, and a day after each check,
+            // whether a monthly backup is due; on regtest the day is counted
+            // on mock time (LegacyWalletDatabaseEndpointFactory.cpp:111-121,
+            // MockMilliSleep in utiltime.cpp:54-60)
+            if wallet_options.monthly_backups > 0 {
                 let wallet_for_backup = Arc::clone(wallet_arc);
                 let backup_root = wallet_dir.parent().map(|p| p.to_path_buf());
+                let keep = wallet_options.monthly_backups;
+                let clock: fn() -> i64 = if config.network.network_type == NetworkType::Regtest {
+                    divi_primitives::clock::now
+                } else {
+                    divi_primitives::clock::system_now
+                };
                 tokio::spawn(async move {
                     let Some(root) = backup_root else { return };
-                    let mut daily =
-                        tokio::time::interval(std::time::Duration::from_secs(24 * 3600));
-                    daily.tick().await;
+                    const DAY: i64 = 24 * 3600;
+                    let mut since = clock();
                     loop {
-                        daily.tick().await;
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        if clock() - since <= DAY {
+                            continue;
+                        }
                         let wallet = Arc::clone(&wallet_for_backup);
                         let root = root.clone();
                         let made = tokio::task::spawn_blocking(move || {
-                            divi_wallet::backup::monthly_backup(&wallet, &root)
+                            divi_wallet::backup::monthly_backup(&wallet, &root, keep)
                         })
                         .await;
                         match made {
@@ -1867,6 +2279,7 @@ async fn run_daemon(
                             Ok(Err(e)) => warn!("Monthly wallet backup failed: {}", e),
                             Err(e) => warn!("Monthly wallet backup failed: {}", e),
                         }
+                        since = clock();
                     }
                 });
             }
@@ -2037,6 +2450,7 @@ async fn run_daemon(
         password: Some(rpc_password),
         keep_alive: config.rpc.keep_alive,
         rest: config.rpc.rest,
+        threads: config.rpc.threads,
     };
 
     info!("Starting RPC server on {}...", rpc_config.bind_address);
@@ -2078,10 +2492,13 @@ async fn run_daemon(
         let mempool_for_tx = node.mempool().clone();
         let tx_relay_for_tx = node.tx_relay().clone();
         let datadir_for_mn = config.data_dir.clone();
+        let mnconf_for_rpc = mn_options.conf_path.clone();
         let pm_for_mn = node.peer_manager().clone();
         // The node's own masternode list, which the network fills from mnb/mnp
         let mn_for_rpc = node.masternode_manager().as_ref().clone();
         let mn_list_for_rpc = Arc::clone(node.masternode_list());
+        let mn_votes_for_rpc = Arc::clone(node.masternode_votes());
+        let mn_sync_for_rpc = Arc::clone(node.masternode_sync());
         let log_config_for_rpc = divi_rpc::LogConfigInfo {
             max_file_size: config.log.max_file_size,
             max_files: config.log.max_files,
@@ -2106,10 +2523,19 @@ async fn run_daemon(
 
                     // The masternode RPCs read the node's masternode list
                     rpc_server.set_masternode_manager(mn_for_rpc);
-                    rpc_server.set_masternode_list(mn_list_for_rpc);
+                    rpc_server.set_masternode_list(Arc::clone(&mn_list_for_rpc));
+                    rpc_server.set_masternode_votes(mn_votes_for_rpc);
+                    rpc_server.set_masternode_sync(Arc::clone(&mn_sync_for_rpc));
                     rpc_server.set_masternode_datadir(datadir_for_mn);
-                    rpc_server.set_masternode_relay(Arc::new(move |bytes: Vec<u8>| {
-                        pm_for_mn.broadcast_masternode_broadcast(bytes);
+                    rpc_server.set_masternode_conf(mnconf_for_rpc);
+                    // broadcaststartmasternode: the list took the broadcast and
+                    // left its inv to announce (RelayParsedMasternodeBroadcast,
+                    // RpcMasternodeFeatures.cpp:80-121)
+                    let mn_list_for_relay = Arc::clone(&mn_list_for_rpc);
+                    rpc_server.set_masternode_relay(Arc::new(move |_bytes: Vec<u8>| {
+                        for item in mn_list_for_relay.take_relays() {
+                            pm_for_mn.broadcast(masternode_inv(item));
+                        }
                     }));
                     info!("Masternode manager initialized");
 
@@ -2143,6 +2569,7 @@ async fn run_daemon(
                         let wallet_for_status = Arc::clone(&wallet_for_staking_status);
                         let chain_for_status = Arc::clone(&chain_for_staking_status);
                         let peers_for_status = Arc::clone(&peers_for_staking_status);
+                        let sync_for_status = Arc::clone(&mn_sync_for_rpc);
 
                         // Register status callback
                         rpc_server.staking().set_status_callback(Arc::new(move || {
@@ -2152,7 +2579,7 @@ async fn run_daemon(
                                 wallet_for_status.is_locked(),
                                 peers_for_status.peer_count(),
                                 tip_time,
-                                blockchain_synced(&chain_for_status),
+                                sync_for_status.lock().sync.is_synced(),
                                 split_threshold_divi,
                             )
                         }));
@@ -2186,9 +2613,19 @@ async fn run_daemon(
                         rpc_server
                             .staking()
                             .set_generate_control(Arc::new(move |n| {
+                                use divi_node::staker::GenerateBlockError;
+                                use divi_rpc::staking::GenerateBlockFailure;
                                 staker_for_generate
                                     .generate_blocks(n)
                                     .map(|hashes| hashes.iter().map(|h| h.to_string()).collect())
+                                    .map_err(|e| match e {
+                                        GenerateBlockError::Refused(m) => {
+                                            GenerateBlockFailure::Refused(m)
+                                        }
+                                        GenerateBlockError::Failed(m) => {
+                                            GenerateBlockFailure::Failed(m)
+                                        }
+                                    })
                             }));
                         let staker_for_block = Arc::clone(staker_arc);
                         rpc_server
@@ -2234,10 +2671,13 @@ async fn run_daemon(
         let history_for_rpc = node.history_fetcher();
         let block_sync_for_rpc = node.block_sync().clone();
         let datadir_for_mn = config.data_dir.clone();
+        let mnconf_for_rpc = mn_options.conf_path.clone();
         let pm_for_mn = node.peer_manager().clone();
         // The node's own masternode list, which the network fills from mnb/mnp
         let mn_for_rpc = node.masternode_manager().as_ref().clone();
         let mn_list_for_rpc = Arc::clone(node.masternode_list());
+        let mn_votes_for_rpc = Arc::clone(node.masternode_votes());
+        let mn_sync_for_rpc = Arc::clone(node.masternode_sync());
         let log_config_for_rpc = divi_rpc::LogConfigInfo {
             max_file_size: config.log.max_file_size,
             max_files: config.log.max_files,
@@ -2261,10 +2701,19 @@ async fn run_daemon(
 
                     // The masternode RPCs read the node's masternode list
                     rpc_server.set_masternode_manager(mn_for_rpc);
-                    rpc_server.set_masternode_list(mn_list_for_rpc);
+                    rpc_server.set_masternode_list(Arc::clone(&mn_list_for_rpc));
+                    rpc_server.set_masternode_votes(mn_votes_for_rpc);
+                    rpc_server.set_masternode_sync(mn_sync_for_rpc);
                     rpc_server.set_masternode_datadir(datadir_for_mn);
-                    rpc_server.set_masternode_relay(Arc::new(move |bytes: Vec<u8>| {
-                        pm_for_mn.broadcast_masternode_broadcast(bytes);
+                    rpc_server.set_masternode_conf(mnconf_for_rpc);
+                    // broadcaststartmasternode: the list took the broadcast and
+                    // left its inv to announce (RelayParsedMasternodeBroadcast,
+                    // RpcMasternodeFeatures.cpp:80-121)
+                    let mn_list_for_relay = Arc::clone(&mn_list_for_rpc);
+                    rpc_server.set_masternode_relay(Arc::new(move |_bytes: Vec<u8>| {
+                        for item in mn_list_for_relay.take_relays() {
+                            pm_for_mn.broadcast(masternode_inv(item));
+                        }
                     }));
                     info!("Masternode manager initialized");
                 }
@@ -2330,6 +2779,59 @@ fn run_notify(cmd: &str, value: &str) {
     });
 }
 
+/// -alertnotify: run the command with the warning's text, kept to Divi Core's
+/// safe characters and put in single quotes (CAlert::Notify, alert.cpp:218-235)
+fn alert_notify(cmd: &str, message: &str) {
+    const SAFE: &str =
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ01234567890 .,;_-/:?@()";
+    let safe: String = message.chars().filter(|c| SAFE.contains(*c)).collect();
+    run_notify(cmd, &format!("'{safe}'"));
+}
+
+/// Divi Core's warning when most of the last 100 blocks are of a newer
+/// version than it makes (ChainTipManager.cpp:43-60): once out of initial
+/// download, with more than 50 of them above version 4 (block.h:26), the
+/// miscellaneous warning is set and -alertnotify run, once. Initial download
+/// ends, for good, at a tip less than 6 hours old (ChainSyncHelpers.cpp:42-49)
+fn spawn_version_warning(chain: Arc<divi_storage::Chain>, alertnotify: Option<String>) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    const CURRENT_VERSION: i32 = 4;
+    let warned = AtomicBool::new(false);
+    let synced = AtomicBool::new(false);
+    let blocks = chain.clone();
+    chain.add_tip_listener(Arc::new(move |tip| {
+        if warned.load(Ordering::SeqCst) {
+            return;
+        }
+        if !synced.load(Ordering::SeqCst) {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs() as i64);
+            if blocks.is_importing() || i64::from(tip.time) < now - 6 * 60 * 60 {
+                return;
+            }
+            synced.store(true, Ordering::SeqCst);
+        }
+        let upgraded = (0..100u32)
+            .map_while(|back| tip.height.checked_sub(back))
+            .filter_map(|height| blocks.get_block_index_by_height(height).ok().flatten())
+            .filter(|index| index.version > CURRENT_VERSION)
+            .count();
+        if upgraded > 100 / 2 {
+            let message = "Warning: This version is obsolete, upgrade required!";
+            warn!(
+                "{} of last 100 blocks above version {}",
+                upgraded, CURRENT_VERSION
+            );
+            divi_rpc::warnings::set_misc_warning(message);
+            if let Some(cmd) = &alertnotify {
+                alert_notify(cmd, message);
+            }
+            warned.store(true, Ordering::SeqCst);
+        }
+    }));
+}
+
 /// -blocknotify: run the command each time the best block changes, with the
 /// new tip's hash (divid's UpdatedBlockTip, init.cpp:113-117, :518-523)
 fn spawn_block_notify(chain: Arc<divi_storage::Chain>, cmd: String) {
@@ -2385,7 +2887,7 @@ fn staking_info(
     wallet_locked: bool,
     peer_count: usize,
     tip_time: u32,
-    synced: bool,
+    masternode_synced: bool,
     split_threshold_divi: f64,
 ) -> divi_rpc::StakingInfo {
     divi_rpc::StakingInfo {
@@ -2408,27 +2910,25 @@ fn staking_info(
         valid_time: tip_time > 1_471_482_000,
         mintable_coins: status.mintable_coins,
         enough_coins: status.stake_weight > 0,
-        // IronDivi keeps no masternode list sync of its own; Divi Core's
-        // starts once the chain is synced
-        mnsync: synced,
+        // The masternode sync has finished (IsSynced, rpcmisc.cpp:1069)
+        mnsync: masternode_synced,
         recently_attempted: status.recently_attempted,
         blocks: status.blocks,
         stake_split_threshold: split_threshold_divi,
     }
 }
 
-/// Divi Core `IsBlockchainSynced`, which its masternode sync waits for: not in
-/// initial block download and the tip is at most ten minutes old. IronDivi has no
-/// masternode list sync of its own, so getstakingstatus `mnsync` reports this.
-fn blockchain_synced(chain: &divi_storage::Chain) -> bool {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    !chain.is_ibd()
-        && chain
-            .tip()
-            .is_some_and(|t| now.saturating_sub(t.time as u64) <= 600)
+/// An inv for a masternode item the list left to relay
+fn masternode_inv((kind, hash): (u32, [u8; 32])) -> divi_network::NetworkMessage {
+    let inv_type = match kind {
+        divi_rpc::mn_list::INV_WINNER => divi_network::InvType::MasternodeWinner,
+        divi_rpc::mn_list::INV_BROADCAST => divi_network::InvType::MasternodeAnnounce,
+        _ => divi_network::InvType::MasternodePing,
+    };
+    divi_network::NetworkMessage::Inv(vec![divi_network::InvItem::new(
+        inv_type,
+        divi_primitives::hash::Hash256(hash),
+    )])
 }
 
 /// Whether `block` is on the active chain (the sync layer also hands over
@@ -2717,6 +3217,20 @@ fn main() -> Result<()> {
         std::process::exit(1);
     }
 
+    // divid creates its files 0600 and its directories 0700 (umask 077), or
+    // with the system's umask under -sysperms, which it refuses with the
+    // wallet on (init.cpp:1378-1385)
+    #[cfg(unix)]
+    if !args.sysperms {
+        // SAFETY: umask(2) only sets this process's file-creation mask
+        unsafe { libc::umask(0o077) };
+    } else if !args.disablewallet {
+        eprintln!(
+            "Error: Error: -sysperms is not allowed in combination with enabled wallet functionality"
+        );
+        std::process::exit(1);
+    }
+
     // Compute data directory early (needed for daemonization and logging)
     let data_dir = compute_data_dir(&args);
     if let Err(e) =
@@ -2837,6 +3351,9 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
         max_file_size: args.maxlogsize.unwrap_or(1) as u64 * 1_048_576, // Convert MB to bytes
         max_files: args.maxlogfiles.unwrap_or(5),
         debug: args.debug,
+        log_ips: args.logips,
+        timestamps: args.logtimestamps,
+        shrink: args.shrinkdebugfile,
         // An export only reads the data directory: it logs to the console
         print_to_console: args.printtoconsole || args.export_chain,
     };
@@ -2855,6 +3372,7 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
     // Check for conflicting network options
     if args.testnet && args.regtest {
         error!("Cannot use both --testnet and --regtest");
+        flush_log();
         std::process::exit(1);
     }
 
@@ -2876,6 +3394,18 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
     let _ = std::fs::write(&pid_file, format!("{}", std::process::id()));
 
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
+
+    // Divi Core AbortNode (ValidationState.cpp:17-27): a write the node cannot
+    // make tells the user to look at debug.log and starts the shutdown
+    let abort_tx = shutdown_tx.clone();
+    divi_storage::abort::set_handler(Box::new(move |_| {
+        use std::io::Write as _;
+        let _ = writeln!(
+            std::io::stderr(),
+            "Error: Error: A fatal internal error occured, see debug.log for details"
+        );
+        let _ = abort_tx.send(());
+    }));
 
     // SIGHUP reopens debug.log and the node keeps running, as Divi Core does
     // (init.cpp:513-516), so a logrotate postrotate line does not stop it
@@ -2925,6 +3455,8 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
 
     let wallet_seed = WalletSeed::from_settings(&args.settings);
     let wallet_options = WalletOptions::from_settings(&args.settings);
+    let mn_options =
+        masternode_options::MasternodeOptions::from_settings(&args.settings, &config.data_dir);
 
     // Run the daemon
     if let Err(e) = run_daemon(
@@ -2933,14 +3465,21 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
         wallet_seed,
         args.disablewallet,
         wallet_options,
+        mn_options,
         shutdown_tx,
         shutdown_rx,
     )
     .await
     {
+        // A start stopped without an InitError (-dbloadfailexit) prints nothing
+        // more (init.cpp:1307-1309)
+        if e.downcast_ref::<QuietExit>().is_some() {
+            remove_pid_file(&pid_file);
+            flush_log();
+            std::process::exit(1);
+        }
         error!("Daemon error: {:#}", e);
-        // Also on stderr, as Divi Core's InitError (noui.cpp:38-40): the log
-        // writer may not get to write the line before the process exits
+        // Also on stderr, as Divi Core's InitError (noui.cpp:38-40)
         {
             use std::io::Write as _;
             let _ = writeln!(std::io::stderr(), "Error: {:#}", e);
@@ -2952,6 +3491,7 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
             source = err.source();
         }
         remove_pid_file(&pid_file);
+        flush_log();
         std::process::exit(1);
     }
 
@@ -3032,6 +3572,9 @@ mod connect_tests {
     fn checkblocks_default_cli_and_config_file() {
         assert_eq!(cfg(&[]).check_blocks, 100);
         assert_eq!(cfg(&["--checkblocks=0"]).check_blocks, 0);
+        // Below 0, as divid's VerifyDB reads it: every block (verifyDb.cpp:73-74)
+        assert_eq!(cfg(&["--checkblocks=-1"]).check_blocks, 0);
+        assert_eq!(cfg(&["--checkblocks=abc"]).check_blocks, 0);
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("irondivi.conf"), "checkblocks = 500\n").unwrap();
         let args = Args::parse_from([
@@ -3628,7 +4171,7 @@ mod log_rotation_tests {
     /// Write `lines` records of 50 bytes, checking the files after each
     fn write_and_check(max_size: u64, max_files: u32, lines: usize) -> Vec<(String, u64)> {
         let dir = tempfile::tempdir().unwrap();
-        let mut log = RotatingLog::open(dir.path(), max_size, max_files, false).unwrap();
+        let mut log = RotatingLog::open(dir.path(), max_size, max_files, false, false).unwrap();
         for i in 0..lines {
             let line = format!("{:049}\n", i);
             log.write_all(line.as_bytes()).unwrap();
@@ -3681,7 +4224,7 @@ mod log_rotation_tests {
     fn log_rotation_rotates_oversized_log_at_startup() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("debug.log"), vec![b'x'; 2000]).unwrap();
-        let mut log = RotatingLog::open(dir.path(), 1000, 3, false).unwrap();
+        let mut log = RotatingLog::open(dir.path(), 1000, 3, false, false).unwrap();
         log.write_all(b"new\n").unwrap();
         assert_eq!(
             log_files(dir.path()),
@@ -4011,6 +4554,119 @@ mod divid_option_tests {
         );
     }
 
+    /// -seednode is applied (Divi Core AddOneShot, net.cpp:1842-1843), every
+    /// value, the command line's first, and not dialled as a lasting peer
+    #[test]
+    fn seednode_values_are_applied() {
+        let c = cfg_in(
+            "divi.conf",
+            "rpcuser=u\nseednode=127.0.0.2:11\nseednode=127.0.0.3\n",
+            &["-seednode=127.0.0.2:10"],
+        )
+        .unwrap();
+        assert_eq!(
+            c.p2p.seednode,
+            ["127.0.0.2:10", "127.0.0.2:11", "127.0.0.3"]
+        );
+        assert!(!c
+            .peer_sources()
+            .static_peers
+            .contains(&"127.0.0.2:10".to_string()));
+        assert!(!UNSUPPORTED_OPTIONS.contains(&"seednode"));
+    }
+
+    /// -dbcache is applied as divid splits it (init.cpp:1030, :1046-1056):
+    /// read with atoi, clamped, the coins in memory unless -utxocachesize
+    #[test]
+    fn dbcache_sets_the_caches() {
+        const MIB: usize = 1 << 20;
+        let c = cfg_in("divi.conf", "rpcuser=u\ndbcache=100\n", &[]).unwrap();
+        let d = divi_node::config::db_cache_sizes(100, c.index.txindex);
+        assert_eq!(c.block_cache_size, Some(d.block_tree + d.coin_db));
+        assert_eq!(c.utxo_cache_size, d.coin_cache_entries);
+        let word = cfg_in("divi.conf", "rpcuser=u\n", &["-dbcache=abc"]).unwrap();
+        assert_eq!(word.block_cache_size.map(|b| b < 4 * MIB), Some(true));
+        let big = cfg_in("divi.conf", "rpcuser=u\n", &["-dbcache=99999999"]).unwrap();
+        // Clamped to 4096 MiB: 512 to the block tree, 1792 to the coin database
+        assert_eq!(big.block_cache_size, Some(2304 * MIB));
+        let both = cfg_in(
+            "divi.conf",
+            "rpcuser=u\n",
+            &["-dbcache=100", "-utxocachesize=7"],
+        )
+        .unwrap();
+        assert_eq!(both.utxo_cache_size, 7);
+        // Not given: irondivid's own sizes
+        let none = cfg_in("divi.conf", "rpcuser=u\n", &[]).unwrap();
+        assert_eq!(none.block_cache_size, None);
+        assert_eq!(none.utxo_cache_size, 10_000_000);
+        assert!(!UNSUPPORTED_OPTIONS.contains(&"dbcache"));
+    }
+
+    /// -dnsseed and -forcednsseed, and -connect turning -dnsseed off unless it
+    /// is given (net.cpp:1015-1030, :1683-1685)
+    #[test]
+    fn dnsseed_and_forcednsseed_are_applied() {
+        let c = cfg_in("divi.conf", "rpcuser=u\n", &["-forcednsseed=1"]).unwrap();
+        assert!(c.p2p.force_dns_seed);
+        assert_eq!(c.p2p.dns_seed, None);
+        let c = cfg_in("divi.conf", "rpcuser=u\nforcednsseed=0\ndnsseed=0\n", &[]).unwrap();
+        assert!(!c.p2p.force_dns_seed);
+        assert_eq!(c.p2p.dns_seed, Some(false));
+        let c = cfg_in("divi.conf", "rpcuser=u\n", &["-connect=127.0.0.2:1"]).unwrap();
+        assert_eq!(c.p2p.dns_seed, Some(false), "-connect sets -dnsseed=0");
+        let c = cfg_in(
+            "divi.conf",
+            "rpcuser=u\n",
+            &["-connect=127.0.0.2:1", "-dnsseed=1"],
+        )
+        .unwrap();
+        assert_eq!(c.p2p.dns_seed, Some(true));
+        assert!(!UNSUPPORTED_OPTIONS.contains(&"forcednsseed"));
+    }
+
+    /// -mining, -genproclimit and -disablesystemnotifications: divid lists them
+    /// in its help only (LicenseAndInfo.cpp:142, :186-187), so they are taken
+    /// without a warning
+    #[test]
+    fn help_only_options_are_taken_without_a_warning() {
+        let s = Settings::default();
+        for o in ["mining", "genproclimit", "disablesystemnotifications"] {
+            assert!(!UNSUPPORTED_OPTIONS.contains(&o), "{o}");
+            assert_eq!(option_warning(&s, o), None, "{o}");
+        }
+        assert!(cfg_in(
+            "divi.conf",
+            "rpcuser=u\nmining=1\ngenproclimit=-1\ndisablesystemnotifications=1\n",
+            &["-genproclimit=4"],
+        )
+        .is_ok());
+    }
+
+    /// Each option is in one list only: read by apply_settings, read
+    /// elsewhere, one divid does not use, or one irondivid does not support
+    #[test]
+    fn every_option_is_in_one_list() {
+        let lists: [(&str, &[&str]); 4] = [
+            ("APPLIED", APPLIED),
+            ("READ_ELSEWHERE", READ_ELSEWHERE),
+            ("UNUSED_BY_DIVID", UNUSED_BY_DIVID),
+            ("UNSUPPORTED_OPTIONS", UNSUPPORTED_OPTIONS),
+        ];
+        let mut seen = std::collections::HashMap::new();
+        for (name, list) in lists {
+            for key in list {
+                if let Some(first) = seen.insert(*key, name) {
+                    panic!("-{key} is in {first} and in {name}");
+                }
+            }
+        }
+        for key in ["forcestart", "rpcthreads", "alerts", "alertnotify"] {
+            assert_eq!(seen.get(key), Some(&"APPLIED"), "-{key}");
+        }
+        assert_eq!(seen.get("sysperms"), Some(&"READ_ELSEWHERE"));
+    }
+
     /// -conf is relative to the data directory (Settings::GetConfigFile)
     #[test]
     fn conf_is_relative_to_the_data_directory() {
@@ -4058,6 +4714,11 @@ mod divid_option_tests {
         assert_eq!((c.p2p.max_inbound, c.p2p.max_outbound), (109, 16));
         assert!(!cfg("rpcuser=x\nserver=0\n").rpc.enabled);
         assert_eq!(cfg("rpcuser=x\nmaxorphantx=7\n").mempool.max_orphan_txs, 7);
+        // Below 0, a text or nothing keeps no orphan (main.cpp:790)
+        for none in ["-5", "abc", ""] {
+            let conf = format!("rpcuser=x\nmaxorphantx={none}\n");
+            assert_eq!(cfg(&conf).mempool.max_orphan_txs, 0, "-maxorphantx={none}");
+        }
         assert_eq!(
             cfg("rpcuser=x\nminrelaytxfee=0.0002\n")
                 .mempool
@@ -4174,18 +4835,56 @@ mod divid_option_tests {
         assert!(cfg("rpcuser=x\n").staking.enabled);
     }
 
-    /// divid reads any masternode=<alias> as running as that masternode and
-    /// refuses to start when it cannot; irondivid cannot run as one at all.
-    /// masternodeprivkey and masternodeaddr alone do nothing in either.
+    /// -litemode and -budgetvotemode appear only in divid's help
+    /// (LicenseAndInfo.cpp:209, :226): no code of divid reads them and it says
+    /// nothing about them, so irondivid does not call them unsupported; an
+    /// option of divid that irondivid has nothing for still gets the warning
     #[test]
-    fn a_masternode_line_is_refused() {
+    fn help_only_options_draw_no_warning() {
+        let s = Settings::default();
+        assert_eq!(option_warning(&s, "checkpoints"), None);
+        assert_eq!(option_warning(&s, "printpriority"), None);
+        assert_eq!(option_warning(&s, "litemode"), None);
+        assert_eq!(option_warning(&s, "budgetvotemode"), None);
+        assert_eq!(option_warning(&s, "masternode"), None);
+        // applied as divid applies it
+        assert_eq!(option_warning(&s, "dbcache"), None);
+        assert!(option_warning(&s, "par").unwrap().contains("not supported"));
+        assert!(option_warning(&s, "nosuchoption")
+            .unwrap()
+            .starts_with("Unknown option"));
+    }
+
+    /// divid's own check and test-aid options are taken without a warning
+    /// (BlockCheckingHelpers.cpp:162, init.cpp:795, :1281, script/sigcache.cpp:51,
+    /// main.cpp:473, Node.cpp:479-485)
+    #[test]
+    fn divids_check_and_test_options_draw_no_warning() {
+        let s = Settings::default();
+        for k in [
+            "checkblockindex",
+            "checkmempool",
+            "flushwallet",
+            "maxsigcachesize",
+            "dropmessagestest",
+            "fuzzmessagestest",
+        ] {
+            assert_eq!(option_warning(&s, k), None, "{k}");
+        }
+    }
+
+    /// The masternode options are read when the node starts, after
+    /// masternode.conf, in divid's order (masternode_options); building the
+    /// configuration takes them without a word
+    #[test]
+    fn masternode_lines_are_checked_at_the_start() {
         for value in ["1", "0", "mn1"] {
             let conf = format!("rpcuser=x\nmasternode={}\n", value);
-            assert!(cfg_in("irondivi.conf", &conf, &[]).is_err(), "{value}");
+            assert!(cfg_in("irondivi.conf", &conf, &[]).is_ok(), "{value}");
         }
         let c = cfg_in(
             "irondivi.conf",
-            "rpcuser=x\nmasternodeprivkey=abc\nmasternodeaddr=1.2.3.4:51472\n",
+            "rpcuser=x\nmasternodeprivkey=abc\nmasternodeaddr=1.2.3.4:51472\nmnconf=x.conf\nmnconflock=0\n",
             &[],
         );
         assert!(c.is_ok());

@@ -55,6 +55,9 @@ pub struct RpcConfig {
     pub keep_alive: bool,
     /// Serve the REST interface (Divi Core's -rest, default off)
     pub rest: bool,
+    /// Connections served at once (Divi Core's -rpcthreads, default 4); none
+    /// at 0 or below
+    pub threads: i64,
 }
 
 impl Default for RpcConfig {
@@ -66,6 +69,7 @@ impl Default for RpcConfig {
             allowed: Vec::new(),
             keep_alive: true,
             rest: false,
+            threads: 4,
         }
     }
 }
@@ -95,12 +99,84 @@ async fn serve(config: &RpcConfig, app: Router) -> Result<(), Error> {
         }
     }));
     let listener = tokio::net::TcpListener::bind(config.bind_address).await?;
+    let slots = config
+        .threads
+        .clamp(0, tokio::sync::Semaphore::MAX_PERMITS as i64) as usize;
     axum::serve(
         listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
+        ConnectionSlots {
+            inner: app.into_make_service_with_connect_info::<SocketAddr>(),
+            slots: Arc::new(tokio::sync::Semaphore::new(slots)),
+        },
     )
     .await?;
     Ok(())
+}
+
+/// Divi Core serves each RPC connection to its end on one of its -rpcthreads
+/// threads, idle keep-alive waits included (rpcserver.cpp:755-757, :1000-1010):
+/// a connection past them waits, accepted but unread, until one closes. Each
+/// connection here takes a slot before it is served and gives it back when it
+/// closes; the accept loop waits for the slot, as Divi Core's threads do.
+#[derive(Clone)]
+struct ConnectionSlots {
+    inner: axum::extract::connect_info::IntoMakeServiceWithConnectInfo<Router, SocketAddr>,
+    slots: Arc<tokio::sync::Semaphore>,
+}
+
+type SlotFuture<T> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<T, std::convert::Infallible>> + Send>,
+>;
+
+impl<'a> tower::Service<axum::serve::IncomingStream<'a>> for ConnectionSlots {
+    type Response =
+        Slotted<axum::middleware::AddExtension<Router, axum::extract::ConnectInfo<SocketAddr>>>;
+    type Error = std::convert::Infallible;
+    type Future = SlotFuture<Self::Response>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        tower::Service::<axum::serve::IncomingStream<'a>>::poll_ready(&mut self.inner, cx)
+    }
+
+    fn call(&mut self, stream: axum::serve::IncomingStream<'a>) -> Self::Future {
+        let made = self.inner.call(stream);
+        let slots = self.slots.clone();
+        Box::pin(async move {
+            // The semaphore is never closed
+            let slot = slots.acquire_owned().await.ok();
+            Ok(Slotted {
+                service: made.await?,
+                _slot: Arc::new(slot),
+            })
+        })
+    }
+}
+
+/// A connection's service, holding its slot until the connection closes
+#[derive(Clone)]
+struct Slotted<S> {
+    service: S,
+    _slot: Arc<Option<tokio::sync::OwnedSemaphorePermit>>,
+}
+
+impl<S: tower::Service<R>, R> tower::Service<R> for Slotted<S> {
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = S::Future;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.service.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: R) -> Self::Future {
+        self.service.call(request)
+    }
 }
 
 /// Log configuration for RPC queries
@@ -258,6 +334,16 @@ impl RpcServer {
         self.masternode.set_network_list(list);
     }
 
+    /// The node's masternode sync, read and reset by mnsync
+    pub fn set_masternode_sync(&self, sync: divi_masternode::mnsync::SharedMasternodeSync) {
+        self.masternode.set_sync(sync);
+    }
+
+    /// The masternodes' payment votes, read by getmasternodewinners
+    pub fn set_masternode_votes(&self, votes: Arc<crate::mn_votes::MasternodeVotes>) {
+        self.masternode.set_votes(votes);
+    }
+
     pub fn set_masternode_manager(&self, manager: divi_masternode::MasternodeManager) {
         self.masternode.set_manager(manager);
     }
@@ -265,6 +351,11 @@ impl RpcServer {
     /// Set the datadir used by the masternode RPCs (`masternode.conf`, stored broadcasts)
     pub fn set_masternode_datadir(&self, dir: std::path::PathBuf) {
         self.masternode.set_datadir(dir);
+    }
+
+    /// The masternode.conf -mnconf names, read by startmasternode
+    pub fn set_masternode_conf(&self, path: std::path::PathBuf) {
+        self.masternode.set_conf_path(path);
     }
 
     /// Set the hook that relays raw masternode broadcasts to peers
@@ -368,37 +459,33 @@ impl RpcServer {
         }
         .to_string();
 
+        // Divi Core's members in its order (rpcmisc.cpp:138-157): the wallet's
+        // only with a wallet
         let mut info = serde_json::json!({
             "version": "3.0.0.0",
             "protocolversion": divi_network::constants::protocol_version(),
-            "blocks": height,
-            "timeoffset": 0,
-            "connections": connections,
-            "proxy": "",
-            "difficulty": difficulty,
-            "testnet": matches!(network_type, NetworkType::Testnet),
-            "moneysupply": self.blockchain.money_supply(),
-            "relayfee": self.blockchain.relay_fee(),
-            "staking status": staking_status_text,
-            "errors": ""
         });
-        // Divi Core has the wallet members only with a wallet
-        // (rpcmisc.cpp:139-144)
-        if let (Some(wallet), Some(map)) = (wallet_info, info.as_object_mut()) {
-            map.insert("walletversion".into(), serde_json::json!(120200));
-            map.insert(
-                "balance".into(),
-                serde_json::json!(wallet["balance"].as_f64().unwrap_or(0.0)),
-            );
-            map.insert(
-                "keypoololdest".into(),
-                serde_json::json!(wallet["keypoololdest"].as_u64().unwrap_or(0)),
-            );
-            map.insert(
-                "keypoolsize".into(),
-                serde_json::json!(wallet["keypoolsize"].as_u64().unwrap_or(0)),
-            );
-            map.insert("paytxfee".into(), serde_json::json!(0.0));
+        if let Some(wallet) = &wallet_info {
+            info["walletversion"] = serde_json::json!(120200);
+            info["balance"] = serde_json::json!(wallet["balance"].as_f64().unwrap_or(0.0));
+        }
+        info["blocks"] = serde_json::json!(height);
+        // GetTimeOffset (rpcmisc.cpp:147)
+        info["timeoffset"] = serde_json::json!(divi_primitives::clock::time_offset());
+        info["connections"] = serde_json::json!(connections);
+        info["proxy"] = serde_json::json!("");
+        info["difficulty"] = serde_json::json!(difficulty);
+        info["testnet"] = serde_json::json!(matches!(network_type, NetworkType::Testnet));
+        info["moneysupply"] = serde_json::json!(self.blockchain.money_supply());
+        info["relayfee"] = serde_json::json!(self.blockchain.relay_fee());
+        info["staking status"] = serde_json::json!(staking_status_text);
+        info["errors"] = serde_json::json!(crate::warnings::status_bar());
+        // irondivid's own members, after divid's
+        if let Some(wallet) = &wallet_info {
+            info["keypoololdest"] =
+                serde_json::json!(wallet["keypoololdest"].as_u64().unwrap_or(0));
+            info["keypoolsize"] = serde_json::json!(wallet["keypoolsize"].as_u64().unwrap_or(0));
+            info["paytxfee"] = serde_json::json!(0.0);
         }
         Ok(info)
     }
@@ -481,6 +568,13 @@ impl RpcServer {
             let help = self.help(&Params::Array(vec![serde_json::json!(method)]))?;
             return Err(RpcError::new(codes::MISC_ERROR, help.as_str().unwrap_or_default()).into());
         }
+        // signmessage and setupmasternode check that the wallet is unlocked
+        // before they read an argument (rpcwallet.cpp:1385, rpcmasternode.cpp:204)
+        if matches!(method, "signmessage" | "setupmasternode") {
+            if let Some(wallet) = self.wallet.wallet_db() {
+                crate::wallet::ensure_fully_unlocked(&wallet)?;
+            }
+        }
         rpc_type_check(method, params)?;
         // The wallet passphrase calls check the encryption state before they
         // read an argument (rpcwallet.cpp:2596, :2642, :2715)
@@ -493,6 +587,8 @@ impl RpcServer {
         if !state_first {
             json_spirit_getter_check(method, params)?;
         }
+        let cut = cut_int_arguments(method, params);
+        let params = cut.as_ref().unwrap_or(params);
         match method {
             // Blockchain methods
             "getblockcount" => self.blockchain.get_block_count(params),
@@ -619,7 +715,6 @@ impl RpcServer {
             "getstakingstatus" => self.staking.get_staking_status(params),
             "getmintinginfo" => self.staking.get_minting_info(params),
             "setstaking" => self.staking.set_staking(params),
-            "reservebalance" => self.staking.reserve_balance(params),
             "getstakesplitthreshold" => self.staking.get_stake_split_threshold(params),
             "setstakesplitthreshold" => self.staking.set_stake_split_threshold(params),
 
@@ -640,7 +735,7 @@ impl RpcServer {
             "getmasternodestatus" => self.masternode.get_masternode_status(params),
             "getmasternodewinners" => self
                 .masternode
-                .get_masternode_winners(params, self.blockchain.tip_height()),
+                .get_masternode_winners(params, self.blockchain.chain()),
             "listmasternodes" => self
                 .masternode
                 .list_masternodes(params, self.blockchain.chain()),
@@ -682,7 +777,7 @@ impl RpcServer {
                 };
                 self.masternode.verify_masternode_setup(params, port)
             }
-            "mnsync" => self.masternode.mnsync(params),
+            "mnsync" => self.masternode.mnsync(params, self.blockchain.chain()),
 
             // Spork methods
             "spork" => self.spork.spork(params),
@@ -824,7 +919,6 @@ impl RpcServer {
                 "getstakingstatus" => "getstakingstatus\n\nReturns an object containing staking information.",
                 "getmintinginfo" => "getmintinginfo\n\nReturns detailed staking/minting information.",
                 "setstaking" => "setstaking true|false\n\nEnable or disable staking.",
-                "reservebalance" => "reservebalance ( true|false amount )\n\nShow or set reserve balance for staking.",
                 "getstakesplitthreshold" => "getstakesplitthreshold\n\nReturns the stake split threshold in DIVI (startup value: -stakesplitthreshold, default 20000).",
                 "setstakesplitthreshold" => "setstakesplitthreshold value\n\nSet the stake split threshold in whole DIVI for this run: a stake whose value plus reward exceeds it is paid back as two outputs; smaller coins of the same address are combined up to half of it.",
                 // Lite wallet (external address queries)
@@ -998,7 +1092,6 @@ impl RpcServer {
                 "== Staking ==",
                 "getmintinginfo",
                 "getstakingstatus",
-                "reservebalance",
                 "getstakesplitthreshold",
                 "setstakesplitthreshold",
                 "setstaking",
@@ -1186,6 +1279,7 @@ fn core_argument_types(method: &str) -> &'static [(usize, &'static str)] {
         // rpcwallet.cpp:650
         "getaddressesbyaccount" => &[(0, "str")],
         // rpcwallet.cpp:1554
+        // (for "*" it answers before it reads minconf: json_spirit_getter_check)
         "getbalance" => &[(0, "str"), (1, "int"), (2, "bool")],
         // rpcblockchain.cpp:176
         // verbose: IronDivi also takes 0, 1 and 2 (verbosity 2 decodes the
@@ -1273,7 +1367,8 @@ fn core_argument_types(method: &str) -> &'static [(usize, &'static str)] {
         // rpcrawtransaction.cpp:602
         "signrawtransaction" => &[(1, "array"), (2, "array"), (3, "str")],
         // rpcrawtransaction.cpp:566
-        "signtransactionwithaddresskey" => &[(1, "str"), (2, "int")],
+        // (the input index is read before the address, :572 then :586)
+        "signtransactionwithaddresskey" => &[(2, "int"), (1, "str")],
         // rpcmisc.cpp:277
         "spork" => &[(0, "str"), (1, "str")],
         // rpcmasternode.cpp:393
@@ -1285,24 +1380,101 @@ fn core_argument_types(method: &str) -> &'static [(usize, &'static str)] {
         // rpcmisc.cpp:485
         "verifymessage" => &[(0, "str"), (1, "str"), (2, "str")],
         // rpcwallet.cpp:2573
-        "walletpassphrase" => &[(0, "str"), (1, "int"), (2, "bool")],
+        // (the timeout is read after the unlock, by the call: rpcwallet.cpp:2622)
+        "walletpassphrase" => &[(0, "str"), (2, "bool")],
         // rpcwallet.cpp:2628
         "walletpassphrasechange" => &[(0, "str"), (1, "str")],
         _ => &[],
     }
 }
 
-/// The calls whose arguments of `core_argument_types` Divi Core reads with no
-/// test for null first, so a null makes the getter throw too
-/// (rpcwallet.cpp:550, :1752, :1798-1808)
-fn getter_reads_null(method: &str) -> bool {
+/// The arguments of `core_argument_types` Divi Core reads with no test for
+/// null first, so a null makes the getter throw too: every one of the calls
+/// listed first (rpcwallet.cpp:550, :1576-1584, :1752, :1798-1808,
+/// :2272-2283, :2342-2348, :2410-2427, :2593-2600; rpcrawtransaction.cpp:206-207,
+/// :571-572; rpcblockchain.cpp:418-420), and the account names, addresses,
+/// messages and paths of the others, which take them with get_str or
+/// AccountFromValue while their comments are read only when not null
+/// (rpcwallet.cpp:299, :598-605, :637, :667, :1388-1391, :1422, :1631-1632,
+/// :1718-1719, :2536; rpcmisc.cpp:504-506; rpcdump.cpp:132-140)
+fn getter_reads_null(method: &str, index: usize) -> bool {
     matches!(
         method,
         "addmultisigaddress"
             | "getaccountaddress"
+            | "getbalance"
+            | "getrawtransaction"
+            | "listaccounts"
             | "listreceivedbyaccount"
             | "listreceivedbyaddress"
+            | "listsinceblock"
+            | "listtransactions"
+            | "signtransactionwithaddresskey"
+            | "verifychain"
+            | "walletpassphrase"
+    ) || matches!(
+        (method, index),
+        ("getnewaddress", 0)
+            | ("setaccount", 0 | 1)
+            | ("getaccount", 0)
+            | ("getaddressesbyaccount", 0)
+            | ("sendfrom", 0 | 1)
+            | ("sendmany", 0 | 1)
+            | ("signmessage", 0..=3)
+            | ("verifymessage", 0..=2)
+            | ("backupwallet", 0)
+            | ("importaddress", 0..=2)
     )
+}
+
+/// The positional arguments Divi Core reads with json_spirit's get_int(), which
+/// cuts an integer to a C++ int (json_spirit_value.h:385-390). Those read with
+/// get_int64() (prioritisetransaction, setmocktime, walletpassphrase) are not cut.
+fn core_int_arguments(method: &str) -> &'static [usize] {
+    match method {
+        // Chain calls (rpcblockchain.cpp:168, :369, :418-420; rpclottery.cpp:50;
+        // rpcrawtransaction.cpp:207); verifychain's one argument too
+        "getblockhash" | "getlotteryblockwinners" => &[0],
+        "gettxout" | "getrawtransaction" => &[1],
+        "verifychain" => &[0, 1],
+        // Raw transaction calls (rpcrawtransaction.cpp:572; rpcmisc.cpp:390,
+        // _createmultisig_redeemScript)
+        "signtransactionwithaddresskey" => &[2],
+        "createmultisig" | "addmultisigaddress" => &[0],
+        // Wallet calls (rpcrawtransaction.cpp:290-294; rpcwallet.cpp:1461, :1520,
+        // :1582, :1798, :2276-2279, :2343, :2420, :2559-2561)
+        "listunspent" => &[0, 1],
+        "getreceivedbyaddress" | "getreceivedbyaccount" | "getbalance" => &[1],
+        "listreceivedbyaddress" | "listreceivedbyaccount" | "listaccounts" | "keypoolrefill" => {
+            &[0]
+        }
+        "listtransactions" => &[1, 2],
+        "listsinceblock" => &[1],
+        // Mining (rpcmining.cpp:79)
+        "setgenerate" => &[0],
+        _ => &[],
+    }
+}
+
+/// The arguments as Divi Core's handler reads them: each integer of
+/// `core_int_arguments` cut to a C++ int. None when nothing changes.
+fn cut_int_arguments(method: &str, params: &Params) -> Option<Params> {
+    let Params::Array(values) = params else {
+        return None;
+    };
+    let mut cut = values.clone();
+    let mut changed = false;
+    for &index in core_int_arguments(method) {
+        if let Some(v) = cut.get_mut(index) {
+            if let Some(n) = crate::protocol::json_spirit_int(v) {
+                if v.as_i64() != Some(n) {
+                    *v = serde_json::json!(n);
+                    changed = true;
+                }
+            }
+        }
+    }
+    changed.then_some(Params::Array(cut))
 }
 
 /// Refuse an argument of the wrong JSON type as json_spirit's getter does. A
@@ -1312,12 +1484,20 @@ fn json_spirit_getter_check(method: &str, params: &Params) -> Result<(), RpcErro
     let Params::Array(values) = params else {
         return Ok(());
     };
+    // getbalance "*" answers before it reads another argument (rpcwallet.cpp:1576-1577)
+    let read = match (method, values.first()) {
+        ("getbalance", Some(serde_json::Value::String(account))) if account == "*" => 1,
+        _ => usize::MAX,
+    };
     for (index, want) in core_argument_types(method) {
+        if *index >= read {
+            continue;
+        }
         let Some(value) = values.get(*index) else {
             continue;
         };
         let got = crate::wallet::json_spirit_type(value);
-        if (value.is_null() && !getter_reads_null(method)) || got == *want {
+        if (value.is_null() && !getter_reads_null(method, *index)) || got == *want {
             continue;
         }
         return Err(RpcError::new(
@@ -1750,6 +1930,50 @@ mod tests {
     use crate::protocol::RequestId;
     use divi_storage::{ChainDatabase, ChainParams};
     use tempfile::tempdir;
+
+    /// A JSON null where Divi Core reads an account name, an address or a
+    /// message with get_str is refused as its getter refuses it; a null
+    /// comment, read only when not null, is not
+    #[test]
+    fn null_text_is_refused_where_divid_reads_it() {
+        let p = |v: serde_json::Value| Params::Array(v.as_array().unwrap().clone());
+        let addr = "yCCufdT3MD8pu8RZopRAxerr65YRHiUbH2";
+        let refused = |method: &str, params: serde_json::Value, want: &str| {
+            let err = json_spirit_getter_check(method, &p(params.clone()))
+                .expect_err(&format!("{method} {params}"));
+            assert_eq!(err.code, codes::MISC_ERROR, "{method} {params}");
+            assert_eq!(err.message, format!("value is type null, expected {want}"));
+        };
+        refused("getnewaddress", serde_json::json!([null]), "str");
+        refused("setaccount", serde_json::json!([addr, null]), "str");
+        refused("getaccount", serde_json::json!([null]), "str");
+        refused("getaddressesbyaccount", serde_json::json!([null]), "str");
+        refused("sendfrom", serde_json::json!([null, addr, 1]), "str");
+        refused("sendmany", serde_json::json!([null, {addr: 1}]), "str");
+        refused("sendmany", serde_json::json!(["", null]), "obj");
+        refused("signmessage", serde_json::json!([addr, null]), "str");
+        refused(
+            "verifymessage",
+            serde_json::json!([addr, "sig", null]),
+            "str",
+        );
+        refused("backupwallet", serde_json::json!([null]), "str");
+        // Comments are read only when they are not null (rpcwallet.cpp:1336,
+        // :1639-1642, :1722)
+        for (method, params) in [
+            (
+                "sendtoaddress",
+                serde_json::json!([addr, 1, null, null, null]),
+            ),
+            ("sendfrom", serde_json::json!(["", addr, 1, null, null])),
+            ("sendmany", serde_json::json!(["", {addr: 1}, null])),
+        ] {
+            assert!(
+                json_spirit_getter_check(method, &p(params.clone())).is_ok(),
+                "{method} {params}"
+            );
+        }
+    }
 
     /// -rpcallowip values as Divi Core's CSubNet reads them
     #[test]

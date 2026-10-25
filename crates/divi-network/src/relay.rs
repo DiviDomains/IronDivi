@@ -63,6 +63,10 @@ struct TxRequest {
     requested_at: Instant,
 }
 
+/// How long a relayed transaction is kept to answer getdata (Divi Core's
+/// 15 minutes, net.cpp:1588)
+const RELAYED_KEEP_SECS: i64 = 15 * 60;
+
 /// Transaction relay manager
 pub struct TxRelay {
     /// Peer manager for sending messages
@@ -88,7 +92,19 @@ pub struct TxRelay {
 
     /// Event channel for received transactions
     event_tx: broadcast::Sender<TxRelayEvent>,
+
+    /// Transactions announced to peers, kept until the Unix time given so a
+    /// getdata is answered from here, in a block by then or not (Divi Core
+    /// mapRelay, net.cpp:1565-1590)
+    relayed: RwLock<HashMap<Hash256, (Transaction, i64)>>,
+
+    /// Whether a transaction is in the node's mempool and whether it is a
+    /// held orphan; without it, the transactions seen here count as had
+    have: RwLock<Option<HaveTx>>,
 }
+
+/// The node's view of a transaction: (in the mempool, a held orphan)
+pub type HaveTx = Arc<dyn Fn(&Hash256) -> (bool, bool) + Send + Sync>;
 
 impl TxRelay {
     /// Create a new transaction relay manager
@@ -104,6 +120,8 @@ impl TxRelay {
             request_queue: RwLock::new(VecDeque::new()),
             recently_announced: RwLock::new(HashMap::new()),
             event_tx,
+            relayed: RwLock::new(HashMap::new()),
+            have: RwLock::new(None),
         })
     }
 
@@ -115,6 +133,30 @@ impl TxRelay {
     /// Check if we've seen a transaction
     pub fn has_seen(&self, txid: &Hash256) -> bool {
         self.seen_txs.read().contains(txid)
+    }
+
+    /// Divi Core's AlreadyHave for a transaction (main.cpp:140-144): in the
+    /// mempool or a held orphan. A transaction refused before, or one in a
+    /// block, is asked for again.
+    pub fn set_have_check(&self, have: HaveTx) {
+        *self.have.write() = Some(have);
+    }
+
+    fn already_have(&self, txid: &Hash256) -> bool {
+        match &*self.have.read() {
+            Some(have) => {
+                let (in_mempool, orphan) = have(txid);
+                in_mempool || orphan
+            }
+            None => self.seen_txs.read().contains(txid),
+        }
+    }
+
+    fn in_mempool(&self, txid: &Hash256) -> bool {
+        match &*self.have.read() {
+            Some(have) => have(txid).0,
+            None => self.seen_txs.read().contains(txid),
+        }
     }
 
     /// Mark a transaction as seen (e.g., from mempool or block)
@@ -165,7 +207,6 @@ impl TxRelay {
         let mut new_txs = Vec::new();
 
         {
-            let seen = self.seen_txs.read();
             let in_flight = self.txs_in_flight.read();
 
             // Track peer inventory
@@ -188,7 +229,7 @@ impl TxRelay {
                 tx_sources.entry(txid).or_default().insert(peer_id);
 
                 // Check if we need to request it
-                if !seen.contains(&txid) && !in_flight.contains_key(&txid) {
+                if !self.already_have(&txid) && !in_flight.contains_key(&txid) {
                     new_txs.push((txid, peer_id));
                 }
             }
@@ -222,14 +263,13 @@ impl TxRelay {
         let to_request: Vec<_> = {
             let mut queue = self.request_queue.write();
             let mut requests = Vec::new();
-            let seen = self.seen_txs.read();
             let in_flight = self.txs_in_flight.read();
 
             while requests.len() < MAX_TX_IN_FLIGHT - in_flight_count {
                 match queue.pop_front() {
                     Some((txid, peer_id)) => {
                         // Skip if we already have it or it's in flight
-                        if seen.contains(&txid) || in_flight.contains_key(&txid) {
+                        if self.already_have(&txid) || in_flight.contains_key(&txid) {
                             continue;
                         }
                         requests.push((txid, peer_id));
@@ -274,10 +314,19 @@ impl TxRelay {
         // Remove from in-flight
         self.txs_in_flight.write().remove(&txid);
 
-        // Check if we've already seen it. One a whitelisted peer sends is
-        // relayed again, so the node serves as a gateway for nodes behind it
-        // (Divi Core main.cpp:794-799)
-        if self.seen_txs.read().contains(&txid) {
+        // The peer has it (Divi Core AddInventoryKnown, main.cpp:720)
+        self.peer_inventory
+            .write()
+            .entry(peer_id)
+            .or_default()
+            .insert(txid);
+
+        // One already in the mempool changes nothing there; one held as an
+        // orphan is offered again, as its parent may have come in a block
+        // (Divi Core checks AlreadyHave for an inv only, main.cpp:140-144).
+        // One a whitelisted peer sends is relayed again, so the node serves
+        // as a gateway for nodes behind it (Divi Core main.cpp:794-799)
+        if self.in_mempool(&txid) {
             trace!("Already have tx {}", txid);
             if self.peer_manager.is_whitelisted(peer_id) {
                 self.relay_tx(txid, Some(peer_id)).await;
@@ -287,7 +336,6 @@ impl TxRelay {
 
         debug!("Received tx {} from peer {}", txid, peer_id);
 
-        // Mark as seen
         self.seen_txs.write().insert(txid);
 
         // Emit event for mempool processing
@@ -303,6 +351,26 @@ impl TxRelay {
         // it (main.cpp:732-734), so a transaction it cannot take yet, such as
         // a child whose parent has not come, is not announced
         let _ = self.event_tx.send(event);
+    }
+
+    /// Keep a transaction that is announced for 15 minutes, as Divi Core keeps
+    /// what it relays in mapRelay (net.cpp:1580-1590); older ones go
+    pub fn keep_relayed(&self, tx: Transaction) {
+        let now = divi_primitives::clock::now();
+        let mut relayed = self.relayed.write();
+        relayed.retain(|_, (_, until)| *until > now);
+        relayed.insert(tx.txid(), (tx, now + RELAYED_KEEP_SECS));
+    }
+
+    /// A transaction announced in the last 15 minutes (RepeatRelayedInventory,
+    /// net.cpp:1565-1574)
+    pub fn relayed_tx(&self, txid: &Hash256) -> Option<Transaction> {
+        let now = divi_primitives::clock::now();
+        self.relayed
+            .read()
+            .get(txid)
+            .filter(|(_, until)| *until > now)
+            .map(|(tx, _)| tx.clone())
     }
 
     /// Relay a transaction the mempool took, to every peer but the one it came
@@ -364,6 +432,15 @@ impl TxRelay {
         }
 
         self.relay_tx(txid, None).await;
+    }
+
+    /// Announce mempool transactions again to every peer not known to have
+    /// them, as Divi Core's RebroadcastSomeMempoolTxs relays each to all peers
+    /// (main.cpp:1269-1271)
+    pub async fn rebroadcast(&self, txids: &[Hash256]) {
+        for txid in txids {
+            self.relay_tx(*txid, None).await;
+        }
     }
 
     /// Relay a transaction to peers that don't have it
@@ -609,5 +686,92 @@ mod tests {
 
         let stats = relay.stats();
         assert_eq!(stats.seen_count, 10);
+    }
+
+    fn test_tx(n: u8) -> Transaction {
+        use divi_primitives::script::Script;
+        use divi_primitives::transaction::{OutPoint, TxIn, TxOut};
+        Transaction {
+            version: 1,
+            vin: vec![TxIn::new(
+                OutPoint::new(Hash256::from_bytes([n; 32]), 0),
+                Script::new(),
+                u32::MAX,
+            )],
+            vout: vec![TxOut::new(Amount::from_sat(1000), Script::new())],
+            lock_time: 0,
+        }
+    }
+
+    /// AlreadyHave (main.cpp:140-144): an inv is asked for unless the
+    /// transaction is in the mempool or a held orphan; one seen and refused
+    /// before is asked for again
+    #[tokio::test]
+    async fn an_inv_is_asked_for_unless_the_node_holds_the_transaction() {
+        let relay = create_test_relay();
+        let (in_pool, orphan, refused) = (
+            Hash256::from_bytes([3; 32]),
+            Hash256::from_bytes([4; 32]),
+            Hash256::from_bytes([5; 32]),
+        );
+        relay.set_have_check(Arc::new(move |t| (*t == in_pool, *t == orphan)));
+        relay.mark_seen(refused);
+        let mut rx = test_peer(&relay, 1);
+        let peer = 1;
+        let items = [in_pool, orphan, refused]
+            .iter()
+            .map(|h| InvItem::new(InvType::Tx, *h))
+            .collect();
+        relay.handle_inv(peer, items).await;
+        let mut asked = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            if let NetworkMessage::GetData(items) = msg {
+                asked.extend(items.into_iter().map(|i| i.hash));
+            }
+        }
+        assert_eq!(asked, vec![refused]);
+    }
+
+    /// A transaction message goes to the mempool unless the transaction is in
+    /// it already: a held orphan sent again is offered again, since its parent
+    /// may have come in a block
+    #[tokio::test]
+    async fn a_held_orphan_sent_again_is_offered_to_the_mempool() {
+        let relay = create_test_relay();
+        let (orphan, pooled) = (test_tx(6), test_tx(7));
+        let (orphan_id, pooled_id) = (orphan.txid(), pooled.txid());
+        relay.set_have_check(Arc::new(move |t| (*t == pooled_id, *t == orphan_id)));
+        let mut events = relay.subscribe();
+        let _rx = test_peer(&relay, 1);
+        let peer = 1;
+        relay.handle_tx(peer, orphan).await;
+        relay.handle_tx(peer, pooled).await;
+        assert_eq!(events.try_recv().map(|e| e.txid).ok(), Some(orphan_id));
+        assert!(
+            events.try_recv().is_err(),
+            "the one in the mempool is not offered"
+        );
+    }
+
+    /// A transaction announced is kept 15 minutes to answer getdata, in a
+    /// block by then or not; an older one is gone (Divi Core mapRelay,
+    /// net.cpp:1565-1590)
+    #[test]
+    fn a_relayed_transaction_is_kept_for_getdata() {
+        let relay = create_test_relay();
+        let tx = test_tx(8);
+        relay.keep_relayed(tx.clone());
+        assert_eq!(relay.relayed_tx(&tx.txid()), Some(tx.clone()));
+        let old = test_tx(9);
+        relay
+            .relayed
+            .write()
+            .insert(old.txid(), (old.clone(), divi_primitives::clock::now() - 1));
+        assert_eq!(relay.relayed_tx(&old.txid()), None, "past its 15 minutes");
+        relay.keep_relayed(test_tx(10));
+        assert!(
+            !relay.relayed.read().contains_key(&old.txid()),
+            "dropped when the map is next written"
+        );
     }
 }

@@ -14,6 +14,7 @@
 //! Methods for querying blockchain state: blocks, transactions, chain info.
 
 use crate::error::{codes, Error, RpcError};
+use crate::protocol::json_spirit_int;
 use crate::protocol::Params;
 use divi_consensus::bits_to_difficulty;
 use divi_primitives::hash::{Hash160, Hash256};
@@ -130,6 +131,14 @@ pub trait MempoolProvider: Send + Sync {
     /// Whether a pool transaction spends this outpoint
     fn is_spent(&self, _outpoint: &divi_primitives::transaction::OutPoint) -> bool {
         false
+    }
+
+    /// Run `f` while no other transaction can enter the pool. Divi Core runs a
+    /// wallet send holding cs_main (rpcserver.cpp:452-454, :1060-1093), which
+    /// its `tx` handler takes too (main.cpp:726): the send picks its coins and
+    /// commits with no relayed transaction accepted in between.
+    fn with_admission(&self, f: &mut dyn FnMut()) {
+        f()
     }
 
     /// The pool's copy of a transaction, if it holds `txid`
@@ -539,6 +548,7 @@ impl BlockchainRpc {
                 })
                 .collect();
 
+            // Divi Core's members in blockToJSON's order (JsonBlockHelpers.cpp:38-77)
             let mut result = json!({
                 "hash": hash.to_string(),
                 "confirmations": confirmations,
@@ -546,19 +556,20 @@ impl BlockchainRpc {
                 "height": index.height,
                 "version": index.version,
                 "merkleroot": index.merkle_root.to_string(),
+                "acc_checkpoint": block.header.accumulator_checkpoint.to_string(),
                 "tx": txs,
                 "time": index.time,
-                "mediantime": self.get_median_time(&index),
                 "nonce": index.nonce,
                 "bits": format!("{:08x}", index.bits),
                 "difficulty": bits_to_difficulty(index.bits),
                 "chainwork": self.chainwork(&index),
-                "acc_checkpoint": block.header.accumulator_checkpoint.to_string(),
-                "nTx": block.transactions.len(),
             });
             // The genesis block has no previousblockhash key (JsonBlockHelpers.cpp:68)
             if index.height > 0 {
                 result["previousblockhash"] = json!(index.prev_hash.to_string());
+            }
+            if let Some(next) = self.next_on_main_chain(&index) {
+                result["nextblockhash"] = json!(next);
             }
 
             // Per-block supply is only known for blocks connected since the
@@ -569,14 +580,9 @@ impl BlockchainRpc {
                 result["moneysupply"] = json!(supply as f64 / 100_000_000.0);
             }
 
-            // Add nextblockhash if on the active chain and not the tip
-            if let Some(tip) = self.chain.tip().filter(|_| index.is_on_main_chain()) {
-                if index.height < tip.height {
-                    if let Ok(Some(next)) = self.chain.get_block_index_by_height(index.height + 1) {
-                        result["nextblockhash"] = json!(next.hash.to_string());
-                    }
-                }
-            }
+            // irondivid's own members, after divid's
+            result["mediantime"] = json!(self.get_median_time(&index));
+            result["nTx"] = json!(block.transactions.len());
 
             Ok(result)
         }
@@ -619,34 +625,43 @@ impl BlockchainRpc {
             let raw = serialize(&header);
             Ok(json!(hex::encode(raw)))
         } else {
-            let mut result = json!({
-                "hash": hash.to_string(),
-                "confirmations": self.get_confirmations(&index),
-                "height": index.height,
-                "version": index.version,
-                "merkleroot": index.merkle_root.to_string(),
-                "time": index.time,
-                "mediantime": self.get_median_time(&index),
-                "nonce": index.nonce,
-                "bits": format!("{:08x}", index.bits),
-                "difficulty": bits_to_difficulty(index.bits),
-                "chainwork": self.chainwork(&index),
-                "nTx": index.n_tx,
-            });
+            // Divi Core's members in blockHeaderToJSON's order
+            // (JsonBlockHelpers.cpp:80-91)
+            let mut result = json!({ "version": index.version });
             if index.height > 0 {
                 result["previousblockhash"] = json!(index.prev_hash.to_string());
             }
+            result["merkleroot"] = json!(index.merkle_root.to_string());
+            result["time"] = json!(index.time);
+            result["bits"] = json!(format!("{:08x}", index.bits));
+            result["nonce"] = json!(index.nonce);
 
-            // Add nextblockhash if on the active chain and not the tip
-            if let Some(tip) = self.chain.tip().filter(|_| index.is_on_main_chain()) {
-                if index.height < tip.height {
-                    if let Ok(Some(next)) = self.chain.get_block_index_by_height(index.height + 1) {
-                        result["nextblockhash"] = json!(next.hash.to_string());
-                    }
-                }
+            // irondivid's own members, after divid's
+            result["hash"] = json!(hash.to_string());
+            result["confirmations"] = json!(self.get_confirmations(&index));
+            result["height"] = json!(index.height);
+            result["mediantime"] = json!(self.get_median_time(&index));
+            result["difficulty"] = json!(bits_to_difficulty(index.bits));
+            result["chainwork"] = json!(self.chainwork(&index));
+            result["nTx"] = json!(index.n_tx);
+            if let Some(next) = self.next_on_main_chain(&index) {
+                result["nextblockhash"] = json!(next);
             }
 
             Ok(result)
+        }
+    }
+
+    /// The hash of the block after `index`, when `index` is on the active chain
+    /// and not the tip
+    fn next_on_main_chain(&self, index: &divi_storage::BlockIndex) -> Option<String> {
+        let tip = self.chain.tip().filter(|_| index.is_on_main_chain())?;
+        if index.height >= tip.height {
+            return None;
+        }
+        match self.chain.get_block_index_by_height(index.height + 1) {
+            Ok(Some(next)) => Some(next.hash.to_string()),
+            _ => None,
         }
     }
 
@@ -697,7 +712,7 @@ impl BlockchainRpc {
                 "hash": hash.to_string(),
                 "historyvalidated": false
             })),
-            "warnings": ""
+            "warnings": crate::warnings::status_bar()
         }))
     }
 
@@ -713,7 +728,7 @@ impl BlockchainRpc {
             "version": 2000000,
             "protocolversion": divi_network::constants::protocol_version(),
             "blocks": height,
-            "timeoffset": 0,
+            "timeoffset": divi_primitives::clock::time_offset(),
             "connections": 0,
             "proxy": "",
             "difficulty": difficulty,
@@ -724,7 +739,7 @@ impl BlockchainRpc {
             "paytxfee": 0.0,
             "relayfee": self.relay_fee(),
             "staking status": "Staking Not Active",
-            "errors": ""
+            "errors": crate::warnings::status_bar()
         }))
     }
 
@@ -836,10 +851,11 @@ impl BlockchainRpc {
             "bestblock": stats.best_block.to_string(),
             "transactions": stats.transactions,
             "txouts": stats.txouts,
-            "bogosize": stats.bogosize,
             "bytes_serialized": stats.bytes_serialized,
             "hash_serialized": stats.hash_serialized.to_string(),
-            "total_amount": total_amount_divi
+            "total_amount": total_amount_divi,
+            // irondivid's own member, after divid's
+            "bogosize": stats.bogosize
         }))
     }
 
@@ -955,10 +971,14 @@ impl BlockchainRpc {
             return Ok(if verbose { json!({}) } else { json!([]) });
         };
 
+        // In txid order, as Divi Core reads its mempool's map (uint256 order,
+        // the order of the txids as shown; rpcblockchain.cpp:119, :143)
         if verbose {
             // Divi Core rpcblockchain.cpp:122-128
             let mut out = serde_json::Map::new();
-            for info in mempool.get_tx_infos() {
+            let mut infos = mempool.get_tx_infos();
+            infos.sort_by_key(|info| info.txid.to_string());
+            for info in infos {
                 out.insert(
                     info.txid.to_string(),
                     json!({
@@ -975,11 +995,12 @@ impl BlockchainRpc {
             return Ok(Value::Object(out));
         }
 
-        let txids: Vec<String> = mempool
+        let mut txids: Vec<String> = mempool
             .get_txids()
             .iter()
             .map(|txid| txid.to_string())
             .collect();
+        txids.sort();
 
         Ok(json!(txids))
     }
@@ -1444,28 +1465,20 @@ impl BlockchainRpc {
     /// Verify blockchain database
     /// verifychain ( numblocks )
     pub fn verifychain(&self, params: &Params) -> Result<Value, Error> {
-        // Parse optional numblocks parameter (default 288)
-        let numblocks = params.get_i64(0).unwrap_or(288).max(0) as u64;
-
-        let best_height = self.chain.height() as u64;
-
-        // Verify last N blocks
-        let start_height = best_height.saturating_sub(numblocks);
-
-        for height in start_height..=best_height {
-            // Check that block index exists
-            let index = match self.chain.get_block_index_by_height(height as u32)? {
-                Some(idx) => idx,
-                None => return Ok(json!(false)),
-            };
-
-            // Verify block data exists
-            if self.chain.get_block(&index.hash)?.is_none() {
-                return Ok(json!(false));
+        // numblocks, default 288. Divi Core reads params[1] whenever an argument
+        // is given (rpcblockchain.cpp:418-420); with only one it reads past the
+        // list, so that one is taken here
+        let at = if params.len() > 1 { 1 } else { 0 };
+        let numblocks = params.get_i64(at).unwrap_or(288);
+        // VerifyDB at level 4, its one level, over that many blocks, as divid's
+        // verifychain runs it (rpcblockchain.cpp:417-422)
+        match self.chain.verify_db(numblocks) {
+            Ok(_) => Ok(json!(true)),
+            Err(e) => {
+                tracing::error!("VerifyDB() : *** {}", e);
+                Ok(json!(false))
             }
         }
-
-        Ok(json!(true))
     }
 
     /// Get mining information
@@ -1493,7 +1506,7 @@ impl BlockchainRpc {
         Ok(json!({
             "blocks": blocks,
             "difficulty": difficulty,
-            "errors": "",
+            "errors": crate::warnings::status_bar(),
             "pooledtx": pooled_tx,
             "testnet": matches!(self.chain.network_type(), NetworkType::Testnet),
             "chain": match self.chain.network_type() {
@@ -1545,21 +1558,6 @@ fn core_parse_hash_str(s: &str, name: &str) -> Result<Hash256, RpcError> {
     }
     let tail = &s[s.len().saturating_sub(64)..];
     Hash256::from_hex(&format!("{tail:0>64}")).map_err(|_| not_hex())
-}
-
-/// json_spirit's `get_int()` of an integer: its 64 bits cut to a C++ `int`
-/// (json_spirit_value.h, `static_cast<int>`), so 2^32 + 5 reads as 5; None for
-/// anything but an integer
-fn json_spirit_int(v: &Value) -> Option<i64> {
-    match v {
-        Value::Number(n) if n.is_i64() || n.is_u64() => {
-            let wide = n
-                .as_i64()
-                .unwrap_or_else(|| n.as_u64().unwrap_or_default() as i64);
-            Some(i64::from(wide as i32))
-        }
-        _ => None,
-    }
 }
 
 #[cfg(test)]

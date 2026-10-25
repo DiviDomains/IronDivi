@@ -2877,6 +2877,7 @@ dependencies = [
  "divi-primitives",
  "divi-script",
  "hex",
+ "libc",
  "moka",
  "parking_lot",
  "rocksdb",
@@ -4163,6 +4164,7 @@ version = "0.2.6"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "chrono",
  "clap",
  "dirs",
  "divi-crypto",
@@ -4176,6 +4178,7 @@ dependencies = [
  "divi-wallet",
  "hex",
  "libc",
+ "rocksdb",
  "serde",
  "serde_json",
  "tempfile",
@@ -6445,6 +6448,8 @@ version = "1.0.154"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e7e9cc8b1b85264074fbcc02a88680c4096b1e47df8f739dceb03bf482f04bd6"
 dependencies = [
+ "foldhash",
+ "indexmap 2.13.0",
  "itoa",
  "memchr",
  "serde",
@@ -6733,6 +6738,14 @@ checksum = "d91ed6c858b01f942cd56b37a94b3e0a1798290327d1236e4d9cf4eaca44d29d"
 dependencies = [
  "base64ct",
  "der",
+]
+
+[[package]]
+name = "spork-seed"
+version = "0.1.0"
+dependencies = [
+ "divi-network",
+ "divi-storage",
 ]
 
 [[package]]

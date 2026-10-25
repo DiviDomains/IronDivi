@@ -96,7 +96,7 @@ impl ChainDatabase {
         path: P,
         block_cache_size: usize,
     ) -> Result<Self, StorageError> {
-        Self::open_inner(path.as_ref(), block_cache_size, true)
+        Self::open_inner(path.as_ref(), block_cache_size, true, false)
     }
 
     /// Open the chain database at `path` only if there is one: a missing or
@@ -109,13 +109,28 @@ impl ChainDatabase {
                 path.display()
             )));
         }
-        Self::open_inner(path, DEFAULT_BLOCK_CACHE_SIZE, false)
+        Self::open_inner(path, DEFAULT_BLOCK_CACHE_SIZE, false, false)
+    }
+
+    /// Open an existing chain database read-only: nothing is written, not even
+    /// the lock, so the database of a running node can be read (it is seen
+    /// as it was when opened). Every write through the handle fails.
+    pub fn open_read_only<P: AsRef<Path>>(path: P) -> Result<Self, StorageError> {
+        let path = path.as_ref();
+        if !path.join("CURRENT").is_file() {
+            return Err(StorageError::NotFound(format!(
+                "no chain database in {}",
+                path.display()
+            )));
+        }
+        Self::open_inner(path, DEFAULT_BLOCK_CACHE_SIZE, false, true)
     }
 
     fn open_inner(
         path: &Path,
         block_cache_size: usize,
         create: bool,
+        read_only: bool,
     ) -> Result<Self, StorageError> {
         crate::datadir::refuse_foreign_database(path)?;
 
@@ -209,7 +224,17 @@ impl ChainDatabase {
             DEFAULT_WRITE_BUFFER_SIZE / (1024 * 1024)
         );
 
-        let db = DB::open_cf_descriptors(&opts, path, cfs)?;
+        let db = if read_only {
+            // A database made by an older version may lack some column
+            // families, and a read-only open cannot create them
+            let present = DB::list_cf(&opts, path)?;
+            let cfs = cfs
+                .into_iter()
+                .filter(|cf| present.iter().any(|p| p == cf.name()));
+            DB::open_cf_descriptors_read_only(&opts, path, cfs, false)?
+        } else {
+            DB::open_cf_descriptors(&opts, path, cfs)?
+        };
 
         // Create block index caches for faster lookups during staking
         let block_index_cache = MokaCache::builder()
@@ -235,7 +260,18 @@ impl ChainDatabase {
         path: P,
         utxo_cache_entries: u64,
     ) -> Result<Self, StorageError> {
-        let mut db = Self::open_with_cache_size(path, DEFAULT_BLOCK_CACHE_SIZE)?;
+        Self::open_with_caches(path, DEFAULT_BLOCK_CACHE_SIZE, utxo_cache_entries)
+    }
+
+    /// Open or create a chain database with a block cache of
+    /// `block_cache_size` bytes and, unless 0, a UTXO cache of
+    /// `utxo_cache_entries` entries (Divi Core -dbcache, init.cpp:1046-1056)
+    pub fn open_with_caches<P: AsRef<Path>>(
+        path: P,
+        block_cache_size: usize,
+        utxo_cache_entries: u64,
+    ) -> Result<Self, StorageError> {
+        let mut db = Self::open_with_cache_size(path, block_cache_size)?;
         if utxo_cache_entries > 0 {
             db.utxo_cache = Some(UtxoCache::new(utxo_cache_entries));
             info!("UTXO cache enabled with {} max entries", utxo_cache_entries);
@@ -614,6 +650,16 @@ impl ChainDatabase {
     ///
     /// Should be called periodically during sync and before shutdown.
     /// Returns the number of entries flushed, or 0 if cache is not enabled.
+    /// The directory the database lives in
+    pub fn path(&self) -> &Path {
+        self.db.path()
+    }
+
+    /// UTXO cache entries not yet written to the database
+    pub fn utxo_dirty_count(&self) -> usize {
+        self.utxo_cache.as_ref().map_or(0, |c| c.dirty_count())
+    }
+
     pub fn flush_utxo_cache(&self) -> Result<usize, StorageError> {
         if let Some(ref cache) = self.utxo_cache {
             cache.flush(&self.db)

@@ -63,7 +63,8 @@ pub type SplitThresholdCallback = Arc<dyn Fn(Option<i64>) -> i64 + Send + Sync>;
 
 /// Callback that mines blocks to the wallet at once (regtest setgenerate) and
 /// returns their hashes
-pub type GenerateCallback = Arc<dyn Fn(u32) -> Result<Vec<String>, String> + Send + Sync>;
+pub type GenerateCallback =
+    Arc<dyn Fn(u32) -> Result<Vec<String>, GenerateBlockFailure> + Send + Sync>;
 
 /// What `generateblock` asks of the one block it makes (rpcmining.cpp:121-210)
 #[derive(Debug, Clone, Default)]
@@ -78,7 +79,7 @@ pub struct GenerateBlockOptions {
     pub bits_shift: Option<u32>,
 }
 
-/// Why `generateblock` made no block
+/// Why `setgenerate` or `generateblock` made no block
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GenerateBlockFailure {
     /// Refused with Divi Core's message, answered as -1
@@ -99,7 +100,6 @@ pub struct StakingRpc {
     split_threshold_callback: RwLock<Option<SplitThresholdCallback>>,
     generate_callback: RwLock<Option<GenerateCallback>>,
     generate_block_callback: RwLock<Option<GenerateBlockCallback>>,
-    reserve_balance: RwLock<f64>,
 }
 
 impl StakingRpc {
@@ -110,7 +110,6 @@ impl StakingRpc {
             split_threshold_callback: RwLock::new(None),
             generate_callback: RwLock::new(None),
             generate_block_callback: RwLock::new(None),
-            reserve_balance: RwLock::new(0.0),
         }
     }
 
@@ -229,7 +228,7 @@ impl StakingRpc {
             "currentblocksize": info.current_block_size,
             "currentblocktx": info.current_block_tx,
             "difficulty": info.difficulty,
-            "errors": info.errors.unwrap_or_default(),
+            "errors": info.errors.unwrap_or_else(crate::warnings::status_bar),
             "generate": info.enabled,
             "genproclimit": 1,
             "pooledtx": info.pooled_tx,
@@ -295,9 +294,15 @@ impl StakingRpc {
         let callback = callback.ok_or_else(|| {
             RpcError::new(codes::MISC_ERROR, "setgenerate needs a wallet to mine to")
         })?;
-        let hashes = callback(count).map_err(|e| {
-            info!("setgenerate failed: {}", e);
-            RpcError::new(codes::VERIFY_ERROR, "failed to generate a valid block")
+        // Divi Core's setgenerate answers -25 when no block is made
+        // (rpcmining.cpp:101-102), and -1 with the message of an exception
+        // thrown on the way (rpcserver.cpp:1107-1108)
+        let hashes = callback(count).map_err(|e| match e {
+            GenerateBlockFailure::Refused(message) => RpcError::new(codes::MISC_ERROR, message),
+            GenerateBlockFailure::Failed(why) => {
+                info!("setgenerate failed: {}", why);
+                RpcError::new(codes::VERIFY_ERROR, "failed to generate a valid block")
+            }
         })?;
         Ok(serde_json::json!(hashes))
     }
@@ -391,34 +396,6 @@ impl StakingRpc {
                 info!("generateblock failed: {}", why);
                 Err(RpcError::new(codes::VERIFY_ERROR, "failed to generate a valid block").into())
             }
-        }
-    }
-
-    pub fn reserve_balance(&self, params: &Params) -> Result<serde_json::Value, Error> {
-        let show = params.get_bool(0).unwrap_or(true);
-
-        if show {
-            let reserve = *self.reserve_balance.read();
-            Ok(serde_json::json!({
-                "reserve": reserve,
-                "amount": reserve
-            }))
-        } else {
-            let amount = params
-                .get(1)
-                .and_then(|v| v.as_f64())
-                .ok_or_else(|| RpcError::invalid_params("Amount required"))?;
-
-            if amount < 0.0 {
-                return Err(RpcError::invalid_params("Amount must be non-negative").into());
-            }
-
-            *self.reserve_balance.write() = amount;
-
-            Ok(serde_json::json!({
-                "reserve": amount,
-                "amount": amount
-            }))
         }
     }
 }

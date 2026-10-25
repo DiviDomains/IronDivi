@@ -51,13 +51,7 @@ START_TIMEOUT = 180
 # Differences irondivid has, one per row name, each listed in README.md with
 # divid's source line. A KNOWN row that starts to match divid is a FAIL, so the
 # list stays true.
-KNOWN = {
-    **{f"sendmany \"\" {label}: payee order":
-       "divid writes the payees in the order of the request's object (json_spirit keeps it, rpcwallet.cpp:1724); "
-       "irondivid reads the request with serde_json, which keeps an object's members in name order "
-       "(docs/divid-differences.md R6), so they come in address order"
-       for label in ("{DEST: 2, Z: 3}", "12 payees of 1", "12 payees of 90 (no coin covers it alone)")},
-}
+KNOWN = {}
 
 # Fields irondivid adds to a reply on purpose: compared without them, and named
 # once per call in a "<method>: fields divid lacks" row
@@ -625,8 +619,8 @@ scenario("sendtoaddress DEST 5 receiver_pays", "sendtoaddress", DEST, 5, "receiv
 scenario("sendtoaddress DEST 900 receiver_pays", "sendtoaddress", DEST, 900, "receiver_pays")
 scenario("sendtoaddress DEST 1 sweep_funds", "sendtoaddress", DEST, 1, "sweep_funds")
 # sendmany: more payees, a larger fee. Each request lists its payees in
-# descending address order, so the payee order row shows divid's request
-# order against irondivid's address order every run
+# descending address order, so the payee order row shows that both keep the
+# request's order, not the address order
 down = lambda pairs: dict(sorted(pairs, key=lambda p: p[0], reverse=True))
 scenario("sendmany \"\" {DEST: 2, Z: 3}", "sendmany", "", down([(DEST, 2), (Z, 3)]))
 scenario("sendmany \"\" 12 payees of 1", "sendmany", "", down([(a, 1) for a in MANY]))

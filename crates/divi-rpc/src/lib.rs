@@ -58,6 +58,7 @@ pub mod lite_wallet;
 pub mod masternode;
 pub mod mn_broadcast;
 pub mod mn_list;
+pub mod mn_votes;
 pub mod network;
 pub mod protocol;
 pub mod rest;
@@ -66,6 +67,7 @@ pub mod spork;
 pub mod staking;
 pub mod wallet;
 mod wallet_history;
+pub mod warnings;
 pub mod websocket;
 
 pub use auth_cookie::{resolve_rpc_auth, AuthCookie, COOKIE_AUTH_USER};

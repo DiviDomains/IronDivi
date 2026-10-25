@@ -52,6 +52,11 @@ pub struct NodeConfig {
     /// UTXO cache size (number of entries). Default: 10_000_000. Set to 0 to disable.
     pub utxo_cache_size: u64,
 
+    /// The chain database's block cache in bytes (`-dbcache`: divid's block
+    /// tree and coin database caches); None for the default
+    #[serde(default)]
+    pub block_cache_size: Option<usize>,
+
     /// Block-expiry pruning (`-1` = never, `0` = minimum, else a retention window).
     pub expire: divi_storage::prune::Expire,
 
@@ -63,6 +68,12 @@ pub struct NodeConfig {
     /// unset = the network's depth, 100 on Divi)
     #[serde(default)]
     pub max_reorg: Option<u32>,
+
+    /// Remove the chain's folders before the chain is opened, so it syncs again
+    /// from genesis (Divi Core -resync: blocks, chainstate and sporks,
+    /// init.cpp:901-930, :1480-1483); the wallet and the configuration stay
+    #[serde(default)]
+    pub resync: bool,
 
     /// Block files to import at start (-loadblock), after bootstrap.dat
     #[serde(default)]
@@ -82,6 +93,11 @@ pub struct NodeConfig {
     #[serde(default)]
     pub blocknotify: Option<String>,
 
+    /// Command run when the node raises a warning, `%s` replaced by its text
+    /// (Divi Core's -alertnotify)
+    #[serde(default)]
+    pub alertnotify: Option<String>,
+
     /// The ZMQ notifier addresses (Divi Core's -zmqpub* options)
     #[serde(default)]
     pub zmq: crate::zmq::ZmqConfig,
@@ -98,6 +114,46 @@ pub struct NodeConfig {
 
 /// C++ `-checkblocks` default (init.cpp: `VerifyChain(4, GetArg("-checkblocks", 100))`)
 pub const DEFAULT_CHECK_BLOCKS: u32 = 100;
+
+/// Divi Core's -dbcache bounds and default, in MiB (defaultValues.h:27-31)
+pub const DEFAULT_DB_CACHE_MIB: i64 = 100;
+pub const MIN_DB_CACHE_MIB: i64 = 4;
+pub const MAX_DB_CACHE_MIB: i64 = 4096;
+
+/// How Divi Core splits -dbcache (init.cpp:1038-1059)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DbCacheSizes {
+    /// The total, in bytes, after clamping to 4..4096 MiB
+    pub total: usize,
+    /// The block tree database's cache: an eighth (at most 2 MiB without -txindex)
+    pub block_tree: usize,
+    /// The coin database's cache: half of the rest
+    pub coin_db: usize,
+    /// Coins held in memory: the rest at about 300 bytes a coin
+    pub coin_cache_entries: u64,
+}
+
+/// The cache sizes for `-dbcache=<mib>`. A negative value is the minimum:
+/// divid shifts it into an unsigned size and so gets the maximum
+/// (init.cpp:1030), which nobody asks for by giving -1.
+pub fn db_cache_sizes(mib: i64, txindex: bool) -> DbCacheSizes {
+    let mib = mib.clamp(MIN_DB_CACHE_MIB, MAX_DB_CACHE_MIB) as usize;
+    let mut total = mib << 20;
+    let all = total;
+    let mut block_tree = total / 8;
+    if block_tree > (1 << 21) && !txindex {
+        block_tree = 1 << 21;
+    }
+    total -= block_tree;
+    let coin_db = total / 2;
+    total -= coin_db;
+    DbCacheSizes {
+        total: all,
+        block_tree,
+        coin_db,
+        coin_cache_entries: (total / 300) as u64,
+    }
+}
 
 fn default_check_blocks() -> u32 {
     DEFAULT_CHECK_BLOCKS
@@ -116,13 +172,16 @@ impl Default for NodeConfig {
             index: IndexConfig::default(),
             log: LogConfig::default(),
             utxo_cache_size: 10_000_000,
+            block_cache_size: None,
             expire: divi_storage::prune::Expire::Never,
             check_blocks: DEFAULT_CHECK_BLOCKS,
             max_reorg: None,
+            resync: false,
             load_block: Vec::new(),
             bootstrap_dir: None,
             stop_after_block_import: false,
             blocknotify: None,
+            alertnotify: None,
             zmq: Default::default(),
             walletnotify: None,
             vault: false,
@@ -395,10 +454,26 @@ pub struct P2pConfig {
     #[serde(default)]
     pub addnode: Vec<String>,
 
+    /// `-seednode` peers: each dialled once, asked for addresses and dropped
+    /// after its answer (Divi Core net.cpp:1071-1084, main.cpp:556-557)
+    #[serde(default)]
+    pub seednode: Vec<String>,
+
     /// Accept inbound connections. `None` = default: listen unless `connect`
     /// is set (C++ soft-sets `-listen=0` under `-connect`).
     #[serde(default)]
     pub listen: Option<bool>,
+
+    /// Query the DNS seeds (Divi Core -dnsseed). `None` = default: on unless
+    /// `connect` is set (C++ soft-sets `-dnsseed=0` under `-connect`,
+    /// net.cpp:1683-1685)
+    #[serde(default)]
+    pub dns_seed: Option<bool>,
+
+    /// Query the DNS seeds even when peers.dat has addresses (Divi Core
+    /// -forcednsseed, net.cpp:1018-1019)
+    #[serde(default)]
+    pub force_dns_seed: bool,
 
     /// Ban time for misbehaving peers (seconds; Divi Core -bantime)
     pub ban_time: u64,
@@ -406,6 +481,11 @@ pub struct P2pConfig {
     /// Misbehaviour score at which a peer is banned (Divi Core -banscore)
     #[serde(default = "default_ban_score")]
     pub ban_score: u32,
+
+    /// Read the alerts peers send (Divi Core -alerts, default on); off, an
+    /// alert message is ignored (main.cpp:870)
+    #[serde(default = "default_alerts")]
+    pub alerts: bool,
 
     /// User agent string
     pub user_agent: String,
@@ -426,6 +506,19 @@ pub struct P2pConfig {
     /// Addresses this node is reachable at (Divi Core -externalip)
     #[serde(default)]
     pub external_ips: Vec<SocketAddr>,
+
+    /// Divi Core -onlynet: the only networks dialled from learnt addresses
+    /// (`ipv4`, `ipv6`, `onion`); empty: every network
+    #[serde(default)]
+    pub only_nets: Vec<String>,
+
+    /// Divi Core -maxreceivebuffer, in thousands of bytes (default 5000)
+    #[serde(default = "default_max_receive_buffer")]
+    pub max_receive_buffer: i64,
+
+    /// Divi Core -maxsendbuffer, in thousands of bytes (default 1000)
+    #[serde(default = "default_max_send_buffer")]
+    pub max_send_buffer: i64,
 
     /// The machine's interface addresses, found at start with `discover`
     #[serde(default)]
@@ -481,11 +574,23 @@ impl P2pConfig {
     }
 }
 
+fn default_max_receive_buffer() -> i64 {
+    5000
+}
+
+fn default_max_send_buffer() -> i64 {
+    1000
+}
+
 fn default_discover() -> bool {
     true
 }
 
 fn default_listen_on_addr() -> bool {
+    true
+}
+
+fn default_alerts() -> bool {
     true
 }
 
@@ -510,14 +615,21 @@ impl Default for P2pConfig {
             enable_discovery: true,
             connect: Vec::new(),
             addnode: Vec::new(),
+            seednode: Vec::new(),
             listen: None,
+            dns_seed: None,
+            force_dns_seed: false,
             ban_time: 86400, // 24 hours
             ban_score: default_ban_score(),
+            alerts: true,
             user_agent: format!("/DiviRust:{}/", env!("CARGO_PKG_VERSION")),
             proxy: None,
             connect_timeout_ms: default_connect_timeout_ms(),
             discover: default_discover(),
             external_ips: Vec::new(),
+            only_nets: Vec::new(),
+            max_receive_buffer: default_max_receive_buffer(),
+            max_send_buffer: default_max_send_buffer(),
             interface_ips: Vec::new(),
             whitelist: Vec::new(),
             white_bind: Vec::new(),
@@ -541,7 +653,13 @@ impl NodeConfig {
         if !self.p2p.connect.is_empty() {
             return PeerSources {
                 static_peers: self.p2p.connect.clone(),
-                dns_seeds: Vec::new(),
+                // Only with -dnsseed=1 given: the seeds' addresses go into
+                // the book, and -connect still dials only its own peers
+                dns_seeds: if self.p2p.dns_seed == Some(true) {
+                    self.network.dns_seeds.clone()
+                } else {
+                    Vec::new()
+                },
                 listen: self.p2p.listen.unwrap_or(false),
             };
         }
@@ -603,10 +721,18 @@ pub struct RpcConfig {
     /// Serve the REST interface (Divi Core's -rest, default off)
     #[serde(default)]
     pub rest: bool,
+
+    /// Connections served at once (Divi Core's -rpcthreads, default 4)
+    #[serde(default = "default_rpc_threads")]
+    pub threads: i64,
 }
 
 fn default_rpc_keep_alive() -> bool {
     true
+}
+
+fn default_rpc_threads() -> i64 {
+    4
 }
 
 impl Default for RpcConfig {
@@ -622,6 +748,7 @@ impl Default for RpcConfig {
             allowed_ips: Vec::new(),
             keep_alive: true,
             rest: false,
+            threads: 4,
         }
     }
 }
@@ -715,6 +842,28 @@ pub struct MempoolConfig {
     /// Take transactions that are not standard (Divi Core's
     /// `-acceptnonstandard`, off by default; MempoolConsensus.cpp:274)
     pub accept_nonstandard: bool,
+
+    /// Bare multisig outputs are standard (Divi Core's `-permitbaremultisig`,
+    /// on by default; MempoolConsensus.cpp:31, :107-109)
+    #[serde(default = "default_true")]
+    pub permit_bare_multisig: bool,
+
+    /// The largest OP_META output script that is standard, in bytes: Divi
+    /// Core's `-datacarriersize` (603, MAX_OP_META_RELAY), or 0 with
+    /// `-datacarrier=0` (MempoolConsensus.cpp:32-33)
+    #[serde(default = "default_max_datacarrier_bytes")]
+    pub max_datacarrier_bytes: u32,
+
+    /// Below the relay fee a transaction needs enough coin-age priority (Divi
+    /// Core's `-relaypriority`, on by default; MempoolConsensus.cpp:254-259)
+    #[serde(default = "default_true")]
+    pub relay_priority: bool,
+
+    /// The free-relay rate limit for transactions from peers, in thousands of
+    /// bytes per minute (Divi Core's `-limitfreerelay`, 30 by default;
+    /// MempoolConsensus.cpp:211-234)
+    #[serde(default = "default_limit_free_relay")]
+    pub limit_free_relay: i64,
 }
 
 impl Default for MempoolConfig {
@@ -726,8 +875,26 @@ impl Default for MempoolConfig {
             max_orphan_txs: 100,
             expiry_time: 336 * 60 * 60, // 2 weeks
             accept_nonstandard: false,
+            permit_bare_multisig: true,
+            max_datacarrier_bytes: default_max_datacarrier_bytes(),
+            relay_priority: true,
+            limit_free_relay: default_limit_free_relay(),
         }
     }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Divi Core's -limitfreerelay default (MempoolConsensus.cpp:228)
+fn default_limit_free_relay() -> i64 {
+    30
+}
+
+/// Divi Core MAX_OP_META_RELAY (defaultValues.h:40)
+fn default_max_datacarrier_bytes() -> u32 {
+    603
 }
 
 /// Divi Core DEFAULT_TRANSACTION_MAXFEE, 100 DIVI (defaultValues.h:34)
@@ -797,6 +964,19 @@ pub struct LogConfig {
 
     /// Print to console instead of file
     pub print_to_console: bool,
+
+    /// Divi Core -logips: log lines carry peers' addresses (default off)
+    #[serde(default)]
+    pub log_ips: bool,
+
+    /// Divi Core -logtimestamps: debug.log lines begin with the time (default on)
+    #[serde(default = "default_discover")]
+    pub timestamps: bool,
+
+    /// Divi Core -shrinkdebugfile: cut a debug.log over 10 MB to its last
+    /// 200 000 bytes at start and every five minutes (default: without -debug)
+    #[serde(default = "default_discover")]
+    pub shrink: bool,
 }
 
 impl Default for LogConfig {
@@ -806,6 +986,9 @@ impl Default for LogConfig {
             max_files: 5,
             debug: false,
             print_to_console: false,
+            log_ips: false,
+            timestamps: true,
+            shrink: true,
         }
     }
 }
@@ -819,6 +1002,44 @@ mod tests {
         let config = NodeConfig::default();
         assert_eq!(config.p2p.port, 51472);
         assert_eq!(config.rpc.port, 51473);
+    }
+
+    /// Divi Core's split of -dbcache (init.cpp:1046-1056), worked out by hand
+    #[test]
+    fn db_cache_is_split_as_divid_splits_it() {
+        const MIB: usize = 1 << 20;
+        // The default, 100 MiB: 12.5 to the block tree, 43.75 to the coin db,
+        // 43.75 MiB / 300 coins
+        let d = db_cache_sizes(DEFAULT_DB_CACHE_MIB, true);
+        assert_eq!(d.total, 100 * MIB);
+        assert_eq!(d.block_tree, 100 * MIB / 8);
+        assert_eq!(d.coin_db, (100 * MIB - 100 * MIB / 8) / 2);
+        assert_eq!(d.coin_cache_entries, 152_917);
+        // Clamped to 4..4096 MiB; 0 and a non-number (atoi 0) give 4
+        assert_eq!(db_cache_sizes(0, true).total, 4 * MIB);
+        assert_eq!(db_cache_sizes(3, true).total, 4 * MIB);
+        assert_eq!(db_cache_sizes(4, true).total, 4 * MIB);
+        assert_eq!(db_cache_sizes(4096, true).total, 4096 * MIB);
+        assert_eq!(db_cache_sizes(4097, true).total, 4096 * MIB);
+        assert_eq!(db_cache_sizes(i64::MAX, true).total, 4096 * MIB);
+        assert_eq!(db_cache_sizes(-1, true).total, 4 * MIB);
+        // Without -txindex the block tree gets at most 2 MiB
+        let n = db_cache_sizes(100, false);
+        assert_eq!(n.block_tree, 2 * MIB);
+        assert_eq!(n.coin_db, 49 * MIB);
+        assert_eq!(n.coin_cache_entries, (49 * MIB / 300) as u64);
+        assert_eq!(db_cache_sizes(4, false).block_tree, MIB / 2);
+    }
+
+    /// -connect leaves the DNS seeds out unless -dnsseed=1 is given (net.cpp:1683-1685)
+    #[test]
+    fn connect_keeps_dns_seeds_only_with_dnsseed_given() {
+        let mut c = NodeConfig::default();
+        c.p2p.connect = vec!["127.0.0.2:1".into()];
+        assert!(c.peer_sources().dns_seeds.is_empty());
+        c.p2p.dns_seed = Some(true);
+        assert_eq!(c.peer_sources().dns_seeds, c.network.dns_seeds);
+        assert_eq!(c.peer_sources().static_peers, ["127.0.0.2:1"]);
     }
 
     #[test]

@@ -20,6 +20,10 @@ import time
 import urllib.error
 import urllib.request
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "lib"))
+import member_order  # noqa: E402  (scripts/lib: the order check the replies scripts share)
+import mnsync_stages  # noqa: E402  (scripts/lib: the sync stages of nodes over time)
+
 IRONDIVID, DIVID, PORT_BASE, WORK = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
 # For the proof that a difference is caught: irondivid's reply of the named row
 # is changed before it is compared
@@ -68,9 +72,6 @@ NETINFO = ("connections_in/out: irondivid's extra fields [by design]; localservi
            only(*NETINFO_FIELDS))
 MNCOUNT = ("irondivid adds the tier counts copper..diamond [by design]",
            only(".copper", ".silver", ".gold", ".platinum", ".diamond"))
-MNSYNC = ("currentMasternodeSyncStatus: divid gives its sync phase (0, then 1 after a restart, with no masternodes "
-          "on regtest: rpcmisc.cpp:212, masternode-sync.h:42-47); irondivid has no masternode sync and gives 999, finished [open]",
-          only(".currentMasternodeSyncStatus"))
 BANLIST = ("divid gives {\"banned:\": \"<text list>\"}, irondivid an array (docs/rpc-parity-audit.md: "
            "listbanned; divid: rpcmisc.cpp:1023-1030, PeerBanningService.cpp:23-34) [by design]",
            pair(EMPTY_BANS, ("ok", [])))
@@ -90,8 +91,6 @@ KNOWN = {
     "after restart: getnetworkinfo": NETINFO,
     "getmasternodecount": MNCOUNT,
     "after restart: getmasternodecount": MNCOUNT,
-    "mnsync status": MNSYNC,
-    "after restart: mnsync status": MNSYNC,
     "listbanned (none)": BANLIST,
     "after restart: listbanned (none)": BANLIST,
     "after restart: listbanned": BANLIST,
@@ -124,8 +123,13 @@ KNOWN = {
 fails = 0
 
 
-def row(name, core, iron, same, raw=None):
+def row(name, core, iron, same, raw=None, moved=None):
     global fails
+    if moved:
+        # The same members or items in another order than divid's: a FAIL of its own kind
+        fails += 1
+        print(f"ORDER  {name}  {moved}  divid={core}  irondivid={iron}", flush=True)
+        return
     if name in KNOWN:
         reason, shape = KNOWN[name]
         if same:
@@ -354,7 +358,10 @@ def compare(name, c, i, vary=(), message=True):
     elif c[0] == "ok" and i[0] == "ok":
         d = differences(flatten(c[1], set(vary)), flatten(i[1], set(vary)))
         LAST_DIFF.update(k for k, _, _ in d)
-        if not d:
+        moved = member_order.difference(c[1], i[1])
+        if moved:
+            row(name, show(c), show(i), not d, (c, i), moved=moved)
+        elif not d:
             row(name, show(c), "same", True, (c, i))
         else:
             row(name, "; ".join(f"{k}={leaf(x)}" for k, x, _ in d[:6]),
@@ -420,7 +427,16 @@ def stop_all():
         n.stop()
 
 
+def stage_rows(label, seqs):
+    """The masternode sync stages of each node, compared with divid's as
+    sequences (INITIAL until the chain is synced, then SPORKS: one peer each)"""
+    for n, (c, i) in enumerate(((C1, I1), (C2, I2)), 1):
+        a, b = seqs[c.name], seqs[i.name]
+        row(f"{label} (node {n})", mnsync_stages.text(a), mnsync_stages.text(b), a == b)
+
+
 start_all()
+poller = mnsync_stages.StagePoller([C1, C2, I1, I2]).start()
 print(f"# divid {C1.rpc('getinfo').get('version')}, irondivid {I1.rpc('getinfo').get('version')}", flush=True)
 # A chain of a few blocks on node 1 of each pair, followed by node 2
 for a, b in PAIRS:
@@ -453,11 +469,14 @@ def replies(prefix):
     both(f"{p}getmasternodecount", "getmasternodecount")
     both(f"{p}listmasternodes", "listmasternodes")
     both(f"{p}getmasternodestatus (no masternode)", "getmasternodestatus")
-    both(f"{p}mnsync status", "mnsync", "status")
+    # The stage a node is at depends on when its sync took its last step;
+    # the stages over time have rows of their own (stage_rows)
+    both(f"{p}mnsync status", "mnsync", "status", vary={"currentMasternodeSyncStatus"})
     both(f"{p}listbanned (none)", "listbanned")
 
 
 replies("")
+stage_rows("mnsync stages from start", poller.stop(settle=12))
 
 # A version names the height at the time it is sent (Node.cpp:994-1005), and a
 # node asks a new peer for blocks whatever height it names (main.cpp:1130-1142):
@@ -536,6 +555,7 @@ both("listbanned (after ban 127.0.0.1)", "listbanned", vary={"banned_until", "ba
 # keeps them in memory (PeerBanningService.cpp:7-8)
 stop_all()
 start_all()
+poller = mnsync_stages.StagePoller([C1, C2, I1, I2]).start()
 time.sleep(5)
 both("after restart: listbanned", "listbanned", vary={"banned_until", "ban_created"})
 both("after restart: getconnectioncount", "getconnectioncount")
@@ -543,6 +563,7 @@ both("clearbanned", "clearbanned")
 both("listbanned (after clearbanned)", "listbanned")
 need(wait_for(connected, 90), "a pair did not connect again after clearbanned")
 replies("after restart: ")
+stage_rows("mnsync stages after restart", poller.stop(settle=12))
 
 stop_all()
 print(f"FAILS {fails}", flush=True)

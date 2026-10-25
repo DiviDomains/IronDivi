@@ -23,6 +23,9 @@ import time
 import urllib.error
 import urllib.request
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "lib"))
+import member_order  # noqa: E402  (scripts/lib: the order check the replies scripts share)
+
 IRONDIVID, DIVID, PORT_BASE, WORK = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
 # For the proof that a difference is caught: irondivid's reply of the named row is
 # changed before it is compared
@@ -71,8 +74,13 @@ def known(name):
     return KNOWN.get(name.split(": ", 1)[1]) if name.startswith("after restart: ") else None
 
 
-def row(name, core, iron, same):
+def row(name, core, iron, same, moved=None):
     global fails
+    if moved:
+        # The same members or items in another order than divid's: a FAIL of its own kind
+        fails += 1
+        print(f"ORDER  {name}  {moved}  divid={core}  irondivid={iron}"[:400], flush=True)
+        return
     reason = known(name)
     if reason:
         word = "KNOWN" if not same else "FAIL"
@@ -98,7 +106,7 @@ class Node:
             "regtest=1", f"port={self.p2p}", f"rpcport={self.rpcport}",
             f"rpcuser=replies{index}", f"rpcpassword={password}",
             "daemon=0", "printtoconsole=0", "server=1", "discover=0", "listenonion=0",
-            "bind=127.0.0.1", "dnsseed=0", "staking=0",
+            "bind=127.0.0.2", "rpcbind=127.0.0.2", "rpcallowip=127.0.0.0/8", "dnsseed=0", "staking=0",
         ] + list(extra_conf)
         fd = os.open(os.path.join(self.dir, "divi.conf"), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w") as f:
@@ -117,7 +125,7 @@ class Node:
     def call(self, method, *params):
         """('ok', result) or ('err', code, message)"""
         body = json.dumps({"jsonrpc": "1.0", "id": 1, "method": method, "params": list(params)}).encode()
-        req = urllib.request.Request(f"http://127.0.0.1:{self.rpcport}/", data=body,
+        req = urllib.request.Request(f"http://127.0.0.2:{self.rpcport}/", data=body,
                                      headers={"Authorization": "Basic " + self.auth, "Content-Type": "text/plain"})
         try:
             with urllib.request.urlopen(req, timeout=RPC_TIMEOUT) as r:
@@ -218,6 +226,7 @@ def compare(name, core, iron, drop=MOMENT | NOTES, order=None):
         row(name, short(core), short(iron), same)
         return
     a, b = strip(core[1], drop), strip(iron[1], drop)
+    moved = member_order.difference(a, b)
     if order and isinstance(a, list) and isinstance(b, list):
         a, b = sorted(a, key=order), sorted(b, key=order)
     a, b = unordered(a), unordered(b)
@@ -226,7 +235,7 @@ def compare(name, core, iron, drop=MOMENT | NOTES, order=None):
         safe = "".join(ch if ch.isalnum() else "_" for ch in name)[:80]
         with open(os.path.join(DUMP, safe + ".json"), "w") as f:
             json.dump({"divid": a, "irondivid": b}, f, indent=1, sort_keys=True)
-    row(name, short(core), d or short(iron), d is None)
+    row(name, short(core), d or short(iron), d is None, moved=moved)
 
 
 def unordered(v):
@@ -320,7 +329,7 @@ if not C.wait_ready():
     print(f"FAIL   start: divid did not answer within {START_TIMEOUT} s", flush=True)
     sys.exit(1)
 phrase = C.rpc("dumphdinfo")["mnemonic"]
-I = Node("irondivid", IRONDIVID, 1, ["listen=0", f"connect=127.0.0.1:{PORT_BASE}"],
+I = Node("irondivid", IRONDIVID, 1, ["listen=0", f"connect=127.0.0.2:{PORT_BASE}"],
          env={"WALLET_MNEMONIC": phrase})
 del phrase
 if not I.wait_ready():

@@ -106,7 +106,7 @@ fn block_not_later_than_parent_mtp_is_rejected_on_the_tip() {
     let mtp = chain.get_median_time_past(&chain.tip().unwrap()).unwrap();
     let bad = block_on(12, parent, mtp, EASY_BITS, 0x77, vec![]);
     let msg = err_text(chain.accept_block(bad));
-    assert!(msg.contains("not greater than median time past"), "{msg}");
+    assert!(msg.contains("time-too-old"), "{msg}");
     let ok = block_on(12, parent, mtp + 1, EASY_BITS, 0x78, vec![]);
     assert!(chain.accept_block(ok).is_ok());
 }
@@ -134,7 +134,7 @@ fn block_not_later_than_parent_mtp_is_rejected_on_a_side_chain() {
         .unwrap();
     let bad = block_on(2, f1h, mtp, EASY_BITS, 0x41, vec![]);
     let msg = err_text(chain.accept_block(bad));
-    assert!(msg.contains("not greater than median time past"), "{msg}");
+    assert!(msg.contains("time-too-old"), "{msg}");
 }
 
 /// Core `ChainExtensionService.cpp:308-311`: a block is refused when

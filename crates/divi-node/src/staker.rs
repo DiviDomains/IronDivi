@@ -286,6 +286,9 @@ pub enum StakeResult {
     NoProofFound,
     /// Rate limited - too soon to try again
     RateLimited,
+    /// A kernel was found on a locked wallet and its key is derived from the
+    /// encrypted HD seed, so Divi Core's GetKey throws while signing
+    LockedHdKey,
     /// Error during staking
     Error(String),
 }
@@ -365,7 +368,12 @@ pub struct BlockOverrides {
     pub bits_shift: Option<u32>,
 }
 
-/// Why `generateblock` made no block
+/// Divi Core's GetKey on a key of an encrypted HD seed while the wallet is
+/// locked (wallet.cpp:544); the RPC server answers it as -1
+/// (rpcserver.cpp:1107-1108)
+pub const LOCKED_HD_KEY: &str = "GetKey: DecryptHDChainSeed failed";
+
+/// Why `setgenerate` or `generateblock` made no block
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GenerateBlockError {
     /// Refused before a block was made, with Divi Core's message
@@ -492,7 +500,8 @@ impl Staker {
     /// a locked coin does not, AvailableUtxoCalculator.cpp:91)
     pub fn has_mintable_coins(&self) -> bool {
         let height = self.chain.height();
-        let now = current_timestamp() as u32;
+        // GetAdjustedTime (wallet.cpp:1477)
+        let now = adjusted_timestamp() as u32;
         let maturity = self.coinbase_maturity();
         let (min_amount, min_age) = {
             let c = self.config.read();
@@ -526,9 +535,12 @@ impl Staker {
             .height
             .and_then(|h| self.chain.get_block_index_by_height(h).ok().flatten())
             .map(|idx| idx.time);
-        match self.wallet.get_transaction(&utxo.txid) {
-            Some(record) => Some(u32::try_from(record.timestamp).unwrap_or(u32::MAX)),
-            None => block_time,
+        match self.wallet.tx_times(&utxo.txid) {
+            (0, 0) => block_time,
+            (received, smart) => {
+                let time = if smart != 0 { smart } else { received };
+                Some(u32::try_from(time).unwrap_or(u32::MAX))
+            }
         }
     }
 
@@ -762,6 +774,9 @@ impl Staker {
                     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
                     continue; // Skip the default sleep at the end
                 }
+                StakeResult::LockedHdKey => {
+                    info!("Staking error: {}", LOCKED_HD_KEY);
+                }
                 StakeResult::Error(e) => {
                     info!("Staking error: {}", e);
                 }
@@ -869,24 +884,29 @@ impl Staker {
     /// their hashes. Proof-of-work up to the last PoW height, proof-of-stake
     /// after it, as Divi Core does. The staking loop's pacing guards (rate
     /// limit, stale tip, minimum coin age, reserve balance) do not apply.
-    pub fn generate_blocks(&self, n: u32) -> Result<Vec<Hash256>, String> {
+    ///
+    /// A work block pays a keypool key, which a locked wallet still hands out
+    /// (CoinMinter.cpp:141-158). A stake block on a locked wallet is searched
+    /// for as on an unlocked one and fails where Divi Core signs it: `Refused`
+    /// with GetKey's message for a key of the HD seed, `Failed` otherwise.
+    pub fn generate_blocks(&self, n: u32) -> Result<Vec<Hash256>, GenerateBlockError> {
+        use GenerateBlockError::Failed;
         let _producing = self.producing.lock();
         let mut hashes = Vec::with_capacity(n as usize);
         for _ in 0..n {
-            let tip = self.chain.tip().ok_or("no chain tip")?;
+            let tip = self
+                .chain
+                .tip()
+                .ok_or_else(|| Failed("no chain tip".to_string()))?;
             let height = tip.height + 1;
-            // A work block pays a keypool key, which a locked wallet still
-            // hands out; only a stake block needs the wallet unlocked
-            // (CoinMinter.cpp:141-158)
             let block = if height <= divi_storage::chain::LAST_POW_BLOCK {
-                self.build_work_block(&tip)?
-            } else if self.wallet.is_locked() {
-                return Err("wallet is locked".to_string());
+                self.build_work_block(&tip).map_err(Failed)?
             } else {
                 self.build_generated_stake_block(&tip)?
             };
             let block_hash = compute_block_hash(&block.header);
-            self.accept_own_block(&block, block_hash, height)?;
+            self.accept_own_block(&block, block_hash, height)
+                .map_err(Failed)?;
             hashes.push(block_hash);
         }
         Ok(hashes)
@@ -903,9 +923,8 @@ impl Staker {
         overrides: &BlockOverrides,
     ) -> Result<Hash256, GenerateBlockError> {
         use GenerateBlockError::{Failed, Refused};
-        if self.wallet.is_locked() {
-            return Err(Failed("wallet is locked".to_string()));
-        }
+        // A locked wallet mines as in setgenerate: the same createNewBlock
+        // (rpcmining.cpp:200-208)
         let _producing = self.producing.lock();
         let tip = self
             .chain
@@ -920,12 +939,12 @@ impl Staker {
         }
         *self.next_block_txs.lock() = Some((overrides.ignore_mempool, overrides.extra_txs.clone()));
         let built = if work {
-            self.build_work_block(&tip)
+            self.build_work_block(&tip).map_err(Failed)
         } else {
             self.build_generated_stake_block(&tip)
         };
         *self.next_block_txs.lock() = None;
-        let mut block = built.map_err(Failed)?;
+        let mut block = built?;
 
         if work {
             // Core signs a changed proof-of-work block with a pay-to-pubkey
@@ -992,9 +1011,11 @@ impl Staker {
         Err("Sign failed: the coinstake output is not a key hash, key or vault".to_string())
     }
 
-    /// Earliest time a block on `tip` may carry: now, but past the median time
+    /// Earliest time a block on `tip` may carry: now on the network-adjusted
+    /// clock, but past the median time (BlockFactory.cpp:77,
+    /// BlockProofProver.cpp:36)
     fn next_block_time(&self, tip: &divi_storage::BlockIndex) -> u32 {
-        (current_timestamp() as u32).max(self.get_median_time_past(&tip.hash) + 1)
+        (adjusted_timestamp() as u32).max(self.get_median_time_past(&tip.hash) + 1)
     }
 
     /// A proof-of-work block on `tip` whose coinbase pays this wallet
@@ -1044,12 +1065,51 @@ impl Staker {
 
     /// A proof-of-stake block on `tip`, its search starting past the median
     /// time so blocks made back to back stay valid
-    fn build_generated_stake_block(&self, tip: &divi_storage::BlockIndex) -> Result<Block, String> {
+    fn build_generated_stake_block(
+        &self,
+        tip: &divi_storage::BlockIndex,
+    ) -> Result<Block, GenerateBlockError> {
+        use GenerateBlockError::{Failed, Refused};
         match self.build_stake_block(tip, self.next_block_time(tip)) {
             StakeResult::Success { block, .. } => Ok(block),
-            StakeResult::NoStakeableUtxos => Err("no coins to stake".to_string()),
-            StakeResult::Error(e) => Err(e),
-            _ => Err("no coin found a proof of stake".to_string()),
+            StakeResult::NoStakeableUtxos => Err(Failed("no coins to stake".to_string())),
+            StakeResult::LockedHdKey => Err(Refused(LOCKED_HD_KEY.to_string())),
+            StakeResult::Error(e) => Err(Failed(e)),
+            _ => Err(Failed("no coin found a proof of stake".to_string())),
+        }
+    }
+
+    /// What signing the coinstake on a locked wallet comes to, as in Divi
+    /// Core, which finds the kernel first and only then signs with its key
+    /// (PoSTransactionCreator.cpp:368-371). A key of the HD seed is derived on
+    /// the fly, and GetKey throws as the seed is encrypted (wallet.cpp:536-545):
+    /// the RPC answers -1 with that text. An imported key is not in memory, so
+    /// the signing fails and no block is made.
+    fn locked_kernel(&self, candidate: &StakeCandidate) -> StakeResult {
+        let key_hash = match candidate {
+            StakeCandidate::Vault(_, vault_script) => {
+                Some(Hash160::from_bytes(vault_script.vault_pubkey_hash))
+            }
+            StakeCandidate::Regular(utxo) => {
+                let bytes = utxo.script_pubkey.as_bytes();
+                if divi_script::standard::is_p2pkh(bytes) {
+                    let mut hash = [0u8; 20];
+                    hash.copy_from_slice(&bytes[3..23]);
+                    Some(Hash160::from_bytes(hash))
+                } else if divi_script::standard::is_p2pk(bytes) {
+                    Some(divi_crypto::hash160(&bytes[1..bytes.len() - 1]))
+                } else {
+                    None
+                }
+            }
+        };
+        let from_seed = key_hash
+            .and_then(|hash| self.wallet.keystore().get_key(&hash))
+            .is_some_and(|entry| entry.hd_path.is_some());
+        if from_seed {
+            StakeResult::LockedHdKey
+        } else {
+            StakeResult::Error("CreateCoinStake : failed to sign coinstake".to_string())
         }
     }
 
@@ -1167,7 +1227,11 @@ impl Staker {
     }
 
     fn try_stake(&self) -> StakeResult {
-        let current_time = current_timestamp() as u32;
+        // The coinstake's time and search window on the network-adjusted clock
+        // (PoSTransactionCreator.cpp:335-341); the rate limit and the attempt
+        // record on the node's own (CoinMinter.cpp:89, PoSTransactionCreator.cpp:236)
+        let current_time = adjusted_timestamp() as u32;
+        let local_time = current_timestamp();
 
         // A locked wallet cannot sign a coinstake; say so once instead of
         // failing every candidate at debug level
@@ -1226,13 +1290,13 @@ impl Staker {
 
         // CRITICAL: Rate limiting check (matches C++ limitStakingSpeed)
         // Check if we tried at this height recently (before updating the timestamp)
-        if self.limit_staking_speed(current_height, current_time as u64) {
+        if self.limit_staking_speed(current_height, local_time) {
             return StakeResult::RateLimited;
         }
 
         // Record this staking attempt (matches C++ PoSTransactionCreator)
         // Only record if we pass rate limiting
-        self.record_staking_attempt(current_height, current_time as u64);
+        self.record_staking_attempt(current_height, local_time);
 
         self.build_stake_block(&tip, current_time)
     }
@@ -1356,6 +1420,17 @@ impl Staker {
             stakeable.iter().map(StakeCandidate::Regular).collect();
         for (utxo, vault_script) in &vault_utxos {
             candidates.push(StakeCandidate::Vault(utxo, vault_script.clone()));
+        }
+        // Divi Core tries its stake set in the set's order, by outpoint
+        // (std::set<StakableCoin>, StakableCoin.h:20-23;
+        // PoSTransactionCreator.cpp:261), and shuffles it only with -vault
+        // (PoSTransactionCreator.cpp:63-72, :99). The first kernel found is
+        // the one staked, or on a locked wallet the one whose key is wanted.
+        if self.wallet.vault_mode() {
+            use rand::seq::SliceRandom;
+            candidates.shuffle(&mut rand::thread_rng());
+        } else {
+            candidates.sort_by_key(|c| (c.utxo().txid, c.utxo().vout));
         }
 
         // Update stake weight for status (include vault UTXOs)
@@ -1521,6 +1596,12 @@ impl Staker {
                     "Found valid stake for UTXO {}:{} at timestamp {} (MTP={}, current_time={})",
                     utxo.txid, utxo.vout, timestamp, mtp, current_time
                 );
+                // Only setgenerate gets here locked (the staking loop waits
+                // for an unlock, as CanStakeCoins does): the search needs no
+                // secret key, the signing does
+                if self.wallet.is_locked() {
+                    return self.locked_kernel(candidate);
+                }
 
                 // Create the block
                 match self.create_stake_block(tip, candidate, timestamp, n_bits, &combine_pool) {
@@ -1721,12 +1802,14 @@ impl Staker {
                 treasury_cycle,
                 treasury_lottery_cycle,
             );
-            let (treasury_payment, charity_payment) =
-                divi_consensus::block_subsidy::calculate_weighted_treasury_payment(
+            let (treasury_payment, charity_payment) = self.chain.with_sporks(|sporks| {
+                divi_consensus::block_subsidy::calculate_weighted_treasury_payment_with(
                     height,
                     payment_cycle,
                     halving_interval,
-                );
+                    sporks,
+                )
+            });
 
             info!(
                 "Treasury block {} payments: {} DIVI treasury, {} DIVI charity",
@@ -2154,13 +2237,8 @@ impl Staker {
     /// what would have gone to masternodes), but this is handled at the
     /// block validation level, not here.
     fn calculate_stake_reward(&self, height: u32) -> Amount {
-        // Use the proper block subsidy calculation from divi-consensus
-        let halving_interval = match self.chain.network_type() {
-            divi_storage::NetworkType::Mainnet => 525_600u32,
-            divi_storage::NetworkType::Testnet => 1_000u32,
-            divi_storage::NetworkType::Regtest => 100u32,
-        };
-        let rewards = divi_consensus::block_subsidy::get_block_subsidy(height, halving_interval);
+        // The chain's rewards, which the network's sporks 13 and 15 can change
+        let rewards = self.chain.block_rewards(height);
 
         // After DeprecateMasternodes fork (MTP >= Aug 23 2023), the masternode
         // reward is folded into the staker reward. Since PrivateDivi started in
@@ -2251,10 +2329,15 @@ fn older_than(now: u32, coin_time: u32, min_age: u32) -> bool {
     i64::from(now) - i64::from(coin_time) > i64::from(min_age)
 }
 
-/// Get current Unix timestamp
-/// The node's clock (Core GetAdjustedTime and GetTime: setmocktime sets it)
+/// The node's clock (Core GetTime: setmocktime sets it)
 fn current_timestamp() -> u64 {
     divi_primitives::clock::now().max(0) as u64
+}
+
+/// The network-adjusted clock (Core GetAdjustedTime: the node's clock plus the
+/// peers' time offset, timedata.cpp:35-38)
+fn adjusted_timestamp() -> u64 {
+    divi_primitives::clock::adjusted_now().max(0) as u64
 }
 
 /// Create a minimal coinbase marker transaction for PoS blocks
@@ -2380,40 +2463,32 @@ impl BlockAssembly {
     }
 }
 
-/// A candidate's place in Divi Core's `TxPriorityCompare`
-/// (BlockMemoryPoolTransactionCollector.cpp:65-87): by priority with ties by
-/// fee rate, or by fee rate with ties by priority. Core's heap leaves equal
-/// keys in no set order; here they go by txid.
+/// A candidate in Divi Core's block assembly heap: what `TxPriorityCompare`
+/// weighs (BlockMemoryPoolTransactionCollector.cpp:65-87)
+#[derive(Clone)]
 struct HeapItem {
-    by_fee: bool,
     index: usize,
     priority: f64,
     fee_rate: i64,
-    txid: Hash256,
 }
 
-impl PartialEq for HeapItem {
-    fn eq(&self, other: &Self) -> bool {
-        self.cmp(other) == std::cmp::Ordering::Equal
-    }
-}
-impl Eq for HeapItem {}
-impl PartialOrd for HeapItem {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-impl Ord for HeapItem {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        let by_priority = self.priority.total_cmp(&other.priority);
-        let by_fee = self.fee_rate.cmp(&other.fee_rate);
-        let order = if self.by_fee {
-            by_fee.then(by_priority)
+/// Divi Core's TxPriorityCompare (BlockMemoryPoolTransactionCollector.cpp:66-87):
+/// true when `a` goes after `b`; by priority then fee rate, or by fee rate then
+/// priority once the block is filled by fee. Equal candidates are left where
+/// the heap steps put them (core_heap).
+fn tx_priority_less(by_fee: bool) -> impl Fn(&HeapItem, &HeapItem) -> bool {
+    move |a, b| {
+        if by_fee {
+            if a.fee_rate == b.fee_rate {
+                a.priority < b.priority
+            } else {
+                a.fee_rate < b.fee_rate
+            }
+        } else if a.priority == b.priority {
+            a.fee_rate < b.fee_rate
         } else {
-            by_priority.then(by_fee)
-        };
-        // The lower txid first among equal keys (a max-heap pops the greatest)
-        order.then_with(|| other.txid.cmp(&self.txid))
+            a.priority < b.priority
+        }
     }
 }
 
@@ -2439,11 +2514,21 @@ fn select_block_txs(
     maturity: u32,
     utxo: impl Fn(&OutPoint) -> Option<divi_storage::Utxo>,
 ) -> Vec<Transaction> {
-    use std::collections::{BinaryHeap, HashSet};
-    let candidates: Vec<_> = candidates
+    use crate::core_heap::{make_heap, pop_heap, push_heap};
+    use std::collections::HashSet;
+    // In the order Divi Core walks its mempool, a std::map by txid: the txids
+    // as numbers, compared from the last byte (uint256.cpp:139-148)
+    let mut candidates: Vec<_> = candidates
         .into_iter()
         .filter(|c| c.tx.is_final(height, time))
         .collect();
+    candidates.sort_by(|a, b| {
+        a.txid
+            .as_bytes()
+            .iter()
+            .rev()
+            .cmp(b.txid.as_bytes().iter().rev())
+    });
     let index: HashMap<Hash256, usize> = candidates
         .iter()
         .enumerate()
@@ -2465,24 +2550,27 @@ fn select_block_txs(
         }
     }
     let mut by_fee = limits.priority_size == 0;
-    let item = |i: usize, by_fee: bool| HeapItem {
-        by_fee,
+    let item = |i: usize| HeapItem {
         index: i,
         priority: candidates[i].priority,
         fee_rate: candidates[i].fee_rate_per_kb,
-        txid: candidates[i].txid,
     };
-    let mut heap: BinaryHeap<HeapItem> = (0..candidates.len())
+    // vecPriority and its heap (:202-235, :276-277)
+    let mut heap: Vec<HeapItem> = (0..candidates.len())
         .filter(|&i| needs[i] == 0 && !blocked[i])
-        .map(|i| item(i, by_fee))
+        .map(item)
         .collect();
+    make_heap(&mut heap, tx_priority_less(by_fee));
 
     let mut kept = Vec::new();
     let mut created: HashMap<OutPoint, TxOut> = HashMap::new();
     let mut spent: HashSet<OutPoint> = HashSet::new();
     let mut block_size = 1000usize;
     let mut block_sig_ops = 100u32;
-    while let Some(best) = heap.pop() {
+    while !heap.is_empty() {
+        let best = heap[0].clone();
+        pop_heap(&mut heap, tx_priority_less(by_fee));
+        heap.pop();
         let c = &candidates[best.index];
         let tx = &c.tx;
         let size = c.size;
@@ -2504,7 +2592,7 @@ fn select_block_txs(
             // This one is still weighed below, now by fee
             if block_size + size >= limits.priority_size || must_pay {
                 by_fee = true;
-                heap = heap.into_iter().map(|h| item(h.index, true)).collect();
+                make_heap(&mut heap, tx_priority_less(true));
             }
         } else if !c.prioritised
             && c.fee_rate_per_kb < limits.fee_floor_per_kb
@@ -2570,7 +2658,9 @@ fn select_block_txs(
         for &child in waiting.get(&c.txid).map(Vec::as_slice).unwrap_or(&[]) {
             needs[child] -= 1;
             if needs[child] == 0 && !blocked[child] {
-                heap.push(item(child, by_fee));
+                // AddDependingTransactionsToPriorityQueue (:149-167)
+                heap.push(item(child));
+                push_heap(&mut heap, tx_priority_less(by_fee));
             }
         }
     }
@@ -3981,6 +4071,41 @@ mod tests {
             &set,
         );
         assert_eq!(ids(&kept), ids(&[t[0].clone(), t[1].clone(), t[2].clone()]));
+    }
+
+    /// Candidates that tie on priority and fee rate (a chain's transactions,
+    /// many sends of one wallet) come out as Divi Core's heap gives them: the
+    /// pool in txid order (mapTx), then std::make_heap and std::pop_heap
+    /// (BlockMemoryPoolTransactionCollector.cpp:276-337). For ten equal keys
+    /// libstdc++ gives the positions 6, 2, 0, 1, 3, 5, 7, 4, 9, 8
+    #[test]
+    fn equal_candidates_follow_divi_cores_heap() {
+        let coins: Vec<OutPoint> = (1..=10).map(|n| op(n, 0)).collect();
+        let set = utxos(
+            coins
+                .iter()
+                .map(|o| (*o, chain_coin(10, OP_TRUE, 1, false)))
+                .collect(),
+        );
+        let txs: Vec<Transaction> = coins
+            .iter()
+            .enumerate()
+            .map(|(i, c)| spend_tx(&[*c], i as u32 + 1))
+            .collect();
+        let mut by_txid = txs.clone();
+        by_txid.sort_by_key(|t| t.txid().to_string());
+        let expected: Vec<Transaction> = [6, 2, 0, 1, 3, 5, 7, 4, 9, 8]
+            .iter()
+            .map(|&i| by_txid[i].clone())
+            .collect();
+        for assembly in [
+            BlockAssembly::new(750_000, 0, 0, 10_000),
+            BlockAssembly::new(750_000, 50_000, 0, 10_000),
+        ] {
+            let pool = txs.iter().map(|t| cand(t, HIGH, 20_000, &[])).collect();
+            let kept = select_block_txs(pool, 50, 0, &assembly, 20, &set);
+            assert_eq!(ids(&kept), ids(&expected));
+        }
     }
 
     /// The sizes are kept within -blockmaxsize, which is kept between 1,000

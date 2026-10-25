@@ -10,6 +10,7 @@ name = "irondivid"
 path = "src/main.rs"
 
 [dependencies]
+chrono = { workspace = true }
 # Internal crates
 divi-node = { workspace = true }
 divi-network = { workspace = true }
@@ -49,4 +50,5 @@ fault-injection = ["divi-storage/fault-injection"]
 
 [dev-dependencies]
 divi-test-support = { workspace = true }
+rocksdb = { workspace = true }
 tempfile = { workspace = true }
