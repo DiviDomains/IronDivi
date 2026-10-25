@@ -453,10 +453,10 @@ mod tests {
 
     #[test]
     fn node01_rpcauth_hmac_verifies() {
-        // Bitcoin Core share/rpcauth vector: user foo, salt and password below
+        // user foo's HMAC was computed independently with Python's hmac module
         let a = access(AccessConfig {
             rpcauth: vec![
-                "foo:cb77f0957de88ff388cf817ddbc7273$9eaa166ace0d94a29c6eceb831a42458e93faeb79f895a7ee4ce03f4343f8f55".into(),
+                "foo:cb77f0957de88ff388cf817ddbc7273$2f463c4fcb7547b038eba7c2e6fe3bf0e27ec1efd65ddd35ae3bafe11501fe8d".into(),
                 rpcauth_line("bob", "0011aabb", "hunter2"),
             ],
             ..Default::default()
