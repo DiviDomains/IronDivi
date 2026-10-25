@@ -45,6 +45,7 @@ SEED=7 scripts/random-sequences/run.sh target/release ~/divi-3.0.0/bin 53850 /va
 | `RANDOM_SEQUENCES_TIMEOUT` | seconds before the run is stopped (1500) |
 | `RANDOM_SEQUENCES_LOGS` | a folder to copy the four logs to, for each episode and on a FAIL |
 | `RANDOM_SEQUENCES_DEBUG` | `1`: irondivid logs at debug level and divid with `debug=mempool` |
+| `RANDOM_SEQUENCES_TRACE` | `1`: before and after each `invalidateblock`, the node's mempool is printed, each transaction with its inputs (`txid:vout@height/kind`) and its outputs |
 
 A run of 200 steps takes 2 to 10 minutes. However it ends, all nodes are stopped and their directories deleted. It
 needs bash and python3 (standard library only).
@@ -92,8 +93,11 @@ episode) and the remaining steps, so every comparison stays exact:
   in its wallet map, ordered by txid.
 - **maturity after a reorg:** after an `invalidateblock`, the two sides dropped different mempool transactions, and
   every one of them spends a coinbase or coinstake output that is immature at the new height. divid's
-  `removeCoinbaseSpends` drops these too (`txmempool.cpp:139-157`). Each side had spent a different coin of the same
-  value, since divid's coin choice among equal coins is by txid order.
+  `removeCoinbaseSpends` drops these too (`txmempool.cpp:139-157`), at each block it disconnects
+  (`ChainTipManager.cpp:175-182`). Each side had spent a different coin of the same value, since divid's coin choice
+  among equal coins is by txid order. The dropped transactions are those the invalidated node held before the
+  invalidate (its own sends count: the other node may never have had them, when it was restarted and a send reaches
+  it again only by the random rebroadcast) and those the other node holds, less what the chain confirms again.
 - **divid balance cache:** divid's `getbalance` disagrees with its own unspent coins (`listunspent 1`), while
   irondivid's agrees with the same coins. divid keeps each wallet transaction's balance in
   `CachedUtxoBalanceCalculator` (`CachedUtxoBalanceCalculator.cpp:13-30`), recomputed only when a wallet transaction

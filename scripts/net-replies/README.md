@@ -52,6 +52,7 @@ node answers, so no other port is touched. The calls are made on node 1 of each 
 | `getaddednodeinfo` | `false`, `false <node>`, `true <node>`, a node not added (-24), after `remove` and after `onetry`; an address without a port |
 | `spork` | an update without the spork key (`failure`), an unknown spork (`Invalid spork name`), no arguments (help) |
 | masternode | `listmasternodes <filter>`, `mnsync <bad mode>` (help), `masternode status` (not a divid method) |
+| sync stages | each node's masternode sync stages from the start and after the restart of all four, node 1 and node 2 of each pair compared (0, 1: one peer each, so SPORKS, `masternode-sync.cpp:424-454`); `mnsync status` compares the stage by its type, the moment it is read being each node's own. `scripts/lib/mnsync_stages.py` polls both nodes side by side; each node's stages are kept in order, each once, and compared as sequences, not by the moment a node moves (its sync takes a step at most every five seconds, `masternode-sync.cpp:297-333`). |
 | `setban`, `disconnectnode` | add, add again, a bad subnet, an absolute end time (and its `banned_until`), removing an address not banned; `disconnectnode` of an address not connected |
 | `ban` | an address with no peer, `outdated`, node 2's address; `getconnectioncount` and `listbanned` after it; the ban across the restart; `clearbanned` |
 | start height | node 2 stops, node 1 mines 2 blocks, node 2 starts again: `getpeerinfo` `startingheight` on node 1 (5, node 2's height) and node 2 (7, the height node 1 has now, reached after it started: Node.cpp:994-1005); node 2's `getblockcount` once it has caught up with no new block mined (divid asks a new peer for blocks whatever height it names, main.cpp:1130-1142) |
@@ -93,9 +94,6 @@ Open (not closed yet):
   `NetworkLocalAddressHelpers.cpp:224-227`); irondivid does not serve bloom filters and gives 1.
 - `getpeerinfo` `synced_headers`, `synced_blocks`: irondivid gives -1; divid the heights it has synced with the peer
   (`rpcnet.cpp:139-140`).
-- `mnsync status` `currentMasternodeSyncStatus`: divid gives its masternode sync phase (0, and 1 after the restart,
-  on regtest with no masternodes: `rpcmisc.cpp:212`, `masternode-sync.h:42-47`); irondivid has no masternode sync
-  and gives 999 (finished).
 - `getaddednodeinfo` of a node given without a port: divid keeps the node as written (`192.0.2.3`); irondivid keeps
   the address, with the network's port (`192.0.2.3:51476`).
 

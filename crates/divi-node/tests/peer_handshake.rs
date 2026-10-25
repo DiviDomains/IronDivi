@@ -82,7 +82,14 @@ async fn connection_to_self_is_dropped() {
         loop {
             let left = deadline.saturating_duration_since(tokio::time::Instant::now());
             match tokio::time::timeout(left, events.recv()).await {
-                Ok(Ok(PeerEvent::Connected { .. })) => connected += 1,
+                // The harness's readiness probe counts as connected once its
+                // version is read; only the node's own version is the self
+                // connection
+                Ok(Ok(PeerEvent::Connected { version, .. }))
+                    if version.user_agent.starts_with("/IronDivi:") =>
+                {
+                    connected += 1
+                }
                 Ok(Ok(_)) => {}
                 Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
                 Ok(Err(_)) | Err(_) => return connected,
@@ -129,10 +136,11 @@ async fn ping_between_version_and_verack_is_answered() {
     assert_eq!(p.expect("pong", WAIT).await, Some(nonce.to_vec()));
 }
 
-/// The other messages between version and verack are handled too, once the
-/// verack is in: an inventory list over 50,000 items costs 20 (main.cpp:563-566)
+/// The other messages after the version are handled as they come, with no
+/// verack from the peer: an inventory list over 50,000 items costs 20
+/// (main.cpp:484-514 checks only for the version, :563-566)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn message_between_version_and_verack_is_handled_after_it() {
+async fn message_after_the_version_is_handled_without_a_verack() {
     let t = TestNode::start().await;
     let mut p = RawPeer::connect(&t, "127.0.0.2").await;
     p.send(
@@ -143,9 +151,36 @@ async fn message_between_version_and_verack_is_handled_after_it() {
     assert!(p.expect("verack", WAIT).await.is_some(), "node verack");
 
     p.send("inv", &inv_payload(1, 50_001)).await;
-    p.send("verack", &[]).await;
     assert_eq!(t.wait_score(p.ip, 20).await, Some(20));
     assert!(p.alive().await);
+}
+
+/// What goes out to an inbound peer once its version is handled comes before
+/// its verack, which the node does not wait for: version, verack, sporkcount,
+/// then a ping and getblocks (main.cpp:400-420, :454; net.cpp:871-893 sends
+/// to any peer with a version, Node.cpp:1025-1036)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn inbound_peer_gets_sporkcount_ping_and_getblocks_before_its_verack() {
+    let t = TestNode::start().await;
+    let mut p = RawPeer::connect(&t, "127.0.0.2").await;
+    p.send(
+        "version",
+        &version_payload(PROTOCOL_VERSION, rand_nonce(), b"/raw:1/"),
+    )
+    .await;
+    let mut got = Vec::new();
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while got.len() < 5 {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match p.recv(left).await {
+            Recv::Message(c, _) => got.push(c),
+            Recv::Closed | Recv::Timeout => break,
+        }
+    }
+    assert_eq!(
+        got,
+        ["version", "verack", "sporkcount", "ping", "getblocks"]
+    );
 }
 
 /// getpeerinfo shows a peer's version, sub-version and start height as soon
@@ -182,4 +217,38 @@ async fn startingheight_is_minus_one_before_any_version() {
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     assert_eq!(stats.version.load(Ordering::Relaxed), 0);
     assert_eq!(stats.start_height.load(Ordering::Relaxed), -1);
+}
+
+/// What goes out to an outbound peer once its version is handled comes before
+/// its verack, which the node does not wait for: after the node's version, a
+/// verack and getaddr (main.cpp:415-442)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn outbound_peer_gets_verack_and_getaddr_before_its_verack() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.3:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let _t = TestNode::start_with(|c| c.p2p.connect = vec![addr.to_string()]).await;
+    let (stream, _) = tokio::time::timeout(WAIT, listener.accept())
+        .await
+        .expect("the node dials")
+        .unwrap();
+    let mut p = RawPeer {
+        stream,
+        ip: addr.ip(),
+    };
+    assert!(p.expect("version", WAIT).await.is_some(), "node version");
+    p.send(
+        "version",
+        &version_payload(PROTOCOL_VERSION, rand_nonce(), b"/raw:1/"),
+    )
+    .await;
+    let mut got = Vec::new();
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while got.len() < 2 {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match p.recv(left).await {
+            Recv::Message(c, _) => got.push(c),
+            Recv::Closed | Recv::Timeout => break,
+        }
+    }
+    assert_eq!(got, ["verack", "getaddr"]);
 }

@@ -334,6 +334,11 @@ impl RpcServer {
         self.masternode.set_network_list(list);
     }
 
+    /// The node's masternode sync, read and reset by mnsync
+    pub fn set_masternode_sync(&self, sync: divi_masternode::mnsync::SharedMasternodeSync) {
+        self.masternode.set_sync(sync);
+    }
+
     /// The masternodes' payment votes, read by getmasternodewinners
     pub fn set_masternode_votes(&self, votes: Arc<crate::mn_votes::MasternodeVotes>) {
         self.masternode.set_votes(votes);
@@ -465,7 +470,8 @@ impl RpcServer {
             info["balance"] = serde_json::json!(wallet["balance"].as_f64().unwrap_or(0.0));
         }
         info["blocks"] = serde_json::json!(height);
-        info["timeoffset"] = serde_json::json!(0);
+        // GetTimeOffset (rpcmisc.cpp:147)
+        info["timeoffset"] = serde_json::json!(divi_primitives::clock::time_offset());
         info["connections"] = serde_json::json!(connections);
         info["proxy"] = serde_json::json!("");
         info["difficulty"] = serde_json::json!(difficulty);
@@ -702,7 +708,6 @@ impl RpcServer {
             "getstakingstatus" => self.staking.get_staking_status(params),
             "getmintinginfo" => self.staking.get_minting_info(params),
             "setstaking" => self.staking.set_staking(params),
-            "reservebalance" => self.staking.reserve_balance(params),
             "getstakesplitthreshold" => self.staking.get_stake_split_threshold(params),
             "setstakesplitthreshold" => self.staking.set_stake_split_threshold(params),
 
@@ -765,7 +770,7 @@ impl RpcServer {
                 };
                 self.masternode.verify_masternode_setup(params, port)
             }
-            "mnsync" => self.masternode.mnsync(params),
+            "mnsync" => self.masternode.mnsync(params, self.blockchain.chain()),
 
             // Spork methods
             "spork" => self.spork.spork(params),
@@ -907,7 +912,6 @@ impl RpcServer {
                 "getstakingstatus" => "getstakingstatus\n\nReturns an object containing staking information.",
                 "getmintinginfo" => "getmintinginfo\n\nReturns detailed staking/minting information.",
                 "setstaking" => "setstaking true|false\n\nEnable or disable staking.",
-                "reservebalance" => "reservebalance ( true|false amount )\n\nShow or set reserve balance for staking.",
                 "getstakesplitthreshold" => "getstakesplitthreshold\n\nReturns the stake split threshold in DIVI (startup value: -stakesplitthreshold, default 20000).",
                 "setstakesplitthreshold" => "setstakesplitthreshold value\n\nSet the stake split threshold in whole DIVI for this run: a stake whose value plus reward exceeds it is paid back as two outputs; smaller coins of the same address are combined up to half of it.",
                 // Lite wallet (external address queries)
@@ -1081,7 +1085,6 @@ impl RpcServer {
                 "== Staking ==",
                 "getmintinginfo",
                 "getstakingstatus",
-                "reservebalance",
                 "getstakesplitthreshold",
                 "setstakesplitthreshold",
                 "setstaking",

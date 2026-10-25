@@ -57,6 +57,25 @@ impl Drop for KillOnDrop {
 
 /// A node with `blocks` work blocks and an encrypted wallet, locked
 fn locked_node(dir: &std::path::Path, blocks: u32) -> (KillOnDrop, u16) {
+    let (node, rpc_port) = started_node(dir);
+    ok(rpc_port, "setgenerate", serde_json::json!([blocks]));
+    lock(rpc_port);
+    (node, rpc_port)
+}
+
+/// Encrypt the wallet, which leaves it locked
+fn lock(rpc_port: u16) {
+    ok(
+        rpc_port,
+        "encryptwallet",
+        serde_json::json!(["throwaway test passphrase"]),
+    );
+    let info = ok(rpc_port, "getwalletinfo", serde_json::json!([]));
+    assert_eq!(info["encryption_status"], "locked", "{info}");
+}
+
+/// A regtest node with an empty chain and a new wallet
+fn started_node(dir: &std::path::Path) -> (KillOnDrop, u16) {
     let (child, rpc_port, _) = start_node(
         dir,
         |rpc_port, p2p_port| {
@@ -75,16 +94,7 @@ fn locked_node(dir: &std::path::Path, blocks: u32) -> (KillOnDrop, u16) {
         },
         |rpc_port| rpc(rpc_port, "getblockcount", serde_json::json!([])).is_some(),
     );
-    let node = KillOnDrop(child);
-    ok(rpc_port, "setgenerate", serde_json::json!([blocks]));
-    ok(
-        rpc_port,
-        "encryptwallet",
-        serde_json::json!(["throwaway test passphrase"]),
-    );
-    let info = ok(rpc_port, "getwalletinfo", serde_json::json!([]));
-    assert_eq!(info["encryption_status"], "locked", "{info}");
-    (node, rpc_port)
+    (KillOnDrop(child), rpc_port)
 }
 
 /// The error of a call that must fail
@@ -129,4 +139,57 @@ fn generateblock_on_a_locked_wallet_mines_as_setgenerate() {
     assert_eq!(err["code"], -1, "{err}\n{}", log_tail(dir.path()));
     assert_eq!(err["message"], "GetKey: DecryptHDChainSeed failed", "{err}");
     assert_eq!(ok(port, "getblockcount", serde_json::json!([])), 100);
+}
+
+/// Divi Core tries its stake set in outpoint order (std::set<StakableCoin>,
+/// StakableCoin.h:20-23; PoSTransactionCreator.cpp:261) and wants the key of
+/// the first kernel: on a locked wallet holding HD coinbases and one large coin
+/// on an imported key, the answer follows the lowest outpoint, -1 from GetKey
+/// for an HD key and -25 for the imported one (its signing fails)
+#[test]
+fn a_locked_stake_wants_the_key_of_the_lowest_outpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_node, port) = started_node(dir.path());
+    ok(port, "setgenerate", serde_json::json!([60]));
+    let key = divi_wallet::encode_wif(&[7u8; 32], true, divi_wallet::Network::Regtest);
+    ok(
+        port,
+        "importprivkey",
+        serde_json::json!([key, "imported", false]),
+    );
+    let imported = ok(
+        port,
+        "getaddressesbyaccount",
+        serde_json::json!(["imported"]),
+    )[0]
+    .clone();
+    let balance = ok(port, "getbalance", serde_json::json!(["*", 1]));
+    ok(
+        port,
+        "sendtoaddress",
+        serde_json::json!([imported, balance, "sweep_funds"]),
+    );
+    ok(port, "setgenerate", serde_json::json!([40]));
+    lock(port);
+
+    // The stake set at height 100: every coin at least 10 deep (no coinstake
+    // output yet), in outpoint order; uint256 orders as its hex reads
+    let mut coins: Vec<Value> = ok(port, "listunspent", serde_json::json!([10]))
+        .as_array()
+        .unwrap()
+        .clone();
+    coins.sort_by_key(|c| (c["txid"].as_str().unwrap().to_string(), c["vout"].as_u64()));
+    assert!(
+        coins.iter().any(|c| c["address"] == imported),
+        "the imported coin stakes"
+    );
+    assert!(coins.len() > 1, "HD coins stake too");
+    let want = if coins[0]["address"] == imported {
+        -25
+    } else {
+        -1
+    };
+
+    let err = error(port, "setgenerate", serde_json::json!([1]));
+    assert_eq!(err["code"], want, "{err}\n{}", log_tail(dir.path()));
 }
