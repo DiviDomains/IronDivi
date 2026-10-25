@@ -252,6 +252,12 @@ impl RpcServer {
     }
 
     /// Set the masternode manager
+    /// The masternodes the network announced (Core's list), read by
+    /// listmasternodes and getmasternodecount
+    pub fn set_masternode_list(&self, list: Arc<crate::mn_list::MasternodeList>) {
+        self.masternode.set_network_list(list);
+    }
+
     pub fn set_masternode_manager(&self, manager: divi_masternode::MasternodeManager) {
         self.masternode.set_manager(manager);
     }
@@ -354,13 +360,13 @@ impl RpcServer {
         let wallet_info = self.wallet.get_wallet_info(&Params::None).ok();
 
         // Staking status from staking subsystem
+        // Divi Core: "Staking Active" when the node tried to stake lately
+        // (rpcmisc.cpp:154-155), the bool getstakingstatus reports
         let staking_status_text = match self.staking.get_staking_status(&Params::None) {
-            Ok(info) => info["staking status"]
-                .as_str()
-                .unwrap_or("Staking Not Active")
-                .to_string(),
-            Err(_) => "Staking Not Active".to_string(),
-        };
+            Ok(info) if info["staking status"] == serde_json::Value::Bool(true) => "Staking Active",
+            _ => "Staking Not Active",
+        }
+        .to_string();
 
         let mut info = serde_json::json!({
             "version": "3.0.0.0",
@@ -628,12 +634,16 @@ impl RpcServer {
             "getlitewalletinfo" => self.lite_wallet.read().get_lite_wallet_info(params),
 
             // Masternode methods
-            "getmasternodecount" => self.masternode.get_masternode_count(params),
+            "getmasternodecount" => self
+                .masternode
+                .get_masternode_count(params, self.blockchain.chain()),
             "getmasternodestatus" => self.masternode.get_masternode_status(params),
             "getmasternodewinners" => self
                 .masternode
                 .get_masternode_winners(params, self.blockchain.tip_height()),
-            "listmasternodes" => self.masternode.list_masternodes(params),
+            "listmasternodes" => self
+                .masternode
+                .list_masternodes(params, self.blockchain.chain()),
             "setupmasternode"
             | "startmasternode"
             | "broadcaststartmasternode"
@@ -1193,10 +1203,9 @@ fn core_argument_types(method: &str) -> &'static [(usize, &'static str)] {
         "getrawmempool" => &[(0, "bool")],
         // rpcrawtransaction.cpp:139
         "getrawtransaction" => &[(1, "int")],
-        // rpcwallet.cpp:1499
-        "getreceivedbyaccount" => &[(0, "str"), (1, "int")],
-        // rpcwallet.cpp:1432
-        "getreceivedbyaddress" => &[(0, "str"), (1, "int")],
+        // getreceivedbyaccount reads minconf before the account, and
+        // getreceivedbyaddress minconf only for an address of the wallet: both
+        // read their arguments themselves
         // rpcwallet.cpp:2452
         "gettransaction" => &[(0, "str"), (1, "bool")],
         // rpcblockchain.cpp:330
@@ -1283,9 +1292,22 @@ fn core_argument_types(method: &str) -> &'static [(usize, &'static str)] {
     }
 }
 
+/// The calls whose arguments of `core_argument_types` Divi Core reads with no
+/// test for null first, so a null makes the getter throw too
+/// (rpcwallet.cpp:550, :1752, :1798-1808)
+fn getter_reads_null(method: &str) -> bool {
+    matches!(
+        method,
+        "addmultisigaddress"
+            | "getaccountaddress"
+            | "listreceivedbyaccount"
+            | "listreceivedbyaddress"
+    )
+}
+
 /// Refuse an argument of the wrong JSON type as json_spirit's getter does. A
 /// null is left to the call, as Divi Core mostly reads optional arguments only
-/// when they are not null.
+/// when they are not null, except for the calls of `getter_reads_null`.
 fn json_spirit_getter_check(method: &str, params: &Params) -> Result<(), RpcError> {
     let Params::Array(values) = params else {
         return Ok(());
@@ -1295,7 +1317,7 @@ fn json_spirit_getter_check(method: &str, params: &Params) -> Result<(), RpcErro
             continue;
         };
         let got = crate::wallet::json_spirit_type(value);
-        if value.is_null() || got == *want {
+        if (value.is_null() && !getter_reads_null(method)) || got == *want {
             continue;
         }
         return Err(RpcError::new(

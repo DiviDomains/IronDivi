@@ -160,6 +160,9 @@ pub struct Node {
     /// Masternode P2P message handler
     masternode_handler: Arc<MasternodeHandler>,
 
+    /// The masternodes the network announced, as Divi Core keeps them
+    masternode_list: Arc<divi_rpc::mn_list::MasternodeList>,
+
     /// Event broadcaster
     event_tx: broadcast::Sender<NodeEvent>,
 
@@ -643,6 +646,9 @@ impl Node {
 
         // Create masternode P2P handler
         let masternode_handler = Arc::new(MasternodeHandler::new(Arc::clone(&masternode_manager)));
+        // Kept in the datadir as Divi Core keeps mncache.dat
+        let masternode_list = Arc::new(divi_rpc::mn_list::MasternodeList::new());
+        masternode_list.set_path(config.data_dir.join("masternodes.list"));
 
         // NOTE: block_connected_callback is set in main.rs where it can include
         // both node-level processing (mempool cleanup, fee estimation) and wallet scanning.
@@ -669,6 +675,7 @@ impl Node {
             spork_manager,
             masternode_manager,
             masternode_handler,
+            masternode_list,
             event_tx,
             shutdown_tx,
             tasks: parking_lot::Mutex::new(Vec::new()),
@@ -822,14 +829,33 @@ impl Node {
         let chain = Arc::clone(&self.chain);
         let mempool = Arc::clone(&self.mempool);
         let masternode_handler = Arc::clone(&self.masternode_handler);
+        let masternode_list = Arc::clone(&self.masternode_list);
         let peer_manager = Arc::clone(&self.peer_manager);
         let mut peer_events = self.peer_manager.subscribe();
+        // Divi Core checks every masternode once a minute (MasternodeModule.cpp:524-529)
+        {
+            let list = Arc::clone(&self.masternode_list);
+            let chain = Arc::clone(&self.chain);
+            let mut shutdown = self.shutdown_tx.subscribe();
+            self.keep(tokio::spawn(async move {
+                let mut every = tokio::time::interval(std::time::Duration::from_secs(60));
+                loop {
+                    tokio::select! {
+                        _ = every.tick() => list.check_collateral(&chain),
+                        _ = shutdown.recv() => break,
+                    }
+                }
+            }));
+        }
         let alert_key = divi_network::alert::alert_key(&self.config.network.magic);
         self.keep(tokio::spawn(async move {
             // Per peer: the last hash of a full getblocks answer (Divi Core
             // hashContinue) and the alerts already accepted from it
             let mut hash_continue: HashMap<u64, Hash256> = HashMap::new();
             let mut alerts_known: HashMap<u64, HashSet<[u8; 32]>> = HashMap::new();
+            // Masternode broadcasts and pings already asked for (Divi Core's
+            // AlreadyHave for MSG_MASTERNODE_ANNOUNCE / _PING)
+            let mut masternode_items_asked: HashSet<Hash256> = HashSet::new();
             while let Ok(event) = peer_events.recv().await {
                 match event {
                     PeerEvent::Connected {
@@ -935,6 +961,30 @@ impl Node {
                                 }
                                 if !tx_items.is_empty() {
                                     tx_relay.handle_inv(peer_id, tx_items).await;
+                                }
+                                // Masternode broadcasts and pings are announced
+                                // by inv and fetched with getdata, as divid
+                                // relays them (CMasternodeBroadcast::Relay,
+                                // CMasternodePing::Relay)
+                                if masternode_items_asked.len() > 100_000 {
+                                    masternode_items_asked.clear();
+                                }
+                                let masternode_items: Vec<_> = items
+                                    .iter()
+                                    .filter(|i| {
+                                        matches!(
+                                            i.inv_type,
+                                            divi_network::message::InvType::MasternodeAnnounce
+                                                | divi_network::message::InvType::MasternodePing
+                                        )
+                                    })
+                                    .filter(|i| masternode_items_asked.insert(i.hash))
+                                    .cloned()
+                                    .collect();
+                                if !masternode_items.is_empty() {
+                                    let _ = peer_manager
+                                        .send_to_peer(peer_id, NetworkMessage::GetData(masternode_items))
+                                        .await;
                                 }
                             }
                             NetworkMessage::NotFound(items) => {
@@ -1096,21 +1146,26 @@ impl Node {
                             NetworkMessage::RequestMasternodeList(_) => {
                                 tracing::debug!("dseg from peer {} not answered", peer_id);
                             }
+                            // Broadcasts and pings in Divi Core's wire format, kept
+                            // when they pass its checks (mn_list)
                             NetworkMessage::MasternodeBroadcast(payload) => {
-                                if let Err(e) =
-                                    masternode_handler.handle_broadcast(peer_id, &payload)
-                                {
-                                    tracing::warn!(
-                                        "Failed to handle masternode broadcast from peer {}: {}",
+                                match masternode_list.accept_broadcast(&chain, &payload) {
+                                    Ok(true) => tracing::info!(
+                                        "Masternode entry from peer {} added to the list",
+                                        peer_id
+                                    ),
+                                    Ok(false) => {}
+                                    Err(e) => tracing::debug!(
+                                        "Masternode broadcast from peer {} not taken: {}",
                                         peer_id,
                                         e
-                                    );
+                                    ),
                                 }
                             }
                             NetworkMessage::MasternodePing(payload) => {
-                                if let Err(e) = masternode_handler.handle_ping(peer_id, &payload) {
-                                    tracing::warn!(
-                                        "Failed to handle masternode ping from peer {}: {}",
+                                if let Err(e) = masternode_list.accept_ping(&payload) {
+                                    tracing::debug!(
+                                        "Masternode ping from peer {} not taken: {}",
                                         peer_id,
                                         e
                                     );
@@ -1871,6 +1926,11 @@ impl Node {
     /// Get masternode manager
     pub fn masternode_manager(&self) -> &Arc<MasternodeManager> {
         &self.masternode_manager
+    }
+
+    /// The masternodes the network announced (listmasternodes)
+    pub fn masternode_list(&self) -> &Arc<divi_rpc::mn_list::MasternodeList> {
+        &self.masternode_list
     }
 }
 
