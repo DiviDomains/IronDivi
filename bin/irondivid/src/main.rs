@@ -277,7 +277,9 @@ fn resolve_args(mut args: Args) -> Result<Args> {
         return Ok(args);
     }
     let path = config_path(&args);
-    if path.exists() {
+    // divid opens a directory as a stream that is good() and yields no line,
+    // so it runs without a config file (Settings.cpp:186-205)
+    if path.exists() && !path.is_dir() {
         let content = std::fs::read_to_string(&path)
             .with_context(|| format!("Error reading configuration file: {:?}", path))?;
         // Only irondivid's own file may be TOML: a divi.conf that happens to
@@ -5018,6 +5020,21 @@ mod divid_option_tests {
 
     fn cfg(conf: &str) -> NodeConfig {
         cfg_in("irondivi.conf", conf, &[]).unwrap()
+    }
+
+    /// -conf naming a directory: divid reads no line from it and runs with
+    /// no config file (Settings.cpp:186-205)
+    #[test]
+    fn a_conf_that_is_a_directory_is_read_as_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("conf.d")).unwrap();
+        let argv = [
+            "irondivid".to_string(),
+            format!("--datadir={}", dir.path().display()),
+            "-conf=conf.d".to_string(),
+        ];
+        let c = build_config(&Args::parse_from(argv)).unwrap();
+        assert_eq!(c.rpc.port, NodeConfig::default().rpc.port);
     }
 
     /// divid reads divi.conf in its data directory
