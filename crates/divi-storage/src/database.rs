@@ -650,6 +650,16 @@ impl ChainDatabase {
     ///
     /// Should be called periodically during sync and before shutdown.
     /// Returns the number of entries flushed, or 0 if cache is not enabled.
+    /// The directory the database lives in
+    pub fn path(&self) -> &Path {
+        self.db.path()
+    }
+
+    /// UTXO cache entries not yet written to the database
+    pub fn utxo_dirty_count(&self) -> usize {
+        self.utxo_cache.as_ref().map_or(0, |c| c.dirty_count())
+    }
+
     pub fn flush_utxo_cache(&self) -> Result<usize, StorageError> {
         if let Some(ref cache) = self.utxo_cache {
             cache.flush(&self.db)

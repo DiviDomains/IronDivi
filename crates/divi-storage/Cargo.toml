@@ -23,6 +23,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 chrono = { workspace = true }
 sha2 = { workspace = true }
+libc = "0.2"
 
 [features]
 # Pauses at named points of a reorganization (IRONDIVI_PAUSE_AT), so a test
