@@ -353,8 +353,6 @@ pub struct BlockSync {
     /// Orphan blocks (blocks whose parent we don't have yet)
     orphan_blocks: RwLock<HashMap<Hash256, OrphanBlock>>,
 
-    /// The blocks a peer was asked for because a block it sent has no known parent
-    parent_asked: RwLock<HashSet<(PeerId, Hash256)>>,
     /// Blocks we've requested from each peer
     peer_block_requests: RwLock<HashMap<PeerId, HashSet<Hash256>>>,
     /// Blocks queued for download (not yet requested due to in-flight limits)
@@ -454,7 +452,6 @@ impl BlockSync {
             downloaded_blocks: RwLock::new(HashMap::new()),
             block_sources: RwLock::new(HashMap::new()),
             orphan_blocks: RwLock::new(HashMap::new()),
-            parent_asked: RwLock::new(HashSet::new()),
             peer_block_requests: RwLock::new(HashMap::new()),
             pending_block_requests: RwLock::new(VecDeque::new()),
             block_retry: RwLock::new(HashMap::new()),
@@ -1304,39 +1301,6 @@ impl BlockSync {
         true
     }
 
-    /// A block we did not ask for whose parent we do not know: Divi Core asks the
-    /// peer for the blocks up to it (main.cpp:820-830, `getblocks` with our locator
-    /// and the block as the stop), and, if it already asked for this block of this
-    /// peer, for the block before it. Blocks that came because we asked for them are
-    /// left to the download.
-    async fn ask_for_parent(&self, peer_id: PeerId, block: &Block, hash: Hash256) {
-        let parent = block.header.prev_block;
-        if parent.is_zero() || self.chain.has_block(&parent).unwrap_or(true) {
-            return;
-        }
-        let stop = {
-            let mut asked = self.parent_asked.write();
-            if asked.len() >= MAX_TRACKED_BLOCK_SOURCES {
-                asked.clear();
-            }
-            let stop = if asked.contains(&(peer_id, hash)) {
-                parent
-            } else {
-                hash
-            };
-            asked.insert((peer_id, stop));
-            stop
-        };
-        let locator = self.build_block_locator();
-        let msg = NetworkMessage::GetBlocks(GetHeadersMessage::new(locator, stop));
-        if let Err(e) = self.peer_manager.send_to_peer(peer_id, msg).await {
-            debug!(
-                "Failed to ask peer {} for the parent of {}: {}",
-                peer_id, hash, e
-            );
-        }
-    }
-
     /// Handle received block
     pub async fn handle_block(&self, peer_id: PeerId, block: Block) {
         let hash = compute_block_hash(&block.header);
@@ -1371,10 +1335,7 @@ impl BlockSync {
         let height_before = self.chain.height();
 
         // Remove from in-flight
-        let solicited = self.blocks_in_flight.write().remove(&hash).is_some();
-        if !solicited {
-            self.ask_for_parent(peer_id, &block, hash).await;
-        }
+        self.blocks_in_flight.write().remove(&hash);
         if let Some(requests) = self.peer_block_requests.write().get_mut(&peer_id) {
             requests.remove(&hash);
         }
