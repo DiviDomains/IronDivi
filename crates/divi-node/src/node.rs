@@ -723,6 +723,8 @@ impl Node {
             chain.network_type() == divi_storage::chain::NetworkType::Mainnet,
         );
         crate::masternode_sync::load(&masternode_sync, &config.data_dir);
+        // Votes are checked against the sync's stage (masternode-payments.cpp:241-245, :320)
+        masternode_votes.follow_sync(Arc::clone(&masternode_sync));
 
         // NOTE: block_connected_callback is set in main.rs where it can include
         // both node-level processing (mempool cleanup, fee estimation) and wallet scanning.
@@ -1327,7 +1329,11 @@ impl Node {
                             NetworkMessage::MasternodeBroadcast(_)
                             | NetworkMessage::MasternodePing(_)
                             | NetworkMessage::MasternodeWinner(_)
-                                if !masternode_list.blockchain_synced(&chain) =>
+                                if !crate::masternode_sync::blockchain_synced(
+                                    &masternode_sync,
+                                    &chain,
+                                    divi_primitives::clock::now(),
+                                ) =>
                             {
                                 tracing::debug!(
                                     "Masternode message from peer {} not read: the chain is not synced",
