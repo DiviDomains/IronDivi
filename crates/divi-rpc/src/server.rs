@@ -456,7 +456,7 @@ impl RpcServer {
             "moneysupply": self.blockchain.money_supply(),
             "relayfee": self.blockchain.relay_fee(),
             "staking status": staking_status_text,
-            "errors": ""
+            "errors": crate::warnings::status_bar()
         });
         // Divi Core has the wallet members only with a wallet
         // (rpcmisc.cpp:139-144)

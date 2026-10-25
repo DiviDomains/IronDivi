@@ -82,6 +82,11 @@ pub struct NodeConfig {
     #[serde(default)]
     pub blocknotify: Option<String>,
 
+    /// Command run when the node raises a warning, `%s` replaced by its text
+    /// (Divi Core's -alertnotify)
+    #[serde(default)]
+    pub alertnotify: Option<String>,
+
     /// The ZMQ notifier addresses (Divi Core's -zmqpub* options)
     #[serde(default)]
     pub zmq: crate::zmq::ZmqConfig,
@@ -123,6 +128,7 @@ impl Default for NodeConfig {
             bootstrap_dir: None,
             stop_after_block_import: false,
             blocknotify: None,
+            alertnotify: None,
             zmq: Default::default(),
             walletnotify: None,
             vault: false,

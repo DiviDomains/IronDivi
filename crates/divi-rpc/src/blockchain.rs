@@ -698,7 +698,7 @@ impl BlockchainRpc {
                 "hash": hash.to_string(),
                 "historyvalidated": false
             })),
-            "warnings": ""
+            "warnings": crate::warnings::status_bar()
         }))
     }
 
@@ -725,7 +725,7 @@ impl BlockchainRpc {
             "paytxfee": 0.0,
             "relayfee": self.relay_fee(),
             "staking status": "Staking Not Active",
-            "errors": ""
+            "errors": crate::warnings::status_bar()
         }))
     }
 
@@ -1503,7 +1503,7 @@ impl BlockchainRpc {
         Ok(json!({
             "blocks": blocks,
             "difficulty": difficulty,
-            "errors": "",
+            "errors": crate::warnings::status_bar(),
             "pooledtx": pooled_tx,
             "testnet": matches!(self.chain.network_type(), NetworkType::Testnet),
             "chain": match self.chain.network_type() {

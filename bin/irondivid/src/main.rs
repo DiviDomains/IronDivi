@@ -96,7 +96,7 @@ the data directory) for whatever the command line left unset. Among them:\n  \
 -rpcpassword=<pw> -txindex -addressindex -spentindex -checkblocks=<n>\n  \
 -maxreorg=<n> -maxorphantx=<n> -minrelaytxfee=<amt> -staking\n  \
 -blockmaxsize=<n> -blockprioritysize=<n> -blockminsize=<n>\n  \
--blocknotify=<cmd> -walletnotify=<cmd>\n  \
+-blocknotify=<cmd> -walletnotify=<cmd> -alertnotify=<cmd>\n  \
 -zmqpubhashblock=<address> -zmqpubhashtx=<address>\n  \
 -zmqpubrawblock=<address> -zmqpubrawtx=<address>\n\
 IronDivi's own: -fullnode=<ip> -stakeonstaletip -stakesplitthreshold=<n>\n  \
@@ -292,7 +292,6 @@ fn resolve_args(mut args: Args) -> Result<Args> {
 
 /// Options divid takes that irondivid has nothing for: accepted, with a warning
 const UNSUPPORTED_OPTIONS: &[&str] = &[
-    "alertnotify",
     "budgetvotemode",
     "checklevel",
     "createwalletbackups",
@@ -690,6 +689,10 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         .get("blocknotify")
         .filter(|c| !c.is_empty())
         .map(String::from);
+    config.alertnotify = s
+        .get("alertnotify")
+        .filter(|c| !c.is_empty())
+        .map(String::from);
     config.walletnotify = s
         .get("walletnotify")
         .filter(|c| !c.is_empty())
@@ -770,6 +773,7 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         "utxocachesize",
         "expire",
         "blocknotify",
+        "alertnotify",
         "walletnotify",
         "zmqpubhashblock",
         "zmqpubhashtx",
@@ -1624,6 +1628,7 @@ async fn run_daemon(
     if let Some(cmd) = config.blocknotify.clone() {
         spawn_block_notify(node.chain().clone(), cmd);
     }
+    spawn_version_warning(node.chain().clone(), config.alertnotify.clone());
 
     // The ZMQ notifiers, before the chain takes blocks (init.cpp:1495-1500).
     // Kept for the life of the node; none if an address cannot be bound.
@@ -2343,6 +2348,59 @@ fn run_notify(cmd: &str, value: &str) {
             Err(e) => warn!("runCommand error: {} ({})", cmd, e),
         }
     });
+}
+
+/// -alertnotify: run the command with the warning's text, kept to Divi Core's
+/// safe characters and put in single quotes (CAlert::Notify, alert.cpp:218-235)
+fn alert_notify(cmd: &str, message: &str) {
+    const SAFE: &str =
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ01234567890 .,;_-/:?@()";
+    let safe: String = message.chars().filter(|c| SAFE.contains(*c)).collect();
+    run_notify(cmd, &format!("'{safe}'"));
+}
+
+/// Divi Core's warning when most of the last 100 blocks are of a newer
+/// version than it makes (ChainTipManager.cpp:43-60): once out of initial
+/// download, with more than 50 of them above version 4 (block.h:26), the
+/// miscellaneous warning is set and -alertnotify run, once. Initial download
+/// ends, for good, at a tip less than 6 hours old (ChainSyncHelpers.cpp:42-49)
+fn spawn_version_warning(chain: Arc<divi_storage::Chain>, alertnotify: Option<String>) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    const CURRENT_VERSION: i32 = 4;
+    let warned = AtomicBool::new(false);
+    let synced = AtomicBool::new(false);
+    let blocks = chain.clone();
+    chain.add_tip_listener(Arc::new(move |tip| {
+        if warned.load(Ordering::SeqCst) {
+            return;
+        }
+        if !synced.load(Ordering::SeqCst) {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs() as i64);
+            if blocks.is_importing() || i64::from(tip.time) < now - 6 * 60 * 60 {
+                return;
+            }
+            synced.store(true, Ordering::SeqCst);
+        }
+        let upgraded = (0..100u32)
+            .map_while(|back| tip.height.checked_sub(back))
+            .filter_map(|height| blocks.get_block_index_by_height(height).ok().flatten())
+            .filter(|index| index.version > CURRENT_VERSION)
+            .count();
+        if upgraded > 100 / 2 {
+            let message = "Warning: This version is obsolete, upgrade required!";
+            warn!(
+                "{} of last 100 blocks above version {}",
+                upgraded, CURRENT_VERSION
+            );
+            divi_rpc::warnings::set_misc_warning(message);
+            if let Some(cmd) = &alertnotify {
+                alert_notify(cmd, message);
+            }
+            warned.store(true, Ordering::SeqCst);
+        }
+    }));
 }
 
 /// -blocknotify: run the command each time the best block changes, with the

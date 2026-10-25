@@ -399,3 +399,78 @@ fn a_bad_alert_scores_unless_alerts_are_off() {
         node.stop();
     }
 }
+
+/// `count` proof-of-work blocks of `version` on genesis, each paying nothing
+fn blocks_of_version(genesis: &str, count: u32, version: i32) -> Vec<Vec<u8>> {
+    use divi_primitives::amount::Amount;
+    use divi_primitives::block::Block;
+    use divi_primitives::hash::Hash256;
+    use divi_primitives::script::Script;
+    use divi_primitives::transaction::{Transaction, TxIn, TxOut};
+    let mut prev = Hash256::from_hex(genesis).unwrap();
+    let start = now() as u32 - count - 60;
+    (1..=count)
+        .map(|height| {
+            let mut sig = divi_storage::bip34_height_script(height);
+            sig.extend_from_slice(&[0, 0]);
+            let coinbase = Transaction {
+                version: 1,
+                vin: vec![TxIn::coinbase(Script::from_bytes(sig))],
+                vout: vec![TxOut::new(
+                    Amount::from_sat(0),
+                    Script::from_bytes(vec![0x51]),
+                )],
+                lock_time: 0,
+            };
+            let mut block = Block::default();
+            block.header.version = version;
+            block.header.prev_block = prev;
+            block.header.time = start + height;
+            block.header.bits = 0x207fffff;
+            block.transactions = vec![coinbase];
+            block.header.merkle_root = divi_crypto::compute_merkle_root(&block.transactions);
+            let target = Hash256::from_compact(block.header.bits);
+            while divi_crypto::compute_block_hash(&block.header) > target {
+                block.header.nonce += 1;
+            }
+            prev = divi_crypto::compute_block_hash(&block.header);
+            divi_primitives::serialize::serialize(&block)
+        })
+        .collect()
+}
+
+/// -alertnotify: more than 50 of the last 100 blocks above version 4 set
+/// divid's warning "Warning: This version is obsolete, upgrade required!",
+/// shown as getinfo's errors, and run the command with the text kept to safe
+/// characters and quoted (ChainTipManager.cpp:43-60, alert.cpp:218-235)
+#[test]
+fn newer_blocks_raise_the_obsolete_version_warning_and_alertnotify() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("alert-marker");
+    let notify = format!("-alertnotify=echo %s > {}", marker.display());
+    let node = start(dir.path(), &[&notify]);
+    let genesis = result(node.rpc_port, "getblockhash", json!([0]));
+    let mut peer = raw_peer(node.p2p_port);
+    for block in blocks_of_version(genesis.as_str().unwrap(), 52, 5) {
+        peer.write_all(&message("block", &block)).unwrap();
+    }
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while result(node.rpc_port, "getblockcount", json!([])) != json!(52) {
+        assert!(Instant::now() < deadline, "the blocks were not taken");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    while !marker.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        std::fs::read_to_string(&marker).ok().as_deref(),
+        Some("Warning: This version is obsolete, upgrade required\n")
+    );
+    assert_eq!(
+        result(node.rpc_port, "getinfo", json!([]))["errors"],
+        json!("Warning: This version is obsolete, upgrade required!")
+    );
+    drop(peer);
+    node.stop();
+}
