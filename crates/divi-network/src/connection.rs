@@ -301,6 +301,10 @@ impl Connection {
 
     /// Perform version handshake
     async fn handshake(&mut self) -> Result<(), NetworkError> {
+        // getpeerinfo lists a peer from its connection on, with start height
+        // -1 until a version names one (Divi Core nStartingHeight, Node.cpp:561)
+        self.info.publish(&self.stats);
+
         // For outbound connections, we send version first
         // For inbound, we wait for their version first
         if self.info.direction == PeerDirection::Outbound {
@@ -354,6 +358,9 @@ impl Connection {
         self.info.start_height = their_version.start_height;
         self.info.version = Some(their_version);
         self.info.state = PeerState::VersionReceived;
+        // Divi Core keeps the version's fields as it reads them (main.cpp:372-391),
+        // so getpeerinfo shows them before the verack
+        self.info.publish(&self.stats);
 
         // If inbound, now send our version
         if self.info.direction == PeerDirection::Inbound {
