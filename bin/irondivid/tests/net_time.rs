@@ -286,3 +286,42 @@ fn a_median_past_seventy_minutes_warns() {
     assert_eq!(offsets(&d), (json!(0), json!(0)));
     assert_eq!(d.rpc("getmininginfo")["errors"], warning);
 }
+
+/// A node whose peers put the network 30 minutes ahead: four raw peers from
+/// 127.0.0.`first`.. (`skew` seconds off), the offset waited for
+fn ahead(d: &Daemon, first: u8, skew: i64) -> Vec<TcpStream> {
+    let peers = (first..first + 4).map(|n| peer(d, n, skew)).collect();
+    wait_offset(d, skew);
+    peers
+}
+
+/// A block 2 h 30 min ahead of the clock is too new on local time (CheckBlock:
+/// at most 2 hours past GetAdjustedTime for a PoW block,
+/// BlockCheckingHelpers.cpp:29-31) and taken with a network offset of +1 h
+#[test]
+fn the_future_block_limit_is_on_the_adjusted_clock() {
+    // A node that makes the block, its clock set 2 h 30 min ahead
+    let miner_dir = tempfile::tempdir().unwrap();
+    let miner = Daemon::start(miner_dir.path(), &[]);
+    miner.rpc_with("setmocktime", json!([unix_now() + 9000]));
+    miner.rpc_with("setgenerate", json!([1]));
+
+    let dir = tempfile::tempdir().unwrap();
+    let d = Daemon::start(dir.path(), &[]);
+    let _peers = ahead(&d, 30, 3600);
+    // The node fetches it from the miner. The miner's own version, 2 h 30 min
+    // ahead, is a sixth sample: an even count, so the offset stays
+    d.rpc_with(
+        "addnode",
+        json!([format!("127.0.0.1:{}", miner.p2p_port), "onetry"]),
+    );
+    let deadline = Instant::now() + WAIT;
+    while d.rpc("getblockcount") != json!(1) {
+        assert!(
+            Instant::now() < deadline,
+            "the block 2 h 30 min ahead was not taken; offset {:?}",
+            offsets(&d)
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
