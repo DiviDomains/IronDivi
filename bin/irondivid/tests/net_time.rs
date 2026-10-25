@@ -489,3 +489,28 @@ fn addr_times_are_read_on_the_adjusted_clock() {
         assert!(Instant::now() < deadline, "no address given back");
     }
 }
+
+/// The version sent to the peer whose sample changes the offset carries the
+/// offset from before it: Divi Core takes the sample last, after it has sent
+/// its version and verack (main.cpp:407-465)
+#[test]
+fn the_sample_is_taken_after_the_version_is_sent() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = Daemon::start(dir.path(), &[]);
+    let _three: Vec<TcpStream> = (100..103).map(|n| peer(&d, n, 1800)).collect();
+    // The fourth makes five samples: the offset becomes +1800 with it
+    let mut s = connect_from(
+        Ipv4Addr::new(127, 0, 0, 103),
+        SocketAddr::from(([127, 0, 0, 1], d.p2p_port)),
+    );
+    let before = unix_now();
+    s.write_all(&frame("version", &version_at(before + 1800)))
+        .unwrap();
+    let theirs = expect(&mut s, "version");
+    let time = i64::from_le_bytes(theirs[12..20].try_into().unwrap());
+    assert!(
+        (before - 5..=unix_now() + 5).contains(&time),
+        "version time {time}, clock {before}: the offset before this peer's sample"
+    );
+    wait_offset(&d, 1800);
+}
