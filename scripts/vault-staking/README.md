@@ -92,9 +92,6 @@ mined by the owner instead), so each coinstake holds only the vault's payout.
   debit in a cache (`CachedTransactionDeltasCalculator.cpp:108-118`) that `removevault` never clears
   (`wallet.cpp:707-716`); irondivid works the entries out from the wallet as it is, which is what divid gives too once
   it has restarted. Copying the stale entries would list coins the manager can no longer stake.
-- `locked manager: setgenerate`: divid's locked wallet throws from key derivation (`CWallet::GetKey`,
-  wallet.cpp:544) and the RPC layer returns that text as -1 "GetKey: DecryptHDChainSeed failed"; irondivid answers
-  -25 "failed to generate a valid block", as divid does when it finds no stake.
 
 No other row differs from divid.
 
