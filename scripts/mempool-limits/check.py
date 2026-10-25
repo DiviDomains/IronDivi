@@ -267,6 +267,9 @@ OLD = []  # the miner's old coins, for transactions it signs
 for _ in range(40):
     a = M.rpc("getnewaddress")
     OLD.append(coin_of(M.rpc("sendtoaddress", a, 100), a))
+# Locked, so the miner's proof-of-stake blocks do not stake them (locked coins
+# are not available, AvailableUtxoCalculator.cpp:91)
+M.rpc("lockunspent", False, [{"txid": c["txid"], "vout": c["vout"]} for c in OLD])
 mine(M, 25)
 if not in_step([C, I]):
     raise RuntimeError("the followers did not follow the miner")
