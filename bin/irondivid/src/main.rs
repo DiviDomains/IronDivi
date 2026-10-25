@@ -392,6 +392,9 @@ const APPLIED: &[&str] = &[
     "maxconnections",
     "timeout",
     "proxy",
+    // read by retired_options
+    "socks",
+    "tor",
     "discover",
     "externalip",
     "onlynet",
@@ -870,20 +873,31 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     }
     config.p2p.alerts = s.get_bool("alerts", true);
 
+    retired_options(settings)?;
     let mut keys: Vec<&String> = settings.keys().collect();
     keys.sort();
     for key in keys {
         let k = key.as_str();
-        if k == "checklevel" {
-            // divid refuses any -checklevel: it always checks at level 4
-            // (init.cpp:782-784)
-            anyhow::bail!(
-                "Error: Unsupported argument -checklevel found. Checklevel must be level 4."
-            );
-        }
         if let Some(text) = option_warning(settings, k) {
             warn!("{}", text);
         }
+    }
+    Ok(())
+}
+
+/// divid's check of the options it no longer takes, in its order
+/// (CheckCriticalUnsupportedFeaturesAreNotUsed, init.cpp:770-790): -socks
+/// given at all and a true -tor stop the start, as any -checklevel does (it
+/// always checks at level 4)
+fn retired_options(s: &Settings) -> Result<()> {
+    if s.is_set("socks") {
+        anyhow::bail!("Error: Unsupported argument -socks found. Setting SOCKS version isn't possible anymore, only SOCKS5 proxies are supported.");
+    }
+    if s.get_bool("tor", false) {
+        anyhow::bail!("Error: Unsupported argument -tor found, use -onion.");
+    }
+    if s.is_set("checklevel") {
+        anyhow::bail!("Error: Unsupported argument -checklevel found. Checklevel must be level 4.");
     }
     Ok(())
 }
