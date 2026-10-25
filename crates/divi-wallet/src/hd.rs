@@ -504,6 +504,193 @@ mod tests {
         assert!(wallet.derive_receiving(0, 0).is_ok());
     }
 
+    /// BIP32 test vector 1 (seed 000102...0f), chain m/0'/1/2'/2/1000000000.
+    /// Pins derivation to the spec so a bip32 crate upgrade cannot change keys.
+    #[test]
+    fn test_bip32_official_vector_1() {
+        let seed = hex::decode("000102030405060708090a0b0c0d0e0f").unwrap();
+        let mut key = ExtendedPrivateKey::from_seed(&seed).unwrap();
+        let chain: [(Option<(u32, bool)>, &str, &str); 6] = [
+            (
+                None,
+                "e8f32e723decf4051aefac8e2c93c9c5b214313817cdb01a1494b917c8436b35",
+                "0339a36013301597daef41fbe593a02cc513d0b55527ec2df1050e2e8ff49c85c2",
+            ),
+            (
+                Some((0, true)),
+                "edb2e14f9ee77d26dd93b4ecede8d16ed408ce149b6cd80b0715a2d911a0afea",
+                "035a784662a4a20a65bf6aab9ae98a6c068a81c52e4b032c0fb5400c706cfccc56",
+            ),
+            (
+                Some((1, false)),
+                "3c6cb8d0f6a264c91ea8b5030fadaa8e538b020f0a387421a12de9319dc93368",
+                "03501e454bf00751f24b1b489aa925215d66af2234e3891c3b21a52bedb3cd711c",
+            ),
+            (
+                Some((2, true)),
+                "cbce0d719ecf7431d88e6a89fa1483e02e35092af60c042b1df2ff59fa424dca",
+                "0357bfe1e341d01c69fe5654309956cbea516822fba8a601743a012a7896ee8dc2",
+            ),
+            (
+                Some((2, false)),
+                "0f479245fb19a38a1954c5c7c0ebab2f9bdfd96a17563ef28a6a4b1a2a764ef4",
+                "02e8445082a72f29b75ca48748a914df60622a609cacfce8ed0e35804560741d29",
+            ),
+            (
+                Some((1_000_000_000, false)),
+                "471b76e389e528d6de6d816857e012c5455051cad6660850e58372a6c3e6e7c8",
+                "022a471424da5e657499d1ff51cb43c47481a03b1e77f951fe64cec9f5a48f7011",
+            ),
+        ];
+        for (step, want_priv, want_pub) in chain {
+            if let Some((index, hardened)) = step {
+                key = if hardened {
+                    key.derive_hardened(index).unwrap()
+                } else {
+                    key.derive_normal(index).unwrap()
+                };
+            }
+            assert_eq!(hex::encode(key.private_key_bytes()), want_priv);
+            assert_eq!(
+                hex::encode(key.public_key().unwrap().public_key_bytes()),
+                want_pub
+            );
+        }
+    }
+
+    /// Fixed IronDivi BIP44 vectors for the public "abandon ... about" test
+    /// mnemonic, captured from the bip32 0.5 implementation. Existing seeds
+    /// must keep producing these exact keys and addresses.
+    #[test]
+    fn test_bip44_wallet_vectors_unchanged() {
+        // (mode, [(label, account, change, index, priv, pub, addr)], xpub recv0)
+        let cases = [
+            (
+                ChainMode::Divi,
+                [
+                    (
+                        "recv0",
+                        0,
+                        false,
+                        0,
+                        "5098ec92f7bf700cfd07820c57099ebd389ccaac4acc3b3cbfffc4fe1b4372cd",
+                        "0339c817aa28e7f241cd2bbd8132f7ef99b8e34ccdd8ce2dfa1ba6d1b240b7b13b",
+                        "DHnrKW52thFXkbftiAFNnmCjP176vkWnRK",
+                    ),
+                    (
+                        "recv1",
+                        0,
+                        false,
+                        1,
+                        "0cf2ef35e19fc03a1354f22ccf03df9a80c84a32f6bf59c85c970fdc439635ce",
+                        "03ea6a3be5755588bbcf9a51a1d9615a5daf15a4de2b765dd9082b07c4bdb58709",
+                        "DJ4qwYGSW9oK5PardNcTXpZvD8KQU5B95J",
+                    ),
+                    (
+                        "change0",
+                        0,
+                        true,
+                        0,
+                        "0c2c59b4ff6f5b8c29cd81785dc9793171396c6458639721e05fc4cf270081d4",
+                        "026b03522a13b3682395a0e348df38cebb5447fc2dba8d5636946873fdd30965e1",
+                        "DJGuMSV47x27kgS5bCB9DoDf6f3RpbNLeZ",
+                    ),
+                    (
+                        "acct1recv0",
+                        1,
+                        false,
+                        0,
+                        "12f26dce097e13ed67297679cdc650bdb851bd02d0095627318aa4c2789558d6",
+                        "0350bc0055ead7235276c598498600de508b13c591861ffe5d25ed0281208fa481",
+                        "DF5J5ibvr1cmET3VtRM11cQfpGRAunPi1i",
+                    ),
+                ],
+            ),
+            (
+                ChainMode::PrivateDivi,
+                [
+                    (
+                        "recv0",
+                        0,
+                        false,
+                        0,
+                        "e1c4743dd7347a0815aa2b22842feae2571a04f8a4e134c79e0e9c6a307f830d",
+                        "022ce0b67078c625b3c9120160ce0875d16870ec8074c0d99aafc27fd050da8b9a",
+                        "DTGLN7tK8eTCWz5u7KFgpjT1Nq6uN3pwph",
+                    ),
+                    (
+                        "recv1",
+                        0,
+                        false,
+                        1,
+                        "aa88feaa3b71f468681cdf3687a517ee34cf836e946bba9b36660a128a2fbad3",
+                        "03d8d51ba80f6bd0a8c9c266a6bca735714f04f086e4662100cae38ca1dffea0df",
+                        "DHqM3Zs5VitRTxcmpy4nEX2WWeR2akKPNU",
+                    ),
+                    (
+                        "change0",
+                        0,
+                        true,
+                        0,
+                        "272e8340bce0903f34675990a9717213eeefc80b94286992d8802e8564d9b042",
+                        "0316093f7bbb2f1f8fa9db99849d023398b84f740cf01c426508c5f4923adcd745",
+                        "DK4GbMoL2khebryi4SyMXS3Zt8oTKRPWVS",
+                    ),
+                    (
+                        "acct1recv0",
+                        1,
+                        false,
+                        0,
+                        "3f7f0ed7ecea93d359e9e5ff2662b882d7ac795c0ec69f5fa9cba66a153abea7",
+                        "03c23c2dac0cce28de6d2363070d4840fb8d823cd2fe82b8a3617cfd7abcc03d27",
+                        "DP6um8GjjFhAMEpUizb6WoM1nVJp2E2teY",
+                    ),
+                ],
+            ),
+        ];
+        for (mode, keys) in cases {
+            let w = HdWallet::from_mnemonic(TEST_MNEMONIC, None, mode).unwrap();
+            // BIP32 fingerprint of this mnemonic's master key is 73c5da0a.
+            assert_eq!(
+                hex::encode(w.master_key_id().unwrap()),
+                "73c5da0a03d2d0803b731f04242bb40ced2f8bbc"
+            );
+            for (label, account, change, index, want_priv, want_pub, want_addr) in keys {
+                let k = if change {
+                    w.derive_change(account, index).unwrap()
+                } else {
+                    w.derive_receiving(account, index).unwrap()
+                };
+                assert_eq!(
+                    hex::encode(k.private_key_bytes()),
+                    want_priv,
+                    "{mode:?} {label}"
+                );
+                assert_eq!(
+                    hex::encode(k.public_key().unwrap().public_key_bytes()),
+                    want_pub,
+                    "{mode:?} {label}"
+                );
+                let pk = k.secret_key().unwrap().public_key();
+                let addr = crate::address::Address::p2pkh(&pk, crate::address::Network::Mainnet);
+                assert_eq!(addr.to_base58(), want_addr, "{mode:?} {label}");
+            }
+            // Public-only derivation from the account xpub must agree.
+            let xpub = w
+                .account_xpub(0)
+                .unwrap()
+                .derive_child(0)
+                .unwrap()
+                .derive_child(0)
+                .unwrap();
+            assert_eq!(
+                hex::encode(xpub.public_key_bytes()),
+                keys[0].5,
+                "{mode:?} xpub"
+            );
+        }
+    }
+
     #[test]
     fn test_invalid_mnemonic_rejected() {
         let result = HdWallet::from_mnemonic("not a valid mnemonic at all", None, ChainMode::Divi);
