@@ -2950,9 +2950,25 @@ impl WalletRpc {
             .map(|(vout, _)| OutPoint::new(funding_txid, vout as u32))
             .collect();
 
-        // CWallet::AddVault finding nothing to add
+        // CWallet::AddVault stores the script before it syncs the transaction,
+        // so a transaction that pays the vault nothing still registers it; the
+        // call succeeds only if the transaction is the wallet's
+        // (rpcwallet.cpp:1295-1301, wallet.cpp:695-704)
         if vault_outpoints.is_empty() {
-            return Err(sync_failed().into());
+            let wallet = self.get_wallet()?;
+            if !wallet.vault_mode() {
+                return Err(sync_failed().into());
+            }
+            wallet.store_vault(VaultMetadata {
+                owner_address: owner_str.to_string(),
+                manager_address: manager_str.to_string(),
+                vault_script: vault_script_bytes.to_vec(),
+                funding_txid: *funding_txid.as_bytes(),
+            });
+            if wallet.get_transaction(&funding_txid).is_none() {
+                return Err(sync_failed().into());
+            }
+            return Ok(json!({"succeeded": true}));
         }
 
         // Divi Core's AddVault changes nothing without -vault (wallet.cpp:693-706)
@@ -3493,6 +3509,14 @@ impl WalletRpc {
         let payees = [TxOut::new(send_amount, dest_addr.script_pubkey())];
         let plan = self.plan(&payees, &coins, mode, ChangeKind::Vault, &ChangeTo::NewKey)?;
         let txid = self.sign_and_submit(&wallet, &plan, ChangeTo::NewKey)?;
+        // The "metadata" mode carries a comment and a comment-to, as
+        // sendtoaddress's (rpcwallet.cpp:1170-1176)
+        if params.get_str(2) == Some("metadata") {
+            wallet.set_tx_notes(
+                &txid,
+                send_notes(&[("comment", params.get_str(3)), ("to", params.get_str(4))]),
+            );
+        }
         // SendMoneyToAddress: the txid alone (rpcwallet.cpp:1189)
         Ok(json!(txid.to_string()))
     }
@@ -4096,7 +4120,9 @@ impl WalletRpc {
         let wallet = self.get_wallet()?;
 
         // Try to parse as address first
-        let addr = if let Ok(address) = self.decode_address(addr_or_script) {
+        let parsed = self.decode_address(addr_or_script).ok();
+        let from_address = parsed.is_some();
+        let addr = if let Some(address) = parsed {
             address
         } else {
             // Try as hex script
@@ -4131,6 +4157,9 @@ impl WalletRpc {
         } else {
             None
         };
+        // Only an address is labelled; a script in hex is watched without
+        // an address book entry (rpcdump.cpp:150-151)
+        let label = label.filter(|_| from_address);
         let rescan = if params.len() > 2 {
             spirit_bool(params, 2)?
         } else {
@@ -4148,9 +4177,11 @@ impl WalletRpc {
         // As Core: an address already watched only gets its label
         // (rpcdump.cpp:150-156)
         if wallet.is_watch_only(&addr) {
-            wallet.set_label(&addr, label.unwrap_or("")).map_err(|e| {
-                RpcError::new(codes::WALLET_ERROR, format!("Failed to store label: {}", e))
-            })?;
+            if from_address {
+                wallet.set_label(&addr, label.unwrap_or("")).map_err(|e| {
+                    RpcError::new(codes::WALLET_ERROR, format!("Failed to store label: {}", e))
+                })?;
+            }
             return Ok(serde_json::Value::Null);
         }
 
@@ -4165,9 +4196,11 @@ impl WalletRpc {
             })?;
 
         info!("Imported watch-only address: {}", addr);
-        wallet.set_label(&addr, label.unwrap_or("")).map_err(|e| {
-            RpcError::new(codes::WALLET_ERROR, format!("Failed to store label: {}", e))
-        })?;
+        if from_address {
+            wallet.set_label(&addr, label.unwrap_or("")).map_err(|e| {
+                RpcError::new(codes::WALLET_ERROR, format!("Failed to store label: {}", e))
+            })?;
+        }
 
         // Save wallet
         wallet.save().map_err(|e| {

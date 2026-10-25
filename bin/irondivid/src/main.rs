@@ -397,6 +397,7 @@ const APPLIED: &[&str] = &[
     "createwalletbackups",
     "monthlybackups",
     "vault_min",
+    "whitelisted_vault",
     "rpcuser",
     "rpcpassword",
     "rpcport",
@@ -1713,7 +1714,7 @@ fn move_wallet_for_restore(wallet_path: &Path) -> Result<()> {
 }
 
 /// Wallet start options
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct WalletOptions {
     /// -rescan: scan the whole chain at the start; -salvagewallet sets it
     /// unless it is given (init.cpp:763-766, :1242)
@@ -1750,6 +1751,36 @@ struct WalletOptions {
     /// -vault_min, whole DIVI read as a number: managed vault coins below it
     /// are not staked (AvailableUtxoCollector.cpp:22)
     vault_min: Amount,
+    /// -whitelisted_vault, each read with ParseHex: vault scripts registered
+    /// at every load (init.cpp:1182-1191, :1201)
+    whitelisted_vaults: Vec<Vec<u8>>,
+}
+
+/// Divi Core's IsHex (utilstrencodings.cpp:64-71): an even number of hex
+/// digits, at least two, and nothing else
+fn core_is_hex(text: &str) -> bool {
+    !text.is_empty() && text.len().is_multiple_of(2) && text.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Divi Core's ParseHex (utilstrencodings.cpp:73-91): pairs of hex digits,
+/// spaces skipped before each pair, up to the first pair that is not one
+fn parse_hex_prefix(text: &str) -> Vec<u8> {
+    let mut bytes = text.bytes().peekable();
+    let nibble = |b: Option<u8>| b.and_then(|b| (b as char).to_digit(16));
+    let mut out = Vec::new();
+    loop {
+        while bytes
+            .next_if(|b| matches!(b, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r'))
+            .is_some()
+        {}
+        let Some(high) = nibble(bytes.next()) else {
+            return out;
+        };
+        let Some(low) = nibble(bytes.next()) else {
+            return out;
+        };
+        out.push((high << 4 | low) as u8);
+    }
 }
 
 /// divid's defaults: the options as when none is given
@@ -1787,6 +1818,11 @@ impl WalletOptions {
                     .get("vault_min")
                     .map_or(0, |v| atoi(v).saturating_mul(100_000_000)),
             ),
+            whitelisted_vaults: settings
+                .get_multi("whitelisted_vault")
+                .iter()
+                .map(|v| parse_hex_prefix(v))
+                .collect(),
         }
     }
 
@@ -1812,6 +1848,13 @@ fn load_or_create_wallet(
     if seed.restore {
         move_wallet_for_restore(wallet_path)?;
     }
+    // A hex -hdseed is preferred over -mnemonic and -mnemonicpassphrase,
+    // logged at every start, a wallet there or not (init.cpp:945-951)
+    if seed.hdseed.as_deref().is_some_and(core_is_hex)
+        && (seed.mnemonic.is_some() || seed.passphrase.is_some())
+    {
+        info!("PruneHDSeedParameterInteraction: parameter interaction: can't use -hdseed and -mnemonic/-mnemonicpassphrase together, will prefer -seed");
+    }
     let env = |name: &str| std::env::var(name).ok();
     // An empty mnemonic asks for a new one, as in Core
     let mnemonic = seed
@@ -1821,7 +1864,6 @@ fn load_or_create_wallet(
     let passphrase = seed
         .passphrase
         .or_else(|| env("WALLET_MNEMONIC_PASSPHRASE"));
-    // -hdseed is preferred over a mnemonic (init.cpp:947-951)
     let hdseed = seed.hdseed.or_else(|| env("WALLET_HDSEED"));
     load_or_restore_wallet_with_seed(
         wallet_path,
@@ -1948,18 +1990,13 @@ fn load_or_restore_wallet_with_seed(
     // Divi Core takes -hdseed when it is hex and logs anything else, then
     // goes on with the mnemonic or a new seed (wallet.cpp:2286-2297)
     let seed = match seed {
-        Some(hex_seed) => match hex::decode(hex_seed.trim()) {
-            Ok(bytes) if !bytes.is_empty() => Some(bytes),
-            _ => {
-                warn!("-hdseed is not a hex seed; not using it");
-                None
-            }
-        },
+        Some(hex_seed) if core_is_hex(&hex_seed) => hex::decode(&hex_seed).ok(),
+        Some(_) => {
+            info!("CWallet::GenerateNewHDChain -- Incorrect seed, generating random one instead");
+            None
+        }
         None => None,
     };
-    if seed.is_some() && (restoring.is_some() || passphrase.is_some()) {
-        warn!("-hdseed and -mnemonic/-mnemonicpassphrase together: using the seed");
-    }
     let restoring = if seed.is_some() { None } else { restoring };
     let passphrase = if seed.is_some() { None } else { passphrase };
     // The version limit is checked before the seed is made
@@ -2282,6 +2319,13 @@ async fn run_daemon(
                 core_files::lock_masternode_collateral(w, &mn_options.conf_path);
             }
             w.set_vault_mode(config.vault);
+            // Before the wallet catches up with the chain, as divid loads
+            // them with the wallet (init.cpp:1201, :1242)
+            for script in &wallet_options.whitelisted_vaults {
+                if w.whitelist_vault(script) {
+                    info!("Whitelisted vault {} registered", hex::encode(script));
+                }
+            }
             w.set_spend_zero_conf_change(wallet_options.spend_zero_conf_change);
             w.set_vault_min(wallet_options.vault_min);
             w.set_relay_fee_per_kb(config.mempool.min_relay_fee_per_kb);

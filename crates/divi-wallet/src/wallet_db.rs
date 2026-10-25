@@ -3992,6 +3992,48 @@ impl WalletDb {
         }
     }
 
+    /// Divi Core's loadWhitelistedVaults (wallet.cpp:1992-2003), for one
+    /// -whitelisted_vault script: a staking vault the wallet holds the
+    /// manager key of, and not the owner key, is registered as addvault
+    /// registers it, without a funding transaction; any other script, or one
+    /// already registered, is left out. True when it was registered.
+    pub fn whitelist_vault(&self, script_bytes: &[u8]) -> bool {
+        let script = Script::from_bytes(script_bytes.to_vec());
+        let Some(vault) = divi_script::StakingVaultScript::from_script(&script) else {
+            return false;
+        };
+        let (owner, manager) = (vault.owner_pubkey_hash, vault.vault_pubkey_hash);
+        // IsStakingVaultScript: the 2-key form only
+        if divi_script::StakingVaultScript::new(owner, manager)
+            .to_script()
+            .as_bytes()
+            != script_bytes
+            || self.vaults.read().contains_key(script_bytes)
+        {
+            return false;
+        }
+        let has_signing_key = |hash: [u8; 20]| {
+            self.keystore
+                .get_key(&Hash160::from_bytes(hash))
+                .is_some_and(|entry| !entry.is_watch_only)
+        };
+        // The owner key makes it an owned vault, not a managed one, so
+        // divid takes the script out again (wallet_ismine.cpp:80-91)
+        if has_signing_key(owner) || !has_signing_key(manager) {
+            return false;
+        }
+        let address = |hash: [u8; 20]| {
+            Address::from_pubkey_hash(Hash160::from_bytes(hash), self.network()).to_string()
+        };
+        self.store_vault(VaultMetadata {
+            owner_address: address(owner),
+            manager_address: address(manager),
+            vault_script: script_bytes.to_vec(),
+            funding_txid: [0; 32],
+        });
+        true
+    }
+
     /// Get vault metadata by script
     pub fn get_vault(&self, vault_script: &[u8]) -> Option<VaultMetadata> {
         self.vaults.read().get(vault_script).cloned()

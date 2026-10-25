@@ -659,6 +659,76 @@ fn reclaim_answers_the_txid_alone() {
     assert_eq!(res, json!(tx.txid().to_string()));
 }
 
+/// addvault stores the vault before it syncs the transaction: a mined
+/// transaction of the wallet's that pays the vault nothing still registers it
+/// and succeeds; one that is not the wallet's is refused with "Unable to sync
+/// TX!", the vault registered all the same (rpcwallet.cpp:1295-1301,
+/// wallet.cpp:695-704)
+#[test]
+fn addvault_registers_a_vault_its_transaction_does_not_fund() {
+    let s = setup();
+    let other = |b: u8| {
+        Address::from_pubkey_hash(
+            divi_primitives::hash::Hash160::from_bytes([b; 20]),
+            Network::Regtest,
+        )
+    };
+    let rpc = s.net.rpc(&s.manager);
+    // The funding transaction pays the manager a plain coin, so it is the
+    // manager's, but it pays this second vault nothing
+    let second = format!("{}:{}", other(0x42), s.manager_addr);
+    let res = rpc
+        .add_vault(&p(vec![json!(second), json!(s.fund_txid.to_string())]))
+        .unwrap();
+    assert_eq!(res, json!({"succeeded": true}));
+    assert!(s
+        .manager
+        .get_vault(vault_script(&other(0x42), &s.manager_addr).as_bytes())
+        .is_some());
+
+    // A coinbase to someone else: not the manager's
+    let block = s.net.mine(vec![], &other(0x99));
+    let coinbase = s.net.chain.get_block(&block).unwrap().unwrap().transactions[0].txid();
+    let third = format!("{}:{}", other(0x43), s.manager_addr);
+    let e = rpc
+        .add_vault(&p(vec![json!(third), json!(coinbase.to_string())]))
+        .unwrap_err();
+    assert_eq!(error_message(e), "AddingVaultScript: Unable to sync TX!");
+    assert!(s
+        .manager
+        .get_vault(vault_script(&other(0x43), &s.manager_addr).as_bytes())
+        .is_some());
+}
+
+/// reclaimvaultfunds' "metadata" mode keeps its comment and comment-to with
+/// the wallet's transaction, as sendtoaddress's does (rpcwallet.cpp:1170-1176)
+#[test]
+fn reclaim_keeps_its_metadata_notes() {
+    let s = setup();
+    let rpc = make_self_vault(&s);
+    let dest = s.owner.new_receiving_address().unwrap();
+    rpc.reclaim_vault_funds(&p(vec![
+        json!(dest.to_string()),
+        json!(10.0),
+        json!("metadata"),
+        json!("a note"),
+        json!("a shop"),
+    ]))
+    .unwrap();
+    let tx = submitted_tx(&s);
+    let notes = s.owner.tx_notes(&tx.txid());
+    assert_eq!(
+        notes.get("comment").map(String::as_str),
+        Some("a note"),
+        "{notes:?}"
+    );
+    assert_eq!(
+        notes.get("to").map(String::as_str),
+        Some("a shop"),
+        "{notes:?}"
+    );
+}
+
 fn output_to(tx: &Transaction, script: &Script) -> Vec<i64> {
     tx.vout
         .iter()
