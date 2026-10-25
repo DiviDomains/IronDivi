@@ -553,6 +553,8 @@ impl Node {
         }
         if reindex {
             db.delete_metadata(REINDEXING_KEY).map_err(damaged)?;
+            // divid's line once its -reindex is done (init.cpp:681)
+            tracing::info!("Reindexing finished");
         }
 
         // Divi Core notes an unclean stop at start and brings the chain to the

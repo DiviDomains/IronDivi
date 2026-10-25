@@ -167,3 +167,17 @@ fn checkpoints_is_taken_without_a_line() {
         "a line for -checkpoints"
     );
 }
+
+/// -reindex ends with divid's line once the indexes are built again (init.cpp:681)
+#[test]
+fn reindex_logs_reindexing_finished() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let (_node, _) = start(dir.path(), &[]);
+    }
+    let (_node, _) = start(dir.path(), &["-reindex".into()]);
+    assert!(
+        log_has(dir.path(), "Reindexing finished"),
+        "no Reindexing finished"
+    );
+}
