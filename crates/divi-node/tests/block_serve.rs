@@ -198,3 +198,29 @@ async fn getdata_of_items_held_by_no_store_is_not_found() {
         .collect();
     assert_eq!(got, vec![("notfound".to_string(), asked)]);
 }
+
+/// A filtered block item ends a getdata pass as a block item does, so the
+/// unknown transactions before and after it are named in two notfounds
+/// (main.cpp:300-332); with no bloom filters offered nothing is sent for the
+/// filtered block itself
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn filtered_block_item_ends_a_getdata_pass() {
+    let t = TestNode::start().await;
+    let b1 = mine(&t);
+    let (tx1, tx2) = (Hash256::from_bytes([1; 32]), Hash256::from_bytes([2; 32]));
+    let mut p = peer(&t, "127.0.0.3").await;
+    p.send("getdata", &getdata(&[(1, tx1), (3, b1), (1, tx2)]))
+        .await;
+    let got: Vec<(String, Vec<(u32, Hash256)>)> = replies(&mut p)
+        .await
+        .iter()
+        .map(|(c, m)| (c.clone(), items(m)))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            ("notfound".to_string(), vec![(1, tx1)]),
+            ("notfound".to_string(), vec![(1, tx2)]),
+        ]
+    );
+}

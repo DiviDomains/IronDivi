@@ -208,10 +208,19 @@ pub fn serve_getdata(
                 }
                 queue.pop_front();
             }
-            // A type outside 1..15 is not known and gets nothing; neither does
-            // a filtered block, taken as a block request (main.cpp:300-321,
+            // A filtered block is a block request to Divi Core: with no bloom
+            // filters offered nothing is sent for it, but like a block it ends
+            // the pass, whose notfound goes out now (main.cpp:300-332)
+            divi_network::InvType::FilteredBlock => {
+                queue.pop_front();
+                if !not_found.is_empty() {
+                    let msg = NetworkMessage::NotFound(std::mem::take(&mut not_found));
+                    let _ = peer_manager.try_send_to_peer(peer_id, msg);
+                }
+            }
+            // A type outside 1..15 is not known and gets nothing (main.cpp:321,
             // protocol.cpp:146-149)
-            divi_network::InvType::Unknown | divi_network::InvType::FilteredBlock => {
+            divi_network::InvType::Unknown => {
                 queue.pop_front();
             }
             // The other known types: Divi Core holds nothing to send for them,
