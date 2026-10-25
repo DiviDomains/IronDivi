@@ -443,10 +443,11 @@ pub struct P2pConfig {
     #[serde(default = "default_name_lookup")]
     pub name_lookup: bool,
 
-    /// Ask Tor for a hidden service at start (Divi Core's `-listenonion`, on
-    /// by default, off under -listen=0 unless given; init.cpp:1621,
-    /// net.cpp:1706-1711)
-    #[serde(default = "default_listen_onion")]
+    /// Ask Tor for a hidden service at start (Divi Core's `-listenonion`).
+    /// Off here, so an embedded or test node only contacts a control port
+    /// when asked; irondivid applies divid's default, on, and off under
+    /// -listen=0 unless given (init.cpp:1621, net.cpp:1706-1711)
+    #[serde(default)]
     pub listen_onion: bool,
 
     /// The Tor control port, a numeric `ip:port` (Divi Core's `-torcontrol`)
@@ -569,10 +570,6 @@ fn default_name_lookup() -> bool {
     true
 }
 
-fn default_listen_onion() -> bool {
-    true
-}
-
 fn default_tor_control() -> String {
     divi_network::torcontrol::DEFAULT_TOR_CONTROL.to_string()
 }
@@ -619,7 +616,7 @@ impl Default for P2pConfig {
             proxy_randomize: default_proxy_randomize(),
             onion: None,
             name_lookup: default_name_lookup(),
-            listen_onion: default_listen_onion(),
+            listen_onion: false,
             tor_control: default_tor_control(),
             tor_password: String::new(),
             upnp: divi_network::upnp::DEFAULT_UPNP,
