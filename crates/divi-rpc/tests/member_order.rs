@@ -458,3 +458,25 @@ fn getinfo_members_are_in_cores_order() {
         ]
     );
 }
+
+/// mnsync status: rpcmisc.cpp:203-213
+#[test]
+fn mnsync_status_members_are_in_cores_order() {
+    let n = node();
+    assert_eq!(
+        keys(&n.ok("mnsync", vec![json!("status")])),
+        [
+            "IsBlockchainSynced",
+            "timestampOfLastMasternodeListUpdate",
+            "timestampOfLastMasternodeWinnerUpdate",
+            "timestampOfLastFailedSync",
+            "countOfFailedSyncAttempts",
+            "nominalNumberOfMasternodeBroadcastsReceived",
+            "nominalNumberOfMasternodeWinnersReceived",
+            "fulfilledMasternodeListSyncRequests",
+            "fulfilledMasternodeWinnerSyncRequests",
+            "currentMasternodeSyncStatus",
+            "totalSuccessivePeerSyncRequests"
+        ]
+    );
+}

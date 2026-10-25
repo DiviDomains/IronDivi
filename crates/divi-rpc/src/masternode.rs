@@ -425,19 +425,19 @@ impl MasternodeRpc {
 
         match command {
             "status" => {
-                // Return basic sync status
+                // Return basic sync status, in Divi Core's order (rpcmisc.cpp:203-213)
                 Ok(json!({
                     "IsBlockchainSynced": true,
                     "timestampOfLastMasternodeListUpdate": 0,
                     "timestampOfLastMasternodeWinnerUpdate": 0,
-                    "currentMasternodeSyncStatus": 999,
-                    "countOfFailedSyncAttempts": 0,
-                    "totalSuccessivePeerSyncRequests": 0,
                     "timestampOfLastFailedSync": 0,
+                    "countOfFailedSyncAttempts": 0,
+                    "nominalNumberOfMasternodeBroadcastsReceived": 0,
+                    "nominalNumberOfMasternodeWinnersReceived": 0,
                     "fulfilledMasternodeListSyncRequests": 0,
                     "fulfilledMasternodeWinnerSyncRequests": 0,
-                    "nominalNumberOfMasternodeBroadcastsReceived": 0,
-                    "nominalNumberOfMasternodeWinnersReceived": 0
+                    "currentMasternodeSyncStatus": 999,
+                    "totalSuccessivePeerSyncRequests": 0
                 }))
             }
             // Divi Core restarts its masternode sync and answers "success"
