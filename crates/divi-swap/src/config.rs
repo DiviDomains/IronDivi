@@ -76,6 +76,90 @@ impl ChainParams {
     }
 }
 
+/// How much time must be left before the maker-leg locktime for the taker to broadcast its
+/// **first** maker-leg claim ([`ClaimDeadline::builtin`]; `Taker::with_claim_deadline`
+/// overrides one chain).
+///
+/// Once that claim is out the preimage is public, and the maker may claim the taker leg with
+/// it at any time before the taker-leg locktime. The taker only keeps the maker leg if its
+/// claim confirms before the maker can refund (MTP reaching the maker-leg locktime), so it
+/// needs enough blocks to get mined in, not just enough seconds. Below the margin the taker
+/// declines for good and waits for its taker-leg refund: nothing has been revealed yet, so
+/// both sides get their coins back. A claim already broadcast is never abandoned.
+///
+/// The margin is `max(min_secs, min_blocks × block_secs)`: both must be met.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimDeadline {
+    /// Target block interval of the chain, in seconds.
+    pub block_secs: u32,
+    /// Blocks that must still be due before the locktime.
+    pub min_blocks: u32,
+    /// Seconds of MTP that must be left before the locktime.
+    pub min_secs: u32,
+}
+
+impl ClaimDeadline {
+    /// Built-in margin for a maker leg on `chain`, the same on every profile (it is about how
+    /// fast the chain mines, not about how much the counterparty is trusted). Never below the
+    /// 1800 s every chain had before margins were per chain
+    /// (`taker::TAKER_SAFETY_MARGIN_SECS`).
+    pub fn builtin(chain: Chain) -> Self {
+        let (block_secs, min_blocks, min_secs) = match chain {
+            // 10-minute blocks. Six blocks: the chance of no block at all in an hour is
+            // e^-6 ≈ 0.25 %, against e^-3 ≈ 5 % for the three blocks 1800 s used to give,
+            // and every block in between is a fee-bump (RBF) step.
+            Chain::Btc => (600, 6, 3600),
+            // 2.5-minute blocks: 1800 s is twelve blocks (no block in 30 min: e^-12, about
+            // 6 in a million), and each one is a CPFP step.
+            Chain::Ltc => (150, 12, 1800),
+            // 75 s is the protocol target (ZIP-208); it is counted at the target, not the
+            // ~25 s measured on NU7, so the block arm never reads more blocks than mainnet
+            // mines. 24 blocks = 1800 s. Neither replacement nor CPFP helps on ZEC
+            // (docs/plans/swap-poc/status/engine.md, DJ round), so the claim is resent at its
+            // first fee and this margin is the whole defence.
+            Chain::Zec => (75, 24, 1800),
+            // 1-minute blocks; 30 blocks = 1800 s. DIVI Core relays no replacement and its
+            // miner ignores CPFP (engine.md, DJ round); it has no mempool size limit to evict
+            // from, so the claim is resent unchanged and thirty blocks is ample.
+            Chain::Divi => (60, 30, 1800),
+            // ~12-second blocks: 1800 s is 150 of them, far over the 180 s timestamp lag;
+            // the seconds floor binds, not the block count.
+            Chain::Usdc => (12, 150, 1800),
+            // 2-minute blocks. Monero has no CLTV, so no HTLC claim ever runs against it;
+            // the value only keeps every chain covered.
+            Chain::Xmr => (120, 15, 1800),
+        };
+        ClaimDeadline {
+            block_secs,
+            min_blocks,
+            min_secs,
+        }
+    }
+
+    /// Seconds that must be left before the locktime: `max(min_secs, min_blocks ×
+    /// block_secs)`, saturating.
+    pub fn margin_secs(&self) -> u32 {
+        self.min_secs
+            .max(self.min_blocks.saturating_mul(self.block_secs))
+    }
+
+    /// `Ok` if a first claim may still go out with the chain at `mtp` and the maker-leg
+    /// locktime at `locktime`; otherwise why not.
+    pub fn check(&self, chain: Chain, mtp: u32, locktime: u32) -> std::result::Result<(), String> {
+        let left = i64::from(locktime) - i64::from(mtp);
+        let blocks = left.max(0) / i64::from(self.block_secs.max(1));
+        if left < i64::from(self.min_secs) || blocks < i64::from(self.min_blocks) {
+            return Err(format!(
+                "maker-leg locktime {locktime} is {left}s (~{blocks} {chain} blocks) after its \
+                 chain's MTP {mtp}, short of the claim deadline (at least {}s and {} blocks); not \
+                 claiming, waiting for the taker-leg refund",
+                self.min_secs, self.min_blocks
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Swap timing and confirmation requirements. All durations in seconds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SwapConfig {
@@ -508,6 +592,50 @@ mod tests {
         assert!(c.validate().is_err());
         c.btc_mtp_lag_secs = u32::MAX;
         assert!(c.validate().is_err());
+    }
+
+    /// Every chain's claim deadline keeps at least the old 1800 s, and fits inside the
+    /// mainnet maker leg's worst case: the maker timeout less the locktime tolerance taken on
+    /// both legs (2 × 1800 s) and the MTP lag on both (2 × the largest lag).
+    #[test]
+    fn claim_deadlines_hold_the_floor_and_fit_the_mainnet_window() {
+        let c = SwapConfig::profile(Profile::Mainnet);
+        let window = c.maker_timeout_secs - 2 * 1800 - 2 * c.max_mtp_lag_secs();
+        for chain in Chain::ALL {
+            let d = ClaimDeadline::builtin(chain);
+            assert!(
+                d.margin_secs() >= crate::taker::TAKER_SAFETY_MARGIN_SECS,
+                "{chain}"
+            );
+            assert!(d.margin_secs() >= d.min_blocks * d.block_secs, "{chain}");
+            assert!(
+                d.margin_secs() <= window,
+                "{chain}: {} > {window}",
+                d.margin_secs()
+            );
+        }
+    }
+
+    #[test]
+    fn claim_deadline_check_needs_both_seconds_and_blocks() {
+        let d = ClaimDeadline {
+            block_secs: 600,
+            min_blocks: 6,
+            min_secs: 600,
+        };
+        assert_eq!(d.margin_secs(), 3600);
+        assert!(d.check(Chain::Btc, 0, 3600).is_ok());
+        assert!(d.check(Chain::Btc, 0, 3599).is_err(), "five blocks");
+        assert!(d.check(Chain::Btc, 100, 50).is_err(), "past the locktime");
+        let d = ClaimDeadline {
+            min_secs: 4000,
+            ..d
+        };
+        assert!(
+            d.check(Chain::Btc, 0, 3999).is_err(),
+            "six blocks, too few seconds"
+        );
+        assert!(d.check(Chain::Btc, 0, 4000).is_ok());
     }
 
     #[test]

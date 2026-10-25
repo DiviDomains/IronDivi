@@ -30,7 +30,7 @@ pub mod types;
 
 pub use api::Direction;
 pub use backend::ChainBackend;
-pub use config::{ChainParams, Profile, SwapConfig};
+pub use config::{ChainParams, ClaimDeadline, Profile, SwapConfig};
 pub use error::{Result, SwapError};
 pub use htlc::HtlcParams;
 pub use maker::{Maker, OfferEngine};

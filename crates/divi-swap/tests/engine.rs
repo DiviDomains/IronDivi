@@ -549,10 +549,15 @@ async fn case_d_body(dir: Direction) {
     assert_eq!(h.maker_state(), SwapState::MakerLockConfirmed);
     let rec = h.store.get_maker_swap(&h.maker_id).unwrap().unwrap();
     let locktime = rec.maker_leg_htlc.unwrap().locktime;
-    // Move to just inside the taker's claim window (locktime − safety margin).
+    // Move to just inside the taker's claim window (locktime − the maker-leg chain's claim
+    // deadline, which on BTC is wider than the 1800 s floor).
     let ml = h.ml_chain().clone();
     let now = ml.mtp();
-    let target = locktime - divi_swap::taker::TAKER_SAFETY_MARGIN_SECS - 30;
+    let ml_chain = match h.dir.maker_chain() {
+        Chain::Divi => Chain::Divi,
+        _ => counter().0,
+    };
+    let target = locktime - h.taker.claim_deadline(ml_chain).margin_secs() - 30;
     ml.advance_time(target - now);
     let view = h.maker.view(&h.maker_id).unwrap();
     h.taker.step(&h.taker_id, view.as_ref()).await.unwrap();

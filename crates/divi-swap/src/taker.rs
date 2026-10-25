@@ -22,15 +22,17 @@ use crate::api::{AcceptRequest, LockNotice, Quote, SwapView};
 use crate::backend::ChainBackend;
 use crate::config::{
     check_maker_leg_locktime, check_maker_leg_locktime_exact, check_terms_against_profile,
-    OfferedTerms, Profile,
+    ClaimDeadline, OfferedTerms, Profile,
 };
 use crate::error::{Result, SwapError};
 use crate::htlc::{new_preimage, HtlcParams};
 use crate::store::{Store, TakerRecord};
 use crate::types::{Chain, SpendInfo};
 
-/// The taker stops claiming the maker leg this many seconds before the maker's locktime: a claim
-/// that confirms after the maker refunds would lose the maker leg while revealing the preimage.
+/// The least margin, on any chain, that the taker keeps before the maker's locktime when it
+/// broadcasts its first claim: a claim that confirms after the maker refunds would lose the
+/// maker leg while revealing the preimage. Each chain's own margin
+/// ([`ClaimDeadline::builtin`]) is at least this, and higher where blocks are slow.
 pub const TAKER_SAFETY_MARGIN_SECS: u32 = 1800;
 
 /// How far the taker-leg locktime may drift from `taker_chain_mtp + taker_timeout` (clock skew
@@ -107,6 +109,8 @@ pub struct Taker {
     store: Store,
     /// Profile whose floors every quote's terms must meet (`None`: terms are taken as offered).
     profile_floor: Option<Profile>,
+    /// Per-chain claim deadlines replacing [`ClaimDeadline::builtin`].
+    claim_deadlines: BTreeMap<Chain, ClaimDeadline>,
     halt_after: Mutex<Option<TakerState>>,
     gate: tokio::sync::Mutex<()>,
 }
@@ -130,6 +134,7 @@ impl Taker {
             counters: counters.into_iter().map(|b| (b.chain(), b)).collect(),
             store,
             profile_floor: None,
+            claim_deadlines: BTreeMap::new(),
             halt_after: Mutex::new(None),
             gate: tokio::sync::Mutex::new(()),
         }
@@ -142,6 +147,20 @@ impl Taker {
     pub fn with_profile_floor(mut self, profile: Profile) -> Self {
         self.profile_floor = Some(profile);
         self
+    }
+
+    /// Use `deadline` instead of [`ClaimDeadline::builtin`] for maker legs on `chain`.
+    pub fn with_claim_deadline(mut self, chain: Chain, deadline: ClaimDeadline) -> Self {
+        self.claim_deadlines.insert(chain, deadline);
+        self
+    }
+
+    /// The claim deadline this taker applies to a maker leg on `chain`.
+    pub fn claim_deadline(&self, chain: Chain) -> ClaimDeadline {
+        self.claim_deadlines
+            .get(&chain)
+            .copied()
+            .unwrap_or_else(|| ClaimDeadline::builtin(chain))
     }
 
     /// The counter chains this taker holds a key on.
@@ -502,15 +521,11 @@ impl Taker {
             return Ok(Flow::Idle);
         }
         let mtp = mb.median_time_past().await?;
-        if (htlc.locktime as u64) < mtp as u64 + TAKER_SAFETY_MARGIN_SECS as u64 {
+        let chain = r.quote.maker_chain();
+        if let Err(reason) = self.claim_deadline(chain).check(chain, mtp, htlc.locktime) {
             // Not an error to retry: a claim now could confirm after the maker refunds, losing
             // the maker leg while revealing the preimage. Decide once, persist, and let the
             // taker-leg refund run its course.
-            let reason = format!(
-                "maker-leg locktime {} is less than {TAKER_SAFETY_MARGIN_SECS}s after its \
-                 chain's MTP {mtp}; not claiming, waiting for the taker-leg refund",
-                htlc.locktime
-            );
             tracing::warn!(swap = %r.id, %reason, "declining to claim the maker leg");
             r.claim_declined = Some(reason);
             self.store.put_taker_swap(r)?;
@@ -561,7 +576,12 @@ impl Taker {
             .maker_leg_htlc
             .ok_or_else(|| SwapError::Other("no verified maker lock".into()))?;
         let mtp = self.mk(r)?.median_time_past().await?;
-        if (mtp as u64) + TAKER_SAFETY_MARGIN_SECS as u64 <= htlc.locktime as u64 {
+        let chain = r.quote.maker_chain();
+        let deadline = match r.claim_declined {
+            Some(_) => Ok(()), // decided below on an earlier pass
+            None => self.claim_deadline(chain).check(chain, mtp, htlc.locktime),
+        };
+        if r.claim_declined.is_none() && deadline.is_ok() {
             let op = r.maker_leg_outpoint.expect("set with maker_leg_htlc");
             let amount = r.maker_leg_amount.expect("set with maker_leg_htlc");
             let claim = self
@@ -572,7 +592,13 @@ impl Taker {
             // Persist the signed claim (which reveals the preimage) before broadcasting it.
             return self.enter(r, TakerState::Claimed);
         }
-        // Too late to claim safely: wait out our own taker-leg timelock.
+        // Too late to claim safely: decide for good, record why, and wait out our own
+        // taker-leg timelock. Nothing has been revealed, so both legs refund.
+        if let Err(reason) = deadline {
+            tracing::warn!(swap = %r.id, %reason, "declining to claim the maker leg");
+            r.claim_declined = Some(reason);
+            self.store.put_taker_swap(r)?;
+        }
         if self.taker_leg_refundable(r).await? {
             return self.enter(r, TakerState::Refunded);
         }
