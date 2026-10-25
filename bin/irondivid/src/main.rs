@@ -1499,13 +1499,14 @@ impl WalletSeed {
 }
 
 /// A start that stops with exit code 1 and no error line, as Divi Core's
-/// AppInit2 returning false without an InitError (-dbloadfailexit)
+/// AppInit2 returning false without an InitError (-dbloadfailexit, or a stop
+/// asked for before the start was done)
 #[derive(Debug)]
 struct QuietExit;
 
 impl std::fmt::Display for QuietExit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("the wallet loaded with a warning and -dbloadfailexit is set")
+        f.write_str("the start ended before it was done")
     }
 }
 
@@ -2477,7 +2478,16 @@ async fn run_daemon(
     });
     let wallet_for_shutdown = wallet.clone();
 
-    if !config.rpc.enabled {
+    // Divi Core's init returns !fRequestShutdown (init.cpp:1536-1539, :1661):
+    // a SIGTERM or SIGINT that came while the node was starting stops it here,
+    // with exit code 1 (divid.cpp:180)
+    let stopped_during_start = !matches!(
+        shutdown_rx.try_recv(),
+        Err(broadcast::error::TryRecvError::Empty)
+    );
+    if stopped_during_start {
+        info!("Shutdown requested. Exiting.");
+    } else if !config.rpc.enabled {
         // -server=0: no RPC server, the node runs until it is told to stop
         info!("RPC server disabled (-server=0)");
         let _ = shutdown_rx.recv().await;
@@ -2763,6 +2773,7 @@ async fn run_daemon(
     info!("Node stopped");
     match rpc_error {
         Some(e) => Err(anyhow::anyhow!("RPC server error: {}", e)),
+        None if stopped_during_start => Err(anyhow::Error::new(QuietExit)),
         None => Ok(()),
     }
 }

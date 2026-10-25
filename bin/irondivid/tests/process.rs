@@ -148,3 +148,33 @@ fn second_start_leaves_the_running_nodes_pid_file() {
     );
     daemon.stop();
 }
+
+/// A SIGTERM while the node is still starting (here during the -rescan of a
+/// start) stops it with exit code 1: divid's init returns !fRequestShutdown
+/// (init.cpp:1536-1539, :1661) and divid.cpp:180 turns that into 1
+#[test]
+fn a_stop_during_start_exits_with_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(dir.path());
+    for _ in 0..8 {
+        try_rpc(daemon.rpc_port, "setgenerate", &json!([50])).expect("setgenerate");
+    }
+    daemon.stop();
+    let pid_file = dir.path().join("divid.pid");
+    let mut child = irondivid(dir.path(), free_port())
+        .arg("-rescan")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !pid_file.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    let code = wait_exit(&mut child, 120);
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(code, Some(1));
+    assert!(!pid_file.exists());
+}
