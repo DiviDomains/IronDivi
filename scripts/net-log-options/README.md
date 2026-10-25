@@ -68,9 +68,6 @@ Message texts are not compared, only the line shape and whether addresses appear
 
 ## KNOWN differences
 
-- **`onion limited` with no `-onlynet`, or with one naming `onion` or `tor`:** irondivid always shows onion as
-  limited, since it cannot address .onion peers (as in `scripts/net-replies`). divid shows it limited only when
-  `-onlynet` leaves it out.
 - **`15 MB old debug.log, -shrinkdebugfile=0` and `-debug`:** divid keeps the old file whole. irondivid also rotates
   `debug.log` by size, so an old file over `-maxlogsize` is moved whole to `debug.log.1`
   (`docs/divid-differences.md` S6).

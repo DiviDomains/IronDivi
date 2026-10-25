@@ -26,6 +26,14 @@ pub const WAIT: Duration = Duration::from_secs(10);
 /// How long to watch for something that should not happen
 pub const QUIET: Duration = Duration::from_secs(3);
 
+/// How many times a node is built on new ports when a port was taken
+pub const START_TRIES: usize = 5;
+
+/// Whether a start error says a listener could not bind
+pub fn bind_failed(error: &str) -> bool {
+    error.contains("Unable to bind") || error.contains("Failed to listen on any port")
+}
+
 pub struct TestNode {
     pub node: Node,
     pub port: u16,
@@ -38,10 +46,52 @@ impl TestNode {
         Self::start_with(|_| {}).await
     }
 
-    pub async fn start_with(edit: impl FnOnce(&mut NodeConfig)) -> Self {
-        let t = Self::build(edit);
+    /// A started regtest node, on a port `free_port` gave it. If the port was
+    /// taken before the node bound it, `Node::start` says so at once ("Unable to
+    /// bind ..."), and the node is built again on another port, up to
+    /// `START_TRIES` times.
+    pub async fn start_with(edit: impl Fn(&mut NodeConfig)) -> Self {
+        for _ in 1..START_TRIES {
+            let t = Self::build(&edit);
+            match t.node.start().await {
+                Ok(()) => {
+                    t.settle().await;
+                    return t;
+                }
+                Err(e) if bind_failed(&e.to_string()) => continue,
+                Err(e) => panic!("the node did not start: {e}"),
+            }
+        }
+        let t = Self::build(&edit);
         t.run().await;
         t
+    }
+
+    /// A node with a -whitebind listener on a port of its own, and that port.
+    /// `Node::start` binds every listener before it returns, but a -whitebind
+    /// listener that cannot bind only logs it (Divi Core does the same,
+    /// net.cpp:1815-1821, fBound): nothing listens on the port then. So the
+    /// port is probed once right after the start, with no waiting, and the node
+    /// built again on another port if it is not there.
+    pub async fn start_with_white_bind(edit: impl Fn(&mut NodeConfig)) -> (Self, u16) {
+        for _ in 0..START_TRIES {
+            let white_port = free_port();
+            let t = Self::build(|c| {
+                c.p2p.white_bind = vec![SocketAddr::from(([127, 0, 0, 1], white_port))];
+                edit(c);
+            });
+            match t.node.start().await {
+                Ok(()) => {}
+                Err(e) if bind_failed(&e.to_string()) => continue,
+                Err(e) => panic!("the node did not start: {e}"),
+            }
+            if TcpStream::connect(("127.0.0.1", white_port)).await.is_err() {
+                continue;
+            }
+            t.settle().await;
+            return (t, white_port);
+        }
+        panic!("no -whitebind port could be bound in {START_TRIES} tries: another process kept taking them");
     }
 
     /// A configured regtest node, not started yet
@@ -63,21 +113,21 @@ impl TestNode {
         }
     }
 
-    /// Start the node and wait until it listens
+    /// Start the node and check that it listens
     pub async fn run(&self) {
         self.node.start().await.unwrap();
+        self.settle().await;
+    }
+
+    /// The node has started, so its listener is bound (`Node::start` binds before
+    /// it returns) and the kernel takes a connect at once: one probe, no waiting.
+    /// A refused connect means the bind failed
+    async fn settle(&self) {
         let port = self.port;
-        // The listener comes up on a spawned task
-        let stream = tokio::time::timeout(divi_test_support::START_WAIT, async {
-            loop {
-                if let Ok(stream) = TcpStream::connect(("127.0.0.1", port)).await {
-                    return stream;
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        })
-        .await
-        .expect("node listens");
+        let stream = tokio::time::timeout(WAIT, TcpStream::connect(("127.0.0.1", port)))
+            .await
+            .expect("the node's listener took a connect in time")
+            .expect("the node's listener is there once Node::start returned");
         // The kernel completes the probe's connect from its backlog before the
         // node accepts it, so the node may not have counted it yet. Keep it open
         // until the node answers its version (or drops it), so it has been

@@ -439,10 +439,6 @@ def onlynet_case(kind, values, extra=()):
     return out
 
 
-ONION = ("irondivid always shows onion limited: it cannot address .onion peers (scripts/net-replies README, "
-         "getnetworkinfo); divid shows it limited only when -onlynet leaves it out")
-
-
 def onlynet_rows():
     cases = [
         ("-onlynet=ipv4", ["ipv4"], ["externalip=1.2.3.4", "externalip=[2a00:1450:4001:80b::200e]"]),
@@ -455,8 +451,6 @@ def onlynet_rows():
         ("-onlynet=", [""], []),
     ]
     for label, values, extra in cases:
-        if not values or any(v.lower() in ("onion", "tor") for v in values):
-            KNOWN[f"{label}: onion limited"] = ONION
         core, iron = both(lambda k: onlynet_case(k, values, extra))
         for key in sorted(core.keys() | iron.keys()):
             row(f"{label}: {key}", core.get(key), iron.get(key))
