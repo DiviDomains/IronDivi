@@ -100,6 +100,13 @@ Binaries are written to `target/release/irondivid` (full node) and `target/relea
 ./target/release/irondivid --mode privatedivi --testnet
 ```
 
+### Wallet Encryption
+
+`encryptwallet` keeps the wallet's existing seed; it does not make a new one.
+Versions up to and including v0.2.6 left the HD seed in plaintext on disk even after
+`encryptwallet`, so a datadir copy made with one of those versions may expose it. See
+[docs/wallet-encryption.md](docs/wallet-encryption.md).
+
 ### RPC Example
 
 Query the node via JSON-RPC (default port 51473 for Divi mainnet):
