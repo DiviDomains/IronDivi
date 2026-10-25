@@ -10,7 +10,7 @@
 
 use divi_primitives::hash::Hash160;
 use divi_primitives::ChainMode;
-use divi_rpc::{Params, Request, RequestId, Response, RpcServer};
+use divi_rpc::{Params, Request, RequestId, Response, RpcError, RpcServer};
 use divi_storage::{Chain, ChainDatabase, ChainParams, NetworkType};
 use divi_wallet::{Address, HdWallet, Network, WalletDb};
 use serde_json::{json, Value};
@@ -53,6 +53,13 @@ impl Node {
             method: method.to_string(),
             params: Params::Array(params),
         })
+    }
+
+    fn err(&self, method: &str, params: Vec<Value>) -> RpcError {
+        let reply = self.call(method, params.clone());
+        reply
+            .error
+            .unwrap_or_else(|| panic!("{method} {params:?} answered {:?}", reply.result))
     }
 
     fn ok(&self, method: &str, params: Vec<Value>) -> Value {
@@ -101,4 +108,17 @@ fn a_hex_script_is_watched_without_its_label() {
         n.ok("getaddressesbyaccount", vec![json!("named")]),
         json!([address])
     );
+}
+
+/// getcoinavailability reads its verbose flag with get_bool whenever it is
+/// given, so null is a type error too (rpcwallet.cpp:828)
+#[test]
+fn getcoinavailability_refuses_a_null_flag() {
+    let n = node();
+    let e = n.err("getcoinavailability", vec![Value::Null]);
+    assert_eq!(
+        (e.code, e.message.as_str()),
+        (-1, "value is type null, expected bool")
+    );
+    assert!(n.ok("getcoinavailability", vec![json!(false)]).is_object());
 }

@@ -1424,6 +1424,8 @@ fn getter_reads_null(method: &str, index: usize) -> bool {
             | ("verifymessage", 0..=2)
             | ("backupwallet", 0)
             | ("importaddress", 0..=2)
+            // get_bool whenever it is given (rpcwallet.cpp:828)
+            | ("getcoinavailability", 0)
     )
 }
 
