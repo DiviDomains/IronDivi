@@ -28,7 +28,7 @@ scripts/coin-select/run.sh target/release ~/divi-3.0.0/bin 54150 /var/tmp
   copies use the first four. `<port-base>+9` is used as a peer that does not exist.
 - `[root]`: a fresh directory is made under it (default `$TMPDIR`, else `/tmp`) and deleted at the end.
 
-A run takes about four minutes and is stopped after 10 minutes. However it ends, every node is stopped and every
+A run takes about a minute and is stopped after 10 minutes. However it ends, every node is stopped and every
 directory deleted. Needs bash and python3 (standard library only).
 
 **The phrase:** read from divid's `dumphdinfo` reply and handed to irondivid in its environment
