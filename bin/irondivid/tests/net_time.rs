@@ -325,3 +325,20 @@ fn the_future_block_limit_is_on_the_adjusted_clock() {
         std::thread::sleep(Duration::from_millis(250));
     }
 }
+
+/// The blocks the node makes carry the adjusted time (BlockFactory.cpp:77,
+/// BlockProofProver.cpp:36)
+#[test]
+fn blocks_made_carry_the_adjusted_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = Daemon::start(dir.path(), &[]);
+    let _peers = ahead(&d, 40, 1800);
+    let before = unix_now();
+    d.rpc_with("setgenerate", json!([1]));
+    let block = d.rpc_with("getblock", json!([d.rpc("getbestblockhash")]));
+    let time = block["time"].as_i64().unwrap();
+    assert!(
+        (before + 1795..=unix_now() + 1805).contains(&time),
+        "block time {time}, clock {before}"
+    );
+}
