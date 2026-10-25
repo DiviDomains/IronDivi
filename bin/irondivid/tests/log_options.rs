@@ -155,6 +155,16 @@ fn raw_peer_handshake(port: u16) -> SocketAddr {
     panic!("no verack within {WAIT:?}");
 }
 
+/// A start and a clean stop with an old debug.log of `old` bytes in place;
+/// returns the old file's bytes and the datadir
+fn start_with_old_log(old: usize, extra: &[&str]) -> (Vec<u8>, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let text: Vec<u8> = (0..old).map(|i| b"0123456789abcdef\n"[i % 17]).collect();
+    std::fs::write(dir.path().join("debug.log"), &text).unwrap();
+    Daemon::start(dir.path(), extra).stop();
+    (text, dir)
+}
+
 /// The log after a raw peer connected and the node stopped
 fn log_with_a_peer(extra: &[&str]) -> (String, SocketAddr) {
     let dir = tempfile::tempdir().unwrap();
@@ -225,4 +235,41 @@ fn logtimestamps_decides_the_line_prefix() {
     );
     assert!(log.lines().all(|l| !timestamped(l)), "{log}");
     assert!(!log.contains("Option -logtimestamps"), "{log}");
+}
+
+/// -shrinkdebugfile (default 1 without -debug): a debug.log over 10 MB is cut
+/// to its last 200 000 bytes at start (Logging.cpp:94-118, :204-205), and the
+/// node goes on writing after them. Without it the old file stays whole;
+/// irondivid then rotates it by size, as it always has (S6 in
+/// docs/divid-differences.md)
+#[test]
+fn shrinkdebugfile_cuts_a_large_debug_log_at_start() {
+    let (old, dir) = start_with_old_log(15_000_000, &[]);
+    let log = std::fs::read(dir.path().join("debug.log")).unwrap();
+    assert!(
+        log.starts_with(&old[old.len() - 200_000..]),
+        "the old tail is not kept"
+    );
+    assert!(log.len() > 200_000, "the node wrote nothing after it");
+    assert!(
+        !dir.path().join("debug.log.1").exists(),
+        "rotated instead of shrunk"
+    );
+
+    for extra in [&["-shrinkdebugfile=0"][..], &["-debug"][..]] {
+        let (old, dir) = start_with_old_log(15_000_000, extra);
+        let kept = std::fs::read(dir.path().join("debug.log.1")).unwrap_or_default();
+        assert_eq!(
+            kept.len(),
+            old.len(),
+            "{extra:?}: the old file is not whole"
+        );
+    }
+
+    // At 10 MB or less nothing is cut
+    let (old, dir) = start_with_old_log(10_000_000, &[]);
+    let kept = std::fs::read(dir.path().join("debug.log.1")).unwrap_or_default();
+    assert_eq!(kept.len(), old.len());
+    let log = read_log(dir.path());
+    assert!(!log.contains("Option -shrinkdebugfile"), "{log}");
 }

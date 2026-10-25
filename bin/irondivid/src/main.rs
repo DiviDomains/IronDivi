@@ -59,6 +59,7 @@ struct Args {
     debug: bool,
     logips: bool,
     logtimestamps: bool,
+    shrinkdebugfile: bool,
     wallet: Option<PathBuf>,
     disablewallet: bool,
     pid: Option<PathBuf>,
@@ -175,6 +176,8 @@ impl Args {
         self.debug = !debug.is_empty() && !debug.iter().any(|c| c == "0");
         self.logips = s.get_bool("logips", false);
         self.logtimestamps = s.get_bool("logtimestamps", true);
+        // Default: shrink unless debugging (Logging.cpp:204)
+        self.shrinkdebugfile = s.get_bool("shrinkdebugfile", !self.debug);
         self.wallet = path("wallet");
         self.disablewallet = s.get_bool("disablewallet", false);
         self.pid = path("pid");
@@ -327,7 +330,6 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "rpcthreads",
     "seednode",
     "sendfreetransactions",
-    "shrinkdebugfile",
     "sysperms",
     "torcontrol",
     "torpassword",
@@ -735,6 +737,7 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         "onlynet",
         "logips",
         "logtimestamps",
+        "shrinkdebugfile",
         "protocolversion",
         "banscore",
         "bantime",
@@ -1012,6 +1015,32 @@ struct RotatingLog {
     redirect_std: bool,
     file: Option<std::fs::File>,
     size: u64,
+    /// -shrinkdebugfile, and when the size was last checked for it
+    shrink: bool,
+    shrink_checked: std::time::Instant,
+}
+
+/// Over this size debug.log is shrunk (Logging.cpp:99)
+const SHRINK_ABOVE: u64 = 10 * 1_000_000;
+/// What a shrink keeps of the end of debug.log (Logging.cpp:105)
+const SHRINK_KEEP: u64 = 200_000;
+/// How often a running node checks whether to shrink (Logging.cpp:186)
+const SHRINK_EVERY: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// Divi Core ShrinkDebugFile (Logging.cpp:94-118): a debug.log over 10 MB is
+/// cut to its last 200 000 bytes
+fn shrink_debug_file(path: &std::path::Path) -> std::io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    let size = std::fs::metadata(path)?.len();
+    if size <= SHRINK_ABOVE {
+        return Ok(());
+    }
+    let mut file = std::fs::File::open(path)?;
+    file.seek(SeekFrom::End(-(SHRINK_KEEP as i64)))?;
+    let mut tail = Vec::with_capacity(SHRINK_KEEP as usize);
+    file.read_to_end(&mut tail)?;
+    drop(file);
+    std::fs::write(path, tail)
 }
 
 impl RotatingLog {
@@ -1020,6 +1049,7 @@ impl RotatingLog {
         max_size: u64,
         max_files: u32,
         redirect_std: bool,
+        shrink: bool,
     ) -> std::io::Result<Self> {
         let mut log = RotatingLog {
             dir: dir.to_path_buf(),
@@ -1028,7 +1058,14 @@ impl RotatingLog {
             redirect_std,
             file: None,
             size: 0,
+            shrink,
+            shrink_checked: std::time::Instant::now(),
         };
+        // Shrunk at start as divid does (Logging.cpp:205); a file that is
+        // still over the size limit after that is rotated
+        if shrink {
+            let _ = shrink_debug_file(&dir.join("debug.log"));
+        }
         log.reopen()?;
         // The log may already be too big from an earlier run
         if log.size >= max_size {
@@ -1071,6 +1108,15 @@ impl std::io::Write for RotatingLog {
         if REOPEN_LOG.swap(false, std::sync::atomic::Ordering::Relaxed) {
             self.file = None;
             self.reopen()?;
+        }
+        // And every five minutes while running (Logging.cpp:186-191)
+        if self.shrink && self.shrink_checked.elapsed() > SHRINK_EVERY {
+            self.shrink_checked = std::time::Instant::now();
+            if self.size > SHRINK_ABOVE {
+                self.file = None;
+                let _ = shrink_debug_file(&self.dir.join("debug.log"));
+                self.reopen()?;
+            }
         }
         if self.size > 0 && self.size + buf.len() as u64 > self.max_size {
             self.rotate()?;
@@ -1160,6 +1206,7 @@ fn init_logging(log_config: &LogConfig, data_dir: &PathBuf) {
             log_config.max_file_size,
             log_config.max_files,
             std_is_log,
+            log_config.shrink,
         ) {
             Ok(log) => log,
             Err(e) => {
@@ -2886,6 +2933,7 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
         debug: args.debug,
         log_ips: args.logips,
         timestamps: args.logtimestamps,
+        shrink: args.shrinkdebugfile,
         // An export only reads the data directory: it logs to the console
         print_to_console: args.printtoconsole || args.export_chain,
     };
@@ -3677,7 +3725,7 @@ mod log_rotation_tests {
     /// Write `lines` records of 50 bytes, checking the files after each
     fn write_and_check(max_size: u64, max_files: u32, lines: usize) -> Vec<(String, u64)> {
         let dir = tempfile::tempdir().unwrap();
-        let mut log = RotatingLog::open(dir.path(), max_size, max_files, false).unwrap();
+        let mut log = RotatingLog::open(dir.path(), max_size, max_files, false, false).unwrap();
         for i in 0..lines {
             let line = format!("{:049}\n", i);
             log.write_all(line.as_bytes()).unwrap();
@@ -3730,7 +3778,7 @@ mod log_rotation_tests {
     fn log_rotation_rotates_oversized_log_at_startup() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("debug.log"), vec![b'x'; 2000]).unwrap();
-        let mut log = RotatingLog::open(dir.path(), 1000, 3, false).unwrap();
+        let mut log = RotatingLog::open(dir.path(), 1000, 3, false, false).unwrap();
         log.write_all(b"new\n").unwrap();
         assert_eq!(
             log_files(dir.path()),

@@ -811,6 +811,11 @@ pub struct LogConfig {
     /// Divi Core -logtimestamps: debug.log lines begin with the time (default on)
     #[serde(default = "default_discover")]
     pub timestamps: bool,
+
+    /// Divi Core -shrinkdebugfile: cut a debug.log over 10 MB to its last
+    /// 200 000 bytes at start and every five minutes (default: without -debug)
+    #[serde(default = "default_discover")]
+    pub shrink: bool,
 }
 
 impl Default for LogConfig {
@@ -822,6 +827,7 @@ impl Default for LogConfig {
             print_to_console: false,
             log_ips: false,
             timestamps: true,
+            shrink: true,
         }
     }
 }
