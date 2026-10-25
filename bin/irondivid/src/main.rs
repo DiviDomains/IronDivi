@@ -1539,6 +1539,17 @@ fn load_or_restore_wallet_with_seed(
                 other.with_context(|| format!("Failed to open wallet at {:?}", wallet_path))?
             }
         };
+        // Other records that cannot be read: a warning, and the start goes
+        // on (DB_NONCRITICAL_ERROR, init.cpp:1157-1162, :1299-1310)
+        let problems = wallet.load_problems();
+        if problems.transactions + problems.others > 0 {
+            let message = "Warning: error reading wallet.dat! All keys read correctly, but transaction data or address book entries might be missing or incorrect.";
+            info!("Errors detected during wallet loading\n{}", message);
+            // InitWarning: "Warning: " and the message, logged and on stderr
+            // (noui.cpp:38-40)
+            warn!("Warning: {}", message);
+            eprintln!("Warning: {}", message);
+        }
 
         // Migrate chain_mode if needed (fixes wallets created before ChainMode was configurable)
         wallet

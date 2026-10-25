@@ -890,7 +890,7 @@ impl WalletDb {
                 Ok(notes) => {
                     self.tx_notes.write().insert(txid, notes);
                 }
-                Err(e) => debug!("Skipping unreadable notes of {}: {}", txid, e),
+                Err(e) => db.note_unreadable_transaction(&format!("notes of {txid}"), e),
             }
         }
 

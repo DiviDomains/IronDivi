@@ -120,6 +120,8 @@ pub struct LoadProblems {
 #[derive(Debug, Clone, Copy)]
 enum Kind {
     Key,
+    Transaction,
+    Other,
 }
 
 /// Wallet database for persistence
@@ -184,7 +186,14 @@ impl WalletDatabase {
         let mut problems = self.problems.lock().unwrap_or_else(|e| e.into_inner());
         match kind {
             Kind::Key => problems.keys += 1,
+            Kind::Transaction => problems.transactions += 1,
+            Kind::Other => problems.others += 1,
         }
+    }
+
+    /// Count a record that could not be read (for the loads of WalletDb)
+    pub(crate) fn note_unreadable_transaction(&self, what: &str, error: impl std::fmt::Display) {
+        self.unreadable(Kind::Transaction, what, error);
     }
 
     pub fn path(&self) -> &Path {
@@ -655,9 +664,7 @@ impl WalletDatabase {
                 let outpoint = outpoint_from_key(&key);
                 match deserialize_utxo(&value) {
                     Ok(utxo) => utxos.push((outpoint, utxo)),
-                    Err(e) => {
-                        debug!("Failed to deserialize UTXO: {}", e);
-                    }
+                    Err(e) => self.unreadable(Kind::Transaction, "coin", e),
                 }
             }
         }
@@ -716,9 +723,7 @@ impl WalletDatabase {
             let (_, value) = item.map_err(|e| WalletError::Storage(e.to_string()))?;
             match deserialize_tx(&value) {
                 Ok(tx) => transactions.push(tx),
-                Err(e) => {
-                    debug!("Failed to deserialize transaction: {}", e);
-                }
+                Err(e) => self.unreadable(Kind::Transaction, "transaction", e),
             }
         }
 
@@ -786,11 +791,10 @@ impl WalletDatabase {
             let (key, value) = item.map_err(|e| WalletError::Storage(e.to_string()))?;
             if let Ok(key_str) = String::from_utf8(key.to_vec()) {
                 if let Some(account) = key_str.strip_prefix("acc_") {
-                    let account = account.to_string();
-                    let addresses: Vec<String> = serde_json::from_slice(&value).map_err(|e| {
-                        WalletError::Storage(format!("Failed to deserialize account: {}", e))
-                    })?;
-                    accounts.push((account, addresses));
+                    match serde_json::from_slice::<Vec<String>>(&value) {
+                        Ok(addresses) => accounts.push((account.to_string(), addresses)),
+                        Err(e) => self.unreadable(Kind::Other, "account", e),
+                    }
                 }
             }
         }
@@ -808,10 +812,10 @@ impl WalletDatabase {
             let (key, value) = item.map_err(|e| WalletError::Storage(e.to_string()))?;
             if let Ok(key_str) = String::from_utf8(key.to_vec()) {
                 if let Some(address) = key_str.strip_prefix("addr_") {
-                    let address = address.to_string();
-                    let account = String::from_utf8(value.to_vec())
-                        .map_err(|e| WalletError::Storage(e.to_string()))?;
-                    mappings.push((address, account));
+                    match String::from_utf8(value.to_vec()) {
+                        Ok(account) => mappings.push((address.to_string(), account)),
+                        Err(e) => self.unreadable(Kind::Other, "address book entry", e),
+                    }
                 }
             }
         }
@@ -885,9 +889,7 @@ impl WalletDatabase {
             let (key, value) = item.map_err(|e| WalletError::Storage(e.to_string()))?;
             match deserialize_vault_metadata(&value) {
                 Ok(metadata) => vaults.push((key.to_vec(), metadata)),
-                Err(e) => {
-                    debug!("Failed to deserialize vault metadata: {}", e);
-                }
+                Err(e) => self.unreadable(Kind::Other, "vault", e),
             }
         }
 
@@ -1038,10 +1040,7 @@ impl WalletDatabase {
             let utxo_data = &value[..value.len() - 4];
             match deserialize_utxo(utxo_data) {
                 Ok(utxo) => results.push((outpoint, utxo, spent_height)),
-                Err(e) => {
-                    debug!("Skipping corrupt spent_utxo_data entry: {}", e);
-                    continue;
-                }
+                Err(e) => self.unreadable(Kind::Transaction, "spent coin", e),
             }
         }
 

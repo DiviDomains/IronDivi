@@ -101,6 +101,8 @@ fn stop(mut node: Node, rpc_port: u16) {
     }
 }
 
+const WARNING: &str = "Warning: Warning: error reading wallet.dat! All keys read correctly, but transaction data or address book entries might be missing or incorrect.";
+
 /// A regtest node's wallet folder
 fn wallet_dir(datadir: &Path) -> std::path::PathBuf {
     datadir.join("wallet")
@@ -163,6 +165,50 @@ fn run_to_exit(
     )
 }
 
+/// The node's stderr while it runs, read after it stopped
+fn start_with_stderr(
+    datadir: &Path,
+    rpc_port: u16,
+    p2p_port: u16,
+    extra: &[&str],
+) -> (Child, std::path::PathBuf) {
+    let err = datadir.join("stderr.txt");
+    let child = Command::new(env!("CARGO_BIN_EXE_irondivid"))
+        .arg("--regtest")
+        .arg("--datadir")
+        .arg(datadir)
+        .args(["--rpcport", &rpc_port.to_string()])
+        .args(["--port", &p2p_port.to_string()])
+        .args(["--bind", "127.0.0.1", "--staking=false", "--listen=false"])
+        .args(["--rpcuser", "test", "--rpcpassword", "test"])
+        .args(extra)
+        .stdout(Stdio::null())
+        .stderr(std::fs::File::create(&err).unwrap())
+        .spawn()
+        .expect("spawn irondivid");
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while try_rpc(
+        rpc_port,
+        "getblockcount",
+        &json!([]),
+        Duration::from_secs(10),
+    )
+    .is_none()
+    {
+        assert!(
+            Instant::now() < deadline,
+            "irondivid did not answer\n{}",
+            log_tail(datadir)
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    (child, err)
+}
+
+fn log(datadir: &Path) -> String {
+    std::fs::read_to_string(datadir.join("debug.log")).unwrap_or_default()
+}
+
 /// A key record that cannot be read stops the start: exit 1 and Divi Core's
 /// InitError (DB_CORRUPT, walletdb.cpp:499-500, init.cpp:1153-1156)
 #[test]
@@ -177,4 +223,21 @@ fn an_unreadable_key_stops_the_start() {
         stderr.contains("Error: Error loading wallet.dat: Wallet corrupted"),
         "stderr: {stderr}"
     );
+}
+
+/// An address-book record that cannot be read: a warning on stderr, and the
+/// node starts (DB_NONCRITICAL_ERROR, init.cpp:1157-1162, :1307)
+#[test]
+fn an_unreadable_address_book_entry_is_a_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    let (rpc_port, p2p_port) = (free_port(), free_port());
+    made(dir.path(), rpc_port, p2p_port, 0);
+    damage(dir.path(), "wallet_accounts", b"acc_damaged", b"{not json");
+    let (child, err) = start_with_stderr(dir.path(), rpc_port, p2p_port, &[]);
+    let node = Node(child);
+    assert!(ok(rpc_port, "getwalletinfo", json!([])).is_object());
+    stop(node, rpc_port);
+    let stderr = std::fs::read_to_string(err).unwrap();
+    assert!(stderr.contains(WARNING), "stderr: {stderr}");
+    assert!(log(dir.path()).contains("Errors detected during wallet loading"));
 }
