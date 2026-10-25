@@ -34,7 +34,7 @@ use crate::error::{Result, SwapError};
 use crate::htlc::{HtlcParams, ScriptVersion};
 use crate::state::SwapState;
 use crate::store::{MakerRecord, QuoteRecord, Store};
-use crate::types::{Amount, Chain, Outpoint, SignedTx};
+use crate::types::{Amount, Chain, Outpoint, SignedTx, SpendInfo};
 
 /// Default wall-clock time the maker waits for the taker's lock after `accept`.
 pub const DEFAULT_LOCK_WAIT_SECS: u64 = 1800;
@@ -576,7 +576,9 @@ impl Maker {
             SwapState::TakerClaimed => self.on_taker_claimed(r).await,
             SwapState::MakerClaimed => self.on_maker_claimed(r).await,
             SwapState::MakerRefunded => self.enter(r, SwapState::Done),
-            SwapState::Quoted | SwapState::Aborted | SwapState::Done => Ok(Flow::Idle),
+            SwapState::Quoted | SwapState::Aborted | SwapState::Done | SwapState::Lost => {
+                Ok(Flow::Idle)
+            }
         }
     }
 
@@ -892,10 +894,12 @@ impl Maker {
             }
         };
         if let Err(e) = ctx.backend.broadcast(&claim).await {
-            if matches!(e, SwapError::Rejected(_))
-                && self.claim_refused(&ctx, r, &claim, &e).await?
-            {
-                return self.enter(r, SwapState::MakerClaimed);
+            if matches!(e, SwapError::Rejected(_)) {
+                match self.claim_refused(&ctx, r, &claim, &e).await? {
+                    Refused::Resent => return self.enter(r, SwapState::MakerClaimed),
+                    Refused::Lost => return self.enter(r, SwapState::Lost),
+                    Refused::NotResent => {}
+                }
             }
             return Err(e);
         }
@@ -928,10 +932,12 @@ impl Maker {
             return self.enter(r, SwapState::Done);
         }
         if let Err(e) = ctx.backend.broadcast(&claim).await {
-            if matches!(e, SwapError::Rejected(_))
-                && self.claim_refused(&ctx, r, &claim, &e).await?
-            {
-                return Ok(Flow::Idle);
+            if matches!(e, SwapError::Rejected(_)) {
+                match self.claim_refused(&ctx, r, &claim, &e).await? {
+                    Refused::Resent => return Ok(Flow::Idle),
+                    Refused::Lost => return self.enter(r, SwapState::Lost),
+                    Refused::NotResent => {}
+                }
             }
             return Err(e);
         }
@@ -940,46 +946,84 @@ impl Maker {
         Ok(Flow::Idle)
     }
 
-    /// The node refused `claim`, the newest taker-leg claim, for good: `true` if it was
+    /// The node refused `claim`, the newest taker-leg claim, for good. `Resent` if it was
     /// re-signed higher and sent ([`ClaimCtx::resign_after_refusal`]). Nothing is re-signed
-    /// while the chain holds it or a version it replaced, or once the taker's refund of the
-    /// taker leg has confirmed: that leg is gone, and the error says so.
+    /// while the chain holds it or a version it replaced (`NotResent`), or once the taker's
+    /// refund of the taker leg has confirmed: that leg is gone. A refund with fewer
+    /// confirmations than the quote asks for on that chain is an error on every step (a
+    /// reorg may still drop it); once it is that deep the loss is recorded on the swap
+    /// (`Lost`, with `last_error` naming the refund) and the claim is forgotten.
     async fn claim_refused(
         &self,
         ctx: &ClaimCtx<'_>,
         r: &mut MakerRecord,
         claim: &SignedTx,
         e: &SwapError,
-    ) -> Result<bool> {
+    ) -> Result<Refused> {
         if ctx.held_after_refusal(r, claim, e).await? {
-            return Ok(false);
+            return Ok(Refused::NotResent);
         }
-        if self.taker_leg_refunded(r).await? {
-            tracing::error!(swap = %r.id, chain = %ctx.chain, error = %e,
-                "the taker refunded the taker leg before the claim confirmed; the leg is lost");
-            return Err(SwapError::Other(format!(
-                "taker leg refunded before the claim confirmed ({e}); the leg is lost"
-            )));
+        if let Some((refund, deep)) = self.taker_leg_refund(r).await? {
+            if !deep {
+                tracing::error!(swap = %r.id, chain = %ctx.chain, refund = %refund.txid,
+                    error = %e, "the taker refunded the taker leg before the claim confirmed");
+                return Err(SwapError::Other(format!(
+                    "taker leg refunded by {} before the claim confirmed ({e}); the leg is lost",
+                    refund.txid
+                )));
+            }
+            tracing::error!(
+                swap = %r.id,
+                chain = %ctx.chain,
+                taker_leg = ?r.taker_leg_outpoint,
+                maker_leg = ?r.maker_leg_funding.as_ref().map(|f| f.outpoint),
+                refund = %refund.txid,
+                claim = %claim.txid,
+                error = %e,
+                "swap lost: the taker refunded the taker leg before our claim confirmed and \
+                 already has the maker leg; nothing is left to claim"
+            );
+            r.last_error = Some(format!(
+                "lost: the taker leg was refunded by {} before our claim {} confirmed ({e})",
+                refund.txid, claim.txid
+            ));
+            r.taker_leg_claim = None;
+            return Ok(Refused::Lost);
         }
-        ctx.resign_after_refusal(r, claim, e).await
+        Ok(if ctx.resign_after_refusal(r, claim, e).await? {
+            Refused::Resent
+        } else {
+            Refused::NotResent
+        })
     }
 
-    /// Whether a confirmed spend of the taker-leg lock carries no preimage: the taker's
-    /// refund.
-    async fn taker_leg_refunded(&self, r: &MakerRecord) -> Result<bool> {
+    /// A confirmed spend of the taker-leg lock that carries no preimage (the taker's
+    /// refund), and whether it is as deep as the quote's confirmations on that chain.
+    async fn taker_leg_refund(&self, r: &MakerRecord) -> Result<Option<(SpendInfo, bool)>> {
         let Some(op) = r.taker_leg_outpoint else {
-            return Ok(false);
+            return Ok(None);
         };
         let tb = self.tk(r)?;
         // No spend predates the lock's own block.
         let Some(confs) = tb.confirmations(&op.txid).await?.filter(|&c| c >= 1) else {
-            return Ok(false);
+            return Ok(None);
         };
-        let from = (tb.tip_height().await? + 1).saturating_sub(confs as u64);
-        let Some(spend) = tb.find_spend(&op, from).await? else {
-            return Ok(false);
+        let tip = tb.tip_height().await?;
+        let Some(spend) = tb
+            .find_spend(&op, (tip + 1).saturating_sub(confs as u64))
+            .await?
+        else {
+            return Ok(None);
         };
-        Ok(spend.height.is_some() && spend.extract_preimage(&r.hash).is_none())
+        let Some(height) = spend.height else {
+            return Ok(None);
+        };
+        if spend.extract_preimage(&r.hash).is_some() {
+            return Ok(None);
+        }
+        let need = r.quote.confirmations_on(r.quote.taker_chain()) as u64;
+        let deep = (tip + 1).saturating_sub(height) >= need;
+        Ok(Some((spend, deep)))
     }
 
     fn taker_leg_outpoint(&self, r: &MakerRecord) -> Result<Outpoint> {
@@ -1017,6 +1061,16 @@ impl Maker {
         }
         Ok(spend.extract_preimage(&r.hash))
     }
+}
+
+/// What became of a taker-leg claim the node refused for good ([`Maker::claim_refused`]).
+enum Refused {
+    /// Re-signed at a higher fee and sent.
+    Resent,
+    /// Not re-signed: the chain holds it or a version it replaced, or it cannot be bumped.
+    NotResent,
+    /// The taker's refund of the taker leg is buried: the swap is lost.
+    Lost,
 }
 
 fn unix_now() -> u64 {

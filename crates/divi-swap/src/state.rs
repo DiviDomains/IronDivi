@@ -12,6 +12,7 @@
 //! Quoted → Accepted → TakerLockSeen → TakerLockConfirmed → MakerLocked → MakerLockConfirmed →
 //!   { TakerClaimed → MakerClaimed → Done | MakerRefundable → MakerRefunded → Done }
 //! Quoted / Accepted / TakerLockSeen → Aborted   (taker never locked, or lock invalid)
+//! TakerClaimed / MakerClaimed → Lost            (taker refunded the taker leg first)
 //! ```
 //! `MakerLocked` means "funding tx built and persisted"; broadcast follows (write-ahead).
 //! The preimage learned in `TakerClaimed` is stored on the swap record, not in the enum.
@@ -47,11 +48,17 @@ pub enum SwapState {
     Aborted,
     /// Finished (claimed or refunded). Terminal.
     Done,
+    /// The taker's refund of the taker leg (no preimage) confirmed, as deep as the quote's
+    /// confirmations on that chain, before our claim of it did; the taker already has the
+    /// maker leg. Nothing is left to claim, so the claim is not resent. Entered from
+    /// `TakerClaimed` or `MakerClaimed` when the node refuses the claim; logged at error
+    /// level with both legs, and `last_error` names the refund. Terminal.
+    Lost,
 }
 
 impl SwapState {
     /// Every state, in pipeline order.
-    pub const ALL: [SwapState; 12] = [
+    pub const ALL: [SwapState; 13] = [
         SwapState::Quoted,
         SwapState::Accepted,
         SwapState::TakerLockSeen,
@@ -64,11 +71,12 @@ impl SwapState {
         SwapState::MakerRefunded,
         SwapState::Aborted,
         SwapState::Done,
+        SwapState::Lost,
     ];
 
     /// No further transitions.
     pub fn is_terminal(self) -> bool {
-        matches!(self, SwapState::Done | SwapState::Aborted)
+        matches!(self, SwapState::Done | SwapState::Aborted | SwapState::Lost)
     }
 
     /// Whether the maker may hold DIVI coins for this swap in this state. Coin selection
@@ -105,6 +113,8 @@ impl SwapState {
                 | (MakerRefundable, TakerClaimed)
                 | (MakerRefundable, MakerRefunded)
                 | (TakerClaimed, MakerClaimed)
+                | (TakerClaimed, Lost)
+                | (MakerClaimed, Lost)
                 | (MakerClaimed, Done)
                 | (MakerRefunded, Done)
         )
@@ -126,6 +136,7 @@ impl SwapState {
             MakerRefunded => "maker_refunded",
             Aborted => "aborted",
             Done => "done",
+            Lost => "lost",
         }
     }
 }
@@ -179,5 +190,52 @@ mod tests {
         for a in SwapState::ALL.into_iter().filter(|s| s.is_terminal()) {
             assert!(SwapState::ALL.iter().all(|b| !a.can_transition_to(*b)));
         }
+    }
+
+    /// Every variant with its verdict. The match makes a new variant a compile error here,
+    /// so it cannot be added without a decision.
+    fn verdict(s: SwapState) -> bool {
+        use SwapState::*;
+        match s {
+            Quoted | Accepted | TakerLockSeen | TakerLockConfirmed | MakerLocked
+            | MakerLockConfirmed | TakerClaimed | MakerClaimed | MakerRefundable
+            | MakerRefunded => false,
+            Aborted | Done | Lost => true,
+        }
+    }
+
+    #[test]
+    fn is_terminal_matches_the_table_for_every_variant() {
+        for s in SwapState::ALL {
+            assert_eq!(s.is_terminal(), verdict(s), "{s}");
+        }
+        assert_eq!(SwapState::ALL.iter().filter(|s| s.is_terminal()).count(), 3);
+    }
+
+    #[test]
+    fn lost_is_terminal_and_entered_only_from_the_taker_leg_claim() {
+        use SwapState::*;
+        assert!(Lost.is_terminal());
+        assert!(!Lost.maker_coins_reserved());
+        for a in SwapState::ALL {
+            assert_eq!(
+                a.can_transition_to(Lost),
+                matches!(a, TakerClaimed | MakerClaimed),
+                "{a} -> lost"
+            );
+            assert!(!Lost.can_transition_to(a), "lost -> {a}");
+        }
+    }
+
+    #[test]
+    fn json_names_are_the_variant_names_and_lost_round_trips() {
+        // The record stores the bare variant name; adding `Lost` must not move any other.
+        for s in SwapState::ALL {
+            let j = serde_json::to_string(&s).unwrap();
+            assert_eq!(j, format!("\"{s:?}\""));
+            assert_eq!(serde_json::from_str::<SwapState>(&j).unwrap(), s);
+        }
+        assert_eq!(serde_json::to_string(&SwapState::Lost).unwrap(), "\"Lost\"");
+        assert_eq!("lost".parse::<SwapState>().unwrap(), SwapState::Lost);
     }
 }
