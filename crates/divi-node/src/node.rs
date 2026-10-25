@@ -705,10 +705,7 @@ impl Node {
                 })
                 .cloned()
                 .collect(),
-            dns_seed: config
-                .p2p
-                .dns_seed
-                .unwrap_or(config.p2p.connect.is_empty()),
+            dns_seed: config.p2p.dns_seed.unwrap_or(config.p2p.connect.is_empty()),
             force_dns_seed: config.p2p.force_dns_seed,
         };
         let peer_manager = PeerManager::new(peer_manager_config);
