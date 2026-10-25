@@ -180,6 +180,7 @@ class Pair:
         self.last_tx = None  # (node, txid) of the step's wallet send
         self.note = None  # what the step needed besides itself
         self.restarted = set()  # nodes stopped and started again in this episode
+        self.pool_before = {}  # an invalidate's node: its mempool before, txid -> inputs
 
     def node(self, n):
         return self.nodes[n - 1]
@@ -315,6 +316,35 @@ def input_values(node, txid):
     return sorted(values, key=float)
 
 
+TRACE = os.environ.get("RANDOM_SEQUENCES_TRACE", "") == "1"
+
+
+def trace_mempool(pair, node, when):
+    """With RANDOM_SEQUENCES_TRACE=1: node's mempool, each transaction with its
+    inputs (txid:vout, height of the block holding them, generated or not) and
+    its outputs, logged"""
+    if not TRACE:
+        return
+    pool = node.call("getrawmempool")
+    log(f"#   trace {pair.name} {node.name} {when}: height {node.rpc('getblockcount')}, mempool {pool[1] if pool[0] == 'ok' else pool}")
+    for txid in pool[1] if pool[0] == "ok" else []:
+        tx = node.call("getrawtransaction", txid, 1)
+        if tx[0] != "ok":
+            continue
+        ins = []
+        for i in tx[1]["vin"]:
+            prev = node.call("getrawtransaction", i.get("txid", ""), 1)
+            where, kind = "?", "?"
+            if prev[0] == "ok":
+                p = prev[1]
+                kind = "coinbase" if "coinbase" in p["vin"][0] else (
+                    "coinstake" if len(p["vout"]) > 1 and p["vout"][0]["value"] in ("0.00000000", "0.0", 0) else "tx")
+                # divid's getblockheader gives no height: from the confirmations
+                where = node.rpc("getblockcount") - p["confirmations"] + 1 if p.get("confirmations") else "mempool"
+            ins.append(f"{i.get('txid', '')[:12]}:{i.get('vout')}@{where}/{kind}")
+        log(f"#     {txid[:12]} in {ins} out {[o['value'] for o in tx[1]['vout']]}")
+
+
 def run_step(pair, step):
     """Apply one step to one pair; returns (outcome, extra) where extra holds
     what is compared besides the snapshots"""
@@ -374,7 +404,10 @@ def run_step(pair, step):
         if height - depth + 1 < 1:
             return "too low", None
         target = node.rpc("getblockhash", height - depth + 1)
+        trace_mempool(pair, node, f"before invalidateblock of {height - depth + 1}")
+        pair.pool_before = pool_inputs(node)
         first = node.call("invalidateblock", target)
+        trace_mempool(pair, node, f"after invalidateblock of {height - depth + 1}")
         mid = snapshot(node)
         # the coins in full, printed with a FAIL but not compared
         coins = node.call("listunspent", 0)
@@ -585,15 +618,29 @@ def coin_choice_differs():
     return len(spent[0]) == len(spent[1]) == 1 and spent[0] != spent[1]
 
 
-def spends_immature(pair, holder, txid, next_height):
-    """Whether the transaction (in `holder`'s mempool) spends a coinbase or
-    coinstake output, of either wallet of the pair, immature at `next_height`"""
-    tx = holder.call("getrawtransaction", txid, 1)
-    if tx[0] != "ok":
-        return False
-    for i in tx[1]["vin"]:
+def pool_inputs(node):
+    """Each transaction of node's mempool with the outpoints it spends"""
+    out = {}
+    pool = node.call("getrawmempool")
+    for txid in pool[1] if pool[0] == "ok" else []:
+        tx = node.call("getrawtransaction", txid, 1)
+        if tx[0] == "ok":
+            out[txid] = [(i.get("txid", ""), i.get("vout")) for i in tx[1]["vin"]]
+    return out
+
+
+def spends_immature(pair, holder, txid, next_height, inputs=None):
+    """Whether the transaction (in `holder`'s mempool, or with `inputs` given)
+    spends a coinbase or coinstake output, of either wallet of the pair,
+    immature at `next_height`"""
+    if inputs is None:
+        tx = holder.call("getrawtransaction", txid, 1)
+        if tx[0] != "ok":
+            return False
+        inputs = [(i.get("txid", ""), i.get("vout")) for i in tx[1]["vin"]]
+    for prev_txid, _ in inputs:
         for wallet in pair.nodes:
-            prev = wallet.call("gettransaction", i.get("txid", ""))
+            prev = wallet.call("gettransaction", prev_txid)
             if prev[0] == "ok" and prev[1].get("generated") and prev[1].get("confirmations", 0) > 0:
                 height = wallet.rpc("getblockcount") - prev[1]["confirmations"] + 1
                 if next_height - height < MATURITY:
@@ -622,21 +669,33 @@ def input_ages(pair, holder, txid):
 
 def maturity_explains(n, mid_heights):
     """After an invalidate on node n: on each side, every transaction node n
-    lacks and the other node holds spends a coin immature at the height after
-    the one the invalidate left (`mid_heights`, per side), and node n holds
-    none of those itself"""
+    lacks, of those the other node holds and those node n held itself before
+    the invalidate (and the chain has not confirmed since), spends a coin
+    immature at the height after the one the invalidate left (`mid_heights`,
+    per side), and node n holds none of those itself. Node n's own sends
+    count too: the other node may never have had them (it was restarted, and
+    a send reaches it again only by the random rebroadcast)"""
     dropped = []
     for pair, mid in zip(PAIRS, mid_heights):
         node, other = pair.node(n), pair.other(n)
         mine, theirs = set(node.rpc("getrawmempool")), set(other.rpc("getrawmempool"))
+        before = pair.pool_before
         next_height = mid + 1
         values = []
-        for txid in theirs - mine:
-            if not spends_immature(pair, other, txid, next_height):
+        for txid in (theirs | set(before)) - mine:
+            known = node.call("getrawtransaction", txid, 1)
+            if known[0] == "ok" and known[1].get("confirmations", 0) > 0:
+                continue
+            holder = other if txid in theirs else node
+            if not spends_immature(pair, holder, txid, next_height, None if txid in theirs else before[txid]):
                 log(f"#   maturity rule: {pair.name} node {n} lacks {txid[:8]}, not immature at {next_height}")
                 return False
-            tx = other.call("getrawtransaction", txid, 1)
-            values.append(sorted(str(o["value"]) for o in tx[1]["vout"]) if tx[0] == "ok" else [])
+            tx = holder.call("getrawtransaction", txid, 1) if txid in theirs else node.call("gettransaction", txid)
+            if txid in theirs:
+                values.append(sorted(str(o["value"]) for o in tx[1]["vout"]) if tx[0] == "ok" else [])
+            else:
+                decoded = node.call("decoderawtransaction", tx[1]["hex"]) if tx[0] == "ok" else tx
+                values.append(sorted(str(o["value"]) for o in decoded[1]["vout"]) if decoded[0] == "ok" else [])
         for txid in mine:
             if spends_immature(pair, node, txid, next_height):
                 log(f"#   maturity rule: {pair.name} node {n} holds {txid[:8]}, immature at {next_height}")
@@ -725,6 +784,7 @@ for step in steps:
     def apply(pair):
         pair.last_tx = None
         pair.note = None
+        pair.pool_before = {}
         try:
             result = run_step(pair, step)
         except RuntimeError as e:
