@@ -146,7 +146,7 @@ cargo clippy --workspace -- -D warnings
 
 ### Releasing
 
-Run `tools/release-check.sh` in the tree being released before building any tarball. It fails on a known vulnerability (`cargo deny`, `cargo audit`) or a disallowed license or source, and a failing tree is not released.
+Run `tools/release-check.sh` in the tree being released before building any tarball. It fails on a known vulnerability in a shipped binary (`irondivid`, `irondivi-cli`; checked with `cargo deny` and `cargo audit`) or a disallowed license or source anywhere in the workspace, and a failing tree is not released. Advisories for crates that only the swap tools use are printed but do not fail it.
 
 ## RPC Compatibility
 

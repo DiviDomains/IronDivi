@@ -1,5 +1,0 @@
-[advisories]
-# cggmp21 is used only by divi-swap-xmr, and only for its re-exported Paillier and
-# generic-ec types; the CGGMP21 presigning protocol this advisory covers is never called.
-# It is not linked into irondivid or irondivi-cli.
-ignore = ["RUSTSEC-2025-0127"]
