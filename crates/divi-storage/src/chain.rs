@@ -5933,10 +5933,48 @@ mod tests {
         assert!(!accepts(1000));
     }
 
+    /// The split of the block value comes from spork 13 where its entry is in force
+    /// (LegacyBlockSubsidies.cpp:72-89, spork.cpp:109-125)
+    #[test]
+    fn block_payments_follow_spork_13() {
+        let (chain, _dir) = create_test_chain();
+        let mut index = chain.tip().unwrap();
+        index.height = 135;
+        let mut block = Block::default();
+        block.header.prev_block = index.hash;
+        let accepts = |mint: i64| {
+            chain
+                .validate_block_value(&block, &index, Amount::from_divi(mint), Amount::ZERO)
+                .is_ok()
+        };
+        assert!(accepts(990));
+
+        // stake 50, masternode 30: the staker side is 80% of 1200 DIVI
+        set_spork(&chain, 10012, &[("50;30;10;5;5;100", 1_000)]);
+        let rewards = chain.block_rewards(135);
+        assert_eq!(rewards.stake, Amount::from_divi(600));
+        assert_eq!(rewards.masternode, Amount::from_divi(360));
+        assert_eq!(rewards.treasury, Amount::from_divi(120));
+        assert_eq!(rewards.proposals, Amount::from_divi(60));
+        assert_eq!(rewards.charity, Amount::from_divi(60));
+        assert!(accepts(960));
+        assert!(!accepts(990));
+
+        // 90% to the staker side
+        set_spork(&chain, 10012, &[("40;50;5;0;5;100", 1_000)]);
+        assert!(accepts(1080));
+        assert!(!accepts(1081));
+
+        // the five must add up to 100
+        set_spork(&chain, 10012, &[("40;50;5;0;6;100", 1_000)]);
+        assert!(accepts(990));
+        assert!(!accepts(1000));
+    }
+
     /// A treasury block is paid from the rewards of the network's sporks, at both
     /// ends of its cycle (BlockSubsidyProvider.cpp:19-37)
     #[test]
-    fn treasury_payments_follow_spork_15() {
+    fn treasury_payments_follow_sporks_13_and_15() {
         let (chain, _dir) = create_test_chain();
         let due = |chain: &Chain| {
             let due = chain.treasury_payments_due(150).unwrap();
@@ -5946,6 +5984,12 @@ mod tests {
             due(&chain),
             (Amount::from_divi(9600), Amount::from_divi(600))
         );
+        set_spork(&chain, 10012, &[("50;30;10;5;5;100", 1_000)]);
+        assert_eq!(
+            due(&chain),
+            (Amount::from_divi(6000), Amount::from_divi(3000))
+        );
+        set_spork(&chain, 10012, &[]);
         set_spork(&chain, 10014, &[("2000;100", 1_000)]);
         // 16% and 1% of 1950 DIVI, for 50 blocks
         assert_eq!(

@@ -152,9 +152,15 @@ pub fn get_block_subsidy_with(
     };
     let distributable = subsidy.as_sat() - lottery.as_sat();
 
-    // Reward distribution:
+    // Default reward distribution, which spork 13 can override:
     // stakers 38%, masternodes 45%, treasury 16%, proposals 0%, charity 1%
-    let (stake, masternode, treasury, proposals, charity) = (38, 45, 16, 0, 1);
+    let (stake, masternode, treasury, proposals, charity) = sporks
+        .and_then(|v| {
+            v.sporks
+                .reward_distribution(height, halving_interval, (v.block_time)(height))
+        })
+        .map(|d| (d.stake, d.masternode, d.treasury, d.proposals, d.charity))
+        .unwrap_or((38, 45, 16, 0, 1));
     let part = |percent: i32| Amount::from_sat((distributable * percent as i64) / 100);
 
     BlockRewards {
