@@ -318,6 +318,11 @@ pub struct WalletDb {
     /// catch-up, reorg rollback and rescans must not interleave, or a spend
     /// can be scanned before the coin it spends and be lost
     scan_lock: Mutex<()>,
+    /// Held while a key is made and stored with the HD indices, as Divi Core
+    /// makes keys under cs_wallet (wallet.cpp:2122-2195): two callers never get
+    /// the same index, and the indices are stored in the order they advanced.
+    /// Taken after `locked`.
+    key_lock: Mutex<()>,
     /// Told each wallet transaction added or seen again (-walletnotify)
     tx_listener: RwLock<Option<TxListener>>,
     /// Transactions that left their block in a reorg and were told to the
@@ -403,6 +408,7 @@ impl WalletDb {
             mempool_txs: RwLock::new(HashMap::new()),
             detached_txs: RwLock::new(HashMap::new()),
             scan_lock: Mutex::new(()),
+            key_lock: Mutex::new(()),
             tx_listener: RwLock::new(None),
             reorg_accepted: RwLock::new(HashSet::new()),
             pending_deletes: RwLock::new(PendingDeletes::default()),
@@ -444,6 +450,7 @@ impl WalletDb {
             mempool_txs: RwLock::new(HashMap::new()),
             detached_txs: RwLock::new(HashMap::new()),
             scan_lock: Mutex::new(()),
+            key_lock: Mutex::new(()),
             tx_listener: RwLock::new(None),
             reorg_accepted: RwLock::new(HashSet::new()),
             pending_deletes: RwLock::new(PendingDeletes::default()),
@@ -489,6 +496,7 @@ impl WalletDb {
             mempool_txs: RwLock::new(HashMap::new()),
             detached_txs: RwLock::new(HashMap::new()),
             scan_lock: Mutex::new(()),
+            key_lock: Mutex::new(()),
             tx_listener: RwLock::new(None),
             reorg_accepted: RwLock::new(HashSet::new()),
             pending_deletes: RwLock::new(PendingDeletes::default()),
@@ -833,6 +841,7 @@ impl WalletDb {
             mempool_txs: RwLock::new(HashMap::new()),
             detached_txs: RwLock::new(HashMap::new()),
             scan_lock: Mutex::new(()),
+            key_lock: Mutex::new(()),
             tx_listener: RwLock::new(None),
             reorg_accepted: RwLock::new(HashSet::new()),
             pending_deletes: RwLock::new(PendingDeletes::default()),
@@ -1587,6 +1596,7 @@ impl WalletDb {
     fn new_address(&self, is_change: bool) -> Result<Address, WalletError> {
         // Held until the key is stored, so a concurrent lock() cannot strip it first
         let locked = self.locked.read();
+        let _keys = self.key_lock.lock();
         let mut store = Vec::new();
         let addr = if *locked {
             self.keystore.take_from_keypool(is_change)?
@@ -2419,6 +2429,7 @@ impl WalletDb {
 
         // As Divi Core's walletpassphrase: top the keypool up while the seed is
         // here, so getnewaddress keeps working after the wallet is locked again
+        let keys = self.key_lock.lock();
         match self.keystore.top_up_keypool(None) {
             Ok(added) if !added.is_empty() => {
                 if let Err(e) = self.persist_keys(&added) {
@@ -2428,6 +2439,7 @@ impl WalletDb {
             Ok(_) => {}
             Err(e) => debug!("Keypool not topped up on unlock: {}", e),
         }
+        drop(keys);
 
         // Set unlock expiration time
         let expiration = if timeout_secs > 0 {
@@ -2785,6 +2797,7 @@ impl WalletDb {
     /// Returns the number of keys generated
     pub fn refill_keypool(&self, new_size: Option<u32>) -> Result<u32, WalletError> {
         let _locked = self.locked.read();
+        let _keys = self.key_lock.lock();
         let added = self.keystore.top_up_keypool(new_size)?;
         if !added.is_empty() {
             self.dirty.write().keys = true;
