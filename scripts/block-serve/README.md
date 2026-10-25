@@ -36,6 +36,12 @@ scripts/block-serve/run.sh target/release ~/divi-3.0.0/bin 54100 /var/tmp
 - `<port-base>`: ports `<port-base>` to `<port-base>+3` on 127.0.0.2 (divid p2p and RPC, then irondivid's), and
   `<port-base>+4` on 127.0.0.60, where the client listens for the nodes' outbound connection.
 - `[root]`: a fresh directory is made under it (default `$TMPDIR`, else `/tmp`) and deleted at the end.
+- `BLOCK_SERVE_FORCE_REBROADCAST=<row name>`: in that row divid is made to rebroadcast its mempool: once its raw
+  peer is connected, its clock is moved 40 minutes ahead (`setmocktime`), in steps of 10 minutes each answered by a
+  ping (divid drops a peer it heard nothing from for 20 minutes, `Node.cpp:815-830`), and back after the request. The run prints how
+  many rebroadcast invs the rule below left out there; the row still passes.
+- `BLOCK_SERVE_INJECT_INV=<row name>`: irondivid is taken to have sent, in that row, an inv of a transaction that is
+  in no mempool; the row FAILs (the proof that the rule leaves out nothing else).
 
 A run takes about eight minutes, most of it divid mining the chain, and is stopped after 25. However it ends, both
 nodes are stopped and their directories deleted. RPC passwords are made at random for each run and kept in the 0600
@@ -50,6 +56,15 @@ nodes are stopped and their directories deleted. RPC passwords are made at rando
 - **The peers:** each row uses a fresh raw peer from its own loopback address (127.0.1.x). The peer waits 3 s after
   the handshake, so the node's own messages then (`sporkcount`, its `getblocks`) are not taken for replies. A row
   ends after 2 s with no message.
+- **A mempool rebroadcast is not a reply:** each node announces some of its mempool again, unasked, at a random time
+  within 30 minutes of the last time:
+  - divid: `PeriodicallyRebroadcastMempoolTxs`, `main.cpp:1245-1294`;
+  - irondivid: `crates/divi-node/src/rebroadcast.rs`.
+
+  So an `inv` that lists only transactions this run put in the mempools (the mempool transaction, then the relayed
+  one) is left out of the messages a row compares, wherever it comes. Every other message nobody asked for is kept:
+  an `inv` of any other transaction or of a block, or one that mixes them, still counts. The run ends with
+  `# rebroadcast invs left out: divid <n>, irondivid <n>`.
 
 ## Rows
 
