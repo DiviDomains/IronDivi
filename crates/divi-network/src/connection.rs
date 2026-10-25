@@ -405,8 +405,13 @@ impl Connection {
         let version = VersionMessage {
             version: crate::constants::protocol_version(),
             services: self.our_services,
-            // GetTime or GetAdjustedTime, both from the mocked clock (Node.cpp PushVersion)
-            timestamp: divi_primitives::clock::now(),
+            // GetAdjustedTime to an inbound peer, GetTime to one we dialled, both on
+            // the clock setmocktime sets (Node.cpp:995-996)
+            timestamp: if self.info.direction == PeerDirection::Inbound {
+                divi_primitives::clock::adjusted_now()
+            } else {
+                divi_primitives::clock::now()
+            },
             addr_recv,
             addr_from: self
                 .local

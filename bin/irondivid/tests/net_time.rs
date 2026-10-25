@@ -408,3 +408,24 @@ fn the_mempool_reads_lock_times_on_the_adjusted_clock() {
     let reply = d.reply("sendrawtransaction", json!([signed["hex"]]));
     assert!(reply["error"].is_null(), "{reply}");
 }
+
+/// The version message to an inbound peer carries the adjusted time
+/// (Node.cpp:995-996)
+#[test]
+fn the_version_to_an_inbound_peer_is_on_the_adjusted_clock() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = Daemon::start(dir.path(), &[]);
+    let _peers = ahead(&d, 70, 1800);
+    let mut s = connect_from(
+        Ipv4Addr::new(127, 0, 0, 80),
+        SocketAddr::from(([127, 0, 0, 1], d.p2p_port)),
+    );
+    let before = unix_now();
+    s.write_all(&frame("version", &version_at(before))).unwrap();
+    let theirs = expect(&mut s, "version");
+    let time = i64::from_le_bytes(theirs[12..20].try_into().unwrap());
+    assert!(
+        (before + 1795..=unix_now() + 1805).contains(&time),
+        "version time {time}, clock {before}"
+    );
+}
