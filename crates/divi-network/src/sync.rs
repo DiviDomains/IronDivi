@@ -1193,8 +1193,9 @@ impl BlockSync {
 
     /// A block was refused. As Divi Core's ProcessMessage ("Bad block
     /// processed"), the peer that sent it gets the refusal's misbehaviour score.
-    /// Returns true when the block is invalid (scored), so callers drop it
-    /// instead of retrying; an orphan or a local error scores 0 and is kept.
+    /// Returns true when the block is invalid, scored or not, so callers drop it
+    /// instead of retrying: Divi Core keeps nothing of a block it refuses, and asks
+    /// for nothing more because of it. An orphan or a local error is kept.
     fn note_block_rejected(&self, hash: &Hash256, err: &StorageError) -> bool {
         // Divi Core tells the peer why (main.cpp:840-843), score or none
         if let Some((code, reason)) = err.block_reject() {
@@ -1211,16 +1212,25 @@ impl BlockSync {
                 );
             }
         }
+        let invalid = matches!(
+            err,
+            StorageError::InvalidBlock(_)
+                | StorageError::InvalidBlockScored { .. }
+                | StorageError::UtxoNotFound(_)
+                | StorageError::DoubleSpend(_)
+        );
         let score = err.misbehaviour_score();
-        if score == 0 {
+        if !invalid {
             return false;
         }
         if let Some(peer_id) = self.block_sources.write().remove(hash) {
-            self.peer_manager.report_misbehavior_score(
-                peer_id,
-                score,
-                &format!("bad block {}: {}", hash, err),
-            );
+            if score > 0 {
+                self.peer_manager.report_misbehavior_score(
+                    peer_id,
+                    score,
+                    &format!("bad block {}: {}", hash, err),
+                );
+            }
         }
         true
     }
@@ -2501,6 +2511,31 @@ mod tests {
     fn test_sync_creation() {
         let (sync, _dir) = create_test_sync();
         assert_eq!(sync.state(), SyncState::Idle);
+    }
+
+    /// A refused block is dropped whether or not it scores: Divi Core keeps nothing
+    /// of it. Only an orphan or a local error is kept to try again; a refusal with
+    /// no score was kept, and with it the sync never counted itself done.
+    #[test]
+    fn a_refused_block_is_dropped_whatever_its_score() {
+        use divi_storage::StorageError;
+        let (sync, _dir) = create_test_sync();
+        let hash = Hash256::from_bytes([5; 32]);
+        for (error, dropped) in [
+            (
+                StorageError::invalid_block_scored(0, "bad-diffbits".into()),
+                true,
+            ),
+            (
+                StorageError::invalid_block_scored(10, "bad-txns-nonfinal".into()),
+                true,
+            ),
+            (StorageError::InvalidBlock("bad-txnmrklroot".into()), true),
+            (StorageError::OrphanBlock("parent".into()), false),
+            (StorageError::ChainState("local".into()), false),
+        ] {
+            assert_eq!(sync.note_block_rejected(&hash, &error), dropped, "{error}");
+        }
     }
 
     #[test]
