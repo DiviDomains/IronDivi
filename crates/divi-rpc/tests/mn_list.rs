@@ -101,12 +101,17 @@ impl Node {
 
     /// Mine a block with the transactions sent so far; the coinbase pays the wallet
     fn mine(&self) {
+        self.mine_at(self.chain.tip().unwrap().time + 60);
+    }
+
+    /// Mine a block with the time `time`
+    fn mine_at(&self, time: u32) {
         let tip = self.chain.tip().unwrap();
         let height = tip.height + 1;
         let mut block = Block::default();
         block.header.version = 4;
         block.header.prev_block = tip.hash;
-        block.header.time = tip.time + 60;
+        block.header.time = time;
         block.header.bits = 0x207fffff;
         let mut cb_sig = divi_storage::bip34_height_script(height);
         cb_sig.extend_from_slice(&height.to_le_bytes());
@@ -349,4 +354,408 @@ fn payment_votes_are_counted_as_divid_counts_them() {
     forged.height = height + 1;
     assert!(n.votes.accept(&n.chain, &n.list, &forged.encode()).is_err());
     let _ = (txhash, vout);
+}
+
+/// The keys of the last set_up as secret keys: the collateral key (from the
+/// wallet) and the masternode key (test-only throwaway regtest keys)
+fn keys(n: &Node, address: &str) -> (divi_crypto::SecretKey, divi_crypto::SecretKey) {
+    let secret = |wif: &str| {
+        divi_crypto::SecretKey::from_bytes(&divi_wallet::decode_wif(wif).unwrap().key_bytes)
+            .unwrap()
+    };
+    let collateral = n.ok("dumpprivkey", vec![json!(address)]);
+    (
+        secret(collateral.as_str().unwrap()),
+        secret(&n_key(n).lock().clone().unwrap()),
+    )
+}
+
+fn now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+/// A broadcast is refused as Divi Core refuses one: a scriptSig on its
+/// input, a tier that does not exist, a collateral that does not pay its
+/// collateral key, a time before the collateral's 15th confirmation, an
+/// attached ping naming an unknown block or one more than 24 below the tip;
+/// an older broadcast than the listed one is refused and a newer one within
+/// five minutes of it is not taken (masternodeman.cpp:196-307, :309-375,
+/// :416-478)
+#[test]
+fn broadcasts_are_refused_as_divid_refuses_them() {
+    use divi_masternode::cpp_wire::CppBroadcast;
+    let n = funded();
+    let (_, _, address, signed) = set_up(&n, "mn1", 16);
+    let (coll_key, mn_key) = keys(&n, &address);
+    let base = CppBroadcast::decode(&hex::decode(&signed).unwrap()).unwrap();
+    let tip_hash = |depth: u32| {
+        n.chain
+            .get_block_index_by_height(n.chain.height() - depth)
+            .unwrap()
+            .unwrap()
+            .hash
+    };
+    let make = |f: &dyn Fn(&mut CppBroadcast)| {
+        let mut mnb = base.clone();
+        mnb.sig_time = now();
+        mnb.last_ping.sig_time = now();
+        mnb.last_ping.block_hash = *tip_hash(2).as_bytes();
+        f(&mut mnb);
+        mnb.last_ping.sign(&mn_key).unwrap();
+        mnb.sign(&coll_key).unwrap();
+        mnb
+    };
+    let accept = |mnb: &CppBroadcast| n.list.accept_broadcast(&n.chain, &mnb.encode());
+    let refused = |what: &str, mnb: CppBroadcast| {
+        assert!(accept(&mnb).is_err(), "{what} was taken");
+        assert!(n.list.entries().is_empty(), "{what} was listed");
+    };
+    refused("a scriptSig", make(&|m| m.vin.script_sig = vec![0x51]));
+    refused("tier 7", make(&|m| m.tier = 7));
+    let other = divi_crypto::SecretKey::new_random();
+    let mut stranger = make(&|m| m.pubkey_collateral = other.public_key().to_bytes().to_vec());
+    stranger.sign(&other).unwrap();
+    refused("a collateral paying another key", stranger);
+    let conf_time = n
+        .chain
+        .get_block_index_by_height(n.chain.height() - 1)
+        .unwrap()
+        .unwrap()
+        .time as i64;
+    refused(
+        "a time before the 15th confirmation",
+        make(&|m| m.sig_time = conf_time - 1000),
+    );
+    refused(
+        "a ping naming an unknown block",
+        make(&|m| m.last_ping.block_hash = [0xcd; 32]),
+    );
+    n.mine_n(30);
+    refused(
+        "a ping naming a block 30 deep",
+        make(&|m| m.last_ping.block_hash = *tip_hash(30).as_bytes()),
+    );
+
+    let good = make(&|_| {});
+    assert_eq!(accept(&good), Ok(true));
+    let newer = make(&|m| m.sig_time = good.sig_time + 60);
+    assert_eq!(accept(&newer), Ok(false));
+    assert_eq!(n.list.entries()[0].mnb.sig_time, good.sig_time);
+    let older = make(&|m| m.sig_time = good.sig_time - 60);
+    assert!(accept(&older).is_err());
+    assert_eq!(n.list.entries()[0].mnb.sig_time, good.sig_time);
+}
+
+/// A ping is taken as Divi Core takes one: not when it names an unknown
+/// block or one more than 24 below the tip, nor a minute after the last
+/// ping; a ping ten minutes on naming a recent block is
+/// (masternodeman.cpp:309-375, MasternodeHelpers.cpp:172-190)
+#[test]
+fn pings_are_taken_as_divid_takes_them() {
+    use divi_masternode::cpp_wire::{CppBroadcast, CppPing};
+    let n = funded();
+    let (_, _, address, signed) = set_up(&n, "mn1", 16);
+    let (coll_key, mn_key) = keys(&n, &address);
+    let block = |depth: u32| {
+        *n.chain
+            .get_block_index_by_height(n.chain.height() - depth)
+            .unwrap()
+            .unwrap()
+            .hash
+            .as_bytes()
+    };
+    let mut mnb = CppBroadcast::decode(&hex::decode(&signed).unwrap()).unwrap();
+    mnb.sig_time = now();
+    mnb.last_ping.sig_time = now() - 3000;
+    mnb.last_ping.block_hash = block(2);
+    mnb.last_ping.sign(&mn_key).unwrap();
+    mnb.sign(&coll_key).unwrap();
+    assert_eq!(n.list.accept_broadcast(&n.chain, &mnb.encode()), Ok(true));
+    n.mine_n(30);
+    let ping = |sig_time: i64, block_hash: [u8; 32]| {
+        let mut p = CppPing {
+            vin: mnb.vin.clone(),
+            block_hash,
+            sig_time,
+            signature: vec![],
+        };
+        p.sign(&mn_key).unwrap();
+        p.to_bytes()
+    };
+    let last_seen = || n.list.entries()[0].mnb.last_ping.sig_time;
+    let first = last_seen();
+    assert!(n
+        .list
+        .accept_ping(&n.chain, &ping(now(), [0xcd; 32]))
+        .is_err());
+    assert!(n
+        .list
+        .accept_ping(&n.chain, &ping(now(), block(30)))
+        .is_err());
+    assert_eq!(last_seen(), first);
+    let good = now();
+    assert_eq!(
+        n.list.accept_ping(&n.chain, &ping(good, block(2))),
+        Ok(true)
+    );
+    assert_eq!(last_seen(), good);
+    assert!(n
+        .list
+        .accept_ping(&n.chain, &ping(good + 60, block(2)))
+        .is_err());
+    assert_eq!(last_seen(), good);
+}
+
+/// A refused broadcast or ping carries the misbehaviour score Divi Core
+/// gives its sender: 1 for a time out of range, 20 for a tier that does not
+/// exist, 100 for a bad broadcast signature, 33 for a collateral that does
+/// not match and for a bad ping signature, none for the others
+/// (masternodeman.cpp:232-265, :309-375, :420-466, :504-534)
+#[test]
+fn refusals_carry_divids_misbehaviour_scores() {
+    use divi_masternode::cpp_wire::{CppBroadcast, CppPing};
+    let n = funded();
+    let (_, _, address, signed) = set_up(&n, "mn1", 16);
+    let (coll_key, mn_key) = keys(&n, &address);
+    let recent = *n
+        .chain
+        .get_block_index_by_height(n.chain.height() - 2)
+        .unwrap()
+        .unwrap()
+        .hash
+        .as_bytes();
+    let base = CppBroadcast::decode(&hex::decode(&signed).unwrap()).unwrap();
+    let make = |f: &dyn Fn(&mut CppBroadcast)| {
+        let mut mnb = base.clone();
+        mnb.sig_time = now();
+        mnb.last_ping.sig_time = now() - 3000;
+        mnb.last_ping.block_hash = recent;
+        f(&mut mnb);
+        mnb.last_ping.sign(&mn_key).unwrap();
+        mnb.sign(&coll_key).unwrap();
+        mnb
+    };
+    let score = |mnb: CppBroadcast| {
+        n.list
+            .accept_broadcast(&n.chain, &mnb.encode())
+            .unwrap_err()
+            .dos
+    };
+    let other = divi_crypto::SecretKey::new_random();
+    assert_eq!(score(make(&|m| m.sig_time = now() + 7200)), 1);
+    assert_eq!(score(make(&|m| m.tier = 7)), 20);
+    assert_eq!(score(make(&|m| m.protocol_version = 70914)), 0);
+    assert_eq!(score(make(&|m| m.vin.script_sig = vec![0x51])), 0);
+    let mut forged = make(&|_| {});
+    forged.sign(&other).unwrap();
+    assert_eq!(score(forged), 100);
+    let mut stranger = make(&|m| m.pubkey_collateral = other.public_key().to_bytes().to_vec());
+    stranger.sign(&other).unwrap();
+    assert_eq!(score(stranger), 33);
+    let mut bad_ping = make(&|_| {});
+    bad_ping.last_ping.sign(&other).unwrap();
+    bad_ping.sign(&coll_key).unwrap();
+    assert_eq!(score(bad_ping), 33);
+    assert_eq!(score(make(&|m| m.last_ping.sig_time = now() + 7200)), 1);
+    assert_eq!(score(make(&|m| m.last_ping.block_hash = [0xcd; 32])), 0);
+
+    let good = make(&|_| {});
+    assert_eq!(n.list.accept_broadcast(&n.chain, &good.encode()), Ok(true));
+    let ping = |sig_time: i64, key: &divi_crypto::SecretKey| {
+        let mut p = CppPing {
+            vin: good.vin.clone(),
+            block_hash: recent,
+            sig_time,
+            signature: vec![],
+        };
+        p.sign(key).unwrap();
+        n.list.accept_ping(&n.chain, &p.to_bytes())
+    };
+    assert_eq!(ping(now(), &other).unwrap_err().dos, 33);
+    assert_eq!(ping(now() + 7200, &mn_key).unwrap_err().dos, 1);
+    assert_eq!(ping(now() - 7200, &mn_key).unwrap_err().dos, 1);
+    assert_eq!(ping(now(), &mn_key), Ok(true));
+    assert_eq!(ping(now() + 60, &mn_key).unwrap_err().dos, 0);
+}
+
+/// A broadcast or ping taken is kept by hash for peers that ask for it and
+/// left to relay by inv, once; a broadcast seen before is not taken again
+/// (masternodeman.cpp:420-426, :486-499, :504-517;
+/// MasternodeNetworkMessageManager.cpp:236-266)
+#[test]
+fn taken_items_are_kept_and_left_to_relay() {
+    use divi_masternode::cpp_wire::{CppBroadcast, CppPing};
+    use divi_rpc::mn_list::{INV_BROADCAST, INV_PING};
+    let n = funded();
+    let (_, _, address, signed) = set_up(&n, "mn1", 16);
+    let (coll_key, mn_key) = keys(&n, &address);
+    let recent = *n
+        .chain
+        .get_block_index_by_height(n.chain.height() - 2)
+        .unwrap()
+        .unwrap()
+        .hash
+        .as_bytes();
+    let mut mnb = CppBroadcast::decode(&hex::decode(&signed).unwrap()).unwrap();
+    mnb.sig_time = now();
+    mnb.last_ping.sig_time = now() - 3000;
+    mnb.last_ping.block_hash = recent;
+    mnb.last_ping.sign(&mn_key).unwrap();
+    mnb.sign(&coll_key).unwrap();
+    assert_eq!(n.list.take_relays(), vec![]);
+    assert_eq!(n.list.accept_broadcast(&n.chain, &mnb.encode()), Ok(true));
+    assert_eq!(n.list.take_relays(), vec![(INV_BROADCAST, mnb.hash())]);
+    assert_eq!(n.list.seen_broadcast(&mnb.hash()), Some(mnb.encode()));
+    assert!(n.list.has(INV_BROADCAST, &mnb.hash()));
+    assert!(n.list.has(INV_PING, &mnb.last_ping.hash()));
+    assert_eq!(n.list.accept_broadcast(&n.chain, &mnb.encode()), Ok(false));
+    assert_eq!(n.list.take_relays(), vec![]);
+
+    let mut ping = CppPing {
+        vin: mnb.vin.clone(),
+        block_hash: recent,
+        sig_time: now(),
+        signature: vec![],
+    };
+    ping.sign(&mn_key).unwrap();
+    assert_eq!(n.list.accept_ping(&n.chain, &ping.to_bytes()), Ok(true));
+    assert_eq!(n.list.take_relays(), vec![(INV_PING, ping.hash())]);
+    assert_eq!(n.list.seen_ping(&ping.hash()), Some(ping.to_bytes()));
+    assert_eq!(n.list.accept_ping(&n.chain, &ping.to_bytes()), Ok(false));
+    assert_eq!(n.list.take_relays(), vec![]);
+    // The broadcast a peer gets carries the last ping (recordLastPing)
+    let shared = CppBroadcast::decode(&n.list.seen_broadcast(&mnb.hash()).unwrap()).unwrap();
+    assert_eq!(shared.last_ping, ping);
+}
+
+/// The sender of a ping for a masternode not in the list, of a ping that
+/// costs it, or of a vote of a masternode not in the list or badly signed is
+/// asked for that masternode with dseg, at most once in ten minutes per
+/// masternode; a ping only too early asks nothing (masternodeman.cpp:504-534,
+/// masternode-payments.cpp:223-245, masternode-sync.cpp:456-462)
+#[test]
+fn unknown_masternodes_are_asked_for_once() {
+    use divi_masternode::cpp_wire::{CppBroadcast, CppPing, CppTxIn, CppWinner};
+    let n = funded();
+    let (_, _, address, signed) = set_up(&n, "mn1", 16);
+    let (coll_key, mn_key) = keys(&n, &address);
+    while n.chain.height() < 100 {
+        n.mine();
+    }
+    let recent = *n
+        .chain
+        .get_block_index_by_height(n.chain.height() - 2)
+        .unwrap()
+        .unwrap()
+        .hash
+        .as_bytes();
+    let mut mnb = CppBroadcast::decode(&hex::decode(&signed).unwrap()).unwrap();
+    mnb.sig_time = now();
+    mnb.last_ping.sig_time = now() - 3000;
+    mnb.last_ping.block_hash = recent;
+    mnb.last_ping.sign(&mn_key).unwrap();
+    mnb.sign(&coll_key).unwrap();
+    assert_eq!(n.list.accept_broadcast(&n.chain, &mnb.encode()), Ok(true));
+    let other = divi_crypto::SecretKey::new_random();
+    let ping = |vin: &CppTxIn, sig_time: i64, key: &divi_crypto::SecretKey| {
+        let mut p = CppPing {
+            vin: vin.clone(),
+            block_hash: recent,
+            sig_time,
+            signature: vec![],
+        };
+        p.sign(key).unwrap();
+        n.list.accept_ping(&n.chain, &p.to_bytes()).unwrap_err()
+    };
+    let stranger = CppTxIn::new([0xab; 32], 0);
+    assert_eq!(
+        ping(&stranger, now(), &mn_key).ask,
+        Some(stranger.to_bytes())
+    );
+    assert_eq!(ping(&stranger, now() + 1, &mn_key).ask, None);
+    let bad = ping(&mnb.vin, now(), &other);
+    assert_eq!((bad.dos, bad.ask), (33, Some(mnb.vin.to_bytes())));
+    assert_eq!(ping(&mnb.vin, now() + 1, &other).ask, None);
+
+    let vote = |vin: &CppTxIn, key: &divi_crypto::SecretKey| {
+        let mut w = CppWinner {
+            vin: vin.clone(),
+            height: n.chain.height() as i32 + 5,
+            payee: payee_script(&mnb),
+            signature: vec![],
+        };
+        w.sign(key).unwrap();
+        n.votes.accept(&n.chain, &n.list, &w.encode()).unwrap_err()
+    };
+    let unlisted = CppTxIn::new([0xbc; 32], 1);
+    assert_eq!(vote(&unlisted, &mn_key).ask, Some(unlisted.to_bytes()));
+    assert_eq!(vote(&unlisted, &mn_key).ask, None);
+}
+
+/// On a node whose masternode sync is finished a vote with a bad signature
+/// costs its sender 20 and a payee far from the top of the queue is refused;
+/// before the sync is finished neither (masternode-payments.cpp:241-245,
+/// :322-330)
+#[test]
+fn votes_follow_the_masternode_sync_as_divid() {
+    use divi_masternode::cpp_wire::{CppBroadcast, CppWinner};
+    let n = funded();
+    let (_, _, address, signed) = set_up(&n, "mn1", 16);
+    let (coll_key, mn_key) = keys(&n, &address);
+    while n.chain.height() < 100 {
+        n.mine();
+    }
+    let recent = *n
+        .chain
+        .get_block_index_by_height(n.chain.height() - 2)
+        .unwrap()
+        .unwrap()
+        .hash
+        .as_bytes();
+    // Old enough to vote (25 minutes on regtest)
+    let mut mnb = CppBroadcast::decode(&hex::decode(&signed).unwrap()).unwrap();
+    mnb.sig_time = now() - 1800;
+    mnb.last_ping.sig_time = now() - 600;
+    mnb.last_ping.block_hash = recent;
+    mnb.last_ping.sign(&mn_key).unwrap();
+    mnb.sign(&coll_key).unwrap();
+    assert_eq!(n.list.accept_broadcast(&n.chain, &mnb.encode()), Ok(true));
+    let other = divi_crypto::SecretKey::new_random();
+    let vote = |ahead: i32, payee: Vec<u8>, key: &divi_crypto::SecretKey| {
+        let mut w = CppWinner {
+            vin: mnb.vin.clone(),
+            height: n.chain.height() as i32 + ahead,
+            payee,
+            signature: vec![],
+        };
+        w.sign(key).unwrap();
+        n.votes.accept(&n.chain, &n.list, &w.encode())
+    };
+    assert_eq!(vote(5, payee_script(&mnb), &other).unwrap_err().dos, 20);
+    assert!(vote(6, vec![0x51], &mn_key).is_err());
+    n.votes.set_sync_finished(false);
+    assert_eq!(vote(7, payee_script(&mnb), &other).unwrap_err().dos, 0);
+    assert_eq!(vote(8, vec![0x51], &mn_key), Ok(true));
+}
+
+/// Masternode messages wait for the chain to be synced: a tip at most ten
+/// minutes old; once it has been, an older tip does not undo it
+/// (MasternodeHelpers.cpp:27-66)
+#[test]
+fn masternode_messages_wait_for_a_recent_tip() {
+    let n = funded();
+    assert!(!n.list.blockchain_synced(&n.chain), "a tip from 2014");
+    n.mine_at(now() as u32 - 300);
+    assert!(n.list.blockchain_synced(&n.chain));
+    n.mine_at(now() as u32 - 250);
+    assert!(n.list.blockchain_synced(&n.chain));
+    let fresh = node();
+    fresh.mine_at(now() as u32 - 900);
+    assert!(
+        !fresh.list.blockchain_synced(&fresh.chain),
+        "a tip 15 minutes old"
+    );
 }
