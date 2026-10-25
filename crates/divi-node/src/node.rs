@@ -582,6 +582,20 @@ impl Node {
         if let Some(proxy) = proxy.map(|p| p.addr) {
             tracing::info!("Outbound P2P connections go through SOCKS5 proxy {}", proxy);
         }
+        // The onion network: -onion's proxy, else -proxy's; reachable with
+        // either, not with -onion=0 (net.cpp:1774-1800)
+        let (tor_proxy, tor_reachable) =
+            match config.p2p.onion_setting().map_err(NodeError::Init)? {
+                crate::config::OnionSetting::Unset => (proxy, proxy.is_some()),
+                crate::config::OnionSetting::Off => (proxy, false),
+                crate::config::OnionSetting::Proxy(addr) => (
+                    Some(divi_network::socks5::Proxy {
+                        addr,
+                        randomize_credentials: config.p2p.proxy_randomize,
+                    }),
+                    true,
+                ),
+            };
         // -timeout for outbound connections
         divi_network::set_connect_timeout_ms(config.p2p.connect_timeout_ms);
         let peer_manager_config = PeerManagerConfig {
@@ -593,8 +607,14 @@ impl Node {
                 .static_peers
                 .iter()
                 .filter_map(|s| {
-                    // First try to parse as SocketAddr (IP:port)
+                    // First try to parse as SocketAddr (IP:port), then as an
+                    // onion name, which no DNS lookup reads
                     if let Ok(addr) = s.parse() {
+                        return Some(addr);
+                    }
+                    if let Some(addr) =
+                        divi_network::local::onion_service(s, config.network.default_p2p_port())
+                    {
                         return Some(addr);
                     }
                     // If that fails, try to resolve as hostname:port
@@ -627,6 +647,8 @@ impl Node {
             },
             default_port: config.network.default_p2p_port(),
             proxy,
+            tor_proxy,
+            tor_reachable,
             connect_only: !config.p2p.connect.is_empty(),
             whitelist: config
                 .p2p
@@ -644,11 +666,17 @@ impl Node {
         let peer_manager = PeerManager::new(peer_manager_config);
         // The -addnode values are the first added nodes (net.cpp:1218)
         for node in &config.p2p.addnode {
-            let addr = node.parse::<std::net::SocketAddr>().ok().or_else(|| {
-                node.parse::<std::net::IpAddr>()
-                    .ok()
-                    .map(|ip| std::net::SocketAddr::new(ip, config.network.default_p2p_port()))
-            });
+            let addr = node
+                .parse::<std::net::SocketAddr>()
+                .ok()
+                .or_else(|| {
+                    node.parse::<std::net::IpAddr>()
+                        .ok()
+                        .map(|ip| std::net::SocketAddr::new(ip, config.network.default_p2p_port()))
+                })
+                .or_else(|| {
+                    divi_network::local::onion_service(node, config.network.default_p2p_port())
+                });
             match addr {
                 Some(addr) => {
                     peer_manager.add_node(addr);

@@ -245,3 +245,80 @@ fn proxy_destination_is_sent_as_a_name() {
         );
     }
 }
+
+/// The onion network: not limited by default; reachable through -proxy, or
+/// through -onion's own proxy, not with -onion=0 (net.cpp:1774-1800)
+#[test]
+fn onion_network_in_getnetworkinfo() {
+    for (options, proxy, reachable) in [
+        (vec![], "", false),
+        (vec!["-proxy=127.0.0.1:9"], "127.0.0.1:9", true),
+        (vec!["-onion=127.0.0.1:8"], "127.0.0.1:8", true),
+        (
+            vec!["-proxy=127.0.0.1:9", "-onion=127.0.0.1:8"],
+            "127.0.0.1:8",
+            true,
+        ),
+        (vec!["-proxy=127.0.0.1:9", "-onion=0"], "127.0.0.1:9", false),
+        (vec!["-proxy=127.0.0.1:9", "-noonion"], "127.0.0.1:9", false),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let node = up(dir.path(), &options);
+        let n = node.network("onion");
+        assert_eq!(n["limited"], false, "{options:?} {n}");
+        assert_eq!(n["reachable"], reachable, "{options:?} {n}");
+        assert_eq!(n["proxy"], proxy, "{options:?} {n}");
+    }
+}
+
+/// A -onion that does not resolve stops the start (net.cpp:1790-1794)
+#[test]
+fn bad_onion_stops_the_start() {
+    let dir = tempfile::tempdir().unwrap();
+    match start(dir.path(), &["-onion=notahost.invalid"]) {
+        Started::Exited(code, text) => {
+            assert_ne!(code, 0);
+            assert!(
+                text.contains("Invalid -onion address or hostname: 'notahost.invalid'"),
+                "{text}"
+            );
+        }
+        Started::Up(_) => panic!("started with a bad -onion"),
+    }
+}
+
+/// An onion peer is dialled through -onion's proxy, not -proxy's
+/// (SetProxy(NET_TOR), net.cpp:1797)
+#[test]
+fn onion_peer_goes_through_the_onion_proxy() {
+    let (socks, seen) = socks5_stand_in();
+    let (onion, onion_seen) = socks5_stand_in();
+    let dir = tempfile::tempdir().unwrap();
+    let proxy = format!("-proxy=127.0.0.1:{socks}");
+    let onion_proxy = format!("-onion=127.0.0.1:{onion}");
+    let node = up(
+        dir.path(),
+        &[
+            proxy.as_str(),
+            onion_proxy.as_str(),
+            "-connect=abcdefghij234567.onion:51476",
+        ],
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while onion_seen.lock().unwrap().is_empty() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    drop(node);
+    let got = onion_seen.lock().unwrap().clone();
+    assert!(!got.is_empty(), "nothing reached the onion proxy");
+    assert!(
+        got.iter()
+            .all(|(_, atyp, d)| *atyp == 3 && d == "abcdefghij234567.onion"),
+        "{got:?}"
+    );
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "went through -proxy: {:?}",
+        seen.lock().unwrap()
+    );
+}

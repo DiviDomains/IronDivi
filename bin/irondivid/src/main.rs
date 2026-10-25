@@ -306,7 +306,6 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "maxreceivebuffer",
     "maxsendbuffer",
     "mining",
-    "onion",
     "onlynet",
     "par",
     "peerbloomfilters",
@@ -363,6 +362,7 @@ const APPLIED: &[&str] = &[
     "timeout",
     "proxy",
     "proxyrandomize",
+    "onion",
     "discover",
     "externalip",
     "protocolversion",
@@ -632,6 +632,8 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     }
     // GetBoolArg("-proxyrandomize", true) (net.cpp:1761)
     config.p2p.proxy_randomize = s.get_bool("proxyrandomize", true);
+    // -onion=<ip:port>, -onion=0 / -noonion (net.cpp:1785-1800)
+    config.p2p.onion = s.get("onion").map(str::to_string);
     config.p2p.discover = s.get_bool("discover", true);
     // -externalip=<ip>[:port], the listen port when none is given; one that
     // does not resolve to a valid address stops the start (net.cpp:1834-1839)

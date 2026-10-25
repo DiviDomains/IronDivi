@@ -65,9 +65,18 @@ impl NetworkRpc {
         let local = pm.map(|pm| pm.local_addresses().list()).unwrap_or_default();
         // Divi Core: a network is reachable once a local address of it is known,
         // and an IPv6 one marks IPv4 too (NetworkLocalAddressHelpers.cpp:73-105,
-        // :163-167)
-        let ipv6_reachable = local.iter().any(|a| a.address.is_ipv6());
+        // :163-167); an onion address is the onion network's
+        let is_onion = |a: &std::net::IpAddr| divi_network::local::is_onion(a);
+        let ipv6_reachable = local
+            .iter()
+            .any(|a| a.address.is_ipv6() && !is_onion(&a.address));
         let ipv4_reachable = ipv6_reachable || local.iter().any(|a| a.address.is_ipv4());
+        // The onion network: its proxy (-onion, else -proxy), reachable with one
+        // set and not with -onion=0, or once an onion address of ours is known
+        // (net.cpp:1774-1800)
+        let tor_proxy = pm.and_then(|pm| pm.tor_proxy());
+        let tor_reachable =
+            pm.is_some_and(|pm| pm.tor_reachable()) || local.iter().any(|a| is_onion(&a.address));
 
         Ok(serde_json::json!({
             "version": format!("{}.0", env!("CARGO_PKG_VERSION")),
@@ -94,12 +103,11 @@ impl NetworkRpc {
                     "proxy_randomize_credentials": randomize
                 },
                 {
-                    // .onion peers cannot be addressed (peer addresses are IP only)
                     "name": "onion",
-                    "limited": true,
-                    "reachable": false,
-                    "proxy": "",
-                    "proxy_randomize_credentials": false
+                    "limited": false,
+                    "reachable": tor_reachable,
+                    "proxy": tor_proxy.map(|p| p.addr.to_string()).unwrap_or_default(),
+                    "proxy_randomize_credentials": tor_proxy.is_some_and(|p| p.randomize_credentials)
                 }
             ],
             "relayfee": 0.0001,
@@ -845,11 +853,14 @@ mod tests {
     #[test]
     fn test_network_info_reports_proxy() {
         let proxy: std::net::SocketAddr = "127.0.0.1:9050".parse().unwrap();
+        let proxy_type = divi_network::socks5::Proxy {
+            addr: proxy,
+            randomize_credentials: true,
+        };
         let pm = PeerManager::new(divi_network::PeerManagerConfig {
-            proxy: Some(divi_network::socks5::Proxy {
-                addr: proxy,
-                randomize_credentials: true,
-            }),
+            proxy: Some(proxy_type),
+            tor_proxy: Some(proxy_type),
+            tor_reachable: true,
             ..quiet_config()
         });
         let ni = NetworkRpc::with_peer_manager(pm)
@@ -860,7 +871,10 @@ mod tests {
         assert_eq!(nets[0]["proxy"], "127.0.0.1:9050");
         assert_eq!(nets[1]["proxy"], "127.0.0.1:9050");
         assert_eq!(nets[0]["proxy_randomize_credentials"], true);
-        assert_eq!(nets[2]["reachable"], false);
+        // -proxy makes onion reachable through it (net.cpp:1774-1779)
+        assert_eq!(nets[2]["reachable"], true);
+        assert_eq!(nets[2]["limited"], false);
+        assert_eq!(nets[2]["proxy"], "127.0.0.1:9050");
         let ni = NetworkRpc::with_peer_manager(PeerManager::new(quiet_config()))
             .get_network_info(&Params::None)
             .unwrap();

@@ -58,6 +58,11 @@ pub struct PeerManagerConfig {
     /// routable (127.0.0.1, a private network) is dialled directly, as Divi
     /// Core keeps no proxy for those (netbase.cpp:620-629).
     pub proxy: Option<crate::socks5::Proxy>,
+    /// The proxy for onion peers (Divi Core's NET_TOR proxy: `-onion`, else
+    /// `-proxy`) and whether onion is reachable (`-proxy`, `-onion`; not with
+    /// `-onion=0`; net.cpp:1774-1800). The Tor controller changes both later.
+    pub tor_proxy: Option<crate::socks5::Proxy>,
+    pub tor_reachable: bool,
     /// `static_peers` are `-connect` peers (dialled by address and port, as
     /// Divi Core dials `-connect`) rather than `-addnode` and built-in peers
     pub connect_only: bool,
@@ -144,6 +149,8 @@ impl Default for PeerManagerConfig {
             listen_addr: None,
             default_port: 51472, // Mainnet P2P port
             proxy: None,
+            tor_proxy: None,
+            tor_reachable: false,
             connect_only: false,
             whitelist: Vec::new(),
             white_listen: Vec::new(),
@@ -183,6 +190,9 @@ pub struct PeerManager {
     local_nonces: crate::connection::LocalNonces,
     /// The node's own addresses (Divi Core mapLocalHost)
     local_addresses: RwLock<Arc<crate::local::LocalAddresses>>,
+    /// The onion network's proxy and whether onion is reachable, which the Tor
+    /// controller changes once it has authenticated (torcontrol.cpp:533-541)
+    tor: RwLock<(Option<crate::socks5::Proxy>, bool)>,
     /// Added nodes, in the order they were added: -addnode, then the addnode
     /// RPC (Divi Core's vAddedNodes list, net.cpp:1218)
     added_nodes: RwLock<Vec<SocketAddr>>,
@@ -219,6 +229,7 @@ impl PeerManager {
     pub fn new(config: PeerManagerConfig) -> Arc<Self> {
         let config_magic = config.magic;
         let seed_nodes = config.seed_nodes.clone();
+        let tor = (config.tor_proxy, config.tor_reachable);
         let (event_tx, _) = broadcast::channel(1000);
         let (shutdown_tx, _) = broadcast::channel(1);
 
@@ -232,6 +243,7 @@ impl PeerManager {
             scoring: PeerScoring::new(),
             local_nonces: Default::default(),
             local_addresses: RwLock::new(Arc::new(Default::default())),
+            tor: RwLock::new(tor),
             added_nodes: RwLock::new(Vec::new()),
             connecting_addrs: RwLock::new(HashSet::new()),
             total_bytes_sent: Arc::new(AtomicU64::new(0)),
@@ -798,13 +810,38 @@ impl PeerManager {
         self.config.proxy
     }
 
+    /// The onion network's proxy, if any (Divi Core GetProxy(NET_TOR))
+    pub fn tor_proxy(&self) -> Option<crate::socks5::Proxy> {
+        self.tor.read().0
+    }
+
+    /// Whether onion was made reachable (Divi Core vfReachable[NET_TOR])
+    pub fn tor_reachable(&self) -> bool {
+        self.tor.read().1
+    }
+
+    /// Set the onion network's proxy (Divi Core SetProxy(NET_TOR, ...))
+    pub fn set_tor_proxy(&self, proxy: Option<crate::socks5::Proxy>) {
+        self.tor.write().0 = proxy;
+    }
+
+    /// Mark onion reachable or not (Divi Core SetReachable(NET_TOR, ...))
+    pub fn set_tor_reachable(&self, reachable: bool) {
+        self.tor.write().1 = reachable;
+    }
+
     /// The proxy a connection to `addr` goes through: Divi Core's GetProxy for
-    /// the address's network, which is none for an address that is not routable
+    /// the address's network: the onion proxy for an onion address, `-proxy`
+    /// for another routable one, and none for an address that is not routable
     /// (ConnectSocket, netbase.cpp:620-629)
     fn proxy_for(&self, addr: &SocketAddr) -> Option<crate::socks5::Proxy> {
-        self.config
-            .proxy
-            .filter(|_| crate::local::is_routable(&addr.ip()))
+        if crate::local::is_onion(&addr.ip()) {
+            self.tor_proxy()
+        } else if crate::local::is_routable(&addr.ip()) {
+            self.config.proxy
+        } else {
+            None
+        }
     }
 
     /// Discover peers from DNS seeds
@@ -1924,6 +1961,11 @@ mod tests {
                 addr,
                 randomize_credentials: true,
             }),
+            tor_proxy: proxy.map(|addr| crate::socks5::Proxy {
+                addr,
+                randomize_credentials: true,
+            }),
+            tor_reachable: proxy.is_some(),
             ..Default::default()
         }
     }

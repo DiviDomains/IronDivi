@@ -432,6 +432,11 @@ pub struct P2pConfig {
     #[serde(default = "default_proxy_randomize")]
     pub proxy_randomize: bool,
 
+    /// A SOCKS5 proxy for onion peers only (`-onion=<ip:port>`), or `0` (also
+    /// `-noonion`) for no onion peers at all; unset, onion peers use `-proxy`
+    #[serde(default)]
+    pub onion: Option<String>,
+
     /// Connection timeout in milliseconds (Divi Core's -timeout)
     #[serde(default = "default_connect_timeout_ms")]
     pub connect_timeout_ms: u64,
@@ -479,25 +484,54 @@ impl P2pConfig {
         else {
             return Ok(None);
         };
-        if let Ok(addr) = raw.parse::<SocketAddr>() {
-            return Ok(Some(addr));
-        }
-        if let Ok(ip) = raw.trim_matches(['[', ']']).parse::<std::net::IpAddr>() {
-            return Ok(Some(SocketAddr::new(ip, 9050)));
-        }
-        use std::net::ToSocketAddrs;
-        let with_port = if raw.contains(':') {
-            raw.to_string()
-        } else {
-            format!("{raw}:9050")
-        };
-        with_port
-            .to_socket_addrs()
-            .ok()
-            .and_then(|mut a| a.next())
-            .map(Some)
-            .ok_or_else(|| format!("Invalid -proxy address or hostname: '{raw}'"))
+        lookup_proxy(raw, "proxy").map(Some)
     }
+
+    /// The `onion` setting: unset or empty (onion peers go through `-proxy`, if
+    /// any), `0` (no onion peers), or a proxy for them, read as `-proxy` is
+    /// (net.cpp:1785-1800)
+    pub fn onion_setting(&self) -> Result<OnionSetting, String> {
+        match self.onion.as_deref().map(str::trim) {
+            None | Some("") => Ok(OnionSetting::Unset),
+            Some("0") => Ok(OnionSetting::Off),
+            Some(raw) => lookup_proxy(raw, "onion").map(OnionSetting::Proxy),
+        }
+    }
+}
+
+/// Divi Core's `-onion` (net.cpp:1785-1800)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnionSetting {
+    /// Onion peers through `-proxy`, reachable when it is set
+    Unset,
+    /// `-onion=0` / `-noonion`: onion is not reachable
+    Off,
+    /// Onion peers through this proxy, reachable
+    Proxy(SocketAddr),
+}
+
+/// A `-proxy` or `-onion` value as divid's Lookup reads it: `ip:port`,
+/// `host:port`, or a bare IP or host with the Tor port 9050; else "Invalid
+/// -<option> address or hostname: '<value>'" (net.cpp:1767-1771, :1790-1794)
+fn lookup_proxy(raw: &str, option: &str) -> Result<SocketAddr, String> {
+    let invalid = || format!("Invalid -{option} address or hostname: '{raw}'");
+    if let Ok(addr) = raw.parse::<SocketAddr>() {
+        return Ok(addr);
+    }
+    if let Ok(ip) = raw.trim_matches(['[', ']']).parse::<std::net::IpAddr>() {
+        return Ok(SocketAddr::new(ip, 9050));
+    }
+    use std::net::ToSocketAddrs;
+    let with_port = if raw.contains(':') {
+        raw.to_string()
+    } else {
+        format!("{raw}:9050")
+    };
+    with_port
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut a| a.next())
+        .ok_or_else(invalid)
 }
 
 fn default_proxy_randomize() -> bool {
@@ -540,6 +574,7 @@ impl Default for P2pConfig {
             user_agent: format!("/DiviRust:{}/", env!("CARGO_PKG_VERSION")),
             proxy: None,
             proxy_randomize: default_proxy_randomize(),
+            onion: None,
             connect_timeout_ms: default_connect_timeout_ms(),
             discover: default_discover(),
             external_ips: Vec::new(),

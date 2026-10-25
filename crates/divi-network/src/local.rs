@@ -99,6 +99,16 @@ pub fn onion_from_name(name: &str) -> Option<IpAddr> {
     Some(IpAddr::V6(Ipv6Addr::from(b)))
 }
 
+/// A `name.onion[:port]` peer as its onion address and port (`default_port`
+/// when none is given), as Divi Core's Lookup reads it with no DNS
+pub fn onion_service(text: &str, default_port: u16) -> Option<SocketAddr> {
+    let (name, port) = match text.rsplit_once(':') {
+        Some((name, port)) => (name, port.parse().ok()?),
+        None => (text, default_port),
+    };
+    Some(SocketAddr::new(onion_from_name(name)?, port))
+}
+
 /// Divi Core CNetAddr::IsValid (netbase.cpp:840-873): not unspecified, not a
 /// documentation address, not 0.0.0.0 or 255.255.255.255
 pub fn is_valid(ip: &IpAddr) -> bool {
