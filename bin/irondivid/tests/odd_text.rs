@@ -163,3 +163,40 @@ fn sends_list_under_the_account_they_came_from() {
     check("after a restart");
     stop(n, rpc_port);
 }
+
+/// sendfrom and sendmany take no minconf: a comment that reads as a number
+/// is a comment (rpcwallet.cpp:1631-1642, :1716-1723), and the send spends
+/// coins with one confirmation
+#[test]
+fn a_comment_that_reads_as_a_number_is_a_comment() {
+    let other = tempfile::tempdir().unwrap();
+    let (rpc_port, p2p_port) = (free_port(), free_port());
+    let n = start(other.path(), rpc_port, p2p_port, &[]);
+    let payee = ok(rpc_port, "getnewaddress", json!([]));
+    stop(n, rpc_port);
+
+    let dir = tempfile::tempdir().unwrap();
+    let n = start(dir.path(), rpc_port, p2p_port, &[]);
+    ok(rpc_port, "setgenerate", json!([101]));
+    let own = ok(rpc_port, "getnewaddress", json!(["acct"]));
+    for _ in 0..2 {
+        ok(rpc_port, "sendtoaddress", json!([own, 10]));
+    }
+    // One confirmation
+    ok(rpc_port, "setgenerate", json!([1]));
+    let from = ok(
+        rpc_port,
+        "sendfrom",
+        json!(["acct", payee, 1, "123", "456"]),
+    );
+    let many = ok(
+        rpc_port,
+        "sendmany",
+        json!(["acct", {payee.as_str().unwrap(): 1}, "7"]),
+    );
+    let tx = ok(rpc_port, "gettransaction", json!([from]));
+    assert_eq!((&tx["comment"], &tx["to"]), (&json!("123"), &json!("456")));
+    let tx = ok(rpc_port, "gettransaction", json!([many]));
+    assert_eq!(tx["comment"], json!("7"));
+    stop(n, rpc_port);
+}

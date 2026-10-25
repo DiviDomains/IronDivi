@@ -3651,8 +3651,10 @@ impl WalletRpc {
             .and_then(|v| v.as_object())
             .ok_or_else(|| RpcError::invalid_params("Amounts object required"))?;
 
-        // Optional minconf (default 1); in Divi Core the third argument is a comment
-        let min_conf = params.get_u64(2).unwrap_or(1) as u32;
+        // Divi Core's sendmany takes no minconf: the third argument is the
+        // comment, whatever it reads as (rpcwallet.cpp:1716-1723), and the
+        // coins spent are confirmed ones
+        let min_conf = 1;
 
         // Optional subtractfeefromamount array - addresses to subtract fee from
         let subtract_fee_from: Vec<String> = params
@@ -4136,7 +4138,10 @@ impl WalletRpc {
             false,
         )?;
 
-        let min_conf = params.get_u64(3).unwrap_or(1) as u32;
+        // Divi Core's sendfrom takes no minconf: the fourth argument is the
+        // comment, whatever it reads as (rpcwallet.cpp:1631-1642), and the
+        // coins spent are confirmed ones
+        let min_conf = 1;
 
         let dest_addr = self
             .decode_address(addr_str)
