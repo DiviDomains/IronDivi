@@ -638,10 +638,15 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         config.p2p.dns_seed = Some(s.get_bool("dnsseed", true));
     }
     config.p2p.force_dns_seed = s.get_bool("forcednsseed", false);
-    // -maxconnections counts inbound and outbound; at most 16 are outbound
-    // (net.cpp:106, :757, :1727)
-    if let Some(n) = number_option(&s, "maxconnections", 0..=i64::from(u32::MAX)) {
-        let n = n as usize;
+    // -maxconnections as divid reads it: atoi64, at most FD_SETSIZE (1024) less
+    // one for -bind and one for -whitebind (at least one) less 150 kept for
+    // files, at least 0, with no warning (net.cpp:1726-1728). Inbound peers
+    // may use it less 16 (net.cpp:757); at most 16 learnt addresses are dialled
+    if s.is_set("maxconnections") {
+        let binds = (i64::from(s.is_set("bind")) + i64::from(s.is_set("whitebind"))).max(1);
+        let n = settings::atoi(s.get("maxconnections").unwrap_or(""))
+            .min(1024 - binds - 150)
+            .max(0) as usize;
         config.p2p.max_outbound = n.min(16);
         config.p2p.max_inbound = n.saturating_sub(16);
     }
@@ -4847,6 +4852,35 @@ mod proxy_tor_settings_tests {
         ];
         v.extend(argv.iter().map(|s| s.to_string()));
         build_config(&Args::parse_from(v)).unwrap().p2p
+    }
+
+    /// -maxconnections as divid reads it: a number below 0, a text or nothing
+    /// is 0, and at most FD_SETSIZE less the binds less 150 (net.cpp:1726-1728);
+    /// inbound peers get it less 16 (net.cpp:757)
+    #[test]
+    fn maxconnections_is_read_as_divid_reads_it() {
+        let slots = |argv: &[&str]| {
+            let c = p2p(argv);
+            (c.max_inbound, c.max_outbound)
+        };
+        for none in [
+            "-maxconnections=-1",
+            "-maxconnections=",
+            "-maxconnections=abc",
+        ] {
+            assert_eq!(slots(&[none]), (0, 0), "{none}");
+        }
+        assert_eq!(slots(&["-maxconnections=17"]), (1, 16));
+        assert_eq!(slots(&["-maxconnections=5"]), (0, 5));
+        assert_eq!(slots(&["-maxconnections=2000"]), (857, 16));
+        assert_eq!(
+            slots(&[
+                "-maxconnections=2000",
+                "-bind=127.0.0.1",
+                "-whitebind=127.0.0.1:1"
+            ]),
+            (856, 16)
+        );
     }
 
     /// -upnp: off by default; -proxy and -listen=0 turn it off unless it is
