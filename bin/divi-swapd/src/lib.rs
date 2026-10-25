@@ -27,7 +27,9 @@ pub use config::{
 };
 pub use routes::{
     router, router_with_auth, router_with_proxy, router_with_xmr, AppState, HashlockAuth,
-    RateLimiter, RATE_LIMIT_PER_WINDOW, RATE_WINDOW, READ_LIMIT_PER_WINDOW, WRITE_LIMIT_PER_WINDOW,
+    RateLimiter, PUBLIC_READ_LIMIT_PER_WINDOW, RATE_LIMIT_PER_WINDOW, RATE_WINDOW,
+    READ_LIMIT_PER_WINDOW, WRITE_LIMIT_PER_WINDOW, XMR_SWAP_LIMIT_PER_WINDOW,
+    XMR_TOKEN_MISS_LIMIT_PER_WINDOW,
 };
 pub use scan::{run_scan, ScanState, ScanStatus, WalletScan};
 pub use scheduler::{spawn_gated_scheduler, spawn_scheduler};
