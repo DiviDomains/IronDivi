@@ -1548,6 +1548,44 @@ mod tests {
         s.parse().unwrap()
     }
 
+    /// The learnt addresses `dial_learnt` picks, under `-onlynet` `only`. Each
+    /// dial goes through a proxy on a closed local port, so none leaves the
+    /// machine; the picks are read before any dial task runs.
+    fn learnt_dials(only: &[crate::local::Network]) -> HashSet<SocketAddr> {
+        let closed = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let pm = PeerManager::new(PeerManagerConfig {
+            magic: crate::REGTEST_MAGIC,
+            dns_seeds: vec![],
+            default_port: 51476,
+            proxy: Some(closed),
+            ..Default::default()
+        });
+        let local = crate::local::LocalAddresses::new(true, true, 51476);
+        local.limit_to(only);
+        pm.set_local_addresses(local);
+        pm.address_book
+            .add_seeds(&[sa("1.2.3.4:51476"), sa("[2a00:1450:4001:80b::200e]:51476")]);
+        pm.dial_learnt();
+        let picked = pm.connecting_addrs.read().clone();
+        picked
+    }
+
+    /// -onlynet: a learnt address of a network it leaves out is not dialled
+    /// (net.cpp:1164-1165), one of a network it names is
+    #[tokio::test]
+    async fn onlynet_keeps_learnt_addresses_of_a_limited_network_from_being_dialled() {
+        let (v4, v6) = (sa("1.2.3.4:51476"), sa("[2a00:1450:4001:80b::200e]:51476"));
+        let picked = learnt_dials(&[crate::local::Network::Ipv6]);
+        assert!(!picked.contains(&v4), "{picked:?}");
+        assert!(picked.contains(&v6), "{picked:?}");
+        // Without -onlynet both are dialled
+        let picked = learnt_dials(&[]);
+        assert!(picked.contains(&v4) && picked.contains(&v6), "{picked:?}");
+    }
+
     #[test]
     fn dial_rules_follow_divi_core() {
         let pm = PeerManager::new(PeerManagerConfig::default());
