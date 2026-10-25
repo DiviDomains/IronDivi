@@ -422,29 +422,10 @@ impl SporkManager {
         }
     }
 
-    /// Handle a `getdata` that asks for sporks: send each one held, and tell the
-    /// peer which are not (Divi Core main.cpp:270-346, `ShareSporkDataWithPeer`
-    /// and the `notfound` that follows)
-    pub async fn handle_getdata(&self, peer_id: PeerId, items: &[InvItem]) {
-        let mut missing = Vec::new();
-        for item in items.iter().filter(|i| i.inv_type == InvType::Spork) {
-            let held = self.sporks.read().get(&item.hash).cloned();
-            match held {
-                Some(spork) => {
-                    let _ = self
-                        .peer_manager
-                        .send_to_peer(peer_id, NetworkMessage::Spork(spork))
-                        .await;
-                }
-                None => missing.push(item.clone()),
-            }
-        }
-        if !missing.is_empty() {
-            let _ = self
-                .peer_manager
-                .send_to_peer(peer_id, NetworkMessage::NotFound(missing))
-                .await;
-        }
+    /// A spork this node holds, by its hash: what a `getdata` for it is answered
+    /// with (Divi Core `ShareSporkDataWithPeer`, spork.cpp:41-50)
+    pub fn spork_by_hash(&self, hash: &Hash256) -> Option<SporkMessage> {
+        self.sporks.read().get(hash).cloned()
     }
 
     /// A peer that dialled us. Divi Core tells it how many sporks it holds

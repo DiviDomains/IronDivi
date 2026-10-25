@@ -63,6 +63,10 @@ struct TxRequest {
     requested_at: Instant,
 }
 
+/// How long a relayed transaction is kept to answer getdata (Divi Core's
+/// 15 minutes, net.cpp:1588)
+const RELAYED_KEEP_SECS: i64 = 15 * 60;
+
 /// Transaction relay manager
 pub struct TxRelay {
     /// Peer manager for sending messages
@@ -89,6 +93,11 @@ pub struct TxRelay {
     /// Event channel for received transactions
     event_tx: broadcast::Sender<TxRelayEvent>,
 
+    /// Transactions announced to peers, kept until the Unix time given so a
+    /// getdata is answered from here, in a block by then or not (Divi Core
+    /// mapRelay, net.cpp:1565-1590)
+    relayed: RwLock<HashMap<Hash256, (Transaction, i64)>>,
+
     /// Whether a transaction is in the node's mempool and whether it is a
     /// held orphan; without it, the transactions seen here count as had
     have: RwLock<Option<HaveTx>>,
@@ -111,6 +120,7 @@ impl TxRelay {
             request_queue: RwLock::new(VecDeque::new()),
             recently_announced: RwLock::new(HashMap::new()),
             event_tx,
+            relayed: RwLock::new(HashMap::new()),
             have: RwLock::new(None),
         })
     }
@@ -341,6 +351,26 @@ impl TxRelay {
         // it (main.cpp:732-734), so a transaction it cannot take yet, such as
         // a child whose parent has not come, is not announced
         let _ = self.event_tx.send(event);
+    }
+
+    /// Keep a transaction that is announced for 15 minutes, as Divi Core keeps
+    /// what it relays in mapRelay (net.cpp:1580-1590); older ones go
+    pub fn keep_relayed(&self, tx: Transaction) {
+        let now = divi_primitives::clock::now();
+        let mut relayed = self.relayed.write();
+        relayed.retain(|_, (_, until)| *until > now);
+        relayed.insert(tx.txid(), (tx, now + RELAYED_KEEP_SECS));
+    }
+
+    /// A transaction announced in the last 15 minutes (RepeatRelayedInventory,
+    /// net.cpp:1565-1574)
+    pub fn relayed_tx(&self, txid: &Hash256) -> Option<Transaction> {
+        let now = divi_primitives::clock::now();
+        self.relayed
+            .read()
+            .get(txid)
+            .filter(|(_, until)| *until > now)
+            .map(|(tx, _)| tx.clone())
     }
 
     /// Relay a transaction the mempool took, to every peer but the one it came
@@ -711,6 +741,28 @@ mod tests {
         assert!(
             events.try_recv().is_err(),
             "the one in the mempool is not offered"
+        );
+    }
+
+    /// A transaction announced is kept 15 minutes to answer getdata, in a
+    /// block by then or not; an older one is gone (Divi Core mapRelay,
+    /// net.cpp:1565-1590)
+    #[test]
+    fn a_relayed_transaction_is_kept_for_getdata() {
+        let relay = create_test_relay();
+        let tx = test_tx(8);
+        relay.keep_relayed(tx.clone());
+        assert_eq!(relay.relayed_tx(&tx.txid()), Some(tx.clone()));
+        let old = test_tx(9);
+        relay
+            .relayed
+            .write()
+            .insert(old.txid(), (old.clone(), divi_primitives::clock::now() - 1));
+        assert_eq!(relay.relayed_tx(&old.txid()), None, "past its 15 minutes");
+        relay.keep_relayed(test_tx(10));
+        assert!(
+            !relay.relayed.read().contains_key(&old.txid()),
+            "dropped when the map is next written"
         );
     }
 }
