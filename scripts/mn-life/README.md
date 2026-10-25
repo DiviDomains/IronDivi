@@ -117,8 +117,6 @@ What the payment rows check (Divi Core 3.0.0):
 
 ## KNOWN differences
 
-- **Member order** (one row, for `setupmasternode`): irondivid writes a result's members in name order
-  (`docs/divid-differences.md` R6). Every other row compares the members as sets.
 - **`getmasternodecount: tier counts divid lacks`**: irondivid adds `copper`, `silver`, `gold`, `platinum`,
   `diamond`, as in scripts/masternode-replies.
 - **`mnsync status`, while divid is still in a sync stage** (the rows before the network is up and right after the

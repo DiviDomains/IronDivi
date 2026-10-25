@@ -45,14 +45,10 @@ START_TIMEOUT = 180
 MNSYNC = ("irondivid has no masternode sync stages and reports whether the chain is synced; divid's stages "
           "need 3 spork-synced peers to move on (masternode-sync.cpp:425-455), so on this two-node chain it "
           "stays false (as in scripts/masternode-replies)")
-R6 = ("irondivid writes a reply's members in name order (docs/divid-differences.md R6); divid in the order "
-      "it adds them")
 KNOWN = {
     **{f"getstakingstatus ({when}): mnsync": MNSYNC
        for when in ("immature coins only", "mature coins", "after stake blocks", "locked", "unlocked for staking only",
                     "unlocked")},
-    **{f"{method}: member order": R6
-       for method in ("getstakingstatus", "listreceivedbyaddress", "listreceivedbyaccount", "validateaddress")},
     "listreceivedbyaddress: fields divid lacks":
         "irondivid adds label, the account's newer name (as in scripts/wallet-replies)",
     "getstakingstatus: fields divid lacks":
