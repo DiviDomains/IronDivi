@@ -89,3 +89,41 @@ async fn connection_to_self_is_dropped() {
     };
     assert_eq!(watch.await, 0, "the node completed a handshake with itself");
 }
+
+/// Divi Core handles a message once the peer's version is in, before its
+/// verack (main.cpp:484-514 checks only for the version): a ping between the
+/// two is answered
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ping_between_version_and_verack_is_answered() {
+    let t = TestNode::start().await;
+    let mut p = RawPeer::connect(&t, "127.0.0.2").await;
+    p.send(
+        "version",
+        &version_payload(PROTOCOL_VERSION, rand_nonce(), b"/raw:1/"),
+    )
+    .await;
+    assert!(p.expect("verack", WAIT).await.is_some(), "node verack");
+
+    let nonce = 0x1122_3344_5566_7788u64.to_le_bytes();
+    p.send("ping", &nonce).await;
+    assert_eq!(p.expect("pong", WAIT).await, Some(nonce.to_vec()));
+}
+
+/// The other messages between version and verack are handled too, once the
+/// verack is in: an inventory list over 50,000 items costs 20 (main.cpp:563-566)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn message_between_version_and_verack_is_handled_after_it() {
+    let t = TestNode::start().await;
+    let mut p = RawPeer::connect(&t, "127.0.0.2").await;
+    p.send(
+        "version",
+        &version_payload(PROTOCOL_VERSION, rand_nonce(), b"/raw:1/"),
+    )
+    .await;
+    assert!(p.expect("verack", WAIT).await.is_some(), "node verack");
+
+    p.send("inv", &inv_payload(1, 50_001)).await;
+    p.send("verack", &[]).await;
+    assert_eq!(t.wait_score(p.ip, 20).await, Some(20));
+    assert!(p.alive().await);
+}
