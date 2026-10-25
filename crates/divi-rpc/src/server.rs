@@ -258,6 +258,11 @@ impl RpcServer {
         self.masternode.set_network_list(list);
     }
 
+    /// The masternodes' payment votes, read by getmasternodewinners
+    pub fn set_masternode_votes(&self, votes: Arc<crate::mn_votes::MasternodeVotes>) {
+        self.masternode.set_votes(votes);
+    }
+
     pub fn set_masternode_manager(&self, manager: divi_masternode::MasternodeManager) {
         self.masternode.set_manager(manager);
     }
@@ -642,7 +647,7 @@ impl RpcServer {
             "getmasternodestatus" => self.masternode.get_masternode_status(params),
             "getmasternodewinners" => self
                 .masternode
-                .get_masternode_winners(params, self.blockchain.tip_height()),
+                .get_masternode_winners(params, self.blockchain.chain()),
             "listmasternodes" => self
                 .masternode
                 .list_masternodes(params, self.blockchain.chain()),

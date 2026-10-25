@@ -12,6 +12,7 @@
 use crate::error::{codes, Error, RpcError};
 use crate::mn_broadcast::{self, BroadcastRelay, BroadcastStore, MnContext};
 use crate::mn_list::MasternodeList;
+use crate::mn_votes::MasternodeVotes;
 use crate::protocol::Params;
 use divi_masternode::{MasternodeManager, MasternodeRpc as MasternodeRpcImpl, PaymentVoteTracker};
 use divi_storage::Chain;
@@ -69,6 +70,8 @@ pub struct MasternodeRpc {
     relay: RwLock<Option<BroadcastRelay>>,
     /// The masternodes the network announced, in Divi Core's form
     network_list: RwLock<Option<Arc<MasternodeList>>>,
+    /// The masternodes' payment votes
+    votes: RwLock<Option<Arc<MasternodeVotes>>>,
 }
 
 impl MasternodeRpc {
@@ -80,7 +83,12 @@ impl MasternodeRpc {
             datadir: RwLock::new(None),
             relay: RwLock::new(None),
             network_list: RwLock::new(None),
+            votes: RwLock::new(None),
         }
+    }
+
+    pub fn set_votes(&self, votes: Arc<MasternodeVotes>) {
+        *self.votes.write() = Some(votes);
     }
 
     pub fn set_network_list(&self, list: Arc<MasternodeList>) {
@@ -180,17 +188,37 @@ impl MasternodeRpc {
     /// exactly two are given; height h is listed only when the block it is scored
     /// with, at h - 101, is on the chain (GetBlockHashForScoring,
     /// MasternodeHelpers.cpp:75-86).
-    pub fn get_masternode_winners(&self, params: &Params, tip_height: i32) -> Result<Value, Error> {
+    pub fn get_masternode_winners(
+        &self,
+        params: &Params,
+        chain: &Arc<Chain>,
+    ) -> Result<Value, Error> {
+        if let Some(votes) = self.votes.read().clone() {
+            let (blocks, filter) = Self::winners_args(params)?;
+            return Ok(votes.winners_json(chain, blocks as i64, filter));
+        }
+        self.winners_at(params, chain.height() as i32)
+    }
+
+    /// `blocks` (read with atoi, default 10) and the filter, read only when
+    /// there are exactly two arguments (rpcmasternode.cpp:489-552)
+    fn winners_args(params: &Params) -> Result<(i32, &str), Error> {
         if params.len() > 3 {
             return Err(Self::usage(GETMASTERNODEWINNERS_USAGE));
         }
-        self.get_rpc()?;
         let blocks = str_arg(params, 0)?.map(atoi).unwrap_or(10);
         let filter = if params.len() == 2 {
             str_arg(params, 1)?.unwrap_or("")
         } else {
             ""
         };
+        Ok((blocks, filter))
+    }
+
+    /// The winners with no vote known: every listed height "Unknown"
+    fn winners_at(&self, params: &Params, tip_height: i32) -> Result<Value, Error> {
+        let (blocks, filter) = Self::winners_args(params)?;
+        self.get_rpc()?;
         if !filter.is_empty() && !"Unknown".contains(filter) {
             return Ok(json!([]));
         }
@@ -567,16 +595,16 @@ mod tests {
             (-1, "value is type int, expected str".into())
         );
         assert_eq!(
-            help(rpc.get_masternode_winners(&args(&[s("5"), s("a"), s("b"), s("c")]), 200)),
+            help(rpc.winners_at(&args(&[s("5"), s("a"), s("b"), s("c")]), 200)),
             (-1, "getmasternodewinners ( blocks \"filter\" )".into())
         );
         assert_eq!(
-            help(rpc.get_masternode_winners(&args(&[json!(5)]), 200)),
+            help(rpc.winners_at(&args(&[json!(5)]), 200)),
             (-1, "value is type int, expected str".into())
         );
         // Three arguments are taken; the filter is read only when there are two
         let three = rpc
-            .get_masternode_winners(&args(&[s("5"), s("nomatch"), s("x")]), 200)
+            .winners_at(&args(&[s("5"), s("nomatch"), s("x")]), 200)
             .unwrap();
         assert_eq!(three.as_array().unwrap().len(), 25);
     }
@@ -588,7 +616,7 @@ mod tests {
     fn masternode_winners_list_only_heights_with_a_scoring_block() {
         let rpc = with_manager();
         let heights = |a: &[&str], tip: i32| -> Vec<i64> {
-            rpc.get_masternode_winners(&args(&a.iter().map(|v| json!(v)).collect::<Vec<_>>()), tip)
+            rpc.winners_at(&args(&a.iter().map(|v| json!(v)).collect::<Vec<_>>()), tip)
                 .unwrap()
                 .as_array()
                 .unwrap()
