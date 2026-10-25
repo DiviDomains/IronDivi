@@ -334,3 +334,21 @@ fn the_start_logs_divid_s_scanning_line() {
     let log = debug_log(dir.path());
     assert!(log.contains("Scanning... from height 3 to 3"), "{log}");
 }
+
+/// -force_rescan scans the wallet from the genesis block at the start, and
+/// logs it under divid's word for a scan not asked for with -rescan
+/// (wallet.cpp:261-262, :292-294)
+#[test]
+fn force_rescan_scans_from_the_genesis_block() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let (_node, port) = start(dir.path(), &[]);
+        let made = rpc(port, "setgenerate", json!([3])).unwrap();
+        assert!(made["error"].is_null(), "{made}");
+    }
+    std::fs::remove_file(dir.path().join("debug.log")).unwrap();
+    drop(start(dir.path(), &["-force_rescan".into()]));
+    let log = debug_log(dir.path());
+    assert!(log.contains("Scanning... from height 0 to 3"), "{log}");
+    assert!(!log.contains("Rescanning"), "{log}");
+}

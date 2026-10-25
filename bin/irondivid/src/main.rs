@@ -394,6 +394,7 @@ const APPLIED: &[&str] = &[
     "litemode",
     "budgetvotemode",
     "rescan",
+    "force_rescan",
     "salvagewallet",
     "dbloadfailexit",
     "allowunencryptedwallet",
@@ -1591,6 +1592,9 @@ struct WalletOptions {
     /// Whether -rescan is given: a transaction record that cannot be read
     /// asks for a rescan only when it is not (SoftSetBoolArg, walletdb.cpp:508)
     rescan_given: bool,
+    /// -force_rescan: the start's scan from the genesis block, as divid's
+    /// seed restore asks for it (wallet.cpp:261, :2327)
+    force_rescan: bool,
     /// -dbloadfailexit, read as a number: a wallet that loads with a warning
     /// stops the start (init.cpp:1307-1309)
     db_load_fail_exit: bool,
@@ -1631,6 +1635,7 @@ impl WalletOptions {
         WalletOptions {
             rescan: settings.get_bool("rescan", settings.get_bool("salvagewallet", false)),
             rescan_given: settings.get("rescan").is_some(),
+            force_rescan: settings.get_bool("force_rescan", false),
             db_load_fail_exit: settings.get("dbloadfailexit").is_some_and(|v| atoi(v) != 0),
             allow_unencrypted: settings.get_bool("allowunencryptedwallet", false),
             spend_zero_conf_change: settings.get_bool("spendzeroconfchange", false),
@@ -2266,6 +2271,11 @@ async fn run_daemon(
                 || (!wallet_options.rescan_given && wallet_arc.load_problems().transactions > 0);
             if rescan {
                 info!("Rescanning... from height 0 to {}", chain_height);
+                wallet_arc.set_last_scan_height(0);
+            } else if wallet_options.force_rescan {
+                // -force_rescan scans from the genesis block too, under the
+                // word for a scan that was not asked for (wallet.cpp:261-262, :292)
+                info!("Scanning... from height 0 to {}", chain_height);
                 wallet_arc.set_last_scan_height(0);
             } else {
                 // Divi Core scans from the wallet's stored best block, itself
