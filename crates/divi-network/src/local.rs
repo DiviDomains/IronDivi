@@ -39,7 +39,8 @@ fn from_bytes(b: [u8; 16]) -> IpAddr {
     }
 }
 
-fn is_tor(b: &[u8; 16]) -> bool {
+/// An OnionCat address (Divi Core CNetAddr::IsTor, netbase.cpp: fd87:d87e:eb43::/48)
+pub(crate) fn is_tor(b: &[u8; 16]) -> bool {
     b[..6] == [0xFD, 0x87, 0xD8, 0x7E, 0xEB, 0x43]
 }
 

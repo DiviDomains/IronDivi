@@ -316,6 +316,168 @@ pub enum ChainEvent {
 /// A listener for connected and disconnected blocks
 pub type BlockListener = Arc<dyn Fn(&ChainEvent) + Send + Sync>;
 
+/// The two payments a treasury block owes: the treasury's and the charity's
+/// script and amount
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreasuryDue {
+    pub treasury: (divi_primitives::script::Script, Amount),
+    pub charity: (divi_primitives::script::Script, Amount),
+}
+
+/// What the treasury block at `height` must pay, or None when `height` is
+/// not a treasury block (Divi Core SuperblockHeightValidator,
+/// BlockSubsidyProvider::updateTreasuryReward, BlockIncentivesPopulator.cpp:31-42:
+/// every network but mainnet pays testnet's addresses)
+pub fn treasury_payments_due(network_type: NetworkType, height: u32) -> Option<TreasuryDue> {
+    use divi_consensus::treasury;
+    let (treasury_cycle, treasury_start, lottery_cycle, halving_interval) = match network_type {
+        NetworkType::Mainnet => (
+            treasury::mainnet::TREASURY_CYCLE,
+            treasury::mainnet::TREASURY_START_BLOCK,
+            treasury::mainnet::LOTTERY_CYCLE,
+            525_600u32,
+        ),
+        NetworkType::Testnet => (
+            treasury::testnet::TREASURY_CYCLE,
+            treasury::testnet::TREASURY_START_BLOCK,
+            treasury::testnet::LOTTERY_CYCLE,
+            1_000u32,
+        ),
+        NetworkType::Regtest => (
+            treasury::regtest::TREASURY_CYCLE,
+            treasury::regtest::TREASURY_START_BLOCK,
+            treasury::regtest::LOTTERY_CYCLE,
+            100u32,
+        ),
+    };
+    if !treasury::is_treasury_block_with_lottery(
+        height,
+        treasury_start,
+        treasury_cycle,
+        lottery_cycle,
+    ) {
+        return None;
+    }
+    let is_mainnet = matches!(network_type, NetworkType::Mainnet);
+    let payment_cycle = treasury::get_treasury_payment_cycle(height, treasury_cycle, lottery_cycle);
+    let (treasury_amount, charity_amount) = divi_consensus::calculate_weighted_treasury_payment(
+        height,
+        payment_cycle,
+        halving_interval,
+    );
+    Some(TreasuryDue {
+        treasury: (treasury::get_treasury_script(is_mainnet), treasury_amount),
+        charity: (treasury::get_charity_script(is_mainnet), charity_amount),
+    })
+}
+
+/// Check that the treasury block at `height` pays the treasury and the
+/// charity what is due: some output of exactly the amount to exactly the
+/// script, for each (Divi Core IsValidTreasuryPayment,
+/// BlockIncentivesPopulator.cpp:66-90). Any other height passes.
+pub fn check_treasury_payments(
+    network_type: NetworkType,
+    block: &Block,
+    height: u32,
+) -> Result<(), StorageError> {
+    let Some(due) = treasury_payments_due(network_type, height) else {
+        // Not a treasury block - nothing to validate
+        return Ok(());
+    };
+    let (treasury_script, expected_treasury) = (&due.treasury.0, due.treasury.1);
+    let (charity_script, expected_charity) = (&due.charity.0, due.charity.1);
+
+    let coinstake = block.transactions.get(1).ok_or_else(|| {
+        StorageError::invalid_block_scored(0, "Treasury block missing coinstake".to_string())
+    })?;
+
+    // Divi Core's IsValidTreasuryPayment (BlockIncentivesPopulator.cpp:66-90):
+    // an output of exactly the amount to exactly the script, for each
+    let pays = |script: &divi_primitives::script::Script, amount| {
+        coinstake
+            .vout
+            .iter()
+            .any(|o| o.script_pubkey == *script && o.value == amount)
+    };
+    if !pays(treasury_script, expected_treasury) {
+        return Err(StorageError::invalid_block_scored(
+            0,
+            format!(
+                "Treasury block {} does not pay the treasury {}",
+                height, expected_treasury
+            ),
+        ));
+    }
+    if !pays(charity_script, expected_charity) {
+        return Err(StorageError::invalid_block_scored(
+            0,
+            format!(
+                "Treasury block {} does not pay the charity {}",
+                height, expected_charity
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
+/// Check that the lottery block at `height` pays each of `winners` (the
+/// winners of the block before it): the first half of the cycle's lottery
+/// pool, each other a tenth of that half (Divi Core
+/// BlockIncentivesPopulator.cpp:48-64, IsValidLotteryBlockPayee)
+pub fn check_lottery_payments(
+    block: &Block,
+    height: u32,
+    winners: &divi_primitives::LotteryWinners,
+    lottery_cycle: u32,
+    halving_interval: u32,
+) -> Result<(), StorageError> {
+    use divi_consensus::block_subsidy;
+
+    // If no winners, lottery payments are optional (C++ returns true for empty winners)
+    if winners.coinstakes.is_empty() {
+        return Ok(());
+    }
+
+    // Calculate lottery pool: 50 DIVI per block × cycle = total
+    // (lottery per-block reward is always 50 DIVI, independent of halving)
+    let per_block_lottery = block_subsidy::get_block_subsidy(height, halving_interval).lottery;
+    let total_pool = Amount::from_sat(per_block_lottery.as_sat() * lottery_cycle as i64);
+
+    // Big reward (1st place): 50% of pool
+    let big_reward = Amount::from_sat(total_pool.as_sat() / 2);
+    // Small reward (2nd-11th): 5% of pool each
+    let small_reward = Amount::from_sat(big_reward.as_sat() / 10);
+
+    let coinstake = block
+        .transactions
+        .get(1)
+        .ok_or_else(|| StorageError::InvalidBlock("Lottery block missing coinstake".to_string()))?;
+
+    // Verify each winner's payment exists in coinstake outputs
+    for (i, winner) in winners.coinstakes.iter().enumerate() {
+        let expected_reward = if i == 0 { big_reward } else { small_reward };
+        let expected_script = &winner.script_pubkey;
+
+        let found = coinstake
+            .vout
+            .iter()
+            .any(|out| out.script_pubkey == *expected_script && out.value == expected_reward);
+
+        if !found {
+            return Err(StorageError::invalid_block_scored(
+                0,
+                format!(
+                    "Lottery block {} missing payment for winner {}: expected {} to script",
+                    height, i, expected_reward
+                ),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 /// Chain state
 pub struct Chain {
     /// Database for persistent storage
@@ -1151,7 +1313,9 @@ impl Chain {
     /// one below, and each stored block body reads back (RocksDB checks its CRC on read),
     /// hashes to its index entry and matches its merkle root; stored undo data must decode.
     /// Bodies may be absent only where pruning or a snapshot import removed them.
-    /// `depth` 0 checks the whole chain (C++ treats `-checkblocks=0` the same way).
+    /// As VerifyDB, the heights from the tip down to tip - `depth` are checked, the
+    /// genesis block never (verifyDb.cpp:69-88); `depth` 0, or one past the height,
+    /// checks every block above genesis (C++ treats `-checkblocks=0` the same way).
     ///
     /// Returns the number of heights checked.
     pub fn verify_recent_blocks(&self, depth: u32) -> Result<u32, StorageError> {
@@ -1162,9 +1326,12 @@ impl Chain {
             .db
             .prune_height()
             .max(self.db.snapshot_base().map(|(h, _)| h).unwrap_or(0));
+        if tip.height == 0 {
+            return Ok(0);
+        }
         let lowest = match depth {
-            0 => 0,
-            n => tip.height.saturating_sub(n - 1),
+            0 => 1,
+            n => tip.height.saturating_sub(n).max(1),
         };
         let damaged = |height: u32, what: String| {
             StorageError::ChainState(format!("database is damaged at height {height}: {what}"))
@@ -4429,98 +4596,7 @@ impl Chain {
         block: &Block,
         index: &BlockIndex,
     ) -> Result<(), StorageError> {
-        use divi_consensus::treasury;
-
-        let height = index.height;
-        let network_type = self.network_type();
-
-        // Get network-specific treasury parameters
-        let (treasury_cycle, treasury_start, lottery_cycle) = match network_type {
-            NetworkType::Mainnet => (
-                treasury::mainnet::TREASURY_CYCLE,
-                treasury::mainnet::TREASURY_START_BLOCK,
-                treasury::mainnet::LOTTERY_CYCLE,
-            ),
-            NetworkType::Testnet => (
-                treasury::testnet::TREASURY_CYCLE,
-                treasury::testnet::TREASURY_START_BLOCK,
-                treasury::testnet::LOTTERY_CYCLE,
-            ),
-            NetworkType::Regtest => (
-                treasury::regtest::TREASURY_CYCLE,
-                treasury::regtest::TREASURY_START_BLOCK,
-                treasury::regtest::LOTTERY_CYCLE,
-            ),
-        };
-
-        // Use transition-aware treasury block check (matches C++ SuperblockHeightValidator)
-        let is_treasury_block = treasury::is_treasury_block_with_lottery(
-            height,
-            treasury_start,
-            treasury_cycle,
-            lottery_cycle,
-        );
-
-        if !is_treasury_block {
-            // Not a treasury block - nothing to validate
-            return Ok(());
-        }
-
-        // Regtest pays testnet's treasury and charity addresses, as every
-        // network but mainnet does (BlockIncentivesPopulator.cpp:34-42)
-        let is_mainnet = matches!(network_type, NetworkType::Mainnet);
-
-        let halving_interval = match network_type {
-            NetworkType::Mainnet => 525_600u32,
-            NetworkType::Testnet => 1_000u32,
-            NetworkType::Regtest => 100u32,
-        };
-
-        let treasury_script = treasury::get_treasury_script(is_mainnet);
-        let charity_script = treasury::get_charity_script(is_mainnet);
-
-        let coinstake = block.transactions.get(1).ok_or_else(|| {
-            StorageError::invalid_block_scored(0, "Treasury block missing coinstake".to_string())
-        })?;
-
-        // Use transition-aware payment cycle (matches C++ GetTreasuryBlockPaymentCycle)
-        let payment_cycle =
-            treasury::get_treasury_payment_cycle(height, treasury_cycle, lottery_cycle);
-        let (expected_treasury, expected_charity) =
-            divi_consensus::calculate_weighted_treasury_payment(
-                height,
-                payment_cycle,
-                halving_interval,
-            );
-
-        // Divi Core's IsValidTreasuryPayment (BlockIncentivesPopulator.cpp:66-90):
-        // an output of exactly the amount to exactly the script, for each
-        let pays = |script: &divi_primitives::script::Script, amount| {
-            coinstake
-                .vout
-                .iter()
-                .any(|o| o.script_pubkey == *script && o.value == amount)
-        };
-        if !pays(&treasury_script, expected_treasury) {
-            return Err(StorageError::invalid_block_scored(
-                0,
-                format!(
-                    "Treasury block {} does not pay the treasury {}",
-                    height, expected_treasury
-                ),
-            ));
-        }
-        if !pays(&charity_script, expected_charity) {
-            return Err(StorageError::invalid_block_scored(
-                0,
-                format!(
-                    "Treasury block {} does not pay the charity {}",
-                    height, expected_charity
-                ),
-            ));
-        }
-
-        Ok(())
+        check_treasury_payments(self.network_type(), block, index.height)
     }
 
     /// Subsidy halving interval for this network
@@ -4706,7 +4782,6 @@ impl Chain {
     }
 
     /// Validate lottery winner payments on lottery blocks.
-    /// Matches C++ IsValidLotteryPayment in BlockIncentivesPopulator.cpp.
     fn validate_lottery_payments(
         &self,
         block: &Block,
@@ -4714,57 +4789,18 @@ impl Chain {
         lottery_cycle: u32,
         halving_interval: u32,
     ) -> Result<(), StorageError> {
-        use divi_consensus::block_subsidy;
-
         // Get previous block's lottery winners
         let prev_index = self
             .db
             .get_block_index(&block.header.prev_block)?
             .ok_or_else(|| StorageError::BlockNotFound(block.header.prev_block.to_string()))?;
-
-        let winners = &prev_index.lottery_winners;
-
-        // If no winners, lottery payments are optional (C++ returns true for empty winners)
-        if winners.coinstakes.is_empty() {
-            return Ok(());
-        }
-
-        // Calculate lottery pool: 50 DIVI per block × cycle = total
-        // (lottery per-block reward is always 50 DIVI, independent of halving)
-        let per_block_lottery = block_subsidy::get_block_subsidy(height, halving_interval).lottery;
-        let total_pool = Amount::from_sat(per_block_lottery.as_sat() * lottery_cycle as i64);
-
-        // Big reward (1st place): 50% of pool
-        let big_reward = Amount::from_sat(total_pool.as_sat() / 2);
-        // Small reward (2nd-11th): 5% of pool each
-        let small_reward = Amount::from_sat(big_reward.as_sat() / 10);
-
-        let coinstake = block.transactions.get(1).ok_or_else(|| {
-            StorageError::InvalidBlock("Lottery block missing coinstake".to_string())
-        })?;
-
-        // Verify each winner's payment exists in coinstake outputs
-        for (i, winner) in winners.coinstakes.iter().enumerate() {
-            let expected_reward = if i == 0 { big_reward } else { small_reward };
-            let expected_script = &winner.script_pubkey;
-
-            let found = coinstake
-                .vout
-                .iter()
-                .any(|out| out.script_pubkey == *expected_script && out.value == expected_reward);
-
-            if !found {
-                return Err(StorageError::invalid_block_scored(
-                    0,
-                    format!(
-                        "Lottery block {} missing payment for winner {}: expected {} to script",
-                        height, i, expected_reward
-                    ),
-                ));
-            }
-        }
-
-        Ok(())
+        check_lottery_payments(
+            block,
+            height,
+            &prev_index.lottery_winners,
+            lottery_cycle,
+            halving_interval,
+        )
     }
 
     /// Update lottery winners when connecting a block.
@@ -7497,22 +7533,35 @@ mod tests {
             hash = chain.accept_block(b.clone()).unwrap().hash;
             blocks.push((hash, b));
         }
-        assert_eq!(chain.verify_recent_blocks(0).unwrap(), 6, "0 = whole chain");
-        assert_eq!(chain.verify_recent_blocks(3).unwrap(), 3);
+        // As VerifyDB: tip - depth up to the tip, genesis never (verifyDb.cpp:69-88)
+        assert_eq!(
+            chain.verify_recent_blocks(0).unwrap(),
+            5,
+            "0 = every block above genesis"
+        );
+        assert_eq!(
+            chain.verify_recent_blocks(3).unwrap(),
+            4,
+            "tip - 3 up to the tip"
+        );
         assert_eq!(
             chain.verify_recent_blocks(100).unwrap(),
-            6,
-            "tip down to genesis"
+            5,
+            "tip down to height 1"
         );
         // Store block 2's body under block 4's hash: wrong data for that key
         chain.db.store_block(&blocks[3].0, &blocks[1].1).unwrap();
         let err = chain.verify_recent_blocks(100).unwrap_err().to_string();
         assert!(err.contains("damaged at height 4"), "{err}");
-        assert_eq!(
-            chain.verify_recent_blocks(1).unwrap(),
-            1,
-            "height 4 not in range"
+        assert!(
+            chain.verify_recent_blocks(1).is_err(),
+            "depth 1 checks the tip and the block below it"
         );
+        // A damaged genesis block is not looked at
+        let genesis = chain.db.get_height_mapping(0).unwrap().unwrap();
+        chain.db.store_block(&blocks[3].0, &blocks[3].1).unwrap();
+        chain.db.store_block(&genesis, &blocks[0].1).unwrap();
+        assert_eq!(chain.verify_recent_blocks(0).unwrap(), 5);
     }
 
     /// getchaintips must report side branches, not just the active tip.

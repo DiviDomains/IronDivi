@@ -64,7 +64,7 @@ divid, but their masternodes were set up and started by different controllers.
 | silver | the same set-up and start for a second masternode of each controller (300 DIVI), on M3 and M4 |
 | restarts | C and I stopped and started; then M1 and M2 |
 | collateral spent | each controller spends its copper collateral; its status on C and on I 1, 2 and 6 blocks later |
-| payments (`MN_LIFE_PAYMENTS=1`) | 25 minutes after the starts, 20 blocks mined in turn by C and by I: `getmasternodewinners 1` before each, the masternode paid in each block (printed), and how many blocks of each miner pay a masternode |
+| payments (`MN_LIFE_PAYMENTS=1`) | C first pays I twelve coins of 200 DIVI to new addresses; 25 minutes after the starts the chain passes height 110, then 20 blocks are mined in turn by C and by I. After each: `getmasternodewinners 20` on both (waiting up to 30 s for the votes to settle), and the block's masternode payments and what it minted. At the end: whether divid's winners carry votes, how many blocks of each miner pay a masternode, and what a block mints |
 
 How a row compares:
 - the same outcome; an error with the same code and first line;
@@ -81,7 +81,7 @@ Timing:
   `getmasternodecount`, each at most every 5 s (`divi/src/MasternodeModule.cpp:524-529`, `divi/src/masternode.h:22`,
   `divi/src/masternodeman.cpp:152-180`).
 - So after a collateral is spent, the rows wait 6 s and call `getmasternodecount` on both before reading the list.
-- A masternode is ranked, so it can vote and be paid, only 25 minutes after its broadcast was signed on regtest
+- A masternode is ranked, so it can vote, only 25 minutes after its broadcast was signed on regtest
   (`divi/src/masternode-payments.cpp:558`). That is why the payment phase is optional.
 
 Not compared:
@@ -91,10 +91,32 @@ Not compared:
 
 Core paths are under `divi/src/` of the Divi Core source at v3.0.0 (commit 9e2f76c).
 
+## Masternode payments on regtest
+
+What the payment rows check (Divi Core 3.0.0):
+- **No masternode is paid, and no payee is checked.** `DeprecateMasternodes` is active once the median time past of
+  the previous block reaches 2023-08-23 (`divi/src/ForkActivation.cpp:31`, `:47-57`). Regtest blocks carry today's
+  time, so it is active at every height. Then:
+  - `FillBlockPayee` skips the masternode payee (`divi/src/BlockIncentivesPopulator.cpp:142-152`);
+  - `HasValidPayees` returns true for a block that is not a treasury or lottery block (`:162-178`).
+
+  The masternode share goes to the staker with the stake share, so a block mints 996 DIVI at these heights. Only
+  `-manual_fork=<time>` (`:21`, `:49-53`) turns payments back on; irondivid does not take it.
+- **The votes still flow.** Ranked masternodes vote for a payee (`mnw`) for each height (`divi/src/MasternodeModule.cpp
+  :395-440`), and `getmasternodewinners` shows the votes (`divi/src/rpcmasternode.cpp:489-578`). A vote is taken when:
+  - its height lies between the tip less 200 and the tip plus 20;
+  - its masternode is known, enabled and in the top 10 by score;
+  - on a node whose masternode sync is finished, its payee is in the top 20 of the node's own queue;
+  - the masternode has not voted for that height yet;
+  - its signature is good (`divi/src/masternode-payments.cpp:203-331`).
+- **Before the fork**, a received block's payee was checked only on a node whose masternode sync was finished, above
+  height 100, and only against a payee with at least 6 votes (`divi/src/BlockIncentivesPopulator.cpp:180-229`,
+  `divi/src/masternode-payments.cpp:359-400`). With fewer votes any payee was taken.
+- **A ranking age:** a masternode is ranked, and its votes counted, only 25 minutes after its broadcast was signed
+  (`divi/src/masternode-payments.cpp:558`).
+
 ## KNOWN differences
 
-- **Member order** (one row, for `setupmasternode`): irondivid writes a result's members in name order
-  (`docs/divid-differences.md` R6). Every other row compares the members as sets.
 - **`getmasternodecount: tier counts divid lacks`**: irondivid adds `copper`, `silver`, `gold`, `platinum`,
   `diamond`, as in scripts/masternode-replies.
 - **`mnsync status`, while divid is still in a sync stage** (the rows before the network is up and right after the

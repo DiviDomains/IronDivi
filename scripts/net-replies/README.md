@@ -8,6 +8,8 @@ field by field, before and after a restart of all four. Each row prints one line
 - `KNOWN`: differs, in exactly the way listed below with the reason;
 - `FAIL`: differs and should not, a `KNOWN` row that differs in another way, or a `KNOWN` row that now matches
   divid (the list below is out of date).
+- `ORDER`: the same members or list items as divid's, in another order (a FAIL, counted in `FAILS`). The line
+  names the first object or list that differs and both orders (`scripts/lib/member_order.py`).
 
 The run ends with `FAILS <n>`; the exit code is the number of FAILs (255: usage error, interrupted, or over 10 minutes).
 

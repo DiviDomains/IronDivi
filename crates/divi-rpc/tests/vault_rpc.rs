@@ -1119,3 +1119,49 @@ fn fundvault_manager_only_labels_the_owner_key() {
     );
     assert_eq!(s.owner.get_account(&owner), "");
 }
+
+/// getcoinavailability true lists a vault's funding txids in text order: a
+/// std::set<std::string> in Divi Core (rpcwallet.cpp:857, :891-895)
+#[test]
+fn coin_availability_lists_vault_txids_in_text_order() {
+    let mut net = Net::new();
+    let owner = net.wallet();
+    let manager_addr = net.wallet().new_receiving_address().unwrap();
+    let owner_addr = owner.new_receiving_address().unwrap();
+    let change = owner.new_receiving_address().unwrap();
+    let cb_addr = owner.new_receiving_address().unwrap();
+    let miner = Address::from_pubkey_hash(
+        divi_primitives::hash::Hash160::from_bytes([0x99; 20]),
+        Network::Regtest,
+    );
+    let coinbases: Vec<Transaction> = (0..6)
+        .map(|_| {
+            let hash = net.mine(vec![], &cb_addr);
+            net.chain.get_block(&hash).unwrap().unwrap().transactions[0].clone()
+        })
+        .collect();
+    // Regtest coinbases mature after 20 blocks
+    for _ in 0..20 {
+        net.mine(vec![], &miner);
+    }
+    // Six fundings of one vault, each its own transaction
+    let vault = vault_script(&owner_addr, &manager_addr);
+    let funds: Vec<Transaction> = coinbases
+        .iter()
+        .map(|cb| fund_vault_tx(&owner, cb, vault.clone(), 100, &change, 1, &change))
+        .collect();
+    let mut txids: Vec<String> = funds.iter().map(|tx| tx.txid().to_string()).collect();
+    txids.sort();
+    net.mine(funds, &miner);
+
+    let ca = net
+        .rpc(&owner)
+        .get_coin_availability(&p(vec![json!(true)]))
+        .unwrap();
+    assert_eq!(
+        ca["Vaulted"]["AllVaults"][0]["txids"],
+        json!(txids),
+        "{}",
+        ca
+    );
+}

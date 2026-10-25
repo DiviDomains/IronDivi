@@ -36,16 +36,30 @@ HOST = "127.0.0.2"
 RPC_TIMEOUT = 120
 START_TIMEOUT = 180
 DUMP = os.environ.get("SUPERBLOCKS_DUMP", "")
+# SB_LONG=1: also stake past the switch at 500 and compare heights 490-560
+LONG = os.environ.get("SB_LONG") == "1"
 
 # Regtest (chainparams.cpp:473-498): last proof-of-work block 100; lottery from
 # 101 every 10 blocks, treasury from 102 every 50, until the switch at 10 * 50 =
-# 500 (SuperblockHeightValidator.cpp:6-11, LegacyBlockSubsidies.cpp:98-108)
+# 500 (LegacyBlockSubsidies.cpp:98-108). From 500 a lottery block every 10 and
+# a treasury block the block after each (SuperblockHeightValidator.cpp:6-11)
 LAST_POW = 100
-LOTTERY = [h for h in range(110, 500, 10)]
-TREASURY = [h for h in range(150, 500, 50)]
+SWITCH = 500
 
-ORDER = ("irondivid writes the members of a result in name order, divid in the order it adds them "
-         "(json_spirit Object); docs/divid-differences.md R6")
+
+def is_lottery(h):
+    return h % 10 == 0 and h > 101 if h < SWITCH else (h - SWITCH) % 10 == 0
+
+
+def is_treasury(h):
+    return h % 50 == 0 and h >= 102 if h < SWITCH else is_lottery(h - 1)
+
+
+LONG_FIRST, LONG_LAST = 490, 560
+END = LONG_LAST + 5 if LONG else SWITCH
+LOTTERY = [h for h in range(101, END) if is_lottery(h)]
+TREASURY = [h for h in range(102, END) if is_treasury(h)]
+
 KNOWN = {}
 # The field order of each reply kind: compared once, in its own row at the end
 order_seen = {}
@@ -249,7 +263,7 @@ def both(name, method, *params, core=None):
     return compare(name, method, core.call(method, *params), I.call(method, *params))
 
 
-# Reply kinds whose field order irondivid does not keep (R6), each with a row
+# Reply kinds whose field order has a row even when no difference was seen
 ORDER_KINDS = ["getlotteryblockwinners", "getblock", "getrawtransaction"]
 
 
@@ -789,9 +803,11 @@ TIP = A.rpc("getblockcount")
 
 # --- each superblock -----------------------------------------------------------------------
 
-def superblock_rows(tag=""):
-    tip = A.rpc("getblockcount")
+def superblock_rows(tag="", first=0, last=None):
+    tip = A.rpc("getblockcount") if last is None else last
     for h in sorted(set(LOTTERY + TREASURY)):
+        if h < first:
+            continue
         if h > tip:
             break
         kind = "treasury" if h in TREASURY else "lottery"
@@ -804,6 +820,8 @@ def superblock_rows(tag=""):
             if out[0] == "ok":
                 for extra in GETBLOCK_EXTRA:
                     out[1].pop(extra, None)
+                if " order" in out[1]:
+                    out[1][" order"] = [k for k in out[1][" order"] if k not in GETBLOCK_EXTRA]
         compare(f"{p}: getblock", "getblock", core, iron)
         stake_txid = A.rpc("getblock", bh[0])["tx"][1]
         both(f"{p}: the coinstake (getrawtransaction verbose)", "getrawtransaction", stake_txid, 1)
@@ -821,10 +839,12 @@ GETBLOCK_EXTRA = ("mediantime", "nTx")
 superblock_rows()
 
 
-def cycle_rows(tag=""):
+def cycle_rows(tag="", first=0, last=None):
     """Per lottery cycle: how many candidates, how many distinct payees, on both"""
-    tip = A.rpc("getblockcount")
+    tip = A.rpc("getblockcount") if last is None else last
     for h in LOTTERY:
+        if h < first:
+            continue
         if h > tip:
             break
         c, i = winner_addresses(A, h - 1), winner_addresses(I, h - 1)
@@ -893,9 +913,49 @@ wait_for(lambda: A.rpc("getblockcount") == TIP and I.rpc("getblockcount") == TIP
 both("after -reindex: getblockcount", "getblockcount")
 winners_at(CHECK_HEIGHTS, "after -reindex")
 superblock_rows("after -reindex: ")
+
+
+# --- SB_LONG=1: past the switch at 500 ------------------------------------------------------
+
+def long_rows():
+    """Stake to 565 with the winners after every block; then heights 490-560 as
+    above: every superblock, every cycle, a bad lottery and a bad treasury block
+    after the switch offered by a raw peer"""
+    while A.rpc("getblockcount") < LONG_FIRST + 25:
+        h, node = next_block()
+        both(f"long: getlotteryblockwinners after block {h} (by {node.name})", "getlotteryblockwinners")
+    # The first lottery superblock from 520 with three or more winners
+    lottery = 520
+    to_height(lottery - 1)
+    while len(lottery_payouts(lottery)) < 3 and lottery < 540:
+        lottery += 10
+        to_height(lottery - 1)
+    wins = lottery_payouts(lottery)
+    print(f"# long: superblock {lottery}: {len(wins)} winners", flush=True)
+    bad_superblocks(lottery, [
+        ("paying the first winner one satoshi less", change_payout(wins, 0, lambda o: o.__setitem__(0, o[0] - 1))),
+        ("leaving out the last winner",
+         lambda vout: vout.remove(next(o for o in vout if o[1] == wins[-1]))),
+    ])
+    treasury = lottery + 1
+    bad_superblocks(treasury, [
+        ("paying the treasury one satoshi less",
+         change_payout([treasury_script], 0, lambda o: o.__setitem__(0, o[0] - 1))),
+        ("leaving out the charity", lambda vout: vout.remove(next(o for o in vout if o[1] == charity_script))),
+    ])
+    while A.rpc("getblockcount") < END:
+        h, node = next_block()
+        both(f"long: getlotteryblockwinners after block {h} (by {node.name})", "getlotteryblockwinners")
+    print(f"# long: staked to {A.rpc('getblockcount')} after {time.time() - t0:.0f} s", flush=True)
+    superblock_rows("long: ", LONG_FIRST, LONG_LAST)
+    cycle_rows("long: ", LONG_FIRST, LONG_LAST)
+    winners_at(range(LONG_FIRST, LONG_LAST + 1), "long")
+
+
+if LONG:
+    long_rows()
 for kind in sorted(set(order_seen) | set(ORDER_KINDS)):
     name = f"{kind}: field order"
-    KNOWN[name] = ORDER
     seen = order_seen.get(kind)
     row(name, seen[1] if seen else "same", seen[2] if seen else "same", seen is None)
 
