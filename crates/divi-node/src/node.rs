@@ -23,8 +23,8 @@ use divi_crypto::compute_block_hash;
 use divi_masternode::MasternodeManager;
 use divi_network::constants::MAX_INV_SIZE;
 use divi_network::{
-    BlockSync, MasternodeHandler, NetworkMessage, PeerEvent, PeerManager, PeerManagerConfig,
-    SporkManager, SyncState, TxRelay,
+    BlockSync, NetworkMessage, PeerEvent, PeerManager, PeerManagerConfig, SporkManager, SyncState,
+    TxRelay,
 };
 use divi_primitives::block::Block;
 use divi_primitives::hash::Hash256;
@@ -157,11 +157,11 @@ pub struct Node {
     /// Masternode manager
     masternode_manager: Arc<MasternodeManager>,
 
-    /// Masternode P2P message handler
-    masternode_handler: Arc<MasternodeHandler>,
-
     /// The masternodes the network announced, as Divi Core keeps them
     masternode_list: Arc<divi_rpc::mn_list::MasternodeList>,
+
+    /// The masternodes' payment votes (mnw)
+    masternode_votes: Arc<divi_rpc::mn_votes::MasternodeVotes>,
 
     /// Event broadcaster
     event_tx: broadcast::Sender<NodeEvent>,
@@ -222,6 +222,9 @@ impl Node {
         // Create data directory if it doesn't exist
         std::fs::create_dir_all(&config.data_dir)
             .map_err(|e| NodeError::Init(format!("Failed to create data directory: {}", e)))?;
+        if config.resync {
+            clear_folders_for_resync(&config);
+        }
 
         // Initialize database, optionally with UTXO cache
         let db = Arc::new(if config.utxo_cache_size > 0 {
@@ -257,9 +260,20 @@ impl Node {
         // C++ checks the newest blocks at every start (-checkblocks); a damaged
         // database otherwise goes unnoticed until the bad record is read.
         let started = std::time::Instant::now();
+        // A failed check stops the start with Divi Core's InitError text
+        // (init.cpp:1116-1119) on the first line; what was found, and how to
+        // recover, after it and in the log
         let checked = chain
             .verify_recent_blocks(config.check_blocks)
-            .map_err(damaged)?;
+            .map_err(|e| {
+                tracing::error!("VerifyDB() : *** {}", e);
+                match damaged(e) {
+                    NodeError::Init(detail) => {
+                        NodeError::Init(format!("Corrupted block database detected\n{detail}"))
+                    }
+                    other => other,
+                }
+            })?;
         tracing::info!(
             "Verified the last {} blocks in {} ms",
             checked,
@@ -575,6 +589,7 @@ impl Node {
             } else {
                 Vec::new()
             },
+            seed_nodes: config.p2p.seednode.clone(),
         };
         let peer_manager = PeerManager::new(peer_manager_config);
         // The -addnode values are the first added nodes (net.cpp:1218)
@@ -651,11 +666,11 @@ impl Node {
             }
         };
 
-        // Create masternode P2P handler
-        let masternode_handler = Arc::new(MasternodeHandler::new(Arc::clone(&masternode_manager)));
-        // Kept in the datadir as Divi Core keeps mncache.dat
+        // The network's masternodes, kept in the datadir as Divi Core keeps
+        // mncache.dat, and their payment votes
         let masternode_list = Arc::new(divi_rpc::mn_list::MasternodeList::new());
         masternode_list.set_path(config.data_dir.join("masternodes.list"));
+        let masternode_votes = Arc::new(divi_rpc::mn_votes::MasternodeVotes::new());
 
         // NOTE: block_connected_callback is set in main.rs where it can include
         // both node-level processing (mempool cleanup, fee estimation) and wallet scanning.
@@ -681,8 +696,8 @@ impl Node {
             orphans,
             spork_manager,
             masternode_manager,
-            masternode_handler,
             masternode_list,
+            masternode_votes,
             event_tx,
             shutdown_tx,
             tasks: parking_lot::Mutex::new(Vec::new()),
@@ -835,8 +850,8 @@ impl Node {
         let spork_manager = Arc::clone(&self.spork_manager);
         let chain = Arc::clone(&self.chain);
         let mempool = Arc::clone(&self.mempool);
-        let masternode_handler = Arc::clone(&self.masternode_handler);
         let masternode_list = Arc::clone(&self.masternode_list);
+        let masternode_votes = Arc::clone(&self.masternode_votes);
         let peer_manager = Arc::clone(&self.peer_manager);
         let mut peer_events = self.peer_manager.subscribe();
         // Divi Core checks every masternode once a minute (MasternodeModule.cpp:524-529)
@@ -881,13 +896,23 @@ impl Node {
                             .begin_syncing_with_peer(peer_id, version.services)
                             .await;
 
+                        peer_manager
+                            .gossip()
+                            .connected(peer_id, peer_manager.is_one_shot(peer_id));
                         if peer_manager.is_inbound(peer_id) {
                             spork_manager.inbound_peer_connected(peer_id).await;
                         } else {
-                            // An outbound peer that answered (addrman Good, main.cpp:443)
-                            peer_manager
-                                .address_book()
-                                .connected(addr, version.services);
+                            // An outbound peer is asked for addresses after its
+                            // version (main.cpp:438-442), and counts as good
+                            // (addrman Good, main.cpp:443)
+                            peer_manager.gossip().asked(peer_id);
+                            if let Err(e) = peer_manager
+                                .send_to_peer(peer_id, NetworkMessage::GetAddr)
+                                .await
+                            {
+                                tracing::debug!("Failed to send getaddr to peer {}: {}", peer_id, e);
+                            }
+                            peer_manager.address_book().good(addr);
                         }
                     }
                     PeerEvent::Disconnected { peer_id, reason } => {
@@ -899,6 +924,7 @@ impl Node {
                         spork_manager.remove_peer(peer_id);
                         hash_continue.remove(&peer_id);
                         alerts_known.remove(&peer_id);
+                        peer_manager.gossip().disconnected(peer_id);
                     }
                     PeerEvent::Message { peer_id, message } => {
                         // Log all message types at INFO for debugging sync issues
@@ -985,6 +1011,7 @@ impl Node {
                                             i.inv_type,
                                             divi_network::message::InvType::MasternodeAnnounce
                                                 | divi_network::message::InvType::MasternodePing
+                                                | divi_network::message::InvType::MasternodeWinner
                                         )
                                     })
                                     .filter(|i| masternode_items_asked.insert(i.hash))
@@ -1150,8 +1177,7 @@ impl Node {
                                 tracing::debug!("Received govsync request from peer {}", peer_id);
                             }
                             // Masternode P2P messages
-                            // Not answered: IronDivi cannot vouch for masternode
-                            // entries as Divi Core does (see MasternodeHandler)
+                            // dseg is not answered (a peer's masternode list sync)
                             NetworkMessage::RequestMasternodeList(_) => {
                                 tracing::debug!("dseg from peer {} not answered", peer_id);
                             }
@@ -1180,14 +1206,21 @@ impl Node {
                                     );
                                 }
                             }
+                            // A payment vote, counted when it passes Divi Core's
+                            // checks and then passed on, as ProcessMasternodeWinners
+                            // relays it (masternode-payments.cpp:250-267)
                             NetworkMessage::MasternodeWinner(payload) => {
-                                if let Err(e) = masternode_handler.handle_winner(peer_id, &payload)
-                                {
-                                    tracing::warn!(
-                                        "Failed to handle masternode winner from peer {}: {}",
+                                match masternode_votes.accept(&chain, &masternode_list, &payload) {
+                                    Ok(true) => peer_manager.broadcast_except(
+                                        NetworkMessage::MasternodeWinner(payload),
+                                        peer_id,
+                                    ),
+                                    Ok(false) => {}
+                                    Err(e) => tracing::debug!(
+                                        "Masternode winner from peer {} not taken: {}",
                                         peer_id,
                                         e
-                                    );
+                                    ),
                                 }
                             }
                             NetworkMessage::Unknown(cmd, payload) => {
@@ -1201,28 +1234,54 @@ impl Node {
                             }
                             NetworkMessage::Addr(addrs) => {
                                 // Kept in the address book, as Divi Core's addrman
-                                // keeps them (main.cpp:521-558)
-                                if addrs.len() > 1000 {
+                                // keeps them, and a short fresh one relayed
+                                // (main.cpp:521-558)
+                                if addrs.len() > divi_network::gossip::MAX_ADDR_MESSAGE {
                                     peer_manager.report_misbehavior_score(
                                         peer_id,
                                         20,
                                         "Requested too many addresses",
                                     );
                                 } else {
-                                    peer_manager.address_book().add(&addrs);
+                                    let now = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map(|d| d.as_secs() as u32)
+                                        .unwrap_or(0);
+                                    let got = peer_manager.gossip().received(
+                                        peer_id,
+                                        &addrs,
+                                        &peer_manager.connected_peers(),
+                                        now,
+                                    );
+                                    if let Some(from) = peer_manager.peer_addr(peer_id) {
+                                        peer_manager.address_book().add(&got.keep, from.ip());
+                                    }
+                                    for (to, relayed) in got.relay {
+                                        if let Err(e) = peer_manager
+                                            .send_to_peer(to, NetworkMessage::Addr(relayed))
+                                            .await
+                                        {
+                                            tracing::debug!("Failed to relay addr to peer {}: {}", to, e);
+                                        }
+                                    }
+                                    // A -seednode peer goes once it has answered (main.cpp:556-557)
+                                    if got.disconnect {
+                                        peer_manager.disconnect(peer_id);
+                                    }
                                 }
                             }
                             // An inbound peer asking for addresses gets a share of
-                            // the book (main.cpp:863-869), at most 1000 per message
+                            // the book it does not have yet, at most 1000
+                            // (main.cpp:863-869, :1087-1104)
                             NetworkMessage::GetAddr if peer_manager.is_inbound(peer_id) => {
                                 let sample = peer_manager.address_book().sample();
-                                for chunk in sample.chunks(1000) {
+                                let answer = peer_manager.gossip().answer(peer_id, sample);
+                                if !answer.is_empty() {
                                     if let Err(e) = peer_manager
-                                        .send_to_peer(peer_id, NetworkMessage::Addr(chunk.to_vec()))
+                                        .send_to_peer(peer_id, NetworkMessage::Addr(answer))
                                         .await
                                     {
                                         tracing::debug!("Failed to send addr to peer {}: {}", peer_id, e);
-                                        break;
                                     }
                                 }
                             }
@@ -1947,6 +2006,11 @@ impl Node {
     pub fn masternode_list(&self) -> &Arc<divi_rpc::mn_list::MasternodeList> {
         &self.masternode_list
     }
+
+    /// The masternodes' payment votes (getmasternodewinners)
+    pub fn masternode_votes(&self) -> &Arc<divi_rpc::mn_votes::MasternodeVotes> {
+        &self.masternode_votes
+    }
 }
 
 /// Blockchain information
@@ -2027,6 +2091,29 @@ fn score_relayed_refusal(peers: &PeerManager, event: &divi_network::TxRelayEvent
         e.misbehaviour_score(),
         &format!("tx {} rejected by the mempool: {}", event.txid, e),
     );
+}
+
+/// Divi Core's -resync (ClearFoldersForResync, init.cpp:901-930): the chain's
+/// folders are deleted before it is loaded, one by one so a missing one does not
+/// stop the rest, and a failure is logged, not fatal. irondivid's chain database
+/// holds its blocks, undo data, sporks and the address and spent indexes; the
+/// transaction index has its own folder. The wallet, the configuration and the
+/// peer and masternode files stay.
+fn clear_folders_for_resync(config: &NodeConfig) {
+    tracing::info!("Deleting blockchain folders blocks, chainstate and sporks");
+    for dir in [
+        config.blocks_path(),
+        config.chainstate_path(),
+        config.data_dir.join("txindex"),
+    ] {
+        if !dir.exists() {
+            continue;
+        }
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => tracing::info!("-resync: folder deleted: {}", dir.display()),
+            Err(e) => tracing::warn!("Failed to delete blockchain folders {}", e),
+        }
+    }
 }
 
 /// The `reject` Divi Core sends the peer that relayed a transaction its
@@ -2176,18 +2263,22 @@ const MAX_STANDARD_TX_SIZE: usize = 100_000;
 /// Divi Core `MAX_TX_SIGOPS_CURRENT` (defaultValues.h:61): 40,000 / 5
 const MAX_TX_SIGOPS: u32 = 8_000;
 
-/// Divi Core `MempoolConsensus::IsStandardTx` (MempoolConsensus.cpp:29-121) with
-/// its defaults (`-permitbaremultisig` on, `-datacarriersize` 603): the reason
-/// a transaction is not relayed, if it is not. Applies on every network, as
-/// `-acceptnonstandard` is off by default.
+/// Divi Core `MempoolConsensus::IsStandardTx` (MempoolConsensus.cpp:29-121): the
+/// reason a transaction is not relayed, if it is not. Applies on every network,
+/// as `-acceptnonstandard` is off by default. Without `permit_bare_multisig`
+/// (`-permitbaremultisig=0`) a bare multisig output is not standard; an OP_META
+/// output script is standard up to `max_datacarrier_bytes` (`-datacarriersize`,
+/// 603 by default; 0 with `-datacarrier=0`).
 pub fn check_standard_tx(
     tx: &Transaction,
     tip_height: u32,
     now: u32,
     relay_fee_per_kb: i64,
+    permit_bare_multisig: bool,
+    max_datacarrier_bytes: usize,
 ) -> Result<(), NodeError> {
     use crate::error::reject;
-    use divi_script::policy::{standard_output_type, MAX_OP_META_RELAY};
+    use divi_script::policy::standard_output_type;
     use divi_script::ScriptType;
 
     let nonstandard = |reason: &str| Err(NodeError::rejected(reject::NONSTANDARD, reason));
@@ -2211,9 +2302,12 @@ pub fn check_standard_tx(
     }
     let mut data_outputs = 0;
     for out in &tx.vout {
-        match standard_output_type(out.script_pubkey.as_bytes(), MAX_OP_META_RELAY) {
+        match standard_output_type(out.script_pubkey.as_bytes(), max_datacarrier_bytes) {
             None => return nonstandard("scriptpubkey"),
             Some(ScriptType::NullData) => data_outputs += 1,
+            Some(ScriptType::Multisig) if !permit_bare_multisig => {
+                return nonstandard("bare-multisig");
+            }
             Some(_) => {
                 if out.value < out.min_non_dust_value(relay_fee_per_kb) {
                     return nonstandard("dust");
@@ -2279,7 +2373,14 @@ pub fn check_mempool_transaction(
     // -acceptnonstandard (MempoolConsensus.cpp:274, :291, :363)
     let require_standard = mempool.requires_standard();
     if require_standard {
-        check_standard_tx(tx, tip_height, now, mempool.min_relay_fee_per_kb())?;
+        check_standard_tx(
+            tx,
+            tip_height,
+            now,
+            mempool.min_relay_fee_per_kb(),
+            mempool.permits_bare_multisig(),
+            mempool.max_datacarrier_bytes(),
+        )?;
     }
     mempool.check_conflicts(tx)?;
 
@@ -2566,8 +2667,15 @@ mod tests {
 
         let err = match Node::new(config.clone()) {
             Ok(_) => panic!("node started on a damaged chain database"),
-            Err(e) => e.to_string(),
+            Err(NodeError::Init(reason)) => reason,
+            Err(e) => panic!("not a start refusal: {e}"),
         };
+        // Divi Core's InitError text first (init.cpp:1116-1119), then the detail
+        assert_eq!(
+            err.lines().next(),
+            Some("Corrupted block database detected"),
+            "{err}"
+        );
         assert!(err.contains("damaged at height"), "{err}");
         assert!(err.contains("move that directory aside"), "{err}");
 

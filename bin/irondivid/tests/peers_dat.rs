@@ -230,9 +230,15 @@ fn addresses_from_gossip_are_given_back_after_a_restart() {
     std::thread::sleep(Duration::from_secs(2));
     drop(peer);
 
-    // 23% of the 100 (ADDRMAN_GETADDR_MAX_PCT), all of them gossiped
+    // 23% of the 100 (ADDRMAN_GETADDR_MAX_PCT), all of them gossiped; as in
+    // divid, an address whose place in the new table is taken is not kept
+    // (addrman.cpp:291-311), so one or two of the 100 may be missing
     let before = asked(p2p_port);
-    assert_eq!(before.len(), 23, "getaddr before the restart");
+    assert!(
+        (21..=23).contains(&before.len()),
+        "getaddr before the restart: {}",
+        before.len()
+    );
     assert!(before.iter().all(|a| gossip().contains(a)));
 
     stop(&mut node, rpc_port);
@@ -242,7 +248,7 @@ fn addresses_from_gossip_are_given_back_after_a_restart() {
     );
     let (mut node, rpc_port, p2p_port) = start(dir.path());
     let after = asked(p2p_port);
-    assert_eq!(after.len(), 23, "getaddr after the restart");
+    assert_eq!(after.len(), before.len(), "getaddr after the restart");
     assert!(after.iter().all(|a| gossip().contains(a)));
     stop(&mut node, rpc_port);
 }

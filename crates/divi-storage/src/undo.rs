@@ -90,7 +90,10 @@ impl BlockUndo {
         let mut cursor = std::io::Cursor::new(data);
 
         let count = cursor.read_u32::<LittleEndian>()? as usize;
-        let mut entries = Vec::with_capacity(count);
+        // The count is read from disk: a damaged one must not reserve more than
+        // the data can hold (each entry is at least 40 bytes), or the reservation
+        // aborts the process instead of giving an error
+        let mut entries = Vec::with_capacity(count.min(data.len() / 40));
 
         for _ in 0..count {
             // Read outpoint
@@ -126,6 +129,16 @@ mod tests {
     use super::*;
     use divi_primitives::amount::Amount;
     use divi_primitives::script::Script;
+
+    /// Damaged undo data with a count past its bytes is an error, as Divi Core
+    /// reports bad undo data at start (verifyDb.cpp:104-107), not an abort
+    #[test]
+    fn damaged_undo_data_is_an_error() {
+        assert!(BlockUndo::from_bytes(&[0xff; 7]).is_err());
+        let mut data = vec![0xff, 0xff, 0xff, 0x7f];
+        data.extend_from_slice(&[0u8; 40]);
+        assert!(BlockUndo::from_bytes(&data).is_err());
+    }
 
     #[test]
     fn test_block_undo_roundtrip() {

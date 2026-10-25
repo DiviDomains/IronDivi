@@ -334,6 +334,11 @@ impl RpcServer {
         self.masternode.set_network_list(list);
     }
 
+    /// The masternodes' payment votes, read by getmasternodewinners
+    pub fn set_masternode_votes(&self, votes: Arc<crate::mn_votes::MasternodeVotes>) {
+        self.masternode.set_votes(votes);
+    }
+
     pub fn set_masternode_manager(&self, manager: divi_masternode::MasternodeManager) {
         self.masternode.set_manager(manager);
     }
@@ -341,6 +346,11 @@ impl RpcServer {
     /// Set the datadir used by the masternode RPCs (`masternode.conf`, stored broadcasts)
     pub fn set_masternode_datadir(&self, dir: std::path::PathBuf) {
         self.masternode.set_datadir(dir);
+    }
+
+    /// The masternode.conf -mnconf names, read by startmasternode
+    pub fn set_masternode_conf(&self, path: std::path::PathBuf) {
+        self.masternode.set_conf_path(path);
     }
 
     /// Set the hook that relays raw masternode broadcasts to peers
@@ -444,37 +454,32 @@ impl RpcServer {
         }
         .to_string();
 
+        // Divi Core's members in its order (rpcmisc.cpp:138-157): the wallet's
+        // only with a wallet
         let mut info = serde_json::json!({
             "version": "3.0.0.0",
             "protocolversion": divi_network::constants::protocol_version(),
-            "blocks": height,
-            "timeoffset": 0,
-            "connections": connections,
-            "proxy": "",
-            "difficulty": difficulty,
-            "testnet": matches!(network_type, NetworkType::Testnet),
-            "moneysupply": self.blockchain.money_supply(),
-            "relayfee": self.blockchain.relay_fee(),
-            "staking status": staking_status_text,
-            "errors": crate::warnings::status_bar()
         });
-        // Divi Core has the wallet members only with a wallet
-        // (rpcmisc.cpp:139-144)
-        if let (Some(wallet), Some(map)) = (wallet_info, info.as_object_mut()) {
-            map.insert("walletversion".into(), serde_json::json!(120200));
-            map.insert(
-                "balance".into(),
-                serde_json::json!(wallet["balance"].as_f64().unwrap_or(0.0)),
-            );
-            map.insert(
-                "keypoololdest".into(),
-                serde_json::json!(wallet["keypoololdest"].as_u64().unwrap_or(0)),
-            );
-            map.insert(
-                "keypoolsize".into(),
-                serde_json::json!(wallet["keypoolsize"].as_u64().unwrap_or(0)),
-            );
-            map.insert("paytxfee".into(), serde_json::json!(0.0));
+        if let Some(wallet) = &wallet_info {
+            info["walletversion"] = serde_json::json!(120200);
+            info["balance"] = serde_json::json!(wallet["balance"].as_f64().unwrap_or(0.0));
+        }
+        info["blocks"] = serde_json::json!(height);
+        info["timeoffset"] = serde_json::json!(0);
+        info["connections"] = serde_json::json!(connections);
+        info["proxy"] = serde_json::json!("");
+        info["difficulty"] = serde_json::json!(difficulty);
+        info["testnet"] = serde_json::json!(matches!(network_type, NetworkType::Testnet));
+        info["moneysupply"] = serde_json::json!(self.blockchain.money_supply());
+        info["relayfee"] = serde_json::json!(self.blockchain.relay_fee());
+        info["staking status"] = serde_json::json!(staking_status_text);
+        info["errors"] = serde_json::json!(crate::warnings::status_bar());
+        // irondivid's own members, after divid's
+        if let Some(wallet) = &wallet_info {
+            info["keypoololdest"] =
+                serde_json::json!(wallet["keypoololdest"].as_u64().unwrap_or(0));
+            info["keypoolsize"] = serde_json::json!(wallet["keypoolsize"].as_u64().unwrap_or(0));
+            info["paytxfee"] = serde_json::json!(0.0);
         }
         Ok(info)
     }
@@ -718,7 +723,7 @@ impl RpcServer {
             "getmasternodestatus" => self.masternode.get_masternode_status(params),
             "getmasternodewinners" => self
                 .masternode
-                .get_masternode_winners(params, self.blockchain.tip_height()),
+                .get_masternode_winners(params, self.blockchain.chain()),
             "listmasternodes" => self
                 .masternode
                 .list_masternodes(params, self.blockchain.chain()),
