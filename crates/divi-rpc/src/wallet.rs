@@ -1989,7 +1989,25 @@ impl WalletRpc {
         }
         check_signed(&tx, plan.fee, self.fee_policy()).map_err(send_error)?;
         wallet.note_committed(&tx.txid());
-        self.submit_transaction(tx)
+        let callback = self.tx_submit.read();
+        let callback = callback.as_ref().ok_or_else(|| {
+            RpcError::new(codes::MISC_ERROR, "Transaction submission not configured")
+        })?;
+        // Divi Core commits the send to the wallet before it offers it to the
+        // mempool, so one the mempool refuses stays in the wallet, and the call
+        // answers -4 (rpcwallet.cpp:774-782, wallet.cpp:1866-1878)
+        let txid = tx.txid();
+        if let Err(e) = callback(tx.clone()) {
+            debug!("The mempool refused wallet send {}: {:?}", txid, e);
+            info!("SendMoney -> CommitTransaction() : Error: Transaction not valid");
+            wallet.keep_refused_send(&tx);
+            return Err(RpcError::new(
+                codes::WALLET_ERROR,
+                "Error: Invalid transaction committed to wallet!",
+            )
+            .into());
+        }
+        Ok(txid)
     }
 
     /// sendtoaddress - Send amount to a given address

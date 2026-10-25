@@ -419,3 +419,34 @@ fn a_send_costing_more_than_maxtxfee_is_refused() {
         .unwrap();
     assert!(net.fee_of(&net.last_submitted()) > 20_000);
 }
+
+/// A send the mempool refuses after the wallet has signed it answers -4
+/// "Error: Invalid transaction committed to wallet!" and stays in the wallet,
+/// unconfirmed, to be offered to the mempool again at the next start
+/// (rpcwallet.cpp:774-782, wallet.cpp:1866-1878, init.cpp:1262-1275)
+#[test]
+fn a_send_the_mempool_refuses_stays_in_the_wallet() {
+    let net = Net::new();
+    net.fund(&[10 * COIN]);
+    let rpc = WalletRpc::with_wallet_and_chain(net.wallet.clone(), net.chain.clone());
+    rpc.set_tx_submit(Arc::new(|_tx: Transaction| {
+        Err(divi_rpc::TxSubmitError::Failed(String::new()))
+    }));
+    let err = rpc
+        .send_to_address(&p(vec![json!(dest().to_string()), json!(1)]))
+        .unwrap_err();
+    match err {
+        divi_rpc::Error::Rpc(e) => assert_eq!(
+            (e.code, e.message.as_str()),
+            (-4, "Error: Invalid transaction committed to wallet!")
+        ),
+        other => panic!("{other:?}"),
+    }
+    let detached = net.wallet.detached_transactions();
+    assert_eq!(detached.len(), 1, "the refused send is kept");
+    assert!(net
+        .wallet
+        .transactions_to_resubmit()
+        .iter()
+        .any(|(tx, _)| tx.txid() == detached[0].0));
+}

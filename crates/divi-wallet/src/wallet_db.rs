@@ -677,6 +677,18 @@ impl WalletDb {
         }
     }
 
+    /// A send the mempool refused after the wallet signed it: Divi Core has
+    /// committed it to the wallet already, so it stays there unconfirmed and
+    /// is offered to the mempool again at the next start (wallet.cpp:1866-1878,
+    /// rpcwallet.cpp:774-782, init.cpp:1262-1275)
+    pub fn keep_refused_send(&self, tx: &divi_primitives::transaction::Transaction) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.detach(tx.txid(), now, Some(tx.clone()));
+    }
+
     /// A detached transaction is in a block or the mempool again
     fn reattach(&self, txid: &Hash256) {
         if self.detached_txs.write().remove(txid).is_some() {
