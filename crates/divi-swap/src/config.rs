@@ -160,10 +160,13 @@ impl ClaimDeadline {
     }
 }
 
-/// How the taker raises the fee of a maker-leg claim that has not confirmed as the maker-leg
-/// locktime nears ([`FeeEscalation::builtin`]; `Taker::with_fee_escalation` overrides or
-/// turns it off for one chain). Applied only where the backend can bump
-/// (`FeeBump::Rbf` or `FeeBump::Cpfp`).
+/// How a claim that has not confirmed has its fee raised as the claimed leg's locktime nears
+/// ([`FeeEscalation::builtin`]): the taker's claim of the maker leg, and the maker's claim of
+/// the taker leg, which the taker's refund takes back at the taker-leg locktime
+/// (`Taker::with_fee_escalation` and `Maker::with_fee_escalation` override or turn it off
+/// for one chain). Applied only where the backend can bump (`FeeBump::Rbf`, `Cpfp` or
+/// `SameNonce`). The schedule is written in terms of the maker leg; for the maker read
+/// "taker leg" throughout.
 ///
 /// The feerate stays at what the first claim paid until `start_secs_left` seconds are left,
 /// then climbs geometrically to the cap, reached with `cap_secs_left` left. The cap is the
