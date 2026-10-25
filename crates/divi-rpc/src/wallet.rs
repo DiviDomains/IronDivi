@@ -3404,6 +3404,14 @@ impl WalletRpc {
         let payees = [TxOut::new(send_amount, dest_addr.script_pubkey())];
         let plan = self.plan(&payees, &coins, mode, ChangeKind::Vault, &ChangeTo::NewKey)?;
         let txid = self.sign_and_submit(&wallet, &plan, ChangeTo::NewKey)?;
+        // The "metadata" mode carries a comment and a comment-to, as
+        // sendtoaddress's (rpcwallet.cpp:1170-1176)
+        if params.get_str(2) == Some("metadata") {
+            wallet.set_tx_notes(
+                &txid,
+                send_notes(&[("comment", params.get_str(3)), ("to", params.get_str(4))]),
+            );
+        }
         // SendMoneyToAddress: the txid alone (rpcwallet.cpp:1189)
         Ok(json!(txid.to_string()))
     }

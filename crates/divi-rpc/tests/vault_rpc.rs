@@ -659,6 +659,35 @@ fn reclaim_answers_the_txid_alone() {
     assert_eq!(res, json!(tx.txid().to_string()));
 }
 
+/// reclaimvaultfunds' "metadata" mode keeps its comment and comment-to with
+/// the wallet's transaction, as sendtoaddress's does (rpcwallet.cpp:1170-1176)
+#[test]
+fn reclaim_keeps_its_metadata_notes() {
+    let s = setup();
+    let rpc = make_self_vault(&s);
+    let dest = s.owner.new_receiving_address().unwrap();
+    rpc.reclaim_vault_funds(&p(vec![
+        json!(dest.to_string()),
+        json!(10.0),
+        json!("metadata"),
+        json!("a note"),
+        json!("a shop"),
+    ]))
+    .unwrap();
+    let tx = submitted_tx(&s);
+    let notes = s.owner.tx_notes(&tx.txid());
+    assert_eq!(
+        notes.get("comment").map(String::as_str),
+        Some("a note"),
+        "{notes:?}"
+    );
+    assert_eq!(
+        notes.get("to").map(String::as_str),
+        Some("a shop"),
+        "{notes:?}"
+    );
+}
+
 fn output_to(tx: &Transaction, script: &Script) -> Vec<i64> {
     tx.vout
         .iter()
