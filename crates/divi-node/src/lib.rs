@@ -55,6 +55,7 @@ pub mod config;
 pub mod error;
 pub mod fee_estimator;
 pub mod history_fetch;
+pub mod masternode_sync;
 pub mod mempool;
 pub mod node;
 pub mod orphans;

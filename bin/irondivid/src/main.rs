@@ -2242,6 +2242,7 @@ async fn run_daemon(
         let mn_for_rpc = node.masternode_manager().as_ref().clone();
         let mn_list_for_rpc = Arc::clone(node.masternode_list());
         let mn_votes_for_rpc = Arc::clone(node.masternode_votes());
+        let mn_sync_for_rpc = Arc::clone(node.masternode_sync());
         let log_config_for_rpc = divi_rpc::LogConfigInfo {
             max_file_size: config.log.max_file_size,
             max_files: config.log.max_files,
@@ -2268,6 +2269,7 @@ async fn run_daemon(
                     rpc_server.set_masternode_manager(mn_for_rpc);
                     rpc_server.set_masternode_list(Arc::clone(&mn_list_for_rpc));
                     rpc_server.set_masternode_votes(mn_votes_for_rpc);
+                    rpc_server.set_masternode_sync(mn_sync_for_rpc);
                     rpc_server.set_masternode_datadir(datadir_for_mn);
                     rpc_server.set_masternode_conf(mnconf_for_rpc);
                     // broadcaststartmasternode: the list took the broadcast and
@@ -2408,6 +2410,7 @@ async fn run_daemon(
         let mn_for_rpc = node.masternode_manager().as_ref().clone();
         let mn_list_for_rpc = Arc::clone(node.masternode_list());
         let mn_votes_for_rpc = Arc::clone(node.masternode_votes());
+        let mn_sync_for_rpc = Arc::clone(node.masternode_sync());
         let log_config_for_rpc = divi_rpc::LogConfigInfo {
             max_file_size: config.log.max_file_size,
             max_files: config.log.max_files,
@@ -2433,6 +2436,7 @@ async fn run_daemon(
                     rpc_server.set_masternode_manager(mn_for_rpc);
                     rpc_server.set_masternode_list(Arc::clone(&mn_list_for_rpc));
                     rpc_server.set_masternode_votes(mn_votes_for_rpc);
+                    rpc_server.set_masternode_sync(mn_sync_for_rpc);
                     rpc_server.set_masternode_datadir(datadir_for_mn);
                     rpc_server.set_masternode_conf(mnconf_for_rpc);
                     // broadcaststartmasternode: the list took the broadcast and

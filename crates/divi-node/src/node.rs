@@ -206,6 +206,9 @@ pub struct Node {
     /// The masternodes' payment votes (mnw)
     masternode_votes: Arc<divi_rpc::mn_votes::MasternodeVotes>,
 
+    /// Divi Core's masternode sync and IsBlockchainSynced
+    masternode_sync: divi_masternode::mnsync::SharedMasternodeSync,
+
     /// Event broadcaster
     event_tx: broadcast::Sender<NodeEvent>,
 
@@ -714,6 +717,12 @@ impl Node {
         let masternode_list = Arc::new(divi_rpc::mn_list::MasternodeList::new());
         masternode_list.set_path(config.data_dir.join("masternodes.list"));
         let masternode_votes = Arc::new(divi_rpc::mn_votes::MasternodeVotes::new());
+        // The masternode sync, with the requests kept from the last run
+        let masternode_sync = divi_masternode::mnsync::shared(
+            divi_primitives::clock::now(),
+            chain.network_type() == divi_storage::chain::NetworkType::Mainnet,
+        );
+        crate::masternode_sync::load(&masternode_sync, &config.data_dir);
 
         // NOTE: block_connected_callback is set in main.rs where it can include
         // both node-level processing (mempool cleanup, fee estimation) and wallet scanning.
@@ -741,6 +750,7 @@ impl Node {
             masternode_manager,
             masternode_list,
             masternode_votes,
+            masternode_sync,
             event_tx,
             shutdown_tx,
             tasks: parking_lot::Mutex::new(Vec::new()),
@@ -912,6 +922,37 @@ impl Node {
                 }
             }));
         }
+        // The masternode sync thread: a step a second, the request cache
+        // cleared of expired entries and kept on disk once a minute
+        // (MasternodeModule.cpp:472-531)
+        {
+            let sync = Arc::clone(&self.masternode_sync);
+            let chain = Arc::clone(&self.chain);
+            let peers = Arc::clone(&self.peer_manager);
+            let sporks = Arc::clone(&self.spork_manager);
+            let data_dir = self.config.data_dir.clone();
+            let mut shutdown = self.shutdown_tx.subscribe();
+            self.keep(tokio::spawn(async move {
+                let mut every = tokio::time::interval(std::time::Duration::from_secs(1));
+                let mut last_cleanup = divi_primitives::clock::now();
+                loop {
+                    tokio::select! {
+                        _ = every.tick() => {}
+                        _ = shutdown.recv() => break,
+                    }
+                    let now = divi_primitives::clock::now();
+                    if !crate::masternode_sync::tick(&sync, &chain, &peers, &sporks, now).await {
+                        continue;
+                    }
+                    if now >= last_cleanup + 60 {
+                        last_cleanup = now;
+                        sync.lock().sync.requests.check_and_remove(now);
+                        crate::masternode_sync::save(&sync, &data_dir);
+                    }
+                }
+            }));
+        }
+        let masternode_sync = Arc::clone(&self.masternode_sync);
         let alert_key = divi_network::alert::alert_key(&self.config.network.magic);
         self.keep(tokio::spawn(async move {
             // Per peer: the last hash of a full getblocks answer (Divi Core
@@ -1215,12 +1256,21 @@ impl Node {
                                 spork_manager.handle_spork(peer_id, spork).await;
                             }
                             // Masternode sync messages
+                            // A peer's count for what the masternode sync asked
                             NetworkMessage::SyncStatusCount { item_id, count } => {
-                                tracing::info!(
-                                    "Received sync status count from peer {}: item_id={}, count={}",
+                                tracing::debug!(
+                                    "Sync status count from peer {}: item_id={}, count={}",
                                     peer_id,
                                     item_id,
                                     count
+                                );
+                                crate::masternode_sync::sync_status_count(
+                                    &masternode_sync,
+                                    &chain,
+                                    peer_manager.peer_addr(peer_id),
+                                    item_id,
+                                    count,
+                                    divi_primitives::clock::now(),
                                 );
                             }
                             NetworkMessage::GetSyncStatus => {
@@ -1687,6 +1737,8 @@ impl Node {
 
         tracing::info!("Stopping Divi node...");
         *self.status.write() = NodeStatus::Stopping;
+        // netfulfilled.dat is written at shutdown (MasternodeModule.cpp:290-296)
+        crate::masternode_sync::save(&self.masternode_sync, &self.config.data_dir);
 
         // Stop the block import between two records and wait for it, for a
         // minute at most (a read can block where the flag is not seen)
@@ -2184,6 +2236,11 @@ impl Node {
     /// The masternodes' payment votes (getmasternodewinners)
     pub fn masternode_votes(&self) -> &Arc<divi_rpc::mn_votes::MasternodeVotes> {
         &self.masternode_votes
+    }
+
+    /// The masternode sync (mnsync, getstakingstatus)
+    pub fn masternode_sync(&self) -> &divi_masternode::mnsync::SharedMasternodeSync {
+        &self.masternode_sync
     }
 }
 

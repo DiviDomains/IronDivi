@@ -258,6 +258,11 @@ impl RpcServer {
         self.masternode.set_network_list(list);
     }
 
+    /// The node's masternode sync, read and reset by mnsync
+    pub fn set_masternode_sync(&self, sync: divi_masternode::mnsync::SharedMasternodeSync) {
+        self.masternode.set_sync(sync);
+    }
+
     /// The masternodes' payment votes, read by getmasternodewinners
     pub fn set_masternode_votes(&self, votes: Arc<crate::mn_votes::MasternodeVotes>) {
         self.masternode.set_votes(votes);
@@ -689,7 +694,7 @@ impl RpcServer {
                 };
                 self.masternode.verify_masternode_setup(params, port)
             }
-            "mnsync" => self.masternode.mnsync(params),
+            "mnsync" => self.masternode.mnsync(params, self.blockchain.chain()),
 
             // Spork methods
             "spork" => self.spork.spork(params),
