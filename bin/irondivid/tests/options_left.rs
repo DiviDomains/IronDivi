@@ -314,3 +314,23 @@ fn testsafemode_refuses_what_divid_refuses_in_safe_mode() {
         assert!(count["error"].is_null(), "{count}");
     }
 }
+
+/// The wallet's scan at each start logs divid's line, from the wallet's best
+/// block (the genesis block for a new wallet) to the tip (wallet.cpp:292-294)
+#[test]
+fn the_start_logs_divid_s_scanning_line() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let (_node, port) = start(dir.path(), &[]);
+        let made = rpc(port, "setgenerate", json!([3])).unwrap();
+        assert!(made["error"].is_null(), "{made}");
+    }
+    assert!(
+        debug_log(dir.path()).contains("Scanning... from height 0 to 0"),
+        "first start"
+    );
+    std::fs::remove_file(dir.path().join("debug.log")).unwrap();
+    drop(start(dir.path(), &[]));
+    let log = debug_log(dir.path());
+    assert!(log.contains("Scanning... from height 3 to 3"), "{log}");
+}
