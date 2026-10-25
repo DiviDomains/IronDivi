@@ -467,6 +467,7 @@ class Peer:
                    + secrets.token_bytes(8) + bytes([len(ua)]) + ua + struct.pack("<i", 0) + bytes([relay]))
         self.buf = b""
         self.services = None
+        self.closed = False
         self.sock.sendall(message("version", payload))
         got_verack = False
         deadline = time.time() + 15
@@ -487,11 +488,13 @@ class Peer:
             try:
                 data = self.sock.recv(65536)
                 if not data:
+                    self.closed = True
                     break
                 self.buf += data
             except socket.timeout:
                 pass
             except OSError:
+                self.closed = True
                 break
             while len(self.buf) >= 24:
                 length = struct.unpack("<I", self.buf[16:20])[0]
@@ -565,14 +568,17 @@ both_rows("services: NODE_BLOOM with the default -peerbloomfilters", lambda n: b
 
 
 def ban_case(messages):
+    """Both nodes disconnect a peer at score 100 and, as it is local (127.0.0.3), do not ban it (divid
+    main.cpp:1107-1125 "not banning local peer"); every bloom score is 100, so the disconnect is the score"""
     def run(node):
         peer = Peer(node)
         for command, payload in messages:
             peer.send(command, payload)
-        peer.read(2)
+        peer.read(3)
+        dropped = peer.closed
         peer.close()
         time.sleep(1)
-        out = banned(node)
+        out = f"disconnected={dropped} banned={banned(node)}"
         node.call("clearbanned")
         return out
     return run
@@ -582,14 +588,14 @@ ok_filter = Bloom(10, 0.001, 0, 1)
 oversize = compact(36001) + bytes(36001) + struct.pack("<IIB", 5, 0, 1)
 too_many_funcs = compact(10) + bytes(10) + struct.pack("<IIB", 51, 0, 1)
 for name, msgs in (
-    ("filterload within the limits: banned", [("filterload", ok_filter.payload())]),
-    ("filteradd before any filterload: banned", [("filteradd", compact(20) + bytes(20))]),
-    ("filterload then filteradd of 520 bytes: banned", [("filterload", ok_filter.payload()),
+    ("filterload within the limits: score 100", [("filterload", ok_filter.payload())]),
+    ("filteradd before any filterload: score 100", [("filteradd", compact(20) + bytes(20))]),
+    ("filterload then filteradd of 520 bytes: score 100", [("filterload", ok_filter.payload()),
                                                          ("filteradd", compact(520) + bytes(520))]),
-    ("filterclear: banned", [("filterclear", b"")]),
-    ("filterload of 36,001 bytes: banned", [("filterload", oversize)]),
-    ("filterload with 51 hash functions: banned", [("filterload", too_many_funcs)]),
-    ("filteradd of 521 bytes: banned", [("filterload", ok_filter.payload()),
+    ("filterclear: score 100", [("filterclear", b"")]),
+    ("filterload of 36,001 bytes: score 100", [("filterload", oversize)]),
+    ("filterload with 51 hash functions: score 100", [("filterload", too_many_funcs)]),
+    ("filteradd of 521 bytes: score 100", [("filterload", ok_filter.payload()),
                                         ("filteradd", compact(521) + bytes(521))]),
 ):
     both_rows(name, ban_case(msgs))
@@ -701,9 +707,9 @@ stop_both()
 start_both(["peerbloomfilters=0"])
 both_rows("-peerbloomfilters=0: services NODE_BLOOM", lambda n: bool(Peer(n).services & 4))
 for name, msgs in (
-    ("-peerbloomfilters=0: filterload banned", [("filterload", ok_filter.payload())]),
-    ("-peerbloomfilters=0: filteradd banned", [("filteradd", compact(20) + bytes(20))]),
-    ("-peerbloomfilters=0: filterclear banned", [("filterclear", b"")]),
+    ("-peerbloomfilters=0: filterload score 100", [("filterload", ok_filter.payload())]),
+    ("-peerbloomfilters=0: filteradd score 100", [("filteradd", compact(20) + bytes(20))]),
+    ("-peerbloomfilters=0: filterclear score 100", [("filterclear", b"")]),
 ):
     both_rows(name, ban_case(msgs))
 both_rows("-peerbloomfilters=0: merkleblock of a filtered getdata (the default filter)",
