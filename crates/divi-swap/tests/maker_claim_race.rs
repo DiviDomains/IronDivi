@@ -299,6 +299,25 @@ proptest! {
     }
 }
 
+/// Found by the property at 5000 cases: the maker's USDC claim first priced at 14 gwei
+/// (fixed cap 500, `cap_feerate`) under a 488 gwei block floor stopped at 487, from where
+/// the step to 500 is under geth's 10% bump: never replaced, never mined, `Lost`.
+#[test]
+fn a_usdc_maker_claim_one_bump_short_of_the_cap_still_reaches_it() {
+    let o = run(&Market {
+        chain: Chain::Usdc,
+        estimate: 14,
+        reveal: 78,
+        floors: vec![(488, 44)],
+        refund_feerate: 2000,
+    });
+    assert_eq!(
+        (o.maker, o.claimed, o.refunded.is_none()),
+        (SwapState::Done, true, true),
+        "{o:?}"
+    );
+}
+
 /// Revealed at the deadline, a first claim at 2, and from the reveal on a block floor of
 /// `block_floor` and a mempool floor of `mempool_floor`.
 fn floor_at(chain: Chain, block_floor: u64, mempool_floor: u64) -> Market {
@@ -359,4 +378,5 @@ fn an_ltc_claim_never_evicted_under_a_floor_above_the_ceiling_waits_unresolved()
         (true, SwapState::MakerClaimed, false, true),
         "{o:?}"
     );
+    assert!(o.fees.1 > 0, "the maker kept bumping by CPFP: {o:?}");
 }

@@ -367,6 +367,26 @@ fn a_usdc_floor_above_the_fifty_x_cap_after_the_leak_is_outbid_up_to_cap_feerate
 }
 
 #[test]
+fn a_usdc_claim_one_bump_short_of_the_cap_still_reaches_it() {
+    // Found by the USDC property at 5000 cases: a first claim at 15 gwei (fixed cap 500,
+    // `cap_feerate`), the block floor at 457. The climb stopped at 456, from where the
+    // step to 500 is under geth's 10% bump: never replaced, never mined, `Lost`.
+    let m = Market {
+        chain: Chain::Usdc,
+        estimate: 15,
+        delay_secs: 13,
+        floors: vec![(914, 0)],
+        refund_feerate: 2000,
+    };
+    let o = run(&m, true);
+    assert_eq!(
+        (o.taker, o.claimed, o.leaked),
+        (TakerState::Done, true, true),
+        "{o:?}"
+    );
+}
+
+#[test]
 fn a_congested_btc_market_is_won_with_escalation_and_lost_without() {
     let on = run(&congested(Chain::Btc), true);
     assert_eq!((on.taker, on.claimed), (TakerState::Done, true), "{on:?}");

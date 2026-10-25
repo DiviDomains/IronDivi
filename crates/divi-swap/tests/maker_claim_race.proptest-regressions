@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 5d7d496e0b1394538a530898b0dd83885c4f1806e9987cbb846f669af529ff65 # shrinks to m = Market { chain: Usdc, estimate: 1, reveal: 0, floors: [(51, 0)], refund_feerate: 2000 }
+cc 134f915925e3d0e68d7c4a4cd123eb29800152ed657e69c9eaad2feeaf2c9b82 # shrinks to m = Market { chain: Usdc, estimate: 14, reveal: 78, floors: [(488, 44)], refund_feerate: 2000 }
