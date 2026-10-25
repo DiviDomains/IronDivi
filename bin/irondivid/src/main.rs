@@ -1513,7 +1513,8 @@ fn load_or_restore_wallet_with_seed(
 /// already dropped the ones mined meanwhile. A transaction whose inputs are
 /// neither unspent on chain nor outputs of a transaction in the mempool can
 /// never confirm (spent by another transaction while we were down): the
-/// wallet forgets it, as it does when the mempool evicts one.
+/// wallet forgets it, as it does when the mempool evicts one. Nothing is
+/// announced to peers, as Core announces none of them then.
 fn resubmit_wallet_txs(node: &Node, wallet: &Arc<WalletDb>) {
     let txs = wallet.transactions_to_resubmit();
     if txs.is_empty() {
@@ -1535,12 +1536,12 @@ fn resubmit_wallet_txs(node: &Node, wallet: &Arc<WalletDb>) {
             Err("inputs no longer available".to_string())
         };
         match result {
+            // Added to the mempool only, not announced: Divi Core's
+            // SubmitTransactionToMempool runs AcceptToMemoryPool alone
+            // (init.cpp:1272, txmempool.cpp:408-415); peers hear of the
+            // transaction from the periodic mempool rebroadcast
             Ok(_) => {
                 resubmitted += 1;
-                let relay = node.tx_relay().clone();
-                tokio::spawn(async move {
-                    relay.announce_tx(txid).await;
-                });
             }
             // A detached transaction the mempool refuses stays as it is, at
             // depth -1, as Divi Core's wallet keeps it
