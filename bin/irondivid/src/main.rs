@@ -3434,7 +3434,10 @@ fn exit_after_stop(runtime: tokio::runtime::Runtime, result: Result<()>) -> ! {
     let code = match &result {
         Ok(()) => 0,
         Err(e) => {
+            // divid's InitError: the line on stderr and in debug.log
+            // (noui.cpp:38-40)
             eprintln!("Error: {:#}", e);
+            info!("Error: {:#}", e);
             1
         }
     };

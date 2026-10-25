@@ -352,3 +352,17 @@ fn force_rescan_scans_from_the_genesis_block() {
     assert!(log.contains("Scanning... from height 0 to 3"), "{log}");
     assert!(!log.contains("Rescanning"), "{log}");
 }
+
+/// A start refused for a stated reason writes divid's InitError line to
+/// debug.log as well as to stderr (noui.cpp:38-40)
+#[test]
+fn a_refused_start_writes_its_error_to_debug_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = run_to_exit(dir.path(), &["-checklevel=4".into()]);
+    let line = "Error: Error: Unsupported argument -checklevel found. Checklevel must be level 4.";
+    assert_eq!(errors(&out), [line]);
+    let log = debug_log(dir.path());
+    let named: Vec<&str> = log.lines().filter(|l| l.contains("-checklevel")).collect();
+    assert_eq!(named.len(), 1, "{log}");
+    assert!(named[0].ends_with(line), "{log}");
+}
