@@ -209,20 +209,25 @@ fn monthlybackups_sets_the_count_and_zero_leaves_it_off() {
     );
 }
 
-/// -txconfirmtarget is in divid's help only (LicenseAndInfo.cpp:143): it takes
-/// it without a word, and so does irondivid
+/// -txconfirmtarget and -sendfreetransactions are in divid's help only
+/// (LicenseAndInfo.cpp:135, :143): it takes them without a word, and so does
+/// irondivid
 #[test]
-fn txconfirmtarget_is_taken_silently() {
+fn txconfirmtarget_and_sendfreetransactions_are_taken_silently() {
     let dir = tempfile::tempdir().unwrap();
     let (rpc_port, p2p_port) = (free_port(), free_port());
-    let n = start(dir.path(), rpc_port, p2p_port, &["-txconfirmtarget=25"]);
+    let n = start(
+        dir.path(),
+        rpc_port,
+        p2p_port,
+        &["-txconfirmtarget=25", "-sendfreetransactions=1"],
+    );
     stop(n, rpc_port);
     let log = std::fs::read_to_string(dir.path().join("regtest").join("debug.log"))
         .or_else(|_| std::fs::read_to_string(dir.path().join("debug.log")))
         .unwrap_or_default();
     assert!(!log.is_empty(), "debug.log written");
-    {
-        let option = "txconfirmtarget";
+    for option in ["txconfirmtarget", "sendfreetransactions"] {
         let warned = log
             .lines()
             .find(|l| l.contains(&format!("-{option} ")) || l.contains(&format!("-{option};")));

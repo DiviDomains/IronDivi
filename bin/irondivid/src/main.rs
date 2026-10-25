@@ -323,7 +323,6 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "resync",
     "rpcthreads",
     "seednode",
-    "sendfreetransactions",
     "shrinkdebugfile",
     "sysperms",
     "torcontrol",
@@ -332,8 +331,8 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
 ];
 
 /// Options divid takes and does nothing with, only naming them in its help:
-/// accepted without a word, as divid does (LicenseAndInfo.cpp:143)
-const UNUSED_BY_DIVID: &[&str] = &["txconfirmtarget"];
+/// accepted without a word, as divid does (LicenseAndInfo.cpp:135, :143)
+const UNUSED_BY_DIVID: &[&str] = &["sendfreetransactions", "txconfirmtarget"];
 
 /// Options read elsewhere (before the node config is built, or by a command)
 const READ_ELSEWHERE: &[&str] = &[
