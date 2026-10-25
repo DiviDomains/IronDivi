@@ -127,19 +127,6 @@ fn versions_name_irondivid() {
     assert_eq!(info["protocolversion"], 70915);
 }
 
-/// Members of a result come in name order, not in divid's insertion order
-#[test]
-fn result_members_are_in_name_order() {
-    let (server, _dir) = server();
-    for method in ["getinfo", "getblockchaininfo", "getwalletinfo"] {
-        let info = result(&server, method, vec![]);
-        let names = keys(&info);
-        let mut sorted = names.clone();
-        sorted.sort();
-        assert_eq!(names, sorted, "{method}");
-    }
-}
-
 /// loadwallet exists in divid (rpcserver.cpp:439) and is refused here: the
 /// wallet is chosen at start
 #[test]
@@ -163,14 +150,14 @@ fn getblock_takes_a_verbosity_number() {
 }
 
 /// getmempoolinfo: divid gives size and bytes (rpcblockchain.cpp:569-574);
-/// irondivid adds usage, maxmempool and mempoolminfee
+/// irondivid adds usage, maxmempool and mempoolminfee after them
 #[test]
 fn getmempoolinfo_has_fields_divid_lacks() {
     let (server, _dir) = server();
     let info = result(&server, "getmempoolinfo", vec![]);
     assert_eq!(
         keys(&info),
-        ["bytes", "maxmempool", "mempoolminfee", "size", "usage"]
+        ["size", "bytes", "usage", "maxmempool", "mempoolminfee"]
     );
 }
 

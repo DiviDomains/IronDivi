@@ -836,10 +836,11 @@ impl BlockchainRpc {
             "bestblock": stats.best_block.to_string(),
             "transactions": stats.transactions,
             "txouts": stats.txouts,
-            "bogosize": stats.bogosize,
             "bytes_serialized": stats.bytes_serialized,
             "hash_serialized": stats.hash_serialized.to_string(),
-            "total_amount": total_amount_divi
+            "total_amount": total_amount_divi,
+            // irondivid's own member, after divid's
+            "bogosize": stats.bogosize
         }))
     }
 
@@ -955,10 +956,14 @@ impl BlockchainRpc {
             return Ok(if verbose { json!({}) } else { json!([]) });
         };
 
+        // In txid order, as Divi Core reads its mempool's map (uint256 order,
+        // the order of the txids as shown; rpcblockchain.cpp:119, :143)
         if verbose {
             // Divi Core rpcblockchain.cpp:122-128
             let mut out = serde_json::Map::new();
-            for info in mempool.get_tx_infos() {
+            let mut infos = mempool.get_tx_infos();
+            infos.sort_by_key(|info| info.txid.to_string());
+            for info in infos {
                 out.insert(
                     info.txid.to_string(),
                     json!({
@@ -975,11 +980,12 @@ impl BlockchainRpc {
             return Ok(Value::Object(out));
         }
 
-        let txids: Vec<String> = mempool
+        let mut txids: Vec<String> = mempool
             .get_txids()
             .iter()
             .map(|txid| txid.to_string())
             .collect();
+        txids.sort();
 
         Ok(json!(txids))
     }
