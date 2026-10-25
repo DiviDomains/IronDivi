@@ -58,6 +58,7 @@ struct Args {
     printtoconsole: bool,
     debug: bool,
     logips: bool,
+    logtimestamps: bool,
     wallet: Option<PathBuf>,
     disablewallet: bool,
     pid: Option<PathBuf>,
@@ -173,6 +174,7 @@ impl Args {
         let debug = s.get_multi("debug");
         self.debug = !debug.is_empty() && !debug.iter().any(|c| c == "0");
         self.logips = s.get_bool("logips", false);
+        self.logtimestamps = s.get_bool("logtimestamps", true);
         self.wallet = path("wallet");
         self.disablewallet = s.get_bool("disablewallet", false);
         self.pid = path("pid");
@@ -307,7 +309,6 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "genproclimit",
     "listenonion",
     "litemode",
-    "logtimestamps",
     "masternode",
     "masternodeaddr",
     "masternodeprivkey",
@@ -733,6 +734,7 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         "externalip",
         "onlynet",
         "logips",
+        "logtimestamps",
         "protocolversion",
         "banscore",
         "bantime",
@@ -1181,10 +1183,15 @@ fn init_logging(log_config: &LogConfig, data_dir: &PathBuf) {
         // still holds
         *LOG_GUARD.lock().unwrap_or_else(|e| e.into_inner()) = Some(_guard);
 
-        // Set up file logging with timestamps
+        // Lines as divid writes them, without ANSI colours
         tracing_subscriber::registry()
             .with(
-                fmt::layer().with_writer(non_blocking).with_ansi(false), // No ANSI colors in file
+                fmt::layer()
+                    .with_writer(non_blocking)
+                    .with_ansi(false)
+                    .event_format(DividLogFormat {
+                        timestamps: log_config.timestamps,
+                    }),
             )
             .with(filter)
             .init();
@@ -1194,6 +1201,42 @@ fn init_logging(log_config: &LogConfig, data_dir: &PathBuf) {
             "Log rotation: max {} bytes per file, {} files kept",
             log_config.max_file_size, log_config.max_files
         );
+    }
+}
+
+/// A debug.log line as Divi Core writes it (Logging.cpp:179-184): with
+/// -logtimestamps (default 1) the time, `%Y-%m-%d %H:%M:%S` in UTC, and a
+/// space; then the message. Warnings and errors begin `WARNING: ` and
+/// `ERROR: ` (divid's error() writes `ERROR: `); no level or module name.
+struct DividLogFormat {
+    timestamps: bool,
+}
+
+impl<S, N> fmt::FormatEvent<S, N> for DividLogFormat
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    N: for<'a> fmt::FormatFields<'a> + 'static,
+{
+    fn format_event(
+        &self,
+        ctx: &fmt::FmtContext<'_, S, N>,
+        mut writer: fmt::format::Writer<'_>,
+        event: &tracing::Event<'_>,
+    ) -> std::fmt::Result {
+        if self.timestamps {
+            write!(
+                writer,
+                "{} ",
+                chrono::Utc::now().format("%Y-%m-%d %H:%M:%S")
+            )?;
+        }
+        match *event.metadata().level() {
+            tracing::Level::ERROR => write!(writer, "ERROR: ")?,
+            tracing::Level::WARN => write!(writer, "WARNING: ")?,
+            _ => {}
+        }
+        ctx.field_format().format_fields(writer.by_ref(), event)?;
+        writeln!(writer)
     }
 }
 
@@ -2842,6 +2885,7 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
         max_files: args.maxlogfiles.unwrap_or(5),
         debug: args.debug,
         log_ips: args.logips,
+        timestamps: args.logtimestamps,
         // An export only reads the data directory: it logs to the console
         print_to_console: args.printtoconsole || args.export_chain,
     };

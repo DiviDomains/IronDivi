@@ -183,3 +183,46 @@ fn logips_decides_whether_peer_addresses_are_logged() {
     );
     assert!(!log.contains("Option -logips"), "{log}");
 }
+
+/// Whether a line starts as divid's do under -logtimestamps:
+/// `YYYY-MM-DD HH:MM:SS ` (Logging.cpp:182)
+fn timestamped(line: &str) -> bool {
+    let b = line.as_bytes();
+    b.len() > 20
+        && b[..19].iter().enumerate().all(|(i, c)| match i {
+            4 | 7 => *c == b'-',
+            10 => *c == b' ',
+            13 | 16 => *c == b':',
+            _ => c.is_ascii_digit(),
+        })
+        && b[19] == b' '
+}
+
+/// -logtimestamps (default 1): each line begins with the time, then the
+/// message, as divid's do: no level or module name. -logtimestamps=0: no time
+#[test]
+fn logtimestamps_decides_the_line_prefix() {
+    let (log, _) = log_with_a_peer(&[]);
+    let lines: Vec<&str> = log.lines().filter(|l| !l.is_empty()).collect();
+    assert!(!lines.is_empty());
+    for line in &lines {
+        assert!(timestamped(line), "not divid's prefix: {line:?}");
+        assert!(
+            !line.contains(" INFO ") && !line.contains("irondivid:"),
+            "{line:?}"
+        );
+    }
+    assert!(!log.contains("Option -logtimestamps"), "{log}");
+
+    let (log, _) = log_with_a_peer(&["-logtimestamps=0"]);
+    let version = log
+        .lines()
+        .find(|l| l.contains("receive version message"))
+        .unwrap_or_else(|| panic!("no version line:\n{log}"));
+    assert!(
+        version.starts_with("receive version message"),
+        "{version:?}"
+    );
+    assert!(log.lines().all(|l| !timestamped(l)), "{log}");
+    assert!(!log.contains("Option -logtimestamps"), "{log}");
+}

@@ -807,6 +807,10 @@ pub struct LogConfig {
     /// Divi Core -logips: log lines carry peers' addresses (default off)
     #[serde(default)]
     pub log_ips: bool,
+
+    /// Divi Core -logtimestamps: debug.log lines begin with the time (default on)
+    #[serde(default = "default_discover")]
+    pub timestamps: bool,
 }
 
 impl Default for LogConfig {
@@ -817,6 +821,7 @@ impl Default for LogConfig {
             debug: false,
             print_to_console: false,
             log_ips: false,
+            timestamps: true,
         }
     }
 }
