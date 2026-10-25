@@ -32,6 +32,9 @@ import urllib.error
 import urllib.request
 from decimal import Decimal
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "lib"))
+import member_order  # noqa: E402  (scripts/lib: the order check the replies scripts share)
+
 IRONDIVID, DIVID, PORT_BASE, WORK = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
 INJECT = os.environ.get("WALLET_OPTIONS_INJECT", "")
 HOST = "127.0.0.2"
@@ -79,6 +82,22 @@ def row(name, core, iron, same):
         fails += 1
     text = lambda v: json.dumps(v, sort_keys=True, default=str)[:220]
     print(f"{word:<5}  {name}  divid={text(core)}  irondivid={text(iron)}{note}", flush=True)
+
+
+def order_row(name, core, iron):
+    """A reply's member and item order next to divid's: PASS, or ORDER (a
+    kind of FAIL)"""
+    global fails
+    if INJECT and INJECT == name:
+        iron = {"injected": True, **iron} if isinstance(iron, dict) else iron
+        moved = "order injected"
+    else:
+        moved = member_order.difference(core, iron)
+    if moved is None:
+        print(f"PASS   {name}  same order", flush=True)
+    else:
+        fails += 1
+        print(f"ORDER  {name}  {moved}"[:400], flush=True)
 
 
 def both(name, fn):
@@ -337,9 +356,13 @@ def availability(n):
 
 
 both("getcoinavailability, -vault_min not given", availability)
+order_row("getcoinavailability, -vault_min not given: member order", C.raw_call("getcoinavailability")["result"],
+          I.raw_call("getcoinavailability")["result"])
 for value in ("500", "1000", "2000", "-5"):
     restart_twins(f"-vault_min={value}")
     both(f"getcoinavailability, -vault_min={value}", availability)
+    order_row(f"getcoinavailability, -vault_min={value}: member order",
+              C.raw_call("getcoinavailability")["result"], I.raw_call("getcoinavailability")["result"])
 
 # --- -txconfirmtarget, -sendfreetransactions (LicenseAndInfo.cpp:135, :143) ----------
 PAYEE = S.rpc("getnewaddress")

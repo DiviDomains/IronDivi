@@ -10,7 +10,8 @@ prints one line:
 
 - `PASS`: same as divid;
 - `KNOWN`: differs, and the difference is listed below with the reason;
-- `FAIL`: differs and should not, or a `KNOWN` row that now matches divid (the list below is out of date).
+- `FAIL`: differs and should not, or a `KNOWN` row that now matches divid (the list below is out of date);
+- `ORDER`: the same members or items in another order than divid's, counted as a FAIL.
 
 The run ends with `FAILS <n>`; the exit code is the number of FAILs (255: usage error, interrupted, or over 15 minutes).
 
@@ -48,7 +49,8 @@ difference is caught.
 - **Coins:** S mines 111 blocks and pays the twins twelve coins of 50.
 - **-vault_min:** S funds two vaults it owns and the twins manage, of 100 and 1000; both twins `addvault` them.
   `getcoinavailability` (Stakable, Spendable, Vaulted) with `-vault_min` not given, 500, 1000 (a coin at the minimum
-  stays), 2000 and -5.
+  stays), 2000 and -5. After each, the order of `getcoinavailability`'s members and list items next to divid's
+  (`scripts/lib/member_order.py`): `PASS`, or `ORDER`, a kind of FAIL counted in `FAILS`.
 - **-txconfirmtarget, -sendfreetransactions:** for each of not given, `-txconfirmtarget=1`, `=25`,
   `-sendfreetransactions=1`, `=0`, and both: the fee and size of a 10 DIVI send from each twin, whether it went without
   a fee, and whether the start logged a warning naming the option.
