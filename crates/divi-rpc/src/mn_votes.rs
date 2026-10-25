@@ -80,6 +80,15 @@ impl MasternodeVotes {
         self.winners.read().get(hash).map(|(w, _)| w.encode())
     }
 
+    /// Every vote taken: the height it is for and its hash
+    pub fn heights_and_hashes(&self) -> Vec<(i32, [u8; 32])> {
+        self.winners
+            .read()
+            .iter()
+            .map(|(hash, (winner, _))| (winner.height, *hash))
+            .collect()
+    }
+
     /// A vote from a peer, checked as Divi Core checks one
     /// (CheckMasternodeWinnerCandidate, CheckMasternodeWinnerValidity,
     /// masternode-payments.cpp:203-331), then counted. Ok(true) when it was

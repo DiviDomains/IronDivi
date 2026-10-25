@@ -1276,10 +1276,31 @@ impl Node {
                             NetworkMessage::GetSyncStatus => {
                                 tracing::debug!("Received govsync request from peer {}", peer_id);
                             }
-                            // Masternode P2P messages
-                            // dseg is not answered (a peer's masternode list sync)
-                            NetworkMessage::RequestMasternodeList(_) => {
-                                tracing::debug!("dseg from peer {} not answered", peer_id);
+                            // Masternode P2P messages: a peer's masternode
+                            // sync asks for the list and the winners
+                            NetworkMessage::RequestMasternodeList(payload) => {
+                                crate::masternode_sync::answer_list_request(
+                                    &masternode_sync,
+                                    &chain,
+                                    &masternode_list,
+                                    &peer_manager,
+                                    peer_id,
+                                    &payload,
+                                    divi_primitives::clock::now(),
+                                )
+                                .await;
+                            }
+                            NetworkMessage::MasternodeWinnersRequest(count) => {
+                                crate::masternode_sync::answer_winners_request(
+                                    &masternode_sync,
+                                    &chain,
+                                    &masternode_votes,
+                                    &peer_manager,
+                                    peer_id,
+                                    count,
+                                    divi_primitives::clock::now(),
+                                )
+                                .await;
                             }
                             // Masternode messages are read once the chain is
                             // synced (ProcessMasternodeMessages,
