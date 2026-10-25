@@ -94,6 +94,31 @@ struct Args {
     #[arg(long)]
     rpcbind: Option<String>,
 
+    /// RPC credentials as `user:salt$hash` (see share/rpcauth); repeatable
+    #[arg(long = "rpcauth")]
+    rpcauth: Vec<String>,
+
+    /// Methods a user may call, as `user:method,method`; repeatable
+    #[arg(long = "rpcwhitelist")]
+    rpcwhitelist: Vec<String>,
+
+    /// Whether users without an rpcwhitelist entry are refused (default: true once
+    /// any rpcwhitelist is set)
+    #[arg(long)]
+    rpcwhitelistdefault: Option<bool>,
+
+    /// Non-loopback address or range (CIDR) allowed to connect to RPC; repeatable
+    #[arg(long = "rpcallowip")]
+    rpcallowip: Vec<String>,
+
+    /// Browser origin (e.g. `https://wallet.example`) allowed to call RPC; repeatable
+    #[arg(long = "rpcalloworigin")]
+    rpcalloworigin: Vec<String>,
+
+    /// Host name accepted in the HTTP `Host` header of RPC requests; repeatable
+    #[arg(long = "rpcallowhost")]
+    rpcallowhost: Vec<String>,
+
     /// P2P port
     #[arg(long)]
     port: Option<u16>,
@@ -339,9 +364,20 @@ fn conf_kind(key: &str) -> Option<ConfKind> {
     Some(match key {
         "rpcuser" | "rpcpassword" | "rpcbind" | "bind" | "proxy" | "mode" | "expire" => Str,
         "rpcport" | "port" | "checkblocks" | "maxlogsize" | "maxlogfiles" | "utxocachesize" => Int,
-        "listen" | "testnet" | "regtest" | "daemon" | "printtoconsole" | "staking"
-        | "stakeonstaletip" | "txindex" | "spentindex" | "addressindex" | "disablewallet" => Bool,
-        "addnode" | "fullnode" | "connect" => List,
+        "listen"
+        | "testnet"
+        | "regtest"
+        | "daemon"
+        | "printtoconsole"
+        | "staking"
+        | "stakeonstaletip"
+        | "txindex"
+        | "spentindex"
+        | "addressindex"
+        | "disablewallet"
+        | "rpcwhitelistdefault" => Bool,
+        "addnode" | "fullnode" | "connect" | "rpcauth" | "rpcwhitelist" | "rpcallowip"
+        | "rpcalloworigin" | "rpcallowhost" => List,
         _ => return None,
     })
 }
@@ -455,6 +491,45 @@ fn resolve_args(mut args: Args) -> Result<Args> {
 }
 
 /// Apply configuration values from TOML table to NodeConfig
+/// The strings of a config value that may be given once or repeated
+fn conf_strings(key: &str, value: &toml::Value) -> Vec<String> {
+    let items = match value.as_array() {
+        Some(arr) => arr.iter().collect(),
+        None => vec![value],
+    };
+    items
+        .into_iter()
+        .filter_map(|v| {
+            let s = v.as_str().map(String::from);
+            if s.is_none() {
+                warn!("Invalid {key} value in config file, expected string");
+            }
+            s
+        })
+        .collect()
+}
+
+/// Warn when a config file holding RPC credentials can be read by other users
+fn warn_if_conf_exposed(path: &std::path::Path, file_config: &toml::Table) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let has_secret = ["rpcpassword", "rpcauth"]
+            .iter()
+            .any(|k| file_config.contains_key(*k));
+        if let Ok(meta) = std::fs::metadata(path) {
+            if has_secret && meta.permissions().mode() & 0o077 != 0 {
+                warn!(
+                    "{:?} holds RPC credentials and is readable by other users; run chmod 600 on it",
+                    path
+                );
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (path, file_config);
+}
+
 fn apply_config_file(config: &mut NodeConfig, file_config: &toml::Table) {
     for (key, value) in file_config {
         match key.as_str() {
@@ -646,6 +721,18 @@ fn apply_config_file(config: &mut NodeConfig, file_config: &toml::Table) {
                     warn!("Invalid addressindex value in config file, expected boolean or integer");
                 }
             }
+            "rpcauth" => config.rpc.rpcauth.extend(conf_strings(key, value)),
+            "rpcwhitelist" => config.rpc.whitelist.extend(conf_strings(key, value)),
+            "rpcallowip" => config.rpc.allow_ips.extend(conf_strings(key, value)),
+            "rpcalloworigin" => config.rpc.allow_origins.extend(conf_strings(key, value)),
+            "rpcallowhost" => config.rpc.allow_hosts.extend(conf_strings(key, value)),
+            "rpcwhitelistdefault" => {
+                if let Some(b) = value.as_bool() {
+                    config.rpc.whitelist_default = Some(b);
+                } else {
+                    warn!("Invalid rpcwhitelistdefault value in config file, expected boolean");
+                }
+            }
             // Peer settings
             "addnode" => {
                 if let Some(s) = value.as_str() {
@@ -811,6 +898,7 @@ fn build_config_with_env(args: &Args, env_expire: Option<String>) -> Result<Node
 
     if let Some(file_config) = load_config_file(&conf_path)? {
         info!("Loaded config from {:?}", conf_path);
+        warn_if_conf_exposed(&conf_path, &file_config);
         apply_config_file(&mut config, &file_config);
     }
 
@@ -827,8 +915,29 @@ fn build_config_with_env(args: &Args, env_expire: Option<String>) -> Result<Node
         config.rpc.username = Some(rpcuser.clone());
     }
     if let Some(rpcpassword) = &args.rpcpassword {
+        warn!(
+            "--rpcpassword on the command line is visible to every user of this machine \
+             (ps, /proc); put it in the config file or use rpcauth instead"
+        );
         config.rpc.password = Some(rpcpassword.clone());
     }
+    config.rpc.rpcauth.extend(args.rpcauth.iter().cloned());
+    config
+        .rpc
+        .whitelist
+        .extend(args.rpcwhitelist.iter().cloned());
+    if args.rpcwhitelistdefault.is_some() {
+        config.rpc.whitelist_default = args.rpcwhitelistdefault;
+    }
+    config.rpc.allow_ips.extend(args.rpcallowip.iter().cloned());
+    config
+        .rpc
+        .allow_origins
+        .extend(args.rpcalloworigin.iter().cloned());
+    config
+        .rpc
+        .allow_hosts
+        .extend(args.rpcallowhost.iter().cloned());
     if let Some(rpcport) = args.rpcport {
         config.rpc.port = rpcport;
     }
@@ -1638,7 +1747,17 @@ async fn run_daemon(
         bind_address: config.rpc.socket_addr(),
         username: Some(rpc_user),
         password: Some(rpc_password),
+        access: config.rpc.access(),
     };
+    // Fail at startup, not on the first request, on a bad rpcauth/rpcwhitelist/
+    // rpcallowip entry or a non-loopback bind without rpcallowip.
+    divi_rpc::rpc_access(&rpc_config)
+        .map_err(anyhow::Error::from)
+        .and_then(|a| {
+            a.check_bind(rpc_config.bind_address)
+                .map_err(|e| anyhow::anyhow!(e))
+        })
+        .context("Invalid RPC configuration")?;
 
     info!("Starting RPC server on {}...", rpc_config.bind_address);
 
@@ -2350,6 +2469,28 @@ mod config_format_tests {
         ];
         argv.extend(extra.iter().map(|s| s.to_string()));
         build_config(&Args::parse_from(argv))
+    }
+
+    #[test]
+    fn node12_rpc_access_keys_from_file_and_cli() {
+        let c = cfg(
+            "rpcauth=bob:00ff$abcd\nrpcauth=carol:11ee$beef\nrpcwhitelist=bob:getinfo\n\
+             rpcwhitelistdefault=0\nrpcallowip=10.0.0.0/8\nrpcalloworigin=https://w.example\n\
+             rpcallowhost=node.lan\n",
+            &[
+                "--rpcallowip=192.168.1.5",
+                "--rpcwhitelist=carol:getblockcount",
+            ],
+        )
+        .unwrap();
+        assert_eq!(c.rpc.rpcauth, ["bob:00ff$abcd", "carol:11ee$beef"]);
+        assert_eq!(c.rpc.whitelist, ["bob:getinfo", "carol:getblockcount"]);
+        assert_eq!(c.rpc.whitelist_default, Some(false));
+        assert_eq!(c.rpc.allow_ips, ["10.0.0.0/8", "192.168.1.5"]);
+        assert_eq!(c.rpc.allow_origins, ["https://w.example"]);
+        assert_eq!(c.rpc.allow_hosts, ["node.lan"]);
+        let access = c.rpc.access();
+        assert_eq!(access.allow_ips, c.rpc.allow_ips);
     }
 
     /// A Divi Core divi.conf used to stop irondivid ("Failed to parse config file"):
