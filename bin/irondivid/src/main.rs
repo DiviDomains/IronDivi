@@ -3155,6 +3155,11 @@ async fn export_chain_command(config: NodeConfig, args: &Args) -> Result<()> {
     Ok(())
 }
 
+/// CreatePidFile: the process id and a newline (util.cpp:122-128)
+fn write_pid_file(pid_file: &std::path::Path) {
+    let _ = std::fs::write(pid_file, format!("{}\n", std::process::id()));
+}
+
 /// -pid, default divid.pid, relative to the data directory (util.cpp:115-119)
 fn pid_file_path(args: &Args, data_dir: &std::path::Path) -> PathBuf {
     match &args.pid {
@@ -3391,7 +3396,7 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
     // Set up shutdown channel
     // Divi Core writes its pid file with or without -daemon (init.cpp:1470)
     #[cfg(unix)]
-    let _ = std::fs::write(&pid_file, format!("{}", std::process::id()));
+    write_pid_file(&pid_file);
 
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
 
