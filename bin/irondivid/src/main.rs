@@ -507,6 +507,8 @@ const READ_ELSEWHERE: &[&str] = &[
     "snapshot-signer",
     "maxlogsize",
     "maxlogfiles",
+    // read by main before the runtime starts
+    "mocktime",
     "?",
     "help",
     "h",
@@ -3364,6 +3366,12 @@ fn main() -> Result<()> {
     #[cfg(not(unix))]
     if args.daemon {
         eprintln!("Warning: Daemon mode is only supported on Unix systems, running in foreground");
+    }
+
+    // -mocktime: the node's clock from here on, set as divid sets it after
+    // daemonizing (divid.cpp:140-143); read as a number, 0 is the real clock
+    if let Some(text) = args.settings.get("mocktime") {
+        divi_primitives::clock::set_mock_time(atoi(text));
     }
 
     // Now enter the tokio runtime (after daemonization)

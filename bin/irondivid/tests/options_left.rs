@@ -236,3 +236,31 @@ fn divid_s_test_aids_are_named_as_not_supported() {
         assert!(log.contains(&line), "no {line:?}: {log}");
     }
 }
+
+/// -mocktime sets the node's clock at the start (divid.cpp:140-143): a block
+/// made then carries that time; 0 (or a word) leaves the real clock
+#[test]
+fn mocktime_sets_the_clock_a_block_is_made_with() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let mock = now + 2 * 86_400;
+    for (value, expect_mock) in [(mock.to_string(), true), ("abc".to_string(), false)] {
+        let dir = tempfile::tempdir().unwrap();
+        let (_node, port) = start(dir.path(), &[format!("-mocktime={value}")]);
+        let made = rpc(port, "setgenerate", json!([1])).unwrap();
+        assert!(made["error"].is_null(), "{made}");
+        let best = rpc(port, "getbestblockhash", json!([])).unwrap()["result"].clone();
+        let block = rpc(port, "getblock", json!([best])).unwrap()["result"].clone();
+        let time = block["time"].as_i64().unwrap();
+        if expect_mock {
+            assert_eq!(time, mock, "-mocktime={value}");
+        } else {
+            assert!(
+                (time - now).abs() < 900,
+                "-mocktime={value}: {time} vs {now}"
+            );
+        }
+    }
+}
