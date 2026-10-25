@@ -297,3 +297,17 @@ fn an_unreadable_transaction_is_found_again_by_a_rescan() {
     stop(node, rpc_port);
     assert!(!log(dir.path())[from..].contains("Rescanning... from height 0"));
 }
+
+/// -dbloadfailexit=1: a wallet that loads with the warning stops the start,
+/// exit 1 and no error line (init.cpp:1307-1309)
+#[test]
+fn dbloadfailexit_stops_a_start_with_the_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    let (rpc_port, p2p_port) = (free_port(), free_port());
+    made(dir.path(), rpc_port, p2p_port, 0);
+    damage(dir.path(), "wallet_accounts", b"acc_damaged", b"{not json");
+    let (code, stderr) = run_to_exit(dir.path(), rpc_port, p2p_port, &["-dbloadfailexit=1"]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains(WARNING), "stderr: {stderr}");
+    assert!(!stderr.contains("Error:"), "stderr: {stderr}");
+}

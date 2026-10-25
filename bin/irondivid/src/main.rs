@@ -345,6 +345,7 @@ const APPLIED: &[&str] = &[
     "budgetvotemode",
     "rescan",
     "salvagewallet",
+    "dbloadfailexit",
     "spendzeroconfchange",
     "keypool",
     "upgradewallet",
@@ -1368,6 +1369,19 @@ impl WalletSeed {
     }
 }
 
+/// A start that stops with exit code 1 and no error line, as Divi Core's
+/// AppInit2 returning false without an InitError (-dbloadfailexit)
+#[derive(Debug)]
+struct QuietExit;
+
+impl std::fmt::Display for QuietExit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the wallet loaded with a warning and -dbloadfailexit is set")
+    }
+}
+
+impl std::error::Error for QuietExit {}
+
 /// Wallet start options
 #[derive(Debug, Clone, Copy)]
 struct WalletOptions {
@@ -1377,6 +1391,9 @@ struct WalletOptions {
     /// Whether -rescan is given: a transaction record that cannot be read
     /// asks for a rescan only when it is not (SoftSetBoolArg, walletdb.cpp:508)
     rescan_given: bool,
+    /// -dbloadfailexit, read as a number: a wallet that loads with a warning
+    /// stops the start (init.cpp:1307-1309)
+    db_load_fail_exit: bool,
     /// -spendzeroconfchange: sends may use unconfirmed outputs of our own
     /// transactions (wallet.cpp:1848)
     spend_zero_conf_change: bool,
@@ -1411,6 +1428,7 @@ impl WalletOptions {
         WalletOptions {
             rescan: settings.get_bool("rescan", settings.get_bool("salvagewallet", false)),
             rescan_given: settings.get("rescan").is_some(),
+            db_load_fail_exit: settings.get("dbloadfailexit").is_some_and(|v| atoi(v) != 0),
             spend_zero_conf_change: settings.get_bool("spendzeroconfchange", false),
             keypool: settings
                 .get("keypool")
@@ -1544,7 +1562,8 @@ fn load_or_restore_wallet_with_seed(
             }
         };
         // Other records that cannot be read: a warning, and the start goes
-        // on (DB_NONCRITICAL_ERROR, init.cpp:1157-1162, :1299-1310)
+        // on unless -dbloadfailexit (DB_NONCRITICAL_ERROR, init.cpp:1157-1162,
+        // :1299-1310)
         let problems = wallet.load_problems();
         if problems.transactions + problems.others > 0 {
             let message = "Warning: error reading wallet.dat! All keys read correctly, but transaction data or address book entries might be missing or incorrect.";
@@ -1553,6 +1572,9 @@ fn load_or_restore_wallet_with_seed(
             // (noui.cpp:38-40)
             warn!("Warning: {}", message);
             eprintln!("Warning: {}", message);
+            if options.db_load_fail_exit {
+                return Err(anyhow::Error::new(QuietExit));
+            }
         }
 
         // Migrate chain_mode if needed (fixes wallets created before ChainMode was configurable)
@@ -3307,6 +3329,13 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
     )
     .await
     {
+        // A start stopped without an InitError (-dbloadfailexit) prints nothing
+        // more (init.cpp:1307-1309)
+        if e.downcast_ref::<QuietExit>().is_some() {
+            remove_pid_file(&pid_file);
+            flush_log();
+            std::process::exit(1);
+        }
         error!("Daemon error: {:#}", e);
         // Also on stderr, as Divi Core's InitError (noui.cpp:38-40)
         {
