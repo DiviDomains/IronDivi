@@ -458,6 +458,12 @@ pub struct P2pConfig {
     #[serde(default, skip_serializing)]
     pub tor_password: String,
 
+    /// Map the listen port on the gateway by UPnP (Divi Core's `-upnp`, off by
+    /// default; off under -proxy or -listen=0 unless given; net.cpp:1454,
+    /// :1690-1706)
+    #[serde(default)]
+    pub upnp: bool,
+
     /// Connection timeout in milliseconds (Divi Core's -timeout)
     #[serde(default = "default_connect_timeout_ms")]
     pub connect_timeout_ms: u64,
@@ -616,6 +622,7 @@ impl Default for P2pConfig {
             listen_onion: default_listen_onion(),
             tor_control: default_tor_control(),
             tor_password: String::new(),
+            upnp: divi_network::upnp::DEFAULT_UPNP,
             connect_timeout_ms: default_connect_timeout_ms(),
             discover: default_discover(),
             external_ips: Vec::new(),

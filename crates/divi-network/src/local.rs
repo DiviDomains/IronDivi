@@ -20,6 +20,8 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 pub const LOCAL_IF: i32 = 1;
 /// Address explicitly bound to
 pub const LOCAL_BIND: i32 = 2;
+/// Address reported by UPnP
+pub const LOCAL_UPNP: i32 = 3;
 /// Address explicitly specified (-externalip)
 pub const LOCAL_MANUAL: i32 = 4;
 

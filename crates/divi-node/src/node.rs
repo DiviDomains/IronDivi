@@ -938,6 +938,17 @@ impl Node {
                 Arc::clone(&self.peer_manager),
             );
         }
+        // -upnp: map the listen port until shutdown (net.cpp:1454, :1477)
+        if self.config.p2p.upnp {
+            let local = self.peer_manager.local_addresses();
+            let shutdown = self.peer_manager.shutdown_signal();
+            let discover = self.config.p2p.discover;
+            tokio::spawn(async move {
+                let igd = divi_network::upnp::Igd::discover().await;
+                let description = format!("DIVI v{}", env!("CARGO_PKG_VERSION"));
+                divi_network::upnp::map_port(igd, local, discover, description, shutdown).await;
+            });
+        }
 
         // Start peer event handler
         let event_tx = self.event_tx.clone();

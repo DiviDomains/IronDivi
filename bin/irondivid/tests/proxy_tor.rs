@@ -542,3 +542,16 @@ fn listenonion_default_and_listen_off() {
         assert_eq!(got, contacted, "{extra:?}");
     }
 }
+
+/// -upnp is an option irondivid takes, not "not supported; ignored". The
+/// row uses -upnp=0 only: -upnp=1 would send SSDP on the LAN
+#[test]
+fn upnp_is_taken() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = up(dir.path(), &["-upnp=0"]);
+    drop(node);
+    let read = |p: &str| std::fs::read_to_string(dir.path().join(p)).unwrap_or_default();
+    let text = read("stderr.txt") + &read("debug.log") + &read("regtest/debug.log");
+    assert!(text.contains("Initializing node"), "no log: {text}");
+    assert!(!text.contains("-upnp is not supported"), "{text}");
+}
