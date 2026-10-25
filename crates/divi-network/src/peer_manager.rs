@@ -1371,6 +1371,40 @@ impl PeerManager {
         self.static_peer_backoff.write().remove(&addr);
     }
 
+    /// The `-connect` peers dialled again and again, as Divi Core's
+    /// ThreadOpenConnections does with -connect (net.cpp:1094-1105): each
+    /// address in turn, then a pause of 500 ms per earlier round (at most ten)
+    /// after each and 500 ms at the end of the round, for as long as the node
+    /// runs. A peer that is connected or being dialled is skipped, as
+    /// OpenNetworkConnection skips a name it has (net.cpp:FindNode); there is
+    /// no backoff, ban check or outbound limit for these, as there is none in
+    /// Core for a named connection. Without -connect it returns at once.
+    pub async fn run_connect_loop(self: Arc<Self>) {
+        if !self.config.connect_only || self.config.static_peers.is_empty() {
+            return;
+        }
+        let pause = Duration::from_millis(500);
+        // earlier rounds, counted up to the cap of the pause
+        let mut round = 0u32;
+        loop {
+            for addr in self.config.static_peers.clone() {
+                if self.claim_dial(addr, DialRule::ByName) {
+                    let self_clone = Arc::clone(&self);
+                    tokio::spawn(async move {
+                        if let Err(e) = self_clone.connect_to_peer(addr).await {
+                            debug!("Failed to connect to -connect peer {}: {}", addr, e);
+                        }
+                    });
+                }
+                for _ in 0..round {
+                    tokio::time::sleep(pause).await;
+                }
+            }
+            tokio::time::sleep(pause).await;
+            round = (round + 1).min(10);
+        }
+    }
+
     /// Periodic maintenance loop that ensures we maintain target outbound peer count.
     ///
     /// Runs every 30 seconds and reconnects to peers if we've dropped below
@@ -1440,8 +1474,9 @@ impl PeerManager {
                 });
             }
 
-            // 2. Try static peers (with exponential backoff for known-failing peers)
-            if self.can_connect_outbound() {
+            // 2. Try static peers (with exponential backoff for known-failing
+            // peers); -connect peers have run_connect_loop instead
+            if self.can_connect_outbound() && !self.config.connect_only {
                 let static_peers = self.config.static_peers.clone();
                 let rule = self.static_rule();
                 for addr in static_peers {
@@ -2045,5 +2080,30 @@ mod tests {
         // Retry delay for a fresh IP should be 1 second (no failures)
         let delay = pm.retry_delay(addr);
         assert_eq!(delay, std::time::Duration::from_secs(1));
+    }
+
+    /// A -connect peer that is down is dialled again within seconds once it
+    /// is up, as Divi Core's ThreadOpenConnections tries the -connect
+    /// addresses again and again (net.cpp:1094-1105), with no backoff
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_connect_peer_is_dialled_again_once_it_is_up() {
+        let port = divi_test_support::free_port();
+        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let pm = PeerManager::new(PeerManagerConfig {
+            magic: crate::REGTEST_MAGIC,
+            static_peers: vec![addr],
+            connect_only: true,
+            dns_seeds: vec![],
+            ..Default::default()
+        });
+        // The peer is down at first: the first dials fail
+        tokio::spawn(Arc::clone(&pm).run_connect_loop());
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+        let accepted = tokio::time::timeout(Duration::from_secs(12), listener.accept()).await;
+        assert!(
+            accepted.is_ok(),
+            "no dial within 12 s of the peer coming up"
+        );
     }
 }
