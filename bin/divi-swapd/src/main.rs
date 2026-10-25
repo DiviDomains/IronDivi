@@ -525,17 +525,21 @@ async fn live_backends(
     Ok((backends, job, offers))
 }
 
-/// One pass of the lock-expiry sweep over `counters`: a maker lock in no mempool and no block
-/// once its deadline has passed gives its inputs back to the wallet. A chain that cannot be
-/// asked keeps its reservations this pass (`--release-reservation` stays the manual override).
+/// One pass of the lock-expiry sweep over `counters` at wall-clock `now` (unix seconds): a
+/// maker lock past its deadline that a fresh backend has found in no mempool and no block on
+/// two checks [`divi_swap::reservation::EXPIRY_ABSENT_BLOCKS`] blocks apart gives its inputs
+/// back to the wallet ([`InputReservations::release_expired`]). A chain that cannot be asked,
+/// or whose backend is stale or went backwards, keeps its reservations this pass
+/// (`--release-reservation` stays the manual override).
 async fn expiry_sweep_once(
     res: &InputReservations,
     store: &Store,
     counters: &[Arc<dyn ChainBackend>],
+    now: u32,
 ) -> usize {
     let mut released = 0;
     for b in counters {
-        match res.release_expired_swaps(store, b.as_ref()).await {
+        match res.release_expired_swaps(store, b.as_ref(), now).await {
             Ok(n) => released += n,
             Err(e) => {
                 tracing::warn!(chain = %b.chain(), error = %e, "could not check locks for expiry")
@@ -563,7 +567,10 @@ fn spawn_expiry_sweep(
         let mut tick = tokio::time::interval(every);
         loop {
             tick.tick().await;
-            expiry_sweep_once(&res, &store, &counters).await;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs().min(u32::MAX as u64) as u32);
+            expiry_sweep_once(&res, &store, &counters, now).await;
         }
     }))
 }
@@ -1348,25 +1355,46 @@ mod tests {
         let mut both = vec![divi_swap::Txid([0x11; 32]), pending_lock];
         both.sort_by_key(|t| t.0);
         let counters: Vec<Arc<dyn ChainBackend>> = vec![Arc::new(wallet)];
+        // The wall clock at the chain's own: a fresh backend unless a test says otherwise.
+        let sweep = |now: u32| expiry_sweep_once(&res, &store, &counters, now);
 
-        assert_eq!(expiry_sweep_once(&res, &store, &counters).await, 0);
+        assert_eq!(sweep(chain.mtp()).await, 0);
         assert_eq!(held(), both, "one second before the deadline");
         chain.set_offline(true);
         chain.advance_time(1);
-        assert_eq!(expiry_sweep_once(&res, &store, &counters).await, 0);
+        assert_eq!(sweep(chain.mtp()).await, 0);
         assert_eq!(
             held(),
             both,
             "a chain that cannot be asked keeps everything"
         );
         chain.set_offline(false);
-        assert_eq!(expiry_sweep_once(&res, &store, &counters).await, 1);
+        let first = chain.height();
+        assert_eq!(sweep(chain.mtp()).await, 0, "the first absent check");
+        assert_eq!(
+            res.first_absent_height(Chain::Btc, &divi_swap::Txid([0x11; 32]))
+                .unwrap(),
+            Some(first)
+        );
+        assert_eq!(
+            sweep(chain.mtp()).await,
+            0,
+            "a second tick at the same height"
+        );
+        chain.mine(divi_swap::reservation::EXPIRY_ABSENT_BLOCKS);
+        assert_eq!(
+            sweep(chain.mtp() + 2 * 600 + 1).await,
+            0,
+            "a stale backend releases nothing"
+        );
+        assert_eq!(held(), both);
+        assert_eq!(sweep(chain.mtp()).await, 1);
         assert_eq!(
             held(),
             vec![pending_lock],
             "the pending lock keeps its input"
         );
-        assert_eq!(expiry_sweep_once(&res, &store, &counters).await, 0);
+        assert_eq!(sweep(chain.mtp()).await, 0);
     }
 
     #[test]

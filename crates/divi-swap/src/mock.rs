@@ -22,7 +22,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use crate::backend::{ChainBackend, FeeBump};
+use crate::backend::{ChainBackend, FeeBump, TipHeader};
 use crate::error::{Result, SwapError};
 use crate::htlc::{HtlcParams, LOCKTIME_THRESHOLD, REFUND_SEQUENCE};
 use crate::types::{Amount, Chain, Funding, LockedOutput, Outpoint, SignedTx, SpendInfo, Txid};
@@ -141,6 +141,12 @@ struct ChainState {
     block_floor: u64,
     /// The mempool's minimum feerate: spends below it are refused and evicted.
     mempool_floor: u64,
+    /// Heights whose block was mined after a [`MockChain::rewind`], by the branch that
+    /// mined it (a height not listed is on branch 0), so a reorged-out block's hash differs
+    /// from its replacement's.
+    branch_of: HashMap<u64, u64>,
+    /// The branch new blocks are mined on; each rewind starts a new one.
+    branch: u64,
 }
 
 /// The kind of a mock transaction.
@@ -249,6 +255,12 @@ impl MockChain {
             let mtp = s.mtp;
             s.mtp_hist.push(mtp);
             let h = s.height;
+            if s.branch == 0 {
+                s.branch_of.remove(&h);
+            } else {
+                let b = s.branch;
+                s.branch_of.insert(h, b);
+            }
             let floor = s.block_floor;
             let mut take: Vec<Txid> = Vec::new();
             for (id, (tx, mined)) in &s.txs {
@@ -353,6 +365,26 @@ impl MockChain {
         let ids = Self::with_dependents(&s, txid);
         for id in ids {
             if let Some((_, mined)) = s.txs.get_mut(&id) {
+                *mined = None;
+            }
+        }
+    }
+
+    /// Reorg to a shorter chain: the tip goes back `n` blocks and every tx mined above the
+    /// new tip returns to the mempool. MTP stays; blocks mined from here on have new hashes.
+    /// Test-only.
+    pub fn rewind(&self, n: u64) {
+        let mut s = self.state.lock();
+        let h = s.height.saturating_sub(n);
+        s.height = h;
+        // The clock does not go back: the new branch's tip keeps the current MTP.
+        let mtp = s.mtp;
+        s.mtp_hist.truncate(h as usize + 1);
+        *s.mtp_hist.last_mut().expect("genesis entry") = mtp;
+        s.branch += 1;
+        s.branch_of.retain(|at, _| *at <= h);
+        for (_, mined) in s.txs.values_mut() {
+            if mined.is_some_and(|m| m > h) {
                 *mined = None;
             }
         }
@@ -626,10 +658,23 @@ impl MockChain {
         self.state.lock().mtp
     }
 
-    /// Deterministic fake hash of the tip block: the chain index and height, zero-padded
-    /// to 64 hex characters (distinct per height and per chain).
+    /// Deterministic fake hash of the tip block: the chain index, the block's branch and its
+    /// height, zero-padded to 64 hex characters (distinct per height, per chain and per
+    /// reorg).
     pub fn tip_hash(&self) -> String {
-        format!("{:02x}{:062x}", self.chain as u8, self.height())
+        self.block_hash(self.height())
+    }
+
+    /// The fake hash of the main-chain block at `height` (see [`Self::tip_hash`]).
+    pub fn block_hash(&self, height: u64) -> String {
+        let branch = self
+            .state
+            .lock()
+            .branch_of
+            .get(&height)
+            .copied()
+            .unwrap_or(0);
+        format!("{:02x}{branch:014x}{height:048x}", self.chain as u8)
     }
 
     /// Current height.
@@ -679,6 +724,7 @@ impl MockChain {
             funding_calls: Arc::new(AtomicU64::new(0)),
             released: Arc::default(),
             nonce: Arc::new(AtomicU64::new(0)),
+            lag: Arc::new(AtomicU64::new(0)),
         }
     }
 }
@@ -691,6 +737,7 @@ pub struct MockBackend {
     funding_calls: Arc<AtomicU64>,
     nonce: Arc<AtomicU64>,
     released: Arc<Mutex<Vec<Txid>>>,
+    lag: Arc<AtomicU64>,
 }
 
 impl MockBackend {
@@ -702,6 +749,14 @@ impl MockBackend {
     /// Locks the engine asked this backend to release as lost (`release_dead_lock`), in order.
     pub fn released_locks(&self) -> Vec<Txid> {
         self.released.lock().clone()
+    }
+
+    /// Make this backend (and its clones) a lagging endpoint: [`ChainBackend::tip_header`]
+    /// reports the block `blocks` below the chain's tip, one target spacing older per block,
+    /// and [`ChainBackend::in_best_chain`] errors above that block. Other calls see the
+    /// chain as it is. Test-only.
+    pub fn set_lag(&self, blocks: u64) {
+        self.lag.store(blocks, Ordering::SeqCst);
     }
 
     /// The underlying chain.
@@ -855,6 +910,40 @@ impl ChainBackend for MockBackend {
     async fn spendable(&self) -> Result<Option<Amount>> {
         self.check_online()?;
         Ok(Some(self.chain.balance(&self.pubkey)))
+    }
+
+    /// The mock has one clock: its tip is as recent as its MTP (less one spacing per block
+    /// of [`MockBackend::set_lag`]).
+    async fn tip_header(&self) -> Result<TipHeader> {
+        self.check_online()?;
+        let lag = self.lag.load(Ordering::SeqCst);
+        let height = self.chain.height().saturating_sub(lag);
+        Ok(TipHeader {
+            height,
+            hash: self.chain.block_hash(height),
+            time: self
+                .chain
+                .mtp()
+                .saturating_sub((lag as u32).saturating_mul(self.chain.block_secs)),
+        })
+    }
+
+    async fn in_best_chain(&self, height: u64, hash: &str) -> Result<bool> {
+        self.check_online()?;
+        let seen = self
+            .chain
+            .height()
+            .saturating_sub(self.lag.load(Ordering::SeqCst));
+        if height > seen {
+            return Err(SwapError::Transient(format!(
+                "mock backend has no block at {height} (its tip is {seen})"
+            )));
+        }
+        Ok(self.chain.block_hash(height) == hash)
+    }
+
+    fn target_block_secs(&self) -> Option<u32> {
+        Some(self.chain.block_secs)
     }
 
     async fn build_funding(&self, htlc: &HtlcParams, amount: Amount) -> Result<Funding> {

@@ -20,6 +20,17 @@ use crate::error::{Result, SwapError};
 use crate::htlc::HtlcParams;
 use crate::types::{Amount, Chain, Funding, LockedOutput, Outpoint, SignedTx, SpendInfo, Txid};
 
+/// The best block as one backend sees it: every field is read from the same block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TipHeader {
+    /// Its height.
+    pub height: u64,
+    /// Its hash: 64 lowercase hex characters in display byte order ([`normalize_block_hash`]).
+    pub hash: String,
+    /// Its header time (unix seconds).
+    pub time: u32,
+}
+
 /// Normalise a block hash a backend reported to 64 lowercase hex characters, or a
 /// `Transient` error (an empty or malformed hash is a node glitch, not a chain state).
 pub fn normalize_block_hash(raw: &str) -> Result<String> {
@@ -86,6 +97,35 @@ pub trait ChainBackend: Send + Sync {
     /// instead be final at `tip_height >= H`.)
     fn refund_final(&self, mtp: u32, locktime: u32) -> bool {
         mtp > locktime
+    }
+
+    /// Height, hash and header time of the current best block, all read from that one block
+    /// (not from separate tip queries that may straddle a new block or land on different
+    /// endpoints), so a caller can tell a backend that has stopped following the chain. A
+    /// backend that cannot report it fails with `Transient` (the default), and a caller that
+    /// needs a fresh view acts on nothing.
+    async fn tip_header(&self) -> Result<TipHeader> {
+        Err(crate::error::SwapError::Transient(format!(
+            "the {} backend does not report its tip header",
+            self.chain()
+        )))
+    }
+
+    /// Whether the block `hash` (as [`TipHeader::hash`]) at `height` is on this backend's
+    /// main chain. `Ok(false)` means it was reorged out; a backend that cannot tell (the
+    /// default, or a height it has not reached) fails with `Transient`.
+    async fn in_best_chain(&self, height: u64, hash: &str) -> Result<bool> {
+        let _ = (height, hash);
+        Err(crate::error::SwapError::Transient(format!(
+            "the {} backend cannot check a block against its main chain",
+            self.chain()
+        )))
+    }
+
+    /// The chain's target block spacing in seconds, from its consensus parameters; `None`
+    /// (the default) if this backend does not say.
+    fn target_block_secs(&self) -> Option<u32> {
+        None
     }
 
     /// Select coins and build + sign a transaction paying `amount` to the HTLC (P2SH on
