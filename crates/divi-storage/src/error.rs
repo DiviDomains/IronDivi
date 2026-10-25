@@ -105,6 +105,57 @@ impl StorageError {
         }
     }
 
+    /// The `reject` Divi Core sends the peer that relayed a block it refused
+    /// (main.cpp:840-843): the code and reason its validation state holds, so
+    /// only the checks CheckBlock and AcceptBlock make; a refusal found when
+    /// the block is connected (amounts, inputs, signatures) leaves no state to
+    /// send, and nor does a failed proof. Some of those checks give a failure
+    /// with no code and no reason, which is sent as such. The reason is cut to
+    /// 111 characters (MAX_REJECT_MESSAGE_LENGTH, defaultValues.h:94).
+    pub fn block_reject(&self) -> Option<(u8, String)> {
+        const INVALID: u8 = 0x10;
+        const OBSOLETE: u8 = 0x11;
+        let text = match self {
+            StorageError::InvalidBlock(text) => text,
+            StorageError::InvalidBlockScored { reason, .. } => reason,
+            _ => return None,
+        };
+        const WITH_CODE: &[&str] = &[
+            "bad-txnmrklroot",
+            "bad-txns-duplicate",
+            "bad-blk-length",
+            "bad-cb-missing",
+            "bad-cb-multiple",
+            "bad-blk-sigops: out-of-bounds",
+            "bad-txns-vin-empty",
+            "bad-txns-vout-empty",
+            "bad-txns-oversize",
+            "bad-txns-vout-negative-or-toolarge",
+            "bad-txns-txouttotal-toolarge",
+            "bad-txns-inputs-duplicate",
+            "bad-txns-nonfinal",
+            "bad-cb-height",
+            "time-too-new",
+            "time-too-old",
+        ];
+        const WITHOUT: &[&str] = &[
+            "coinbase output not empty",
+            "more than one coinstake",
+            "txout empty for user transaction",
+        ];
+        if let Some(found) = WITH_CODE.iter().find(|p| text.starts_with(**p)) {
+            let token = found.split(':').next().unwrap_or(found);
+            return Some((INVALID, token.chars().take(111).collect()));
+        }
+        if text.starts_with("bad-version") {
+            return Some((OBSOLETE, "bad-version".to_string()));
+        }
+        if WITHOUT.iter().any(|p| text.starts_with(p)) {
+            return Some((0, String::new()));
+        }
+        None
+    }
+
     /// A write (or read) of the node's own data that failed: Divi Core aborts
     /// the node on these (AbortNode) instead of refusing the block
     pub fn is_write_failure(&self) -> bool {

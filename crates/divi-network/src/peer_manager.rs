@@ -1195,6 +1195,13 @@ impl PeerManager {
         }
     }
 
+    /// Queue a message for one peer without waiting; false if the peer is gone
+    /// or its queue is full
+    pub fn try_send_to_peer(&self, peer_id: PeerId, msg: NetworkMessage) -> bool {
+        let handle = self.peers.read().get(&peer_id).cloned();
+        handle.is_some_and(|h| h.try_send(msg).is_ok())
+    }
+
     /// Broadcast a message to all connected peers
     pub fn broadcast(&self, msg: NetworkMessage) {
         let peers = self.peers.read();
