@@ -59,7 +59,7 @@ only). RPC passwords are made at random per run and kept in each node's 0600 `di
 | second start (other ports, same data directory) | exit code; the error up to the directory; the first node still answers; the first node's pid file |
 | SIGTERM / SIGINT idle | exit code; the log ends with the node's shutdown line; pid file after; height and balance at the next start |
 | SIGTERM / SIGINT during start (sent once the pid file is there, before RPC answers) | that RPC had not answered; exit code; pid file after; height and balance at the next start |
-| SIGTERM / SIGINT during `-reindex` (sent once RPC answers) | exit code; height and balance once the next start has the chain again |
+| SIGTERM / SIGINT during `-reindex` (sent a second after RPC answers, once divid's init has returned) | exit code; height and balance once the next start has the chain again |
 | SIGTERM during `-rescan` (sent once the pid file is there) | exit code; height and balance at the next start |
 | kill -9 | the pid file left; the next start names its own pid |
 | `-pid=other.pid`, `-pid=<absolute>` | the file while running; after a clean stop |

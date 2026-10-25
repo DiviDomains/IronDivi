@@ -355,6 +355,9 @@ for name, sig in (("SIGTERM", signal.SIGTERM), ("SIGINT", signal.SIGINT)):
     for n in NODES:
         n.proc = n.launch(args=["-reindex"])
         wait_for(lambda: n.call("getblockcount")[0] == "ok", START_TIMEOUT, 0.02)
+        # divid's RPC answers just before its init returns (the warm-up ends
+        # there, init.cpp:1639-1661): a second on, the stop comes after init
+        time.sleep(1)
         n.signal(sig)
     facts(f"{name} during -reindex: exit code", lambda n: n.wait_exit())
     for n in NODES:
