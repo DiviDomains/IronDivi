@@ -199,3 +199,67 @@ fn walletpassphrase_on_an_unlocked_wallet_takes_any_passphrase() {
     );
     assert_eq!(node.status(), json!("unlocked-for-staking"));
 }
+
+/// A walletpassphrasechange with a wrong old passphrase leaves the wallet
+/// locked, whether it was unlocked or unlocked for staking only: divid locks
+/// it before the check (wallet.cpp:815, :820-823). unlocked_until stays until
+/// the timer ends, and the timer does not unlock it again
+#[test]
+fn a_wrong_walletpassphrasechange_locks_the_wallet() {
+    let incorrect = (
+        -14,
+        "Error: The wallet passphrase entered was incorrect.".to_string(),
+    );
+    let node = encrypted_node();
+    node.ok("walletpassphrase", vec![json!("pass"), json!(600)]);
+    let until = unlocked_until(&node);
+    assert_eq!(
+        node.err("walletpassphrasechange", vec![json!("wrong"), json!("new")]),
+        incorrect
+    );
+    assert_eq!(node.status(), json!("locked"));
+    assert_eq!(unlocked_until(&node), until);
+    node.ok("walletlock", vec![]);
+    assert_eq!(unlocked_until(&node), 0);
+
+    node.ok(
+        "walletpassphrase",
+        vec![json!("pass"), json!(600), json!(true)],
+    );
+    assert_eq!(
+        node.err("walletpassphrasechange", vec![json!("wrong"), json!("new")]),
+        incorrect
+    );
+    assert_eq!(node.status(), json!("locked"));
+
+    // From staking only, a full unlock with a timer that would go back to
+    // staking; after the wrong change the timer ends with the wallet locked
+    node.ok("walletpassphrase", vec![json!("pass"), json!(0)]);
+    node.ok(
+        "walletpassphrase",
+        vec![json!("pass"), json!(600), json!(true)],
+    );
+    node.ok("walletpassphrase", vec![json!("pass"), json!(2)]);
+    assert_eq!(node.status(), json!("unlocked"));
+    assert_eq!(
+        node.err("walletpassphrasechange", vec![json!("wrong"), json!("new")]),
+        incorrect
+    );
+    assert_eq!(node.status(), json!("locked"));
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    assert_eq!(node.status(), json!("locked"));
+    assert_eq!(unlocked_until(&node), 0);
+
+    // A timeout that is no integer after that keeps the wallet unlocked
+    assert_eq!(
+        node.err("walletpassphrase", vec![json!("pass"), json!(1.5)]),
+        (-1, "value is type real, expected int".to_string())
+    );
+    assert_eq!(node.status(), json!("unlocked"));
+    assert_eq!(unlocked_until(&node), 0);
+
+    // The old passphrase still works
+    node.ok("walletlock", vec![]);
+    node.ok("walletpassphrase", vec![json!("pass"), json!(60)]);
+    assert_eq!(node.status(), json!("unlocked"));
+}

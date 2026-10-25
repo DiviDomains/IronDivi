@@ -2575,13 +2575,30 @@ impl WalletDb {
             self.unlock.write().staking_only = staking_only;
             return Ok(());
         }
-        let before = *self.unlock.read();
+        let mut before = *self.unlock.read();
+        if before.until.is_some_and(|t| Instant::now() >= t) {
+            // A timer that ran out while the wallet was locked has cleared
+            // unlocked_until (revertWalletUnlockStatus, rpcserver.cpp:1160-1174)
+            before = UnlockState::default();
+        }
         self.unlock_for(passphrase, 0, staking_only)?;
         let mut state = self.unlock.write();
         state.until = before.until;
         state.revert_to_staking = before.revert_to_staking;
         state.unlock_time = before.unlock_time;
         Ok(())
+    }
+
+    /// Lock the wallet as a failed walletpassphrasechange does (Lock() before
+    /// the old passphrase is checked, wallet.cpp:815-823): unlocked_until and
+    /// the timer stay as they were
+    pub fn lock_keeping_unlock_time(&self) {
+        let before = *self.unlock.read();
+        self.lock();
+        let mut state = self.unlock.write();
+        state.until = before.until;
+        state.revert_to_staking = before.revert_to_staking;
+        state.unlock_time = before.unlock_time;
     }
 
     /// walletpassphrase's timeout (UnlockWalletBriefly, rpcserver.cpp:1195-1220):

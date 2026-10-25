@@ -3875,10 +3875,17 @@ impl WalletRpc {
         wallet
             .change_passphrase(old_passphrase, new_passphrase)
             .map_err(|e| match e {
-                divi_wallet::WalletError::WrongPassphrase => RpcError::new(
-                    codes::WALLET_PASSPHRASE_INCORRECT,
-                    "Error: The wallet passphrase entered was incorrect.",
-                ),
+                divi_wallet::WalletError::WrongPassphrase => {
+                    // divid locks the wallet before it checks the old passphrase
+                    // and does not unlock it again (wallet.cpp:815, :820-823)
+                    if !wallet.is_locked() {
+                        wallet.lock_keeping_unlock_time();
+                    }
+                    RpcError::new(
+                        codes::WALLET_PASSPHRASE_INCORRECT,
+                        "Error: The wallet passphrase entered was incorrect.",
+                    )
+                }
                 other => RpcError::new(codes::WALLET_ENCRYPTION_FAILED, other.to_string()),
             })?;
 
