@@ -1963,7 +1963,7 @@ impl Chain {
 
     /// Accept a new block into the chain
     pub fn accept_block(&self, block: Block) -> Result<AcceptBlockResult, StorageError> {
-        self.notifying_tip(|| self.accept_block_unnotified(block))
+        abort_on_write_failure(self.notifying_tip(|| self.accept_block_unnotified(block)))
     }
 
     fn accept_block_unnotified(&self, block: Block) -> Result<AcceptBlockResult, StorageError> {
@@ -2750,7 +2750,7 @@ impl Chain {
     /// is rolled back to its parent, then the best remaining valid chain is
     /// activated.
     pub fn invalidate_block(&self, hash: &Hash256) -> Result<Vec<Transaction>, StorageError> {
-        self.notifying_tip(|| self.invalidate_block_unnotified(hash, true))
+        abort_on_write_failure(self.notifying_tip(|| self.invalidate_block_unnotified(hash, true)))
     }
 
     /// Mark the block failed and disconnect it and the blocks above it; with
@@ -2895,7 +2895,7 @@ impl Chain {
     /// Clear the invalid flag on a block, its ancestors and its descendants
     /// (`reconsiderblock`), then activate the best valid chain.
     pub fn reconsider_block(&self, hash: &Hash256) -> Result<(), StorageError> {
-        self.notifying_tip(|| self.reconsider_block_unnotified(hash))
+        abort_on_write_failure(self.notifying_tip(|| self.reconsider_block_unnotified(hash)))
     }
 
     fn reconsider_block_unnotified(&self, hash: &Hash256) -> Result<(), StorageError> {
@@ -4060,10 +4060,10 @@ impl Chain {
     /// (e.g., the sync layer after processing orphan blocks). For the internal
     /// lock-free version used by `accept_block`, see `activate_best_chain_inner`.
     pub fn activate_best_chain(&self) -> Result<Option<(u32, Vec<Transaction>)>, StorageError> {
-        self.notifying_tip(|| {
+        abort_on_write_failure(self.notifying_tip(|| {
             let _chain_guard = self.chain_lock.lock();
             self.activate_best_chain_inner()
-        })
+        }))
     }
 
     /// Inner implementation of activate_best_chain (caller must hold chain_lock).
@@ -5117,7 +5117,8 @@ impl Chain {
     /// Should be called periodically during sync for durability.
     /// Returns the number of entries flushed, or 0 if cache is not enabled.
     pub fn flush_utxo_cache(&self) -> Result<usize, StorageError> {
-        self.db.flush_utxo_cache()
+        // Divi Core FlushStateToDisk: "Failed to write to coin database" (FlushChainState.cpp:49-50)
+        abort_on_write_failure(self.db.flush_utxo_cache())
     }
 
     /// Get UTXO cache statistics (if cache is enabled)
@@ -5136,6 +5137,13 @@ impl Chain {
     /// When it does, returns the fork height and the transactions of the
     /// disconnected blocks to return to the mempool, as `accept_block` reports them.
     pub fn try_activate_block(
+        &self,
+        hash: &Hash256,
+    ) -> Result<Option<(u32, Vec<Transaction>)>, StorageError> {
+        abort_on_write_failure(self.try_activate_block_unchecked(hash))
+    }
+
+    fn try_activate_block_unchecked(
         &self,
         hash: &Hash256,
     ) -> Result<Option<(u32, Vec<Transaction>)>, StorageError> {
@@ -5329,6 +5337,19 @@ fn coinstake_stake_reward(
     } else {
         rewards.stake
     }
+}
+
+/// A chain change that failed to write the node's own data stops the node, as
+/// Divi Core's state.Abort does (ChainExtensionService.cpp:513-518,
+/// BlockConnectionService.cpp:111-192, FlushChainState.cpp:37-58); the error is
+/// returned as it was
+fn abort_on_write_failure<T>(result: Result<T, StorageError>) -> Result<T, StorageError> {
+    if let Err(e) = &result {
+        if e.is_write_failure() {
+            crate::abort::abort_node(&format!("System error: {e}"));
+        }
+    }
+    result
 }
 
 /// `CScript() << height` (Divi Core script.h:210-225): OP_1..OP_16 for 1-16,

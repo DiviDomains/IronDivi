@@ -2980,6 +2980,18 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
 
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
 
+    // Divi Core AbortNode (ValidationState.cpp:17-27): a write the node cannot
+    // make tells the user to look at debug.log and starts the shutdown
+    let abort_tx = shutdown_tx.clone();
+    divi_storage::abort::set_handler(Box::new(move |_| {
+        use std::io::Write as _;
+        let _ = writeln!(
+            std::io::stderr(),
+            "Error: Error: A fatal internal error occured, see debug.log for details"
+        );
+        let _ = abort_tx.send(());
+    }));
+
     // SIGHUP reopens debug.log and the node keeps running, as Divi Core does
     // (init.cpp:513-516), so a logrotate postrotate line does not stop it
     #[cfg(unix)]

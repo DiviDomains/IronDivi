@@ -45,6 +45,7 @@ macro_rules! pause_point {
     };
 }
 
+pub mod abort;
 pub mod address_index;
 pub mod block_index;
 pub mod chain;
