@@ -693,11 +693,14 @@ is_stake = bool(coinstake) and coinstake["vout"][0]["value"] == 0
 print(f"# block {block_stake[:16]}: coinstake {is_stake}", flush=True)
 if is_stake:
     spk = bytes.fromhex(coinstake["vout"][1]["scriptPubKey"]["hex"])
-    push = spk[1:1 + spk[0]] if 0 < spk[0] < 0x4c else spk
+    # The key (P2PK) or key hash (P2PKH): the script's one data push, as divid's filter sees it
+    push = [spk[i + 1:i + 1 + spk[i]] for i in range(len(spk)) if spk[i] in (20, 33, 65) and i + 1 + spk[i] <= len(spk)][0]
+    print(f"# coinstake output 1: {coinstake['vout'][1]['scriptPubKey']['type']}, filter on its {len(push)}-byte push", flush=True)
     f = Bloom(10, 0.000001, secrets.randbelow(2 ** 32), 1)
     f.insert(push)
-    both_rows("merkleblock of a proof-of-stake block, filter on the coinstake's key",
-              lambda n: filtered_block(n, f, block_stake), short)
+    c, _ = both_rows("merkleblock of a proof-of-stake block, filter on the coinstake's key",
+                     lambda n: filtered_block(n, f, block_stake), short)
+    need(c["tx"], "divid matched nothing in the proof-of-stake block")
 else:
     row("a proof-of-stake block to filter", "no coinstake", "", False)
 
