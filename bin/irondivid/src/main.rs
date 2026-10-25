@@ -395,6 +395,8 @@ const APPLIED: &[&str] = &[
     // read by retired_options
     "socks",
     "tor",
+    "debugnet",
+    "benchmark",
     "discover",
     "externalip",
     "onlynet",
@@ -886,10 +888,13 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
 }
 
 /// divid's check of the options it no longer takes, in its order
-/// (CheckCriticalUnsupportedFeaturesAreNotUsed, init.cpp:770-790): -socks
-/// given at all and a true -tor stop the start, as any -checklevel does (it
-/// always checks at level 4)
+/// (CheckCriticalUnsupportedFeaturesAreNotUsed, init.cpp:770-790): a true
+/// -debugnet or -benchmark draws a warning; -socks given at all and a true
+/// -tor stop the start, as any -checklevel does (it always checks at level 4)
 fn retired_options(s: &Settings) -> Result<()> {
+    if s.get_bool("debugnet", false) {
+        init_warning("Warning: Unsupported argument -debugnet ignored, use -debug=net.");
+    }
     if s.is_set("socks") {
         anyhow::bail!("Error: Unsupported argument -socks found. Setting SOCKS version isn't possible anymore, only SOCKS5 proxies are supported.");
     }
@@ -899,7 +904,17 @@ fn retired_options(s: &Settings) -> Result<()> {
     if s.is_set("checklevel") {
         anyhow::bail!("Error: Unsupported argument -checklevel found. Checklevel must be level 4.");
     }
+    if s.get_bool("benchmark", false) {
+        init_warning("Warning: Unsupported argument -benchmark ignored, use -debug=bench.");
+    }
     Ok(())
+}
+
+/// divid's InitWarning: "Warning: " and the text, in debug.log and on stderr
+/// (init.cpp:303-307, noui.cpp:38-40)
+fn init_warning(text: &str) {
+    info!("Warning: {}", text);
+    eprintln!("Warning: {}", text);
 }
 
 /// The warning an option read nowhere gets: one divid takes and irondivid

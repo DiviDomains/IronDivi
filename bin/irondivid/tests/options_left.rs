@@ -84,6 +84,11 @@ fn start(datadir: &Path, extra: &[String]) -> (Node, u16) {
     (Node(child), rpc_port)
 }
 
+/// debug.log, once the node that wrote it has stopped
+fn debug_log(datadir: &Path) -> String {
+    std::fs::read_to_string(datadir.join("debug.log")).unwrap_or_default()
+}
+
 /// A start with `extra` that is expected to end by itself, within 120 s
 fn run_to_exit(datadir: &Path, extra: &[String]) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_irondivid"))
@@ -136,4 +141,40 @@ fn socks_and_a_true_tor_are_refused_as_divid_refuses_them() {
     let dir = tempfile::tempdir().unwrap();
     let (_node, port) = start(dir.path(), &["-tor=0".into()]);
     assert!(rpc(port, "getblockcount", json!([])).is_some());
+}
+
+/// A true -debugnet or -benchmark draws divid's warning, in debug.log and on
+/// stderr (init.cpp:773-774, :786-787), and the node starts; =0 draws none
+#[test]
+fn debugnet_and_benchmark_draw_divid_s_warning() {
+    for (arg, line) in [
+        (
+            "-debugnet",
+            "Warning: Warning: Unsupported argument -debugnet ignored, use -debug=net.",
+        ),
+        (
+            "-benchmark=1",
+            "Warning: Warning: Unsupported argument -benchmark ignored, use -debug=bench.",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let (node, _) = start(dir.path(), &[arg.into()]);
+        drop(node);
+        let log = debug_log(dir.path());
+        let named: Vec<&str> = log
+            .lines()
+            .filter(|l| l.contains(&arg[..arg.find('=').unwrap_or(arg.len())]))
+            .collect();
+        assert_eq!(named.len(), 1, "{arg}: {named:?}");
+        assert!(named[0].ends_with(line), "{arg}: {named:?}");
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _) = start(dir.path(), &["-debugnet=0".into(), "-bogusmarker".into()]);
+    drop(node);
+    let log = debug_log(dir.path());
+    assert!(
+        log.contains("Unknown option -bogusmarker; ignored"),
+        "{log}"
+    );
+    assert!(!log.contains("-debugnet"), "{log}");
 }
