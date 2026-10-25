@@ -59,10 +59,6 @@ PARTIAL = ("divid sets the peer's version and services before it reads the rest 
 KNOWN = {
     "handshake: commands before our verack (first 3 s)": (SPORKCOUNT, lambda c, i: (
         c[:3] == ["version", "verack", ["sporkcount", 0]] and i == ["version", "verack"])),
-    "handshake: commands in the first 6 s, as a set": (
-        "irondivid also sends sendheaders after the handshake (BIP 130, crates/divi-network/src/connection.rs "
-        "Connection::run); divid has no handler for it and ignores it, unscored (main.cpp:963-966)",
-        lambda c, i: set(i) - set(c) == {"sendheaders"} and set(c) <= set(i)),
     "handshake: version: services": (NO_BLOOM, pair(5, 1)),
     "handshake: version: addr_from": (NO_BLOOM, lambda c, i: c.get("services") == 5 and i == dict(c, services=1)),
     "handshake: version: subver": (
