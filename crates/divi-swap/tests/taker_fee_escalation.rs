@@ -960,3 +960,147 @@ async fn ltc_claim_replacing_its_child_keeps_climbing_after_a_crash_where_the_no
         TakerState::Done
     );
 }
+
+/// How a claim first priced at `base` fared once the preimage was out and the block floor
+/// rose to `floor`: the taker's final state, every feerate it paid in order (replaced
+/// versions, then the newest, as a package feerate under CPFP), the feerate of the version
+/// that confirmed, if any, and its CPFP children's own feerates.
+struct AfterTheLeak {
+    state: TakerState,
+    rates: Vec<u64>,
+    mined: Option<u64>,
+    /// Each CPFP child's own feerate, in spend order.
+    children: Vec<u64>,
+}
+
+/// The taker claims at `base`; from then on the maker-leg chain mines nothing under
+/// `floor`. A block every `block_secs` with a step and a maker tick each; once the locktime
+/// passes the hostile maker sends a refund paying far more than any claim may, so the
+/// taker keeps the leg only if a version confirms first.
+async fn ride_after_the_leak(
+    chain: Chain,
+    bump: FeeBump,
+    block_secs: u32,
+    esc: FeeEscalation,
+    base: u64,
+    floor: u64,
+) -> AfterTheLeak {
+    let w = world(chain, block_secs, bump);
+    w.ml.set_price_bump(10);
+    w.ml.set_fee_estimate(base);
+    w.ml.set_refund_feerate(9_000);
+    let store = Store::in_memory().unwrap();
+    let maker = maker(&w, &store);
+    let taker = taker(&w, &store).with_fee_escalation(chain, Some(esc));
+    let (tid, view) = to_claimed(&w, &maker, &taker).await;
+    let rec = store.get_taker_swap(&tid).unwrap().unwrap();
+    assert_eq!(rec.claim_base_feerate, Some(base));
+    w.ml.set_block_floor(floor);
+    let at = view.maker_leg.as_ref().unwrap().outpoint.unwrap();
+    let mid = view.id.clone();
+    for _ in 0..2000 {
+        let _ = taker.step(&tid, Some(&view)).await;
+        let _ = maker.tick().await;
+        let mrec = store.get_maker_swap(&mid).unwrap().unwrap();
+        if let (Some(htlc), Some(f)) = (mrec.maker_leg_htlc, mrec.maker_leg_funding) {
+            if w.ml.mtp() >= htlc.locktime {
+                if let Ok(tx) = w.mml.build_refund(&htlc, &f.outpoint, f.amount).await {
+                    let _ = w.mml.broadcast(&tx).await;
+                }
+            }
+        }
+        w.ml.mine(1);
+        w.divi.advance_time(block_secs);
+        w.divi.mine(1);
+        let rec = store.get_taker_swap(&tid).unwrap().unwrap();
+        if rec.state.is_terminal() || w.ml.mtp() > locktime(&view) + 3600 {
+            break;
+        }
+    }
+    let rec = store.get_taker_swap(&tid).unwrap().unwrap();
+    let mut rates: Vec<u64> = rec.claim_replaced.iter().map(|(_, f)| *f).collect();
+    rates.extend(rec.claim_feerate);
+    let mined =
+        w.ml.spender(&at)
+            .filter(|id| {
+                rec.maker_leg_claim.iter().any(|c| c.txid == *id)
+                    || rec.claim_replaced.iter().any(|(c, _)| c.txid == *id)
+            })
+            .and_then(|id| w.ml.feerate_of(&id));
+    let children = rec
+        .claim_children
+        .iter()
+        .filter_map(|c| w.ml.feerate_of(&c.txid))
+        .collect();
+    AfterTheLeak {
+        state: rec.state,
+        rates,
+        mined,
+        children,
+    }
+}
+
+/// The USDC schedule at the mock's scale: one mock unit stands for one gwei, so the
+/// builtin 500 gwei cap is 500 (the mock pays a claim's fee out of the 1M unit leg, where a
+/// wei-denominated fee would not fit). Every rule of the schedule is a ratio, so the shape
+/// is the builtin's.
+fn usdc_in_gwei() -> FeeEscalation {
+    let esc = FeeEscalation::builtin(Chain::Usdc).unwrap();
+    assert_eq!(esc.cap_feerate, 500_000_000_000);
+    esc.with_cap_feerate(500)
+}
+
+/// A USDC claim first priced at 2 gwei: the fixed cap `min(500, 50 x 2)` is 100 gwei. Once
+/// the preimage is out the block floor rises to 300 gwei (geth's 10% price bump). A claim
+/// held to 100 gwei never confirms and the hostile refund takes the leg; past the cap point
+/// the multiple no longer binds, the claim climbs to `cap_feerate` (500) and confirms.
+#[tokio::test]
+async fn usdc_claim_after_the_leak_outbids_a_floor_above_the_fifty_x_cap() {
+    let esc = usdc_in_gwei();
+    assert_eq!(esc.cap(2), 100);
+    let o = ride_after_the_leak(Chain::Usdc, FeeBump::SameNonce, 12, esc, 2, 300).await;
+    let ctx = format!("{:?} rates {:?} mined {:?}", o.state, o.rates, o.mined);
+    assert_eq!(o.state, TakerState::Done, "{ctx}");
+    let last = *o.rates.last().unwrap();
+    assert!((300..=500).contains(&last), "{ctx}");
+    assert!(o.mined.is_some_and(|m| m >= 300), "{ctx}");
+    assert!(
+        o.rates.iter().all(|&r| r <= 500),
+        "never over cap_feerate: {ctx}"
+    );
+    for pair in o.rates.windows(2) {
+        assert!(pair[1] >= geth_floor(pair[0]), "under geth's bump: {ctx}");
+    }
+}
+
+/// The same leak on BTC (RBF) and LTC (CPFP), first priced at 2/vB with the floor at 300/vB:
+/// their post-leak ceiling (a share of the leg) governs past the cap point, as before this
+/// lane. Pinned to the feerates paid, so a change to the USDC cap cannot move them.
+#[tokio::test]
+async fn btc_and_ltc_claims_after_the_leak_still_climb_to_their_ceiling() {
+    for (chain, bump, secs, want) in [
+        (
+            Chain::Btc,
+            FeeBump::Rbf,
+            600,
+            (vec![2u64, 4, 5, 8, 12, 18, 28, 42, 65, 100, 437], vec![]),
+        ),
+        (
+            Chain::Ltc,
+            FeeBump::Cpfp,
+            150,
+            (vec![319u64], vec![6, 16, 48, 138, 390, 667, 1285]),
+        ),
+    ] {
+        let esc = FeeEscalation::builtin(chain).unwrap();
+        assert_eq!(esc.cap(2), 100);
+        let o = ride_after_the_leak(chain, bump, secs, esc, 2, 300).await;
+        let ctx = format!(
+            "{chain}: {:?} rates {:?} mined {:?} children {:?}",
+            o.state, o.rates, o.mined, o.children
+        );
+        assert_eq!(o.state, TakerState::Done, "{ctx}");
+        assert!(o.rates.last().is_some_and(|&r| r >= 300), "{ctx}");
+        assert_eq!((o.rates, o.children), want, "{ctx}");
+    }
+}
