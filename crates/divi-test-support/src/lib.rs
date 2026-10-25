@@ -274,15 +274,15 @@ mod tests {
         let dir = tempfile_dir();
         let (mut rpc, mut p2p) = (free_port(), free_port());
         let first = (rpc, p2p);
-        let mut calls = 0;
+        let calls = std::cell::Cell::new(0);
         let mut child = start_on(
             &dir,
             &mut rpc,
             &mut p2p,
             |_, _| {
-                calls += 1;
+                calls.set(calls.get() + 1);
                 let mut cmd = Command::new("sh");
-                if calls == 1 {
+                if calls.get() == 1 {
                     cmd.args(["-c", "echo 'Address already in use' > debug.log; exit 1"]);
                 } else {
                     cmd.args(["-c", "sleep 30"]);
@@ -290,11 +290,12 @@ mod tests {
                 cmd.current_dir(&dir);
                 cmd
             },
-            |_| true,
+            // answers only once the second one runs: the first exits with its log
+            |_| calls.get() >= 2,
         );
         let _ = child.kill();
         let _ = child.wait();
-        assert_eq!(calls, 2, "started again once");
+        assert_eq!(calls.get(), 2, "started again once");
         assert_ne!((rpc, p2p), first, "on new ports");
         std::fs::remove_dir_all(&dir).unwrap();
     }
