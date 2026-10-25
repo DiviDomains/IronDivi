@@ -1629,7 +1629,11 @@ fn load_or_restore_wallet_with_seed(
     // The version limit is checked before the seed is made
     // (wallet.cpp:1963-1979), and before anything is written
     if options.refuses_new_wallet() {
-        anyhow::bail!("Error loading wallet.dat: database load failure");
+        // As Divi Core logs it (wallet.cpp:1969, init.cpp:1303)
+        info!("Unable to downgrade wallet version. -upgradewallet=<custom_version> might be incorrectly set");
+        let message = "Error loading wallet.dat: database load failure";
+        error!("Errors detected during wallet loading\n{}", message);
+        anyhow::bail!(message);
     }
     // Checked only when words make the wallet, before anything is written
     // (wallet.cpp:2302-2305, reported by init.cpp:1203-1209)

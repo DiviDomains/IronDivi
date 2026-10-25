@@ -331,3 +331,24 @@ fn salvagewallet_says_it_sets_rescan() {
     );
     assert!(after.contains("Rescanning... from height 0"));
 }
+
+/// A new wallet refused by -upgradewallet below the base version: Divi Core
+/// logs why before its InitError (wallet.cpp:1969, init.cpp:1303)
+#[test]
+fn a_refused_upgradewallet_is_logged() {
+    let dir = tempfile::tempdir().unwrap();
+    let (rpc_port, p2p_port) = (free_port(), free_port());
+    let (code, stderr) = run_to_exit(dir.path(), rpc_port, p2p_port, &["-upgradewallet=1000"]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("Error: Error loading wallet.dat: database load failure"),
+        "{stderr}"
+    );
+    let log = log(dir.path());
+    assert!(
+        log.contains("Unable to downgrade wallet version. -upgradewallet=<custom_version> might be incorrectly set"),
+        "{}",
+        log_tail(dir.path())
+    );
+    assert!(log.contains("Errors detected during wallet loading"));
+}
