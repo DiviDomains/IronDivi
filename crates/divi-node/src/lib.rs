@@ -65,7 +65,7 @@ pub mod zmq;
 pub use config::{NetworkConfig, NetworkType, NodeConfig, P2pConfig, RpcConfig};
 pub use error::NodeError;
 pub use fee_estimator::{FeeEstimator, FeeEstimatorStats};
-pub use mempool::{Admission, MempoolValidator};
+pub use mempool::{Admission, MempoolValidator, Origin};
 pub use mempool::{Mempool, MempoolEntry, MempoolStats};
 pub use node::{
     accept_orphans, accept_relayed_transaction, check_mempool_transaction, getblocks_reply,

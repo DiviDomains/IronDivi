@@ -21,6 +21,8 @@ import json
 import os
 import re
 import secrets
+import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -35,8 +37,21 @@ HOST = os.environ.get("INT_ARGS_HOST", "127.0.0.2")
 # A directory to write both replies of every differing row to (for looking into
 # a FAIL); nothing is written without it
 DUMP = os.environ.get("INT_ARGS_DUMP", "")
-RPC_TIMEOUT = 120
+# A call not answered in this many seconds ends the run with a "hang" report
+# naming the node and the call, and keeps both nodes' logs and threads
+RPC_TIMEOUT = float(os.environ.get("INT_ARGS_CALL_TIMEOUT", "150"))
+# Where the hang report keeps them (outside the work directory, which run.sh deletes)
+KEEP = os.environ.get("INT_ARGS_KEEP", "") or os.path.join(os.path.dirname(WORK), "int-args-hang." + os.path.basename(WORK).split(".")[-1])
 START_TIMEOUT = 180
+STARTED = time.time()
+
+
+class Hang(Exception):
+    """A node that did not answer a call within RPC_TIMEOUT"""
+
+    def __init__(self, node, method, secs):
+        super().__init__(f"{node.name} did not answer {method} within {secs:.0f} s")
+        self.node, self.method = node, method
 
 # Each value as a label and the JSON text sent. The last three columns of the
 # README's table say what get_int() makes of the extra ones.
@@ -98,16 +113,30 @@ class Node:
         with open(os.path.join(WORK, "pids"), "a") as f:
             f.write(f"{self.proc.pid}\n")
 
-    def post(self, body):
-        """('ok', result) or ('err', code, message); reals keep their text"""
+    def post(self, body, timeout=None):
+        """('ok', result) or ('err', code, message); reals keep their text. A
+        call not answered within `timeout` (RPC_TIMEOUT) raises Hang"""
+        timeout = timeout or RPC_TIMEOUT
         auth = base64.b64encode(f"{self.user}:{self.password}".encode()).decode()
         req = urllib.request.Request(f"http://{HOST}:{self.rpcport}/", data=body.encode(),
                                      headers={"Authorization": "Basic " + auth, "Content-Type": "text/plain"})
+        method = json.loads(body).get("method", "?")
+        started = time.time()
         try:
-            with urllib.request.urlopen(req, timeout=RPC_TIMEOUT) as r:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
                 reply = json.loads(r.read(), parse_float=str)
         except urllib.error.HTTPError as e:
             reply = json.loads(e.read() or b"{}", parse_float=str)
+        except (socket.timeout, TimeoutError) as e:
+            raise Hang(self, method, time.time() - started) from e
+        except urllib.error.URLError as e:
+            if isinstance(e.reason, (socket.timeout, TimeoutError)):
+                raise Hang(self, method, time.time() - started) from e
+            raise
+        took = time.time() - started
+        if took > 30:
+            print(f"# slow: {self.name} took {took:.0f} s for {method} ({time.time() - STARTED:.0f} s into the run)",
+                  flush=True)
         err = reply.get("error")
         if err:
             return ("err", err.get("code"), err.get("message", ""))
@@ -245,14 +274,67 @@ def wait_for(fn, secs):
         try:
             if fn():
                 return True
+        except Hang:
+            raise
         except Exception:
             pass
         time.sleep(0.25)
     return False
 
 
+def threads(proc):
+    """Each thread of a running node: name, state, wait channel and current
+    system call, from /proc (the script is the node's parent, so it may read
+    them under ptrace_scope 1)"""
+    out = []
+    base = f"/proc/{proc.pid}/task"
+    try:
+        tids = sorted(os.listdir(base), key=int)
+    except OSError as e:
+        return f"no /proc entry: {e}"
+    for tid in tids:
+        def read(name):
+            try:
+                with open(f"{base}/{tid}/{name}", errors="replace") as f:
+                    return f.read().strip()
+            except OSError as e:
+                return f"({e.strerror})"
+        stat = read("stat")
+        state = stat.rsplit(")", 1)[-1].split()[0] if ")" in stat else "?"
+        out.append(f"{tid} {read('comm')!r} state={state} wchan={read('wchan')} syscall={read('syscall')}")
+    return "\n".join(out)
+
+
+def hang_report(hang):
+    """Name the node and call that did not answer, probe both nodes, and keep
+    their logs and threads in KEEP"""
+    print(f"FAIL   hang: {hang} ({time.time() - STARTED:.0f} s into the run)", flush=True)
+    os.makedirs(KEEP, exist_ok=True)
+    for n in (C, I):
+        if n.proc.poll() is not None:
+            note = f"exited {n.proc.returncode}"
+        else:
+            try:
+                out = n.post(json.dumps({"jsonrpc": "1.0", "id": 1, "method": "getblockcount", "params": []}),
+                             timeout=10)
+                note = f"answers getblockcount on a new connection: {out}"
+            except Exception as e:
+                note = f"does not answer getblockcount on a new connection within 10 s ({e.__class__.__name__})"
+            with open(os.path.join(KEEP, f"{n.name}.threads.txt"), "w") as f:
+                f.write(threads(n.proc) + "\n")
+        print(f"#   {n.name}: {note}", flush=True)
+        for log in (os.path.join(n.dir, "regtest", "debug.log"), os.path.join(n.dir, "debug.log"),
+                    os.path.join(WORK, n.name + ".out")):
+            if os.path.exists(log):
+                shutil.copy(log, os.path.join(KEEP, f"{n.name}.{os.path.basename(log)}"))
+    print(f"#   logs and threads kept in {KEEP}", flush=True)
+
+
 def setup_failed(kind, value, tb):
     # A setup call that fails ends the run with one FAIL line instead of a traceback
+    if isinstance(value, Hang):
+        hang_report(value)
+        sys.exit(1)
     print(f"FAIL   setup: {value}"[:300], flush=True)
     sys.exit(1)
 
@@ -269,6 +351,16 @@ I = Node("irondivid", IRONDIVID, 1, ["listen=0", f"connect={HOST}:{PORT_BASE}"],
 if not I.wait_ready():
     raise RuntimeError(f"irondivid did not answer within {START_TIMEOUT} s")
 print(f"# divid {C.rpc('getinfo').get('version')}, irondivid {I.rpc('getnetworkinfo').get('version')}", flush=True)
+
+
+def same_tip(name, miner, other):
+    """Wait until `other` has `miner`'s tip; a tip that does not reach it ends
+    the run with a FAIL naming both tips"""
+    tip = miner.rpc("getbestblockhash")
+    if not wait_for(lambda: other.rpc("getbestblockhash") == tip, 120):
+        raise RuntimeError(f"after {name}: {other.name} did not take {miner.name}'s tip {tip} "
+                           f"(height {miner.rpc('getblockcount')}) within 120 s; it is at "
+                           f"{other.rpc('getbestblockhash')} (height {other.rpc('getblockcount')})")
 
 
 def synced():
@@ -430,8 +522,20 @@ for method, arg, params, view, not_to_divid, not_sent in CALLS + LAST:
             out = I.call_with(method, params, text)
             row(name, "not sent", short(("ok", view(out[1])) if out[0] == "ok" else out), False)
             continue
-        c = C.call_with(method, params, text)
-        i = I.call_with(method, params, text)
+        if method in ("setgenerate", "generateblock"):
+            # One node mines at a time, each on the tip both have. Both mining
+            # at once would fork the chain, and divid cannot check a block that
+            # stakes a coin of irondivid's side of the fork: its stake input is
+            # read with GetTransaction, which knows only divid's own chain
+            # (BlockProofVerifier.cpp:66-70, :145-147), so it refuses the rest
+            # of irondivid's chain and the two never meet again
+            c = C.call_with(method, params, text)
+            same_tip(name, C, I)
+            i = I.call_with(method, params, text)
+            same_tip(name, I, C)
+        else:
+            c = C.call_with(method, params, text)
+            i = I.call_with(method, params, text)
         compare(name, method, c, i, view)
         if method == "lockunspent":
             compare(f"{name}: listlockunspent", "listlockunspent", C.call("listlockunspent"),
@@ -441,12 +545,10 @@ for method, arg, params, view, not_to_divid, not_sent in CALLS + LAST:
         if method == "setmocktime":
             C.call("setmocktime", 0)
             I.call("setmocktime", 0)
-        if method in ("setgenerate", "generateblock"):
-            # Each daemon's blocks reach the other; wait until both are on one tip
-            wait_for(lambda: I.rpc("getblockcount") == C.rpc("getblockcount"), 120)
 
 for n in (I, C):
     n.stop()
+print(f"# ran for {time.time() - STARTED:.0f} s", flush=True)
 print(f"# rows: {counts['PASS']} PASS, {counts['KNOWN']} KNOWN, {counts['FAIL']} FAIL", flush=True)
 print(f"FAILS {fails}", flush=True)
 sys.exit(min(fails, 254))
