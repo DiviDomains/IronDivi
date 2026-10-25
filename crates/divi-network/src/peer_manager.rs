@@ -1553,8 +1553,8 @@ impl PeerManager {
 
     /// Periodic maintenance loop that ensures we maintain target outbound peer count.
     ///
-    /// Runs every 30 seconds and reconnects to peers if we've dropped below
-    /// `max_outbound`. Tries added nodes first, then static peers (with exponential
+    /// Runs every 30 seconds: dials the added nodes not connected, then, if
+    /// we've dropped below `max_outbound`, static peers (with exponential
     /// backoff for repeatedly-failing peers), then DNS seeds.
     ///
     /// Backoff schedule for static peers (consecutive failures → min wait before retry):
@@ -1572,24 +1572,13 @@ impl PeerManager {
 
             self.dial_one_shots();
 
-            let outbound = self.outbound_count();
-            let target = self.config.max_outbound;
-
-            if outbound >= target {
-                continue;
-            }
-
-            info!(
-                "Peer maintenance: {}/{} outbound peers, attempting reconnection",
-                outbound, target
-            );
-
-            // 1. Try added nodes first (manually added via RPC)
+            // 1. The added nodes (-addnode, addnode add), with -connect or
+            // not and whatever -maxconnections says: divid's added-node
+            // thread runs beside the -connect loop and counts no outbound
+            // slot since Divi Core f8c0d2e67 took its semaphore grant out; it skips a
+            // banned address (net.cpp:1214-1271, :1275-1285)
             let added: Vec<SocketAddr> = self.added_nodes.read().iter().copied().collect();
             for addr in added {
-                if !self.can_connect_outbound() {
-                    break;
-                }
                 if self.is_banned(&addr.ip()) {
                     continue;
                 }
@@ -1616,6 +1605,18 @@ impl PeerManager {
                     }
                 });
             }
+
+            let outbound = self.outbound_count();
+            let target = self.config.max_outbound;
+
+            if outbound >= target {
+                continue;
+            }
+
+            info!(
+                "Peer maintenance: {}/{} outbound peers, attempting reconnection",
+                outbound, target
+            );
 
             // 2. Try static peers (with exponential backoff for known-failing
             // peers); -connect peers have run_connect_loop instead
