@@ -178,3 +178,37 @@ fn debugnet_and_benchmark_draw_divid_s_warning() {
     );
     assert!(!log.contains("-debugnet"), "{log}");
 }
+
+/// The options divid takes and does nothing outside with, or reads for parts
+/// irondivid does not have, start without a line, as in divid: the help-only
+/// -windowtitle, -printstakemodifier, -printcoinstake (LicenseAndInfo.cpp:150,
+/// :215-216), the wallet database's -dblogsize and -privdb (db.cpp:101,
+/// dbenv.cpp:68), -help-debug without -help, and the block index's
+/// -safe_shutdown and -recoverblockdb (BlockIndexLoading.cpp:258-283)
+#[test]
+fn divid_s_silent_options_start_without_a_line() {
+    let options = [
+        "windowtitle",
+        "printstakemodifier",
+        "printcoinstake",
+        "dblogsize",
+        "privdb",
+        "help-debug",
+        "safe_shutdown",
+        "recoverblockdb",
+    ];
+    let dir = tempfile::tempdir().unwrap();
+    let mut args: Vec<String> = options.iter().map(|o| format!("-{o}=1")).collect();
+    // the unknown option's line shows the warnings were written
+    args.push("-bogusmarker".into());
+    let (node, _) = start(dir.path(), &args);
+    drop(node);
+    let log = debug_log(dir.path());
+    assert!(
+        log.contains("Unknown option -bogusmarker; ignored"),
+        "{log}"
+    );
+    for o in options {
+        assert!(!log.contains(&format!("-{o}")), "a line for -{o}: {log}");
+    }
+}

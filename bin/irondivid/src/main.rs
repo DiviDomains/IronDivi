@@ -315,7 +315,8 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
 /// Options divid takes and does nothing with, only naming them in its help:
 /// accepted without a word, as divid does (LicenseAndInfo.cpp:135, :143;
 /// -disablesystemnotifications :142, -mining and -genproclimit :186-187, :205;
-/// -checkpoints :165, -printpriority :201)
+/// -checkpoints :165, -printpriority :201; -windowtitle :150,
+/// -printstakemodifier and -printcoinstake :215-216)
 const UNUSED_BY_DIVID: &[&str] = &[
     "sendfreetransactions",
     "txconfirmtarget",
@@ -324,6 +325,9 @@ const UNUSED_BY_DIVID: &[&str] = &[
     "genproclimit",
     "checkpoints",
     "printpriority",
+    "windowtitle",
+    "printstakemodifier",
+    "printcoinstake",
 ];
 
 /// Options divid reads for checks and test aids of its own that irondivid has
@@ -332,7 +336,13 @@ const UNUSED_BY_DIVID: &[&str] = &[
 /// init.cpp:795), its wallet flush thread (init.cpp:1281) and signature cache
 /// size (script/sigcache.cpp:51), none of which shows outside, and its message
 /// fault injection (-dropmessagestest main.cpp:473, Node.cpp:479;
-/// -fuzzmessagestest Node.cpp:484-485), which irondivid does not do
+/// -fuzzmessagestest Node.cpp:484-485), which irondivid does not do; its
+/// Berkeley DB wallet environment (-dblogsize db.cpp:101, -privdb
+/// dbenv.cpp:68); the debug section of its -help (-help-debug
+/// LicenseAndInfo.cpp:140-231); and the shutdown flag of its block index with
+/// the recovery after a stop that was not prepared (-safe_shutdown, -recoverblockdb
+/// BlockIndexLoading.cpp:258-283), a check irondivid does not make (see
+/// -forcestart)
 const NO_COUNTERPART: &[&str] = &[
     "checkblockindex",
     "checkmempool",
@@ -340,6 +350,11 @@ const NO_COUNTERPART: &[&str] = &[
     "maxsigcachesize",
     "dropmessagestest",
     "fuzzmessagestest",
+    "dblogsize",
+    "privdb",
+    "help-debug",
+    "safe_shutdown",
+    "recoverblockdb",
 ];
 
 /// Options apply_settings reads
