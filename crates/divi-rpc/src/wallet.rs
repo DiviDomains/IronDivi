@@ -2926,9 +2926,25 @@ impl WalletRpc {
             .map(|(vout, _)| OutPoint::new(funding_txid, vout as u32))
             .collect();
 
-        // CWallet::AddVault finding nothing to add
+        // CWallet::AddVault stores the script before it syncs the transaction,
+        // so a transaction that pays the vault nothing still registers it; the
+        // call succeeds only if the transaction is the wallet's
+        // (rpcwallet.cpp:1295-1301, wallet.cpp:695-704)
         if vault_outpoints.is_empty() {
-            return Err(sync_failed().into());
+            let wallet = self.get_wallet()?;
+            if !wallet.vault_mode() {
+                return Err(sync_failed().into());
+            }
+            wallet.store_vault(VaultMetadata {
+                owner_address: owner_str.to_string(),
+                manager_address: manager_str.to_string(),
+                vault_script: vault_script_bytes.to_vec(),
+                funding_txid: *funding_txid.as_bytes(),
+            });
+            if wallet.get_transaction(&funding_txid).is_none() {
+                return Err(sync_failed().into());
+            }
+            return Ok(json!({"succeeded": true}));
         }
 
         // Divi Core's AddVault changes nothing without -vault (wallet.cpp:693-706)
