@@ -43,6 +43,13 @@ fn try_rpc(port: u16, method: &str, params: &Value) -> Option<Value> {
 struct Node {
     child: Child,
     port: u16,
+    log: std::path::PathBuf,
+}
+
+impl Node {
+    fn log(&self) -> String {
+        std::fs::read_to_string(&self.log).unwrap_or_default()
+    }
 }
 
 impl Drop for Node {
@@ -80,7 +87,11 @@ fn start(datadir: &Path, extra: &[&str]) -> Result<Node, String> {
             return Err(std::fs::read_to_string(&stderr).unwrap_or_default());
         }
         if try_rpc(port, "getblockcount", &json!([])).is_some() {
-            return Ok(Node { child, port });
+            return Ok(Node {
+                child,
+                port,
+                log: datadir.join("debug.log"),
+            });
         }
         assert!(Instant::now() < deadline, "irondivid did not start");
         std::thread::sleep(Duration::from_millis(200));
@@ -191,4 +202,36 @@ fn every_bind_is_listened_on() {
         err.contains("Cannot resolve -bind address: 'not-an-address'"),
         "{err}"
     );
+}
+
+/// Each parameter interaction that sets an option not given is logged with
+/// divid's text, and one that sets nothing is not (net.cpp:1672-1716)
+#[test]
+fn parameter_interactions_are_logged_as_divid_logs_them() {
+    let line = |what: &str| format!("parameter interaction: {what}");
+    let bind_listen = line("-bind or -whitebind set -> setting -listen=1");
+    let connect_seed = line("-connect set -> setting -dnsseed=0");
+    let connect_listen = line("-connect set -> setting -listen=0");
+    let off_upnp = line("-listen=0 -> setting -upnp=0");
+    let off_discover = line("-listen=0 -> setting -discover=0");
+
+    // -bind wins over -connect for listening
+    let dir = tempfile::tempdir().unwrap();
+    let bind = format!("-bind=127.0.0.1:{}", free_port());
+    let node = up(dir.path(), &[&bind, "-connect=127.0.0.1:1", "-discover=0"]);
+    let log = node.log();
+    assert!(log.contains(&bind_listen), "{log}");
+    assert!(log.contains(&connect_seed), "{log}");
+    assert!(!log.contains(&connect_listen), "{log}");
+    assert!(!log.contains(&off_upnp), "{log}");
+    drop(node);
+
+    // -connect alone: no listening, so no UPnP and no discovery
+    let dir = tempfile::tempdir().unwrap();
+    let node = up(dir.path(), &["-connect=127.0.0.1:1"]);
+    let log = node.log();
+    for want in [&connect_seed, &connect_listen, &off_upnp, &off_discover] {
+        assert!(log.contains(want.as_str()), "{want}: {log}");
+    }
+    assert!(!log.contains(&bind_listen), "{log}");
 }

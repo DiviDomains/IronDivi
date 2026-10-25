@@ -489,30 +489,76 @@ fn host_and_port(value: &str) -> (String, Option<u16>) {
 fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     let mut s = settings.clone();
     let regtest = config.network.network_type == NetworkType::Regtest;
-    // -bind or -whitebind means listening; -connect means no DNS seeds and
-    // no listening; -proxy means no listening (net.cpp:1672-1700)
+    // divid's parameter interactions, each logged as divid logs it when it
+    // sets an option not given (net.cpp:1672-1716). -bind or -whitebind means
+    // listening; -connect means no DNS seeds and no listening
+    let interaction = |set: bool, text: &str| {
+        if set {
+            info!("{}", text);
+        }
+    };
     if s.is_set("bind") || s.is_set("whitebind") {
-        s.soft_set_bool("listen", true);
+        let set = s.soft_set_bool("listen", true);
+        interaction(
+            set,
+            "InitializeDivi : parameter interaction: -bind or -whitebind set -> setting -listen=1",
+        );
     }
     if !s.get_multi("connect").is_empty() {
-        if s.soft_set_bool("dnsseed", false) {
-            info!("InitializeDivi : parameter interaction: -connect set -> setting -dnsseed=0");
-        }
-        s.soft_set_bool("listen", false);
+        let set = s.soft_set_bool("dnsseed", false);
+        interaction(
+            set,
+            "InitializeDivi : parameter interaction: -connect set -> setting -dnsseed=0",
+        );
+        let set = s.soft_set_bool("listen", false);
+        interaction(
+            set,
+            "InitializeDivi : parameter interaction: -connect set -> setting -listen=0",
+        );
     }
+    // -proxy means no listening, no UPnP and no discovery
     if s.is_set("proxy") {
-        s.soft_set_bool("listen", false);
-        s.soft_set_bool("upnp", false);
+        let set = s.soft_set_bool("listen", false);
+        interaction(
+            set,
+            "SetNetworkingParameters: parameter interaction: -proxy set -> setting -listen=0",
+        );
+        let set = s.soft_set_bool("upnp", false);
+        interaction(
+            set,
+            "SetNetworkingParameters: parameter interaction: -proxy set -> setting -upnp=0",
+        );
+        let set = s.soft_set_bool("discover", false);
+        interaction(
+            set,
+            "InitializeDivi : parameter interaction: -proxy set -> setting -discover=0",
+        );
     }
-    // -proxy, -listen=0 and -externalip each turn -discover off unless it is
-    // given (net.cpp:1690-1716)
-    if s.is_set("proxy") || !s.get_bool("listen", true) || s.is_set("externalip") {
-        s.soft_set_bool("discover", false);
-    }
-    // -listen=0 turns -upnp and -listenonion off unless given (net.cpp:1700-1711)
+    // -listen=0 turns -upnp, -discover and -listenonion off unless given
     if !s.get_bool("listen", true) {
-        s.soft_set_bool("upnp", false);
-        s.soft_set_bool("listenonion", false);
+        let set = s.soft_set_bool("upnp", false);
+        interaction(
+            set,
+            "InitializeDivi : parameter interaction: -listen=0 -> setting -upnp=0",
+        );
+        let set = s.soft_set_bool("discover", false);
+        interaction(
+            set,
+            "InitializeDivi : parameter interaction: -listen=0 -> setting -discover=0",
+        );
+        let set = s.soft_set_bool("listenonion", false);
+        interaction(
+            set,
+            "InitializeDivi : parameter interaction: -listen=0 -> setting -listenonion=0",
+        );
+    }
+    // -externalip turns -discover off unless given
+    if s.is_set("externalip") {
+        let set = s.soft_set_bool("discover", false);
+        interaction(
+            set,
+            "InitializeDivi : parameter interaction: -externalip set -> setting -discover=0",
+        );
     }
     // Regtest does not stake unless asked (init.cpp:242); no wallet, no staking
     if regtest && !s.is_set("staking") {
