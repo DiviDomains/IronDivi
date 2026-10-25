@@ -313,13 +313,16 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
 
 /// Options divid takes and does nothing with, only naming them in its help:
 /// accepted without a word, as divid does (LicenseAndInfo.cpp:135, :143;
-/// -disablesystemnotifications :142, -mining and -genproclimit :186-187, :205)
+/// -disablesystemnotifications :142, -mining and -genproclimit :186-187, :205;
+/// -checkpoints :165, -printpriority :201)
 const UNUSED_BY_DIVID: &[&str] = &[
     "sendfreetransactions",
     "txconfirmtarget",
     "disablesystemnotifications",
     "mining",
     "genproclimit",
+    "checkpoints",
+    "printpriority",
 ];
 
 /// Options apply_settings reads
@@ -4632,6 +4635,8 @@ mod divid_option_tests {
     #[test]
     fn help_only_options_draw_no_warning() {
         let s = Settings::default();
+        assert_eq!(option_warning(&s, "checkpoints"), None);
+        assert_eq!(option_warning(&s, "printpriority"), None);
         assert_eq!(option_warning(&s, "litemode"), None);
         assert_eq!(option_warning(&s, "budgetvotemode"), None);
         assert_eq!(option_warning(&s, "masternode"), None);
