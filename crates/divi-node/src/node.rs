@@ -320,7 +320,7 @@ impl Node {
         // (init.cpp:1116-1119) on the first line; what was found, and how to
         // recover, after it and in the log
         let checked = chain
-            .verify_recent_blocks(config.check_blocks)
+            .verify_db(i64::from(config.check_blocks))
             .map_err(|e| {
                 tracing::error!("VerifyDB() : *** {}", e);
                 match damaged(e) {

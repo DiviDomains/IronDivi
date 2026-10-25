@@ -112,3 +112,41 @@ fn a_loadblock_file_that_does_not_open_is_named_in_divid_s_warning() {
         "a missing file named as imported"
     );
 }
+
+/// The chain check at start and verifychain log divid's line, with divid's
+/// depth: -checkblocks or the verifychain depth, 0 or below every block, more
+/// than the height the height (verifyDb.cpp:73-78)
+#[test]
+fn the_chain_check_logs_divid_s_verifying_line() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let (_node, port) = start(dir.path(), &[]);
+        let mined = rpc(port, "setgenerate", json!([3])).expect("setgenerate");
+        assert!(mined["error"].is_null(), "{mined}");
+        assert_eq!(rpc(port, "getblockcount", json!([])).unwrap()["result"], 3);
+    }
+    for (depth, line) in [
+        ("2", "Verifying last 2 blocks at level 4"),
+        ("0", "Verifying last 3 blocks at level 4"),
+    ] {
+        std::fs::remove_file(dir.path().join("debug.log")).ok();
+        let (_node, port) = start(dir.path(), &[format!("-checkblocks={depth}")]);
+        assert!(
+            log_has(dir.path(), line),
+            "-checkblocks={depth}: no {line:?}"
+        );
+        if depth == "0" {
+            let reply = rpc(port, "verifychain", json!([4, 1])).unwrap();
+            assert_eq!(reply["result"], true, "{reply}");
+            assert!(log_has(dir.path(), "Verifying last 1 blocks at level 4"));
+            let reply = rpc(port, "verifychain", json!([4, 99])).unwrap();
+            assert_eq!(reply["result"], true, "{reply}");
+            assert_eq!(
+                debug_log(dir.path())
+                    .matches("Verifying last 3 blocks at level 4")
+                    .count(),
+                2
+            );
+        }
+    }
+}

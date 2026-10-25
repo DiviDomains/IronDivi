@@ -1469,27 +1469,16 @@ impl BlockchainRpc {
         // is given (rpcblockchain.cpp:418-420); with only one it reads past the
         // list, so that one is taken here
         let at = if params.len() > 1 { 1 } else { 0 };
-        let numblocks = params.get_i64(at).unwrap_or(288).max(0) as u64;
-
-        let best_height = self.chain.height() as u64;
-
-        // Verify last N blocks
-        let start_height = best_height.saturating_sub(numblocks);
-
-        for height in start_height..=best_height {
-            // Check that block index exists
-            let index = match self.chain.get_block_index_by_height(height as u32)? {
-                Some(idx) => idx,
-                None => return Ok(json!(false)),
-            };
-
-            // Verify block data exists
-            if self.chain.get_block(&index.hash)?.is_none() {
-                return Ok(json!(false));
+        let numblocks = params.get_i64(at).unwrap_or(288);
+        // VerifyDB at level 4, its one level, over that many blocks, as divid's
+        // verifychain runs it (rpcblockchain.cpp:417-422)
+        match self.chain.verify_db(numblocks) {
+            Ok(_) => Ok(json!(true)),
+            Err(e) => {
+                tracing::error!("VerifyDB() : *** {}", e);
+                Ok(json!(false))
             }
         }
-
-        Ok(json!(true))
     }
 
     /// Get mining information

@@ -1338,6 +1338,22 @@ impl Chain {
         Ok(())
     }
 
+    /// Divi Core's VerifyDB at its one level, 4, over the last `depth` blocks
+    /// (`-checkblocks` at start, init.cpp:1116; `verifychain`,
+    /// rpcblockchain.cpp:417-422), with its log line: 0 or below is every
+    /// block, more than the height is the height (verifyDb.cpp:73-78). Nothing
+    /// is checked or logged below height 1 (verifyDb.cpp:68-69). Returns the
+    /// number of heights checked.
+    pub fn verify_db(&self, depth: i64) -> Result<u32, StorageError> {
+        let height = self.height();
+        if self.tip().is_none() || height == 0 {
+            return Ok(0);
+        }
+        let depth = check_depth(depth, height);
+        info!("Verifying last {} blocks at level 4", depth);
+        self.verify_recent_blocks(depth)
+    }
+
     /// Check the last `depth` blocks of the active chain, as C++ `-checkblocks` does at
     /// start (CVerifyDB::VerifyDB): each height maps to an index entry that links to the
     /// one below, and each stored block body reads back (RocksDB checks its CRC on read),
@@ -5644,12 +5660,35 @@ fn check_block_txs_final(block: &Block, height: u32) -> Result<(), StorageError>
     Ok(())
 }
 
+/// The depth Divi Core's VerifyDB checks for a requested `depth` on a chain of
+/// `height` (verifyDb.cpp:73-76)
+pub fn check_depth(depth: i64, height: u32) -> u32 {
+    if depth <= 0 || depth > i64::from(height) {
+        height
+    } else {
+        depth as u32
+    }
+}
+
 #[cfg(test)]
 mod tests {
     mod crash;
     mod disk_space;
 
     use super::*;
+
+    /// Divi Core's VerifyDB depth: 0 or below is every block, more than the
+    /// height is the height (verifyDb.cpp:73-76)
+    #[test]
+    fn verify_depth_is_divid_s() {
+        assert_eq!(check_depth(0, 30), 30);
+        assert_eq!(check_depth(-1, 30), 30);
+        assert_eq!(check_depth(1, 30), 1);
+        assert_eq!(check_depth(30, 30), 30);
+        assert_eq!(check_depth(31, 30), 30);
+        assert_eq!(check_depth(288, 30), 30);
+        assert_eq!(check_depth(100, 300), 100);
+    }
     use divi_primitives::amount::Amount;
     use divi_primitives::script::Script;
     use divi_primitives::transaction::{TxIn, TxOut};
