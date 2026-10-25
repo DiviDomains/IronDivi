@@ -257,9 +257,20 @@ impl Node {
         // C++ checks the newest blocks at every start (-checkblocks); a damaged
         // database otherwise goes unnoticed until the bad record is read.
         let started = std::time::Instant::now();
+        // A failed check stops the start with Divi Core's InitError text
+        // (init.cpp:1116-1119) on the first line; what was found, and how to
+        // recover, after it and in the log
         let checked = chain
             .verify_recent_blocks(config.check_blocks)
-            .map_err(damaged)?;
+            .map_err(|e| {
+                tracing::error!("VerifyDB() : *** {}", e);
+                match damaged(e) {
+                    NodeError::Init(detail) => {
+                        NodeError::Init(format!("Corrupted block database detected\n{detail}"))
+                    }
+                    other => other,
+                }
+            })?;
         tracing::info!(
             "Verified the last {} blocks in {} ms",
             checked,
@@ -2564,8 +2575,15 @@ mod tests {
 
         let err = match Node::new(config.clone()) {
             Ok(_) => panic!("node started on a damaged chain database"),
-            Err(e) => e.to_string(),
+            Err(NodeError::Init(reason)) => reason,
+            Err(e) => panic!("not a start refusal: {e}"),
         };
+        // Divi Core's InitError text first (init.cpp:1116-1119), then the detail
+        assert_eq!(
+            err.lines().next(),
+            Some("Corrupted block database detected"),
+            "{err}"
+        );
         assert!(err.contains("damaged at height"), "{err}");
         assert!(err.contains("move that directory aside"), "{err}");
 
