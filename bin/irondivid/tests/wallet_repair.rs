@@ -312,7 +312,9 @@ fn dbloadfailexit_stops_a_start_with_the_warning() {
     assert!(!stderr.contains("Error:"), "stderr: {stderr}");
 }
 
-/// -salvagewallet sets -rescan, and Divi Core says so (init.cpp:763-766)
+/// -salvagewallet sets -rescan, and Divi Core says so (init.cpp:763-766),
+/// after the network interactions (init.cpp:1416-1418): here the -listen=0
+/// ones, since the node is started with --listen=false
 #[test]
 fn salvagewallet_says_it_sets_rescan() {
     let dir = tempfile::tempdir().unwrap();
@@ -322,11 +324,13 @@ fn salvagewallet_says_it_sets_rescan() {
     let node = start(dir.path(), rpc_port, p2p_port, &["-salvagewallet"]);
     stop(node, rpc_port);
     let after = &log(dir.path())[from..];
+    let salvage =
+        after.find("InitializeDivi : parameter interaction: -salvagewallet=1 -> setting -rescan=1");
+    assert!(salvage.is_some(), "{}", log_tail(dir.path()));
+    let listen = after.find("InitializeDivi : parameter interaction: -listen=0 -> setting -upnp=0");
     assert!(
-        after.contains(
-            "InitializeDivi : parameter interaction: -salvagewallet=1 -> setting -rescan=1"
-        ),
-        "{}",
+        listen.is_some_and(|l| l < salvage.unwrap()),
+        "the -listen=0 line is not before the -salvagewallet one: {}",
         log_tail(dir.path())
     );
     assert!(after.contains("Rescanning... from height 0"));

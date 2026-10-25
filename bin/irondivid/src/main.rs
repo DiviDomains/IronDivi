@@ -601,11 +601,6 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
             "InitializeDivi : parameter interaction: -proxy set -> setting -discover=0",
         );
     }
-    // -salvagewallet rewrites nothing in Divi Core 3.0.0: it sets -rescan
-    // (EnableWalletFeatures, init.cpp:763-766)
-    if s.get_bool("salvagewallet", false) && s.soft_set_bool("rescan", true) {
-        info!("InitializeDivi : parameter interaction: -salvagewallet=1 -> setting -rescan=1");
-    }
     // -listen=0 turns -upnp, -discover and -listenonion off unless given
     if !s.get_bool("listen", true) {
         let set = s.soft_set_bool("upnp", false);
@@ -631,6 +626,12 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
             set,
             "InitializeDivi : parameter interaction: -externalip set -> setting -discover=0",
         );
+    }
+    // -salvagewallet rewrites nothing in Divi Core 3.0.0: it sets -rescan
+    // (EnableWalletFeatures, init.cpp:763-766), after the network ones
+    // (init.cpp:1416-1418)
+    if s.get_bool("salvagewallet", false) && s.soft_set_bool("rescan", true) {
+        info!("InitializeDivi : parameter interaction: -salvagewallet=1 -> setting -rescan=1");
     }
     // Regtest does not stake unless asked (init.cpp:242); no wallet, no staking
     if regtest && !s.is_set("staking") {
