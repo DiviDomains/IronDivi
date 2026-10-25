@@ -211,10 +211,7 @@ impl FeeEscalation {
     /// `base`. Never below `base` and never above the cap.
     pub fn target(&self, base: u64, left: i64) -> u64 {
         let base = base.max(1);
-        let cap = self
-            .cap_feerate
-            .min(base.saturating_mul(self.max_multiple))
-            .max(base);
+        let cap = self.cap(base);
         let (start, end) = (
             i64::from(self.start_secs_left),
             i64::from(self.cap_secs_left),
@@ -237,6 +234,21 @@ impl FeeEscalation {
     pub fn worth_bumping(current: u64, target: u64) -> bool {
         target >= current.saturating_add((current / 4).max(1))
     }
+
+    /// The highest feerate a claim whose first version paid `base` ever pays.
+    pub fn cap(&self, base: u64) -> u64 {
+        let base = base.max(1);
+        self.cap_feerate
+            .min(base.saturating_mul(self.max_multiple))
+            .max(base)
+    }
+
+    /// Whether to bump a claim paying `current` (first version `base`) to `target`: when
+    /// [`FeeEscalation::worth_bumping`], or to finish the climb to the cap, which a quarter
+    /// step could otherwise leave just short of (one more transaction at most).
+    pub fn should_bump(&self, base: u64, current: u64, target: u64) -> bool {
+        target > current && (Self::worth_bumping(current, target) || target == self.cap(base))
+    }
 }
 
 /// Swap timing and confirmation requirements. All durations in seconds.
@@ -253,6 +265,8 @@ pub struct SwapConfig {
     /// How far BTC median time past lags wall clock (≈ 1 h).
     pub btc_mtp_lag_secs: u32,
     /// Time the maker needs to get its taker-leg claim confirmed after learning the preimage.
+    /// The taker's own margin before the maker-leg locktime is per chain, in
+    /// [`ClaimDeadline`], not this value.
     pub claim_margin_secs: u32,
     /// Quote validity.
     pub quote_expiry_secs: u32,
@@ -719,6 +733,17 @@ mod tests {
         assert!(FeeEscalation::worth_bumping(10, 12) && !FeeEscalation::worth_bumping(10, 11));
         assert!(!FeeEscalation::worth_bumping(100, 124));
         assert!(FeeEscalation::worth_bumping(1, 2) && !FeeEscalation::worth_bumping(1, 1));
+        let btc = FeeEscalation::builtin(Chain::Btc).unwrap();
+        assert_eq!((btc.cap(10), btc.cap(100)), (500, 1000));
+        assert!(
+            btc.should_bump(10, 450, 500),
+            "finishes the climb to the cap"
+        );
+        assert!(
+            !btc.should_bump(10, 450, 480),
+            "short of the cap: a quarter step"
+        );
+        assert!(!btc.should_bump(10, 500, 500));
         for chain in [Chain::Divi, Chain::Zec, Chain::Xmr, Chain::Usdc] {
             assert!(FeeEscalation::builtin(chain).is_none(), "{chain}");
         }

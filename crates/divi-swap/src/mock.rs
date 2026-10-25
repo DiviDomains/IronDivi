@@ -78,6 +78,12 @@ enum MockTx {
         htlc: HtlcParams,
         at: Outpoint,
         amount: Amount,
+        /// Left out at the default so that refunds built before it existed keep their txids.
+        #[serde(
+            default = "default_feerate",
+            skip_serializing_if = "is_default_feerate"
+        )]
+        feerate: u64,
     },
 }
 
@@ -103,6 +109,12 @@ struct ChainState {
     fee_bump: FeeBump,
     /// Feerate backends report through `claim_feerate` (`None`: [`MOCK_FEERATE`]).
     fee_estimate: Option<u64>,
+    /// Feerate of every refund built on this chain (`None`: [`MOCK_FEERATE`]).
+    refund_feerate: Option<u64>,
+    /// `mine` leaves unmined spends whose effective feerate is below this in the mempool.
+    block_floor: u64,
+    /// The mempool's minimum feerate: spends below it are refused and evicted.
+    mempool_floor: u64,
 }
 
 impl MockTx {
@@ -116,8 +128,10 @@ impl MockTx {
                 let fee = feerate.saturating_mul(MOCK_VSIZE).min(amount.0);
                 Some((fee, amount.0 - fee))
             }
-            MockTx::Refund { amount, .. } => {
-                let fee = MOCK_FEE.0.min(amount.0);
+            MockTx::Refund {
+                amount, feerate, ..
+            } => {
+                let fee = feerate.saturating_mul(MOCK_VSIZE).min(amount.0);
                 Some((fee, amount.0 - fee))
             }
             MockTx::Child {
@@ -169,18 +183,111 @@ impl MockChain {
     }
 
     /// Mine `n` blocks: confirms everything in the mempool, advances height and MTP.
+    ///
+    /// Above a block floor ([`MockChain::set_block_floor`]) a spend is mined only if its
+    /// effective feerate reaches the floor: its own, or under [`FeeBump::Cpfp`] that of the
+    /// package it heads (itself and every unmined descendant), which is then mined together.
     pub fn mine(&self, n: u64) {
         let mut s = self.state.lock();
         for _ in 0..n {
             s.height += 1;
             s.mtp += self.block_secs;
             let h = s.height;
-            for (_, mined) in s.txs.values_mut() {
-                if mined.is_none() {
-                    *mined = Some(h);
+            let floor = s.block_floor;
+            let mut take: Vec<Txid> = Vec::new();
+            for (id, (tx, mined)) in &s.txs {
+                if mined.is_some() {
+                    continue;
+                }
+                let parent_mined = match tx {
+                    MockTx::Child { parent, .. } => {
+                        matches!(s.txs.get(parent), Some((_, Some(_))))
+                    }
+                    _ => true,
+                };
+                if parent_mined && (floor == 0 || Self::effective_feerate(&s, *id) >= floor) {
+                    take.push(*id);
+                }
+            }
+            while let Some(id) = take.pop() {
+                let Some((_, mined)) = s.txs.get_mut(&id) else {
+                    continue;
+                };
+                if mined.is_some() {
+                    continue;
+                }
+                *mined = Some(h);
+                if s.fee_bump == FeeBump::Cpfp {
+                    take.extend(Self::spenders_of(&s, id));
                 }
             }
         }
+    }
+
+    /// From now on `mine` includes only spends paying at least `feerate` (0: everything, the
+    /// default). Fundings are always mined.
+    pub fn set_block_floor(&self, feerate: u64) {
+        self.state.lock().block_floor = feerate;
+    }
+
+    /// The mempool's minimum feerate from now on: unmined spends below it (by effective
+    /// feerate) are evicted with what spends them, giving back what they booked, and new
+    /// ones below it are refused (`SwapError::Rejected`, "mempool min fee not met").
+    pub fn set_mempool_floor(&self, feerate: u64) {
+        let mut s = self.state.lock();
+        s.mempool_floor = feerate;
+        let low: Vec<Txid> = s
+            .txs
+            .iter()
+            .filter(|(id, (tx, mined))| {
+                mined.is_none()
+                    && !matches!(tx, MockTx::Fund { .. })
+                    && Self::effective_feerate(&s, **id) < feerate
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in low {
+            Self::evict(&mut s, id);
+        }
+    }
+
+    /// Feerate of every refund built on this chain from now on (a maker outbidding the
+    /// taker's claim once its refund is valid).
+    pub fn set_refund_feerate(&self, feerate: u64) {
+        self.state.lock().refund_feerate = Some(feerate);
+    }
+
+    /// Unmined `id`'s own feerate, or under [`FeeBump::Cpfp`] its package's (with every
+    /// unmined descendant) if higher.
+    fn effective_feerate(s: &ChainState, id: Txid) -> u64 {
+        let own = s.txs.get(&id).map_or(0, |(tx, _)| tx.feerate());
+        if s.fee_bump != FeeBump::Cpfp {
+            return own;
+        }
+        let (fee, n) = Self::package_with_descendants(s, id);
+        own.max(fee / (n.max(1) * MOCK_VSIZE))
+    }
+
+    fn spenders_of(s: &ChainState, id: Txid) -> Vec<Txid> {
+        s.spends
+            .iter()
+            .filter(|(at, _)| at.txid == id)
+            .map(|(_, spender)| *spender)
+            .collect()
+    }
+
+    /// Fee and count of unmined `id` and every unmined tx spending it.
+    fn package_with_descendants(s: &ChainState, id: Txid) -> (u64, u64) {
+        let (mut fee, mut n) = (0, 0);
+        let mut queue = vec![id];
+        while let Some(id) = queue.pop() {
+            if let Some((tx, None)) = s.txs.get(&id) {
+                fee += tx.fee_and_out().map_or(0, |(f, _)| f);
+                n += 1;
+            }
+            queue.extend(Self::spenders_of(s, id));
+        }
+        (fee, n)
     }
 
     /// Reorg: `txid` (and every mined tx that spends its outputs) goes back to the mempool.
@@ -310,24 +417,6 @@ impl MockChain {
         }
     }
 
-    /// Fee of unmined `id` and every unmined tx spending it.
-    fn fee_with_descendants(s: &ChainState, id: Txid) -> u64 {
-        let mut fee = 0;
-        let mut queue = vec![id];
-        while let Some(id) = queue.pop() {
-            if let Some((tx, None)) = s.txs.get(&id) {
-                fee += tx.fee_and_out().map_or(0, |(f, _)| f);
-            }
-            queue.extend(
-                s.spends
-                    .iter()
-                    .filter(|(at, _)| at.txid == id)
-                    .map(|(_, spender)| *spender),
-            );
-        }
-        fee
-    }
-
     /// Make room for `new` spending `at`, or refuse it as a double spend: an unmined
     /// claim or refund there is replaced if the relay takes replacements and `new` pays
     /// enough more ([`MockChain::set_fee_bump`]).
@@ -344,7 +433,7 @@ impl MockChain {
             return Err(SwapError::Rejected("double spend".into()));
         }
         let (new_fee, _) = new.fee_and_out().expect("a spend");
-        let need = Self::fee_with_descendants(s, old) + MOCK_VSIZE;
+        let need = Self::package_with_descendants(s, old).0 + MOCK_VSIZE;
         if new_fee < need || new.feerate() <= s.txs[&old].0.feerate() {
             return Err(SwapError::Rejected(format!(
                 "insufficient fee: replacement pays {new_fee}, needs {need}"
@@ -631,11 +720,18 @@ impl ChainBackend for MockBackend {
         amount: Amount,
     ) -> Result<SignedTx> {
         self.check_online()?;
+        let feerate = self
+            .chain
+            .state
+            .lock()
+            .refund_feerate
+            .unwrap_or(MOCK_FEERATE);
         Ok(Self::sign(&MockTx::Refund {
             to: self.owner(),
             htlc: *htlc,
             at: *at,
             amount,
+            feerate,
         }))
     }
 
@@ -653,6 +749,13 @@ impl ChainBackend for MockBackend {
         }
         if s.txs.contains_key(&tx.txid) {
             return Ok(tx.txid);
+        }
+        if !matches!(parsed, MockTx::Fund { .. }) && parsed.feerate() < s.mempool_floor {
+            return Err(SwapError::Rejected(format!(
+                "mempool min fee not met: {} < {}",
+                parsed.feerate(),
+                s.mempool_floor
+            )));
         }
         match &parsed {
             MockTx::Fund { from, amount, .. } => {
@@ -714,6 +817,7 @@ impl ChainBackend for MockBackend {
                 htlc,
                 at,
                 amount,
+                ..
             } => {
                 let locked = htlc_amount(&s, htlc, at)
                     .ok_or_else(|| SwapError::Rejected("missing inputs".into()))?;
@@ -726,11 +830,10 @@ impl ChainBackend for MockBackend {
                         s.mtp, htlc.locktime
                     )));
                 }
-                if s.spends.contains_key(at) {
-                    return Err(SwapError::Rejected("double spend".into()));
-                }
+                MockChain::replace_spend(&mut s, at, &parsed)?;
                 s.spends.insert(*at, tx.txid);
-                *s.balances.entry(to.clone()).or_default() += amount.0 - MOCK_FEE.0;
+                let (_, out) = parsed.fee_and_out().expect("a spend");
+                *s.balances.entry(to.clone()).or_default() += out;
             }
         }
         s.txs.insert(tx.txid, (parsed, None));
