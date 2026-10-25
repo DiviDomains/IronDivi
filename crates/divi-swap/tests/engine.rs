@@ -15,7 +15,7 @@ use divi_swap::mock::{MockBackend, MockChain};
 use divi_swap::store::{MakerRecord, TakerRecord};
 use divi_swap::{
     Amount, Chain, ChainBackend, Funding, HtlcParams, LockedOutput, Maker, Outpoint, Profile,
-    Result, SignedTx, SpendInfo, Store, SwapConfig, SwapState, Taker, TakerState, Txid,
+    Result, SignedTx, SpendInfo, Store, SwapConfig, SwapError, SwapState, Taker, TakerState, Txid,
 };
 use proptest::prelude::*;
 use std::path::PathBuf;
@@ -2085,4 +2085,119 @@ both!(
     claimed_after_maker_refund_refund_only,
     rev_claimed_after_maker_refund_refund_only,
     claimed_after_maker_refund_refund_only_body
+);
+
+/// The loss the taker can only detect, not undo: its maker-leg claim reveals the preimage in
+/// the mempool and is evicted, the maker refunds the maker leg after its locktime and then
+/// claims the taker leg with the leaked preimage, before the taker-leg locktime. Both legs go
+/// to the maker. The taker must end `Lost` (error-level log naming the swap and both
+/// outpoints), never put a second spend of the taker leg on chain, and not re-sign its
+/// refused refund on every step forever.
+///
+/// Why moving `Claimed → Refunded` once the maker refunded (6420158) is safe: it needs a mined
+/// spend of the maker leg that carries no preimage, valid only after the maker-leg locktime,
+/// and the maker-leg locktime is earlier than the taker-leg one. Our refund is then built but
+/// stays premature until the taker-leg locktime; in that window the maker can claim the taker
+/// leg only with the preimage, i.e. only if a claim of ours leaked it. Without a leak our
+/// refund wins after the taker-leg locktime; with one the node refuses our refund as a double
+/// spend, so the move never makes a second spend of the taker leg, and `Lost` ends the
+/// retries.
+async fn lost_after_leaked_preimage_body(dir: Direction, refund_only: bool) {
+    let mut h = H::with(dir);
+    h.accept(None).await;
+    h.lock_and_notify(None).await;
+    drive_taker_to(&mut h, TakerState::Claimed).await;
+    let view = h.maker.view(&h.maker_id).unwrap();
+    h.taker.step(&h.taker_id, view.as_ref()).await.unwrap(); // the preimage is out
+    let t = h.store.get_taker_swap(&h.taker_id).unwrap().unwrap();
+    let (mhtlc, mat, mamount) = (
+        t.maker_leg_htlc.unwrap(),
+        t.maker_leg_outpoint.unwrap(),
+        t.maker_leg_amount.unwrap(),
+    );
+    let (thtlc, tf) = (
+        t.taker_leg_htlc.unwrap(),
+        t.taker_leg_funding.clone().unwrap(),
+    );
+    let (ml, tl) = (h.ml_chain().clone(), h.tl_chain().clone());
+    ml.forget(&t.maker_leg_claim.unwrap().txid); // evicted
+
+    // A hostile maker refunds its leg once the locktime allows...
+    ml.advance_time(mhtlc.locktime + 1 - ml.mtp());
+    let refund = h.m_ml().build_refund(&mhtlc, &mat, mamount).await.unwrap();
+    h.m_ml().broadcast(&refund).await.unwrap();
+    // ...and claims the taker leg with the preimage it saw, before the taker-leg locktime.
+    let claim = h
+        .m_tl()
+        .build_claim(&thtlc, &tf.outpoint, tf.amount, &t.preimage)
+        .await
+        .unwrap();
+    h.m_tl().broadcast(&claim).await.unwrap();
+    h.mine_all(1);
+    assert!(
+        tl.mtp() < thtlc.locktime,
+        "test setup: taker leg still locked"
+    );
+
+    let mut errors_when_lost = 0;
+    for round in 0..12 {
+        if round == 6 {
+            tl.advance_time(22_000); // past the taker-leg locktime too
+        }
+        let res = if refund_only {
+            h.taker.refund(&h.taker_id).await
+        } else {
+            let view = h.maker.view(&h.maker_id).unwrap();
+            h.taker.step(&h.taker_id, view.as_ref()).await
+        };
+        if h.taker_state() == TakerState::Lost && res.is_err() {
+            errors_when_lost += 1;
+        }
+        h.mine_all(1);
+    }
+    let t = h.store.get_taker_swap(&h.taker_id).unwrap().unwrap();
+    assert_eq!(t.state, TakerState::Lost, "last error: {:?}", t.last_error);
+    assert!(t.state.is_terminal());
+    assert_eq!(errors_when_lost, 0, "a Lost swap keeps failing");
+    assert!(
+        t.taker_leg_refund.is_none(),
+        "no refund is kept for resending"
+    );
+    assert!(t.last_error.as_deref().unwrap_or("").starts_with("lost"));
+    let c = tl.tx_counts(&tf.outpoint);
+    assert_eq!(
+        (c.claims, c.refunds),
+        (1, 0),
+        "one spend, the maker's: {c:?}"
+    );
+    assert!(c.refund_attempts <= 1, "{c:?}");
+    let c = ml.tx_counts(&mat);
+    assert_eq!((c.claims, c.refunds), (0, 1), "{c:?}");
+    // Once Lost, nothing is sent again.
+    let before = tl.tx_counts(&tf.outpoint);
+    let view = h.maker.view(&h.maker_id).unwrap();
+    assert_eq!(
+        h.taker.step(&h.taker_id, view.as_ref()).await.unwrap(),
+        TakerState::Lost
+    );
+    assert_eq!(h.taker.refund(&h.taker_id).await.unwrap(), TakerState::Lost);
+    assert_eq!(tl.tx_counts(&tf.outpoint), before);
+}
+
+async fn lost_after_leaked_preimage_steps_body(dir: Direction) {
+    lost_after_leaked_preimage_body(dir, false).await
+}
+both!(
+    lost_after_leaked_preimage_steps,
+    rev_lost_after_leaked_preimage_steps,
+    lost_after_leaked_preimage_steps_body
+);
+
+async fn lost_after_leaked_preimage_refund_only_body(dir: Direction) {
+    lost_after_leaked_preimage_body(dir, true).await
+}
+both!(
+    lost_after_leaked_preimage_refund_only,
+    rev_lost_after_leaked_preimage_refund_only,
+    lost_after_leaked_preimage_refund_only_body
 );

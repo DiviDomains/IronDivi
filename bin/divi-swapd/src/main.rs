@@ -1419,6 +1419,30 @@ mod tests {
     }
 
     #[test]
+    fn a_lost_taker_swap_is_terminal_listed_as_lost_and_releasable() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("swaps.db");
+        Store::open(&db)
+            .unwrap()
+            .put_taker_swap(&taker_lock_swap("tlost", divi_swap::TakerState::Lost, 0x53))
+            .unwrap();
+        InputReservations::open(&db)
+            .unwrap()
+            .reserve(Chain::Btc, &divi_swap::Txid([0x53; 32]), &[op(7, 0)])
+            .unwrap();
+        let cfg = inflight_cfg(&db, false);
+        let out = reservations_report(&cfg).unwrap();
+        assert!(out.contains("\ttlost\tlost\n"), "{out}");
+        let out = release_reservation(&cfg, Chain::Btc, &hex_of(0x53), true).unwrap();
+        assert!(out.released);
+        assert!(
+            out.text.contains("swap tlost (lost, terminal)"),
+            "{}",
+            out.text
+        );
+    }
+
+    #[test]
     fn reservations_list_shows_the_real_taker_state() {
         let dir = tempfile::tempdir().unwrap();
         let db = taker_reserved_db(dir.path());

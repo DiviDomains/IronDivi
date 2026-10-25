@@ -27,7 +27,7 @@ use crate::config::{
 use crate::error::{Result, SwapError};
 use crate::htlc::{new_preimage, HtlcParams};
 use crate::store::{Store, TakerRecord};
-use crate::types::Chain;
+use crate::types::{Chain, SpendInfo};
 
 /// The taker stops claiming the maker leg this many seconds before the maker's locktime: a claim
 /// that confirms after the maker refunds would lose the maker leg while revealing the preimage.
@@ -55,6 +55,11 @@ pub enum TakerState {
     Refunded,
     /// Finished.
     Done,
+    /// Both legs went to the maker: our maker-leg claim revealed the preimage but never
+    /// confirmed (e.g. evicted from the mempool), the maker refunded the maker leg and then
+    /// claimed the taker leg with the preimage. Nothing is left to spend; logged at error
+    /// level with both outpoints.
+    Lost,
 }
 
 impl TakerState {
@@ -71,14 +76,18 @@ impl TakerState {
     ///   confirms (`Done`), unless the maker refunded its leg first (`Refunded`).
     /// - `Refunded`: not terminal. The refund is only built and broadcast from here, and
     ///   still owed until it confirms (`Done`); the taker leg stays funded and spendable
-    ///   by the refund.
+    ///   by the refund, unless the maker claimed it with a leaked preimage (`Lost`).
     /// - `Done`: terminal. Reached from `Claimed` or `Refunded` once the claim or refund
     ///   confirmed; `step` and `refund` return at once and nothing else leaves it.
+    /// - `Lost`: terminal. Reached from `Refunded` once a claim of the taker leg that
+    ///   carries our preimage is buried as deep as the quote's confirmations on that
+    ///   chain: the refund can never confirm, so it is not re-signed or sent again;
+    ///   `step` and `refund` return at once and nothing else leaves it.
     ///
     /// The `match` is exhaustive on purpose: a new variant must be decided here.
     pub fn is_terminal(self) -> bool {
         match self {
-            TakerState::Done => true,
+            TakerState::Done | TakerState::Lost => true,
             TakerState::Prepared
             | TakerState::Accepted
             | TakerState::Locked
@@ -270,7 +279,7 @@ impl Taker {
     pub async fn step(&self, local_id: &str, maker: Option<&SwapView>) -> Result<TakerState> {
         let _g = self.gate.lock().await;
         let mut r = self.load(local_id)?;
-        if r.state == TakerState::Done {
+        if r.state.is_terminal() {
             return Ok(r.state);
         }
         let had_error = r.last_error.take().is_some();
@@ -298,7 +307,7 @@ impl Taker {
     pub async fn refund(&self, local_id: &str) -> Result<TakerState> {
         let _g = self.gate.lock().await;
         let mut r = self.load(local_id)?;
-        if r.state == TakerState::Done {
+        if r.state.is_terminal() {
             return Ok(r.state);
         }
         let had_error = r.last_error.take().is_some();
@@ -321,7 +330,7 @@ impl Taker {
 
     /// [`Taker::refund`]'s state machine: `Locked`/`MakerLockConfirmed` only ever move to
     /// `Refunded` (never `Claimed`), and only once the taker leg is actually refundable;
-    /// `Refunded` drives the refund to `Done` the same way [`Taker::advance`] does;
+    /// `Refunded` drives the refund to `Done` (or `Lost`) the same way [`Taker::advance`] does;
     /// `Claimed` moves to `Refunded` only once the maker has refunded its leg (nothing is
     /// left to claim); every other state is left exactly as it is.
     async fn advance_refund_only(&self, r: &mut TakerRecord) -> Result<Flow> {
@@ -341,7 +350,8 @@ impl Taker {
             TakerState::Prepared
             | TakerState::Accepted
             | TakerState::Claimed
-            | TakerState::Done => Ok(Flow::Idle),
+            | TakerState::Done
+            | TakerState::Lost => Ok(Flow::Idle),
         }
     }
 
@@ -388,7 +398,9 @@ impl Taker {
 
     async fn advance(&self, r: &mut TakerRecord, maker: Option<&SwapView>) -> Result<Flow> {
         match r.state {
-            TakerState::Prepared | TakerState::Accepted | TakerState::Done => Ok(Flow::Idle),
+            TakerState::Prepared | TakerState::Accepted | TakerState::Done | TakerState::Lost => {
+                Ok(Flow::Idle)
+            }
             TakerState::Locked => self.on_locked(r, maker).await,
             TakerState::MakerLockConfirmed => self.on_maker_lock_confirmed(r).await,
             TakerState::Claimed => self.on_claimed(r).await,
@@ -414,6 +426,35 @@ impl Taker {
             return Ok(false);
         };
         Ok(spend.height.is_some() && spend.extract_preimage(&r.hash).is_none())
+    }
+
+    /// The maker's claim of the taker leg, if one that carries our preimage is buried at
+    /// least as deep as the quote asks on that chain. Our refund can then never confirm: the
+    /// preimage went out with a maker-leg claim of ours that never confirmed, and the maker
+    /// spent both legs.
+    async fn taker_leg_lost(&self, r: &TakerRecord) -> Result<Option<SpendInfo>> {
+        let Some(f) = &r.taker_leg_funding else {
+            return Ok(None);
+        };
+        let tb = self.tk(r)?;
+        let Some(confs) = tb
+            .confirmations(&f.outpoint.txid)
+            .await?
+            .filter(|&c| c >= 1)
+        else {
+            return Ok(None);
+        };
+        let tip = tb.tip_height().await?;
+        let Some(spend) = tb
+            .find_spend(&f.outpoint, (tip + 1).saturating_sub(confs as u64))
+            .await?
+        else {
+            return Ok(None);
+        };
+        let deep = spend
+            .height
+            .is_some_and(|h| tip + 1 - h >= r.quote.confirmations_on(r.quote.taker_chain()) as u64);
+        Ok((deep && spend.extract_preimage(&r.hash).is_some()).then_some(spend))
     }
 
     async fn taker_leg_refundable(&self, r: &TakerRecord) -> Result<bool> {
@@ -581,6 +622,24 @@ impl Taker {
     }
 
     async fn on_refunded(&self, r: &mut TakerRecord) -> Result<Flow> {
+        if let Some(spend) = self.taker_leg_lost(r).await? {
+            // Without this the refund is refused for good on every step and re-signed
+            // forever.
+            tracing::error!(
+                swap = %r.id,
+                taker_leg = ?r.taker_leg_funding.as_ref().map(|f| f.outpoint),
+                maker_leg = ?r.maker_leg_outpoint,
+                maker_claim = %spend.txid,
+                "swap lost: the maker claimed the taker leg with our preimage and our \
+                 maker-leg claim never confirmed; nothing is left to refund or claim"
+            );
+            r.taker_leg_refund = None;
+            r.last_error = Some(format!(
+                "lost: the taker leg was claimed by {} with our preimage",
+                spend.txid
+            ));
+            return self.enter(r, TakerState::Lost);
+        }
         let refund = match r.taker_leg_refund.clone() {
             Some(tx) => tx,
             None => {
@@ -641,7 +700,7 @@ mod terminal_tests {
             | TakerState::MakerLockConfirmed
             | TakerState::Claimed
             | TakerState::Refunded => false,
-            TakerState::Done => true,
+            TakerState::Done | TakerState::Lost => true,
         }
     }
 
@@ -655,11 +714,12 @@ mod terminal_tests {
             TakerState::Claimed,
             TakerState::Refunded,
             TakerState::Done,
+            TakerState::Lost,
         ];
         for s in all {
             assert_eq!(s.is_terminal(), verdict(s), "{s:?}");
         }
-        // Refunded still owes its refund broadcast, so only Done is terminal.
-        assert_eq!(all.iter().filter(|s| s.is_terminal()).count(), 1);
+        // Refunded still owes its refund broadcast, so only Done and Lost are terminal.
+        assert_eq!(all.iter().filter(|s| s.is_terminal()).count(), 2);
     }
 }
