@@ -611,16 +611,19 @@ def maturity_explains(n, mid_heights):
         values = []
         for txid in theirs - mine:
             if not spends_immature(pair, other, txid, next_height):
+                log(f"#   maturity rule: {pair.name} node {n} lacks {txid[:8]}, not immature at {next_height}")
                 return False
             tx = other.call("getrawtransaction", txid, 1)
             values.append(sorted(str(o["value"]) for o in tx[1]["vout"]) if tx[0] == "ok" else [])
         for txid in mine:
             if spends_immature(pair, node, txid, next_height):
+                log(f"#   maturity rule: {pair.name} node {n} holds {txid[:8]}, immature at {next_height}")
                 return False
         dropped.append(sorted(values))
     # explained only when the two sides dropped different transactions (each
     # spent a different coin); the same drops on both sides leave nothing to
     # explain a difference
+    log(f"#   maturity rule: dropped {dropped}")
     return bool(dropped[0] or dropped[1]) and dropped[0] != dropped[1]
 
 
