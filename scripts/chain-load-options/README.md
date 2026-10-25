@@ -80,7 +80,7 @@ The rows `log lines naming -<option>` compare each line that names the option, a
 | `-checklevel` | any value refused: "Error: Unsupported argument -checklevel found. Checklevel must be level 4." (`init.cpp:783-784`) |
 | `-checkpoints` | only in the help (`LicenseAndInfo.cpp:165`); no code reads it, nothing logged |
 | `-dbcache` | MiB, clamped to 4..4096, split between the block tree, coin database and coin cache, nothing logged (`init.cpp:1030`, `:1046-1056`) |
-| `-par=<n>` | script-check threads: n, or the cores plus n for 0 and below; 1 or fewer is none; at most 16; nothing logged (`TransactionInputChecker.cpp:16-26`, `init.cpp:801`) |
+| `-par=<n>` | script-check threads: n, or the cores plus n for 0 and below; 1 or fewer is none; at most 16; no line names `-par`, the count is in "Using \<n\> threads for script verification" (`TransactionInputChecker.cpp:16-26`, `init.cpp:801`, `:965`; compared in `scripts/start-checks`) |
 | `-prune`, `-blocksonly`, `-stopatheight`, `-assumevalid` | not divid 3.0.0 options: kept and never read, nothing logged (`Settings.cpp:130-150`) |
 
 ## KNOWN
