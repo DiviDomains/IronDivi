@@ -135,25 +135,15 @@ async fn whitelisted_peer_comes_in_though_banned() {
 /// listen address are not
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn whitebind_peers_are_whitelisted() {
-    let white_port = divi_test_support::free_port();
-    let t = TestNode::start_with(|c| {
-        c.p2p.white_bind = vec![std::net::SocketAddr::from(([127, 0, 0, 1], white_port))];
-    })
-    .await;
-    // The -whitebind listener comes up on a task of its own
-    let stream = tokio::time::timeout(divi_test_support::START_WAIT, async {
-        loop {
-            let socket = tokio::net::TcpSocket::new_v4().unwrap();
-            socket.bind("127.0.0.4:0".parse().unwrap()).unwrap();
-            let to = std::net::SocketAddr::from(([127, 0, 0, 1], white_port));
-            match socket.connect(to).await {
-                Ok(stream) => break stream,
-                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
-            }
-        }
-    })
-    .await
-    .expect("the -whitebind address listens");
+    let (t, white_port) = TestNode::start_with_white_bind(|_| {}).await;
+    // Node::start bound the -whitebind listener, so one connect takes
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.4:0".parse().unwrap()).unwrap();
+    let to = std::net::SocketAddr::from(([127, 0, 0, 1], white_port));
+    let stream = tokio::time::timeout(WAIT, socket.connect(to))
+        .await
+        .expect("the -whitebind address answers in time")
+        .expect("the -whitebind address listens");
     let mut white = RawPeer {
         stream,
         ip: "127.0.0.4".parse().unwrap(),
@@ -173,15 +163,19 @@ async fn whitebind_peers_are_whitelisted() {
 /// again with no backoff (ThreadOpenConnections, net.cpp:1094-1105)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_connect_peer_that_comes_up_later_is_dialled() {
-    let peer_port = divi_test_support::free_port();
+    // A bound socket that does not listen yet refuses connects, and no other process
+    // can take its port: the peer is "down" until listen() is called on it
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket
+        .bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+        .unwrap();
+    let peer_port = socket.local_addr().unwrap().port();
     let t = TestNode::start_with(|c| {
         c.p2p.connect = vec![format!("127.0.0.1:{peer_port}")];
     })
     .await;
     tokio::time::sleep(std::time::Duration::from_secs(4)).await;
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", peer_port))
-        .await
-        .unwrap();
+    let listener = socket.listen(16).unwrap();
     let dialled = tokio::time::timeout(std::time::Duration::from_secs(12), listener.accept()).await;
     assert!(
         dialled.is_ok(),
