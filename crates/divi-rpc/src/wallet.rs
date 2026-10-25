@@ -1854,6 +1854,16 @@ impl WalletRpc {
         plan: &SendPlan,
         change_to: ChangeTo,
     ) -> Result<Hash256, Error> {
+        // Divi Core reserves a change key on every send that has no change
+        // address of its own (wallet.cpp:1786, :1909-1910), which tops the
+        // keypool up when the wallet is not locked (wallet.cpp:2129-2130), and
+        // returns the key when no change is needed (:1813-1816): so a send
+        // without change still leaves the keypool full
+        if plan.change.is_none() && matches!(change_to, ChangeTo::NewKey) {
+            if let Err(e) = wallet.top_up_keypool() {
+                debug!("Keypool not topped up for a send without change: {}", e);
+            }
+        }
         let mut builder = TransactionBuilder::new();
         for utxo in &plan.inputs {
             builder = builder.add_input(utxo.outpoint(), utxo.script_pubkey.clone());
