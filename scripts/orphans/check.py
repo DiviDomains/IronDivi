@@ -437,9 +437,18 @@ def log_since(node, mark):
     path = log_path(node)
     if not path:
         return ""
+    start = mark[1] if mark[0] == path else 0
+    text = b""
+    # irondivid keeps 1 MiB per log file and renames a full one to debug.log.1: when the
+    # file is smaller than the mark, the rest of the old file comes first
+    if os.path.getsize(path) < start and os.path.exists(path + ".1"):
+        with open(path + ".1", "rb") as f:
+            f.seek(start)
+            text = f.read()
+        start = 0
     with open(path, "rb") as f:
-        f.seek(mark[1] if mark[0] == path else 0)
-        return f.read().decode(errors="replace")
+        f.seek(start)
+        return (text + f.read()).decode(errors="replace")
 
 
 # The -debug=mempool lines of OrphanTransactions.cpp and main.cpp:743-793

@@ -46,6 +46,7 @@ a transaction to carry, A sent one before it staked.
 | treasury block 150 | the treasury paid one satoshi less and more, paid to another address, left out; the charity left out |
 | lottery block (first from 170 with winners) | the first winner paid one satoshi less, paid to another address; the last winner left out |
 | side chain | 15 of the above built on the tip block's parent, so the node holds them as a side chain |
+| side chain with a bad proof | a sibling of the tip block whose coinstake signature is damaged, then two blocks built on it so that this side chain would be the longer; per block: the reject, the connection, the tip, whether the node asks the sender for blocks (a new peer is first given 2 s to be sent what a node sends it unasked); then whether each block is held (`getblock`), what `getchaintips` gained, and whether another peer was told of any of them |
 
 A masternode payee rule is not active: DeprecateMasternodes holds from 2023-08-23 on every network
 (`BlockConnectionService.cpp:321-326`).
@@ -63,3 +64,11 @@ script offers the two-transaction form so the comparison can go on.
 On regtest the stake target is easy, so changing a block's time, which the kernel hashes, leaves the proof valid about
 half the time. A time case therefore draws divid's `reject` when the proof still holds and none when it does not;
 irondivid does the same, since it checks the proof first, as divid does.
+
+## KNOWN: a side-chain block that stakes a coin only its own branch made
+
+divid refuses a block of a side chain whose coinstake stakes a coin that no connected block made: its proof is read
+from the transaction index, which holds only the blocks it has connected (`TransactionDiskAccessor.cpp:56-72`,
+`BlockProofVerifier.cpp:56-57`), and the block is not stored. irondivid keeps it until the branch is connected, so that
+a fork that restakes its own coins can be followed (`crates/divi-network` `test_deep_side_chain_reorg_across_inv_batches`).
+The row `unknown-coin side chain: the sibling is held` shows it as KNOWN.
