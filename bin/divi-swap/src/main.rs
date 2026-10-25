@@ -681,7 +681,7 @@ fn unix_now() -> u32 {
 /// ([`divi_swap_cli::reservations::release_finished`]), then those of every lock past its
 /// swap's deadline that `counter`, fresh at wall-clock `now`, has found in no mempool and no
 /// block on two checks [`divi_swap::reservation::EXPIRY_ABSENT_BLOCKS`] blocks apart
-/// ([`InputReservations::release_expired_swaps`]; the first check's height is kept in
+/// ([`InputReservations::release_expired_swaps`]; the first check's block is kept in
 /// `--db`, so the second can come from a later command). Run before each taker command (a
 /// swap that finished, or a lock that expired, since the last one) and after each command
 /// that can finish a swap, whether or not that command succeeded. A failure only warns: an

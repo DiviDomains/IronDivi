@@ -508,15 +508,53 @@ impl ChainBackend for LtcBackend {
         divi_swap::backend::normalize_block_hash(&self.tip_hash_raw().await?)
     }
 
-    async fn tip_time(&self) -> Result<u32> {
-        let hash = self.tip_hash_raw().await?;
-        let block = self.get_json(&format!("/block/{}", hash.trim())).await?;
-        block["timestamp"]
-            .as_u64()
-            .map(|t| t as u32)
-            .ok_or_else(|| {
-                SwapError::Transient("block JSON lacks timestamp (still indexing?)".into())
+    /// Esplora `GET /blocks/tip/hash` ("the hash of the last block"), then `GET /block/:hash`
+    /// for that block's `height`, `timestamp` and `id` (Blockstream esplora `API.md`). Height
+    /// and time come from the one block whose hash was read, so a tip that moves between
+    /// the two requests cannot mix two blocks; a block whose `id` is not the hash asked for
+    /// is a transient error.
+    async fn tip_header(&self) -> Result<divi_swap::backend::TipHeader> {
+        let hash = divi_swap::backend::normalize_block_hash(&self.tip_hash_raw().await?)?;
+        let block = self.get_json(&format!("/block/{hash}")).await?;
+        let id = block["id"]
+            .as_str()
+            .ok_or_else(|| SwapError::Transient("block JSON lacks id (still indexing?)".into()))
+            .and_then(divi_swap::backend::normalize_block_hash)?;
+        if id != hash {
+            return Err(SwapError::Transient(format!(
+                "asked for block {hash}, got {id}"
+            )));
+        }
+        let field = |name: &str| {
+            block[name].as_u64().ok_or_else(|| {
+                SwapError::Transient(format!("block JSON lacks {name} (still indexing?)"))
             })
+        };
+        Ok(divi_swap::backend::TipHeader {
+            height: field("height")?,
+            hash,
+            time: field("timestamp")? as u32,
+        })
+    }
+
+    /// Esplora `GET /block/:hash/status`: `in_best_chain` is "false for orphaned blocks"
+    /// (Blockstream esplora `API.md`). A status whose `height` is not `height` is a transient
+    /// error, as is one without `in_best_chain`. Esplora may also answer `false` (or 404, an
+    /// error here) for a hash it never saw; the expiry sweep only asks about a block at or
+    /// below a tip it has already accepted from this chain.
+    async fn in_best_chain(&self, height: u64, hash: &str) -> Result<bool> {
+        let hash = divi_swap::backend::normalize_block_hash(hash)?;
+        let status = self.get_json(&format!("/block/{hash}/status")).await?;
+        let best = status["in_best_chain"]
+            .as_bool()
+            .ok_or_else(|| SwapError::Transient("block status JSON lacks in_best_chain".into()))?;
+        if best && status["height"].as_u64() != Some(height) {
+            return Err(SwapError::Transient(format!(
+                "block {hash} is in the best chain at {}, not {height}",
+                status["height"]
+            )));
+        }
+        Ok(best)
     }
 
     fn target_block_secs(&self) -> Option<u32> {

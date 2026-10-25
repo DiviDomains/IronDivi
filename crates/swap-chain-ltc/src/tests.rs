@@ -1163,3 +1163,96 @@ async fn claims_and_refunds_are_never_reserved_or_blocked_by_the_store() {
     assert_eq!(posts(&server.received_requests().await.unwrap()), 1);
     rm_db(&db);
 }
+
+const TIP_A: &str = "00000000000000000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const TIP_B: &str = "00000000000000000001bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+/// The tip moves between the reads: `/blocks/tip/height` already says 101, while the hash
+/// read first names block 100. Height and time both come from block 100.
+#[tokio::test]
+async fn tip_header_takes_height_and_time_from_the_block_whose_hash_it_read() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/blocks/tip/height"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("101"))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/blocks/tip/hash"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(TIP_A.to_uppercase()))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/block/{TIP_A}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": TIP_A, "height": 100, "timestamp": 1_790_000_000u64,
+            "mediantime": 1_789_998_000u64
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/block/{TIP_B}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": TIP_B, "height": 101, "timestamp": 1_790_000_600u64,
+            "mediantime": 1_789_998_600u64
+        })))
+        .mount(&server)
+        .await;
+    let b = backend(vec![server.uri()], MAKER_KEY);
+    assert_eq!(b.tip_height().await.unwrap(), 101);
+    assert_eq!(
+        b.tip_header().await.unwrap(),
+        divi_swap::backend::TipHeader {
+            height: 100,
+            hash: TIP_A.into(),
+            time: 1_790_000_000,
+        }
+    );
+}
+
+/// A block answer for some other hash (a confused proxy) is not the tip's header.
+#[tokio::test]
+async fn tip_header_refuses_a_block_whose_id_is_not_the_tip_hash() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/blocks/tip/hash"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(TIP_A))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/block/{TIP_A}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": TIP_B, "height": 101, "timestamp": 1_790_000_600u64
+        })))
+        .mount(&server)
+        .await;
+    let b = backend(vec![server.uri()], MAKER_KEY);
+    assert!(matches!(
+        b.tip_header().await.unwrap_err(),
+        SwapError::Transient(_)
+    ));
+}
+
+#[tokio::test]
+async fn in_best_chain_reads_the_block_status() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/block/{TIP_A}/status")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "in_best_chain": true, "height": 100, "next_best": TIP_B
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/block/{TIP_B}/status")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"in_best_chain": false})))
+        .mount(&server)
+        .await;
+    let b = backend(vec![server.uri()], MAKER_KEY);
+    assert!(b.in_best_chain(100, TIP_A).await.unwrap());
+    assert!(!b.in_best_chain(101, TIP_B).await.unwrap(), "orphaned");
+    assert!(
+        b.in_best_chain(99, TIP_A).await.is_err(),
+        "on the best chain at another height"
+    );
+}

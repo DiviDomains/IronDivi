@@ -20,13 +20,14 @@ pub mod tx;
 use async_trait::async_trait;
 use secp256k1::{All, Secp256k1, SecretKey};
 
+use divi_swap::backend::TipHeader;
 use divi_swap::{
     Amount, Chain, ChainBackend, Funding, HtlcParams, InputReservations, LockedOutput, Outpoint,
     SignedTx, SpendInfo, SwapError, Txid,
 };
 
 use address::TransparentAddress;
-use grpc::{ClientError, CompactBlock, LightwalletdClient};
+use grpc::{BlockId, ClientError, CompactBlock, LightwalletdClient};
 
 pub use grpc::RetryPolicy;
 
@@ -431,16 +432,30 @@ impl ChainBackend for ZecBackend {
         display_block_hash(&tip.hash)
     }
 
-    async fn tip_time(&self) -> Result<u32> {
-        let tip = self.tip_height().await?;
-        let blocks = self
+    /// lightwalletd `GetLatestBlock` (the tip's height and hash), then `GetBlock` at that
+    /// height for its time ([`tip_header_from`]). `GetBlock` takes a height only.
+    async fn tip_header(&self) -> Result<TipHeader> {
+        let latest = self.client.latest_block().await.map_err(SwapError::from)?;
+        let block = self
             .client
-            .block_range(tip, tip)
+            .block(latest.height)
             .await
             .map_err(SwapError::from)?;
-        blocks.last().map(|b| b.time).ok_or_else(|| {
-            SwapError::Transient(format!("lightwalletd returned no block at tip {tip}"))
-        })
+        tip_header_from(&latest, &block)
+    }
+
+    /// lightwalletd `GetBlock` at `height`: `hash` is on the main chain of the endpoint
+    /// that answered iff that block's hash is `hash`. A block without a hash is an error,
+    /// never "not on the main chain".
+    async fn in_best_chain(&self, height: u64, hash: &str) -> Result<bool> {
+        let block = self.client.block(height).await.map_err(SwapError::from)?;
+        if block.height != height {
+            return Err(SwapError::Transient(format!(
+                "lightwalletd GetBlock({height}) answered block {}",
+                block.height
+            )));
+        }
+        Ok(display_block_hash(&block.hash)? == hash.trim().to_ascii_lowercase())
     }
 
     fn target_block_secs(&self) -> Option<u32> {
@@ -672,6 +687,29 @@ impl ChainBackend for ZecBackend {
     }
 }
 
+/// The tip header from `GetLatestBlock`'s `latest` and `GetBlock(latest.height)`'s `block`.
+/// Both name the block by height and by little-endian hash (lightwalletd's
+/// `GetLatestBlock` reverses zcashd's `getbestblockhash` hex, and `CompactBlock.hash` is
+/// the block's wire-order hash), so a `block` whose height or hash differs means the tip
+/// moved, or another endpoint answered with another chain, between the two reads: a
+/// transient error, never a header mixing two blocks.
+fn tip_header_from(latest: &BlockId, block: &CompactBlock) -> Result<TipHeader> {
+    if block.height != latest.height || block.hash != latest.hash {
+        return Err(SwapError::Transient(format!(
+            "lightwalletd tip moved between reads: GetLatestBlock said {} {}, GetBlock answered {} {}",
+            latest.height,
+            hex::encode(&latest.hash),
+            block.height,
+            hex::encode(&block.hash)
+        )));
+    }
+    Ok(TipHeader {
+        height: block.height,
+        hash: display_block_hash(&block.hash)?,
+        time: block.time,
+    })
+}
+
 /// `BlockID.hash` from lightwalletd is the 32-byte hash in internal (wire) order; explorers
 /// show it byte-reversed. Returns the explorer form: 64 lowercase hex characters.
 fn display_block_hash(wire: &[u8]) -> Result<String> {
@@ -802,6 +840,36 @@ mod tests {
         assert_eq!(display_block_hash(&wire).unwrap(), explorer);
     }
 
+    /// GetLatestBlock named block 100 (hash A); by the GetBlock read the tip moved to 101.
+    /// GetBlock(100) still answers block 100, so its time is block 100's. A different block
+    /// at that height (another endpoint, a reorg) is refused.
+    #[test]
+    fn tip_header_takes_its_time_from_the_block_get_latest_block_named() {
+        let a = vec![0xaa; 32];
+        let latest = BlockId {
+            height: 100,
+            hash: a.clone(),
+        };
+        let block = |height, hash: &[u8], time| CompactBlock {
+            height,
+            hash: hash.to_vec(),
+            time,
+            vtx: Vec::new(),
+        };
+        assert_eq!(
+            tip_header_from(&latest, &block(100, &a, 1_790_000_000)).unwrap(),
+            TipHeader {
+                height: 100,
+                hash: "aa".repeat(32),
+                time: 1_790_000_000,
+            }
+        );
+        for bad in [block(100, &[0xbb; 32], 1), block(101, &a, 1)] {
+            let err = tip_header_from(&latest, &bad).unwrap_err();
+            assert!(matches!(err, SwapError::Transient(_)), "{err:?}");
+        }
+    }
+
     #[test]
     fn display_block_hash_rejects_wrong_length() {
         for bad in [&[][..], &[0u8; 31][..], &[0u8; 33][..]] {
@@ -899,6 +967,7 @@ mod tests {
         // The compact block only carries prevout/index, as the real API would.
         let block = CompactBlock {
             height: 500,
+            hash: vec![0x55; 32],
             time: 1_900_000_100,
             vtx: vec![CompactTx {
                 index: 1,
