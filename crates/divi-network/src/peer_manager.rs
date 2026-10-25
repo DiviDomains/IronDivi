@@ -228,6 +228,9 @@ pub struct PeerManager {
     static_peer_backoff: RwLock<HashMap<SocketAddr, (u32, Instant)>>,
     /// Reads the current chain height for version messages (set by the node)
     height_source: RwLock<Option<HeightSource>>,
+    /// The node's active spork count, which an inbound peer is told after its
+    /// version (main.cpp:417-419)
+    spork_count_source: RwLock<Option<HeightSource>>,
     /// Listeners bound before the node starts (bind_listeners): address,
     /// whether its peers are whitelisted, socket. None until bound.
     prebound: parking_lot::Mutex<Option<Vec<(SocketAddr, bool, TcpListener)>>>,
@@ -271,6 +274,7 @@ impl PeerManager {
             total_bytes_recv: Arc::new(AtomicU64::new(0)),
             static_peer_backoff: RwLock::new(HashMap::new()),
             height_source: RwLock::new(None),
+            spork_count_source: RwLock::new(None),
             prebound: parking_lot::Mutex::new(None),
             inbound_handshaking: AtomicUsize::new(0),
             address_book: Arc::new(crate::addrbook::AddressBook::new(config_magic)),
@@ -505,6 +509,11 @@ impl PeerManager {
     /// Divi Core reads its chain height in each PushVersion (Node.cpp:994)
     pub fn set_height_source(&self, source: HeightSource) {
         *self.height_source.write() = Some(source);
+    }
+
+    /// Read the spork count an inbound peer is told from `source`
+    pub fn set_spork_count_source(&self, source: HeightSource) {
+        *self.spork_count_source.write() = Some(source);
     }
 
     /// The height a new version message names
@@ -1097,7 +1106,10 @@ impl PeerManager {
         .await;
 
         let (conn, handle) = match result {
-            Ok(r) => r,
+            Ok((conn, handle)) => (
+                conn.with_spork_count(self.spork_count_source.read().clone()),
+                handle,
+            ),
             Err(e) => {
                 self.connecting_addrs.write().remove(&addr);
                 return Err(e);
@@ -1255,6 +1267,7 @@ impl PeerManager {
             self.local_addresses(),
         )
         .await?;
+        let conn = conn.with_spork_count(self.spork_count_source.read().clone());
 
         let peer_id = handle.id;
         let addr = handle.addr;
