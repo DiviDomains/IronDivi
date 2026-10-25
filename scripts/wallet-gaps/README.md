@@ -52,7 +52,7 @@ None of these is printed. `WALLET_GAPS_INJECT=<row name>` makes that row differ,
 | `addvault` of a funding still in the mempool, then once mined | rpcwallet.cpp:1280-1290. |
 | `fundvault {<owner:manager>: 3}`, `{…: {"amount": 2, "repetitions": 2}}`, `{…: {"amount": "x"}}`, `{…: [1]}` | The object form (rpcwallet.cpp:989-1036): one output, two, -8 `Unable to parse amount for: <enc>`, -8 `Unknown json input. Unable to parse input for <enc>`. |
 | `sendmany` while locked, and unlocked for staking only | -13 (EnsureWalletIsUnlocked). |
-| `walletpassphrase <wrong> 60` while fully unlocked, then the status | divid returns before it checks the passphrase (wallet.cpp:781-784). **KNOWN**, below. |
+| `walletpassphrase <wrong> 60` while fully unlocked, then the status | divid returns before it checks the passphrase, and the wallet stays unlocked (wallet.cpp:781-784). |
 | `walletpassphrase <passphrase> 60 true` while fully unlocked, then the status | Unlocked for staking only. |
 | `walletpassphrasechange` while unlocked, then the status | Changed; still unlocked (wallet.cpp:843-844). |
 | `walletpassphrase <passphrase> 0`: the status 3 s later, and `unlocked_until` | Never locks again; `unlocked_until` is the time of the unlock (rpcserver.cpp:1201-1235). |
@@ -63,6 +63,4 @@ None of these is printed. `WALLET_GAPS_INJECT=<row name>` makes that row differ,
 
 ## KNOWN
 
-| row | difference | why |
-|---|---|---|
-| `fully unlocked: walletpassphrase <wrong> 60` | divid answers `null`: on a wallet already fully unlocked, Unlock returns true without checking the passphrase (wallet.cpp:781-784), and the relock timer restarts. irondivid checks it, answers -14 `Error: The wallet passphrase entered was incorrect.` and leaves the unlock as it was. | A wrong passphrase never changes the wallet's lock state (docs/divid-differences.md R17). The row is KNOWN only with exactly those two replies (check.py `KNOWN`). |
+None: every row is compared as it is.

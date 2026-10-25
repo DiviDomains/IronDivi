@@ -37,12 +37,8 @@ RPC_TIMEOUT = 120
 START_TIMEOUT = 300
 EXIT_TIMEOUT = 180
 
-# Differences listed in README.md: (rows, reason, shape)
-UNCHECKED_UNLOCK = ("divid's walletpassphrase on a fully unlocked wallet returns before it checks the passphrase "
-                    "(wallet.cpp:781-784); irondivid checks it and answers -14 (docs/divid-differences.md R17)")
-KNOWN = [(lambda n: n == "fully unlocked: walletpassphrase <wrong> 60", UNCHECKED_UNLOCK,
-          lambda c, i: c == {"ok": None}
-          and i == {"error": -14, "message": "Error: The wallet passphrase entered was incorrect."})]
+# Differences listed in README.md: (rows, reason, shape); none at present
+KNOWN = []
 
 fails = 0
 
