@@ -523,24 +523,38 @@ fn tor_controller_advertises_the_onion_service() {
 }
 
 /// -torpassword goes to the control port quoted, with HASHEDPASSWORD
-/// (torcontrol.cpp:650-659); the value here is a fixed fake
+/// (torcontrol.cpp:650-659). The password is a throwaway made for the run and
+/// kept only in the datadir's 0600 divi.conf, never on the command line.
 #[test]
 fn torpassword_is_sent_for_hashedpassword() {
+    use std::hash::{BuildHasher, Hasher};
+    use std::os::unix::fs::OpenOptionsExt;
+    let random = || {
+        std::collections::hash_map::RandomState::new()
+            .build_hasher()
+            .finish()
+    };
+    let password = format!("{:016x}{:016x}", random(), random());
     let (control, seen) = tor_control_stand_in("HASHEDPASSWORD");
     let dir = tempfile::tempdir().unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(dir.path().join("divi.conf"))
+        .unwrap()
+        .write_all(format!("torpassword={password}\n").as_bytes())
+        .unwrap();
     let torcontrol = format!("-torcontrol=127.0.0.1:{control}");
-    let node = up(
-        dir.path(),
-        &[
-            "-listenonion=1",
-            torcontrol.as_str(),
-            "-torpassword=dummy-not-a-password",
-        ],
-    );
+    let node = up(dir.path(), &["-listenonion=1", torcontrol.as_str()]);
     assert!(wait_until(|| seen.lock().unwrap().len() >= 3, 30));
     drop(node);
     let got = seen.lock().unwrap().clone();
-    assert_eq!(got[1], r#"AUTHENTICATE "dummy-not-a-password""#);
+    // Compared without printing either line: one holds the password
+    assert!(
+        got[1] == format!(r#"AUTHENTICATE "{password}""#),
+        "AUTHENTICATE does not carry the configured password"
+    );
 }
 
 /// -listenonion is on by default but off under -listen=0 unless given
