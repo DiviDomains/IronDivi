@@ -590,12 +590,20 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     if let Some(p) = port("port") {
         config.p2p.port = p;
     }
-    if let Some(first) = s.get_multi("bind").first() {
+    // GetListenPort: -port, else the network's (net.cpp)
+    let listen_port = config.p2p.port;
+    let binds = s.get_multi("bind");
+    if let Some(first) = binds.first() {
         let (host, p) = host_and_port(first);
         config.p2p.listen_addr = host;
         if let Some(p) = p {
             config.p2p.port = p;
         }
+    }
+    // Every further -bind is listened on too, on its own port or the listen
+    // port (net.cpp:1809-1814)
+    for raw in binds.iter().skip(1) {
+        config.p2p.more_bind.push(bind_address(raw, listen_port)?);
     }
     if s.is_set("listen") {
         config.p2p.listen = Some(s.get_bool("listen", true));
@@ -889,6 +897,22 @@ fn option_warning(settings: &Settings, k: &str) -> Option<String> {
     } else {
         format!("Unknown option -{}; ignored", settings.written_name(k))
     })
+}
+
+/// A -bind value as Divi Core's Lookup reads it without name lookup: `ip`,
+/// `ip:port` or `[ipv6]:port`, `port` when none is given; else the start stops
+/// with "Cannot resolve -bind address" (net.cpp:1809-1813)
+fn bind_address(text: &str, port: u16) -> Result<std::net::SocketAddr> {
+    let text = text.trim();
+    text.parse::<std::net::SocketAddr>()
+        .ok()
+        .or_else(|| {
+            text.trim_matches(['[', ']'])
+                .parse::<std::net::IpAddr>()
+                .ok()
+                .map(|ip| std::net::SocketAddr::new(ip, port))
+        })
+        .ok_or_else(|| anyhow::anyhow!("Cannot resolve -bind address: '{}'", text))
 }
 
 /// A -whitebind value as Divi Core's Lookup reads it without name lookup:

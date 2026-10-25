@@ -79,6 +79,9 @@ pub struct PeerManagerConfig {
     /// More listen addresses; every peer coming in on one is whitelisted
     /// (Divi Core -whitebind)
     pub white_listen: Vec<SocketAddr>,
+    /// More listen addresses (the -bind addresses after the first), their
+    /// peers not whitelisted
+    pub more_listen: Vec<SocketAddr>,
     /// `-seednode` peers: each dialled once, asked for addresses and dropped
     /// after its answer, `-connect` or not (Divi Core AddOneShot,
     /// net.cpp:1071-1084, :1096, :1112, :1842-1843)
@@ -168,6 +171,7 @@ impl Default for PeerManagerConfig {
             connect_only: false,
             whitelist: Vec::new(),
             white_listen: Vec::new(),
+            more_listen: Vec::new(),
             seed_nodes: Vec::new(),
             dns_seed: true,
             force_dns_seed: false,
@@ -716,6 +720,19 @@ impl PeerManager {
         self.added_nodes.read().contains(addr)
     }
 
+    /// The addresses to listen on, each with whether its peers are
+    /// whitelisted: the listen address, the other -bind addresses, and each
+    /// -whitebind address, whose peers are (net.cpp:1808-1823)
+    fn listen_addresses(&self) -> Vec<(SocketAddr, bool)> {
+        self.config
+            .listen_addr
+            .iter()
+            .chain(self.config.more_listen.iter())
+            .map(|a| (*a, false))
+            .chain(self.config.white_listen.iter().map(|a| (*a, true)))
+            .collect()
+    }
+
     /// Bind the listeners before the node starts: the listen address and each
     /// -whitebind address. As Divi Core, an address that cannot be bound is
     /// reported ("Unable to bind to ... on this computer", net.cpp:1355-1365,
@@ -724,13 +741,7 @@ impl PeerManager {
     /// you want this.", net.cpp:1829-1831). Before, a listener that could not
     /// bind only logged it, and the node ran on without listening.
     pub async fn bind_listeners(&self) -> Result<(), String> {
-        let wanted: Vec<(SocketAddr, bool)> = self
-            .config
-            .listen_addr
-            .iter()
-            .map(|a| (*a, false))
-            .chain(self.config.white_listen.iter().map(|a| (*a, true)))
-            .collect();
+        let wanted = self.listen_addresses();
         let mut bound = Vec::new();
         let mut failures = Vec::new();
         for (addr, white) in wanted.iter().copied() {
@@ -762,15 +773,8 @@ impl PeerManager {
     pub async fn start(self: Arc<Self>) -> Result<(), NetworkError> {
         info!("Starting peer manager");
 
-        // Start listeners for inbound connections: the listen address, and
-        // each -whitebind address, whose peers are whitelisted
-        let listeners: Vec<(SocketAddr, bool)> = self
-            .config
-            .listen_addr
-            .iter()
-            .map(|a| (*a, false))
-            .chain(self.config.white_listen.iter().map(|a| (*a, true)))
-            .collect();
+        // Start listeners for inbound connections
+        let listeners = self.listen_addresses();
         // The sockets bind_listeners bound, when it ran; else bind each here
         let to_run: Vec<(SocketAddr, bool, Option<TcpListener>)> = match self.prebound.lock().take()
         {

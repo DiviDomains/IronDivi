@@ -15,7 +15,7 @@
 use divi_test_support::free_port;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -110,6 +110,22 @@ fn target(ip: &str) -> (TcpListener, String) {
     (listener, at)
 }
 
+/// A TCP connection from `src` to `to`, closed at once
+fn knock(src: &str, to: SocketAddr) -> bool {
+    let from: SocketAddr = format!("{src}:0").parse().unwrap();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let socket = tokio::net::TcpSocket::new_v4().unwrap();
+            socket.bind(from).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), socket.connect(to))
+                .await
+                .is_ok_and(|r| r.is_ok())
+        })
+}
+
 /// divid dials every added node, with -connect or not and whatever
 /// -maxconnections says: its added-node thread takes no outbound slot since
 /// Divi Core f8c0d2e67 (net.cpp:1214-1271, :1275-1285). Each target has its
@@ -143,4 +159,36 @@ fn added_nodes_are_dialled_whatever_maxconnections_says() {
         drop(node);
         assert_eq!(dialled, (true, true), "{setting:?}");
     }
+}
+
+/// Every -bind is listened on, the second on its own port or the listen port;
+/// one that is not an address stops the start (net.cpp:1809-1814)
+#[test]
+fn every_bind_is_listened_on() {
+    let (p1, p2, p3) = (free_port(), free_port(), free_port());
+    let dir = tempfile::tempdir().unwrap();
+    let (b1, b2) = (
+        format!("-bind=127.0.0.1:{p1}"),
+        format!("-bind=127.0.0.2:{p2}"),
+    );
+    let port = format!("-port={p3}");
+    let node = up(
+        dir.path(),
+        &[&b1, &b2, "-bind=127.0.0.3", &port, "-discover=0"],
+    );
+    for (ip, p) in [("127.0.0.1", p1), ("127.0.0.2", p2), ("127.0.0.3", p3)] {
+        let at: SocketAddr = format!("{ip}:{p}").parse().unwrap();
+        assert!(knock("127.0.0.9", at), "{at} does not listen");
+    }
+    drop(node);
+
+    let dir = tempfile::tempdir().unwrap();
+    let err = match start(dir.path(), &[&b1, "-bind=not-an-address"]) {
+        Ok(_) => panic!("started with -bind=not-an-address"),
+        Err(e) => e,
+    };
+    assert!(
+        err.contains("Cannot resolve -bind address: 'not-an-address'"),
+        "{err}"
+    );
 }
