@@ -1752,6 +1752,13 @@ async fn run_daemon(
     // Kept for the life of the node; none if an address cannot be bound.
     let _zmq = divi_node::zmq::ZmqNotifier::start(&config.zmq, node.chain(), node.mempool());
 
+    // Divi Core's last check before it starts the node: 50 MB free on the
+    // data directory's filesystem (init.cpp:1604-1605)
+    if !divi_storage::disk_space::check_disk_space(&config.data_dir, 0) {
+        divi_storage::abort::abort_node("Disk space is low!");
+        anyhow::bail!("Disk space is low!");
+    }
+
     // Start the node
     node.start().await.with_context(|| "Failed to start node")?;
 
@@ -2259,12 +2266,18 @@ async fn run_daemon(
 
                     // The masternode RPCs read the node's masternode list
                     rpc_server.set_masternode_manager(mn_for_rpc);
-                    rpc_server.set_masternode_list(mn_list_for_rpc);
+                    rpc_server.set_masternode_list(Arc::clone(&mn_list_for_rpc));
                     rpc_server.set_masternode_votes(mn_votes_for_rpc);
                     rpc_server.set_masternode_datadir(datadir_for_mn);
                     rpc_server.set_masternode_conf(mnconf_for_rpc);
-                    rpc_server.set_masternode_relay(Arc::new(move |bytes: Vec<u8>| {
-                        pm_for_mn.broadcast_masternode_broadcast(bytes);
+                    // broadcaststartmasternode: the list took the broadcast and
+                    // left its inv to announce (RelayParsedMasternodeBroadcast,
+                    // RpcMasternodeFeatures.cpp:80-121)
+                    let mn_list_for_relay = Arc::clone(&mn_list_for_rpc);
+                    rpc_server.set_masternode_relay(Arc::new(move |_bytes: Vec<u8>| {
+                        for item in mn_list_for_relay.take_relays() {
+                            pm_for_mn.broadcast(masternode_inv(item));
+                        }
                     }));
                     info!("Masternode manager initialized");
 
@@ -2418,12 +2431,18 @@ async fn run_daemon(
 
                     // The masternode RPCs read the node's masternode list
                     rpc_server.set_masternode_manager(mn_for_rpc);
-                    rpc_server.set_masternode_list(mn_list_for_rpc);
+                    rpc_server.set_masternode_list(Arc::clone(&mn_list_for_rpc));
                     rpc_server.set_masternode_votes(mn_votes_for_rpc);
                     rpc_server.set_masternode_datadir(datadir_for_mn);
                     rpc_server.set_masternode_conf(mnconf_for_rpc);
-                    rpc_server.set_masternode_relay(Arc::new(move |bytes: Vec<u8>| {
-                        pm_for_mn.broadcast_masternode_broadcast(bytes);
+                    // broadcaststartmasternode: the list took the broadcast and
+                    // left its inv to announce (RelayParsedMasternodeBroadcast,
+                    // RpcMasternodeFeatures.cpp:80-121)
+                    let mn_list_for_relay = Arc::clone(&mn_list_for_rpc);
+                    rpc_server.set_masternode_relay(Arc::new(move |_bytes: Vec<u8>| {
+                        for item in mn_list_for_relay.take_relays() {
+                            pm_for_mn.broadcast(masternode_inv(item));
+                        }
                     }));
                     info!("Masternode manager initialized");
                 }
@@ -2574,6 +2593,19 @@ fn staking_info(
         blocks: status.blocks,
         stake_split_threshold: split_threshold_divi,
     }
+}
+
+/// An inv for a masternode item the list left to relay
+fn masternode_inv((kind, hash): (u32, [u8; 32])) -> divi_network::NetworkMessage {
+    let inv_type = match kind {
+        divi_rpc::mn_list::INV_WINNER => divi_network::InvType::MasternodeWinner,
+        divi_rpc::mn_list::INV_BROADCAST => divi_network::InvType::MasternodeAnnounce,
+        _ => divi_network::InvType::MasternodePing,
+    };
+    divi_network::NetworkMessage::Inv(vec![divi_network::InvItem::new(
+        inv_type,
+        divi_primitives::hash::Hash256(hash),
+    )])
 }
 
 /// Divi Core `IsBlockchainSynced`, which its masternode sync waits for: not in
@@ -3036,6 +3068,18 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
     let _ = std::fs::write(&pid_file, format!("{}", std::process::id()));
 
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
+
+    // Divi Core AbortNode (ValidationState.cpp:17-27): a write the node cannot
+    // make tells the user to look at debug.log and starts the shutdown
+    let abort_tx = shutdown_tx.clone();
+    divi_storage::abort::set_handler(Box::new(move |_| {
+        use std::io::Write as _;
+        let _ = writeln!(
+            std::io::stderr(),
+            "Error: Error: A fatal internal error occured, see debug.log for details"
+        );
+        let _ = abort_tx.send(());
+    }));
 
     // SIGHUP reopens debug.log and the node keeps running, as Divi Core does
     // (init.cpp:513-516), so a logrotate postrotate line does not stop it
