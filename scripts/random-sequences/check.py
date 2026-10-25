@@ -45,6 +45,8 @@ INJECT = os.environ.get("RANDOM_SEQUENCES_INJECT", "")
 GO_ON = os.environ.get("RANDOM_SEQUENCES_GO_ON", "") == "1"
 # For looking into a difference: a folder to copy the four debug.logs to on a FAIL
 LOGS = os.environ.get("RANDOM_SEQUENCES_LOGS", "")
+# For looking into a difference: irondivid logs at debug level
+IRON_DEBUG = ["debug=1"] if os.environ.get("RANDOM_SEQUENCES_DEBUG", "") == "1" else []
 RPC_TIMEOUT = 120
 START_TIMEOUT = 180
 SETTLE_TIMEOUT = 45
@@ -173,6 +175,7 @@ class Pair:
         self.lock_order = {1: [], 2: []}  # coins in the order the steps locked them
         self.last_tx = None  # (node, txid) of the step's wallet send
         self.note = None  # what the step needed besides itself
+        self.restarted = set()  # nodes stopped and started again in this episode
 
     def node(self, n):
         return self.nodes[n - 1]
@@ -375,6 +378,8 @@ def run_step(pair, step):
             (str(u["amount"]), u["confirmations"]) for u in coins[1]) if coins[0] == "ok" else coins
         second = node.call("reconsiderblock", target)
         return f"{outcome(first)}/{outcome(second)}", mid
+    if kind in ("restart", "kill"):
+        pair.restarted.add(n)
     if kind == "restart":
         node.stop()
         node.start()
@@ -477,10 +482,24 @@ def setup(pair):
     return True
 
 
+def keep_logs(tag):
+    """Copy the four debug.logs to LOGS, when set"""
+    if not LOGS:
+        return
+    import shutil
+    os.makedirs(LOGS, exist_ok=True)
+    for pair in PAIRS:
+        for node in pair.nodes:
+            for path in (os.path.join(node.dir, "regtest", "debug.log"), os.path.join(node.dir, "debug.log")):
+                if os.path.exists(path):
+                    shutil.copy(path, os.path.join(LOGS, f"{node.name}-{tag}.log"))
+
+
 def new_episode():
     """Four fresh nodes and their first blocks: the start of the run, and the
     restart after an accidental difference of divid's (see EXPLAINED)"""
     global PAIRS, episode
+    keep_logs(f"episode{episode}")
     for pair in PAIRS:
         for node in pair.nodes:
             node.stop()
@@ -492,8 +511,8 @@ def new_episode():
     c1 = Node("divid1", DIVID, 0, ["listen=1"])
     c2 = Node("divid2", DIVID, 1, ["listen=0", f"connect=127.0.0.1:{PORT_BASE}"])
     phrases = [c1.rpc("dumphdinfo")["mnemonic"], c2.rpc("dumphdinfo")["mnemonic"]]
-    i1 = Node("irondivid1", IRONDIVID, 2, ["listen=1"], env={"WALLET_MNEMONIC": phrases[0]})
-    i2 = Node("irondivid2", IRONDIVID, 3, ["listen=0", f"connect=127.0.0.1:{PORT_BASE + 4}"],
+    i1 = Node("irondivid1", IRONDIVID, 2, ["listen=1"] + IRON_DEBUG, env={"WALLET_MNEMONIC": phrases[0]})
+    i2 = Node("irondivid2", IRONDIVID, 3, ["listen=0", f"connect=127.0.0.1:{PORT_BASE + 4}"] + IRON_DEBUG,
               env={"WALLET_MNEMONIC": phrases[1]})
     del phrases
     PAIRS = [Pair("divid", [c1, c2]), Pair("irondivid", [i1, i2])]
@@ -728,12 +747,17 @@ for step in steps:
         elif step["kind"] == "kill" and counted(PAIRS[0].node(n).call("getrawmempool"))[1:] \
                 < counted(PAIRS[1].node(n).call("getrawmempool"))[1:]:
             explained = "divid wallet after a kill"
-        elif all(k.split(": ")[-1].startswith("getbalance") for k in diff) and balance_cache_explains():
+        elif all(k.split(": ")[-1].startswith("getbalance") or k == "after invalidateblock: listunspent 0 amounts"
+                 for k in diff) and any(not k.startswith("after") for k in diff) and balance_cache_explains():
             explained = "divid balance cache"
-        elif step["kind"] in ("restart", "kill") and rebroadcast_explains(n) and all(
-                k in (f"node {n}: mempool size", f"node {n}: getunconfirmedbalance",
-                      f"node {n}: listunspent 0 amounts") for k in diff):
-            explained = "rebroadcast timing"
+        else:
+            # a node restarted earlier in the episode holds fewer of its peer's
+            # transactions on one side than the other
+            for m in (1, 2):
+                if m in PAIRS[0].restarted and rebroadcast_explains(m) and all(
+                        k in (f"node {m}: mempool size", f"node {m}: getunconfirmedbalance",
+                              f"node {m}: listunspent 0 amounts") for k in diff):
+                    explained = "rebroadcast timing"
     known = KNOWN.get(step["kind"])
     if diff and (explained or known):
         log(f"KNOWN  {line}  {explained or ''}  [{EXPLAINED[explained] if explained else known}]")
@@ -808,6 +832,7 @@ for step in steps:
         break
     log(f"PASS   {line}")
 
+keep_logs(f"episode{episode}")
 log(f"# {len(steps)} steps planned, {episode} episode(s), ran for {int(time.time() - started)} s")
 log(f"FAILS {fails}")
 sys.exit(min(fails, 254))
