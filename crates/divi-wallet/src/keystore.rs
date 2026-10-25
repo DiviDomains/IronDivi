@@ -223,14 +223,10 @@ impl KeyStore {
     /// Returns true if the address is derived from the HD wallet's change chain (m/44'/301'/0'/1/*)
     /// Returns false for receiving addresses (m/44'/301'/0'/0/*) or non-HD addresses
     pub fn is_change_address(&self, address: &Address) -> bool {
-        if let Some(entry) = self.get_key(&address.hash) {
-            if let Some(ref path) = entry.hd_path {
-                // HD path format: m/44'/301'/0'/1/index (change) or m/44'/301'/0'/0/index (receiving)
-                // Check if this is a change address by looking for '/1/' in the path
-                return path.contains("/1/");
-            }
-        }
-        false
+        // The chain is the path's next-to-last step: m/44'/301'/0'/1/index
+        self.get_key(&address.hash)
+            .and_then(|entry| hd_chain_index(entry.hd_path.as_deref()?))
+            .is_some_and(|(is_change, _)| is_change)
     }
 
     /// Get all addresses
@@ -249,37 +245,37 @@ impl KeyStore {
 
     /// Generate a new receiving address
     pub fn new_receiving_address(&self) -> Result<Address, WalletError> {
-        let wallet = self.hd_wallet.read();
-        let wallet = wallet
-            .as_ref()
-            .ok_or(WalletError::KeyNotFound("No HD wallet configured".into()))?;
-
-        let index = *self.receiving_index.read();
-        let key = wallet.derive_receiving(0, index)?;
-        let secret = key.secret_key()?;
-        let entry = KeyEntry::with_hd_path(secret, hd_key_path(false, index));
-        let address = entry.address(self.network);
-        self.add_key(entry);
-
-        *self.receiving_index.write() += 1;
-        Ok(address)
+        self.new_hd_address(false)
     }
 
     /// Generate a new change address
     pub fn new_change_address(&self) -> Result<Address, WalletError> {
+        self.new_hd_address(true)
+    }
+
+    /// Derive the key at the chain's next index and move the index on. The
+    /// index stays write-locked throughout, so two callers never get one key.
+    fn new_hd_address(&self, is_change: bool) -> Result<Address, WalletError> {
         let wallet = self.hd_wallet.read();
         let wallet = wallet
             .as_ref()
             .ok_or(WalletError::KeyNotFound("No HD wallet configured".into()))?;
 
-        let index = *self.change_index.read();
-        let key = wallet.derive_change(0, index)?;
-        let secret = key.secret_key()?;
-        let entry = KeyEntry::with_hd_path(secret, hd_key_path(true, index));
+        let mut index = if is_change {
+            self.change_index.write()
+        } else {
+            self.receiving_index.write()
+        };
+        let key = if is_change {
+            wallet.derive_change(0, *index)?
+        } else {
+            wallet.derive_receiving(0, *index)?
+        };
+        let entry = KeyEntry::with_hd_path(key.secret_key()?, hd_key_path(is_change, *index));
         let address = entry.address(self.network);
         self.add_key(entry);
 
-        *self.change_index.write() += 1;
+        *index += 1;
         Ok(address)
     }
 
@@ -602,6 +598,53 @@ mod tests {
     use divi_primitives::ChainMode;
 
     const TEST_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+    #[test]
+    fn node20_concurrent_new_addresses_are_all_different() {
+        let wallet = HdWallet::from_mnemonic(TEST_MNEMONIC, None, ChainMode::Divi).unwrap();
+        let store = std::sync::Arc::new(KeyStore::with_hd_wallet(Network::Mainnet, wallet));
+        let threads: Vec<_> = (0..8)
+            .map(|t| {
+                let store = store.clone();
+                std::thread::spawn(move || {
+                    (0..25)
+                        .map(|_| {
+                            if t % 2 == 0 {
+                                store.new_receiving_address().unwrap()
+                            } else {
+                                store.new_change_address().unwrap()
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let mut all = std::collections::HashSet::new();
+        for t in threads {
+            for addr in t.join().unwrap() {
+                assert!(all.insert(addr.to_base58()), "address handed out twice");
+            }
+        }
+        assert_eq!(all.len(), 200);
+        assert_eq!(store.get_indices(), (100, 100));
+    }
+
+    #[test]
+    fn node24_change_is_read_from_the_chain_step_of_the_path() {
+        let store = KeyStore::new(Network::Mainnet);
+        let with_path = |path: &str| {
+            let entry = KeyEntry::with_hd_path(SecretKey::new_random(), path.to_string());
+            let addr = entry.address(Network::Mainnet);
+            store.add_key(entry);
+            addr
+        };
+        assert!(store.is_change_address(&with_path("m/44'/301'/0'/1/7")));
+        assert!(!store.is_change_address(&with_path("m/44'/301'/0'/0/7")));
+        // "/1/" appears, but on the account step: a receiving key
+        assert!(!store.is_change_address(&with_path("m/44'/301'/1/0/7")));
+        let imported = store.import_key(SecretKey::new_random(), None);
+        assert!(!store.is_change_address(&imported));
+    }
 
     #[test]
     fn test_keystore_new() {
