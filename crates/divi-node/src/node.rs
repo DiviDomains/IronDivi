@@ -870,6 +870,10 @@ impl Node {
 
         // Set peer manager height
         self.peer_manager.set_height(self.chain.height());
+        // An inbound peer is told the active spork count after its version
+        let sporks_for_count = Arc::clone(&self.spork_manager);
+        self.peer_manager
+            .set_spork_count_source(Arc::new(move || sporks_for_count.spork_count() as u32));
         // Version messages name the height at the time they are sent
         let chain_for_height = Arc::clone(&self.chain);
         self.peer_manager
@@ -948,16 +952,10 @@ impl Node {
                         if peer_manager.is_inbound(peer_id) {
                             spork_manager.inbound_peer_connected(peer_id).await;
                         } else {
-                            // An outbound peer is asked for addresses after its
-                            // version (main.cpp:438-442), and counts as good
+                            // An outbound peer was asked for addresses with its
+                            // verack (main.cpp:438-442), and counts as good
                             // (addrman Good, main.cpp:443)
                             peer_manager.gossip().asked(peer_id);
-                            if let Err(e) = peer_manager
-                                .send_to_peer(peer_id, NetworkMessage::GetAddr)
-                                .await
-                            {
-                                tracing::debug!("Failed to send getaddr to peer {}: {}", peer_id, e);
-                            }
                             peer_manager.address_book().good(addr);
                         }
                     }
