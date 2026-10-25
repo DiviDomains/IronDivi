@@ -50,14 +50,25 @@ const KEY_PRUNE_HEIGHT: &[u8] = b"prune_height";
 const KEY_WINNERS_STRIP_HEIGHT: &[u8] = b"winners_strip_height";
 const KEY_SNAPSHOT_BASE: &[u8] = b"snapshot_base";
 
+/// `gettxoutsetinfo`'s values, as Divi Core's `CCoinsViewDB::GetStats`
+/// computes them (txdb.cpp:105-157)
 #[derive(Debug, Clone)]
 pub struct UtxoStats {
+    /// Height and hash of the block the UTXO set is at
+    pub height: u32,
+    pub best_block: Hash256,
+    /// Transactions with at least one unspent output
     pub transactions: u64,
     pub txouts: u64,
     pub total_amount: u64,
+    /// Size of Core's coin records: 32 bytes of txid plus the record, per
+    /// transaction
     pub bytes_serialized: u64,
-    /// SHA256 hash over all UTXO entries (txid, vout, height, is_coinbase, amount, scriptPubKey)
-    pub hash_serialized: [u8; 32],
+    /// Double SHA-256 over the best block hash and every transaction's coins
+    /// in txid order, as Core hashes them
+    pub hash_serialized: Hash256,
+    /// Size of irondivid's own UTXO records (one per output)
+    pub bogosize: u64,
 }
 
 /// Default block index cache size (10,000 entries - covers recent blocks for MTP, stake modifier, etc.)
@@ -85,9 +96,32 @@ impl ChainDatabase {
         path: P,
         block_cache_size: usize,
     ) -> Result<Self, StorageError> {
+        Self::open_inner(path.as_ref(), block_cache_size, true)
+    }
+
+    /// Open the chain database at `path` only if there is one: a missing or
+    /// empty folder is refused and nothing is created
+    pub fn open_existing<P: AsRef<Path>>(path: P) -> Result<Self, StorageError> {
+        let path = path.as_ref();
+        if !path.join("CURRENT").is_file() {
+            return Err(StorageError::NotFound(format!(
+                "no chain database in {}",
+                path.display()
+            )));
+        }
+        Self::open_inner(path, DEFAULT_BLOCK_CACHE_SIZE, false)
+    }
+
+    fn open_inner(
+        path: &Path,
+        block_cache_size: usize,
+        create: bool,
+    ) -> Result<Self, StorageError> {
+        crate::datadir::refuse_foreign_database(path)?;
+
         // === Database-wide options ===
         let mut opts = Options::default();
-        opts.create_if_missing(true);
+        opts.create_if_missing(create);
         opts.create_missing_column_families(true);
 
         // Performance tuning for blockchain workload
@@ -162,6 +196,11 @@ impl ChainDatabase {
             ColumnFamilyDescriptor::new(CF_MASTERNODES, mn_opts),
             ColumnFamilyDescriptor::new(CF_SPENT_INDEX, spent_opts),
             ColumnFamilyDescriptor::new(CF_UNDO, undo_opts),
+            ColumnFamilyDescriptor::new(crate::search_index::CF_ADDRESS_DELTA, Options::default()),
+            ColumnFamilyDescriptor::new(
+                crate::search_index::CF_ADDRESS_UNSPENT,
+                Options::default(),
+            ),
         ];
 
         tracing::info!(
@@ -416,6 +455,22 @@ impl ChainDatabase {
         Ok(())
     }
 
+    /// Write a raw metadata value and sync the log before returning
+    pub fn put_metadata_synced(&self, key: &[u8], value: &[u8]) -> Result<(), StorageError> {
+        let cf = self.db.cf_handle(CF_METADATA).unwrap();
+        let mut opts = rocksdb::WriteOptions::default();
+        opts.set_sync(true);
+        self.db.put_cf_opt(cf, key, value, &opts)?;
+        Ok(())
+    }
+
+    /// Remove a raw metadata value.
+    pub fn delete_metadata(&self, key: &[u8]) -> Result<(), StorageError> {
+        let cf = self.db.cf_handle(CF_METADATA).unwrap();
+        self.db.delete_cf(cf, key)?;
+        Ok(())
+    }
+
     // ========== UTXO Set ==========
 
     /// Add a UTXO
@@ -512,6 +567,39 @@ impl ChainDatabase {
         }
     }
 
+    /// Whether `txid` still has an unspent output that can be spent (Divi Core
+    /// `CCoins::IsPruned` is false: OP_META outputs never count). RocksDB holds
+    /// every UTXO write, so a prefix scan sees them all.
+    pub fn has_spendable_output_of(&self, txid: &Hash256) -> Result<bool, StorageError> {
+        Ok(self.spendable_output_height_of(txid)?.is_some())
+    }
+
+    /// The height of the block holding `txid`, from any of its unspent
+    /// spendable outputs: what Divi Core's coins entry for it records
+    /// (`CCoins::nHeight`); None once every such output is spent. Read from
+    /// the database, which every UTXO change is written to.
+    pub fn spendable_output_height_of(&self, txid: &Hash256) -> Result<Option<u32>, StorageError> {
+        let cf = self.db.cf_handle(CF_UTXO).unwrap();
+        let mut prefix = Vec::with_capacity(33);
+        prefix.push(b'u');
+        prefix.extend_from_slice(txid.as_bytes());
+        let iter = self.db.iterator_cf(
+            cf,
+            rocksdb::IteratorMode::From(&prefix, rocksdb::Direction::Forward),
+        );
+        for item in iter {
+            let (key, value) = item?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            let utxo = Utxo::from_bytes(&value)?;
+            if !utxo.script_pubkey.is_op_return() {
+                return Ok(Some(utxo.height));
+            }
+        }
+        Ok(None)
+    }
+
     /// Get a UTXO directly from database (bypassing cache)
     fn get_utxo_direct(&self, outpoint: &OutPoint) -> Result<Option<Utxo>, StorageError> {
         let cf = self.db.cf_handle(CF_UTXO).unwrap();
@@ -534,51 +622,101 @@ impl ChainDatabase {
         }
     }
 
-    /// Iterate all UTXOs and calculate statistics
+    /// Value of every stored output, unspendable (OP_META) ones included: the
+    /// money supply at the tip, as Divi Core counts it (every output a block
+    /// creates minus every output it spends, TransactionInputChecker.cpp:79-80)
+    pub fn utxo_value_total(&self) -> Result<i64, StorageError> {
+        let snapshot = self.db.snapshot();
+        let cf = self.db.cf_handle(CF_UTXO).unwrap();
+        let mut total = 0i64;
+        for item in snapshot.iterator_cf(cf, rocksdb::IteratorMode::Start) {
+            let (_, value) = item?;
+            total += Utxo::from_bytes(&value)?.value.as_sat();
+        }
+        Ok(total)
+    }
+
+    /// The UTXO set's statistics, as Divi Core's `gettxoutsetinfo` reports them
+    ///
+    /// Reads one RocksDB snapshot, so the best block and the outputs are from the
+    /// same block and no lock is held while the whole set is walked; blocks keep
+    /// connecting meanwhile.
     pub fn get_utxo_stats(&self) -> Result<UtxoStats, StorageError> {
+        use crate::core_coins::CoreCoins;
         use sha2::{Digest, Sha256};
 
-        let cf = self.db.cf_handle(CF_UTXO).unwrap();
-        let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+        let snapshot = self.db.snapshot();
+        let cf_meta = self.db.cf_handle(CF_METADATA).unwrap();
+        let best_block = match snapshot.get_cf(cf_meta, KEY_BEST_BLOCK)? {
+            Some(data) if data.len() == 32 => {
+                Hash256::from_bytes(data[..].try_into().expect("32 bytes"))
+            }
+            _ => Hash256::zero(),
+        };
+        let height = match snapshot.get_cf(cf_meta, KEY_CHAIN_HEIGHT)? {
+            Some(data) if data.len() == 4 => {
+                u32::from_le_bytes(data[..].try_into().expect("4 bytes"))
+            }
+            _ => 0,
+        };
 
         let mut stats = UtxoStats {
+            height,
+            best_block,
             transactions: 0,
             txouts: 0,
             total_amount: 0,
             bytes_serialized: 0,
-            hash_serialized: [0u8; 32],
+            hash_serialized: Hash256::zero(),
+            bogosize: 0,
         };
 
-        let mut last_txid: Option<Hash256> = None;
         let mut hasher = Sha256::new();
+        let mut entry = Vec::with_capacity(1 << 16);
+        hasher.update(best_block.as_bytes());
 
-        for item in iter {
-            let (_key, value) = item?;
-            stats.txouts += 1;
-            stats.bytes_serialized += value.len() as u64;
-
-            let utxo = Utxo::from_bytes(&value)?;
-            stats.total_amount += utxo.value.as_sat() as u64;
-
-            let outpoint = outpoint_from_key(&_key).map_err(StorageError::Deserialization)?;
-            if last_txid.as_ref() != Some(&outpoint.txid) {
+        // Core keys its coin database by txid, so its walk is in txid byte order;
+        // irondivid's keys are txid then vout, so one transaction's outputs are
+        // adjacent and the transactions come in the same order
+        let mut add = |txid: &Hash256, records: &mut Vec<(u32, Utxo)>, stats: &mut UtxoStats| {
+            if let Some(coins) = CoreCoins::from_records(records) {
                 stats.transactions += 1;
-                last_txid = Some(outpoint.txid);
+                stats.txouts += coins.outputs.len() as u64;
+                stats.total_amount += coins
+                    .outputs
+                    .iter()
+                    .map(|(_, out)| out.value.as_sat() as u64)
+                    .sum::<u64>();
+                stats.bytes_serialized += 32 + coins.disk_bytes().len() as u64;
+                entry.clear();
+                entry.extend_from_slice(txid.as_bytes());
+                coins.write_stats_entry(&mut entry);
+                hasher.update(&entry);
             }
+            records.clear();
+        };
 
-            // Feed UTXO data into SHA256 hasher (matching C++ gettxoutsetinfo format):
-            // txid (32 bytes) | vout (u32 LE) | height (u32 LE) | is_coinbase (1 byte) | amount (i64 LE) | scriptPubKey (varint len + bytes)
-            hasher.update(outpoint.txid.as_bytes());
-            hasher.update(outpoint.vout.to_le_bytes());
-            hasher.update(utxo.height.to_le_bytes());
-            hasher.update([utxo.is_coinbase as u8]);
-            hasher.update(utxo.value.as_sat().to_le_bytes());
-            let script_bytes = utxo.script_pubkey.as_bytes();
-            hasher.update((script_bytes.len() as u32).to_le_bytes());
-            hasher.update(script_bytes);
+        let cf = self.db.cf_handle(CF_UTXO).unwrap();
+        let mut current: Option<Hash256> = None;
+        let mut records: Vec<(u32, Utxo)> = Vec::new();
+        for item in snapshot.iterator_cf(cf, rocksdb::IteratorMode::Start) {
+            let (key, value) = item?;
+            stats.bogosize += value.len() as u64;
+            let outpoint = outpoint_from_key(&key).map_err(StorageError::Deserialization)?;
+            if current.as_ref() != Some(&outpoint.txid) {
+                if let Some(txid) = current.replace(outpoint.txid) {
+                    add(&txid, &mut records, &mut stats);
+                }
+            }
+            records.push((outpoint.vout, Utxo::from_bytes(&value)?));
+        }
+        if let Some(txid) = current {
+            add(&txid, &mut records, &mut stats);
         }
 
-        stats.hash_serialized = hasher.finalize().into();
+        // CHashWriter::GetHash is SHA-256 twice
+        let once = hasher.finalize();
+        stats.hash_serialized = Hash256::from_bytes(Sha256::digest(once).into());
 
         Ok(stats)
     }
@@ -769,12 +907,15 @@ impl ChainDatabase {
 
     /// Atomically flush UTXO changes + undo data + tip update in a single WriteBatch.
     /// This is the C++ pattern: all state changes for a connected block are atomic.
+    /// `extra` adds the block's other entries (address and spent index) to the
+    /// same batch, as Divi Core writes them with the block's best-block hash.
     pub fn atomic_connect_block(
         &self,
         utxo_batch: &BatchedUtxoWriter,
         undo_data: &[u8],
         block_hash: &Hash256,
         block_index: &BlockIndex,
+        extra: &dyn Fn(&mut WriteBatch) -> Result<(), StorageError>,
     ) -> Result<(), StorageError> {
         let removed_set: std::collections::HashSet<&OutPoint> = utxo_batch.removes.iter().collect();
         let added_set: std::collections::HashSet<&OutPoint> =
@@ -821,6 +962,7 @@ impl ChainDatabase {
             height_key(block_index.height),
             block_index.hash.as_bytes(),
         );
+        extra(&mut wb)?;
 
         // Single atomic write
         self.db.write(wb)?;
@@ -845,6 +987,70 @@ impl ChainDatabase {
         self.height_to_hash_cache
             .insert(block_index.height, block_index.hash);
 
+        Ok(())
+    }
+
+    /// Write a disconnected block in one batch: its UTXO changes, its undo data
+    /// removed, its index entry (`index`, no longer on the main chain), its
+    /// height entry removed and the tip moved to `new_tip`, its parent. `extra`
+    /// adds the address and spent index changes. Divi Core flushes the coins and
+    /// the best block together after every disconnect (ChainTipManager.cpp:157-173),
+    /// so a stop between two disconnects of a reorg leaves a chain that matches
+    /// its UTXO set.
+    pub fn atomic_disconnect_block(
+        &self,
+        utxo_batch: &BatchedUtxoWriter,
+        index: &BlockIndex,
+        new_tip: &BlockIndex,
+        extra: &dyn Fn(&mut WriteBatch) -> Result<(), StorageError>,
+    ) -> Result<(), StorageError> {
+        let removed_set: std::collections::HashSet<&OutPoint> = utxo_batch.removes.iter().collect();
+        let added_set: std::collections::HashSet<&OutPoint> =
+            utxo_batch.adds.iter().map(|(op, _)| op).collect();
+
+        let cf_utxo = self.db.cf_handle(CF_UTXO).unwrap();
+        let cf_undo = self.db.cf_handle(CF_UNDO).unwrap();
+        let cf_metadata = self.db.cf_handle(CF_METADATA).unwrap();
+        let cf_block_index = self.db.cf_handle(CF_BLOCK_INDEX).unwrap();
+
+        let mut wb = WriteBatch::default();
+        for outpoint in &utxo_batch.removes {
+            if !added_set.contains(outpoint) {
+                wb.delete_cf(&cf_utxo, utxo_key(outpoint));
+            }
+        }
+        for (outpoint, utxo) in &utxo_batch.adds {
+            if !removed_set.contains(outpoint) {
+                wb.put_cf(&cf_utxo, utxo_key(outpoint), utxo.to_bytes());
+            }
+        }
+        wb.delete_cf(&cf_undo, index.hash.as_bytes());
+        wb.put_cf(
+            &cf_block_index,
+            block_index_key(&index.hash),
+            index.to_bytes(),
+        );
+        wb.delete_cf(&cf_block_index, height_key(index.height));
+        wb.put_cf(&cf_metadata, KEY_BEST_BLOCK, new_tip.hash.as_bytes());
+        wb.put_cf(&cf_metadata, KEY_CHAIN_HEIGHT, new_tip.height.to_le_bytes());
+        extra(&mut wb)?;
+
+        self.db.write(wb)?;
+
+        if let Some(ref cache) = self.utxo_cache {
+            for outpoint in &utxo_batch.removes {
+                if !added_set.contains(outpoint) {
+                    cache.remove(*outpoint);
+                }
+            }
+            for (outpoint, utxo) in &utxo_batch.adds {
+                if !removed_set.contains(outpoint) {
+                    cache.insert(*outpoint, utxo.clone());
+                }
+            }
+        }
+        self.block_index_cache.insert(index.hash, index.clone());
+        self.height_to_hash_cache.invalidate(&index.height);
         Ok(())
     }
 
@@ -890,6 +1096,12 @@ impl ChainDatabase {
     /// Flush all pending writes
     pub fn flush(&self) -> Result<(), StorageError> {
         self.db.flush()?;
+        Ok(())
+    }
+
+    /// Write the write-ahead log out and sync it to disk
+    pub fn sync_wal(&self) -> Result<(), StorageError> {
+        self.db.flush_wal(true)?;
         Ok(())
     }
 
@@ -1226,13 +1438,13 @@ mod tests {
             "Expected non-zero serialized bytes"
         );
 
-        // Verify bytes_serialized is reasonable (3 UTXOs with P2PKH scripts)
-        // Each UTXO: 8 (value) + 4 (script_len) + 25 (P2PKH script) + 4 (height) + 1 (flags) = 42 bytes
-        assert_eq!(
-            stats.bytes_serialized,
-            42 * 3,
-            "Expected 126 bytes (42 per UTXO)"
-        );
+        // Core's records: per transaction 32 (txid) + version 1 + code 1 + height 1,
+        // and per output 1 (compressed amount) + 21 (compressed P2PKH script)
+        assert_eq!(stats.bytes_serialized, (32 + 3 + 22 * 2) + (32 + 3 + 22));
+
+        // bogosize is irondivid's own records: 8 (value) + 4 (script_len) +
+        // 25 (P2PKH script) + 4 (height) + 1 (flags) = 42 bytes each
+        assert_eq!(stats.bogosize, 42 * 3);
     }
 
     #[test]

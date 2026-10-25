@@ -1,0 +1,12 @@
+listmnbroadcasts
+
+Lists pre-signed masternode broadcasts stored in the wallet
+
+Result:
+[
+  {
+    "txhash": "hash",    (string) Collateral transaction hash
+    "outidx": n,         (numeric) Collateral transaction output index
+    "broadcast": "hex"   (string) Stored broadcast data as hex string
+  }, ...
+]

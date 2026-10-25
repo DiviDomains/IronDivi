@@ -104,7 +104,7 @@ impl SpentIndexValue {
     }
 
     /// Serialize to bytes
-    fn to_bytes(&self) -> Vec<u8> {
+    pub(crate) fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(69);
         bytes.extend_from_slice(&self.spending_txid.0);
         bytes.extend_from_slice(&self.input_index.to_le_bytes());
@@ -116,7 +116,7 @@ impl SpentIndexValue {
     }
 
     /// Deserialize from bytes
-    fn from_bytes(bytes: &[u8]) -> Result<Self, StorageError> {
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self, StorageError> {
         if bytes.len() != 69 {
             return Err(StorageError::Deserialization(format!(
                 "invalid spent index value length: expected 69, got {}",

@@ -6,8 +6,9 @@
 // it under the terms of the GNU Affero General Public License as published
 // by the Free Software Foundation, version 3.
 
-//! signrawtransaction co-signs a P2SH multisig input across two wallets, matches
-//! prevtxs to inputs by outpoint, and signs P2PK inputs.
+//! signrawtransaction co-signs a P2SH multisig input across two wallets that
+//! hold its redeem script, matches prevtxs to inputs by outpoint, and signs P2PK
+//! inputs.
 
 use divi_primitives::amount::Amount;
 use divi_primitives::hash::Hash256;
@@ -68,10 +69,10 @@ fn two_wallets_cosign_a_p2sh_multisig_input() {
     let (pk_a, pk_b) = (pubkey(&a), pubkey(&b));
     let keys = json!([pk_a, pk_b]);
 
-    // A stores the redeem script; B only learns it from prevtxs
+    // A stores the redeem script; B first has it only in prevtxs
     let ms_a = call(&a, "addmultisigaddress", vec![json!(2), keys.clone()]);
     let ms_b = call(&b, "createmultisig", vec![json!(2), keys]);
-    assert_eq!(ms_a["address"], ms_b["address"]);
+    assert_eq!(ms_a, ms_b["address"]);
     let redeem = ms_b["redeemScript"].as_str().unwrap().to_string();
     let redeem_bytes = hex::decode(&redeem).unwrap();
     let p2sh = Script::new_p2sh(divi_crypto::hash160(&redeem_bytes).as_bytes());
@@ -106,6 +107,18 @@ fn two_wallets_cosign_a_p2sh_multisig_input() {
         "one of two multisig signatures must not be complete"
     );
     assert_ne!(half, unsigned, "A added nothing");
+
+    // Signing with its wallet's keys, B does not take the redeem script from
+    // prevtxs: Divi Core reads it there only with given keys
+    // (rpcrawtransaction.cpp:745-753), so B adds nothing until its wallet holds it
+    let (still_half, complete) = sign(&b, &half, &prevtxs);
+    assert!(!complete, "B signed without holding the redeem script");
+    assert_eq!(still_half, half);
+    call(
+        &b,
+        "addmultisigaddress",
+        vec![json!(2), json!([pk_a, pk_b])],
+    );
 
     let (full, complete) = sign(&b, &half, &prevtxs);
     assert!(

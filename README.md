@@ -22,7 +22,7 @@ The goal is to provide a memory-safe, performant, and well-structured alternativ
 - [x] Lottery and treasury block validation
 - [x] Vault staking support
 - [x] JSON-RPC API (Divi Core compatible)
-- [x] Peer-to-peer network protocol (protocol v70920)
+- [x] Peer-to-peer network protocol (protocol v70915, as Divi Core 3.0.0)
 - [x] UTXO set management with RocksDB
 - [x] Address and spent indexing (txindex)
 - [x] Fee estimation

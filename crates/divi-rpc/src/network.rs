@@ -20,6 +20,10 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Divi Core's addnode help, the error for a call it cannot take
+/// (rpcnet.cpp:156-170)
+const ADDNODE_USAGE: &str = "addnode \"node\" \"add|remove|onetry\"\n\nAttempts add or remove a node from the addnode list.\nOr try a connection to a node once.\n\nArguments:\n1. \"node\"     (string, required) The node (see getpeerinfo for nodes)\n2. \"command\"  (string, required) 'add' to add a node to the list, 'remove' to remove a node from the list, 'onetry' to try a connection to the node once\n\nExamples:\n> divi-cli addnode \"192.168.0.6:51472\" \"onetry\"\n> curl --user myusername --data-binary '{\"jsonrpc\": \"1.0\", \"id\":\"curltest\", \"method\": \"addnode\", \"params\": [\"192.168.0.6:51472\", \"onetry\"] }' -H 'content-type: text/plain;' http://127.0.0.1:51473/\n";
+
 /// Network RPC handler
 pub struct NetworkRpc {
     /// Peer manager for network queries
@@ -57,11 +61,17 @@ impl NetworkRpc {
         let local_services = pm
             .map(|pm| pm.services())
             .unwrap_or(divi_network::constants::services::NODE_NETWORK);
+        let local = pm.map(|pm| pm.local_addresses().list()).unwrap_or_default();
+        // Divi Core: a network is reachable once a local address of it is known,
+        // and an IPv6 one marks IPv4 too (NetworkLocalAddressHelpers.cpp:73-105,
+        // :163-167)
+        let ipv6_reachable = local.iter().any(|a| a.address.is_ipv6());
+        let ipv4_reachable = ipv6_reachable || local.iter().any(|a| a.address.is_ipv4());
 
         Ok(serde_json::json!({
             "version": format!("{}.0", env!("CARGO_PKG_VERSION")),
-            "subversion": format!("/IronDivi:{}/", env!("CARGO_PKG_VERSION")),
-            "protocolversion": 70920,
+            "subversion": divi_network::USER_AGENT,
+            "protocolversion": divi_network::constants::protocol_version(),
             "localservices": format!("{:016x}", local_services),
             "timeoffset": self.time_offset(),
             "connections": connections,
@@ -71,14 +81,14 @@ impl NetworkRpc {
                 {
                     "name": "ipv4",
                     "limited": false,
-                    "reachable": true,
+                    "reachable": ipv4_reachable,
                     "proxy": proxy,
                     "proxy_randomize_credentials": false
                 },
                 {
                     "name": "ipv6",
                     "limited": false,
-                    "reachable": true,
+                    "reachable": ipv6_reachable,
                     "proxy": proxy,
                     "proxy_randomize_credentials": false
                 },
@@ -92,7 +102,15 @@ impl NetworkRpc {
                 }
             ],
             "relayfee": 0.0001,
-            "localaddresses": []
+            // Divi Core gives port and score as strings (NetworkLocalAddressHelpers.cpp:45-51)
+            "localaddresses": local
+                .into_iter()
+                .map(|a| serde_json::json!({
+                    "address": a.address.to_string(),
+                    "port": a.port.to_string(),
+                    "score": a.score.to_string(),
+                }))
+                .collect::<Vec<_>>()
         }))
     }
 
@@ -146,7 +164,7 @@ impl NetworkRpc {
                     "startingheight": st.start_height.load(Relaxed),
                     "banscore": banscore,
                     "inflight": [],
-                    "whitelisted": false,
+                    "whitelisted": peer_manager.is_whitelisted(*id),
                     "synced_headers": -1,
                     "synced_blocks": -1
                 });
@@ -182,46 +200,49 @@ impl NetworkRpc {
             .as_ref()
             .ok_or_else(|| RpcError::new(codes::MISC_ERROR, "Peer manager not available"))?;
 
-        let addr_str = params
-            .get_str(0)
-            .ok_or_else(|| RpcError::invalid_params("Missing node address"))?;
-
-        let command = params
-            .get_str(1)
-            .ok_or_else(|| RpcError::invalid_params("Missing command (add/remove/onetry)"))?;
-
-        // Parse the address
-        let addr: std::net::SocketAddr = if addr_str.contains(':') {
-            addr_str.parse().map_err(|_| {
-                RpcError::new(codes::CLIENT_INVALID_IP_OR_SUBNET, "Invalid address format")
-            })?
-        } else {
-            // Default port is 51472
-            format!("{}:51472", addr_str).parse().map_err(|_| {
-                RpcError::new(codes::CLIENT_INVALID_IP_OR_SUBNET, "Invalid address format")
-            })?
+        // Divi Core takes exactly a node and one of its three commands, as
+        // written; anything else is answered with its help (rpcnet.cpp:156-170)
+        let usage = || RpcError::new(codes::MISC_ERROR, ADDNODE_USAGE);
+        let command = match (params.len(), params.get_str(0), params.get_str(1)) {
+            (2, Some(_), Some(c)) if ["add", "remove", "onetry"].contains(&c) => c,
+            _ => return Err(usage().into()),
         };
+        let addr_str = params.get_str(0).unwrap_or_default();
 
-        match command.to_lowercase().as_str() {
+        // An address without a port gets the network's (Params().GetDefaultPort())
+        let addr: std::net::SocketAddr = addr_str
+            .parse()
+            .or_else(|_| {
+                addr_str
+                    .parse::<IpAddr>()
+                    .map(|ip| std::net::SocketAddr::new(ip, peer_manager.default_port()))
+            })
+            .map_err(|_| {
+                RpcError::new(codes::CLIENT_INVALID_IP_OR_SUBNET, "Invalid address format")
+            })?;
+
+        match command {
             "add" => {
                 if !peer_manager.add_node(addr) {
-                    return Err(RpcError::new(codes::MISC_ERROR, "Node already added").into());
+                    return Err(RpcError::new(
+                        codes::CLIENT_NODE_ALREADY_ADDED,
+                        "Error: Node already added",
+                    )
+                    .into());
                 }
             }
             "remove" => {
                 if !peer_manager.remove_added_node(&addr) {
-                    return Err(RpcError::new(codes::MISC_ERROR, "Node has not been added").into());
+                    return Err(RpcError::new(
+                        codes::CLIENT_NODE_NOT_ADDED,
+                        "Error: Node has not been added.",
+                    )
+                    .into());
                 }
             }
-            "onetry" => {
-                // Just add it - connection will be attempted on next cycle
-                peer_manager.add_node(addr);
-            }
             _ => {
-                return Err(RpcError::invalid_params(
-                    "Command must be 'add', 'remove', or 'onetry'",
-                )
-                .into());
+                // Divi Core dials it once, now, and does not keep it in the list
+                peer_manager.connect_once(addr);
             }
         }
 
@@ -246,12 +267,14 @@ impl NetworkRpc {
             )
             .into());
         }
+        let dns = params.get(0).and_then(|v| v.as_bool()).unwrap_or(false);
+        // The node as addnode takes it: without a port, the network's
         let filter_addr: Option<std::net::SocketAddr> = params.get_str(1).and_then(|s| {
-            if s.contains(':') {
-                s.parse().ok()
-            } else {
-                format!("{}:51472", s).parse().ok()
-            }
+            s.parse().ok().or_else(|| {
+                s.parse::<IpAddr>()
+                    .ok()
+                    .map(|ip| std::net::SocketAddr::new(ip, peer_manager.default_port()))
+            })
         });
 
         if params.get_str(1).is_some() && !added_nodes.iter().any(|n| filter_addr == Some(n.addr)) {
@@ -262,21 +285,23 @@ impl NetworkRpc {
             .into());
         }
 
+        // Divi Core: without dns only the added node; with it, the node's
+        // address and whether a peer of that address is connected
+        // (rpcnet.cpp:220-284)
         let result: Vec<_> = added_nodes
             .iter()
             .filter(|n| filter_addr.is_none() || filter_addr == Some(n.addr))
             .map(|node| {
+                if !dns {
+                    return serde_json::json!({ "addednode": node.addr.to_string() });
+                }
                 serde_json::json!({
                     "addednode": node.addr.to_string(),
                     "connected": node.connected,
-                    "addresses": if node.connected {
-                        vec![serde_json::json!({
-                            "address": node.addr.to_string(),
-                            "connected": "outbound"
-                        })]
-                    } else {
-                        vec![]
-                    }
+                    "addresses": [{
+                        "address": node.addr.to_string(),
+                        "connected": if node.connected { "outbound" } else { "false" },
+                    }],
                 })
             })
             .collect();
@@ -311,9 +336,21 @@ impl NetworkRpc {
 
         match command.to_lowercase().as_str() {
             "add" => {
-                // Get ban time (default 24 hours)
-                let ban_time = params.get_u64(2).unwrap_or(86400);
-                let duration = Duration::from_secs(ban_time);
+                // Ban time: missing or 0 means the node's -bantime (default 24
+                // hours); with `absolute` it is the time the ban ends, in
+                // seconds since 1970, as the help says
+                let absolute = params.get_bool(3).unwrap_or(false);
+                let duration = match params.get_u64(2) {
+                    Some(until) if until > 0 && absolute => {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        Duration::from_secs(until.saturating_sub(now))
+                    }
+                    Some(secs) if secs > 0 => Duration::from_secs(secs),
+                    _ => peer_manager.scoring().ban_policy().1,
+                };
 
                 peer_manager.ban_ip(ip, duration, "Manually banned via RPC");
                 Ok(serde_json::Value::Null)
@@ -345,8 +382,9 @@ impl NetworkRpc {
             .map(|ban| {
                 serde_json::json!({
                     "address": ban.ip.to_string(),
-                    "ban_created": ban.created_at.elapsed().as_secs(),
-                    "banned_until": ban.remaining().as_secs(),
+                    // Unix times, as in Bitcoin Core's listbanned
+                    "ban_created": ban.created,
+                    "banned_until": ban.until,
                     "ban_reason": ban.reason,
                 })
             })
@@ -417,13 +455,30 @@ impl NetworkRpc {
             .ok_or_else(|| RpcError::new(codes::MISC_ERROR, "Peer manager not available"))?;
 
         if target == "outdated" {
-            // Peer sub-versions are not recorded after the handshake, so "outdated" peers
-            // cannot be identified; refuse rather than report an empty (false) success.
-            return Err(RpcError::new(
-                codes::MISC_ERROR,
-                "ban outdated is not supported: peer versions are not tracked",
-            )
-            .into());
+            // BanOutdatedPeers (net.cpp:357-393): every peer whose sub-version is
+            // below Divi Core 3.0.0.0's gets a lifetime ban and is disconnected;
+            // the reply names each as ip:port, in the order they connected
+            let reference = subversion_index("3.0.0.0").unwrap_or(0);
+            let mut peers = peer_manager.get_peer_details();
+            peers.sort_by_key(|(id, ..)| *id);
+            let mut banned = Vec::new();
+            for (id, addr, _, stats, _) in peers {
+                let subver = stats.subver.lock().clone();
+                // divid throws (std::stoi) on a sub-version it cannot read;
+                // such a peer is left alone here
+                if subversion_index(core_subversion(&subver)).is_some_and(|v| v < reference) {
+                    // Only this peer is dropped; others from its address stay
+                    // until they reconnect (net.cpp:386-388)
+                    peer_manager.scoring().ban_ip(
+                        addr.ip(),
+                        LIFETIME,
+                        "Outdated peer banned via RPC",
+                    );
+                    peer_manager.disconnect(id);
+                    banned.push(serde_json::json!(addr.to_string()));
+                }
+            }
+            return Ok(serde_json::json!({ "Banned": banned }));
         }
 
         // C++ ban reports an unresolvable address the same way as an unknown peer
@@ -505,9 +560,78 @@ impl Default for NetworkRpc {
     }
 }
 
+/// The part of a peer's sub-version divid reads: after the first ": ", or from
+/// the second character when there is none (net.cpp:359-363, where
+/// `find` + 2 wraps to 1)
+fn core_subversion(raw: &str) -> &str {
+    match raw.find(": ") {
+        Some(at) => &raw[at + 2..],
+        None => raw.get(1..).unwrap_or(""),
+    }
+}
+
+/// divid's version index of a sub-version: its first four numbers, split at the
+/// dots and spaces, each read as std::stoi reads it and put 7 bits apart in an
+/// int (net.cpp:364-376). None where divid's std::stoi would throw or fewer than
+/// four parts would be read.
+fn subversion_index(subver: &str) -> Option<i64> {
+    let replaced = subver.replace('.', " ");
+    let parts: Vec<&str> = replaced.split_ascii_whitespace().collect();
+    let mut index: i64 = 0;
+    for (k, part) in parts.get(..4)?.iter().enumerate() {
+        index |= i64::from(stoi(part)?.wrapping_shl(21 - 7 * k as u32));
+    }
+    Some(index)
+}
+
+/// std::stoi: an optional sign and at least one digit, then anything; None
+/// where it throws (no digits, or out of int's range)
+fn stoi(text: &str) -> Option<i32> {
+    let (sign, rest) = match text.as_bytes().first() {
+        Some(b'-') => (-1i64, &text[1..]),
+        Some(b'+') => (1, &text[1..]),
+        _ => (1, text),
+    };
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 {
+        return None;
+    }
+    let value: i64 = rest[..digits].parse().ok()?;
+    i32::try_from(sign * value).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// divid's reading of a sub-version (net.cpp:359-376)
+    #[test]
+    fn subversions_are_read_as_divid_reads_them() {
+        assert_eq!(core_subversion("DIVI Core: 3.0.0.0"), "3.0.0.0");
+        assert_eq!(
+            core_subversion("x2.0.0.0"),
+            "2.0.0.0",
+            "no \": \": from the second character"
+        );
+        assert_eq!(core_subversion(""), "");
+        let v = |s: &str| subversion_index(core_subversion(s));
+        assert_eq!(v("DIVI Core: 3.0.0.0"), Some(3 << 21));
+        assert_eq!(v("Divi Core: 2.4.0.0"), Some((2 << 21) | (4 << 14)));
+        assert_eq!(v("Divi Core: 3.0.0.1(comment)"), Some((3 << 21) | 1));
+        assert_eq!(v("Divi Core: +3.0.0.0"), Some(3 << 21));
+        assert!(v("Divi Core: -1.0.0.0").unwrap() < 0);
+        assert_eq!(
+            v("/IronDivi:0.2.6/"),
+            None,
+            "std::stoi throws on \"IronDivi:0\""
+        );
+        assert_eq!(v("Divi Core: 3.0"), None, "fewer than four parts");
+        assert_eq!(
+            v("Divi Core: 99999999999.0.0.0"),
+            None,
+            "out of int's range"
+        );
+    }
 
     #[test]
     fn test_network_rpc_creation() {
@@ -520,14 +644,6 @@ mod tests {
         let rpc = NetworkRpc::new();
         let result = rpc.get_connection_count(&Params::None).unwrap();
         assert_eq!(result, serde_json::json!(0));
-    }
-
-    fn free_port() -> u16 {
-        std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
     }
 
     fn quiet_config() -> divi_network::PeerManagerConfig {
@@ -545,7 +661,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_peer_counters_and_connection_split_are_real() {
         use std::time::Duration;
-        let listen: std::net::SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+        let listen: std::net::SocketAddr = format!("127.0.0.1:{}", divi_test_support::free_port())
+            .parse()
+            .unwrap();
         let server = PeerManager::new(divi_network::PeerManagerConfig {
             listen_addr: Some(listen),
             ..quiet_config()
@@ -609,7 +727,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_ping_rpc_pings_every_peer() {
         use std::time::Duration;
-        let listen: std::net::SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+        let listen: std::net::SocketAddr = format!("127.0.0.1:{}", divi_test_support::free_port())
+            .parse()
+            .unwrap();
         let server = PeerManager::new(divi_network::PeerManagerConfig {
             listen_addr: Some(listen),
             ..quiet_config()
@@ -680,6 +800,46 @@ mod tests {
         server.disconnect_all();
     }
 
+    /// Divi Core `addnode … onetry` (net.cpp addNode): dials now, by address and
+    /// port even when a peer from that IP is connected, and is not kept in the
+    /// added-node list
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_addnode_onetry_dials_once_now() {
+        use std::time::Duration;
+        let listen: std::net::SocketAddr = format!("127.0.0.1:{}", divi_test_support::free_port())
+            .parse()
+            .unwrap();
+        let server = PeerManager::new(divi_network::PeerManagerConfig {
+            listen_addr: Some(listen),
+            ..quiet_config()
+        });
+        tokio::spawn(Arc::clone(&server).start());
+        let client = PeerManager::new(quiet_config());
+        let mut connected = false;
+        for _ in 0..50 {
+            if Arc::clone(&client).connect_to_peer(listen).await.is_ok() {
+                connected = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(connected, "client did not connect to the server");
+
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        let rpc = NetworkRpc::with_peer_manager(Arc::clone(&client));
+        rpc.add_node(&Params::Array(vec![
+            serde_json::json!(target_addr.to_string()),
+            serde_json::json!("onetry"),
+        ]))
+        .unwrap();
+        let accepted = tokio::time::timeout(Duration::from_secs(10), target.accept()).await;
+        assert!(accepted.is_ok(), "onetry did not dial");
+        assert!(!client.is_added_node(&target_addr));
+        client.disconnect_all();
+        server.disconnect_all();
+    }
+
     #[test]
     fn test_network_info_reports_proxy() {
         let proxy: std::net::SocketAddr = "127.0.0.1:9050".parse().unwrap();
@@ -699,6 +859,181 @@ mod tests {
             .get_network_info(&Params::None)
             .unwrap();
         assert_eq!(ni["networks"][0]["proxy"], "");
+    }
+
+    /// getnetworkinfo: IPv4 and IPv6 are reachable only once a local address of
+    /// them is known, and an IPv6 one marks IPv4 too (Divi Core
+    /// NetworkLocalAddressHelpers.cpp:73-105, :163-167)
+    #[test]
+    fn getnetworkinfo_reachable_follows_the_local_addresses() {
+        let reachable = |pm: &Arc<PeerManager>| {
+            let ni = NetworkRpc::with_peer_manager(Arc::clone(pm))
+                .get_network_info(&Params::None)
+                .unwrap();
+            let nets = ni["networks"].as_array().unwrap().clone();
+            nets.iter()
+                .map(|n| n["reachable"].as_bool().unwrap())
+                .collect::<Vec<_>>()
+        };
+        let pm = PeerManager::new(quiet_config());
+        assert_eq!(reachable(&pm), [false, false, false]);
+        assert!(pm.local_addresses().add(
+            "8.8.4.4:51472".parse().unwrap(),
+            divi_network::local::LOCAL_MANUAL
+        ));
+        assert_eq!(reachable(&pm), [true, false, false]);
+        let pm = PeerManager::new(quiet_config());
+        assert!(pm.local_addresses().add(
+            "[2001:4860:4860::8844]:51472".parse().unwrap(),
+            divi_network::local::LOCAL_MANUAL,
+        ));
+        assert_eq!(reachable(&pm), [true, true, false]);
+    }
+
+    /// setban with `absolute`: the ban ends at the time given, as the help
+    /// says, not that many seconds from now
+    #[test]
+    fn setban_absolute_bans_until_the_time_given() {
+        let pm = PeerManager::new(quiet_config());
+        let rpc = NetworkRpc::with_peer_manager(Arc::clone(&pm));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let until = now + 3600;
+        rpc.set_ban(&Params::Array(vec![
+            serde_json::json!("192.0.2.11"),
+            serde_json::json!("add"),
+            serde_json::json!(until),
+            serde_json::json!(true),
+        ]))
+        .unwrap();
+        rpc.set_ban(&Params::Array(vec![
+            serde_json::json!("192.0.2.12"),
+            serde_json::json!("add"),
+            serde_json::json!(600),
+        ]))
+        .unwrap();
+        let banned = rpc.list_banned(&Params::None).unwrap();
+        let end = |ip: &str| {
+            banned
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|b| b["address"] == ip)
+                .and_then(|b| b["banned_until"].as_u64())
+                .unwrap()
+        };
+        assert!(end("192.0.2.11").abs_diff(until) <= 2, "{banned}");
+        assert!(end("192.0.2.12").abs_diff(now + 600) <= 2, "{banned}");
+    }
+
+    /// The code and message of an RPC error
+    fn rpc_err(r: Result<serde_json::Value, Error>) -> (i32, String) {
+        match r {
+            Err(Error::Rpc(e)) => (e.code, e.message),
+            other => panic!("expected an RPC error, got {other:?}"),
+        }
+    }
+
+    fn regtest_peers() -> Arc<PeerManager> {
+        PeerManager::new(divi_network::PeerManagerConfig {
+            default_port: 51476,
+            ..quiet_config()
+        })
+    }
+
+    /// addnode as Divi Core answers it (rpcnet.cpp:156-186): -23 and -24 with
+    /// its texts, its help for a call it cannot take, and the network's port
+    /// for an address given without one
+    #[test]
+    fn addnode_replies_as_divid() {
+        let pm = regtest_peers();
+        let rpc = NetworkRpc::with_peer_manager(Arc::clone(&pm));
+        let call = |args: Vec<serde_json::Value>| rpc.add_node(&Params::Array(args));
+        let (add, remove) = (serde_json::json!("add"), serde_json::json!("remove"));
+        let node = serde_json::json!("192.0.2.1");
+
+        assert_eq!(
+            call(vec![node.clone(), add.clone()]).unwrap(),
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            pm.get_added_node_info()[0].addr,
+            "192.0.2.1:51476".parse().unwrap()
+        );
+        assert_eq!(
+            rpc_err(call(vec![
+                serde_json::json!("192.0.2.1:51476"),
+                add.clone()
+            ])),
+            (-23, "Error: Node already added".to_string())
+        );
+        assert_eq!(
+            call(vec![node.clone(), remove.clone()]).unwrap(),
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            rpc_err(call(vec![node.clone(), remove])),
+            (-24, "Error: Node has not been added.".to_string())
+        );
+        for bad in [
+            vec![],
+            vec![node.clone()],
+            vec![node.clone(), serde_json::json!("ADD")],
+            vec![node.clone(), serde_json::json!("badcommand")],
+            vec![node, add, serde_json::json!(1)],
+        ] {
+            let (code, message) = rpc_err(call(bad.clone()));
+            assert_eq!(code, -1, "{bad:?}");
+            assert!(
+                message.starts_with("addnode \"node\" \"add|remove|onetry\"\n\nAttempts add")
+                    && message.ends_with("http://127.0.0.1:51473/\n"),
+                "{bad:?}: {message}"
+            );
+        }
+    }
+
+    /// getaddednodeinfo as Divi Core gives it (rpcnet.cpp:188-287): without
+    /// dns only `addednode`; with dns `connected` and the node's address with
+    /// its own `connected` "false" while no peer of it is connected
+    #[test]
+    fn getaddednodeinfo_replies_as_divid() {
+        let pm = regtest_peers();
+        let rpc = NetworkRpc::with_peer_manager(Arc::clone(&pm));
+        assert!(pm.add_node("192.0.2.1:51476".parse().unwrap()));
+        let info = |args: Vec<serde_json::Value>| rpc.get_added_node_info(&Params::Array(args));
+        let plain = serde_json::json!([{ "addednode": "192.0.2.1:51476" }]);
+        let with_dns = serde_json::json!([{
+            "addednode": "192.0.2.1:51476",
+            "connected": false,
+            "addresses": [{ "address": "192.0.2.1:51476", "connected": "false" }],
+        }]);
+        assert_eq!(info(vec![serde_json::json!(false)]).unwrap(), plain);
+        assert_eq!(
+            info(vec![
+                serde_json::json!(false),
+                serde_json::json!("192.0.2.1")
+            ])
+            .unwrap(),
+            plain
+        );
+        assert_eq!(info(vec![serde_json::json!(true)]).unwrap(), with_dns);
+        assert_eq!(
+            info(vec![
+                serde_json::json!(true),
+                serde_json::json!("192.0.2.1:51476")
+            ])
+            .unwrap(),
+            with_dns
+        );
+        assert_eq!(
+            rpc_err(info(vec![
+                serde_json::json!(true),
+                serde_json::json!("192.0.2.2")
+            ])),
+            (-24, "Error: Node has not been added.".to_string())
+        );
     }
 
     #[test]

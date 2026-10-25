@@ -51,16 +51,22 @@
 pub mod access;
 pub mod auth_cookie;
 pub mod blockchain;
+pub mod core_help;
 pub mod error;
+pub mod http;
+pub mod json_spirit_text;
 pub mod lite_wallet;
 pub mod masternode;
 pub mod mn_broadcast;
+pub mod mn_list;
 pub mod network;
 pub mod protocol;
+pub mod rest;
 pub mod server;
 pub mod spork;
 pub mod staking;
 pub mod wallet;
+mod wallet_history;
 pub mod websocket;
 
 pub use access::{AccessConfig, RpcAccess};
@@ -75,7 +81,7 @@ pub use server::{
     create_router_with_auth, rpc_access, start_server, start_server_with_peer_manager,
     start_server_with_peer_manager_and_setup, start_server_with_wallet_and_peer_manager,
     start_server_with_wallet_peer_and_staker, LogConfigInfo, RpcConfig, RpcServer,
-    ShutdownCallback,
+    ShutdownCallback, Subnet,
 };
 pub use staking::{StakingInfo, StakingRpc};
 pub use wallet::{TxSubmitError, WalletRpc};

@@ -206,8 +206,11 @@ impl Encodable for Script {
 impl Decodable for Script {
     fn decode<R: Read>(reader: &mut R) -> Result<Self, Error> {
         let len = CompactSize::decode(reader)?.0 as usize;
-        let mut bytes = vec![0u8; len];
-        reader.read_exact(&mut bytes)?;
+        let mut bytes = Vec::with_capacity(crate::compact::prealloc_len::<u8>(len));
+        reader.take(len as u64).read_to_end(&mut bytes)?;
+        if bytes.len() != len {
+            return Err(Error::UnexpectedEof);
+        }
         Ok(Script(bytes))
     }
 }

@@ -16,10 +16,13 @@
 
 use crate::error::NetworkError;
 use crate::message::NetAddr;
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use crate::wire::Reader;
+use byteorder::{LittleEndian, WriteBytesExt};
 use divi_primitives::compact::CompactSize;
-use divi_primitives::serialize::{Decodable, Encodable};
-use std::io::Cursor;
+use divi_primitives::serialize::Encodable;
+
+/// Divi Core `LIMITED_STRING(strSubVer, 256)`
+pub const MAX_SUBVERSION_LENGTH: usize = 256;
 
 /// Version message payload
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,60 +73,29 @@ impl VersionMessage {
         buf
     }
 
-    /// Deserialize from bytes
+    /// Deserialize from bytes. As in Divi Core, only the fields up to the
+    /// receiver's address are required; the sender's address and nonce, the
+    /// user agent (at most 256 bytes), the start height and the relay flag
+    /// are read only if the payload goes on.
     pub fn deserialize(data: &[u8]) -> Result<Self, NetworkError> {
-        let mut cursor = Cursor::new(data);
+        let mut r = Reader::new(data);
+        let version = r.i32()?;
+        let services = r.u64()?;
+        let timestamp = r.i64()?;
+        let addr_recv = NetAddr::read(&mut r)?;
 
-        let version = cursor.read_i32::<LittleEndian>()?;
-        let services = cursor.read_u64::<LittleEndian>()?;
-        let timestamp = cursor.read_i64::<LittleEndian>()?;
-
-        // Read addr_recv (26 bytes)
-        let pos = cursor.position() as usize;
-        let addr_recv = NetAddr::deserialize(&data[pos..pos + 26])?;
-        cursor.set_position((pos + 26) as u64);
-
-        // Read addr_from (26 bytes)
-        let pos = cursor.position() as usize;
-        let addr_from = NetAddr::deserialize(&data[pos..pos + 26])?;
-        cursor.set_position((pos + 26) as u64);
-
-        let nonce = cursor.read_u64::<LittleEndian>()?;
-
-        // Read user agent
-        let len = CompactSize::decode(&mut cursor)
-            .map_err(|e| NetworkError::Deserialization(e.to_string()))?;
-        let len = len.value() as usize;
-        let pos = cursor.position() as usize;
-        if pos + len > data.len() {
-            return Err(NetworkError::Deserialization("user agent too long".into()));
-        }
-        let user_agent = String::from_utf8_lossy(&data[pos..pos + len]).to_string();
-        cursor.set_position((pos + len) as u64);
-
-        let start_height = cursor.read_i32::<LittleEndian>()?;
-
-        // Relay is optional (added in BIP 0037)
-        let relay = if cursor.position() < data.len() as u64 {
-            cursor.read_u8()? != 0
+        let (addr_from, nonce) = if r.is_empty() {
+            (NetAddr::from_ipv4([0, 0, 0, 0], 0, 0), 1)
         } else {
-            true
+            (NetAddr::read(&mut r)?, r.u64()?)
         };
-
-        // Check for unconsumed bytes (version messages may have extra data)
-        let consumed = cursor.position() as usize;
-        if consumed != data.len() {
-            tracing::warn!(
-                "version message: consumed {} bytes but payload has {} bytes ({} unconsumed)",
-                consumed,
-                data.len(),
-                data.len() - consumed
-            );
-            tracing::warn!(
-                "Unconsumed bytes: {:02x?}",
-                &data[consumed..data.len().min(consumed + 64)]
-            );
-        }
+        let user_agent = if r.is_empty() {
+            String::new()
+        } else {
+            r.limited_string(MAX_SUBVERSION_LENGTH)?
+        };
+        let start_height = if r.is_empty() { -1 } else { r.i32()? };
+        let relay = if r.is_empty() { true } else { r.u8()? != 0 };
 
         Ok(VersionMessage {
             version,
@@ -210,7 +182,7 @@ mod tests {
             addr_recv: NetAddr::from_ipv4([127, 0, 0, 1], 52474, NODE_NETWORK),
             addr_from: NetAddr::from_ipv4([0, 0, 0, 0], 0, NODE_NETWORK),
             nonce: 0xdeadbeef_cafebabe,
-            user_agent: "/IronDivi:0.1.0/".to_string(),
+            user_agent: USER_AGENT.to_string(),
             start_height: 500_000,
             relay: true,
         };
@@ -223,7 +195,7 @@ mod tests {
         assert_eq!(deserialized.services, NODE_NETWORK);
         assert_eq!(deserialized.start_height, 500_000);
         assert!(deserialized.relay);
-        assert_eq!(deserialized.user_agent, "/IronDivi:0.1.0/");
+        assert_eq!(deserialized.user_agent, USER_AGENT);
 
         // The magic bytes for PrivateDivi testnet are 0x70 0xd1 0x76 0x12
         assert_eq!(PRIVATEDIVI_TESTNET_MAGIC, [0x70, 0xd1, 0x76, 0x12]);

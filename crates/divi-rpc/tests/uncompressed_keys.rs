@@ -154,18 +154,20 @@ fn imported_uncompressed_key_controls_its_own_address() {
         json!(key.wif)
     );
 
-    // BIP38 keeps the key's form: decrypting gives back the uncompressed WIF
+    // BIP38 keeps the key's form: decrypting gives the uncompressed key, whose
+    // address the wallet already holds (bip38decrypt adds the key as Divi Core
+    // does, rpcdump.cpp:331-337, so it refuses it here)
     let enc = ok(call(
         &server,
         "bip38encrypt",
         vec![json!(key.address), json!("test only pass")],
     ));
-    let dec = ok(call(
-        &server,
-        "bip38decrypt",
-        vec![enc, json!("test only pass")],
-    ));
-    assert!(dec.to_string().contains(&key.wif), "{dec}");
+    let r = call(&server, "bip38decrypt", vec![enc, json!("test only pass")]);
+    let e = r.error.expect("key already held");
+    assert_eq!(
+        (e.code, e.message.as_str()),
+        (-4, "Key already held by wallet")
+    );
 
     // The wallet signs spends of the address with its uncompressed public key
     let (unsigned, prevtxs) = spend_of(&key.script_pubkey);
@@ -286,6 +288,6 @@ fn createmultisig_keeps_an_uncompressed_public_key() {
         "addmultisigaddress",
         vec![json!(1), json!([key.address])],
     ));
-    // (this tree answers {address, redeemScript}; Divi Core answers the address alone)
-    assert_eq!(r3["address"], r["address"]);
+    // Divi Core answers the address alone
+    assert_eq!(r3, r["address"]);
 }

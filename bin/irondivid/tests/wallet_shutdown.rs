@@ -25,11 +25,12 @@ use divi_primitives::{
     ChainMode,
 };
 use divi_storage::{Chain, ChainDatabase, ChainParams, NetworkType};
+use divi_test_support::start_node;
 use divi_wallet::{HdWallet, Network, WalletDb};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -39,14 +40,6 @@ const WALLET_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon \
      abandon abandon abandon abandon abandon about";
 const OTHER_MNEMONIC: &str =
     "legal winner thank year wave sausage worth useful legal winner thank yellow";
-
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
 
 /// First receiving address of a wallet restored from `mnemonic`
 fn first_address(mnemonic: &str) -> divi_wallet::Address {
@@ -92,33 +85,27 @@ struct Daemon {
 
 impl Daemon {
     fn start(datadir: &Path) -> Daemon {
-        let rpc_port = free_port();
-        let child = Command::new(env!("CARGO_BIN_EXE_irondivid"))
-            .arg("--regtest")
-            .arg("--datadir")
-            .arg(datadir)
-            .args(["--rpcport", &rpc_port.to_string()])
-            .args(["--port", &free_port().to_string()])
-            .args(["--bind", "127.0.0.1", "--staking=false"])
-            // RPC always requires credentials; "dGVzdDp0ZXN0" is base64 of test:test
-            .args(["--rpcuser", "test", "--rpcpassword", "test"])
-            .env("WALLET_MNEMONIC", WALLET_MNEMONIC)
-            .env("WALLET_LOOKAHEAD", "5")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn irondivid");
-        let mut daemon = Daemon { child, rpc_port };
-        let deadline = Instant::now() + Duration::from_secs(120);
-        while try_rpc(rpc_port, "getblockcount", &json!([])).is_none() {
-            assert!(
-                daemon.child.try_wait().unwrap().is_none(),
-                "irondivid exited before its RPC server came up"
-            );
-            assert!(Instant::now() < deadline, "RPC server did not come up");
-            std::thread::sleep(Duration::from_millis(250));
-        }
-        daemon
+        let (child, rpc_port, _) = start_node(
+            datadir,
+            |rpc_port, p2p_port| {
+                let mut cmd = Command::new(env!("CARGO_BIN_EXE_irondivid"));
+                cmd.arg("--regtest")
+                    .arg("--datadir")
+                    .arg(datadir)
+                    .args(["--rpcport", &rpc_port.to_string()])
+                    .args(["--port", &p2p_port.to_string()])
+                    .args(["--bind", "127.0.0.1", "--staking=false"])
+                    // RPC always requires credentials; "dGVzdDp0ZXN0" is base64 of test:test
+                    .args(["--rpcuser", "test", "--rpcpassword", "test"])
+                    .env("WALLET_MNEMONIC", WALLET_MNEMONIC)
+                    .env("WALLET_LOOKAHEAD", "5")
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
+                cmd
+            },
+            |rpc_port| try_rpc(rpc_port, "getblockcount", &json!([])).is_some(),
+        );
+        Daemon { child, rpc_port }
     }
 
     fn rpc(&self, method: &str, params: Value) -> Value {
@@ -169,11 +156,12 @@ fn mine_offline(datadir: &Path, to: &divi_wallet::Address, n: u32) {
         let tip = chain.tip().unwrap();
         let height = tip.height + 1;
         let mut block = Block::default();
-        block.header.version = 1;
+        block.header.version = 4;
         block.header.prev_block = tip.hash;
         block.header.time = (now - 86_400 + 60 * i).max(tip.time + 1);
         block.header.bits = 0x207fffff;
-        let mut sig = vec![0x04];
+        // BIP34: the coinbase starts with the height
+        let mut sig = divi_storage::bip34_height_script(height);
         sig.extend_from_slice(&height.to_le_bytes());
         block.transactions.push(Transaction {
             version: 1,
@@ -185,6 +173,11 @@ fn mine_offline(datadir: &Path, to: &divi_wallet::Address, n: u32) {
             lock_time: 0,
         });
         block.header.merkle_root = compute_merkle_root(&block.transactions);
+        // Proof of work for the block's bits
+        let target = divi_primitives::hash::Hash256::from_compact(block.header.bits);
+        while divi_crypto::compute_block_hash(&block.header) > target {
+            block.header.nonce += 1;
+        }
         chain.accept_block(block).unwrap();
     }
 }
@@ -229,9 +222,11 @@ fn send_then_end(how: End) {
     daemon.rpc("stop", json!([]));
     assert!(daemon.wait());
     mine_offline(datadir, &first_address(WALLET_MNEMONIC), 3);
+    // Regtest coinbases mature after 20 blocks: 22 more blocks to someone else
+    mine_offline(datadir, &first_address(OTHER_MNEMONIC), 22);
 
     let daemon = Daemon::start(datadir);
-    assert_eq!(daemon.rpc("getblockcount", json!([])), json!(3));
+    assert_eq!(daemon.rpc("getblockcount", json!([])), json!(25));
     let before = unspent(&daemon);
     assert_eq!(before.len(), 3, "funding coins: {before:?}");
 
@@ -245,7 +240,7 @@ fn send_then_end(how: End) {
 
     let clean = match how {
         End::RpcStop => {
-            assert_eq!(daemon.rpc("stop", json!([])), json!("Divi server stopping"));
+            assert_eq!(daemon.rpc("stop", json!([])), json!("DIVI server stopping"));
             true
         }
         End::Signal(sig) => {

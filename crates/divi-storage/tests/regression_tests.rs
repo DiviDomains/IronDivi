@@ -194,16 +194,18 @@ fn test_regression_utxo_cache_flush_persists_to_db() {
 // chain with more cumulative work than the active tip and calls do_reorg().
 // ============================================================
 
-fn build_block(prev_hash: Hash256, prev_time: u32, tag: u8) -> Block {
+fn build_block(height: u32, prev_hash: Hash256, prev_time: u32, tag: u8) -> Block {
     let mut block = Block::default();
-    block.header.version = 1;
+    block.header.version = 4;
     block.header.prev_block = prev_hash;
     block.header.time = prev_time + 60;
     block.header.bits = 0x207fffff; // Regtest minimum difficulty
 
     let coinbase = Transaction {
         version: 1,
-        vin: vec![TxIn::coinbase(Script::from_bytes(vec![tag]))],
+        vin: vec![TxIn::coinbase(Script::from_bytes(
+            [divi_storage::bip34_height_script(height), vec![0x01, tag]].concat(),
+        ))],
         vout: vec![TxOut::new(
             Amount::from_sat(1250_00000000),
             Script::new_p2pkh(&[tag; 20]),
@@ -212,6 +214,10 @@ fn build_block(prev_hash: Hash256, prev_time: u32, tag: u8) -> Block {
     };
     block.transactions.push(coinbase);
     block.header.merkle_root = compute_merkle_root(&block.transactions);
+    let target = Hash256::from_compact(block.header.bits);
+    while divi_crypto::compute_block_hash(&block.header) > target {
+        block.header.nonce += 1;
+    }
     block
 }
 
@@ -237,20 +243,20 @@ fn test_regression_reorg_switches_to_longer_chain() {
     let genesis_time = genesis.time;
 
     // Chain A: genesis → A1 → A2 (height 2)
-    let block_a1 = build_block(genesis_hash, genesis_time, 0x0A);
+    let block_a1 = build_block(1, genesis_hash, genesis_time, 0x0A);
     let hash_a1 = chain.accept_block(block_a1.clone()).unwrap().hash;
-    let block_a2 = build_block(hash_a1, block_a1.header.time, 0x0B);
+    let block_a2 = build_block(2, hash_a1, block_a1.header.time, 0x0B);
     let hash_a2 = chain.accept_block(block_a2.clone()).unwrap().hash;
 
     assert_eq!(chain.height(), 2);
     assert_eq!(chain.tip().unwrap().hash, hash_a2);
 
     // Chain B: genesis → B1 → B2 → B3 (height 3, more work)
-    let block_b1 = build_block(genesis_hash, genesis_time + 1, 0x1A);
+    let block_b1 = build_block(1, genesis_hash, genesis_time + 1, 0x1A);
     let hash_b1 = chain.accept_block(block_b1.clone()).unwrap().hash;
-    let block_b2 = build_block(hash_b1, block_b1.header.time, 0x1B);
+    let block_b2 = build_block(2, hash_b1, block_b1.header.time, 0x1B);
     let hash_b2 = chain.accept_block(block_b2.clone()).unwrap().hash;
-    let block_b3 = build_block(hash_b2, block_b2.header.time, 0x1C);
+    let block_b3 = build_block(3, hash_b2, block_b2.header.time, 0x1C);
     let hash_b3 = chain.accept_block(block_b3).unwrap().hash;
 
     assert_eq!(
@@ -277,9 +283,9 @@ fn test_connect_block_records_money_supply() {
     let (chain, _dir) = create_test_chain();
     let genesis = chain.tip().expect("genesis must exist");
 
-    let block1 = build_block(genesis.hash, genesis.time, 0x0A);
+    let block1 = build_block(1, genesis.hash, genesis.time, 0x0A);
     let h1 = chain.accept_block(block1.clone()).unwrap().hash;
-    let block2 = build_block(h1, block1.header.time, 0x0B);
+    let block2 = build_block(2, h1, block1.header.time, 0x0B);
     let h2 = chain.accept_block(block2.clone()).unwrap().hash;
 
     let created = |b: &Block| -> i64 {
@@ -318,7 +324,7 @@ fn test_regression_reorg_updates_utxo_set() {
     let genesis_time = genesis.time;
 
     // Chain A (will be abandoned)
-    let block_a1 = build_block(genesis_hash, genesis_time, 0x0A);
+    let block_a1 = build_block(1, genesis_hash, genesis_time, 0x0A);
     let hash_a1 = chain.accept_block(block_a1.clone()).unwrap().hash;
 
     // Check A1's coinbase UTXO exists
@@ -328,9 +334,9 @@ fn test_regression_reorg_updates_utxo_set() {
     assert!(chain.has_utxo(&a1_outpoint).unwrap(), "A1 UTXO must exist");
 
     // Chain B: longer, will replace A
-    let block_b1 = build_block(genesis_hash, genesis_time + 1, 0x1A);
+    let block_b1 = build_block(1, genesis_hash, genesis_time + 1, 0x1A);
     let hash_b1 = chain.accept_block(block_b1.clone()).unwrap().hash;
-    let block_b2 = build_block(hash_b1, block_b1.header.time, 0x1B);
+    let block_b2 = build_block(2, hash_b1, block_b1.header.time, 0x1B);
     let _hash_b2 = chain.accept_block(block_b2.clone()).unwrap().hash;
 
     // After reorg: A1's UTXO must be gone, B1's UTXO must exist
@@ -359,20 +365,20 @@ fn test_regression_no_reorg_for_shorter_chain() {
     let genesis_time = genesis.time;
 
     // Build a 3-block main chain
-    let b1 = build_block(genesis_hash, genesis_time, 0x01);
+    let b1 = build_block(1, genesis_hash, genesis_time, 0x01);
     let h1 = chain.accept_block(b1.clone()).unwrap().hash;
-    let b2 = build_block(h1, b1.header.time, 0x02);
+    let b2 = build_block(2, h1, b1.header.time, 0x02);
     let h2 = chain.accept_block(b2.clone()).unwrap().hash;
-    let b3 = build_block(h2, b2.header.time, 0x03);
+    let b3 = build_block(3, h2, b2.header.time, 0x03);
     let h3 = chain.accept_block(b3).unwrap().hash;
 
     assert_eq!(chain.height(), 3);
     assert_eq!(chain.tip().unwrap().hash, h3);
 
     // Add a 2-block competing chain (shorter — must NOT reorg)
-    let c1 = build_block(genesis_hash, genesis_time + 1, 0x11);
+    let c1 = build_block(1, genesis_hash, genesis_time + 1, 0x11);
     let hc1 = chain.accept_block(c1.clone()).unwrap().hash;
-    let c2 = build_block(hc1, c1.header.time, 0x12);
+    let c2 = build_block(2, hc1, c1.header.time, 0x12);
     let _hc2 = chain.accept_block(c2).unwrap().hash;
 
     // Main chain must still win (height 3)

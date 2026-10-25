@@ -122,7 +122,12 @@ fn assert_send_kept(wallet: &WalletDb, fund: &Transaction, send: &Transaction) {
     );
     assert_eq!(spendable.len(), 1);
     assert_eq!(spendable[0].txid, send.txid());
-    assert_eq!(wallet.get_balance().as_sat(), 70 * COIN - 1_000_000);
+    // The change is unconfirmed balance, not getbalance's (Divi Core)
+    assert_eq!(wallet.get_balance().as_sat(), 0);
+    assert_eq!(
+        wallet.get_unconfirmed_balance().as_sat(),
+        70 * COIN - 1_000_000
+    );
     assert_eq!(wallet.mempool_tx_count(), 1);
 }
 
@@ -177,7 +182,11 @@ fn unconfirmed_chain_of_sends_survives_restart() {
     let spendable = wallet.get_spendable_utxos(100, 0);
     assert_eq!(spendable.len(), 1);
     assert_eq!(spendable[0].txid, child.txid());
-    assert_eq!(wallet.get_balance().as_sat(), 60 * COIN - 2_000_000);
+    assert_eq!(wallet.get_balance().as_sat(), 0);
+    assert_eq!(
+        wallet.get_unconfirmed_balance().as_sat(),
+        60 * COIN - 2_000_000
+    );
 }
 
 #[test]
@@ -266,5 +275,62 @@ fn send_conflicted_by_a_block_is_forgotten_on_disk_too() {
     let wallet = open(dir.path());
     assert_eq!(wallet.mempool_tx_count(), 0);
     assert!(wallet.get_transaction(&send.txid()).is_none());
+    assert_eq!(wallet.get_balance().as_sat(), 0);
+}
+
+/// An evicted send leaves the balance and the mempool overlay, but the wallet
+/// keeps it, raw, as a detached transaction across a restart, as Divi Core
+/// keeps it at depth -1
+#[test]
+fn evicted_send_is_kept_as_detached_across_restart() {
+    let dir = tempdir().unwrap();
+    let (wallet, fund, change) = funded(dir.path());
+    let send = own_send(&fund, &change);
+    assert!(wallet.add_mempool_tx(&send));
+    assert!(wallet.remove_mempool_tx(&send.txid()));
+    drop(wallet);
+
+    let wallet = open(dir.path());
+    let detached = wallet.detached_transactions();
+    assert_eq!(detached.len(), 1);
+    assert_eq!(detached[0].0, send.txid());
+    assert_eq!(detached[0].1.tx.as_ref(), Some(&send));
+    assert!(wallet.history_record(&send.txid()).is_some());
+    assert_eq!(wallet.get_balance().as_sat(), 100 * COIN);
+
+    // Seen in the mempool again: no longer detached, on disk too
+    assert!(wallet.add_mempool_tx(&send));
+    assert!(wallet.detached_transactions().is_empty());
+    drop(wallet);
+    assert!(open(dir.path()).detached_transactions().is_empty());
+}
+
+/// A send conflicted by a block is kept as a detached transaction across a
+/// restart; the history lists it once
+#[test]
+fn send_conflicted_by_a_block_is_kept_as_detached() {
+    let dir = tempdir().unwrap();
+    let (wallet, fund, change) = funded(dir.path());
+    let send = own_send(&fund, &change);
+    assert!(wallet.add_mempool_tx(&send));
+    let other = spend(&[(fund.txid(), 0)], vec![(99 * COIN, stranger())]);
+    wallet.scan_block(
+        Hash256::from_bytes([3u8; 32]),
+        101,
+        1_060,
+        std::slice::from_ref(&other),
+    );
+    wallet.set_last_scan_height(101);
+    wallet.save_incremental().unwrap();
+    drop(wallet);
+
+    let wallet = open(dir.path());
+    let ids: Vec<Hash256> = wallet
+        .history_records()
+        .iter()
+        .map(|r| r.txid)
+        .filter(|id| *id == send.txid())
+        .collect();
+    assert_eq!(ids, vec![send.txid()]);
     assert_eq!(wallet.get_balance().as_sat(), 0);
 }

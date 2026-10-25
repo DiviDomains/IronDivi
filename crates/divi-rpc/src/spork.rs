@@ -99,8 +99,10 @@ impl SporkRpc {
             )
             .into()
         };
+        // params[n].get_str(): json_spirit takes only a string (rpcmisc.cpp:280-301)
+        let arg = |i: usize| crate::masternode::str_arg(params, i);
         match params.len() {
-            1 => match params.get_str(0) {
+            1 => match arg(0)? {
                 Some("show") => Ok(Value::Object(
                     SPORKS
                         .iter()
@@ -116,10 +118,11 @@ impl SporkRpc {
                 _ => Err(usage()),
             },
             2 => {
-                let name = params.get_str(0).ok_or_else(usage)?;
+                let name = arg(0)?.ok_or_else(usage)?;
                 if !SPORKS.iter().any(|(_, n, _)| *n == name) {
                     return Ok(json!("Invalid spork name"));
                 }
+                arg(1)?;
                 // Updating a spork needs the network's spork private key.
                 Ok(json!("failure"))
             }
@@ -153,6 +156,30 @@ mod tests {
         assert_eq!(v["SPORK_8_MASTERNODE_PAYMENT_ENFORCEMENT"], true);
         assert_eq!(v["SPORK_9_SUPERBLOCKS_ENABLED"], false);
         assert_eq!(v["SPORK_13_BLOCK_PAYMENTS"], false);
+    }
+
+    /// spork reads its name and value with get_str (rpcmisc.cpp:280-301): another
+    /// JSON type is json_spirit's -1 type error; the value is read after the name
+    /// is found
+    #[test]
+    fn spork_name_and_value_must_be_strings() {
+        let r = SporkRpc::new();
+        let code_message = |params: Vec<Value>| match r.spork(&Params::Array(params)) {
+            Err(Error::Rpc(e)) => (e.code, e.message),
+            other => panic!("expected an RPC error, got {other:?}"),
+        };
+        let type_error = |t: &str| (-1, format!("value is type {t}, expected str"));
+        assert_eq!(
+            code_message(vec![json!("SPORK_2_SWIFTTX_ENABLED"), json!(4070908800u64)]),
+            type_error("int")
+        );
+        assert_eq!(code_message(vec![json!(2), json!("1")]), type_error("int"));
+        assert_eq!(code_message(vec![json!(true)]), type_error("bool"));
+        assert_eq!(
+            r.spork(&Params::Array(vec![json!("NOPE"), json!(1)]))
+                .unwrap(),
+            "Invalid spork name"
+        );
     }
 
     #[test]

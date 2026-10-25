@@ -37,18 +37,33 @@
 //! assert_ne!(addr1.to_string(), addr2.to_string());
 //! ```
 
+/// A point where a test can stop the operation, as if the process died there
+/// (see `fault`); nothing outside test builds
+macro_rules! stop_point {
+    ($point:expr) => {
+        #[cfg(test)]
+        crate::fault::check($point)?;
+    };
+}
+
 pub mod address;
 #[cfg(not(target_arch = "wasm32"))]
 mod at_rest;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod backup;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod coin_selection;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod coinstake;
 pub mod error;
+#[cfg(test)]
+mod fault;
 pub mod hd;
 pub mod keystore;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod persistence;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod send;
 pub mod signer;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod wallet_db;
@@ -59,10 +74,12 @@ pub use coin_selection::{CoinSelector, SelectionResult};
 #[cfg(not(target_arch = "wasm32"))]
 pub use coinstake::CoinstakeBuilder;
 pub use error::WalletError;
-pub use hd::{ExtendedPrivateKey, ExtendedPublicKey, HdWallet, DIVI_COIN_TYPE};
+pub use hd::{core_coin_type, ExtendedPrivateKey, ExtendedPublicKey, HdWallet, DIVI_COIN_TYPE};
 pub use keystore::{HdPublicIds, KeyEntry, KeyStore};
 #[cfg(not(target_arch = "wasm32"))]
 pub use persistence::WalletDatabase;
 pub use signer::{sighash, sign_input, TransactionBuilder, TransactionSigner};
 #[cfg(not(target_arch = "wasm32"))]
-pub use wallet_db::{WalletDb, WalletTx, WalletUtxo};
+pub use wallet_db::{
+    DetachedTx, Ownership, TxListener, WalletDb, WalletTx, WalletUtxo, BACKUP_MARKER,
+};

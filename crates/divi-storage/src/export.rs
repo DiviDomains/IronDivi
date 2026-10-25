@@ -163,6 +163,45 @@ impl Chain {
     ///     00000001.json
     ///     ...
     /// ```
+    /// Write the active blocks `start_height..=end_height` to `path` as a
+    /// block file in Divi Core's format: the network's message start, the
+    /// block's size, the block (BlockDiskAccessor.cpp:35-43), as its blk*.dat
+    /// and bootstrap.dat hold them, so -loadblock can read it. Returns the
+    /// number of blocks written.
+    pub fn export_block_file(
+        &self,
+        start_height: u32,
+        end_height: u32,
+        message_start: [u8; 4],
+        path: &Path,
+    ) -> Result<u32, StorageError> {
+        use std::io::Write;
+        if start_height > end_height || end_height > self.height() {
+            return Err(StorageError::InvalidParameter(format!(
+                "heights {}..={} are not on the chain (height {})",
+                start_height,
+                end_height,
+                self.height()
+            )));
+        }
+        let mut out = std::io::BufWriter::new(fs::File::create(path).map_err(StorageError::Io)?);
+        for height in start_height..=end_height {
+            let index = self
+                .get_block_index_by_height(height)?
+                .ok_or_else(|| StorageError::BlockNotFound(format!("height {}", height)))?;
+            let block = self
+                .get_block(&index.hash)?
+                .ok_or_else(|| StorageError::BlockNotFound(format!("block {}", index.hash)))?;
+            let bytes = divi_primitives::serialize::serialize(&block);
+            out.write_all(&message_start).map_err(StorageError::Io)?;
+            out.write_all(&(bytes.len() as u32).to_le_bytes())
+                .map_err(StorageError::Io)?;
+            out.write_all(&bytes).map_err(StorageError::Io)?;
+        }
+        out.flush().map_err(StorageError::Io)?;
+        Ok(end_height - start_height + 1)
+    }
+
     pub fn export_chain(
         &self,
         start_height: u32,
@@ -174,6 +213,15 @@ impl Chain {
             return Err(StorageError::InvalidParameter(
                 "start_height must be <= end_height".to_string(),
             ));
+        }
+        // Blocks above the tip are not there: refuse before writing anything
+        // rather than write a partial export
+        if end_height > self.height() {
+            return Err(StorageError::InvalidParameter(format!(
+                "end height {} is above the chain height {}",
+                end_height,
+                self.height()
+            )));
         }
 
         // Create output directory structure
@@ -235,7 +283,7 @@ impl Chain {
         };
 
         let manifest = ExportManifest {
-            chain: "mainnet".to_string(),
+            chain: crate::datadir::network_name(self.params()),
             exported_at: chrono::Utc::now().to_rfc3339(),
             block_count: exported_count,
             start_height,

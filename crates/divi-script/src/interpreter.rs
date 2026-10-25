@@ -232,6 +232,57 @@ pub fn is_push_only(script: &[u8]) -> bool {
     true
 }
 
+/// Core's `CScript::GetSigOpCount(fAccurate)` (script.cpp:31-53): CHECKSIG and
+/// CHECKSIGVERIFY count 1; CHECKMULTISIG(VERIFY) counts the preceding OP_1..OP_16
+/// when `accurate`, otherwise 20. Counting stops at the first unparsable op.
+pub fn sig_op_count(script: &[u8], accurate: bool) -> u32 {
+    let mut n = 0u32;
+    let mut pc = 0;
+    let mut last_opcode = 0xff; // OP_INVALIDOPCODE
+    while pc < script.len() {
+        let Some((opcode, _)) = get_op(script, &mut pc) else {
+            break;
+        };
+        if opcode == op::OP_CHECKSIG || opcode == op::OP_CHECKSIGVERIFY {
+            n += 1;
+        } else if opcode == op::OP_CHECKMULTISIG || opcode == op::OP_CHECKMULTISIGVERIFY {
+            if accurate && (op::OP_1..=op::OP_16).contains(&last_opcode) {
+                n += u32::from(last_opcode - (op::OP_1 - 1));
+            } else {
+                n += 20;
+            }
+        }
+        last_opcode = opcode;
+    }
+    n
+}
+
+/// Core's `CScript::GetSigOpCount(scriptSig)` (script.cpp:55-77): for a P2SH
+/// `script_pubkey`, the accurate count of the redeem script that `script_sig`
+/// pushes last (0 if `script_sig` is not push-only); otherwise the accurate count
+/// of `script_pubkey` itself.
+pub fn p2sh_sig_op_count(script_pubkey: &[u8], script_sig: &[u8]) -> u32 {
+    let is_p2sh = script_pubkey.len() == 23
+        && script_pubkey[0] == op::OP_HASH160
+        && script_pubkey[1] == 0x14
+        && script_pubkey[22] == op::OP_EQUAL;
+    if !is_p2sh {
+        return sig_op_count(script_pubkey, true);
+    }
+    let mut pc = 0;
+    let mut data: &[u8] = &[];
+    while pc < script_sig.len() {
+        let Some((opcode, pushed)) = get_op(script_sig, &mut pc) else {
+            return 0;
+        };
+        if opcode > op::OP_16 {
+            return 0;
+        }
+        data = pushed;
+    }
+    sig_op_count(data, true)
+}
+
 /// `CScript() << data`: the push of `data` with the shortest push opcode
 pub(crate) fn push_data_script(data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len() + 5);

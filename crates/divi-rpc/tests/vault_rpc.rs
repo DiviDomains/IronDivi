@@ -67,6 +67,16 @@ impl Net {
     fn wallet(&mut self) -> Arc<WalletDb> {
         let hd = HdWallet::new(ChainMode::Divi).unwrap();
         let w = Arc::new(WalletDb::with_hd_wallet(Network::Regtest, hd));
+        // The wallets run as a node started with -vault=1
+        w.set_vault_mode(true);
+        self.wallets.push(w.clone());
+        w
+    }
+
+    /// A wallet of a node started without -vault
+    fn wallet_without_vault_option(&mut self) -> Arc<WalletDb> {
+        let hd = HdWallet::new(ChainMode::Divi).unwrap();
+        let w = Arc::new(WalletDb::with_hd_wallet(Network::Regtest, hd));
         self.wallets.push(w.clone());
         w
     }
@@ -88,11 +98,12 @@ impl Net {
         let tip = self.chain.tip().unwrap();
         let height = tip.height + 1;
         let mut block = Block::default();
-        block.header.version = 1;
+        block.header.version = 4;
         block.header.prev_block = tip.hash;
         block.header.time = tip.time + 60;
         block.header.bits = 0x207fffff;
-        let mut cb_sig = vec![0x04];
+        // BIP34: the coinbase starts with the height
+        let mut cb_sig = divi_storage::bip34_height_script(height);
         cb_sig.extend_from_slice(&height.to_le_bytes());
         block.transactions.push(Transaction {
             version: 1,
@@ -118,6 +129,11 @@ impl Net {
         }
         block.transactions.extend(txs);
         block.header.merkle_root = compute_merkle_root(&block.transactions);
+        // Proof of work for the block's bits
+        let target = divi_primitives::hash::Hash256::from_compact(block.header.bits);
+        while divi_crypto::compute_block_hash(&block.header) > target {
+            block.header.nonce += 1;
+        }
         let time = block.header.time;
         let txs = block.transactions.clone();
         let hash = self.chain.accept_block(block).unwrap().hash;
@@ -218,7 +234,10 @@ fn setup() -> Setup {
         .unwrap()
         .transactions[0]
         .clone();
-    net.mine(vec![], &miner);
+    // Regtest coinbases mature after 20 blocks
+    for _ in 0..20 {
+        net.mine(vec![], &miner);
+    }
 
     let vault = vault_script(&owner_addr, &manager_addr);
     let fund = fund_vault_tx(
@@ -302,10 +321,12 @@ fn manager_plain_send_never_selects_vault_output() {
     assert!(left > 34 * COIN && left < 35 * COIN, "{}", left);
 
     // fundvault from the manager wallet goes through the same selection
-    let txid = rpc
+    let funded = rpc
         .fund_vault(&p(vec![json!(s.encoding), json!(10.0)]))
         .unwrap_or_else(|e| panic!("manager fundvault failed: {}", error_message(e)));
-    assert!(txid.is_string());
+    // Divi Core answers {"txhash", "vault": [{"encoding"}]}
+    assert!(funded["txhash"].is_string());
+    assert_eq!(funded["vault"][0]["encoding"], json!(s.encoding));
 }
 
 /// The vault output is not part of the manager's Spendable set, and after
@@ -415,7 +436,11 @@ fn manager_cannot_reclaim_vault() {
     let e = rpc
         .reclaim_vault_funds(&p(vec![json!(dest.to_string()), json!(1.0)]))
         .unwrap_err();
-    assert!(error_message(e).contains("No vault funds available to reclaim"));
+    // SendMoney's balance check against the vaulted balance (rpcwallet.cpp:745-753)
+    assert_eq!(
+        error_message(e),
+        "Insufficient funds: 100000000(total requested) is greater than 0(total available)"
+    );
     assert!(s.net.submitted.lock().is_empty());
 }
 
@@ -615,6 +640,25 @@ fn submitted_tx(s: &Setup) -> Transaction {
     txs[0].clone()
 }
 
+/// The fee of a transaction spending the one vault coin
+fn vault_fee(tx: &Transaction) -> i64 {
+    VAULT_DIVI * COIN - tx.vout.iter().map(|o| o.value.as_sat()).sum::<i64>()
+}
+
+/// reclaimvaultfunds answers the txid as a string, as SendMoneyToAddress
+/// does (rpcwallet.cpp:1189)
+#[test]
+fn reclaim_answers_the_txid_alone() {
+    let s = setup();
+    let rpc = make_self_vault(&s);
+    let dest = s.owner.new_receiving_address().unwrap();
+    let res = rpc
+        .reclaim_vault_funds(&p(vec![json!(dest.to_string()), json!(40.0)]))
+        .unwrap();
+    let tx = submitted_tx(&s);
+    assert_eq!(res, json!(tx.txid().to_string()));
+}
+
 fn output_to(tx: &Transaction, script: &Script) -> Vec<i64> {
     tx.vout
         .iter()
@@ -623,11 +667,12 @@ fn output_to(tx: &Transaction, script: &Script) -> Vec<i64> {
         .collect()
 }
 
-/// Default mode: the destination gets the full amount, the fee comes out of
-/// the remainder, and the remainder goes back to the same vault script so it
-/// keeps staking (seen on the manager after the block).
+/// Default mode: the destination gets the full amount and the fee comes out
+/// of the remainder, which goes to a new key of the owner: Divi Core's
+/// reclaimvaultfunds has no change script, so its change takes a key from the
+/// keypool (rpcwallet.cpp:1158-1186, wallet.cpp:1905-1910)
 #[test]
-fn reclaim_partial_keeps_remainder_in_vault() {
+fn reclaim_partial_sends_remainder_to_a_new_owner_key() {
     let s = setup();
     let rpc = make_self_vault(&s);
     let dest = s.owner.new_receiving_address().unwrap();
@@ -635,31 +680,29 @@ fn reclaim_partial_keeps_remainder_in_vault() {
         .reclaim_vault_funds(&p(vec![json!(dest.to_string()), json!(40.0)]))
         .unwrap();
     let tx = submitted_tx(&s);
-    let fee = (divi(&res["fee"]) * COIN as f64).round() as i64;
+    // Divi Core answers the txid alone (rpcwallet.cpp:1189)
+    assert_eq!(res, json!(tx.txid().to_string()));
+    let fee = vault_fee(&tx);
     assert!(fee > 0);
     assert_eq!(
         output_to(&tx, &Script::new_p2pkh(dest.hash.as_bytes())),
         vec![40 * COIN]
     );
-    assert_eq!(
-        output_to(&tx, &s.vault),
-        vec![(VAULT_DIVI - 40) * COIN - fee],
-        "the rest of the vault left the vault"
-    );
-
-    s.net.mine_submitted(&s.owner_addr);
-    let h = s.net.chain.height();
-    let managed: i64 = s
-        .manager
-        .get_stakeable_vault_utxos(h, 1)
+    assert!(output_to(&tx, &s.vault).is_empty());
+    let change: Vec<&TxOut> = tx
+        .vout
         .iter()
-        .map(|(u, _)| u.value.as_sat())
-        .sum();
-    assert_eq!(managed, (VAULT_DIVI - 40) * COIN - fee);
+        .filter(|o| o.script_pubkey != Script::new_p2pkh(dest.hash.as_bytes()))
+        .collect();
+    assert_eq!(change.len(), 1);
+    assert_eq!(change[0].value.as_sat(), (VAULT_DIVI - 40) * COIN - fee);
+    assert!(change[0].script_pubkey.is_p2pkh());
+    assert!(s.owner.is_mine_script(&change[0].script_pubkey));
+    s.net.mine_submitted(&s.owner_addr);
 }
 
-/// receiver_pays: the fee comes out of the amount, the vault keeps the rest
-/// untouched.
+/// receiver_pays: the fee comes out of the amount; the rest goes to a new
+/// owner key, as for any reclaim
 #[test]
 fn reclaim_receiver_pays_takes_fee_from_amount() {
     let s = setup();
@@ -673,14 +716,25 @@ fn reclaim_receiver_pays_takes_fee_from_amount() {
         ]))
         .unwrap();
     let tx = submitted_tx(&s);
-    let fee = (divi(&res["fee"]) * COIN as f64).round() as i64;
+    // Divi Core answers the txid alone (rpcwallet.cpp:1189)
+    assert_eq!(res, json!(tx.txid().to_string()));
+    let fee = vault_fee(&tx);
     assert!(fee > 0);
     assert_eq!(
         output_to(&tx, &Script::new_p2pkh(dest.hash.as_bytes())),
         vec![5 * COIN - fee],
         "receiver_pays ignored"
     );
-    assert_eq!(output_to(&tx, &s.vault), vec![(VAULT_DIVI - 5) * COIN]);
+    assert!(output_to(&tx, &s.vault).is_empty());
+    let change: i64 = tx
+        .vout
+        .iter()
+        .filter(|o| {
+            o.script_pubkey.is_p2pkh() && o.script_pubkey != Script::new_p2pkh(dest.hash.as_bytes())
+        })
+        .map(|o| o.value.as_sat())
+        .sum();
+    assert_eq!(change, (VAULT_DIVI - 5) * COIN);
     s.net.mine_submitted(&s.owner_addr);
 }
 
@@ -699,7 +753,9 @@ fn reclaim_sweep_funds_sends_everything() {
         ]))
         .unwrap();
     let tx = submitted_tx(&s);
-    let fee = (divi(&res["fee"]) * COIN as f64).round() as i64;
+    // Divi Core answers the txid alone (rpcwallet.cpp:1189)
+    assert_eq!(res, json!(tx.txid().to_string()));
+    let fee = vault_fee(&tx);
     assert_eq!(tx.vout.len(), 1, "sweep left change");
     assert_eq!(
         output_to(&tx, &Script::new_p2pkh(dest.hash.as_bytes())),
@@ -844,8 +900,7 @@ fn removevault_one_and_two_arguments() {
     let res = rpc
         .remove_vault(&p(vec![json!(s.encoding), json!(s.fund_txid.to_string())]))
         .unwrap();
-    assert_eq!(res["removal_status"], json!(true), "{}", res);
-    assert_eq!(res["tx_hash"], json!(s.fund_txid.to_string()));
+    assert_eq!(res, json!({"removal_status": true}));
     assert!(s.manager.get_all_vaults().is_empty());
 }
 
@@ -887,4 +942,180 @@ fn reclaim_drops_change_below_the_vault_dust_limit() {
         );
     }
     assert!(output_to(&tx, &s.vault).is_empty());
+}
+
+// ----------------------------------------------------------------
+
+/// Without Divi Core's -vault option addvault fails and stores nothing
+/// (CWallet::AddVault, wallet.cpp:693-706; the RPC answers -32600)
+#[test]
+fn addvault_needs_the_vault_option() {
+    let mut s = setup();
+    let fresh = s.net.wallet_without_vault_option();
+    let manager_key = s
+        .manager
+        .keystore()
+        .get_key(&s.manager_addr.hash)
+        .unwrap()
+        .secret
+        .unwrap();
+    fresh.import_key(manager_key, None);
+    let rpc = s.net.rpc(&fresh);
+    let e = rpc
+        .add_vault(&p(vec![json!(s.encoding), json!(s.fund_txid.to_string())]))
+        .expect_err("addvault without the vault option must fail");
+    match e {
+        divi_rpc::Error::Rpc(r) => {
+            assert_eq!(r.code, -32600, "{}", r.message);
+            assert!(r.message.contains("vault=1"), "{}", r.message);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(fresh.get_all_vaults().is_empty());
+}
+
+/// Without the option removevault reports false and keeps the vault
+/// (CWallet::RemoveVault, wallet.cpp:707-716; rpcwallet.cpp:1227)
+#[test]
+fn removevault_needs_the_vault_option() {
+    let s = setup();
+    s.manager.set_vault_mode(false);
+    let res = s
+        .net
+        .rpc(&s.manager)
+        .remove_vault(&p(vec![json!(s.encoding)]))
+        .unwrap();
+    assert_eq!(res, json!({"removal_status": false}));
+    assert_eq!(s.manager.get_all_vaults().len(), 1);
+}
+
+/// removevault answers as divid: {removal_status} alone (rpcwallet.cpp:1226),
+/// true again for a vault no longer held (RemoveVault, wallet.cpp:707-713),
+/// and -5 "Vault Registry Failed: ..." for a bad manager or owner address,
+/// the manager checked first (rpcwallet.cpp:1215-1221)
+#[test]
+fn removevault_replies_as_divid() {
+    let s = setup();
+    let rpc = s.net.rpc(&s.manager);
+    let res = rpc.remove_vault(&p(vec![json!(s.encoding)])).unwrap();
+    assert_eq!(res, json!({"removal_status": true}));
+    let again = rpc
+        .remove_vault(&p(vec![json!(s.encoding)]))
+        .unwrap_or_else(|e| panic!("removevault of a vault not held: {}", error_message(e)));
+    assert_eq!(again, json!({"removal_status": true}));
+
+    for (encoding, text) in [
+        (
+            format!("{}:notanaddress", s.owner_addr),
+            "Vault Registry Failed: Invalid manager DIVI address",
+        ),
+        (
+            format!("notanaddress:{}", s.manager_addr),
+            "Vault Registry Failed: Invalid owner DIVI address",
+        ),
+        (
+            "notanaddress:notanaddress".to_string(),
+            "Vault Registry Failed: Invalid manager DIVI address",
+        ),
+    ] {
+        match rpc.remove_vault(&p(vec![json!(encoding)])).unwrap_err() {
+            divi_rpc::Error::Rpc(r) => assert_eq!((r.code, r.message.as_str()), (-5, text)),
+            other => panic!("{other:?}"),
+        }
+    }
+}
+
+/// debitvaultbyname from a wallet without the owner key names the owner
+/// address's ownership type as divid does (rpcwallet.cpp:1103-1104;
+/// isminetype, IsMineType.h: 0 not mine, 1 watch-only)
+#[test]
+fn debitvaultbyname_names_the_ownership_type() {
+    let s = setup();
+    let dest = s.manager.new_receiving_address().unwrap();
+    let refusal = |wallet: &Arc<WalletDb>| match s
+        .net
+        .rpc(wallet)
+        .debit_vault_by_name(&p(vec![
+            json!(s.encoding),
+            json!(dest.to_string()),
+            json!(1.0),
+        ]))
+        .unwrap_err()
+    {
+        divi_rpc::Error::Rpc(r) => (r.code, r.message),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        refusal(&s.manager),
+        (
+            -5,
+            format!(
+                "Vault owner key is unknown: ownership=0 address={}",
+                s.owner_addr
+            )
+        )
+    );
+    // A wallet that watches the owner address
+    s.manager
+        .import_watch_only_address(&s.owner_addr, None)
+        .unwrap();
+    assert_eq!(
+        refusal(&s.manager),
+        (
+            -5,
+            format!(
+                "Vault owner key is unknown: ownership=1 address={}",
+                s.owner_addr
+            )
+        )
+    );
+}
+
+/// debitvaultbyname of a vault with no spendable coin while the wallet's
+/// vaults hold enough: divid's balance check is over all vaults and passes
+/// (GetVaultedBalance, rpcwallet.cpp:727-734); its coin selection for this
+/// vault then fails, -4 with the selection's text (rpcwallet.cpp:796-800,
+/// wallet.cpp:1779)
+#[test]
+fn debitvaultbyname_of_a_vault_without_coins_fails_coin_selection() {
+    let s = setup();
+    let rpc = s.net.rpc(&s.owner);
+    let other_manager = s.manager.new_receiving_address().unwrap();
+    let empty = format!("{}:{}", s.owner_addr, other_manager);
+    let dest = s.owner.new_receiving_address().unwrap();
+    match rpc
+        .debit_vault_by_name(&p(vec![json!(empty), json!(dest.to_string()), json!(1.0)]))
+        .unwrap_err()
+    {
+        divi_rpc::Error::Rpc(r) => assert_eq!(
+            (r.code, r.message.as_str()),
+            (
+                -4,
+                "Insufficient funds to meet coin selection algorithm requirements."
+            )
+        ),
+        other => panic!("{other:?}"),
+    }
+    assert!(s.net.submitted.lock().is_empty());
+}
+
+/// fundvault with a manager address only takes the owner key from the
+/// keypool and puts it in the address book with the name "", as Divi Core's
+/// parseVaultAddressEncoding (rpcwallet.cpp:935-947)
+#[test]
+fn fundvault_manager_only_labels_the_owner_key() {
+    let s = setup();
+    let rpc = s.net.rpc(&s.owner);
+    let funded = rpc
+        .fund_vault(&p(vec![json!(s.manager_addr.to_string()), json!(5.0)]))
+        .unwrap_or_else(|e| panic!("manager-only fundvault failed: {}", error_message(e)));
+    let encoding = funded["vault"][0]["encoding"].as_str().unwrap().to_string();
+    let (owner, manager) = encoding.split_once(':').unwrap();
+    assert_eq!(manager, s.manager_addr.to_string());
+    let owner = Address::from_base58(owner).unwrap();
+    assert!(
+        s.owner.in_address_book(&owner),
+        "owner key not in the address book"
+    );
+    assert_eq!(s.owner.get_account(&owner), "");
 }

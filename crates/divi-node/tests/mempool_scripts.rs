@@ -65,7 +65,8 @@ impl TestNode {
         let chain = self.node.chain();
         let tip = chain.tip().unwrap();
         let height = tip.height + 1;
-        let mut sig = vec![4u8];
+        // BIP34: the coinbase starts with the height
+        let mut sig = divi_storage::bip34_height_script(height);
         sig.extend_from_slice(&height.to_le_bytes());
         let coinbase = Transaction {
             version: 1,
@@ -75,12 +76,17 @@ impl TestNode {
         };
         let outpoint = OutPoint::new(coinbase.txid(), 0);
         let mut block = Block::default();
-        block.header.version = 1;
+        block.header.version = 4;
         block.header.prev_block = tip.hash;
         block.header.time = tip.time + 60;
         block.header.bits = 0x207fffff;
         block.transactions = vec![coinbase];
         block.header.merkle_root = divi_crypto::compute_merkle_root(&block.transactions);
+        // Proof of work for the block's bits
+        let target = divi_primitives::hash::Hash256::from_compact(block.header.bits);
+        while divi_crypto::compute_block_hash(&block.header) > target {
+            block.header.nonce += 1;
+        }
         chain.accept_block(block).unwrap();
         outpoint
     }
@@ -88,7 +94,10 @@ impl TestNode {
     /// A mature 1250 DIVI coin paying `script`
     fn fund(&self, script: Script) -> (OutPoint, i64) {
         let coin = self.mine(script);
-        self.mine(Script::new_p2pkh(&[0xee; 20]));
+        // Regtest coinbase maturity is 20 blocks
+        for _ in 0..20 {
+            self.mine(Script::new_p2pkh(&[0xee; 20]));
+        }
         (coin, 1250 * COIN)
     }
 
@@ -101,6 +110,8 @@ impl TestNode {
     }
 }
 
+/// Divi Core's AreInputsStandard refuses an unsigned spend before any script
+/// runs: a P2PKH spend needs two scriptSig items
 #[test]
 fn unsigned_spend_is_refused_as_core_refuses_it() {
     let t = TestNode::new();
@@ -109,10 +120,7 @@ fn unsigned_spend_is_refused_as_core_refuses_it() {
     let err = t
         .submit(spend(coin, value, p2pkh(&KeyPair::new_random())))
         .unwrap_err();
-    assert_eq!(
-        err,
-        "16: mandatory-script-verify-flag-failed (Operation not valid with the current stack size)"
-    );
+    assert_eq!(err, "64: bad-txns-nonstandard-inputs");
     assert_eq!(t.node.mempool().size(), 0);
 }
 

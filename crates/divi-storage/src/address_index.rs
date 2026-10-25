@@ -273,7 +273,7 @@ impl AddressIndex {
 
     /// Get balance for an address
     ///
-    /// `coinbase_maturity` is network-specific: mainnet=20, testnet/regtest=1.
+    /// `coinbase_maturity` is network-specific: mainnet 20, testnet 1, regtest 20.
     pub fn get_balance(
         &self,
         script: &Script,

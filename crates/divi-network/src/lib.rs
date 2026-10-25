@@ -55,15 +55,19 @@
 //! assert!(bytes.len() > 24); // Header + payload
 //! ```
 
+pub mod alert;
 pub mod constants;
 pub mod error;
 pub mod message;
 pub mod messages;
 pub mod version;
+mod wire;
 
 // P2P networking
+pub mod addrbook;
 pub mod codec;
 pub mod connection;
+pub mod local;
 pub mod masternode_handler;
 pub mod peer;
 pub mod peer_manager;
@@ -71,6 +75,7 @@ pub mod relay;
 pub mod scoring;
 pub mod socks5;
 pub mod spork;
+pub mod subnet;
 pub mod sync;
 
 pub use constants::{
@@ -86,7 +91,7 @@ pub use version::VersionMessage;
 
 // P2P types
 pub use codec::DiviCodec;
-pub use connection::Connection;
+pub use connection::{connect_timeout, set_connect_timeout_ms, Connection};
 pub use masternode_handler::MasternodeHandler;
 pub use peer::{LivePeerStats, PeerDirection, PeerEvent, PeerHandle, PeerId, PeerInfo, PeerState};
 pub use peer_manager::{
@@ -94,6 +99,7 @@ pub use peer_manager::{
     PeerManagerConfig,
 };
 pub use relay::{TxRelay, TxRelayEvent, TxRelayStats};
-pub use scoring::{BanEntry, Misbehavior, PeerScoring, PeerStats};
+pub use scoring::{BanEntry, Misbehavior, MisbehaviourOutcome, PeerScoring, PeerStats};
 pub use spork::{SporkManager, SporkSyncProgress, SporkSyncState};
+pub use subnet::Subnet;
 pub use sync::{BlockConnectedCallback, BlockSync, ReorgCallback, SyncProgress, SyncState};

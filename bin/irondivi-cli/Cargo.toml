@@ -10,9 +10,6 @@ name = "irondivi-cli"
 path = "src/main.rs"
 
 [dependencies]
-# CLI
-clap = { version = "4.4", features = ["derive"] }
-
 # HTTP client
 reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "rustls-tls"] }
 
@@ -25,4 +22,5 @@ dirs = "5.0"
 anyhow = { workspace = true }
 
 [dev-dependencies]
+divi-test-support = { workspace = true }
 tempfile = { workspace = true }

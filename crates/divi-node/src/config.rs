@@ -58,6 +58,42 @@ pub struct NodeConfig {
     /// How many of the newest blocks to check at start (`-checkblocks`, 0 = all, as in C++)
     #[serde(default = "default_check_blocks")]
     pub check_blocks: u32,
+
+    /// Refuse a block this many blocks or more below the tip (C++ `-maxreorg`;
+    /// unset = the network's depth, 100 on Divi)
+    #[serde(default)]
+    pub max_reorg: Option<u32>,
+
+    /// Block files to import at start (-loadblock), after bootstrap.dat
+    #[serde(default)]
+    pub load_block: Vec<PathBuf>,
+
+    /// Directory of the bootstrap.dat imported at start: Divi Core's
+    /// network data directory (unset = the data directory)
+    #[serde(default)]
+    pub bootstrap_dir: Option<PathBuf>,
+
+    /// Stop once the block files are imported (-stopafterblockimport)
+    #[serde(default)]
+    pub stop_after_block_import: bool,
+
+    /// Command run when the best block changes, `%s` replaced by its hash
+    /// (Divi Core's -blocknotify)
+    #[serde(default)]
+    pub blocknotify: Option<String>,
+
+    /// The ZMQ notifier addresses (Divi Core's -zmqpub* options)
+    #[serde(default)]
+    pub zmq: crate::zmq::ZmqConfig,
+
+    /// Command run when a wallet transaction is added or updated, `%s`
+    /// replaced by its txid (Divi Core's -walletnotify)
+    #[serde(default)]
+    pub walletnotify: Option<String>,
+
+    /// Vaults may be added and removed (Divi Core's -vault, default off)
+    #[serde(default)]
+    pub vault: bool,
 }
 
 /// C++ `-checkblocks` default (init.cpp: `VerifyChain(4, GetArg("-checkblocks", 100))`)
@@ -82,6 +118,14 @@ impl Default for NodeConfig {
             utxo_cache_size: 10_000_000,
             expire: divi_storage::prune::Expire::Never,
             check_blocks: DEFAULT_CHECK_BLOCKS,
+            max_reorg: None,
+            load_block: Vec::new(),
+            bootstrap_dir: None,
+            stop_after_block_import: false,
+            blocknotify: None,
+            zmq: Default::default(),
+            walletnotify: None,
+            vault: false,
         }
     }
 }
@@ -96,7 +140,8 @@ impl NodeConfig {
     /// CLI and `DEFAULT_RPC_PORT_PRIVATEDIVI_MAINNET` already assume.
     pub fn mainnet(chain_mode: ChainMode) -> Self {
         let (p2p_port, rpc_port) = match chain_mode {
-            ChainMode::Divi => (51472, 51471),
+            // divid's ports (chainparams.cpp:177, chainparamsbase.cpp:25)
+            ChainMode::Divi => (51472, 51473),
             ChainMode::PrivateDivi => (52472, 52471),
         };
         NodeConfig {
@@ -116,7 +161,8 @@ impl NodeConfig {
     /// Create a new config with default testnet settings
     pub fn testnet(chain_mode: ChainMode) -> Self {
         let (p2p_port, rpc_port) = match chain_mode {
-            ChainMode::Divi => (51474, 51473),
+            // divid's ports (chainparams.cpp:393, chainparamsbase.cpp:53)
+            ChainMode::Divi => (51474, 51475),
             ChainMode::PrivateDivi => (52474, 52473),
         };
         NodeConfig {
@@ -181,7 +227,7 @@ pub struct NetworkConfig {
     /// Magic bytes for network messages
     pub magic: [u8; 4],
 
-    /// Protocol version
+    /// Protocol version sent and reported (Divi Core's, or -protocolversion)
     pub protocol_version: u32,
 
     /// Minimum supported protocol version
@@ -217,7 +263,7 @@ impl NetworkConfig {
                 network_type: NetworkType::Mainnet,
                 chain_mode,
                 magic: [0xdf, 0xa0, 0x8d, 0x8f],
-                protocol_version: 70920,
+                protocol_version: divi_network::constants::PROTOCOL_VERSION as u32,
                 min_protocol_version: 70915,
                 dns_seeds: dns_seeds::divi::MAINNET
                     .iter()
@@ -233,7 +279,7 @@ impl NetworkConfig {
                 chain_mode,
                 // 2026-04-20 relaunch (PrivateDivi Core 21de13166, chainparams.cpp:172-175)
                 magic: [0x70, 0xd2, 0x76, 0x11],
-                protocol_version: 70920,
+                protocol_version: divi_network::constants::PROTOCOL_VERSION as u32,
                 min_protocol_version: 70915,
                 dns_seeds: dns_seeds::privatedivi::MAINNET
                     .iter()
@@ -268,7 +314,7 @@ impl NetworkConfig {
                 network_type: NetworkType::Testnet,
                 chain_mode,
                 magic: [0xdf, 0xa0, 0x8d, 0x78],
-                protocol_version: 70920,
+                protocol_version: divi_network::constants::PROTOCOL_VERSION as u32,
                 min_protocol_version: 70915,
                 dns_seeds: dns_seeds::divi::TESTNET
                     .iter()
@@ -280,7 +326,7 @@ impl NetworkConfig {
                 network_type: NetworkType::Testnet,
                 chain_mode,
                 magic: [0x70, 0xd1, 0x76, 0x12],
-                protocol_version: 70920,
+                protocol_version: divi_network::constants::PROTOCOL_VERSION as u32,
                 min_protocol_version: 70915,
                 dns_seeds: dns_seeds::privatedivi::TESTNET
                     .iter()
@@ -304,7 +350,7 @@ impl NetworkConfig {
             network_type: NetworkType::Regtest,
             chain_mode,
             magic,
-            protocol_version: 70920,
+            protocol_version: divi_network::constants::PROTOCOL_VERSION as u32,
             min_protocol_version: 70915,
             dns_seeds: Vec::new(),
             static_peers: Vec::new(),
@@ -343,13 +389,23 @@ pub struct P2pConfig {
     #[serde(default)]
     pub connect: Vec<String>,
 
+    /// `-addnode` peers, as given: the node's first added nodes, which
+    /// getaddednodeinfo lists (Divi Core net.cpp:1218). They are dialled as
+    /// static peers.
+    #[serde(default)]
+    pub addnode: Vec<String>,
+
     /// Accept inbound connections. `None` = default: listen unless `connect`
     /// is set (C++ soft-sets `-listen=0` under `-connect`).
     #[serde(default)]
     pub listen: Option<bool>,
 
-    /// Ban time for misbehaving peers (seconds)
+    /// Ban time for misbehaving peers (seconds; Divi Core -bantime)
     pub ban_time: u64,
+
+    /// Misbehaviour score at which a peer is banned (Divi Core -banscore)
+    #[serde(default = "default_ban_score")]
+    pub ban_score: u32,
 
     /// User agent string
     pub user_agent: String,
@@ -357,6 +413,39 @@ pub struct P2pConfig {
     /// SOCKS5 proxy for outbound connections (`-proxy=<ip:port>`, port 9050 if omitted)
     #[serde(default)]
     pub proxy: Option<String>,
+
+    /// Connection timeout in milliseconds (Divi Core's -timeout)
+    #[serde(default = "default_connect_timeout_ms")]
+    pub connect_timeout_ms: u64,
+
+    /// Learn local addresses from the bound address and the machine's
+    /// interfaces (Divi Core -discover)
+    #[serde(default = "default_discover")]
+    pub discover: bool,
+
+    /// Addresses this node is reachable at (Divi Core -externalip)
+    #[serde(default)]
+    pub external_ips: Vec<SocketAddr>,
+
+    /// The machine's interface addresses, found at start with `discover`
+    #[serde(default)]
+    pub interface_ips: Vec<std::net::IpAddr>,
+
+    /// Networks whose inbound peers are whitelisted (Divi Core -whitelist):
+    /// `ip`, `ip/bits` or `ip/netmask`
+    #[serde(default)]
+    pub whitelist: Vec<String>,
+
+    /// More addresses to listen on, each peer coming in on them whitelisted
+    /// (Divi Core -whitebind)
+    #[serde(default)]
+    pub white_bind: Vec<SocketAddr>,
+
+    /// Listen on `listen_addr`. Divi Core listens only on the -bind and
+    /// -whitebind addresses when either is given, so -whitebind alone leaves
+    /// this off (net.cpp:1808-1823)
+    #[serde(default = "default_listen_on_addr")]
+    pub listen_on_addr: bool,
 }
 
 impl P2pConfig {
@@ -388,8 +477,25 @@ impl P2pConfig {
             .ok()
             .and_then(|mut a| a.next())
             .map(Some)
-            .ok_or_else(|| format!("invalid proxy address '{raw}'"))
+            .ok_or_else(|| format!("Invalid -proxy address or hostname: '{raw}'"))
     }
+}
+
+fn default_discover() -> bool {
+    true
+}
+
+fn default_listen_on_addr() -> bool {
+    true
+}
+
+fn default_ban_score() -> u32 {
+    100
+}
+
+/// Divi Core's DEFAULT_CONNECT_TIMEOUT
+fn default_connect_timeout_ms() -> u64 {
+    5000
 }
 
 impl Default for P2pConfig {
@@ -397,14 +503,25 @@ impl Default for P2pConfig {
         P2pConfig {
             listen_addr: "0.0.0.0".to_string(),
             port: 51472,
-            max_inbound: 125,
-            max_outbound: 8,
+            // Divi Core: -maxconnections 125 in all, 16 of them outbound
+            // (net.cpp:106, :757), so 109 inbound
+            max_inbound: 109,
+            max_outbound: 16,
             enable_discovery: true,
             connect: Vec::new(),
+            addnode: Vec::new(),
             listen: None,
             ban_time: 86400, // 24 hours
+            ban_score: default_ban_score(),
             user_agent: format!("/DiviRust:{}/", env!("CARGO_PKG_VERSION")),
             proxy: None,
+            connect_timeout_ms: default_connect_timeout_ms(),
+            discover: default_discover(),
+            external_ips: Vec::new(),
+            interface_ips: Vec::new(),
+            whitelist: Vec::new(),
+            white_bind: Vec::new(),
+            listen_on_addr: true,
         }
     }
 }
@@ -486,7 +603,8 @@ pub struct RpcConfig {
     #[serde(default)]
     pub whitelist_default: Option<bool>,
 
-    /// `rpcallowip` entries: non-loopback addresses or ranges allowed to connect
+    /// Subnets allowed to connect besides the local host (Divi Core's
+    /// -rpcallowip); with none, the server listens on the loopback only
     #[serde(default)]
     pub allow_ips: Vec<String>,
 
@@ -497,6 +615,19 @@ pub struct RpcConfig {
     /// `rpcallowhost` entries: host names accepted in the `Host` header
     #[serde(default)]
     pub allow_hosts: Vec<String>,
+
+    /// Keep a connection open after a reply when the request asks for it
+    /// (Divi Core's -rpckeepalive, default on)
+    #[serde(default = "default_rpc_keep_alive")]
+    pub keep_alive: bool,
+
+    /// Serve the REST interface (Divi Core's -rest, default off)
+    #[serde(default)]
+    pub rest: bool,
+}
+
+fn default_rpc_keep_alive() -> bool {
+    true
 }
 
 impl Default for RpcConfig {
@@ -504,7 +635,7 @@ impl Default for RpcConfig {
         RpcConfig {
             enabled: true,
             listen_addr: "127.0.0.1".to_string(),
-            port: 51471,
+            port: 51473,
             username: None,
             password: None,
             max_request_size: 10 * 1024 * 1024, // 10 MB
@@ -515,6 +646,8 @@ impl Default for RpcConfig {
             allow_ips: Vec::new(),
             allow_origins: Vec::new(),
             allow_hosts: Vec::new(),
+            keep_alive: true,
+            rest: false,
         }
     }
 }
@@ -561,6 +694,23 @@ pub struct StakingConfig {
     /// Allow staking on a tip older than 24h (`stakeonstaletip`). Default off.
     #[serde(default)]
     pub stake_on_stale_tip: bool,
+
+    /// Divi Core `-blockmaxsize`, `-blockprioritysize` and `-blockminsize`
+    /// (defaultValues.h:47-50)
+    #[serde(default = "default_block_max_size")]
+    pub block_max_size: usize,
+    #[serde(default = "default_block_priority_size")]
+    pub block_priority_size: usize,
+    #[serde(default)]
+    pub block_min_size: usize,
+}
+
+fn default_block_max_size() -> usize {
+    crate::staker::DEFAULT_BLOCK_MAX_SIZE
+}
+
+fn default_block_priority_size() -> usize {
+    crate::staker::DEFAULT_BLOCK_PRIORITY_SIZE
 }
 
 impl Default for StakingConfig {
@@ -572,6 +722,9 @@ impl Default for StakingConfig {
             split_threshold: 2_000_000_000_000, // 20,000 DIVI (C++ -stakesplitthreshold default)
             combine_threshold: 100_000_000_000, // 1,000 DIVI
             stake_on_stale_tip: false,
+            block_max_size: default_block_max_size(),
+            block_priority_size: default_block_priority_size(),
+            block_min_size: crate::staker::DEFAULT_BLOCK_MIN_SIZE,
         }
     }
 }
@@ -582,8 +735,14 @@ pub struct MempoolConfig {
     /// Maximum mempool size (bytes)
     pub max_size: usize,
 
-    /// Minimum relay fee (satoshis per byte)
-    pub min_relay_fee: i64,
+    /// Minimum relay fee in satoshis per 1000 bytes (Divi Core's
+    /// `-minrelaytxfee`, kept unrounded as `CFeeRate` keeps it)
+    pub min_relay_fee_per_kb: i64,
+
+    /// The highest fee in satoshis a send may pay without an override (Divi
+    /// Core's `-maxtxfee`, FeeAndPriorityCalculator::SetMaxFee, init.cpp:844)
+    #[serde(default = "default_max_tx_fee")]
+    pub max_tx_fee: i64,
 
     /// Maximum orphan transactions
     pub max_orphan_txs: usize,
@@ -595,12 +754,18 @@ pub struct MempoolConfig {
 impl Default for MempoolConfig {
     fn default() -> Self {
         MempoolConfig {
-            max_size: 300 * 1024 * 1024, // 300 MB
-            min_relay_fee: 10, // 10 sat/byte (matches C++ Divi CFeeRate(10000) = 10000 sat/kB)
+            max_size: 300 * 1024 * 1024,  // 300 MB
+            min_relay_fee_per_kb: 10_000, // C++ Divi CFeeRate(10000)
+            max_tx_fee: default_max_tx_fee(),
             max_orphan_txs: 100,
             expiry_time: 336 * 60 * 60, // 2 weeks
         }
     }
+}
+
+/// Divi Core DEFAULT_TRANSACTION_MAXFEE, 100 DIVI (defaultValues.h:34)
+fn default_max_tx_fee() -> i64 {
+    100 * 100_000_000
 }
 
 /// Debug configuration
@@ -633,6 +798,10 @@ pub struct IndexConfig {
 
     /// Enable address index (-addressindex)
     pub addressindex: bool,
+
+    /// Build the transaction index again from the stored blocks (-reindex);
+    /// this is how -txindex is changed for an existing chain database
+    pub reindex: bool,
 }
 
 impl Default for IndexConfig {
@@ -642,6 +811,7 @@ impl Default for IndexConfig {
             txindex: true,
             spentindex: false,
             addressindex: false,
+            reindex: false,
         }
     }
 }
@@ -681,7 +851,7 @@ mod tests {
     fn test_default_config() {
         let config = NodeConfig::default();
         assert_eq!(config.p2p.port, 51472);
-        assert_eq!(config.rpc.port, 51471);
+        assert_eq!(config.rpc.port, 51473);
     }
 
     #[test]
@@ -696,7 +866,7 @@ mod tests {
         let config = NodeConfig::testnet(ChainMode::Divi);
         assert_eq!(config.network.network_type, NetworkType::Testnet);
         assert_eq!(config.p2p.port, 51474);
-        assert_eq!(config.rpc.port, 51473);
+        assert_eq!(config.rpc.port, 51475);
     }
 
     #[test]
@@ -714,7 +884,7 @@ mod tests {
         assert_eq!(p2p_addr.port(), 51472);
 
         let rpc_addr = config.rpc.socket_addr();
-        assert_eq!(rpc_addr.port(), 51471);
+        assert_eq!(rpc_addr.port(), 51473);
     }
 
     #[test]
@@ -758,9 +928,13 @@ mod tests {
 
     /// Every default port across both modes and all networks is distinct,
     /// so a Divi and a PrivateDivi node (or two PrivateDivi networks) can
-    /// run side by side on one host.
+    /// run side by side on one host, except where divid's own collide: Divi
+    /// testnet and regtest both serve RPC on 51475 (chainparamsbase.cpp:53,
+    /// regtest inheriting testnet's)
     #[test]
     fn default_ports_never_collide() {
+        assert_eq!(NodeConfig::testnet(ChainMode::Divi).rpc.port, 51475);
+        assert_eq!(NodeConfig::regtest(ChainMode::Divi).rpc.port, 51475);
         let mut ports = Vec::new();
         for mode in [ChainMode::Divi, ChainMode::PrivateDivi] {
             for c in [
@@ -769,7 +943,9 @@ mod tests {
                 NodeConfig::regtest(mode),
             ] {
                 ports.push(c.p2p.port);
-                ports.push(c.rpc.port);
+                if !(mode == ChainMode::Divi && c.network.network_type == NetworkType::Regtest) {
+                    ports.push(c.rpc.port);
+                }
             }
         }
         let mut uniq = ports.clone();
@@ -820,7 +996,11 @@ mod tests {
             with("::1").proxy_addr(),
             Ok(Some("[::1]:9050".parse().unwrap()))
         );
-        assert!(with("not a proxy!").proxy_addr().is_err());
+        // Divi Core's text (init.cpp's -proxy check)
+        assert_eq!(
+            with("not a proxy!").proxy_addr(),
+            Err("Invalid -proxy address or hostname: 'not a proxy!'".to_string())
+        );
     }
 
     #[test]
