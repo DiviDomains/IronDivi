@@ -504,6 +504,11 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     if s.is_set("proxy") {
         s.soft_set_bool("listen", false);
     }
+    // -salvagewallet rewrites nothing in Divi Core 3.0.0: it sets -rescan
+    // (EnableWalletFeatures, init.cpp:763-766)
+    if s.get_bool("salvagewallet", false) && s.soft_set_bool("rescan", true) {
+        info!("InitializeDivi : parameter interaction: -salvagewallet=1 -> setting -rescan=1");
+    }
     // -proxy, -listen=0 and -externalip each turn -discover off unless it is
     // given (net.cpp:1690-1716)
     if s.is_set("proxy") || !s.get_bool("listen", true) || s.is_set("externalip") {

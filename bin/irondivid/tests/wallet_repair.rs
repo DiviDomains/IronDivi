@@ -311,3 +311,23 @@ fn dbloadfailexit_stops_a_start_with_the_warning() {
     assert!(stderr.contains(WARNING), "stderr: {stderr}");
     assert!(!stderr.contains("Error:"), "stderr: {stderr}");
 }
+
+/// -salvagewallet sets -rescan, and Divi Core says so (init.cpp:763-766)
+#[test]
+fn salvagewallet_says_it_sets_rescan() {
+    let dir = tempfile::tempdir().unwrap();
+    let (rpc_port, p2p_port) = (free_port(), free_port());
+    made(dir.path(), rpc_port, p2p_port, 0);
+    let from = log(dir.path()).len();
+    let node = start(dir.path(), rpc_port, p2p_port, &["-salvagewallet"]);
+    stop(node, rpc_port);
+    let after = &log(dir.path())[from..];
+    assert!(
+        after.contains(
+            "InitializeDivi : parameter interaction: -salvagewallet=1 -> setting -rescan=1"
+        ),
+        "{}",
+        log_tail(dir.path())
+    );
+    assert!(after.contains("Rescanning... from height 0"));
+}
