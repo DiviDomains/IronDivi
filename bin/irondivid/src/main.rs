@@ -319,7 +319,6 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "par",
     "peerbloomfilters",
     "proxyrandomize",
-    "resync",
     "rpcthreads",
     "sendfreetransactions",
     "shrinkdebugfile",
@@ -578,8 +577,11 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     // -loadblock files as given, relative to the working directory as in divid
     config.load_block = s.get_multi("loadblock").iter().map(PathBuf::from).collect();
     config.stop_after_block_import = s.get_bool("stopafterblockimport", false);
-    if let Some(n) = number_option(&s, "checkblocks", 0..=i64::from(u32::MAX)) {
-        config.check_blocks = n as u32;
+    // -resync: the chain's folders are removed before it loads (init.cpp:1480-1483)
+    config.resync = s.get_bool("resync", false);
+    // -checkblocks: atoi64; 0 or below checks every block (verifyDb.cpp:73-74)
+    if let Some(text) = s.get("checkblocks") {
+        config.check_blocks = settings::atoi(text).clamp(0, i64::from(u32::MAX)) as u32;
     }
     if let Some(n) = number_option(&s, "maxreorg", 0..=i64::from(u32::MAX)) {
         config.max_reorg = Some(n as u32);
@@ -751,6 +753,7 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         "banscore",
         "bantime",
         "checkblocks",
+        "resync",
         "loadblock",
         "stopafterblockimport",
         "maxreorg",
@@ -3108,6 +3111,9 @@ mod connect_tests {
     fn checkblocks_default_cli_and_config_file() {
         assert_eq!(cfg(&[]).check_blocks, 100);
         assert_eq!(cfg(&["--checkblocks=0"]).check_blocks, 0);
+        // Below 0, as divid's VerifyDB reads it: every block (verifyDb.cpp:73-74)
+        assert_eq!(cfg(&["--checkblocks=-1"]).check_blocks, 0);
+        assert_eq!(cfg(&["--checkblocks=abc"]).check_blocks, 0);
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("irondivi.conf"), "checkblocks = 500\n").unwrap();
         let args = Args::parse_from([

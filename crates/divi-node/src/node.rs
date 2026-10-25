@@ -222,6 +222,9 @@ impl Node {
         // Create data directory if it doesn't exist
         std::fs::create_dir_all(&config.data_dir)
             .map_err(|e| NodeError::Init(format!("Failed to create data directory: {}", e)))?;
+        if config.resync {
+            clear_folders_for_resync(&config);
+        }
 
         // Initialize database, optionally with UTXO cache
         let db = Arc::new(if config.utxo_cache_size > 0 {
@@ -257,9 +260,20 @@ impl Node {
         // C++ checks the newest blocks at every start (-checkblocks); a damaged
         // database otherwise goes unnoticed until the bad record is read.
         let started = std::time::Instant::now();
+        // A failed check stops the start with Divi Core's InitError text
+        // (init.cpp:1116-1119) on the first line; what was found, and how to
+        // recover, after it and in the log
         let checked = chain
             .verify_recent_blocks(config.check_blocks)
-            .map_err(damaged)?;
+            .map_err(|e| {
+                tracing::error!("VerifyDB() : *** {}", e);
+                match damaged(e) {
+                    NodeError::Init(detail) => {
+                        NodeError::Init(format!("Corrupted block database detected\n{detail}"))
+                    }
+                    other => other,
+                }
+            })?;
         tracing::info!(
             "Verified the last {} blocks in {} ms",
             checked,
@@ -2077,6 +2091,29 @@ fn score_relayed_refusal(peers: &PeerManager, event: &divi_network::TxRelayEvent
     );
 }
 
+/// Divi Core's -resync (ClearFoldersForResync, init.cpp:901-930): the chain's
+/// folders are deleted before it is loaded, one by one so a missing one does not
+/// stop the rest, and a failure is logged, not fatal. irondivid's chain database
+/// holds its blocks, undo data, sporks and the address and spent indexes; the
+/// transaction index has its own folder. The wallet, the configuration and the
+/// peer and masternode files stay.
+fn clear_folders_for_resync(config: &NodeConfig) {
+    tracing::info!("Deleting blockchain folders blocks, chainstate and sporks");
+    for dir in [
+        config.blocks_path(),
+        config.chainstate_path(),
+        config.data_dir.join("txindex"),
+    ] {
+        if !dir.exists() {
+            continue;
+        }
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => tracing::info!("-resync: folder deleted: {}", dir.display()),
+            Err(e) => tracing::warn!("Failed to delete blockchain folders {}", e),
+        }
+    }
+}
+
 /// The `reject` Divi Core sends the peer that relayed a transaction its
 /// mempool refused (main.cpp:803-809): only for a refusal with a reject
 /// state, with its code, its reason cut to MAX_REJECT_MESSAGE_LENGTH (111,
@@ -2628,8 +2665,15 @@ mod tests {
 
         let err = match Node::new(config.clone()) {
             Ok(_) => panic!("node started on a damaged chain database"),
-            Err(e) => e.to_string(),
+            Err(NodeError::Init(reason)) => reason,
+            Err(e) => panic!("not a start refusal: {e}"),
         };
+        // Divi Core's InitError text first (init.cpp:1116-1119), then the detail
+        assert_eq!(
+            err.lines().next(),
+            Some("Corrupted block database detected"),
+            "{err}"
+        );
         assert!(err.contains("damaged at height"), "{err}");
         assert!(err.contains("move that directory aside"), "{err}");
 
