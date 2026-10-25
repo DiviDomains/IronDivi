@@ -263,11 +263,6 @@ impl Connection {
             self.info.start_height
         );
 
-        // Send BIP 130 sendheaders message
-        if let Err(e) = self.send_message(NetworkMessage::SendHeaders).await {
-            debug!("Failed to send sendheaders to {}: {}", self.info.addr, e);
-        }
-
         // The peer's services are readable before anyone hears of it: block
         // download picks peers by NODE_NETWORK
         self.info.publish(&self.stats);
