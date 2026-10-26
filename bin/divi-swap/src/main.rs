@@ -105,6 +105,11 @@ struct Cli {
         default_value = "off"
     )]
     ltc_crosscheck: String,
+    /// Run `--ltc-crosscheck` again before every LTC claim, not only at start (off by
+    /// default). A disagreement holds the claim for a retry; an unreachable source warns and
+    /// the claim goes ahead. Needs `--ltc-crosscheck` set to a source.
+    #[arg(long, global = true, env = "SWAP_LTC_CROSSCHECK_BEFORE_CLAIM")]
+    ltc_crosscheck_before_claim: bool,
     /// Zcash network: `testnet` (default) or `mainnet` (only with `--allow-mainnet`).
     #[arg(long, global = true, default_value = "testnet")]
     zec_network: String,
@@ -566,6 +571,12 @@ fn live_backends(cli: &Cli) -> Result<Backends> {
             if ltc_crosscheck_source(cli)?.is_some() && cli.ltc_network != "mainnet" {
                 bail!("--ltc-crosscheck is mainnet-only: no testnet source is verified");
             }
+            if cli.ltc_crosscheck_before_claim && ltc_crosscheck_source(cli)?.is_none() {
+                bail!(
+                    "--ltc-crosscheck-before-claim needs a source: set --ltc-crosscheck to \
+                     blockbook or blockcypher (it is off)"
+                );
+            }
         }
         _ => {}
     }
@@ -701,7 +712,12 @@ fn live_counter(
                     swap_chain_ltc::FeePolicy::default(),
                     swap_chain_ltc::RetryPolicy::default(),
                 )?
-                .with_input_reservations(reservations.clone()),
+                .with_input_reservations(reservations.clone())
+                .with_claim_crosscheck(if cli.ltc_crosscheck_before_claim {
+                    ltc_crosscheck_source(cli)?
+                } else {
+                    None
+                }),
             );
             (backend.clone(), CounterLive::Ltc(backend))
         }
@@ -1984,6 +2000,24 @@ mod tests {
             Err(e) => e,
         };
         assert!(e.to_string().contains("--ltc-crosscheck"), "{e}");
+    }
+
+    #[test]
+    fn ltc_crosscheck_before_claim_defaults_off_and_needs_a_source() {
+        assert!(!cli(&[]).ltc_crosscheck_before_claim);
+        let e = match live_backends(&cli(&[
+            "--counter-chain",
+            "ltc",
+            "--ltc-crosscheck-before-claim",
+        ])) {
+            Ok(_) => panic!("built an ltc backend with the claim check on and no source"),
+            Err(e) => e,
+        };
+        let e = e.to_string();
+        assert!(
+            e.contains("--ltc-crosscheck-before-claim") && e.contains("--ltc-crosscheck "),
+            "{e}"
+        );
     }
 
     #[test]

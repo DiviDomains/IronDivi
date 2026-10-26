@@ -166,6 +166,12 @@ pub struct LtcSection {
     /// Off by default; when it is used, a warning is logged at every start.
     #[serde(default)]
     pub allow_single_source: bool,
+    /// Run the `crosscheck` comparison again before every LTC claim, not only at startup.
+    /// Off by default (no mainnet default chosen). A disagreement holds the claim and the
+    /// engine retries it; an unreachable or rate-limited source logs a warning and the claim
+    /// goes ahead. Needs `crosscheck` set to a source; on with `crosscheck = "off"` is refused.
+    #[serde(default)]
+    pub crosscheck_before_claim: bool,
 }
 
 impl LtcSection {
@@ -783,6 +789,12 @@ impl DaemonConfig {
             self.validate_mainnet_gate("ltc", &l.network, l.allow_mainnet, &["testnet"])?;
             if l.crosscheck_source()?.is_some() && l.network != "mainnet" {
                 bail!("[ltc].crosscheck is mainnet-only: no testnet source is verified");
+            }
+            if l.crosscheck_before_claim && l.crosscheck_source()?.is_none() {
+                bail!(
+                    "[ltc].crosscheck_before_claim = true needs a source: set [ltc].crosscheck \
+                     to \"blockbook\" or \"blockcypher\" (it is \"off\")"
+                );
             }
             if self.profile == Profile::Mainnet && l.crosscheck_source()?.is_none() {
                 require_second_source("ltc", "[ltc].crosscheck is \"off\"", l.allow_single_source)?;
@@ -1448,6 +1460,36 @@ divi_fund_txids = ["ab"]
             );
             let c = DaemonConfig::parse(&text).unwrap();
             assert_eq!(c.ltc.unwrap().crosscheck_source().unwrap(), Some(want));
+        }
+    }
+
+    #[test]
+    fn ltc_crosscheck_before_claim_defaults_off_and_needs_a_source() {
+        let c = DaemonConfig::parse(&mainnet_with_ltc(
+            &good_mainnet_btc(),
+            "crosscheck = \"blockbook\"\n",
+        ))
+        .unwrap();
+        assert!(!c.ltc.unwrap().crosscheck_before_claim);
+        let c = DaemonConfig::parse(&mainnet_with_ltc(
+            &good_mainnet_btc(),
+            "crosscheck = \"blockcypher\"\ncrosscheck_before_claim = true\n",
+        ))
+        .unwrap();
+        assert!(c.ltc.unwrap().crosscheck_before_claim);
+        // On with the source off is refused, naming both keys, waiver or not, on any network.
+        for text in [
+            mainnet_with_ltc(
+                &good_mainnet_btc(),
+                "crosscheck = \"off\"\nallow_single_source = true\ncrosscheck_before_claim = true\n",
+            ),
+            format!("{GOOD}\n[ltc]\nkey = \"credential:btc\"\ncrosscheck_before_claim = true\n"),
+        ] {
+            let e = DaemonConfig::parse(&text).unwrap_err().to_string();
+            assert!(
+                e.contains("[ltc].crosscheck_before_claim") && e.contains("[ltc].crosscheck "),
+                "{e}"
+            );
         }
     }
 

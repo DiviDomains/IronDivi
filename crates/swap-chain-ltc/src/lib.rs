@@ -117,6 +117,18 @@ pub struct LtcBackend {
     hrp: &'static str,
     fees: FeePolicy,
     reservations: Option<InputReservations>,
+    retry: RetryPolicy,
+    claim_check: Option<ClaimCrossCheck>,
+}
+
+/// The opt-in claim-time tip cross-check (see [`LtcBackend::with_claim_crosscheck`]).
+struct ClaimCrossCheck {
+    source: CrossCheckSource,
+    base: String,
+    /// The last outcome and the primary tip hash it was taken at. A claim retried every
+    /// engine tick reuses it until the primary's tip moves, so the (rate-limited) source is
+    /// asked at most once per primary block.
+    last: parking_lot::Mutex<Option<(String, CrossCheckOutcome)>>,
 }
 
 impl std::fmt::Debug for LtcBackend {
@@ -135,6 +147,97 @@ impl LtcBackend {
     pub fn with_input_reservations(mut self, reservations: InputReservations) -> Self {
         self.reservations = Some(reservations);
         self
+    }
+
+    /// Opt-in (`[ltc].crosscheck_before_claim`): before every claim is built, compare the
+    /// primary's hash at `tip - CROSSCHECK_DEPTH` with `source` at its default mainnet base,
+    /// as the startup [`LtcBackend::crosscheck`] does. `Disagree` refuses the claim as
+    /// [`SwapError::Transient`] (the engine retries); `Unavailable` logs one warning per claim
+    /// and builds it anyway. The result is reused until the primary's tip hash changes.
+    /// `None` (the default) is off: no extra request. Mainnet only; the daemon's config
+    /// enforces that.
+    pub fn with_claim_crosscheck(self, source: Option<CrossCheckSource>) -> Self {
+        match source {
+            Some(s) => self.with_claim_crosscheck_at(s, s.default_base()),
+            None => Self {
+                claim_check: None,
+                ..self
+            },
+        }
+    }
+
+    /// [`LtcBackend::with_claim_crosscheck`] asking `source` at `base` instead of its default
+    /// mainnet API (a self-hosted explorer, or a test mock).
+    pub fn with_claim_crosscheck_at(
+        mut self,
+        source: CrossCheckSource,
+        base: impl Into<String>,
+    ) -> Self {
+        self.claim_check = Some(ClaimCrossCheck {
+            source,
+            base: base.into(),
+            last: parking_lot::Mutex::new(None),
+        });
+        self
+    }
+
+    /// The claim-time cross-check for a claim of `at`; `Ok` when off.
+    async fn check_before_claim(&self, at: &Outpoint) -> Result<()> {
+        let Some(cc) = &self.claim_check else {
+            return Ok(());
+        };
+        let source = cc.source.as_str();
+        let outcome = match self.tip_hash_raw().await {
+            Err(e) => CrossCheckOutcome::Unavailable {
+                reason: format!("{}: tip hash: {e}", self.esplora.primary_url()),
+            },
+            Ok(tip) => {
+                let tip = tip.trim().to_ascii_lowercase();
+                let cached = cc
+                    .last
+                    .lock()
+                    .as_ref()
+                    .filter(|(t, _)| *t == tip)
+                    .map(|(_, o)| o.clone());
+                match cached {
+                    Some(o) => o,
+                    None => {
+                        // One attempt: a rate-limited source must not hold the claim up in
+                        // backoff; the next primary block asks again.
+                        let once = RetryPolicy {
+                            attempts: 1,
+                            ..self.retry
+                        };
+                        let o = tip_crosscheck(&self.esplora, cc.source, &cc.base, once).await;
+                        *cc.last.lock() = Some((tip, o.clone()));
+                        o
+                    }
+                }
+            }
+        };
+        match outcome {
+            CrossCheckOutcome::Agree { height, hash } => {
+                tracing::debug!(height, %hash, source, outpoint = %at, "ltc claim cross-check agrees");
+                Ok(())
+            }
+            CrossCheckOutcome::Unavailable { reason } => {
+                // Warn and continue: the claim must not stall past the counterparty's refund
+                // timeout because a second explorer is down. One line per claim built
+                // unchecked, for audit.
+                tracing::warn!(
+                    source,
+                    source_url = %cc.base,
+                    %reason,
+                    outpoint = %at,
+                    "ltc claim cross-check unavailable; building the claim unchecked"
+                );
+                Ok(())
+            }
+            d @ CrossCheckOutcome::Disagree { .. } => Err(SwapError::Transient(format!(
+                "{}; claim of {at} held",
+                d.disagree_message().expect("disagree")
+            ))),
+        }
     }
 
     /// `coins` without those reserved by a broadcast transaction that has not confirmed.
@@ -235,6 +338,8 @@ impl LtcBackend {
             hrp,
             fees,
             reservations: None,
+            retry,
+            claim_check: None,
         })
     }
 
@@ -609,6 +714,7 @@ impl ChainBackend for LtcBackend {
         amount: Amount,
         preimage: &[u8; 32],
     ) -> Result<SignedTx> {
+        self.check_before_claim(at).await?;
         let tx = build_spend_tx(
             &self.secp,
             &self.key,
@@ -648,6 +754,7 @@ impl ChainBackend for LtcBackend {
         preimage: &[u8; 32],
         feerate: u64,
     ) -> Result<SignedTx> {
+        self.check_before_claim(at).await?;
         let tx = build_spend_tx(
             &self.secp,
             &self.key,

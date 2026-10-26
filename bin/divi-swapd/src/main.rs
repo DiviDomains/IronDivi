@@ -374,7 +374,14 @@ async fn live_ltc(
         swap_chain_ltc::FeePolicy::default(),
         swap_chain_ltc::RetryPolicy::default(),
     )?
-    .with_input_reservations(reservations.clone());
+    .with_input_reservations(reservations.clone())
+    // Opt-in (`[ltc].crosscheck_before_claim`, needs `crosscheck`): the same comparison again
+    // before every claim; config load refuses it without a source.
+    .with_claim_crosscheck(if cfg.crosscheck_before_claim {
+        cfg.crosscheck_source()?
+    } else {
+        None
+    });
     tracing::info!(address = %backend.address(), network = %cfg.network, "ltc backend ready");
     // Opt-in (`[ltc].crosscheck`): a primary that disagrees with the independent source
     // refuses to start; an unreachable source only warns.
