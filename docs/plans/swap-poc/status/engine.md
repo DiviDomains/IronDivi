@@ -856,5 +856,24 @@ The Manager's rulings on the DJ2 report. Testnet only, $0, not pushed.
   - Fail-first on 78b60c6: maker_lock_coin_race 8 passed / 4 failed (all four in `MakerLocked` with "transaction rejected: input ... is reserved by ..."); divi-swap lib 1 failed; swap-chain-divi 1 failed; divi-swapd 1 failed.
 - closed: DV's "lost coin race" limit.
 - left:
-  - A lock that was sent, confirmed (its row released), reorged out and left unknown to the node, whose coin another daemon then reserves, would be re-selected by `on_maker_locked` while still short of `maker_leg_confs`. If the old bytes were later mined after all, the maker would hold two locks and track only the new one. This needs a reorg, a vanished lock and a racing daemon at once; F2 covers the same case after `MakerLockConfirmed`.
+  - A lock that was sent, confirmed (its row released), reorged out and left unknown to the node, whose coin another daemon then reserves, would be re-selected by `on_maker_locked` while still short of `maker_leg_confs`. If the old bytes were later mined after all, the maker would hold two locks and track only the new one. This needs a reorg, a vanished lock and a racing daemon at once; F2 covers the same case after `MakerLockConfirmed`. (closed by DZ)
+  - DQ's other limits stand. No live run (no node, no funds).
+
+## 2026-10-26 round: maker-lock-reorg-relock DZ (builder DZ, `lane/maker-lock-reorg-relock`, on 95699a5)
+- why: DW's open limit. Take a maker lock that was sent and confirmed once (its `input_reservation` row is released on that confirmation), then reorged out and dropped by the node while still short of `maker_leg_confs`, and whose coin another holder on the table then takes. `lost_coin_race` re-selected it. If the old bytes were mined later after all, the maker held two locks and tracked one.
+- finding: the record, the table and the chain cannot tell this case from DW's never-sent one. In both, the node does not know the txid, the table refuses with `InputsHeld`, the maker has no row of its own, and the other lock may already spend the coin in the mempool. "Re-select only when the input is provably spent on chain" either breaks DW's next-tick re-select (that test runs while the other lock is only in the mempool) or leaves the old bytes minable. So the send itself has to be on the record.
+- decisions: provisional (orchestrator, 2026-10-26): maker_lock_sent field, the smaller migration.
+- design: no change to the HTLC script, fees, confirmation counts, the protocol or the SQL schema.
+  - `MakerRecord.maker_lock_sent: bool` (new, `#[serde(default, skip_serializing_if = "Not::not")]`): older records read as unsent (today's behaviour) and write back byte for byte.
+  - `Maker::on_maker_locked` sets it and persists the record once the broadcast of the persisted funding returns Ok, or once the table refuses it but the node knows the txid. A crash between the send and that write leaves the maker's own row in the table (only its own confirmation releases it), so the next tick's idempotent send is Ok and sets the flag.
+  - `lost_coin_race`, when the table refuses and the node does not know the txid: with `maker_lock_sent` set, the funding is kept and never replaced. It reports "maker lock dropped by a reorg and its inputs are held by another lock" each tick without a new write, and past the maker-leg locktime it enters `MakerRefundable`, as `on_maker_locked` does. Unset: DW's re-select or abort, unchanged.
+  - Behaviour change in DW's design: a table refusal of bytes the node already holds now goes on to `on_maker_locked`'s confirmation and timeout checks. It used to return `InputsHeld` each tick, which would have kept a kept lock that is mined later from ever reaching `MakerLockConfirmed`. DW's test for that case (funding kept, nothing re-selected) passes unchanged.
+- tests (test-first): `tests/maker_lock_reorg_relock.rs`, maker leg on DIVI and on BTC, both at three confirmations, 6 tests.
+  - The lock is sent and confirmed once (row released), reorged out and forgotten. Its coin is then either reserved by another holder or spent by another daemon's lock. In both, the funding is kept over further ticks, there is no second selection, and no second lock is sent.
+  - The kept bytes, re-sent by another node and mined, are tracked to `MakerLockConfirmed` with the same funding.
+  - `store_at_rest::maker_records_from_before_maker_lock_sent_read_unsent`: every maker fixture (at rest, v0.2.5, forward-done) reads false, the at-rest one writes back byte for byte, and a sent lock round-trips through the store.
+  - Fail-first on 95699a5 (committed ignored in f6980c6): the first four tests 0 passed / 4 failed, each re-selecting onto the second coin.
+- closed: DW's "a reorged-out lock whose coin another daemon reserves is re-selected" limit.
+- left:
+  - A lock sent before this build has `maker_lock_sent` false. If such an in-flight swap hits this exact sequence it still re-selects, as before (old records cannot know their past sends).
   - DQ's other limits stand. No live run (no node, no funds).

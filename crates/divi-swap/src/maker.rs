@@ -53,6 +53,10 @@ const MAX_TRANSITIONS_PER_STEP: usize = 32;
 
 /// Reported once when the maker lock was reorged out and cannot be re-sent.
 const MAKER_LOCK_DROPPED: &str = "maker lock dropped by a reorg and its inputs were spent";
+/// `last_error` of a sent maker lock the node dropped whose coin the reservation table now
+/// gives to another lock: kept, never replaced.
+const MAKER_LOCK_HELD: &str =
+    "maker lock dropped by a reorg and its inputs are held by another lock";
 
 /// What one pass of the state machine did.
 enum Flow {
@@ -422,6 +426,7 @@ impl Maker {
             taker_leg_claim: None,
             last_error: None,
             maker_lock_dropped: false,
+            maker_lock_sent: false,
             claim_fees: Default::default(),
         };
         qr.used = true;
@@ -735,9 +740,14 @@ impl Maker {
         // Idempotent: a tx the chain already has is Ok.
         match self.mk(r)?.broadcast(&funding.tx).await {
             Ok(_) => {}
-            Err(SwapError::InputsHeld(why)) => return self.lost_coin_race(r, &funding, &why).await,
+            Err(SwapError::InputsHeld(why)) => {
+                if let Some(flow) = self.lost_coin_race(r, &funding, &why).await? {
+                    return Ok(flow);
+                }
+            }
             Err(e) => return Err(e),
         }
+        self.mark_lock_sent(r)?;
         let confs = self
             .mk(r)?
             .confirmations(&funding.tx.txid)
@@ -753,25 +763,48 @@ impl Maker {
         Ok(Flow::Idle)
     }
 
+    /// Persist `maker_lock_sent` the first time the funding is known to have left: a
+    /// broadcast returned Ok or the node reported the tx.
+    fn mark_lock_sent(&self, r: &mut MakerRecord) -> Result<()> {
+        if !r.maker_lock_sent {
+            r.maker_lock_sent = true;
+            self.store.put_maker_swap(r)?;
+        }
+        Ok(())
+    }
+
     /// The reservation table refused the persisted funding before it was sent: another lock
-    /// (a second daemon on the same database) took one of its coins first. Unless the chain
-    /// knows these bytes (sent earlier, before their row went), drop the funding and go back
-    /// to `TakerLockConfirmed`, whose checks build a new one from other coins or, past the
-    /// lock window, abort. The backend has already given the coins back to its wallet.
+    /// (a second daemon on the same database) took one of its coins first. When the chain
+    /// knows these bytes (sent earlier, before their row went) nothing needs sending: `None`,
+    /// and the caller goes on to its confirmation checks. Bytes that were ever sent
+    /// (`maker_lock_sent`: e.g. confirmed once, row released, then reorged out and dropped)
+    /// can still be mined, so they are kept and never replaced: the lock is reported dropped,
+    /// and past its locktime the swap goes to `MakerRefundable`. Otherwise drop the funding
+    /// and go back to `TakerLockConfirmed`, whose checks build a new one from other coins
+    /// or, past the lock window, abort. The backend has already given the coins back to its
+    /// wallet.
     async fn lost_coin_race(
         &self,
         r: &mut MakerRecord,
         funding: &Funding,
         why: &str,
-    ) -> Result<Flow> {
+    ) -> Result<Option<Flow>> {
         if self.mk(r)?.confirmations(&funding.tx.txid).await?.is_some() {
-            return Err(SwapError::InputsHeld(why.into()));
+            return Ok(None);
+        }
+        if r.maker_lock_sent {
+            if self.maker_leg_timed_out(r).await? {
+                return self.enter(r, SwapState::MakerRefundable).map(Some);
+            }
+            // `step` clears the error each pass; keep reporting it without a new write.
+            r.last_error = Some(format!("{MAKER_LOCK_HELD}: {why}"));
+            return Ok(Some(Flow::Idle));
         }
         tracing::warn!(swap = %r.id, txid = %funding.tx.txid, "maker lock lost the coin race, unsent: {why}");
         r.maker_leg_htlc = None;
         r.maker_leg_funding = None;
         r.maker_mtp_at_lock = None;
-        self.enter(r, SwapState::TakerLockConfirmed)
+        self.enter(r, SwapState::TakerLockConfirmed).map(Some)
     }
 
     async fn on_maker_lock_confirmed(&self, r: &mut MakerRecord) -> Result<Flow> {

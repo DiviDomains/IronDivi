@@ -67,6 +67,7 @@ fn maker() -> MakerRecord {
         taker_leg_claim: None,
         last_error: None,
         maker_lock_dropped: false,
+        maker_lock_sent: false,
         claim_fees: Default::default(),
     }
 }
@@ -280,6 +281,38 @@ fn maker_records_from_before_lost_still_read() {
     let text = std::fs::read_to_string(dir.join("store-at-rest/maker-record.json")).unwrap();
     let rec: MakerRecord = serde_json::from_str(&text).unwrap();
     assert_eq!(serde_json::to_string(&rec).unwrap(), text);
+}
+
+/// Maker records written before `maker_lock_sent` existed read it as false (unsent, as
+/// before), the at-rest one writes back byte for byte, and a sent lock round-trips through
+/// the store under that key, which is left out while false.
+#[test]
+fn maker_records_from_before_maker_lock_sent_read_unsent() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    for name in [
+        "store-at-rest/maker-record.json",
+        "v0.2.5/maker-forward-done.json",
+        "v0.2.5/maker-reverse-done.json",
+        "maker-forward-done-happy.json",
+        "maker-forward-done-casec.json",
+    ] {
+        let text = std::fs::read_to_string(dir.join(name)).unwrap();
+        assert!(!text.contains("maker_lock_sent"), "{name}");
+        let rec: MakerRecord =
+            serde_json::from_str(&text).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert!(!rec.maker_lock_sent, "{name}");
+    }
+    let text = std::fs::read_to_string(dir.join("store-at-rest/maker-record.json")).unwrap();
+    let rec: MakerRecord = serde_json::from_str(&text).unwrap();
+    assert_eq!(serde_json::to_string(&rec).unwrap(), text);
+
+    let mut m = maker();
+    m.maker_lock_sent = true;
+    let json = serde_json::to_string(&m).unwrap();
+    assert!(json.contains("\"maker_lock_sent\":true"), "{json}");
+    let store = Store::in_memory().unwrap();
+    store.put_maker_swap(&m).unwrap();
+    assert!(store.get_maker_swap("m1").unwrap().unwrap().maker_lock_sent);
 }
 
 /// A `Lost` maker record goes through the store: JSON `"state":"Lost"` (the variant name,

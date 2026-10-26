@@ -12,9 +12,6 @@
 //! then takes. Its bytes reached the network and can still be mined, so the maker must keep
 //! that funding and never build a second lock beside it. Run with the maker leg on DIVI and
 //! on BTC (both at three confirmations, so one confirmation is short of them).
-//!
-//! Ignored until the fix lands: today the maker re-selects (see DW's `lost_coin_race`), and
-//! telling these sent bytes from DW's never-sent ones needs a persisted "sent" marker.
 
 use divi_swap::api::{Direction, Offer};
 use divi_swap::mock::{MockBackend, MockChain, TxKind};
@@ -177,6 +174,7 @@ async fn locked_confirmed_once(dir: Direction) -> World {
         "the first confirmation released its row"
     );
     assert_eq!(w.mk.funding_calls(), 1);
+    assert!(r.maker_lock_sent, "the send is on the record");
     w
 }
 
@@ -246,15 +244,47 @@ async fn a_reorged_lock_whose_coin_another_lock_spends_is_not_reselected(dir: Di
     keeps_the_lock(&w, &persisted).await;
 }
 
+/// The kept bytes are mined after all (a miner still held them): the maker tracks that one
+/// lock to `MakerLockConfirmed`, although the table still gives the coin to another holder.
+async fn a_kept_reorged_lock_mined_later_is_the_one_tracked(dir: Direction) {
+    let w = locked_confirmed_once(dir).await;
+    let persisted = w.funding();
+    reorg_out(&w, &persisted);
+    w.res
+        .reserve(w.chain(), &Txid([0x77; 32]), &[COINS[0]])
+        .unwrap();
+    keeps_the_lock(&w, &persisted).await;
+    // Another node on the network sends the old bytes again; no table in between.
+    let have = w.ml().balance(&w.mk.pubkey());
+    w.ml()
+        .backend(1, have)
+        .broadcast(&persisted.tx)
+        .await
+        .unwrap();
+    for _ in 0..10 {
+        w.mine();
+        let _ = w.maker.tick().await;
+        if w.rec().state == SwapState::MakerLockConfirmed {
+            break;
+        }
+    }
+    let r = w.rec();
+    assert_eq!(r.state, SwapState::MakerLockConfirmed, "{:?}", r.last_error);
+    assert_eq!(
+        r.maker_leg_funding.as_ref(),
+        Some(&persisted),
+        "the same lock"
+    );
+    assert_eq!(w.mk.funding_calls(), 1, "never re-selected");
+}
+
 macro_rules! on_both_chains {
     ($divi:ident, $btc:ident, $body:ident) => {
         #[tokio::test]
-        #[ignore = "fails today; the fix waits on the maker_lock_sent decision (DZ STATUS)"]
         async fn $divi() {
             $body(Direction::TakerPaysBtc).await;
         }
         #[tokio::test]
-        #[ignore = "fails today; the fix waits on the maker_lock_sent decision (DZ STATUS)"]
         async fn $btc() {
             $body(Direction::TakerPaysDivi).await;
         }
@@ -270,4 +300,9 @@ on_both_chains!(
     divi_a_reorged_lock_whose_coin_another_lock_spends_is_not_reselected,
     btc_a_reorged_lock_whose_coin_another_lock_spends_is_not_reselected,
     a_reorged_lock_whose_coin_another_lock_spends_is_not_reselected
+);
+on_both_chains!(
+    divi_a_kept_reorged_lock_mined_later_is_the_one_tracked,
+    btc_a_kept_reorged_lock_mined_later_is_the_one_tracked,
+    a_kept_reorged_lock_mined_later_is_the_one_tracked
 );

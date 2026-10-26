@@ -1408,6 +1408,7 @@ mod tests {
             taker_leg_claim: None,
             last_error: None,
             maker_lock_dropped: false,
+            maker_lock_sent: false,
             claim_fees: Default::default(),
         }
     }
