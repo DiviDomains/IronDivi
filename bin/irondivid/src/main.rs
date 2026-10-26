@@ -3092,9 +3092,16 @@ async fn run_daemon(
                     }
                 }
             ) => {
-                if let Err(e) = result {
-                    error!("RPC server error: {}", e);
-                    rpc_error = Some(e.to_string());
+                match result {
+                    Err(e) => {
+                        error!("RPC server error: {}", e);
+                        rpc_error = Some(e.to_string());
+                    }
+                    // The server ends after an RPC stop, whose signal follows
+                    Ok(()) => {
+                        let _ = shutdown_rx.recv().await;
+                        info!("Shutdown signal received");
+                    }
                 }
             }
             _ = shutdown_rx.recv() => {
@@ -3155,9 +3162,16 @@ async fn run_daemon(
                     info!("Masternode manager initialized");
                 }
             ) => {
-                if let Err(e) = result {
-                    error!("RPC server error: {}", e);
-                    rpc_error = Some(e.to_string());
+                match result {
+                    Err(e) => {
+                        error!("RPC server error: {}", e);
+                        rpc_error = Some(e.to_string());
+                    }
+                    // The server ends after an RPC stop, whose signal follows
+                    Ok(()) => {
+                        let _ = shutdown_rx.recv().await;
+                        info!("Shutdown signal received");
+                    }
                 }
             }
             _ = shutdown_rx.recv() => {
