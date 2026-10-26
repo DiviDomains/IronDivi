@@ -433,12 +433,33 @@ fn server_0_runs_without_rpc() {
     );
 }
 
-/// This host's address on another interface than the loopback, if any
+/// This host's IPv4 address on another interface than the loopback, if any,
+/// read from the interfaces (no route out is needed or used)
 fn non_loopback_ip() -> Option<IpAddr> {
-    let s = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
-    s.connect("192.0.2.1:9").ok()?;
-    let ip = s.local_addr().ok()?.ip();
-    (!ip.is_loopback() && !ip.is_unspecified()).then_some(ip)
+    let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
+    let mut found = None;
+    // SAFETY: getifaddrs fills `list`, which is walked read-only and freed once
+    unsafe {
+        if libc::getifaddrs(&mut list) != 0 {
+            return None;
+        }
+        let mut ifa = list;
+        while !ifa.is_null() && found.is_none() {
+            let entry = &*ifa;
+            ifa = entry.ifa_next;
+            if entry.ifa_addr.is_null()
+                || (entry.ifa_flags & libc::IFF_UP as u32) == 0
+                || i32::from((*entry.ifa_addr).sa_family) != libc::AF_INET
+            {
+                continue;
+            }
+            let sin = &*(entry.ifa_addr as *const libc::sockaddr_in);
+            let ip = IpAddr::from(u32::from_be(sin.sin_addr.s_addr).to_be_bytes());
+            found = (!ip.is_loopback() && !ip.is_unspecified()).then_some(ip);
+        }
+        libc::freeifaddrs(list);
+    }
+    found
 }
 
 /// -rpcallowip: the server listens on every interface and answers only the
