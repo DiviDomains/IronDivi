@@ -1857,12 +1857,15 @@ impl WalletOptions {
 
 /// The WALLET_MNEMONIC, WALLET_MNEMONIC_PASSPHRASE and WALLET_HDSEED
 /// environment variables, each taken when its option is not set (see
-/// `WalletSeed`)
+/// `WalletSeed`), and WALLET_CHAIN_MODE and WALLET_LOOKAHEAD, read by a
+/// restore
 #[derive(Default)]
 struct WalletEnv {
     mnemonic: Option<String>,
     passphrase: Option<String>,
     hdseed: Option<String>,
+    chain_mode: Option<String>,
+    lookahead: Option<String>,
 }
 
 impl WalletEnv {
@@ -1872,6 +1875,8 @@ impl WalletEnv {
             mnemonic: env("WALLET_MNEMONIC"),
             passphrase: env("WALLET_MNEMONIC_PASSPHRASE"),
             hdseed: env("WALLET_HDSEED"),
+            chain_mode: env("WALLET_CHAIN_MODE"),
+            lookahead: env("WALLET_LOOKAHEAD"),
         }
     }
 }
@@ -1917,10 +1922,10 @@ fn load_or_create_wallet_with_env(
     // An empty mnemonic asks for a new one, as in Core
     let mnemonic = seed
         .mnemonic
-        .or(env.mnemonic)
+        .or_else(|| env.mnemonic.clone())
         .filter(|m| !m.trim().is_empty());
-    let passphrase = seed.passphrase.or(env.passphrase);
-    let hdseed = seed.hdseed.or(env.hdseed);
+    let passphrase = seed.passphrase.or_else(|| env.passphrase.clone());
+    let hdseed = seed.hdseed.or_else(|| env.hdseed.clone());
     load_or_restore_wallet_with_seed(
         wallet_path,
         network,
@@ -1929,6 +1934,7 @@ fn load_or_create_wallet_with_env(
         passphrase,
         hdseed,
         options,
+        &env,
     )
 }
 
@@ -1962,11 +1968,14 @@ fn load_or_restore_wallet(
         passphrase,
         None,
         &WalletOptions::default(),
+        &WalletEnv::default(),
     )
 }
 
 /// `load_or_restore_wallet`, where a new wallet may instead come from a hex
-/// `seed` (Divi Core's -hdseed, taken over a mnemonic)
+/// `seed` (Divi Core's -hdseed, taken over a mnemonic); a restore takes
+/// WALLET_CHAIN_MODE and WALLET_LOOKAHEAD from `env`
+#[allow(clippy::too_many_arguments)]
 fn load_or_restore_wallet_with_seed(
     wallet_path: &PathBuf,
     network: WalletNetwork,
@@ -1975,6 +1984,7 @@ fn load_or_restore_wallet_with_seed(
     passphrase: Option<String>,
     seed: Option<String>,
     options: &WalletOptions,
+    env: &WalletEnv,
 ) -> Result<Arc<WalletDb>> {
     // Try to open existing wallet
     if wallet_path.exists() {
@@ -2081,8 +2091,9 @@ fn load_or_restore_wallet_with_seed(
     } else if let Some(ref mnemonic) = restoring {
         // Use WALLET_CHAIN_MODE env var to override chain mode for mnemonic restore.
         // Falls back to the --mode flag value so PrivateDivi nodes derive correct addresses.
-        let restore_chain_mode = std::env::var("WALLET_CHAIN_MODE")
-            .ok()
+        let restore_chain_mode = env
+            .chain_mode
+            .as_deref()
             .map(|v| match v.to_lowercase().as_str() {
                 "privatedivi" => ChainMode::PrivateDivi,
                 "divi" => ChainMode::Divi,
@@ -2133,7 +2144,7 @@ fn load_or_restore_wallet_with_seed(
     // keys of each chain a restore pre-generates (default: the keypool size).
     // They stay in the keypool, so the receiving and change indices stay low.
     let lookahead = (restoring.is_some() || seed.is_some())
-        .then(|| std::env::var("WALLET_LOOKAHEAD").ok()?.parse::<u32>().ok())
+        .then(|| env.lookahead.as_deref()?.parse::<u32>().ok())
         .flatten();
     let generated = wallet
         .refill_keypool(lookahead)
