@@ -39,6 +39,14 @@ const DNS_SEED_DELAY: Duration = Duration::from_secs(11);
 /// Reads the node's current chain height
 pub type HeightSource = Arc<dyn Fn() -> u32 + Send + Sync>;
 
+/// Looks a DNS seed up: given "host:port", its addresses. The system
+/// resolver unless one is set ([`PeerManager::set_seed_resolver`])
+pub type SeedResolver = Arc<
+    dyn Fn(String) -> futures::future::BoxFuture<'static, std::io::Result<Vec<SocketAddr>>>
+        + Send
+        + Sync,
+>;
+
 /// What `try_send_to_peer` did
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrySend {
@@ -219,6 +227,8 @@ pub struct PeerManager {
     /// looked up from then on, as Divi Core interrupts and joins its net
     /// threads first when it shuts down (divid.cpp:42-53)
     stopping: AtomicBool,
+    /// The seed lookup in place of the system resolver, when set
+    seed_resolver: RwLock<Option<SeedResolver>>,
     /// Peer scoring and ban management
     scoring: PeerScoring,
     /// Nonces of our version messages on open connections (self-connection check)
@@ -282,6 +292,7 @@ impl PeerManager {
             event_tx,
             shutdown_tx,
             stopping: AtomicBool::new(false),
+            seed_resolver: RwLock::new(None),
             scoring: PeerScoring::new(),
             local_nonces: Default::default(),
             local_addresses: RwLock::new(Arc::new(Default::default())),
@@ -1005,10 +1016,15 @@ impl PeerManager {
             }
             debug!("Resolving DNS seed: {}", seed);
 
-            match tokio::net::lookup_host(format!("{}:{}", seed, self.config.default_port)).await {
+            let name = format!("{}:{}", seed, self.config.default_port);
+            let resolver = self.seed_resolver.read().clone();
+            let resolved = match resolver {
+                Some(resolve) => resolve(name).await,
+                None => tokio::net::lookup_host(name).await.map(|a| a.collect()),
+            };
+            match resolved {
                 Ok(addrs) => {
                     // Into the book, as divid adds what a seed gives (net.cpp ThreadDNSAddressSeed)
-                    let addrs: Vec<SocketAddr> = addrs.collect();
                     found += addrs.len();
                     self.address_book.add_seeds(&addrs);
                     let local = self.local_addresses();
@@ -1585,6 +1601,12 @@ impl PeerManager {
         // A socket bound for a listener that has not started yet closes now
         self.prebound.lock().take();
         let _ = self.shutdown_tx.send(());
+    }
+
+    /// Look DNS seeds up with `resolver` instead of the system resolver, so a
+    /// test controls what a seed gives and when
+    pub fn set_seed_resolver(&self, resolver: SeedResolver) {
+        *self.seed_resolver.write() = Some(resolver);
     }
 
     /// Whether the node has begun to stop (see [`Self::stop_network`])
