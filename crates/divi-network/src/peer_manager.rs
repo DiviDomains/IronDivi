@@ -39,6 +39,15 @@ const DNS_SEED_DELAY: Duration = Duration::from_secs(11);
 /// Reads the node's current chain height
 pub type HeightSource = Arc<dyn Fn() -> u32 + Send + Sync>;
 
+/// Takes a peer task's name off the running list when it ends, however
+struct TaskDone(Arc<parking_lot::Mutex<HashMap<u64, String>>>, u64);
+
+impl Drop for TaskDone {
+    fn drop(&mut self) {
+        self.0.lock().remove(&self.1);
+    }
+}
+
 /// Looks a DNS seed up: given "host:port", its addresses. The system
 /// resolver unless one is set ([`PeerManager::set_seed_resolver`])
 pub type SeedResolver = Arc<
@@ -229,6 +238,12 @@ pub struct PeerManager {
     stopping: AtomicBool,
     /// The seed lookup in place of the system resolver, when set
     seed_resolver: RwLock<Option<SeedResolver>>,
+    /// The tasks this manager spawns (listeners, dials, connections, the seed
+    /// lookup), so a stop can wait for them as Divi Core's join_all waits for
+    /// its net threads (divid.cpp:42-53); and the names of those running
+    tasks: tokio_util::task::TaskTracker,
+    running: Arc<parking_lot::Mutex<HashMap<u64, String>>>,
+    next_task: AtomicU64,
     /// Peer scoring and ban management
     scoring: PeerScoring,
     /// Nonces of our version messages on open connections (self-connection check)
@@ -293,6 +308,9 @@ impl PeerManager {
             shutdown_tx,
             stopping: AtomicBool::new(false),
             seed_resolver: RwLock::new(None),
+            tasks: tokio_util::task::TaskTracker::new(),
+            running: Default::default(),
+            next_task: AtomicU64::new(0),
             scoring: PeerScoring::new(),
             local_nonces: Default::default(),
             local_addresses: RwLock::new(Arc::new(Default::default())),
@@ -406,7 +424,7 @@ impl PeerManager {
             debug!("Dialling learnt address {}", addr);
             self.address_book.attempt(addr);
             let self_clone = Arc::clone(self);
-            tokio::spawn(async move {
+            self.spawn_task(format!("dial of learnt address {addr}"), async move {
                 if let Err(e) = self_clone.connect_to_peer(addr).await {
                     debug!("Failed to connect to learnt address {}: {}", addr, e);
                 }
@@ -420,7 +438,7 @@ impl PeerManager {
         let pending: Vec<String> = self.one_shots.lock().drain(..).collect();
         for dest in pending {
             let self_clone = Arc::clone(self);
-            tokio::spawn(async move {
+            self.spawn_task(format!("dial of one-shot peer {dest}"), async move {
                 let reached = match self_clone.resolve(&dest).await {
                     Some(addr) => {
                         self_clone.claim_dial(addr, DialRule::ByName)
@@ -868,7 +886,7 @@ impl PeerManager {
             .into_iter()
             .map(|(listen_addr, white, bound)| {
                 let self_clone = Arc::clone(&self);
-                tokio::spawn(async move {
+                self.spawn_task(format!("listener on {listen_addr}"), async move {
                     if let Err(e) = self_clone.run_listener(listen_addr, white, bound).await {
                         error!("Listener error: {}", e);
                     }
@@ -889,7 +907,7 @@ impl PeerManager {
             .filter(|addr| self.can_connect_outbound() && self.claim_dial(*addr, rule))
             .map(|addr| {
                 let self_clone = Arc::clone(&self);
-                tokio::spawn(async move {
+                self.spawn_task(format!("dial of static peer {addr}"), async move {
                     if let Err(e) = self_clone.connect_to_peer(addr).await {
                         warn!(
                             "Failed to connect to static peer {}: {}",
@@ -910,7 +928,10 @@ impl PeerManager {
         // Then addresses learnt from peers, then DNS seeds
         self.dial_learnt();
         if self.config.dns_seed {
-            tokio::spawn(Arc::clone(&self).seed_from_dns());
+            self.spawn_task(
+                "DNS seed lookup".to_string(),
+                Arc::clone(&self).seed_from_dns(),
+            );
         } else {
             info!("DNS seeding disabled");
         }
@@ -1043,7 +1064,7 @@ impl PeerManager {
                             }
                             info!("Discovered peer: {}", crate::peer_log::address(addr));
                             let self_clone = Arc::clone(&self);
-                            tokio::spawn(async move {
+                            self.spawn_task(format!("dial of seed address {addr}"), async move {
                                 if let Err(e) = self_clone.connect_to_peer(addr).await {
                                     debug!("Failed to connect to discovered peer {}: {}", addr, e);
                                 }
@@ -1110,7 +1131,7 @@ impl PeerManager {
 
                             self.inbound_handshaking.fetch_add(1, Ordering::SeqCst);
                             let self_clone = Arc::clone(&self);
-                            tokio::spawn(async move {
+                            self.spawn_task(format!("inbound connection from {peer_addr}"), async move {
                                 let pm = Arc::clone(&self_clone);
                                 if let Err(e) = self_clone.handle_inbound(stream, white).await {
                                     debug!("Inbound connection error from {}: {}", peer_addr, e);
@@ -1188,7 +1209,7 @@ impl PeerManager {
             return;
         }
         let self_clone = Arc::clone(self);
-        tokio::spawn(async move {
+        self.spawn_task(format!("dial of {addr}"), async move {
             if let Err(e) = self_clone.connect_to_peer(addr).await {
                 debug!("Failed to connect to {}: {}", addr, e);
             }
@@ -1271,7 +1292,7 @@ impl PeerManager {
 
         // Run the connection handler
         let self_clone = Arc::clone(&self);
-        tokio::spawn(async move {
+        self.spawn_task(format!("connection to {addr}"), async move {
             if let Err(e) = conn.run().await {
                 debug!("Connection to {} ended: {}", addr, e);
                 self_clone.ban_obsolete(addr.ip(), &e);
@@ -1305,7 +1326,7 @@ impl PeerManager {
                 continue;
             }
             let self_clone = Arc::clone(self);
-            tokio::spawn(async move {
+            self.spawn_task(format!("dial of {host}:{port}"), async move {
                 if let Err(e) = Arc::clone(&self_clone)
                     .connect_to_named(&host, port, proxy)
                     .await
@@ -1351,7 +1372,7 @@ impl PeerManager {
             .write()
             .insert(format!("{host}:{port}"), peer_id);
         let self_clone = Arc::clone(&self);
-        tokio::spawn(async move {
+        self.spawn_task(format!("connection to {addr}"), async move {
             if let Err(e) = conn.run().await {
                 debug!("Connection to {} ended: {}", addr, e);
             }
@@ -1424,7 +1445,7 @@ impl PeerManager {
 
         // Run the connection handler
         let self_clone = Arc::clone(&self);
-        tokio::spawn(async move {
+        self.spawn_task(format!("inbound connection from {addr}"), async move {
             if let Err(e) = conn.run().await {
                 debug!("Inbound connection ended: {}", e);
                 self_clone.ban_obsolete(addr.ip(), &e);
@@ -1603,6 +1624,36 @@ impl PeerManager {
         let _ = self.shutdown_tx.send(());
     }
 
+    /// Spawn one of the peer tasks, under `name`, tracked so a stop waits for it
+    fn spawn_task<F>(&self, name: String, task: F) -> tokio::task::JoinHandle<()>
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let id = self.next_task.fetch_add(1, Ordering::Relaxed);
+        self.running.lock().insert(id, name);
+        let done = TaskDone(Arc::clone(&self.running), id);
+        self.tasks.spawn(async move {
+            let _done = done;
+            task.await;
+        })
+    }
+
+    /// Wait, `bound` at most, until every peer task has ended, as Divi Core's
+    /// shutdown waits for its net threads (join_all, divid.cpp:42-53). The
+    /// names of those still running at the bound, sorted; none when all ended
+    pub async fn join_tasks(&self, bound: Duration) -> Vec<String> {
+        self.tasks.close();
+        let ended = tokio::time::timeout(bound, self.tasks.wait()).await.is_ok();
+        // A node started again spawns its tasks anew
+        self.tasks.reopen();
+        if ended {
+            return Vec::new();
+        }
+        let mut left: Vec<String> = self.running.lock().values().cloned().collect();
+        left.sort();
+        left
+    }
+
     /// Look DNS seeds up with `resolver` instead of the system resolver, so a
     /// test controls what a seed gives and when
     pub fn set_seed_resolver(&self, resolver: SeedResolver) {
@@ -1711,7 +1762,7 @@ impl PeerManager {
             for addr in self.config.static_peers.clone() {
                 if self.claim_dial(addr, DialRule::ByName) {
                     let self_clone = Arc::clone(&self);
-                    tokio::spawn(async move {
+                    self.spawn_task(format!("dial of -connect peer {addr}"), async move {
                         if let Err(e) = self_clone.connect_to_peer(addr).await {
                             debug!("Failed to connect to -connect peer {}: {}", addr, e);
                         }
@@ -1770,7 +1821,7 @@ impl PeerManager {
                     crate::peer_log::address(addr)
                 );
                 let self_clone = Arc::clone(&self);
-                tokio::spawn(async move {
+                self.spawn_task(format!("dial of added node {addr}"), async move {
                     let self_for_record = Arc::clone(&self_clone);
                     match self_clone.connect_to_peer(addr).await {
                         Ok(_) => {
@@ -1820,7 +1871,7 @@ impl PeerManager {
                         crate::peer_log::address(addr)
                     );
                     let self_clone = Arc::clone(&self);
-                    tokio::spawn(async move {
+                    self.spawn_task(format!("dial of static peer {addr}"), async move {
                         let self_for_record = Arc::clone(&self_clone);
                         match self_clone.connect_to_peer(addr).await {
                             Ok(_) => {

@@ -4,9 +4,8 @@
 
 //! `Node::stop` returns only once the peer tasks have ended, as Divi Core's
 //! shutdown returns from `join_all` only when every net thread has
-//! (divid.cpp:42-53): a peer whose handshake is under way at the stop has
-//! its connection closed by the time stop returns, and a quiet node stops
-//! at once.
+//! (divid.cpp:42-53): a peer caught in the middle of its handshake at the
+//! stop has its connection closed by the time stop returns.
 //!
 //! No test leaves the host: the peers are raw sockets on 127.0.0.1.
 
@@ -93,6 +92,25 @@ async fn closed_within(peer: &mut TcpStream, within: Duration) -> bool {
             Err(_) => return false,
         }
     }
+}
+
+/// A peer that sent half its version when stop came: the node was waiting
+/// for the rest in its handshake. By the time stop returns that task has
+/// ended and the peer's connection is closed
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_peer_half_way_through_its_version_is_closed_by_stop() {
+    let dir = tempfile::tempdir().unwrap();
+    let n = node(&dir, 53804);
+    n.start().await.unwrap();
+    let mut peer = connect(53804).await;
+    peer.write_all(&version_frame()[..30]).await.unwrap();
+    // Taken by the node, which now waits for the rest of the version
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    n.stop().await.unwrap();
+    assert!(
+        closed_within(&mut peer, Duration::from_millis(500)).await,
+        "the connection of a peer in its handshake is still open after stop"
+    );
 }
 
 /// A peer that sent its version and then nothing (no verack): its
