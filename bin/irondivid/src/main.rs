@@ -38,6 +38,7 @@ use divi_rpc::{start_server_with_wallet_peer_and_staker, RpcConfig};
 use divi_wallet::{HdWallet, Network as WalletNetwork, WalletDb};
 use settings::{atoi, Settings};
 use std::error::Error as StdError;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::signal;
@@ -103,6 +104,8 @@ the data directory) for whatever the command line left unset. Among them:\n  \
 -zmqpubrawblock=<address> -zmqpubrawtx=<address>\n\
 IronDivi's own: -fullnode=<ip> -stakeonstaletip -stakesplitthreshold=<n>\n  \
 -utxocachesize=<n> -expire=<age> -maxlogsize=<MB> -maxlogfiles=<n>\n  \
+-webui -webuiport=<port> -webuibind=<addr> -webuiallowhost=<host>\n  \
+-webuiallowremote (the web interface, off unless -webui is given)\n  \
 --export-chain --export-start N --export-end N --export-output DIR\n  \
 --export-snapshot DIR --import-snapshot DIR [--snapshot-root HEX]\n  \
 --sign-snapshot DIR --verify-snapshot DIR --snapshot-signer ADDRESS\n";
@@ -340,6 +343,11 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
 
 /// Options read elsewhere (before the node config is built, or by a command)
 const READ_ELSEWHERE: &[&str] = &[
+    "webui",
+    "webuiport",
+    "webuibind",
+    "webuiallowremote",
+    "webuiallowhost",
     "conf",
     "hdseed",
     "mnemonic",
@@ -1663,6 +1671,7 @@ async fn run_daemon(
     wallet_options: WalletOptions,
     shutdown_tx: broadcast::Sender<()>,
     shutdown_rx: broadcast::Receiver<()>,
+    webui: Option<divi_webui::WebUiConfig>,
 ) -> Result<()> {
     // Create data directory if it doesn't exist
     private_files::ensure_private_dir(&config.data_dir, false)
@@ -1672,6 +1681,10 @@ async fn run_daemon(
     let _datadir_lock = lock_data_dir(&config.data_dir)?;
     // divid reads masternode.conf at every start and makes it when missing
     core_files::ensure_masternode_conf(&config.data_dir);
+
+    // -webui: take its port now, so a port in use stops the start at once
+    let webui = webui.map(divi_webui::prepare).transpose()?;
+    let webui_shutdown = shutdown_tx.subscribe();
 
     // Divi Core Discover: the interfaces' addresses (net.cpp:1385-1425)
     if config.p2p.discover {
@@ -2181,6 +2194,9 @@ async fn run_daemon(
                 wallet,
                 peer_manager,
                 move |rpc_server| {
+                    if let Some(webui) = webui {
+                        webui.spawn(Arc::clone(rpc_server), webui_shutdown);
+                    }
                     rpc_server.set_shutdown_callback(rpc_stop);
                     rpc_server.set_mempool(mempool_for_rpc);
                     rpc_server.set_reorg_hook(reorg_hook_for_rpc);
@@ -2336,6 +2352,9 @@ async fn run_daemon(
                 chain,
                 peer_manager,
                 move |rpc_server| {
+                    if let Some(webui) = webui {
+                        webui.spawn(Arc::clone(rpc_server), webui_shutdown);
+                    }
                     rpc_server.set_shutdown_callback(rpc_stop);
                     rpc_server.set_mempool(mempool_for_rpc);
                     rpc_server.set_reorg_hook(reorg_hook_for_rpc);
@@ -2396,6 +2415,70 @@ async fn run_daemon(
         Some(e) => Err(anyhow::anyhow!("RPC server error: {}", e)),
         None => Ok(()),
     }
+}
+
+/// `-webui`: the web interface's settings; None when it is off
+fn webui_config(args: &Args, config: &NodeConfig) -> Result<Option<divi_webui::WebUiConfig>> {
+    let s = &args.settings;
+    if !s.get_bool("webui", false) {
+        return Ok(None);
+    }
+    if !config.rpc.enabled {
+        anyhow::bail!(
+            "-webui calls the daemon through its RPC server; it cannot run with -server=0"
+        );
+    }
+    let private = config.network.chain_mode == ChainMode::PrivateDivi;
+    let net = config.network.network_type;
+    let port = match s.get("webuiport") {
+        Some(p) => p
+            .trim()
+            .parse::<u16>()
+            .ok()
+            .filter(|p| *p != 0)
+            .with_context(|| format!("Invalid -webuiport: '{p}'"))?,
+        None => divi_webui::default_port(
+            private,
+            net == NetworkType::Testnet,
+            net == NetworkType::Regtest,
+        ),
+    };
+    let ip: std::net::IpAddr = match s.get("webuibind").map(str::trim) {
+        Some(b) if !b.is_empty() => b
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse()
+            .with_context(|| format!("Invalid -webuibind: '{b}' (an IP address)"))?,
+        _ => std::net::Ipv4Addr::LOCALHOST.into(),
+    };
+    let cli = args
+        .cli
+        .keys()
+        .map(|k| {
+            let all = args.cli.get_multi(k);
+            let values = if all.is_empty() {
+                args.cli.get(k).map(str::to_string).into_iter().collect()
+            } else {
+                all.to_vec()
+            };
+            (k.clone(), values)
+        })
+        .collect();
+    Ok(Some(divi_webui::WebUiConfig {
+        bind: SocketAddr::new(ip, port),
+        allow_remote: s.get_bool("webuiallowremote", false),
+        allow_hosts: s.get_multi("webuiallowhost").to_vec(),
+        data_dir: config.data_dir.clone(),
+        conf_path: config_path(args),
+        network: match net {
+            NetworkType::Mainnet => "main",
+            NetworkType::Testnet => "test",
+            NetworkType::Regtest => "regtest",
+        }
+        .into(),
+        chain_mode: if private { "privatedivi" } else { "divi" }.into(),
+        cli,
+    }))
 }
 
 /// Run a notify command as divid's runCommand: through the shell, `%s`
@@ -3025,6 +3108,7 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
 
     let wallet_seed = WalletSeed::from_settings(&args.settings);
     let wallet_options = WalletOptions::from_settings(&args.settings);
+    let webui = webui_config(&args, &config)?;
 
     // Run the daemon
     if let Err(e) = run_daemon(
@@ -3035,6 +3119,7 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
         wallet_options,
         shutdown_tx,
         shutdown_rx,
+        webui,
     )
     .await
     {

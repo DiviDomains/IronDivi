@@ -19,6 +19,7 @@ divi-primitives = { workspace = true }
 divi-wallet = { workspace = true }
 divi-crypto = { workspace = true }
 divi-masternode = { workspace = true }
+divi-webui = { workspace = true }
 
 # CLI
 clap = { version = "4.4", features = ["derive"] }
