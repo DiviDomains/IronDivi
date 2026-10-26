@@ -363,6 +363,11 @@ def seen(txid, nodes=None):
     return wait_for(lambda: all(txid in n.rpc("getrawmempool") for n in (nodes or NODES)), 60)
 
 
+def txid_of(hex_tx):
+    """The txid of a signed transaction, as divid sorts it: the hash as a number"""
+    return hashlib.sha256(hashlib.sha256(bytes.fromhex(hex_tx)).digest()).digest()[::-1].hex()
+
+
 def shared_address(label=""):
     a = C.rpc("getnewaddress", label)
     I.rpc("setaccount", a, label)
@@ -517,14 +522,30 @@ row("backupwallet <file>: the log has divid's \"copied wallet.dat to <file>\"", 
 # holds. The twins import the key with a rescan, which reads blocks only, so
 # the coin looks unspent to them; their send of it is committed to the
 # wallet, then refused by their own mempool (rpcwallet.cpp:774-782,
-# wallet.cpp:1866-1878, MempoolConsensus.cpp:296-305)
-Q = S.rpc("getnewaddress")
+# wallet.cpp:1866-1878, MempoolConsensus.cpp:296-305).
+# X's txid sorts above its funding's, trying payees until it does: divid's
+# -prunewalletconfs below would otherwise look at X first and drop it, as it
+# drops pair B's sweep, since X pays none of the twins' keys
+# (wallet.cpp:900-920, :1185-1197)
+# X's funding pays a fresh key again while its txid sorts too high for a
+# txid above it to be found soon; the keys left behind are S's only
+X_ABOVE = os.environ.get("WALLET_GAPS_4_X_BELOW") != "1"
+for _ in range(64):
+    Q = S.rpc("getnewaddress")
+    k_txid = S.rpc("sendtoaddress", Q, 7)
+    if k_txid[0] != ("f" if X_ABOVE else "0"):
+        break
 q_key = S.rpc("dumpprivkey", Q)
-k_txid = S.rpc("sendtoaddress", Q, 7)
 mine(1)
 K = outpoint_of(k_txid, Q)
-raw = S.rpc("createrawtransaction", [{"txid": K[0], "vout": K[1]}], {S.rpc("getnewaddress"): 6.999})
-X = S.rpc("sendrawtransaction", S.rpc("signrawtransaction", raw)["hex"])
+for _ in range(1024):
+    raw = S.rpc("createrawtransaction", [{"txid": K[0], "vout": K[1]}], {S.rpc("getnewaddress"): 6.999})
+    x_hex = S.rpc("signrawtransaction", raw)["hex"]
+    if (txid_of(x_hex) > k_txid) == X_ABOVE:
+        break
+else:
+    raise RuntimeError("no X txid in the order wanted")
+X = S.rpc("sendrawtransaction", x_hex)
 if not seen(X):
     raise RuntimeError("X did not reach the twins")
 PAYEE2 = S.rpc("getnewaddress")
@@ -583,22 +604,21 @@ def sweep_with_order(funding, low):
     until it does. divid prunes in txid order when its sort finds no coinbase
     to start from (wallet.cpp:1092-1133, :1185-1188)"""
     f_txid, f = funding
-    for _ in range(64):
+    for _ in range(1024):
         raw = C.rpc("createrawtransaction", [{"txid": f[0], "vout": f[1]}], {S.rpc("getnewaddress"): 9.999})
         signed = C.rpc("signrawtransaction", raw)
         if not signed.get("complete"):
             raise RuntimeError("C could not sign its sweep")
-        txid = hashlib.sha256(hashlib.sha256(bytes.fromhex(signed["hex"])).digest()).digest()[::-1].hex()
-        if (txid < f_txid) == low:
+        if (txid_of(signed["hex"]) < f_txid) == low:
             return f_txid, C.rpc("sendrawtransaction", signed["hex"])
     raise RuntimeError("no sweep txid in the order wanted")
 
 
 # Pair A: the sweep's txid sorts above its funding's, so divid looks at the
 # funding first; pair B: below it. Both fundings are mined before either sweep
-# is sent, so no sweep can go into the block of pair B's funding
-funding_a = fund(shared_address())
-funding_b = fund(shared_address())
+# is sent, so no sweep can go into the block of pair B's funding. The lower
+# funding txid goes to pair A, so a sweep in each order is found soon
+funding_a, funding_b = sorted([fund(shared_address()), fund(shared_address())])
 p_txid, q_txid = sweep_with_order(funding_a, low=False)
 pb_txid, qb_txid = sweep_with_order(funding_b, low=True)
 for t in (q_txid, qb_txid):

@@ -443,6 +443,17 @@ def dump(text, txid):
             "vout": sorted((v, sc if sc == PAYEE_ASM else "<own>") for v, sc in DUMP_OUT.findall(body))}
 
 
+ORDERED = re.compile(r"keypool (reserve|keep|return) -?\d+|(CommitTransaction):|\w{10}: (Relaying) wtx SendMoney")
+
+
+def order(text):
+    """The order of a send's keypool reservation, keep or return, its
+    CommitTransaction dump and its relay line: divid keeps the change key
+    after the dump (wallet.cpp:1866-1868)"""
+    names = {"CommitTransaction": "dump", "Relaying": "relay"}
+    return [names.get(g, g) for m in ORDERED.finditer(text) for g in m.groups() if g]
+
+
 def relay(text, txid):
     return [m == txid[:10] for m in RELAY.findall(text)]
 
@@ -469,7 +480,8 @@ def send(name, fn, keep):
         n.rpc("lockunspent", True)
         txid = reply[1] if reply[0] == "ok" else ""
         out[n.name] = {"reply": "txid" if txid else outcome(reply), "keypool": keypool(log),
-                       "dump": dump(log, txid) if txid else None, "relay": relay(log, txid) if txid else None}
+                       "dump": dump(log, txid) if txid else None, "relay": relay(log, txid) if txid else None,
+                       "order of the lines": order(log)}
     for k in out[C.name]:
         row(f"{name}: {k}", out[C.name][k], out[I.name][k])
     mine(1)
