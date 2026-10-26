@@ -3742,33 +3742,34 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
         });
     }
 
-    // Set up signal handler
+    // SIGTERM and SIGINT stop the node. They are registered here, before the
+    // pid file is written, as Divi Core sets its handlers (init.cpp:1388-1394)
+    // before CreatePidFile (:1470): a signal sent once the pid file is there is
+    // always handled, never the default action that kills the process
+    #[cfg(unix)]
+    let mut terminate = signal::unix::signal(signal::unix::SignalKind::terminate())
+        .context("Failed to install SIGTERM handler")?;
+    #[cfg(unix)]
+    let mut interrupt = signal::unix::signal(signal::unix::SignalKind::interrupt())
+        .context("Failed to install SIGINT handler")?;
     let shutdown_tx_clone = shutdown_tx.clone();
     tokio::spawn(async move {
-        let ctrl_c = async {
+        #[cfg(unix)]
+        tokio::select! {
+            _ = interrupt.recv() => {
+                info!("Received Ctrl+C, initiating shutdown...");
+            }
+            _ = terminate.recv() => {
+                info!("Received SIGTERM, initiating shutdown...");
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
             signal::ctrl_c()
                 .await
                 .expect("Failed to install Ctrl+C handler");
-        };
-
-        #[cfg(unix)]
-        let terminate = async {
-            signal::unix::signal(signal::unix::SignalKind::terminate())
-                .expect("Failed to install signal handler")
-                .recv()
-                .await;
-        };
-
-        #[cfg(not(unix))]
-        let terminate = std::future::pending::<()>();
-
-        tokio::select! {
-            _ = ctrl_c => {
-                info!("Received Ctrl+C, initiating shutdown...");
-            }
-            _ = terminate => {
-                info!("Received SIGTERM, initiating shutdown...");
-            }
+            info!("Received Ctrl+C, initiating shutdown...");
         }
 
         let _ = shutdown_tx_clone.send(());
