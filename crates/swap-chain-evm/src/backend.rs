@@ -29,7 +29,7 @@
 use alloy::eips::{BlockNumberOrTag, Encodable2718};
 use alloy::network::{EthereumWallet, NetworkTransactionBuilder, TransactionBuilder};
 use alloy::primitives::{keccak256, Address, FixedBytes, B256, U256};
-use alloy::providers::Provider;
+use alloy::providers::{DynProvider, Provider, ProviderBuilder};
 use alloy::rpc::types::{Filter, TransactionRequest};
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types::SolEvent;
@@ -44,6 +44,7 @@ use divi_swap::{
 
 use crate::client::{connect_provider, swap_id, EvmHtlcClient};
 use crate::contract::{IErc20, IErc20Htlc};
+use crate::quorum;
 
 type Result<T> = std::result::Result<T, SwapError>;
 
@@ -156,6 +157,9 @@ pub struct UsdcBackend {
     token: Address,
     compressed_pubkey: [u8; 33],
     min_lock_gas_wei: U256,
+    /// A second node `htlc_output`, `find_spend`, `confirmations` and `median_time_past`
+    /// also ask ([`UsdcBackend::with_quorum_rpc`]); `None` reads the one node only.
+    quorum: Option<DynProvider>,
 }
 
 impl std::fmt::Debug for UsdcBackend {
@@ -188,6 +192,7 @@ impl UsdcBackend {
             token,
             compressed_pubkey,
             min_lock_gas_wei: U256::ZERO,
+            quorum: None,
         })
     }
 
@@ -201,6 +206,22 @@ impl UsdcBackend {
     pub fn with_min_lock_gas_wei(mut self, wei: u128) -> Self {
         self.min_lock_gas_wei = U256::from(wei);
         self
+    }
+
+    /// Ask a second node, at `rpc_url`, the reads a claim or refund rests on: `htlc_output`,
+    /// `find_spend`, `confirmations` and `median_time_past`. Off unless called; without it
+    /// every read is the one node's, with the requests it always made. With it, both nodes
+    /// are asked and their answers reconciled (`quorum.rs`): a disagreement on existence, on
+    /// the spending transaction or on the lock is `SwapError::Transient`, two confirmation
+    /// counts or block times are the smaller one, and a second node that does not answer is
+    /// `Transient` (fail closed). Tips, sending, nonces, gas and balances stay on the one node.
+    pub fn with_quorum_rpc(mut self, rpc_url: &str) -> Result<Self> {
+        let url = rpc_url
+            .parse()
+            .map_err(|e| SwapError::Other(format!("bad quorum RPC URL: {e}")))?;
+        // Read-only: nothing is ever signed or sent through the second node.
+        self.quorum = Some(DynProvider::new(ProviderBuilder::new().connect_http(url)));
+        Ok(self)
     }
 
     /// This backend's own ETH (gas) and `self.token` (USDC) balances — e.g. to check a
@@ -311,6 +332,180 @@ impl UsdcBackend {
         let txid = Txid((*envelope.tx_hash()).into());
         Ok(SignedTx { txid, raw })
     }
+
+    // The reads a claim or refund rests on, made on one node `p`: the primary
+    // (`self.client`) or the quorum's second node.
+
+    async fn tip_height_on(p: &DynProvider) -> Result<u64> {
+        p.get_block_number()
+            .await
+            .map_err(|e| SwapError::Transient(format!("get_block_number: {e}")))
+    }
+
+    /// The latest block's timestamp: the same quantity `Erc20Htlc`'s own
+    /// `block.timestamp >= timelock` check compares against (see the design doc).
+    async fn latest_timestamp_on(p: &DynProvider) -> Result<u32> {
+        let block = p
+            .get_block_by_number(BlockNumberOrTag::Latest)
+            .await
+            .map_err(|e| SwapError::Transient(format!("get_block_by_number: {e}")))?
+            .ok_or_else(|| SwapError::Transient("no latest block".into()))?;
+        Ok(block.header.timestamp as u32)
+    }
+
+    async fn confirmations_on(p: &DynProvider, txid: &Txid) -> Result<Option<u32>> {
+        let hash = B256::from(txid.0);
+        if let Some(receipt) = p
+            .get_transaction_receipt(hash)
+            .await
+            .map_err(|e| SwapError::Transient(format!("get_transaction_receipt: {e}")))?
+        {
+            let Some(block_number) = receipt.block_number else {
+                return Ok(Some(0));
+            };
+            let tip = Self::tip_height_on(p).await?;
+            return Ok(Some((tip.saturating_sub(block_number) + 1) as u32));
+        }
+        let pending = p
+            .get_transaction_by_hash(hash)
+            .await
+            .map_err(|e| SwapError::Transient(format!("get_transaction_by_hash: {e}")))?;
+        Ok(pending.map(|_| 0))
+    }
+
+    async fn htlc_output_on(
+        &self,
+        p: &DynProvider,
+        htlc: &HtlcParams,
+        at: &Outpoint,
+    ) -> Result<Option<LockedOutput>> {
+        let hash = B256::from(at.txid.0);
+        let Some(receipt) = p
+            .get_transaction_receipt(hash)
+            .await
+            .map_err(|e| SwapError::Transient(format!("get_transaction_receipt: {e}")))?
+        else {
+            return Ok(None);
+        };
+        let Some(block_number) = receipt.block_number else {
+            return Ok(None);
+        };
+        let mut locked = None;
+        for log in receipt.inner.logs() {
+            if log.address() != self.client.htlc_address() {
+                continue;
+            }
+            if let Ok(decoded) = log.log_decode::<IErc20Htlc::Locked>() {
+                locked = Some(decoded.inner.data);
+                break;
+            }
+        }
+        let Some(locked) = locked else {
+            return Ok(None);
+        };
+        let (want_sender, want_receiver) = htlc_addresses(htlc)?;
+        let hashlock_matches = FixedBytes::<32>(htlc.hash) == locked.hashlock;
+        if locked.sender != want_sender
+            || locked.receiver != want_receiver
+            || locked.token != self.token
+            || !hashlock_matches
+            || locked.timelock != U256::from(htlc.locktime)
+        {
+            return Ok(None);
+        }
+        let tip = Self::tip_height_on(p).await?;
+        let confirmations = (tip.saturating_sub(block_number) + 1) as u32;
+        let amount = usdc_units_to_amount(locked.amount)?;
+        Ok(Some(LockedOutput {
+            amount,
+            confirmations,
+        }))
+    }
+
+    async fn find_spend_on(
+        &self,
+        p: &DynProvider,
+        outpoint: &Outpoint,
+        from_height: u64,
+    ) -> Result<Option<SpendInfo>> {
+        let hash = B256::from(outpoint.txid.0);
+        let Some(receipt) = p
+            .get_transaction_receipt(hash)
+            .await
+            .map_err(|e| SwapError::Transient(format!("get_transaction_receipt: {e}")))?
+        else {
+            return Ok(None);
+        };
+        let mut id = None;
+        for log in receipt.inner.logs() {
+            if log.address() != self.client.htlc_address() {
+                continue;
+            }
+            if let Ok(decoded) = log.log_decode::<IErc20Htlc::Locked>() {
+                id = Some(decoded.inner.data.id);
+                break;
+            }
+        }
+        let Some(id) = id else {
+            return Ok(None);
+        };
+
+        let from_block = BlockNumberOrTag::Number(from_height);
+        let claimed = Filter::new()
+            .address(self.client.htlc_address())
+            .event_signature(IErc20Htlc::Claimed::SIGNATURE_HASH)
+            .from_block(from_block)
+            .to_block(BlockNumberOrTag::Latest);
+        for log in p
+            .get_logs(&claimed)
+            .await
+            .map_err(|e| SwapError::Transient(format!("get_logs Claimed: {e}")))?
+        {
+            let Some(txid) = log.transaction_hash else {
+                continue;
+            };
+            let height = log.block_number;
+            if let Ok(decoded) = log.log_decode::<IErc20Htlc::Claimed>() {
+                if decoded.inner.data.id == id {
+                    return Ok(Some(SpendInfo {
+                        txid: Txid(txid.0),
+                        input_index: 0,
+                        height,
+                        script_sig: Vec::new(),
+                        witness: vec![decoded.inner.data.preimage.to_vec()],
+                    }));
+                }
+            }
+        }
+
+        let refunded = Filter::new()
+            .address(self.client.htlc_address())
+            .event_signature(IErc20Htlc::Refunded::SIGNATURE_HASH)
+            .from_block(from_block)
+            .to_block(BlockNumberOrTag::Latest);
+        for log in p
+            .get_logs(&refunded)
+            .await
+            .map_err(|e| SwapError::Transient(format!("get_logs Refunded: {e}")))?
+        {
+            let Some(txid) = log.transaction_hash else {
+                continue;
+            };
+            let height = log.block_number;
+            if let Ok(decoded) = log.log_decode::<IErc20Htlc::Refunded>() {
+                if decoded.inner.data.id == id {
+                    return Ok(Some(SpendInfo {
+                        txid: Txid(txid.0),
+                        input_index: 0,
+                        height,
+                        script_sig: Vec::new(),
+                        witness: Vec::new(),
+                    }));
+                }
+            }
+        }
+        Ok(None)
+    }
 }
 
 #[allow(clippy::double_must_use)]
@@ -325,11 +520,7 @@ impl ChainBackend for UsdcBackend {
     }
 
     async fn tip_height(&self) -> Result<u64> {
-        self.client
-            .provider()
-            .get_block_number()
-            .await
-            .map_err(|e| SwapError::Transient(format!("get_block_number: {e}")))
+        Self::tip_height_on(self.client.provider()).await
     }
 
     async fn tip_hash(&self) -> Result<String> {
@@ -344,16 +535,15 @@ impl ChainBackend for UsdcBackend {
     }
 
     /// The latest block's timestamp: the same quantity `Erc20Htlc`'s own
-    /// `block.timestamp >= timelock` check compares against (see the design doc).
+    /// `block.timestamp >= timelock` check compares against (see the design doc). With a
+    /// quorum, the smaller of the two nodes' (`quorum.rs`).
     async fn median_time_past(&self) -> Result<u32> {
-        let block = self
-            .client
-            .provider()
-            .get_block_by_number(BlockNumberOrTag::Latest)
-            .await
-            .map_err(|e| SwapError::Transient(format!("get_block_by_number: {e}")))?
-            .ok_or_else(|| SwapError::Transient("no latest block".into()))?;
-        Ok(block.header.timestamp as u32)
+        let a = Self::latest_timestamp_on(self.client.provider()).await?;
+        let Some(q) = &self.quorum else {
+            return Ok(a);
+        };
+        let b = quorum::second("median_time_past", Self::latest_timestamp_on(q).await)?;
+        Ok(quorum::agree_mtp(a, b))
     }
 
     /// `Erc20Htlc.refund` checks `block.timestamp >= timelock` in the block that includes
@@ -621,159 +811,37 @@ impl ChainBackend for UsdcBackend {
     }
 
     async fn confirmations(&self, txid: &Txid) -> Result<Option<u32>> {
-        let hash = B256::from(txid.0);
-        if let Some(receipt) = self
-            .client
-            .provider()
-            .get_transaction_receipt(hash)
-            .await
-            .map_err(|e| SwapError::Transient(format!("get_transaction_receipt: {e}")))?
-        {
-            let Some(block_number) = receipt.block_number else {
-                return Ok(Some(0));
-            };
-            let tip = self.tip_height().await?;
-            return Ok(Some((tip.saturating_sub(block_number) + 1) as u32));
-        }
-        let pending = self
-            .client
-            .provider()
-            .get_transaction_by_hash(hash)
-            .await
-            .map_err(|e| SwapError::Transient(format!("get_transaction_by_hash: {e}")))?;
-        Ok(pending.map(|_| 0))
+        let a = Self::confirmations_on(self.client.provider(), txid).await?;
+        let Some(q) = &self.quorum else {
+            return Ok(a);
+        };
+        let b = quorum::second("confirmations", Self::confirmations_on(q, txid).await)?;
+        quorum::agree_confirmations(a, b)
     }
 
     async fn htlc_output(&self, htlc: &HtlcParams, at: &Outpoint) -> Result<Option<LockedOutput>> {
-        let hash = B256::from(at.txid.0);
-        let Some(receipt) = self
-            .client
-            .provider()
-            .get_transaction_receipt(hash)
-            .await
-            .map_err(|e| SwapError::Transient(format!("get_transaction_receipt: {e}")))?
-        else {
-            return Ok(None);
+        let a = self
+            .htlc_output_on(self.client.provider(), htlc, at)
+            .await?;
+        let Some(q) = &self.quorum else {
+            return Ok(a);
         };
-        let Some(block_number) = receipt.block_number else {
-            return Ok(None);
-        };
-        let mut locked = None;
-        for log in receipt.inner.logs() {
-            if log.address() != self.client.htlc_address() {
-                continue;
-            }
-            if let Ok(decoded) = log.log_decode::<IErc20Htlc::Locked>() {
-                locked = Some(decoded.inner.data);
-                break;
-            }
-        }
-        let Some(locked) = locked else {
-            return Ok(None);
-        };
-        let (want_sender, want_receiver) = htlc_addresses(htlc)?;
-        let hashlock_matches = FixedBytes::<32>(htlc.hash) == locked.hashlock;
-        if locked.sender != want_sender
-            || locked.receiver != want_receiver
-            || locked.token != self.token
-            || !hashlock_matches
-            || locked.timelock != U256::from(htlc.locktime)
-        {
-            return Ok(None);
-        }
-        let tip = self.tip_height().await?;
-        let confirmations = (tip.saturating_sub(block_number) + 1) as u32;
-        let amount = usdc_units_to_amount(locked.amount)?;
-        Ok(Some(LockedOutput {
-            amount,
-            confirmations,
-        }))
+        let b = quorum::second("htlc_output", self.htlc_output_on(q, htlc, at).await)?;
+        quorum::agree_htlc_output(a, b)
     }
 
     async fn find_spend(&self, outpoint: &Outpoint, from_height: u64) -> Result<Option<SpendInfo>> {
-        let hash = B256::from(outpoint.txid.0);
-        let Some(receipt) = self
-            .client
-            .provider()
-            .get_transaction_receipt(hash)
-            .await
-            .map_err(|e| SwapError::Transient(format!("get_transaction_receipt: {e}")))?
-        else {
-            return Ok(None);
+        let a = self
+            .find_spend_on(self.client.provider(), outpoint, from_height)
+            .await?;
+        let Some(q) = &self.quorum else {
+            return Ok(a);
         };
-        let mut id = None;
-        for log in receipt.inner.logs() {
-            if log.address() != self.client.htlc_address() {
-                continue;
-            }
-            if let Ok(decoded) = log.log_decode::<IErc20Htlc::Locked>() {
-                id = Some(decoded.inner.data.id);
-                break;
-            }
-        }
-        let Some(id) = id else {
-            return Ok(None);
-        };
-
-        let from_block = BlockNumberOrTag::Number(from_height);
-        let claimed = Filter::new()
-            .address(self.client.htlc_address())
-            .event_signature(IErc20Htlc::Claimed::SIGNATURE_HASH)
-            .from_block(from_block)
-            .to_block(BlockNumberOrTag::Latest);
-        for log in self
-            .client
-            .provider()
-            .get_logs(&claimed)
-            .await
-            .map_err(|e| SwapError::Transient(format!("get_logs Claimed: {e}")))?
-        {
-            let Some(txid) = log.transaction_hash else {
-                continue;
-            };
-            let height = log.block_number;
-            if let Ok(decoded) = log.log_decode::<IErc20Htlc::Claimed>() {
-                if decoded.inner.data.id == id {
-                    return Ok(Some(SpendInfo {
-                        txid: Txid(txid.0),
-                        input_index: 0,
-                        height,
-                        script_sig: Vec::new(),
-                        witness: vec![decoded.inner.data.preimage.to_vec()],
-                    }));
-                }
-            }
-        }
-
-        let refunded = Filter::new()
-            .address(self.client.htlc_address())
-            .event_signature(IErc20Htlc::Refunded::SIGNATURE_HASH)
-            .from_block(from_block)
-            .to_block(BlockNumberOrTag::Latest);
-        for log in self
-            .client
-            .provider()
-            .get_logs(&refunded)
-            .await
-            .map_err(|e| SwapError::Transient(format!("get_logs Refunded: {e}")))?
-        {
-            let Some(txid) = log.transaction_hash else {
-                continue;
-            };
-            let height = log.block_number;
-            if let Ok(decoded) = log.log_decode::<IErc20Htlc::Refunded>() {
-                if decoded.inner.data.id == id {
-                    return Ok(Some(SpendInfo {
-                        txid: Txid(txid.0),
-                        input_index: 0,
-                        height,
-                        script_sig: Vec::new(),
-                        witness: Vec::new(),
-                    }));
-                }
-            }
-        }
-        Ok(None)
+        let b = quorum::second(
+            "find_spend",
+            self.find_spend_on(q, outpoint, from_height).await,
+        )?;
+        quorum::agree_spend(a, b)
     }
 }
 
