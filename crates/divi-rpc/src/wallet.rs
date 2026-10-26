@@ -747,14 +747,21 @@ const MAX_TX_FEE: Amount = Amount::from_sat(100 * 100_000_000);
 /// The notes a send keeps with its transaction (Divi Core's TxTextMetadata):
 /// FromAccount as given (also ""), comment and to when given and not empty
 fn send_notes(pairs: &[(&str, Option<&str>)]) -> std::collections::BTreeMap<String, String> {
-    pairs
+    let mut notes: std::collections::BTreeMap<String, String> = pairs
         .iter()
         .filter_map(|(key, value)| {
             value
                 .filter(|v| *key == "FromAccount" || !v.is_empty())
                 .map(|v| (key.to_string(), v.to_string()))
         })
-        .collect()
+        .collect();
+    // SendMoney erases the note named after the account, not FromAccount,
+    // so an account named "comment" or "to" loses that note
+    // (wallet.cpp:1915-1922)
+    if let Some(account) = notes.get("FromAccount").cloned() {
+        notes.remove(&account);
+    }
+    notes
 }
 
 /// addvault and removevault without Divi Core's -vault option
@@ -1989,7 +1996,25 @@ impl WalletRpc {
         }
         check_signed(&tx, plan.fee, self.fee_policy()).map_err(send_error)?;
         wallet.note_committed(&tx.txid());
-        self.submit_transaction(tx)
+        let callback = self.tx_submit.read();
+        let callback = callback.as_ref().ok_or_else(|| {
+            RpcError::new(codes::MISC_ERROR, "Transaction submission not configured")
+        })?;
+        // Divi Core commits the send to the wallet before it offers it to the
+        // mempool, so one the mempool refuses stays in the wallet, and the call
+        // answers -4 (rpcwallet.cpp:774-782, wallet.cpp:1866-1878)
+        let txid = tx.txid();
+        if let Err(e) = callback(tx.clone()) {
+            debug!("The mempool refused wallet send {}: {:?}", txid, e);
+            info!("SendMoney -> CommitTransaction() : Error: Transaction not valid");
+            wallet.keep_refused_send(&tx);
+            return Err(RpcError::new(
+                codes::WALLET_ERROR,
+                "Error: Invalid transaction committed to wallet!",
+            )
+            .into());
+        }
+        Ok(txid)
     }
 
     /// sendtoaddress - Send amount to a given address
@@ -4580,6 +4605,8 @@ impl WalletRpc {
         let wallet = self.get_wallet()?;
         wallet
             .backup_to(std::path::Path::new(destination))
+            // walletdb.cpp:619, naming the wallet as divid does
+            .inspect(|written| info!("copied wallet.dat to {}", written.display()))
             .map_err(|e| {
                 // Core's reply (rpcwallet.cpp:2538); the cause goes to the log
                 warn!("backupwallet to {}: {}", destination, e);
