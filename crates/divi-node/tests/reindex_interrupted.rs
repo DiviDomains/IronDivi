@@ -4,13 +4,14 @@
 
 //! A -reindex that stops before it is done is carried out again at the next
 //! start, as Divi Core's is (init.cpp:1072-1073, :679;
-//! BlockIndexLoading.cpp:287-290): the address and spent indexes are never
-//! left half built while the node runs as if they were complete.
+//! BlockIndexLoading.cpp:287-290): address and spent indexes left half built
+//! are never recorded as complete, so the next start builds them again.
 //!
 //! The stop is made at a known block, not by timing a kill: the undo data of
-//! a block that spends a coin is taken away, so building the indexes stops
-//! there with the transaction index rebuilt and the address rows of the
-//! blocks below written; it is put back before the next start.
+//! a block that spends a coin is taken away, so building the indexes (on the
+//! import thread, as Divi Core reindexes, init.cpp:686-690) stops there with
+//! the transaction index rebuilt and the address rows of the blocks below
+//! written; it is put back before the next start.
 
 use divi_crypto::KeyPair;
 use divi_node::config::NodeConfig;
@@ -75,7 +76,11 @@ fn start(dir: &Path, reindex: bool) -> Result<Node, divi_node::NodeError> {
     config.index.addressindex = true;
     config.index.spentindex = true;
     config.index.reindex = reindex;
-    Node::new(config)
+    let node = Node::new(config)?;
+    // A start carries a -reindex out on the import thread
+    node.spawn_import();
+    node.wait_for_import();
+    Ok(node)
 }
 
 /// Extend the active chain by one block paying its coinbase to `kp`, with
@@ -163,9 +168,8 @@ fn reindex_stopped_while_building_the_indexes_is_done_again_at_the_next_start() 
         db.delete_undo_data(&spending_hash).unwrap();
         undo
     };
-    let stopped = start(dir.path(), true);
-    assert!(stopped.is_err(), "the reindex did not stop at block 22");
-    drop(stopped);
+    // The import thread stops there; the reindex stays marked under way
+    drop(start(dir.path(), true).unwrap());
     {
         let db = ChainDatabase::open(dir.path().join("chainstate")).unwrap();
         db.store_undo_data(&spending_hash, &undo).unwrap();

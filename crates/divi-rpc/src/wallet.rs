@@ -202,9 +202,18 @@ fn new_key_error(e: divi_wallet::WalletError) -> Error {
         divi_wallet::WalletError::WalletLocked => {
             RpcError::new(codes::WALLET_UNLOCK_NEEDED, "Wallet is locked")
         }
+        divi_wallet::WalletError::Storage(_) => key_write_error(e),
         _ => RpcError::new(codes::WALLET_ERROR, e.to_string()),
     }
     .into()
+}
+
+/// New keys that could not be written: Divi Core's derivation throws
+/// (wallet.cpp:2346-2347), and its RPC server answers with the exception's
+/// text (rpcserver.cpp:1107-1108)
+fn key_write_error(e: divi_wallet::WalletError) -> RpcError {
+    warn!("Failed to store new keys: {}", e);
+    RpcError::new(codes::MISC_ERROR, "loadHDChain: WriteHDChain failed")
 }
 
 fn amount_from_value(value: &serde_json::Value, allow_zero: bool) -> Result<Amount, Error> {
@@ -1914,7 +1923,22 @@ impl WalletRpc {
             &change_to.template(),
             self.fee_policy(),
         )
-        .map_err(send_error)
+        .map_err(|e| {
+            // Divi Core reserves the change key once the coins are chosen,
+            // before it takes the fee from the payments or sweeps
+            // (wallet.cpp:1786-1800), and the reservation tops the key pool
+            // up (wallet.cpp:2129-2130); the key goes back when these fail
+            if matches!(e, SendError::CannotSubtractFee | SendError::CannotSweep)
+                && matches!(change_to, ChangeTo::NewKey)
+            {
+                if let Ok(wallet) = self.get_wallet() {
+                    if let Err(err) = wallet.top_up_keypool() {
+                        debug!("Keypool not topped up for a failed send: {}", err);
+                    }
+                }
+            }
+            send_error(e)
+        })
     }
 
     /// The wallet's fee rate (Divi Core's wallet pays -minrelaytxfee,
@@ -1950,51 +1974,69 @@ impl WalletRpc {
         for out in &plan.outputs {
             builder = builder.add_output(out.value, out.script_pubkey.clone());
         }
+        // The change key a send takes, given back if the send then fails
+        // before it is committed, as Divi Core's CReserveKey returns it: only
+        // a send that succeeds keeps it (reservekey.cpp:44-51,
+        // wallet.cpp:1805-1825)
+        let mut change_key = None;
         if let Some(change) = plan.change {
             let script = match change_to {
-                ChangeTo::NewKey => wallet
-                    .new_change_address()
-                    .map_err(|e| {
-                        RpcError::new(
+                ChangeTo::NewKey => {
+                    let address = wallet.new_change_address().map_err(|e| match e {
+                        divi_wallet::WalletError::Storage(_) => key_write_error(e),
+                        e => RpcError::new(
                             codes::WALLET_ERROR,
                             format!("Failed to generate change address: {}", e),
-                        )
-                    })?
-                    .script_pubkey(),
+                        ),
+                    })?;
+                    let script = address.script_pubkey();
+                    change_key = Some(address);
+                    script
+                }
                 ChangeTo::Script(script) => script,
             };
             builder = builder.add_output(change, script);
         }
+        let give_back = |e: Error| -> Error {
+            if let Some(address) = &change_key {
+                if let Err(err) = wallet.return_change_address(address) {
+                    debug!(
+                        "The change key of a failed send was not given back: {}",
+                        err
+                    );
+                }
+            }
+            e
+        };
         let (mut tx, prev_scripts) = builder.build();
 
         // Every coin type the wallet spends (P2PKH, P2PK, multisig, P2SH with
-        // a stored redeem script), as Core's SignSignature (wallet.cpp:1609-1624)
+        // a stored redeem script), as Core's SignSignature (wallet.cpp:1609-1624).
+        // An input it cannot sign fails the send as Divi Core's CreateTransaction
+        // does, -4 "Signing transaction failed" (wallet.cpp:1805-1809,
+        // rpcwallet.cpp:796-800)
         let signer = TransactionSigner::new(wallet.keystore());
         let redeem_script = |hash: &Hash160| wallet.get_script(hash);
-        let mut signed_count = 0;
+        let signing_failed = || RpcError::new(codes::WALLET_ERROR, "Signing transaction failed");
         for (i, script) in prev_scripts.iter().enumerate() {
-            let verified = signer
-                .sign_and_merge_input(&mut tx, i, script, &redeem_script)
-                .map_err(|e| {
-                    RpcError::new(
-                        codes::WALLET_ERROR,
-                        format!("Failed to sign transaction: {}", e),
-                    )
-                })?;
-            signed_count += usize::from(verified);
+            match signer.sign_and_merge_input(&mut tx, i, script, &redeem_script) {
+                Ok(true) => {}
+                Ok(false) => {
+                    debug!("Send input {} of {} not signed", i, plan.inputs.len());
+                    return Err(give_back(signing_failed().into()));
+                }
+                Err(e) => {
+                    debug!(
+                        "Send input {} of {} not signed: {}",
+                        i,
+                        plan.inputs.len(),
+                        e
+                    );
+                    return Err(give_back(signing_failed().into()));
+                }
+            }
         }
-        if signed_count != plan.inputs.len() {
-            return Err(RpcError::new(
-                codes::WALLET_ERROR,
-                format!(
-                    "Only signed {} of {} inputs",
-                    signed_count,
-                    plan.inputs.len()
-                ),
-            )
-            .into());
-        }
-        check_signed(&tx, plan.fee, self.fee_policy()).map_err(send_error)?;
+        check_signed(&tx, plan.fee, self.fee_policy()).map_err(|e| give_back(send_error(e)))?;
         wallet.note_committed(&tx.txid());
         let callback = self.tx_submit.read();
         let callback = callback.as_ref().ok_or_else(|| {
@@ -4088,10 +4130,13 @@ impl WalletRpc {
             .into());
         }
 
+        // Divi Core's reply names no cause (rpcwallet.cpp:2729-2730); the
+        // cause goes to the log
         wallet.encrypt_wallet(passphrase).map_err(|e| {
+            tracing::error!("Failed to encrypt the wallet: {}", e);
             RpcError::new(
                 codes::WALLET_ENCRYPTION_FAILED,
-                format!("Error: Failed to encrypt the wallet: {}", e),
+                "Error: Failed to encrypt the wallet.",
             )
         })?;
 
@@ -4932,9 +4977,12 @@ impl WalletRpc {
         }
         wallet.set_account(&address, account);
 
-        wallet.save().map_err(|e| {
-            RpcError::new(codes::WALLET_ERROR, format!("Failed to save wallet: {}", e))
-        })?;
+        // Divi Core does not read SetAddressLabel's result (rpcwallet.cpp:616):
+        // a label that cannot be written now is kept in memory and written by
+        // the next save
+        if let Err(e) = wallet.save() {
+            warn!("Failed to save the wallet after setaccount: {}", e);
+        }
 
         Ok(serde_json::Value::Null)
     }

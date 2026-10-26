@@ -201,6 +201,9 @@ pub enum PeerEvent {
     },
 }
 
+/// Messages kept for a dialled peer whose sporks are out (LivePeerStats::hold)
+pub const MAX_HELD: usize = 1000;
+
 /// Live per-peer statistics shared between the connection task and RPC readers
 #[derive(Debug, Default)]
 pub struct LivePeerStats {
@@ -242,6 +245,14 @@ pub struct LivePeerStats {
     pub recv_taken: AtomicU64,
     /// Woken when the node takes one of this peer's messages
     pub recv_space: tokio::sync::Notify,
+    /// A peer we dialled that has not yet sent its sporks: Divi Core sends it nothing
+    /// of its own (CNode::CanSendMessagesToPeer, Node.cpp:1025-1034)
+    pub sporks_wait: std::sync::atomic::AtomicBool,
+    /// What the node queued for such a peer meanwhile, sent once its sporks are in, as
+    /// Divi Core keeps its inventory, addresses, asks and a queued ping until then
+    /// (vInventoryToSend, vAddrToSend, mapAskFor, fPingQueued)
+    pub held: parking_lot::Mutex<Vec<crate::messages::NetworkMessage>>,
+
     /// Bytes queued for the peer and not yet written (Divi Core nSendSize)
     pub send_queued_bytes: AtomicU64,
     /// The peer's bloom filter and transaction relay flag (not published by
@@ -250,6 +261,52 @@ pub struct LivePeerStats {
 }
 
 impl LivePeerStats {
+    /// Whether `msg` is held back from a peer whose sporks have not arrived: what Divi Core
+    /// sends from its send loop (SendMessages and MaybeSendPing, net.cpp:871-893). The
+    /// answers its message handlers push at once (verack, getaddr, getsporks, pong, blocks,
+    /// transactions, headers, notfound, reject) go.
+    pub fn holds_back(&self, msg: &crate::messages::NetworkMessage) -> bool {
+        use crate::messages::NetworkMessage as M;
+        self.sporks_wait.load(Ordering::Acquire)
+            && matches!(
+                msg,
+                M::Ping(_)
+                    | M::GetBlocks(_)
+                    | M::GetHeaders(_)
+                    | M::Inv(_)
+                    | M::GetData(_)
+                    | M::Addr(_)
+                    | M::Mempool
+                    | M::RequestMasternodeList(_)
+                    | M::MasternodeBroadcast(_)
+                    | M::MasternodePing(_)
+                    | M::MasternodeWinner(_)
+                    | M::MasternodeWinnersRequest(_)
+                    | M::GetSyncStatus
+            )
+    }
+
+    /// Keep a message held back from a peer whose sporks are out, at most
+    /// MAX_HELD (the oldest goes first)
+    pub fn hold(&self, msg: crate::messages::NetworkMessage) {
+        let mut held = self.held.lock();
+        if held.len() >= MAX_HELD {
+            held.remove(0);
+        }
+        held.push(msg);
+    }
+
+    /// The peer's sporks are in: nothing is held back from now on. True when it was
+    /// waiting
+    pub fn sporks_arrived(&self) -> bool {
+        self.sporks_wait.swap(false, Ordering::AcqRel)
+    }
+
+    /// The messages held back while the peer's sporks were out
+    pub fn take_held(&self) -> Vec<crate::messages::NetworkMessage> {
+        std::mem::take(&mut *self.held.lock())
+    }
+
     /// Whether the peer may be read: its waiting messages are within
     /// -maxreceivebuffer and MAX_QUEUED_MESSAGES
     pub fn can_receive(&self) -> bool {
@@ -471,5 +528,41 @@ mod tests {
 
         info.add_misbehavior(50);
         assert!(info.should_ban());
+    }
+
+    /// What Divi Core sends from its send loop is held back from a peer whose sporks
+    /// are out; the answers its handlers push are not
+    #[test]
+    fn a_peer_without_sporks_is_sent_only_what_handlers_answer() {
+        use crate::messages::NetworkMessage as M;
+        let stats = LivePeerStats::default();
+        assert!(!stats.holds_back(&M::Ping(1)));
+        stats.sporks_wait.store(true, Ordering::Release);
+        for held in [
+            M::Ping(1),
+            M::GetBlocks(crate::messages::GetHeadersMessage::new(
+                vec![],
+                divi_primitives::hash::Hash256::zero(),
+            )),
+            M::Inv(vec![]),
+            M::Mempool,
+        ] {
+            assert!(stats.holds_back(&held), "{}", held.command());
+        }
+        for sent in [
+            M::Verack,
+            M::GetAddr,
+            M::GetSporks,
+            M::Pong(1),
+            M::SporkCount(0),
+        ] {
+            assert!(!stats.holds_back(&sent), "{}", sent.command());
+        }
+        stats.hold(M::Inv(vec![]));
+        assert!(stats.sporks_arrived());
+        assert!(!stats.sporks_arrived());
+        assert!(matches!(stats.take_held()[..], [M::Inv(_)]));
+        assert!(stats.take_held().is_empty());
+        assert!(!stats.holds_back(&M::Ping(1)));
     }
 }

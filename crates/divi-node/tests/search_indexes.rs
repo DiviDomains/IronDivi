@@ -903,7 +903,11 @@ fn start_reindex(dir: &Path, indexes: &Indexes) -> Result<Node, divi_node::NodeE
     config.index.addressindex = indexes.addressindex;
     config.index.spentindex = indexes.spentindex;
     config.index.reindex = true;
-    Node::new(config)
+    let node = Node::new(config)?;
+    // A start carries a -reindex out on the import thread
+    node.spawn_import();
+    node.wait_for_import();
+    Ok(node)
 }
 
 /// The blocks of `t`'s active chain, block 1 to the tip

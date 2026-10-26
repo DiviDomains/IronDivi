@@ -128,6 +128,8 @@ enum Kind {
 pub struct WalletDatabase {
     db: DB,
     problems: std::sync::Mutex<LoadProblems>,
+    /// An I/O error came back from RocksDB (`has_failed`)
+    failed: std::sync::atomic::AtomicBool,
 }
 
 impl WalletDatabase {
@@ -171,6 +173,7 @@ impl WalletDatabase {
         Ok(WalletDatabase {
             db,
             problems: std::sync::Mutex::new(LoadProblems::default()),
+            failed: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -196,6 +199,21 @@ impl WalletDatabase {
         self.unreadable(Kind::Transaction, what, error);
     }
 
+    /// Whether a read or write has failed with an I/O error: after a failed
+    /// write RocksDB refuses every later one until the database is opened again
+    pub fn has_failed(&self) -> bool {
+        self.failed.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// A RocksDB error as the wallet's, noting an I/O error for `has_failed`
+    fn storage_error(&self, e: rocksdb::Error) -> WalletError {
+        if e.kind() == rocksdb::ErrorKind::IOError {
+            self.failed
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        WalletError::Storage(e.to_string())
+    }
+
     pub fn path(&self) -> &Path {
         self.db.path()
     }
@@ -204,12 +222,10 @@ impl WalletDatabase {
     /// exist: a RocksDB checkpoint after the memtables are flushed, so writes
     /// running meanwhile are either all in it or not at all
     pub fn checkpoint_to(&self, dir: &Path) -> Result<(), WalletError> {
-        self.db
-            .flush()
-            .map_err(|e| WalletError::Storage(e.to_string()))?;
+        self.db.flush().map_err(|e| self.storage_error(e))?;
         rocksdb::checkpoint::Checkpoint::new(&self.db)
             .and_then(|c| c.create_checkpoint(dir))
-            .map_err(|e| WalletError::Storage(e.to_string()))
+            .map_err(|e| self.storage_error(e))
     }
 
     // ========== Metadata ==========
@@ -219,7 +235,7 @@ impl WalletDatabase {
         let cf = self.db.cf_handle(CF_METADATA).unwrap();
         self.db
             .put_cf(cf, KEY_MNEMONIC, mnemonic.as_bytes())
-            .map_err(|e| WalletError::Storage(e.to_string()))?;
+            .map_err(|e| self.storage_error(e))?;
         debug!("Stored mnemonic");
         Ok(())
     }
@@ -230,7 +246,7 @@ impl WalletDatabase {
         match self
             .db
             .get_cf(cf, KEY_MNEMONIC)
-            .map_err(|e| WalletError::Storage(e.to_string()))?
+            .map_err(|e| self.storage_error(e))?
         {
             Some(data) => {
                 let mnemonic =
@@ -246,7 +262,7 @@ impl WalletDatabase {
         let cf = self.db.cf_handle(CF_METADATA).unwrap();
         self.db
             .put_cf(cf, KEY_MNEMONIC_PASSPHRASE, passphrase.as_bytes())
-            .map_err(|e| WalletError::Storage(e.to_string()))
+            .map_err(|e| self.storage_error(e))
     }
 
     /// Load the BIP39 passphrase of an unencrypted wallet's seed
@@ -255,7 +271,7 @@ impl WalletDatabase {
         match self
             .db
             .get_cf(cf, KEY_MNEMONIC_PASSPHRASE)
-            .map_err(|e| WalletError::Storage(e.to_string()))?
+            .map_err(|e| self.storage_error(e))?
         {
             Some(data) => String::from_utf8(data)
                 .map(Some)
@@ -269,7 +285,7 @@ impl WalletDatabase {
         let cf = self.db.cf_handle(CF_METADATA).unwrap();
         self.db
             .get_cf(cf, KEY_ENCRYPTED_MNEMONIC_PASSPHRASE)
-            .map_err(|e| WalletError::Storage(e.to_string()))
+            .map_err(|e| self.storage_error(e))
     }
 
     /// Store the BIP44 coin type the wallet derives with
@@ -277,7 +293,7 @@ impl WalletDatabase {
         let cf = self.db.cf_handle(CF_METADATA).unwrap();
         self.db
             .put_cf(cf, KEY_HD_COIN_TYPE, coin_type.to_le_bytes())
-            .map_err(|e| WalletError::Storage(e.to_string()))
+            .map_err(|e| self.storage_error(e))
     }
 
     /// The stored BIP44 coin type; None for wallets made before it was stored
@@ -286,7 +302,7 @@ impl WalletDatabase {
         match self
             .db
             .get_cf(cf, KEY_HD_COIN_TYPE)
-            .map_err(|e| WalletError::Storage(e.to_string()))?
+            .map_err(|e| self.storage_error(e))?
         {
             Some(data) => {
                 let bytes: [u8; 4] = data
@@ -305,7 +321,7 @@ impl WalletDatabase {
         let cf = self.db.cf_handle(CF_METADATA).unwrap();
         self.db
             .put_cf(cf, KEY_HD_SEED, seed)
-            .map_err(|e| WalletError::Storage(e.to_string()))
+            .map_err(|e| self.storage_error(e))
     }
 
     /// Load the seed of a wallet made from a seed (None for a mnemonic wallet)
@@ -314,7 +330,7 @@ impl WalletDatabase {
         Ok(self
             .db
             .get_cf(cf, KEY_HD_SEED)
-            .map_err(|e| WalletError::Storage(e.to_string()))?
+            .map_err(|e| self.storage_error(e))?
             .map(zeroize::Zeroizing::new))
     }
 
@@ -323,14 +339,14 @@ impl WalletDatabase {
         let cf = self.db.cf_handle(CF_METADATA).unwrap();
         self.db
             .get_cf(cf, KEY_ENCRYPTED_HD_SEED)
-            .map_err(|e| WalletError::Storage(e.to_string()))
+            .map_err(|e| self.storage_error(e))
     }
 
     pub fn load_encrypted_mnemonic(&self) -> Result<Option<Vec<u8>>, WalletError> {
         let cf = self.db.cf_handle(CF_METADATA).unwrap();
         self.db
             .get_cf(cf, KEY_ENCRYPTED_MNEMONIC)
-            .map_err(|e| WalletError::Storage(e.to_string()))
+            .map_err(|e| self.storage_error(e))
     }
 
     /// Load every encrypted private key: stored under `hash160 || 0x01` in the keys CF
@@ -338,7 +354,7 @@ impl WalletDatabase {
         let cf = self.db.cf_handle(CF_KEYS).unwrap();
         let mut out = Vec::new();
         for item in self.db.iterator_cf(cf, rocksdb::IteratorMode::Start) {
-            let (key, value) = item.map_err(|e| WalletError::Storage(e.to_string()))?;
+            let (key, value) = item.map_err(|e| self.storage_error(e))?;
             if key.len() == 21 && key[20] == ENCRYPTED_SECRET_SUFFIX {
                 let hash = Hash160::from_bytes(key[..20].try_into().unwrap());
                 out.push((hash, value.to_vec()));
@@ -367,7 +383,7 @@ impl WalletDatabase {
         };
         self.db
             .put_cf(cf, KEY_NETWORK, value)
-            .map_err(|e| WalletError::Storage(e.to_string()))?;
+            .map_err(|e| self.storage_error(e))?;
         Ok(())
     }
 
@@ -377,7 +393,7 @@ impl WalletDatabase {
         match self
             .db
             .get_cf(cf, KEY_NETWORK)
-            .map_err(|e| WalletError::Storage(e.to_string()))?
+            .map_err(|e| self.storage_error(e))?
         {
             Some(data) => {
                 let network = match data.as_slice() {
@@ -401,7 +417,7 @@ impl WalletDatabase {
         };
         self.db
             .put_cf(cf, KEY_CHAIN_MODE, value)
-            .map_err(|e| WalletError::Storage(e.to_string()))?;
+            .map_err(|e| self.storage_error(e))?;
         Ok(())
     }
 
@@ -411,7 +427,7 @@ impl WalletDatabase {
         match self
             .db
             .get_cf(cf, KEY_CHAIN_MODE)
-            .map_err(|e| WalletError::Storage(e.to_string()))?
+            .map_err(|e| self.storage_error(e))?
         {
             Some(data) => {
                 let mode = match data.as_slice() {
@@ -431,7 +447,7 @@ impl WalletDatabase {
         let cf = self.db.cf_handle(CF_METADATA).unwrap();
         self.db
             .put_cf(cf, KEY_HD_PUBLIC_IDS, encode_hd_public_ids(ids))
-            .map_err(|e| WalletError::Storage(e.to_string()))?;
+            .map_err(|e| self.storage_error(e))?;
         Ok(())
     }
 
@@ -441,7 +457,7 @@ impl WalletDatabase {
         match self
             .db
             .get_cf(cf, KEY_HD_PUBLIC_IDS)
-            .map_err(|e| WalletError::Storage(e.to_string()))?
+            .map_err(|e| self.storage_error(e))?
         {
             Some(data) if data.len() == 52 => {
                 let mut master_key_id = [0u8; 20];
@@ -463,7 +479,7 @@ impl WalletDatabase {
         let cf = self.db.cf_handle(CF_METADATA).unwrap();
         self.db
             .put_cf(cf, KEY_ENCRYPTED, [encrypted as u8])
-            .map_err(|e| WalletError::Storage(e.to_string()))?;
+            .map_err(|e| self.storage_error(e))?;
         Ok(())
     }
 
@@ -473,7 +489,7 @@ impl WalletDatabase {
         match self
             .db
             .get_cf(cf, KEY_ENCRYPTED)
-            .map_err(|e| WalletError::Storage(e.to_string()))?
+            .map_err(|e| self.storage_error(e))?
         {
             Some(data) => Ok(!data.is_empty() && data[0] != 0),
             None => Ok(false),
@@ -503,7 +519,7 @@ impl WalletDatabase {
         let salt = match self
             .db
             .get_cf(cf, KEY_ENCRYPTION_SALT)
-            .map_err(|e| WalletError::Storage(e.to_string()))?
+            .map_err(|e| self.storage_error(e))?
         {
             Some(data) => data,
             None => return Ok(None),
@@ -512,7 +528,7 @@ impl WalletDatabase {
         let encrypted_key = match self
             .db
             .get_cf(cf, KEY_ENCRYPTED_MASTER_KEY)
-            .map_err(|e| WalletError::Storage(e.to_string()))?
+            .map_err(|e| self.storage_error(e))?
         {
             Some(data) => data,
             None => return Ok(None),
@@ -526,10 +542,10 @@ impl WalletDatabase {
         let cf = self.db.cf_handle(CF_METADATA).unwrap();
         self.db
             .put_cf(cf, KEY_RECEIVING_INDEX, receiving.to_le_bytes())
-            .map_err(|e| WalletError::Storage(e.to_string()))?;
+            .map_err(|e| self.storage_error(e))?;
         self.db
             .put_cf(cf, KEY_CHANGE_INDEX, change.to_le_bytes())
-            .map_err(|e| WalletError::Storage(e.to_string()))?;
+            .map_err(|e| self.storage_error(e))?;
         Ok(())
     }
 
@@ -540,7 +556,7 @@ impl WalletDatabase {
         let receiving = match self
             .db
             .get_cf(cf, KEY_RECEIVING_INDEX)
-            .map_err(|e| WalletError::Storage(e.to_string()))?
+            .map_err(|e| self.storage_error(e))?
         {
             Some(data) if data.len() == 4 => {
                 u32::from_le_bytes([data[0], data[1], data[2], data[3]])
@@ -551,7 +567,7 @@ impl WalletDatabase {
         let change = match self
             .db
             .get_cf(cf, KEY_CHANGE_INDEX)
-            .map_err(|e| WalletError::Storage(e.to_string()))?
+            .map_err(|e| self.storage_error(e))?
         {
             Some(data) if data.len() == 4 => {
                 u32::from_le_bytes([data[0], data[1], data[2], data[3]])
@@ -567,7 +583,7 @@ impl WalletDatabase {
         let cf = self.db.cf_handle(CF_METADATA).unwrap();
         self.db
             .put_cf(cf, KEY_LAST_SCAN_HEIGHT, height.to_le_bytes())
-            .map_err(|e| WalletError::Storage(e.to_string()))?;
+            .map_err(|e| self.storage_error(e))?;
         Ok(())
     }
 
@@ -577,7 +593,7 @@ impl WalletDatabase {
         let raw = self
             .db
             .get_cf(cf, KEY_SCANNED_HASHES)
-            .map_err(|e| WalletError::Storage(e.to_string()))?;
+            .map_err(|e| self.storage_error(e))?;
         Ok(raw.map(|v| decode_scanned_hashes(&v)).unwrap_or_default())
     }
 
@@ -587,7 +603,7 @@ impl WalletDatabase {
         match self
             .db
             .get_cf(cf, KEY_LAST_SCAN_HEIGHT)
-            .map_err(|e| WalletError::Storage(e.to_string()))?
+            .map_err(|e| self.storage_error(e))?
         {
             Some(data) if data.len() == 4 => {
                 Ok(u32::from_le_bytes([data[0], data[1], data[2], data[3]]))
@@ -605,7 +621,7 @@ impl WalletDatabase {
         let value = serialize_key_entry(entry);
         self.db
             .put_cf(cf, key, value)
-            .map_err(|e| WalletError::Storage(e.to_string()))?;
+            .map_err(|e| self.storage_error(e))?;
         Ok(())
     }
 
@@ -616,7 +632,7 @@ impl WalletDatabase {
 
         let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
         for item in iter {
-            let (key, value) = item.map_err(|e| WalletError::Storage(e.to_string()))?;
+            let (key, value) = item.map_err(|e| self.storage_error(e))?;
             if key.len() == 20 {
                 let hash = Hash160::from_bytes(key[..20].try_into().unwrap());
                 match deserialize_key_entry(&value) {
@@ -638,7 +654,7 @@ impl WalletDatabase {
         let value = serialize_utxo(utxo);
         self.db
             .put_cf(cf, key, value)
-            .map_err(|e| WalletError::Storage(e.to_string()))?;
+            .map_err(|e| self.storage_error(e))?;
         Ok(())
     }
 
@@ -648,7 +664,7 @@ impl WalletDatabase {
         let key = outpoint_key(outpoint);
         self.db
             .delete_cf(cf, key)
-            .map_err(|e| WalletError::Storage(e.to_string()))?;
+            .map_err(|e| self.storage_error(e))?;
         Ok(())
     }
 
@@ -659,7 +675,7 @@ impl WalletDatabase {
 
         let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
         for item in iter {
-            let (key, value) = item.map_err(|e| WalletError::Storage(e.to_string()))?;
+            let (key, value) = item.map_err(|e| self.storage_error(e))?;
             if key.len() == 36 {
                 let outpoint = outpoint_from_key(&key);
                 match deserialize_utxo(&value) {
@@ -680,7 +696,7 @@ impl WalletDatabase {
         let key = outpoint_key(outpoint);
         self.db
             .put_cf(cf, key, [1])
-            .map_err(|e| WalletError::Storage(e.to_string()))?;
+            .map_err(|e| self.storage_error(e))?;
         Ok(())
     }
 
@@ -691,7 +707,7 @@ impl WalletDatabase {
 
         let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
         for item in iter {
-            let (key, _) = item.map_err(|e| WalletError::Storage(e.to_string()))?;
+            let (key, _) = item.map_err(|e| self.storage_error(e))?;
             if key.len() == 36 {
                 spent.push(outpoint_from_key(&key));
             }
@@ -709,7 +725,7 @@ impl WalletDatabase {
         let value = serialize_tx(tx);
         self.db
             .put_cf(cf, key, value)
-            .map_err(|e| WalletError::Storage(e.to_string()))?;
+            .map_err(|e| self.storage_error(e))?;
         Ok(())
     }
 
@@ -720,7 +736,7 @@ impl WalletDatabase {
 
         let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
         for item in iter {
-            let (_, value) = item.map_err(|e| WalletError::Storage(e.to_string()))?;
+            let (_, value) = item.map_err(|e| self.storage_error(e))?;
             match deserialize_tx(&value) {
                 Ok(tx) => transactions.push(tx),
                 Err(e) => self.unreadable(Kind::Transaction, "transaction", e),
@@ -737,7 +753,7 @@ impl WalletDatabase {
         let cf = self.db.cf_handle(CF_ADDRESSES).unwrap();
         self.db
             .put_cf(cf, address.as_bytes(), [1])
-            .map_err(|e| WalletError::Storage(e.to_string()))?;
+            .map_err(|e| self.storage_error(e))?;
         Ok(())
     }
 
@@ -748,7 +764,7 @@ impl WalletDatabase {
 
         let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
         for item in iter {
-            let (key, _) = item.map_err(|e| WalletError::Storage(e.to_string()))?;
+            let (key, _) = item.map_err(|e| self.storage_error(e))?;
             if let Ok(addr) = String::from_utf8(key.to_vec()) {
                 addresses.push(addr);
             }
@@ -767,7 +783,7 @@ impl WalletDatabase {
             .map_err(|e| WalletError::Storage(format!("Failed to serialize account: {}", e)))?;
         self.db
             .put_cf(cf, key.as_bytes(), value.as_bytes())
-            .map_err(|e| WalletError::Storage(e.to_string()))?;
+            .map_err(|e| self.storage_error(e))?;
         Ok(())
     }
 
@@ -777,7 +793,7 @@ impl WalletDatabase {
         let key = format!("addr_{}", address);
         self.db
             .put_cf(cf, key.as_bytes(), account.as_bytes())
-            .map_err(|e| WalletError::Storage(e.to_string()))?;
+            .map_err(|e| self.storage_error(e))?;
         Ok(())
     }
 
@@ -788,7 +804,7 @@ impl WalletDatabase {
 
         let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
         for item in iter {
-            let (key, value) = item.map_err(|e| WalletError::Storage(e.to_string()))?;
+            let (key, value) = item.map_err(|e| self.storage_error(e))?;
             if let Ok(key_str) = String::from_utf8(key.to_vec()) {
                 if let Some(account) = key_str.strip_prefix("acc_") {
                     match serde_json::from_slice::<Vec<String>>(&value) {
@@ -809,7 +825,7 @@ impl WalletDatabase {
 
         let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
         for item in iter {
-            let (key, value) = item.map_err(|e| WalletError::Storage(e.to_string()))?;
+            let (key, value) = item.map_err(|e| self.storage_error(e))?;
             if let Ok(key_str) = String::from_utf8(key.to_vec()) {
                 if let Some(address) = key_str.strip_prefix("addr_") {
                     match String::from_utf8(value.to_vec()) {
@@ -827,7 +843,7 @@ impl WalletDatabase {
         let cf = self.db.cf_handle(CF_SCRIPTS).unwrap();
         self.db
             .put_cf(cf, script_hash.as_bytes(), script.as_bytes())
-            .map_err(|e| WalletError::Storage(e.to_string()))?;
+            .map_err(|e| self.storage_error(e))?;
         Ok(())
     }
 
@@ -836,7 +852,7 @@ impl WalletDatabase {
         match self
             .db
             .get_cf(cf, script_hash.as_bytes())
-            .map_err(|e| WalletError::Storage(e.to_string()))?
+            .map_err(|e| self.storage_error(e))?
         {
             Some(data) => Ok(Some(Script::from_bytes(data))),
             None => Ok(None),
@@ -849,7 +865,7 @@ impl WalletDatabase {
 
         let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
         for item in iter {
-            let (key, value) = item.map_err(|e| WalletError::Storage(e.to_string()))?;
+            let (key, value) = item.map_err(|e| self.storage_error(e))?;
             if key.len() == 20 {
                 let hash = Hash160::from_bytes(key[..20].try_into().unwrap());
                 let script = Script::from_bytes(value.to_vec());
@@ -872,7 +888,7 @@ impl WalletDatabase {
         let value = serialize_vault_metadata(metadata);
         self.db
             .put_cf(cf, vault_script, value)
-            .map_err(|e| WalletError::Storage(e.to_string()))?;
+            .map_err(|e| self.storage_error(e))?;
         debug!("Stored vault metadata for script");
         Ok(())
     }
@@ -886,7 +902,7 @@ impl WalletDatabase {
 
         let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
         for item in iter {
-            let (key, value) = item.map_err(|e| WalletError::Storage(e.to_string()))?;
+            let (key, value) = item.map_err(|e| self.storage_error(e))?;
             match deserialize_vault_metadata(&value) {
                 Ok(metadata) => vaults.push((key.to_vec(), metadata)),
                 Err(e) => self.unreadable(Kind::Other, "vault", e),
@@ -901,15 +917,13 @@ impl WalletDatabase {
         let cf = self.db.cf_handle(CF_VAULTS).unwrap();
         self.db
             .delete_cf(cf, vault_script)
-            .map_err(|e| WalletError::Storage(e.to_string()))?;
+            .map_err(|e| self.storage_error(e))?;
         debug!("Removed vault metadata");
         Ok(())
     }
 
     pub fn flush(&self) -> Result<(), WalletError> {
-        self.db
-            .flush()
-            .map_err(|e| WalletError::Storage(e.to_string()))?;
+        self.db.flush().map_err(|e| self.storage_error(e))?;
         Ok(())
     }
 
@@ -922,9 +936,7 @@ impl WalletDatabase {
 
     /// Write a batch atomically
     pub fn write_batch(&self, batch: WriteBatch) -> Result<(), WalletError> {
-        self.db
-            .write(batch)
-            .map_err(|e| WalletError::Storage(e.to_string()))
+        self.db.write(batch).map_err(|e| self.storage_error(e))
     }
 
     /// Write a batch atomically and fsync the WAL before returning, so the batch
@@ -934,7 +946,7 @@ impl WalletDatabase {
         opts.set_sync(true);
         self.db
             .write_opt(batch, &opts)
-            .map_err(|e| WalletError::Storage(e.to_string()))
+            .map_err(|e| self.storage_error(e))
     }
 
     /// Get a column family handle by name
@@ -1000,7 +1012,7 @@ impl WalletDatabase {
         value.extend_from_slice(&spent_height.to_le_bytes());
         self.db
             .put_cf(cf, &key, &value)
-            .map_err(|e| WalletError::Storage(e.to_string()))?;
+            .map_err(|e| self.storage_error(e))?;
         Ok(())
     }
 
@@ -1010,7 +1022,7 @@ impl WalletDatabase {
         let key = outpoint_key(outpoint);
         self.db
             .delete_cf(cf, &key)
-            .map_err(|e| WalletError::Storage(e.to_string()))?;
+            .map_err(|e| self.storage_error(e))?;
         Ok(())
     }
 
@@ -1021,7 +1033,7 @@ impl WalletDatabase {
         let mut results = Vec::new();
 
         for item in iter {
-            let (key, value) = item.map_err(|e| WalletError::Storage(e.to_string()))?;
+            let (key, value) = item.map_err(|e| self.storage_error(e))?;
             if key.len() != 36 {
                 continue;
             }
@@ -1054,9 +1066,9 @@ impl WalletDatabase {
         for item in self
             .db
             .get_updates_since(seq)
-            .map_err(|e| WalletError::Storage(e.to_string()))?
+            .map_err(|e| self.storage_error(e))?
         {
-            item.map_err(|e| WalletError::Storage(e.to_string()))?;
+            item.map_err(|e| self.storage_error(e))?;
             count += 1;
         }
         Ok(count)
@@ -1094,7 +1106,7 @@ impl WalletDatabase {
         );
         let mut rows = Vec::new();
         for item in iter {
-            let (key, value) = item.map_err(|e| WalletError::Storage(e.to_string()))?;
+            let (key, value) = item.map_err(|e| self.storage_error(e))?;
             if !key.starts_with(prefix) {
                 break;
             }
@@ -1114,7 +1126,7 @@ impl WalletDatabase {
                 Self::prefixed_txid_key(Self::TX_ORDER_PREFIX, txid),
                 position.to_le_bytes(),
             )
-            .map_err(|e| WalletError::Storage(e.to_string()))
+            .map_err(|e| self.storage_error(e))
     }
 
     /// Every stored transaction position
@@ -1145,7 +1157,7 @@ impl WalletDatabase {
                 Self::prefixed_txid_key(Self::TX_TIMES_PREFIX, txid),
                 value,
             )
-            .map_err(|e| WalletError::Storage(e.to_string()))
+            .map_err(|e| self.storage_error(e))
     }
 
     /// Every stored transaction's (received, smart) times
@@ -1207,7 +1219,7 @@ impl WalletDatabase {
     pub fn remove_unconfirmed_tx(&self, txid: &Hash256) -> Result<(), WalletError> {
         self.db
             .delete_cf(self.cf(CF_DEFAULT), Self::unconfirmed_tx_key(txid))
-            .map_err(|e| WalletError::Storage(e.to_string()))
+            .map_err(|e| self.storage_error(e))
     }
 
     /// Key prefix of wallet transactions that left the chain or the mempool
@@ -1240,7 +1252,7 @@ impl WalletDatabase {
     pub fn remove_detached_tx(&self, txid: &Hash256) -> Result<(), WalletError> {
         self.db
             .delete_cf(self.cf(CF_DEFAULT), Self::detached_tx_key(txid))
-            .map_err(|e| WalletError::Storage(e.to_string()))
+            .map_err(|e| self.storage_error(e))
     }
 
     /// Load every detached wallet transaction as (txid, timestamp, raw tx)
@@ -1251,7 +1263,7 @@ impl WalletDatabase {
         );
         let mut results = Vec::new();
         for item in iter {
-            let (key, value) = item.map_err(|e| WalletError::Storage(e.to_string()))?;
+            let (key, value) = item.map_err(|e| self.storage_error(e))?;
             if !key.starts_with(Self::DETACHED_TX_PREFIX) {
                 break;
             }
@@ -1281,7 +1293,7 @@ impl WalletDatabase {
         );
         let mut results = Vec::new();
         for item in iter {
-            let (key, value) = item.map_err(|e| WalletError::Storage(e.to_string()))?;
+            let (key, value) = item.map_err(|e| self.storage_error(e))?;
             if !key.starts_with(Self::UNCONFIRMED_TX_PREFIX) {
                 break;
             }

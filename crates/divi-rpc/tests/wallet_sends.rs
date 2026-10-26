@@ -114,6 +114,23 @@ impl Net {
     /// Give the wallet under test confirmed coins of exactly these values (in
     /// satoshis), on new addresses, from a mature coinbase of the funder
     fn fund(&self, values: &[i64]) -> Vec<Address> {
+        let addresses: Vec<Address> = values
+            .iter()
+            .map(|_| self.wallet.new_receiving_address().unwrap())
+            .collect();
+        let outputs: Vec<(Address, i64)> = addresses
+            .iter()
+            .cloned()
+            .zip(values.iter().copied())
+            .collect();
+        self.fund_to(&outputs);
+        addresses
+    }
+
+    /// Pay these addresses exactly these values (in satoshis), confirmed, from
+    /// a mature coinbase of the funder
+    fn fund_to(&self, outputs: &[(Address, i64)]) {
+        let values: Vec<i64> = outputs.iter().map(|(_, v)| *v).collect();
         let cb_addr = self.funder.new_receiving_address().unwrap();
         let coinbase = self.mine(vec![], &cb_addr);
         // Coinbase maturity 20 on regtest: spendable with 21 confirmations
@@ -124,11 +141,8 @@ impl Net {
             OutPoint::new(coinbase.txid(), 0),
             coinbase.vout[0].script_pubkey.clone(),
         );
-        let mut addresses = Vec::new();
-        for value in values {
-            let addr = self.wallet.new_receiving_address().unwrap();
-            builder = builder.add_output_to_address(Amount::from_sat(*value), &addr);
-            addresses.push(addr);
+        for (addr, value) in outputs {
+            builder = builder.add_output_to_address(Amount::from_sat(*value), addr);
         }
         let rest = 1250 * COIN - values.iter().sum::<i64>() - COIN / 100;
         builder = builder.add_output_to_address(Amount::from_sat(rest), &self.miner);
@@ -140,7 +154,6 @@ impl Net {
             1
         );
         self.mine(vec![tx], &self.miner);
-        addresses
     }
 
     fn last_submitted(&self) -> Transaction {
@@ -487,4 +500,95 @@ fn an_account_named_after_a_note_loses_that_note() {
         names(&notes[2]),
         ["FromAccount=shop", "comment=a note", "to=a shop"]
     );
+}
+
+/// A coin of the wallet's whose key it holds the wrong secret for: the wallet
+/// counts it as its own and picks it, but cannot sign for it
+fn unsignable_coin(net: &Net, value: i64) {
+    use divi_crypto::keys::SecretKey;
+    use divi_wallet::KeyEntry;
+    let owner = KeyEntry::imported(SecretKey::new_random(), true).address(Network::Regtest);
+    let wrong = KeyEntry::imported(SecretKey::new_random(), true);
+    net.wallet.keystore().add_key_with_hash(owner.hash, wrong);
+    net.fund_to(&[(owner, value)]);
+}
+
+/// A send whose input the wallet cannot sign fails as Divi Core's does: -4
+/// "Signing transaction failed" (wallet.cpp:1805-1809, rpcwallet.cpp:796-800),
+/// and nothing is sent
+#[test]
+fn a_send_that_cannot_be_signed_fails_with_divi_core_s_reply() {
+    let net = Net::new();
+    unsignable_coin(&net, 10 * COIN);
+    let rpc = net.rpc();
+    let err = rpc
+        .send_to_address(&p(vec![json!(dest().to_string()), json!(1)]))
+        .unwrap_err();
+    match err {
+        divi_rpc::Error::Rpc(e) => {
+            assert_eq!(
+                (e.code, e.message.as_str()),
+                (-4, "Signing transaction failed")
+            )
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(net.submitted.lock().is_empty(), "nothing is sent");
+}
+
+/// A send that fails after it took a change key gives the key back, as Divi
+/// Core's CReserveKey returns it (reservekey.cpp:44-51, wallet.cpp:1805-1825):
+/// the key pool is as full as before and the next change key is the same
+#[test]
+fn a_failed_send_gives_its_change_key_back() {
+    let net = Net::new();
+    unsignable_coin(&net, 10 * COIN);
+    net.wallet.top_up_keypool().unwrap();
+    let pool = net.wallet.keypool_size();
+    let indices = net.wallet.keystore().get_indices();
+    let rpc = net.rpc();
+    // 1 of the 10 DIVI coin: the send has change, so it takes a change key
+    assert!(rpc
+        .send_to_address(&p(vec![json!(dest().to_string()), json!(1)]))
+        .is_err());
+    assert_eq!(
+        net.wallet.keypool_size(),
+        pool,
+        "the key pool is as full as before"
+    );
+    assert_eq!(
+        net.wallet.keystore().get_indices(),
+        indices,
+        "the change key is unused"
+    );
+}
+
+/// A send that fails as Divi Core's does once it has reserved the change key,
+/// here the receiver paying a fee that leaves its payment as dust ("Cannot
+/// subtract needed fees from outputs.", wallet.cpp:1786-1793), leaves the key
+/// pool topped up, as the reservation does (wallet.cpp:2129-2130)
+#[test]
+fn a_send_failing_after_coin_selection_tops_the_key_pool_up() {
+    let net = Net::new();
+    net.fund(&[10 * COIN]);
+    net.wallet.top_up_keypool().unwrap();
+    let full = net.wallet.keypool_size();
+    net.wallet.new_receiving_address().unwrap();
+    assert_eq!(net.wallet.keypool_size(), full - 1);
+    let rpc = net.rpc();
+    let err = rpc
+        .send_to_address(&p(vec![
+            json!(dest().to_string()),
+            json!(0.00006),
+            json!("receiver_pays"),
+        ]))
+        .unwrap_err();
+    match err {
+        divi_rpc::Error::Rpc(e) => assert_eq!(
+            (e.code, e.message.as_str()),
+            (-4, "Cannot subtract needed fees from outputs.")
+        ),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(net.wallet.keypool_size(), full, "the key pool is topped up");
 }
