@@ -499,6 +499,35 @@ impl MasternodeList {
         }
     }
 
+    /// Drop the masternodes whose collateral is spent, whose last ping is
+    /// past the removal time, or whose protocol is below the active one, with
+    /// their seen broadcasts and the record of asking for them
+    /// (MasternodeNetworkMessageManager.cpp:36-56, :132-155)
+    pub fn remove_inactive(&self, now: i64) {
+        let removed: Vec<NetworkMasternode> = {
+            let mut entries = self.entries.write();
+            let (gone, kept) = std::mem::take(&mut *entries).into_iter().partition(|e| {
+                matches!(e.status(now), "VIN_SPENT" | "REMOVE")
+                    || e.mnb.protocol_version < ACTIVE_PROTOCOL
+            });
+            *entries = kept;
+            gone
+        };
+        if removed.is_empty() {
+            return;
+        }
+        {
+            let mut seen = self.seen_broadcasts.write();
+            let mut asked = self.asked_entries.lock();
+            for e in &removed {
+                let vin = (e.mnb.vin.prevout_hash, e.mnb.vin.prevout_n);
+                seen.retain(|_, b| (b.vin.prevout_hash, b.vin.prevout_n) != vin);
+                asked.remove(&vin);
+            }
+        }
+        self.save();
+    }
+
     pub fn entries(&self) -> Vec<NetworkMasternode> {
         self.entries.read().clone()
     }
@@ -506,13 +535,22 @@ impl MasternodeList {
     /// `listmasternodes ( "filter" )` as Divi Core answers it
     /// (rpcmasternode.cpp:263-325, RpcMasternodeFeatures.cpp:279-324). Like
     /// divid it shows the state of the last check: it does not check the
-    /// collateral itself (getmasternodecount and a timer do).
-    pub fn list_json(&self, chain: &Chain, filter: Option<&str>) -> serde_json::Value {
+    /// collateral itself (getmasternodecount and a timer do). `lastpaid`
+    /// comes from the payment votes `votes` holds.
+    pub fn list_json(
+        &self,
+        chain: &Chain,
+        filter: Option<&str>,
+        votes: Option<&crate::mn_votes::MasternodeVotes>,
+    ) -> serde_json::Value {
         let now = now();
         let network = address_network(chain);
         let filter = filter.unwrap_or("");
         let mut out = Vec::new();
-        for e in self.entries() {
+        let entries = self.entries();
+        // numberOfBlocksToSearchBackForLastPayment (RpcMasternodeFeatures.cpp:289)
+        let search_depth = entries.len() * 5 / 4;
+        for e in entries {
             let txhash = Hash256(e.mnb.vin.prevout_hash).to_string();
             let status = e.status(now);
             let address = collateral_address(&e.mnb, network);
@@ -532,7 +570,7 @@ impl MasternodeList {
                 "version": e.mnb.protocol_version,
                 "lastseen": e.mnb.last_ping.sig_time,
                 "activetime": e.mnb.last_ping.sig_time - e.mnb.sig_time,
-                "lastpaid": 0,
+                "lastpaid": votes.map_or(0, |v| last_paid_time(chain, v, &e.mnb, search_depth)),
                 "tier": tier_name(e.mnb.tier),
             }));
         }
@@ -815,6 +853,44 @@ pub fn get_compact(n: &[u8; 32]) -> u32 {
         size += 1;
     }
     compact | ((size as u32) << 24)
+}
+
+/// FindLastPayeePaymentTime (RpcMasternodeFeatures.cpp:244-277): the time of
+/// the newest of the last `max_depth` active blocks for which the masternode
+/// is a payee with at least two votes, plus its DeterministicTimeOffset; 0 if
+/// none. A height with no block to score with stops the search at 0, as
+/// divid's loop then stays on that block until the depth runs out.
+pub fn last_paid_time(
+    chain: &Chain,
+    votes: &crate::mn_votes::MasternodeVotes,
+    mnb: &CppBroadcast,
+    max_depth: usize,
+) -> i64 {
+    let payee = payee_script(mnb);
+    let mut index = chain.tip();
+    let mut searched = 0;
+    while let Some(block) = index.filter(|b| b.height > 0) {
+        if searched >= max_depth {
+            return 0;
+        }
+        searched += 1;
+        if scoring_hash(chain, i64::from(block.height)).is_none() {
+            return 0;
+        }
+        if votes.has_payee_with_votes(chain, i64::from(block.height), &payee, 2) {
+            return i64::from(block.time.wrapping_add(deterministic_time_offset(mnb)));
+        }
+        index = chain.get_block_index(&block.prev_hash).ok().flatten();
+    }
+    0
+}
+
+/// CMasternode::DeterministicTimeOffset (masternode.cpp:219-227): the compact
+/// form of the hash of the collateral input and the broadcast time, modulo 150
+pub fn deterministic_time_offset(mnb: &CppBroadcast) -> u32 {
+    let mut data = mnb.vin.to_bytes();
+    data.extend_from_slice(&mnb.sig_time.to_le_bytes());
+    get_compact(&divi_crypto::double_sha256(&data)) % 150
 }
 
 /// The script a masternode is paid to: P2PKH of its collateral key

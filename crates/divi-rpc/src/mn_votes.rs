@@ -373,6 +373,20 @@ impl MasternodeVotes {
         serde_json::Value::Array(out)
     }
 
+    /// CMasternodeBlockPayees::HasPayeeWithVotes (MasternodePayeeData.cpp:82-91)
+    /// for the block scored at `height`
+    pub fn has_payee_with_votes(
+        &self,
+        chain: &Chain,
+        height: i64,
+        payee: &[u8],
+        required: u32,
+    ) -> bool {
+        self.votes_for_height(chain, height)
+            .iter()
+            .any(|(script, votes)| *votes >= required && script == payee)
+    }
+
     /// The payee scripts and their votes for a height, highest count first
     /// as CMasternodeBlockPayees::GetPayee picks (the first of a tie)
     pub fn votes_for_height(&self, chain: &Chain, height: i64) -> Vec<(Vec<u8>, u32)> {

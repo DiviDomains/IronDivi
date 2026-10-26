@@ -770,22 +770,45 @@ impl Chain {
     }
 
     /// Index the transactions of the active blocks above the newest block the
-    /// index recorded. When that block is not on the active chain, or the
-    /// index never recorded one, the last `TX_INDEX_RECHECK` blocks are
-    /// indexed again (rewriting an entry is harmless).
+    /// index recorded. When that block is not on the active chain, the active
+    /// blocks above the point its branch left it are indexed, however deep;
+    /// when the index never recorded one (or its block is unknown), the last
+    /// `TX_INDEX_RECHECK` blocks are indexed again (rewriting an entry is
+    /// harmless).
     fn catch_up_tx_index(&self, tx_index: &TxIndex) -> Result<u32, StorageError> {
         let Some(tip) = self.tip() else {
             return Ok(0);
         };
+        let recheck = tip.height.saturating_sub(TX_INDEX_RECHECK);
         let from = match tx_index.indexed_tip()? {
             Some((height, hash))
                 if height <= tip.height && self.db.get_height_mapping(height)? == Some(hash) =>
             {
                 height + 1
             }
-            _ => tip.height.saturating_sub(TX_INDEX_RECHECK),
+            Some((_, hash)) => match self.fork_point_with_active(&hash)? {
+                Some(fork_height) => (fork_height + 1).min(recheck),
+                None => recheck,
+            },
+            None => recheck,
         };
         self.index_tx_blocks(tx_index, from, false)
+    }
+
+    /// The height at which the branch holding `hash` meets the active chain,
+    /// walking its ancestors; None when an ancestor is not in the block index
+    fn fork_point_with_active(&self, hash: &Hash256) -> Result<Option<u32>, StorageError> {
+        let mut current = self.db.get_block_index(hash)?;
+        while let Some(index) = current {
+            if self.db.get_height_mapping(index.height)? == Some(index.hash) {
+                return Ok(Some(index.height));
+            }
+            if index.prev_hash.is_zero() {
+                return Ok(None);
+            }
+            current = self.db.get_block_index(&index.prev_hash)?;
+        }
+        Ok(None)
     }
 
     /// Index the transactions of the active blocks from `from` to the tip.
@@ -6503,6 +6526,63 @@ mod tests {
                 expected,
                 "stake modifier at height {}",
                 height
+            );
+        }
+    }
+
+    /// A transaction index left on a branch that lost (it stopped while the
+    /// chain moved on) is filled in from where that branch left the active
+    /// chain, however far below the tip that is, so every active block's
+    /// transactions are found
+    #[test]
+    fn tx_index_left_on_a_lost_branch_catches_up_from_the_fork() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(ChainDatabase::open(dir.path().join("chain")).unwrap());
+        let params = ChainParams {
+            check_block_work: false,
+            checkpoints: Vec::new(),
+            ..ChainParams::for_network(NetworkType::Mainnet, ChainMode::Divi)
+        };
+        let tx_index = Arc::new(crate::txindex::TxIndex::open(dir.path().join("txindex")).unwrap());
+        let extend = |chain: &Chain, from: (Hash256, u32), n: usize, key: u8| {
+            let (mut prev_hash, mut prev_time) = from;
+            for _ in 0..n {
+                let mut block = create_child_block_with_pubkey(prev_hash, prev_time, [key; 20]);
+                block.transactions[0].vout[0].value = Amount::from_divi(1);
+                seal(&mut block);
+                prev_time = block.header.time;
+                prev_hash = chain.accept_block(block).unwrap().hash;
+            }
+            (prev_hash, prev_time)
+        };
+        // 50 common blocks, then a branch of 10 the index records
+        let fork = {
+            let mut chain = Chain::new(db.clone(), params.clone()).unwrap();
+            chain.enable_tx_index(tx_index.clone());
+            let fork = extend(&chain, get_genesis_info(&chain), 50, 1);
+            extend(&chain, fork, 10, 2);
+            assert_eq!(tx_index.indexed_tip().unwrap().map(|(h, _)| h), Some(60));
+            fork
+        };
+        // Without the index, another branch from the fork takes over, 150 long
+        {
+            let chain = Chain::new(db.clone(), params.clone()).unwrap();
+            extend(&chain, fork, 150, 3);
+            assert_eq!(chain.height(), 200);
+        }
+        let mut chain = Chain::new(db, params).unwrap();
+        chain.enable_tx_index(tx_index.clone());
+        for height in 51..=200 {
+            let hash = chain
+                .get_block_index_by_height(height)
+                .unwrap()
+                .unwrap()
+                .hash;
+            let block = chain.get_block(&hash).unwrap().unwrap();
+            let txid = block.transactions[0].txid();
+            assert!(
+                tx_index.get_location(&txid).unwrap().is_some(),
+                "coinbase of active block {height} not indexed"
             );
         }
     }

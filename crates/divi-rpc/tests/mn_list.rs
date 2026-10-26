@@ -19,7 +19,7 @@ use divi_primitives::{
     transaction::{OutPoint, Transaction, TxIn, TxOut},
     ChainMode,
 };
-use divi_rpc::mn_list::{payee_script, MasternodeList};
+use divi_rpc::mn_list::{get_compact, payee_script, MasternodeList};
 use divi_rpc::mn_votes::MasternodeVotes;
 use divi_rpc::{Params, Request, RequestId, RpcServer};
 use divi_storage::{txindex::TxIndex, Chain, ChainDatabase, ChainParams, NetworkType};
@@ -37,17 +37,22 @@ struct Node {
     list: Arc<MasternodeList>,
     votes: Arc<MasternodeVotes>,
     sent: Arc<Mutex<Vec<Transaction>>>,
+    /// The masternode key of the last set_up, from its config line (WIF)
+    mn_key: Mutex<Option<String>>,
     dir: tempfile::TempDir,
 }
 
 fn node() -> Node {
+    node_with(ChainParams::for_network(
+        NetworkType::Regtest,
+        ChainMode::Divi,
+    ))
+}
+
+fn node_with(params: ChainParams) -> Node {
     let dir = tempfile::tempdir().unwrap();
     let db = Arc::new(ChainDatabase::open(dir.path().join("chain")).unwrap());
-    let mut chain = Chain::new(
-        db,
-        ChainParams::for_network(NetworkType::Regtest, ChainMode::Divi),
-    )
-    .unwrap();
+    let mut chain = Chain::new(db, params).unwrap();
     chain.enable_tx_index(Arc::new(TxIndex::open(dir.path().join("txindex")).unwrap()));
     let chain = Arc::new(chain);
     let wallet = Arc::new(WalletDb::with_hd_wallet(
@@ -76,6 +81,7 @@ fn node() -> Node {
         list,
         votes,
         sent,
+        mn_key: Mutex::new(None),
         dir,
     }
 }
@@ -120,7 +126,9 @@ impl Node {
             version: 1,
             vin: vec![TxIn::coinbase(Script::from_bytes(cb_sig))],
             vout: vec![TxOut::new(
-                Amount::from_sat(1250 * COIN),
+                // The proof-of-work reward; past it (a chain made with
+                // check_block_work off) well under the stake reward
+                Amount::from_sat(if height <= 100 { 1250 * COIN } else { COIN }),
                 Script::new_p2pkh(to.hash.as_bytes()),
             )],
             lock_time: 0,
@@ -186,10 +194,10 @@ fn set_up(n: &Node, alias: &str, confirmations: usize) -> (String, u32, String, 
     )
 }
 
-/// The masternode key of the last set_up, from its config line (WIF)
-fn n_key(_n: &Node) -> &'static Mutex<Option<String>> {
-    static KEY: Mutex<Option<String>> = parking_lot::const_mutex(None);
-    &KEY
+/// The masternode key of the node's last set_up; each node keeps its own,
+/// as the tests run side by side
+fn n_key(n: &Node) -> &Mutex<Option<String>> {
+    &n.mn_key
 }
 
 fn funded() -> Node {
@@ -245,7 +253,7 @@ fn started_masternode_is_listed_as_divid_lists_it() {
     // The list is kept in the datadir and read back, as mncache.dat
     let again = MasternodeList::new();
     again.set_path(n.dir.path().join("masternodes.list"));
-    assert_eq!(again.list_json(&n.chain, None), listed);
+    assert_eq!(again.list_json(&n.chain, None, Some(&n.votes)), listed);
 }
 
 /// A broadcast whose collateral has fewer than 15 confirmations is refused
@@ -301,6 +309,62 @@ fn spent_collateral_shows_after_a_check() {
     );
 }
 
+/// The minute timer drops a masternode whose collateral is spent, and one
+/// whose last ping is older than the removal time, from the list
+/// (MasternodeNetworkMessageManager.cpp:36-56)
+#[test]
+fn spent_and_removed_masternodes_leave_the_list_as_divid() {
+    let n = funded();
+    let (spent, vout, _, signed) = set_up(&n, "mn1", 16);
+    n.ok("broadcaststartmasternode", vec![json!(signed)]);
+    let (kept, _, _, signed) = set_up(&n, "mn2", 16);
+    n.ok("broadcaststartmasternode", vec![json!(signed)]);
+    let hex = n.ok("getrawtransaction", vec![json!(spent)]);
+    let prev: Transaction =
+        divi_primitives::serialize::deserialize(&hex::decode(hex.as_str().unwrap()).unwrap())
+            .unwrap();
+    let to = n.wallet.new_receiving_address().unwrap();
+    let (mut tx, prevs) = TransactionBuilder::new()
+        .add_input(
+            OutPoint::new(prev.txid(), vout),
+            prev.vout[vout as usize].script_pubkey.clone(),
+        )
+        .add_output_to_address(Amount::from_sat(99 * COIN), &to)
+        .build();
+    TransactionSigner::new(n.wallet.keystore())
+        .sign_all_inputs(&mut tx, &prevs)
+        .unwrap();
+    n.sent.lock().push(tx);
+    n.mine();
+    n.list.check_collateral(&n.chain);
+    let listed = |n: &Node| -> Vec<(String, String)> {
+        n.ok("listmasternodes", vec![])
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| {
+                (
+                    e["txhash"].as_str().unwrap().to_string(),
+                    e["status"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect()
+    };
+    let mut both = listed(&n);
+    both.sort();
+    let mut want = vec![
+        (spent.clone(), "VIN_SPENT".to_string()),
+        (kept.clone(), "ENABLED".to_string()),
+    ];
+    want.sort();
+    assert_eq!(both, want);
+    n.list.remove_inactive(now());
+    assert_eq!(listed(&n), vec![(kept.clone(), "ENABLED".to_string())]);
+    // 130 minutes without a ping: REMOVE, and dropped
+    n.list.remove_inactive(now() + 131 * 60);
+    assert_eq!(listed(&n), vec![]);
+}
+
 /// A payment vote (mnw) of a ranked masternode for the payee at the top of
 /// the queue is counted and shown by getmasternodewinners; the same vote
 /// again is not new, a second payee from the same masternode for the height
@@ -354,6 +418,81 @@ fn payment_votes_are_counted_as_divid_counts_them() {
     forged.height = height + 1;
     assert!(n.votes.accept(&n.chain, &n.list, &forged.encode()).is_err());
     let _ = (txhash, vout);
+}
+
+/// listmasternodes' lastpaid is the time of the newest of the last
+/// (masternodes x 5 / 4) active blocks whose scored payees give the
+/// masternode two votes or more, plus its DeterministicTimeOffset; 0 when
+/// there is none (RpcMasternodeFeatures.cpp:244-277, :289, :321)
+#[test]
+fn lastpaid_comes_from_the_payment_votes_as_divid_finds_it() {
+    // Proof of work past height 100, so blocks above 101 can be scored
+    let n = node_with(ChainParams {
+        check_block_work: false,
+        ..ChainParams::for_network(NetworkType::Regtest, ChainMode::Divi)
+    });
+    n.mine_n(25);
+    let mut keys = Vec::new();
+    for alias in ["mn1", "mn2"] {
+        let (_, _, _, signed) = set_up(&n, alias, 16);
+        let wif = n_key(&n).lock().clone().unwrap();
+        keys.push(
+            divi_crypto::SecretKey::from_bytes(&divi_wallet::decode_wif(&wif).unwrap().key_bytes)
+                .unwrap(),
+        );
+        n.ok("broadcaststartmasternode", vec![json!(signed)]);
+    }
+    while n.chain.height() < 104 {
+        n.mine();
+    }
+    let entries = n.list.entries();
+    assert_eq!(entries.len(), 2);
+    let paid = entries[0].mnb.clone();
+    // Both masternodes vote the first one the payee of the next block
+    let height = n.chain.height() as i32 + 1;
+    for key in &keys {
+        let voter = entries
+            .iter()
+            .find(|e| e.mnb.pubkey_masternode == key.public_key().to_bytes())
+            .unwrap();
+        let mut vote = divi_masternode::cpp_wire::CppWinner {
+            vin: voter.mnb.vin.clone(),
+            height,
+            payee: payee_script(&paid),
+            signature: vec![],
+        };
+        vote.sign(key).unwrap();
+        assert_eq!(n.votes.accept(&n.chain, &n.list, &vote.encode()), Ok(true));
+    }
+    let lastpaid = |listed: &Value, mnb: &divi_masternode::cpp_wire::CppBroadcast| {
+        let txhash = Hash256(mnb.vin.prevout_hash).to_string();
+        listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["txhash"] == json!(txhash))
+            .unwrap()["lastpaid"]
+            .clone()
+    };
+    // Not yet: the voted block is not in the chain
+    let listed = n.ok("listmasternodes", vec![]);
+    assert_eq!(lastpaid(&listed, &paid), json!(0), "{listed}");
+    n.mine();
+    let block_time = i64::from(n.chain.tip().unwrap().time);
+    let mut data = paid.vin.to_bytes();
+    data.extend_from_slice(&paid.sig_time.to_le_bytes());
+    let offset = i64::from(get_compact(&divi_crypto::double_sha256(&data)) % 150);
+    let listed = n.ok("listmasternodes", vec![]);
+    assert_eq!(
+        lastpaid(&listed, &paid),
+        json!(block_time + offset),
+        "{listed}"
+    );
+    assert_eq!(lastpaid(&listed, &entries[1].mnb), json!(0), "{listed}");
+    // Two masternodes search two blocks back: two more blocks pass it
+    n.mine_n(2);
+    let listed = n.ok("listmasternodes", vec![]);
+    assert_eq!(lastpaid(&listed, &paid), json!(0), "{listed}");
 }
 
 /// The keys of the last set_up as secret keys: the collateral key (from the

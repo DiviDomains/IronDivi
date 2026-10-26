@@ -1392,7 +1392,8 @@ impl Node {
         let masternode_votes = Arc::clone(&self.masternode_votes);
         let peer_manager = Arc::clone(&self.peer_manager);
         let mut peer_events = self.peer_manager.subscribe();
-        // Divi Core checks every masternode once a minute (MasternodeModule.cpp:524-529)
+        // Divi Core checks every masternode once a minute, and once the chain
+        // is synced drops the spent and removed ones (MasternodeModule.cpp:502-529)
         {
             let list = Arc::clone(&self.masternode_list);
             let chain = Arc::clone(&self.chain);
@@ -1401,7 +1402,16 @@ impl Node {
                 let mut every = tokio::time::interval(std::time::Duration::from_secs(60));
                 loop {
                     tokio::select! {
-                        _ = every.tick() => list.check_collateral(&chain),
+                        _ = every.tick() => {
+                            list.check_collateral(&chain);
+                            if list.blockchain_synced(&chain) {
+                                let now = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_secs() as i64)
+                                    .unwrap_or(0);
+                                list.remove_inactive(now);
+                            }
+                        }
                         _ = shutdown.recv() => break,
                     }
                 }
