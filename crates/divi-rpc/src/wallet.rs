@@ -4283,11 +4283,12 @@ impl WalletRpc {
                 let hash = divi_primitives::hash::Hash160::from_bytes(hash_bytes);
                 Address::p2sh(hash, wallet.network())
             } else {
-                return Err(RpcError::new(
-                    codes::WALLET_ERROR,
-                    "Only P2PKH and P2SH scripts are supported for watch-only import",
-                )
-                .into());
+                // Divi Core watches any script and answers null
+                // (rpcdump.cpp:122-166), but a watched script of another kind
+                // never brings a transaction into its wallet, which records
+                // only what pays or spends a spendable output
+                // (wallet.cpp:1292-1311): nothing more to keep
+                return Ok(serde_json::Value::Null);
             }
         };
         let label = if params.len() > 1 {

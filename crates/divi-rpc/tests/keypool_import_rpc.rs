@@ -342,6 +342,21 @@ fn importaddress_rescan_true_watches_without_recording_coins() {
     assert_eq!(info["iswatchonly"], true);
 }
 
+/// Divi Core takes a script of any kind, a bare 1-of-1 multisig here, and
+/// answers null (rpcdump.cpp:122-166)
+#[test]
+fn importaddress_takes_a_script_of_any_kind() {
+    let net = Net::new();
+    let script = format!("5121{}51ae", "02".to_string() + &"11".repeat(32));
+    for _ in 0..2 {
+        let reply = net
+            .rpc
+            .import_address(&p(vec![json!(script), json!(""), json!(false)]))
+            .unwrap();
+        assert_eq!(reply, Value::Null);
+    }
+}
+
 #[test]
 fn importaddress_rescan_false_labels_the_address() {
     let net = Net::new();
