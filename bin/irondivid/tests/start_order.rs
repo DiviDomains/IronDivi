@@ -110,12 +110,14 @@ fn failed_start(cmd: &mut Command) -> (Option<i32>, String) {
     )
 }
 
-/// The names in `dir`
+/// The names in `dir`; none when it is not there
 fn names(dir: &Path) -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(dir)
-        .unwrap()
-        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-        .collect();
+        .map(|r| {
+            r.map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
     names.sort();
     names
 }
@@ -144,4 +146,19 @@ fn a_seed_restore_moves_the_wallet_before_the_chain_is_opened() {
         "the wallet was not moved: {names:?}"
     );
     assert!(!dir.path().join("wallet").exists(), "{names:?}");
+}
+
+/// divid backs the wallet up in step 5, after its pid file and before the
+/// network and the chain (BackupWallet, init.cpp:1479): a start that then
+/// fails at the chain has made the copy
+#[test]
+fn the_wallet_is_backed_up_before_the_chain_is_opened() {
+    let dir = tempfile::tempdir().unwrap();
+    started_once(dir.path());
+    let backups = dir.path().join("backups");
+    let before = names(&backups).len();
+    damage_chain(dir.path());
+    let (code, err) = failed_start(&mut irondivid(dir.path(), free_port()));
+    assert_eq!(code, Some(1), "{err}");
+    assert_eq!(names(&backups).len(), before + 1, "{:?}", names(&backups));
 }

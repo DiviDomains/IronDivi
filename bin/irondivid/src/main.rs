@@ -1711,6 +1711,22 @@ fn move_wallet_for_restore(wallet_path: &Path) -> Result<()> {
     })
 }
 
+/// Divi Core copies the wallet into backups/ (and monthlyBackups/) at every
+/// start, in step 5: after the pid file, before the network and the chain
+/// (BackupWallet, init.cpp:1479, :933-943). A wallet not there yet has none.
+fn backup_wallet_at_start(wallet_path: &Path, options: &WalletOptions) {
+    if !wallet_path.exists() {
+        return;
+    }
+    if let Some(data_dir) = wallet_path.parent() {
+        if let Err(e) =
+            divi_wallet::backup::backup_at_start(wallet_path, data_dir, options.wallet_backups)
+        {
+            warn!("Failed to create backup: {}", e);
+        }
+    }
+}
+
 /// Wallet start options
 #[derive(Debug, Clone)]
 struct WalletOptions {
@@ -1983,17 +1999,8 @@ fn load_or_restore_wallet_with_seed(
     options: &WalletOptions,
     env: &WalletEnv,
 ) -> Result<Arc<WalletDb>> {
-    // Try to open existing wallet
+    // Try to open existing wallet (backed up by `backup_wallet_at_start`)
     if wallet_path.exists() {
-        // Divi Core copies the wallet into backups/ (and monthlyBackups/) at
-        // every start, before it opens it (init.cpp:1479)
-        if let Some(data_dir) = wallet_path.parent() {
-            if let Err(e) =
-                divi_wallet::backup::backup_at_start(wallet_path, data_dir, options.wallet_backups)
-            {
-                warn!("Failed to create backup: {}", e);
-            }
-        }
         info!("Loading wallet from {:?}", wallet_path);
         let wallet = match WalletDb::open(wallet_path, network) {
             // A key record that cannot be read: Divi Core's DB_CORRUPT, an
@@ -2283,6 +2290,9 @@ async fn run_daemon(
     // -daemon (init.cpp:1470), so a second start leaves a running node's alone
     #[cfg(unix)]
     write_pid_file(&pid_file);
+    if !disable_wallet {
+        backup_wallet_at_start(&wallet_dir, &wallet_options);
+    }
     // The clock warning of the network time offset goes where Divi Core's
     // Warnings::setMiscWarning puts it: getinfo's and getmininginfo's "errors"
     // (timedata.cpp:96-97)
@@ -4980,7 +4990,7 @@ mod wallet_move_tests {
         assert!(wallet.mnemonic().is_none());
     }
 
-    /// Opening an existing wallet first copies it into backups/ and
+    /// A start first copies the wallet there into backups/ and
     /// monthlyBackups/ next to it, as Divi Core does at every start
     #[test]
     fn start_makes_wallet_backups() {
@@ -4990,6 +5000,7 @@ mod wallet_move_tests {
             load_or_create_wallet_from(&path, WalletNetwork::Regtest, ChainMode::Divi, None)
                 .unwrap(),
         );
+        backup_wallet_at_start(&path, &WalletOptions::default());
         let wallet =
             load_or_create_wallet_from(&path, WalletNetwork::Regtest, ChainMode::Divi, None)
                 .unwrap();
