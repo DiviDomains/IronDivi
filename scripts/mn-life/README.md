@@ -29,7 +29,9 @@ MN_LIFE_PAYMENTS=1 scripts/mn-life/run.sh target/release ~/divi-3.0.0/bin 53900 
 - `[root]`: a fresh directory is made under it (default `$TMPDIR`, else `/tmp`) and deleted at the end.
 
 A run takes about six minutes and is stopped after 10 minutes. With `MN_LIFE_PAYMENTS=1` it waits for the masternodes
-to be ranked and the limit is 50 minutes. However it ends, every node is stopped and the directories deleted. Needs
+to be ranked and the limit is 50 minutes. `MN_LIFE_REWARDS=1` (set by scripts/mn-reward, which see) also turns on the
+payment phase, gives the divid nodes `-manual_fork` so that masternodes are paid, and adds the wallet rows of the
+payments; it uses ports up to `<port-base>+15` and the limit is 60 minutes. However it ends, every node is stopped and the directories deleted. Needs
 bash and python3 (standard library only).
 
 Secrets:
@@ -104,7 +106,8 @@ What the payment rows check (Divi Core 3.0.0):
   - `HasValidPayees` returns true for a block that is not a treasury or lottery block (`:162-178`).
 
   The masternode share goes to the staker with the stake share, so a block mints 996 DIVI at these heights. Only
-  `-manual_fork=<time>` (`:21`, `:49-53`) turns payments back on; irondivid does not take it.
+  `-manual_fork=<time>` (`:21`, `:49-53`) turns payments back on; irondivid does not take it. scripts/mn-reward
+  gives it to the divid nodes to get a masternode paid.
 - **The votes still flow.** Ranked masternodes vote for a payee (`mnw`) for each height (`divi/src/MasternodeModule.cpp
   :395-440`), and `getmasternodewinners` shows the votes (`divi/src/rpcmasternode.cpp:489-578`). A vote is taken when:
   - its height lies between the tip less 200 and the tip plus 20;
