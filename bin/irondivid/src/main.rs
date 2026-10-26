@@ -1909,9 +1909,6 @@ fn load_or_create_wallet_with_env(
     options: &WalletOptions,
     env: WalletEnv,
 ) -> Result<Arc<WalletDb>> {
-    if seed.restore {
-        move_wallet_for_restore(wallet_path)?;
-    }
     // A hex -hdseed is preferred over -mnemonic and -mnemonicpassphrase,
     // logged at every start, a wallet there or not (init.cpp:945-951)
     if seed.hdseed.as_deref().is_some_and(core_is_hex)
@@ -2275,6 +2272,13 @@ async fn run_daemon(
     // One process per data directory, held until this one exits
     // (TryLockDataDirectory, init.cpp:850-862)
     let _datadir_lock = lock_data_dir(&config.data_dir)?;
+    // With -hdseed or -mnemonic the wallet there is moved out of the way once
+    // the lock is held, before the pid file and before anything is opened, as
+    // Divi Core's CheckWalletFileExists (init.cpp:1460-1467, :864-888)
+    let wallet_dir = core_files::wallet_dir(&config.data_dir, wallet_path.as_deref());
+    if !disable_wallet && wallet_seed.restore {
+        move_wallet_for_restore(&wallet_dir)?;
+    }
     // Divi Core writes its pid file once it holds the lock, with or without
     // -daemon (init.cpp:1470), so a second start leaves a running node's alone
     #[cfg(unix)]
@@ -2385,7 +2389,6 @@ async fn run_daemon(
 
         None
     } else {
-        let wallet_dir = core_files::wallet_dir(&config.data_dir, wallet_path.as_deref());
         let wallet_network = match config.network.network_type {
             NetworkType::Mainnet => WalletNetwork::Mainnet,
             NetworkType::Testnet => WalletNetwork::Testnet,
@@ -4308,8 +4311,9 @@ mod wallet_log_tests {
     }
 
     /// As init.cpp:864-888: -mnemonic with a wallet already there moves it to
-    /// `<wallet><time>.moved` and restores a new one from the words; without
-    /// -mnemonic or -hdseed the wallet there is loaded
+    /// `<wallet><time>.moved` (run_daemon's `move_wallet_for_restore`, before
+    /// the load) and restores a new one from the words; without -mnemonic or
+    /// -hdseed the wallet there is loaded
     #[test]
     fn a_mnemonic_moves_a_wallet_already_there() {
         let mnemonic = "abandon abandon abandon abandon abandon abandon \
@@ -4339,6 +4343,7 @@ mod wallet_log_tests {
         );
         assert!(moved_wallets(dir.path()).is_empty());
 
+        move_wallet_for_restore(&path).unwrap();
         let restored = open(WalletSeed {
             mnemonic: Some(mnemonic.clone()),
             restore: true,
@@ -4376,6 +4381,7 @@ mod wallet_log_tests {
             load_or_create_wallet_from(&path, WalletNetwork::Regtest, ChainMode::Divi, None)
                 .unwrap(),
         );
+        move_wallet_for_restore(&path).unwrap();
         let refused = load_or_create_wallet_with_env(
             &path,
             WalletNetwork::Regtest,
