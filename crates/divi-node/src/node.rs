@@ -1109,8 +1109,8 @@ impl Node {
         // mncache.dat next (MasternodeModule.cpp:262-266), with the sync's
         // asks for the list in it
         masternode_list.follow_sync(Arc::clone(&masternode_sync));
-        masternode_list.set_file(
-            config.data_dir.join(divi_rpc::mn_list::MNCACHE_FILE),
+        masternode_list.load_file(
+            &config.data_dir.join(divi_rpc::mn_list::MNCACHE_FILE),
             config.network.magic,
         );
         // Votes are checked against the sync's stage (masternode-payments.cpp:241-245, :320)
@@ -2435,6 +2435,19 @@ impl Node {
             );
         }
         shutdown_stage("node loops stopped", started);
+
+        // mncache.dat once the loops that change the list have stopped,
+        // first of the three files SaveMasternodeDataToDisk writes
+        // (init.cpp:372, :376; MasternodeModule.cpp:284-297)
+        let started = std::time::Instant::now();
+        let path = self.config.data_dir.join(divi_rpc::mn_list::MNCACHE_FILE);
+        if let Err(e) = self
+            .masternode_list
+            .save_file(&path, self.config.network.magic)
+        {
+            tracing::error!("Failed to write {}: {}", divi_rpc::mn_list::MNCACHE_FILE, e);
+        }
+        shutdown_stage("mncache.dat written", started);
 
         // netfulfilled.dat once the loops that change it have stopped, as
         // Divi Core's SaveMasternodeDataToDisk follows StopNode

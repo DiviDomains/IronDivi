@@ -340,6 +340,26 @@ fn peers_are_written_before_and_closed_after_the_flush() {
     assert!(dir.path().join("peers.dat").exists());
 }
 
+/// mncache.dat is written only at a stop, once the node's loops have stopped
+/// and before netfulfilled.dat, as Divi Core's SaveMasternodeDataToDisk
+/// writes it first after StopNode (init.cpp:372, :376;
+/// MasternodeModule.cpp:284-297)
+#[test]
+fn mncache_is_written_at_the_stop() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(dir.path());
+    assert!(!dir.path().join("mncache.dat").exists());
+    daemon.stop();
+    let lines = log_lines(dir.path());
+    let loops = line_of(&lines, "Shutdown: node loops stopped").expect("loops stopped");
+    let written = line_of(&lines, "Shutdown: mncache.dat written").expect("mncache.dat written");
+    let fulfilled =
+        line_of(&lines, "Shutdown: netfulfilled.dat written").expect("netfulfilled.dat written");
+    assert!(loops < written && written < fulfilled, "{lines:#?}");
+    let bytes = std::fs::read(dir.path().join("mncache.dat")).unwrap();
+    assert_eq!(&bytes[1..21], b"magicMasternodeCache");
+}
+
 /// netfulfilled.dat is written once the node's loops have stopped, as Divi
 /// Core's SaveMasternodeDataToDisk follows StopNode (init.cpp:372, :376)
 #[test]

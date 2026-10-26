@@ -27,7 +27,7 @@ use divi_wallet::Network;
 use parking_lot::{Mutex, RwLock};
 use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, Ipv6Addr};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// MASTERNODE_MIN_CONFIRMATIONS (masternode.h:16)
 const MIN_CONFIRMATIONS: u32 = 15;
@@ -243,8 +243,6 @@ pub const INV_PING: u32 = 15;
 #[derive(Default)]
 pub struct MasternodeList {
     entries: RwLock<Vec<NetworkMasternode>>,
-    /// mncache.dat and the network's magic number it is written with
-    file: RwLock<Option<(PathBuf, [u8; 4])>>,
     /// The masternode sync, whose list asks mncache.dat keeps too
     sync: RwLock<Option<SharedMasternodeSync>>,
     /// The broadcasts and pings taken, by hash, which a peer may ask for
@@ -278,21 +276,8 @@ impl MasternodeList {
         *self.sync.write() = Some(sync);
     }
 
-    /// Keep the list in `path` (mncache.dat) for the network of
-    /// `network_magic`, and read what is there
-    pub fn set_file(&self, path: PathBuf, network_magic: [u8; 4]) {
-        self.load_file(&path, network_magic);
-        *self.file.write() = Some((path, network_magic));
-    }
-
-    fn save(&self) {
-        let Some((path, network_magic)) = self.file.read().clone() else {
-            return;
-        };
-        let _ = self.save_file(&path, network_magic);
-    }
-
-    /// Write the list to `path` as Divi Core writes mncache.dat
+    /// Write the list to `path` as Divi Core writes mncache.dat, which it
+    /// does only at a stop (SaveMasternodeDataToDisk, MasternodeModule.cpp:284-297)
     pub fn save_file(&self, path: &Path, network_magic: [u8; 4]) -> std::io::Result<bool> {
         let bytes = flat_file::bytes(MNCACHE_MAGIC, network_magic, &self.file_data(now()));
         let tmp = path.with_extension("dat.new");
@@ -475,9 +460,6 @@ impl MasternodeList {
                 }
             }
         };
-        if changed {
-            self.save();
-        }
         // IsVinAssociatedWithPubkey (masternodeman.cpp:57-74): the collateral
         // pays the tier's amount to the broadcast's collateral key
         let mismatched = || {
@@ -540,7 +522,6 @@ impl MasternodeList {
                 vin_spent: false,
             });
         }
-        self.save();
         Ok(true)
     }
 
@@ -651,25 +632,17 @@ impl MasternodeList {
             self.record_ping(&e.mnb);
             self.relays.lock().push((INV_PING, e.mnb.last_ping.hash()));
         }
-        self.save();
         Ok(true)
     }
 
     /// Mark the masternodes whose collateral the active chain has spent
     /// (CMasternodeMan::Check's IsCoinSpent)
     pub fn check_collateral(&self, chain: &Chain) {
-        let mut changed = false;
-        {
-            let mut entries = self.entries.write();
-            for e in entries.iter_mut().filter(|e| !e.vin_spent) {
-                if matches!(chain.get_utxo(&e.outpoint()), Ok(None)) {
-                    e.vin_spent = true;
-                    changed = true;
-                }
+        let mut entries = self.entries.write();
+        for e in entries.iter_mut().filter(|e| !e.vin_spent) {
+            if matches!(chain.get_utxo(&e.outpoint()), Ok(None)) {
+                e.vin_spent = true;
             }
-        }
-        if changed {
-            self.save();
         }
     }
 
