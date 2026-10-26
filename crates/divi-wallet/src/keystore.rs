@@ -128,6 +128,9 @@ pub struct KeyStore {
     keypool_target: RwLock<u32>,
     /// Timestamp of oldest key in keypool
     keypool_oldest: RwLock<u64>,
+    /// Divi Core's pool index of each HD key in the keypool, by (change chain,
+    /// child index): what its keypool log lines number
+    pool_numbers: RwLock<std::collections::BTreeMap<(bool, u32), u64>>,
     /// Public ids of the HD chain; kept when the seed is stripped on lock
     hd_public_ids: RwLock<Option<HdPublicIds>>,
 }
@@ -174,6 +177,7 @@ impl KeyStore {
             change_index: RwLock::new(0),
             keypool_target: RwLock::new(DEFAULT_KEYPOOL_SIZE),
             keypool_oldest: RwLock::new(now),
+            pool_numbers: RwLock::new(std::collections::BTreeMap::new()),
             hd_public_ids: RwLock::new(None),
         }
     }
@@ -193,6 +197,7 @@ impl KeyStore {
             change_index: RwLock::new(0),
             keypool_target: RwLock::new(DEFAULT_KEYPOOL_SIZE),
             keypool_oldest: RwLock::new(now),
+            pool_numbers: RwLock::new(std::collections::BTreeMap::new()),
         }
     }
 
@@ -254,6 +259,8 @@ impl KeyStore {
             .ok_or(WalletError::KeyNotFound("No HD wallet configured".into()))?;
 
         let index = *self.receiving_index.read();
+        self.number_pool();
+        self.keep_from_pool(false, index);
         let key = wallet.derive_receiving(0, index)?;
         let secret = key.secret_key()?;
         let entry = KeyEntry::with_hd_path(secret, hd_key_path(wallet.coin_type(), false, index));
@@ -272,6 +279,8 @@ impl KeyStore {
             .ok_or(WalletError::KeyNotFound("No HD wallet configured".into()))?;
 
         let index = *self.change_index.read();
+        self.number_pool();
+        self.keep_from_pool(true, index);
         let key = wallet.derive_change(0, index)?;
         let secret = key.secret_key()?;
         let entry = KeyEntry::with_hd_path(secret, hd_key_path(wallet.coin_type(), true, index));
@@ -538,12 +547,26 @@ impl KeyStore {
             .filter_map(|entry| hd_chain_index(entry.hd_path.as_deref()?))
             .collect();
         let (receiving, change) = self.get_indices();
+        self.number_pool();
 
         let mut added = Vec::new();
         for (is_change, start, count) in [(false, receiving, target), (true, change, target)] {
             for i in start..start.saturating_add(count) {
                 if held.contains(&(is_change, i)) {
                     continue;
+                }
+                // Divi Core numbers a key one past the newest in the pool, and
+                // logs it (wallet.cpp:2093-2112)
+                {
+                    let mut pool = self.pool_numbers.write();
+                    let number = pool.values().max().map_or(1, |n| n + 1);
+                    pool.insert((is_change, i), number);
+                    tracing::info!(
+                        "keypool added key {}, size={}, internal={}",
+                        number,
+                        pool.len(),
+                        u8::from(is_change)
+                    );
                 }
                 let key = if is_change {
                     wallet.derive_change(0, i)?
@@ -571,10 +594,69 @@ impl KeyStore {
         Ok(added)
     }
 
+    /// Number the keys in the keypool when none is numbered yet (a wallet from
+    /// before the numbers were kept): receiving keys first, then change, as
+    /// Divi Core's TopUpKeyPool adds them
+    fn number_pool(&self) {
+        let mut pool = self.pool_numbers.write();
+        if !pool.is_empty() {
+            return;
+        }
+        let (receiving, change) = self.get_indices();
+        let mut keys: Vec<(bool, u32)> = self
+            .keys
+            .read()
+            .values()
+            .filter(|entry| !entry.is_watch_only)
+            .filter_map(|entry| hd_chain_index(entry.hd_path.as_deref()?))
+            .filter(|&(is_change, i)| i >= if is_change { change } else { receiving })
+            .collect();
+        keys.sort();
+        for (n, key) in keys.into_iter().enumerate() {
+            pool.insert(key, n as u64 + 1);
+        }
+    }
+
+    /// The key at `index` of a chain leaves the keypool: Divi Core reserves its
+    /// oldest key and keeps it (wallet.cpp:2154, :2162). A key derived outside
+    /// the pool has no number and no line.
+    fn keep_from_pool(&self, is_change: bool, index: u32) {
+        if let Some(number) = self.pool_numbers.write().remove(&(is_change, index)) {
+            tracing::info!("keypool reserve {}", number);
+            tracing::info!("keypool keep {}", number);
+        }
+    }
+
+    /// A change key reserved for a send that needs no change, and returned
+    /// (wallet.cpp:2154, :2176)
+    pub fn reserve_and_return_change(&self) {
+        let (_, change) = self.get_indices();
+        if let Some(number) = self.pool_numbers.read().get(&(true, change)) {
+            tracing::info!("keypool reserve {}", number);
+            tracing::info!("keypool return {}", number);
+        }
+    }
+
+    /// The keypool's numbers, for persistence: (change chain, child, number)
+    pub fn pool_numbers(&self) -> Vec<(bool, u32, u64)> {
+        self.pool_numbers
+            .read()
+            .iter()
+            .map(|(&(c, i), &n)| (c, i, n))
+            .collect()
+    }
+
+    /// Restore the keypool's numbers from persistence
+    pub fn set_pool_numbers(&self, numbers: &[(bool, u32, u64)]) {
+        *self.pool_numbers.write() = numbers.iter().map(|&(c, i, n)| ((c, i), n)).collect();
+    }
+
     /// Hand out the next pre-generated key of the receiving or change chain
     /// without the HD seed, as Divi Core does from its keypool while the wallet
     /// is locked. The key's secret was stored encrypted when it was derived.
     pub fn take_from_keypool(&self, is_change: bool) -> Result<Address, WalletError> {
+        // Before the counter's lock: number_pool reads both counters
+        self.number_pool();
         let counter = if is_change {
             &self.change_index
         } else {
@@ -591,6 +673,7 @@ impl KeyStore {
             })
             .map(|entry| entry.address(self.network))
             .ok_or(WalletError::KeypoolRanOut)?;
+        self.keep_from_pool(is_change, *index);
         *index += 1;
         Ok(address)
     }

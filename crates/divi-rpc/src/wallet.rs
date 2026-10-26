@@ -1939,7 +1939,7 @@ impl WalletRpc {
         // returns the key when no change is needed (:1813-1816): so a send
         // without change still leaves the keypool full
         if plan.change.is_none() && matches!(change_to, ChangeTo::NewKey) {
-            if let Err(e) = wallet.top_up_keypool() {
+            if let Err(e) = wallet.reserve_and_return_change() {
                 debug!("Keypool not topped up for a send without change: {}", e);
             }
         }

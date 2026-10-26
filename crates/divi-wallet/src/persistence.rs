@@ -59,6 +59,7 @@ const KEY_ENCRYPTED_MNEMONIC: &[u8] = b"encrypted_mnemonic";
 pub(crate) const KEY_HD_SEED: &[u8] = b"hd_seed";
 pub(crate) const KEY_ENCRYPTED_HD_SEED: &[u8] = b"encrypted_hd_seed";
 const KEY_HD_COIN_TYPE: &[u8] = b"hd_coin_type";
+pub(crate) const KEY_KEYPOOL_NUMBERS: &[u8] = b"keypool_numbers";
 pub(crate) const KEY_MNEMONIC_PASSPHRASE: &[u8] = b"mnemonic_passphrase";
 pub(crate) const KEY_ENCRYPTED_MNEMONIC_PASSPHRASE: &[u8] = b"encrypted_mnemonic_passphrase";
 pub(crate) const KEY_HD_PUBLIC_IDS: &[u8] = b"hd_public_ids";
@@ -273,6 +274,37 @@ impl WalletDatabase {
     }
 
     /// Store the BIP44 coin type the wallet derives with
+    /// The keypool's numbers (Divi Core's pool indexes) of the HD keys in the
+    /// keypool: (change chain, child index, number) each
+    pub fn store_keypool_numbers(&self, numbers: &[(bool, u32, u64)]) -> Result<(), WalletError> {
+        let cf = self.db.cf_handle(CF_METADATA).unwrap();
+        self.db
+            .put_cf(cf, KEY_KEYPOOL_NUMBERS, encode_keypool_numbers(numbers))
+            .map_err(|e| WalletError::Storage(e.to_string()))
+    }
+
+    /// The keypool's numbers; empty for wallets made before they were stored
+    pub fn load_keypool_numbers(&self) -> Result<Vec<(bool, u32, u64)>, WalletError> {
+        let cf = self.db.cf_handle(CF_METADATA).unwrap();
+        let data = self
+            .db
+            .get_cf(cf, KEY_KEYPOOL_NUMBERS)
+            .map_err(|e| WalletError::Storage(e.to_string()))?
+            .unwrap_or_default();
+        Ok(data
+            .as_chunks::<13>()
+            .0
+            .iter()
+            .map(|c| {
+                (
+                    c[0] != 0,
+                    u32::from_le_bytes(c[1..5].try_into().unwrap()),
+                    u64::from_le_bytes(c[5..13].try_into().unwrap()),
+                )
+            })
+            .collect())
+    }
+
     pub fn store_hd_coin_type(&self, coin_type: u32) -> Result<(), WalletError> {
         let cf = self.db.cf_handle(CF_METADATA).unwrap();
         self.db
@@ -1311,6 +1343,17 @@ fn outpoint_from_key(key: &[u8]) -> OutPoint {
     txid_bytes.copy_from_slice(&key[0..32]);
     let vout = u32::from_le_bytes([key[32], key[33], key[34], key[35]]);
     OutPoint::new(Hash256::from_bytes(txid_bytes), vout)
+}
+
+/// The keypool's numbers as stored: 13 bytes each (change chain, child, number)
+pub(crate) fn encode_keypool_numbers(numbers: &[(bool, u32, u64)]) -> Vec<u8> {
+    let mut data = Vec::with_capacity(numbers.len() * 13);
+    for (is_change, index, number) in numbers {
+        data.push(u8::from(*is_change));
+        data.extend_from_slice(&index.to_le_bytes());
+        data.extend_from_slice(&number.to_le_bytes());
+    }
+    data
 }
 
 pub(crate) fn serialize_key_entry(entry: &KeyEntry) -> Vec<u8> {
