@@ -1788,6 +1788,7 @@ impl WalletDb {
         let locked = self.locked.read();
         let _keys = self.key_lock.lock();
         let mut store = Vec::new();
+        let indices = self.keystore.get_indices();
         let addr = if *locked {
             self.keystore.take_from_keypool(is_change)?
         } else {
@@ -1803,6 +1804,7 @@ impl WalletDb {
         self.dirty.write().keys = true;
         self.dirty.write().metadata = true; // receiving/change index changed
         let derived = !store.is_empty();
+        let added = store.clone();
         store.push(addr.hash);
         match self.persist_keys(&store) {
             // A key stored by an earlier top-up is handed out even when the
@@ -1814,7 +1816,14 @@ impl WalletDb {
                 warn!("Failed to store the next key index: {}", e);
                 Ok(addr)
             }
-            Err(e) => Err(e),
+            // Divi Core's derivation throws before the key joins the pool or a
+            // key is taken from it (wallet.cpp:2339-2347, :2129-2137): the keys
+            // just derived go and neither index moves
+            Err(e) => {
+                self.keystore.remove_keys(&added);
+                self.keystore.set_indices(indices.0, indices.1);
+                Err(e)
+            }
             Ok(()) => Ok(addr),
         }
     }
@@ -3196,7 +3205,12 @@ impl WalletDb {
         let added = self.keystore.top_up_keypool(new_size)?;
         if !added.is_empty() {
             self.dirty.write().keys = true;
-            self.persist_keys(&added)?;
+            // Keys that cannot be written do not join the pool, as Divi Core's
+            // derivation throws before they do (wallet.cpp:2339-2347)
+            if let Err(e) = self.persist_keys(&added) {
+                self.keystore.remove_keys(&added);
+                return Err(e);
+            }
         }
         Ok(added.len() as u32)
     }
