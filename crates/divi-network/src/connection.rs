@@ -715,7 +715,7 @@ impl Connection {
 
                 // Proactive keepalive ping
                 _ = ping_timer.tick() => {
-                    if inactivity_exceeded(info.last_recv, info.ping_time, std::time::Instant::now()) {
+                    if inactivity_exceeded(info.last_send, info.last_recv, info.ping_time, std::time::Instant::now()) {
                         info!("{} inactive for {:?}, disconnecting", crate::peer_log::peer(peer_id, info.addr), TIMEOUT_INTERVAL);
                         break;
                     }
@@ -812,7 +812,7 @@ impl Connection {
                         Err(_) => {
                             // A quiet peer gets no extra ping: the keepalive above
                             // runs on its own interval, as in Divi Core
-                            if inactivity_exceeded(info.last_recv, info.ping_time, std::time::Instant::now()) {
+                            if inactivity_exceeded(info.last_send, info.last_recv, info.ping_time, std::time::Instant::now()) {
                                 info!("{} inactive for {:?}, disconnecting", crate::peer_log::peer(peer_id, info.addr), TIMEOUT_INTERVAL);
                                 break;
                             }
@@ -1083,17 +1083,21 @@ fn duplicate_version(peer_id: PeerId) -> PeerEvent {
 }
 
 /// Divi Core `CheckForInnactivity`: disconnect after this long without
-/// receiving anything, or with a ping unanswered
+/// sending anything, without receiving anything, or with a ping unanswered
 const TIMEOUT_INTERVAL: Duration = Duration::from_secs(20 * 60);
 
-/// True once a peer has been silent, or has left a ping unanswered, for
-/// longer than `TIMEOUT_INTERVAL`
+/// True once nothing has been sent to a peer, nothing received from it, or a
+/// ping left unanswered, for longer than `TIMEOUT_INTERVAL` (Node.cpp:823-832;
+/// the sending timeout drops a peer we keep nothing to send, such as a peer we
+/// dialled that never sends its sporks)
 fn inactivity_exceeded(
+    last_send: std::time::Instant,
     last_recv: std::time::Instant,
     ping_sent: Option<std::time::Instant>,
     now: std::time::Instant,
 ) -> bool {
-    now.saturating_duration_since(last_recv) > TIMEOUT_INTERVAL
+    now.saturating_duration_since(last_send) > TIMEOUT_INTERVAL
+        || now.saturating_duration_since(last_recv) > TIMEOUT_INTERVAL
         || ping_sent.is_some_and(|sent| now.saturating_duration_since(sent) > TIMEOUT_INTERVAL)
 }
 
@@ -1153,11 +1157,25 @@ mod tests {
     fn inactive_peers_time_out_after_twenty_minutes() {
         let start = std::time::Instant::now();
         let at = |secs| start + Duration::from_secs(secs);
-        assert!(!inactivity_exceeded(start, None, at(20 * 60)));
-        assert!(inactivity_exceeded(start, None, at(20 * 60 + 1)));
+        assert!(!inactivity_exceeded(at(1200), start, None, at(20 * 60)));
+        assert!(inactivity_exceeded(at(1200), start, None, at(20 * 60 + 1)));
         // Data keeps coming but the ping is never answered
-        assert!(!inactivity_exceeded(at(1199), Some(start), at(1200)));
-        assert!(inactivity_exceeded(at(1200), Some(start), at(1201)));
-        assert!(!inactivity_exceeded(at(1200), None, at(1201)));
+        assert!(!inactivity_exceeded(
+            at(1200),
+            at(1199),
+            Some(start),
+            at(1200)
+        ));
+        assert!(inactivity_exceeded(
+            at(1200),
+            at(1200),
+            Some(start),
+            at(1201)
+        ));
+        assert!(!inactivity_exceeded(at(1200), at(1200), None, at(1201)));
+        // Data keeps coming but nothing is sent: the sending timeout
+        // (Node.cpp:823-825), as for a dialled peer that never sends its sporks
+        assert!(!inactivity_exceeded(start, at(1200), None, at(20 * 60)));
+        assert!(inactivity_exceeded(start, at(1200), None, at(20 * 60 + 1)));
     }
 }
