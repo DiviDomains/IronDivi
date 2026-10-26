@@ -2997,11 +2997,17 @@ impl WalletDb {
     fn top_up_keypool_after_unlock(&self) {
         let _keys = self.key_lock.lock();
         self.keystore.hold_pool_lines();
+        let pool = self.keystore.pool_state();
         let written = match self.keystore.top_up_keypool(None) {
             Ok(added) if !added.is_empty() => match self.persist_keys(&added) {
                 Ok(()) => true,
                 Err(e) => {
+                    // Keys that cannot be written do not join the pool, as
+                    // Divi Core's derivation throws before they do
+                    // (wallet.cpp:2357-2360)
                     warn!("Failed to store keypool keys: {}", e);
+                    self.keystore.remove_keys(&added);
+                    self.keystore.restore_pool_state(pool);
                     false
                 }
             },
@@ -3088,9 +3094,11 @@ impl WalletDb {
 
         // Fill the keypool while the seed is still in the clear: the pool keys go
         // into the batch below, and a locked wallet hands out only pool keys
-        if let Err(e) = self.keystore.top_up_keypool(None) {
+        let pool = self.keystore.pool_state();
+        let topped = self.keystore.top_up_keypool(None).unwrap_or_else(|e| {
             debug!("Keypool not topped up before encryption: {}", e);
-        }
+            Vec::new()
+        });
 
         // One atomic batch: either the wallet becomes encrypted or nothing changes.
         let mut batch = db.create_batch();
@@ -3158,7 +3166,14 @@ impl WalletDb {
         batch.put_cf(db.cf_metadata(), b"encryption_salt", &salt);
         batch.put_cf(db.cf_metadata(), b"encrypted_master_key", &sealed_master);
         batch.put_cf(db.cf_metadata(), b"encrypted", [1u8]);
-        db.write_batch(batch)?;
+        if let Err(e) = db.write_batch(batch) {
+            // The pool keys of the top-up were not written: Divi Core's
+            // derivation throws before a key it cannot write joins the pool
+            // (wallet.cpp:1011-1015, :2357-2360)
+            self.keystore.remove_keys(&topped);
+            self.keystore.restore_pool_state(pool);
+            return Err(e);
+        }
         db.flush()?;
         // Overwritten plaintext can survive in old SST files until compaction
         db.compact_secret_cfs();

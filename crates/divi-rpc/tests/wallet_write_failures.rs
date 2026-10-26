@@ -507,3 +507,30 @@ fn a_send_without_change_whose_top_up_cannot_be_written_logs_no_reservation() {
     );
     assert!(!log.contains("keypool"), "{log}");
 }
+
+/// encryptwallet and walletpassphrase top the keypool up (wallet.cpp:1011-1015,
+/// rpcwallet.cpp:2617-2620); a key they cannot write throws before it joins the
+/// pool (wallet.cpp:2357-2360), so the pool is as it was
+#[test]
+fn encryption_and_unlock_top_ups_that_cannot_be_written_leave_the_pool_as_it_was() {
+    let _limit = LIMIT.lock();
+    let net = Net::new();
+    let rpc = one_key_short(&net);
+    let pool = net.wallet.keypool_size();
+    writes_fail();
+    assert!(rpc
+        .encrypt_wallet(&p(vec![json!("throwaway-pass")]))
+        .is_err());
+    writes_work();
+    assert_eq!(net.wallet.keypool_size(), pool, "after encryptwallet");
+
+    rpc.encrypt_wallet(&p(vec![json!("throwaway-pass")]))
+        .unwrap();
+    // A locked getnewaddress takes a pool key and does not top up
+    rpc.get_new_address(&p(vec![])).unwrap();
+    let pool = net.wallet.keypool_size();
+    writes_fail();
+    let _ = rpc.wallet_passphrase(&p(vec![json!("throwaway-pass"), json!(60)]));
+    writes_work();
+    assert_eq!(net.wallet.keypool_size(), pool, "after walletpassphrase");
+}
