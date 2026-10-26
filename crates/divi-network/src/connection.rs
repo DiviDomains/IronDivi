@@ -394,8 +394,20 @@ impl Connection {
             });
         }
 
-        // Main message loop
-        self.message_loop().await
+        // Main message loop, raced against the stop: its writes to a peer that
+        // no longer reads wait outside the loop's own watch on the signal.
+        // Divi Core's sends never wait (MSG_DONTWAIT, SocketChannel.cpp:11-13)
+        let (peer_id, event_tx) = (self.peer_id, self.event_tx.clone());
+        tokio::select! {
+            result = self.message_loop() => result,
+            _ = stop.recv() => {
+                let _ = event_tx.send(PeerEvent::Disconnected {
+                    peer_id,
+                    reason: "the node is stopping".to_string(),
+                });
+                Ok(())
+            }
+        }
     }
 
     /// Perform version handshake
