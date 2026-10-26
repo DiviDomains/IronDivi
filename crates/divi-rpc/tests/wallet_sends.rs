@@ -593,27 +593,35 @@ fn a_send_failing_after_coin_selection_tops_the_key_pool_up() {
     assert_eq!(net.wallet.keypool_size(), full, "the key pool is topped up");
 }
 
-/// The log lines written while `f` runs on this thread
+/// The log lines written while `f` runs on this thread. One global subscriber
+/// writes each thread's lines to that thread's buffer: a subscriber set for
+/// one thread can miss lines whose call sites another test thread, with no
+/// subscriber, registered at the same time
 fn logged<T>(f: impl FnOnce() -> T) -> (T, String) {
-    #[derive(Clone)]
-    struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-    impl std::io::Write for Buf {
+    thread_local! {
+        static LINES: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    struct ThreadLines;
+    impl std::io::Write for ThreadLines {
         fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(data);
+            LINES.with(|lines| lines.borrow_mut().extend_from_slice(data));
             Ok(data.len())
         }
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
     }
-    let buf = Buf(Default::default());
-    let writer = buf.clone();
-    let subscriber = tracing_subscriber::fmt()
-        .with_ansi(false)
-        .with_writer(move || writer.clone())
-        .finish();
-    let out = tracing::subscriber::with_default(subscriber, f);
-    let text = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(|| ThreadLines)
+            .init();
+    });
+    LINES.with(|lines| lines.borrow_mut().clear());
+    let out = f();
+    let text =
+        LINES.with(|lines| String::from_utf8(std::mem::take(&mut *lines.borrow_mut())).unwrap());
     (out, text)
 }
 
@@ -661,6 +669,62 @@ fn a_send_logs_the_transaction_it_commits() {
         )),
         "{log}"
     );
+}
+
+/// The position of `line` in `log`, which must have it
+fn at(log: &str, line: &str) -> usize {
+    log.find(line)
+        .unwrap_or_else(|| panic!("no {line:?} in\n{log}"))
+}
+
+/// A send reserves its change key as it makes the change output and keeps it
+/// after CommitTransaction's dump, as Divi Core's CReserveKey does
+/// (wallet.cpp:1786, :1866-1868, :2154, :2162)
+#[test]
+fn a_send_keeps_its_change_key_after_logging_the_commit() {
+    let net = Net::new();
+    net.fund(&[10 * COIN]);
+    let rpc = net.rpc();
+    let (_, log) = logged(|| {
+        rpc.send_to_address(&p(vec![json!(dest().to_string()), json!(1)]))
+            .unwrap()
+    });
+    let reserve = at(&log, "keypool reserve ");
+    let number = log[reserve..].split_whitespace().nth(2).unwrap();
+    let commit = at(&log, "CommitTransaction:\n");
+    let keep = at(&log, &format!("keypool keep {number}\n"));
+    assert!(reserve < commit && commit < keep, "{log}");
+}
+
+/// A send that fails after it reserved its change key gives the key back
+/// under its number, as Divi Core's ReturnKey does (reservekey.cpp:44-51,
+/// wallet.cpp:2165-2177): the next send reserves the same number
+#[test]
+fn a_failed_send_returns_its_change_key_to_the_pool() {
+    let net = Net::new();
+    unsignable_coin(&net, 10 * COIN);
+    let rpc = net.rpc();
+    let (_, log) = logged(|| {
+        rpc.send_to_address(&p(vec![json!(dest().to_string()), json!(1)]))
+            .unwrap_err()
+    });
+    let reserve = at(&log, "keypool reserve ");
+    let number = log[reserve..]
+        .split_whitespace()
+        .nth(2)
+        .unwrap()
+        .to_string();
+    assert!(
+        at(&log, &format!("keypool return {number}\n")) > reserve,
+        "{log}"
+    );
+    assert!(!log.contains("keypool keep"), "{log}");
+
+    let (_, log) = logged(|| {
+        rpc.send_to_address(&p(vec![json!(dest().to_string()), json!(1)]))
+            .unwrap_err()
+    });
+    at(&log, &format!("keypool reserve {number}\n"));
 }
 
 /// A send the mempool takes logs SendMoney's "<txid's first 10 digits>:

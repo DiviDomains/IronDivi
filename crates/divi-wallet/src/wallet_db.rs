@@ -1766,12 +1766,25 @@ impl WalletDb {
 
     /// Generate a new receiving address
     pub fn new_receiving_address(&self) -> Result<Address, WalletError> {
-        self.new_address(false)
+        self.new_address(false, false)
     }
 
     /// Generate a new change address
     pub fn new_change_address(&self) -> Result<Address, WalletError> {
-        self.new_address(true)
+        self.new_address(true, false)
+    }
+
+    /// The change key of a send, as [`Self::new_change_address`], but kept
+    /// only once the send is committed ([`Self::keep_change_address`]) or
+    /// given back ([`Self::return_change_address`]), as Divi Core's CReserveKey
+    /// logs its keep after CommitTransaction's dump (wallet.cpp:1866-1868)
+    pub fn reserve_change_address(&self) -> Result<Address, WalletError> {
+        self.new_address(true, true)
+    }
+
+    /// Keep the change key of a committed send (wallet.cpp:1868, :2158-2163)
+    pub fn keep_change_address(&self, address: &Address) {
+        self.keystore.keep_key(&address.hash);
     }
 
     /// Give back the change key a send took and did not use, as Divi Core's
@@ -1794,19 +1807,25 @@ impl WalletDb {
     /// disk, encrypted) and fails with `KeypoolRanOut` when none is left; an
     /// unlocked wallet derives the key and tops the keypool up. The key and the
     /// advanced index are stored before the address is returned.
-    fn new_address(&self, is_change: bool) -> Result<Address, WalletError> {
+    fn new_address(&self, is_change: bool, keep_later: bool) -> Result<Address, WalletError> {
         // Held until the key is stored, so a concurrent lock() cannot strip it first
         let locked = self.locked.read();
         let _keys = self.key_lock.lock();
         let mut store = Vec::new();
         let indices = self.keystore.get_indices();
         let addr = if *locked {
-            self.keystore.take_from_keypool(is_change)?
+            if keep_later {
+                self.keystore.reserve_from_keypool()?
+            } else {
+                self.keystore.take_from_keypool(is_change)?
+            }
         } else {
             // Divi Core tops the keypool up, then takes its oldest key
             // (wallet.cpp:2122-2156), so the pool is one short afterwards
             store = self.keystore.top_up_keypool(None).unwrap_or_default();
-            if is_change {
+            if keep_later {
+                self.keystore.reserve_change_address()?
+            } else if is_change {
                 self.keystore.new_change_address()?
             } else {
                 self.keystore.new_receiving_address()?

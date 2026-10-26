@@ -2041,7 +2041,7 @@ impl WalletRpc {
         if let Some(change) = plan.change {
             let script = match change_to {
                 ChangeTo::NewKey => {
-                    let address = wallet.new_change_address().map_err(|e| match e {
+                    let address = wallet.reserve_change_address().map_err(|e| match e {
                         divi_wallet::WalletError::Storage(_) => key_write_error(e),
                         e => RpcError::new(
                             codes::WALLET_ERROR,
@@ -2096,8 +2096,12 @@ impl WalletRpc {
             }
         }
         check_signed(&tx, plan.fee, self.fee_policy()).map_err(|e| give_back(send_error(e)))?;
-        // CommitTransaction logs the transaction it commits (wallet.cpp:1866)
+        // CommitTransaction logs the transaction it commits, then keeps its
+        // change key (wallet.cpp:1866-1868)
         info!("CommitTransaction:\n{}", core_tx_string(&tx));
+        if let Some(address) = &change_key {
+            wallet.keep_change_address(address);
+        }
         wallet.note_committed(&tx.txid());
         let callback = self.tx_submit.read();
         let callback = callback.as_ref().ok_or_else(|| {
