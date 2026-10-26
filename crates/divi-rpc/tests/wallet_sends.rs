@@ -419,3 +419,72 @@ fn a_send_costing_more_than_maxtxfee_is_refused() {
         .unwrap();
     assert!(net.fee_of(&net.last_submitted()) > 20_000);
 }
+
+/// A send the mempool refuses after the wallet has signed it answers -4
+/// "Error: Invalid transaction committed to wallet!" and stays in the wallet,
+/// unconfirmed, to be offered to the mempool again at the next start
+/// (rpcwallet.cpp:774-782, wallet.cpp:1866-1878, init.cpp:1262-1275)
+#[test]
+fn a_send_the_mempool_refuses_stays_in_the_wallet() {
+    let net = Net::new();
+    net.fund(&[10 * COIN]);
+    let rpc = WalletRpc::with_wallet_and_chain(net.wallet.clone(), net.chain.clone());
+    rpc.set_tx_submit(Arc::new(|_tx: Transaction| {
+        Err(divi_rpc::TxSubmitError::Failed(String::new()))
+    }));
+    let err = rpc
+        .send_to_address(&p(vec![json!(dest().to_string()), json!(1)]))
+        .unwrap_err();
+    match err {
+        divi_rpc::Error::Rpc(e) => assert_eq!(
+            (e.code, e.message.as_str()),
+            (-4, "Error: Invalid transaction committed to wallet!")
+        ),
+        other => panic!("{other:?}"),
+    }
+    let detached = net.wallet.detached_transactions();
+    assert_eq!(detached.len(), 1, "the refused send is kept");
+    assert!(net
+        .wallet
+        .transactions_to_resubmit()
+        .iter()
+        .any(|(tx, _)| tx.txid() == detached[0].0));
+}
+
+/// sendfrom from an account named "comment" or "to" loses that note: Divi
+/// Core's SendMoney erases the note named after the account, not
+/// FromAccount (wallet.cpp:1915-1922, rpcwallet.cpp:1636-1646)
+#[test]
+fn an_account_named_after_a_note_loses_that_note() {
+    let net = Net::new();
+    let addresses = net.fund(&[10 * COIN, 10 * COIN, 10 * COIN]);
+    for (account, addr) in ["comment", "to", "shop"].iter().zip(&addresses) {
+        net.wallet.set_label(addr, account).unwrap();
+    }
+    let rpc = net.rpc();
+    let mut notes = Vec::new();
+    for account in ["comment", "to", "shop"] {
+        let txid = rpc
+            .send_from(&p(vec![
+                json!(account),
+                json!(dest().to_string()),
+                json!(1),
+                json!("a note"),
+                json!("a shop"),
+            ]))
+            .unwrap();
+        let txid = Hash256::from_hex(txid.as_str().unwrap()).unwrap();
+        notes.push(net.wallet.tx_notes(&txid));
+    }
+    let names = |n: &std::collections::BTreeMap<String, String>| {
+        n.iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(names(&notes[0]), ["FromAccount=comment", "to=a shop"]);
+    assert_eq!(names(&notes[1]), ["FromAccount=to", "comment=a note"]);
+    assert_eq!(
+        names(&notes[2]),
+        ["FromAccount=shop", "comment=a note", "to=a shop"]
+    );
+}

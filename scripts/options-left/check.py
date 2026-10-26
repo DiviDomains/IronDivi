@@ -51,9 +51,6 @@ ABORT = ("same error line; divid then aborts (SIGABRT) in the shutdown after thi
 AIDS = ("a divid test aid for a part irondivid has but does not let an option change (bin/irondivid/src/main.rs "
         "UNSUPPORTED_OPTIONS): divid takes it without a word, irondivid names it as not supported "
         "(docs/divid-differences.md S2)")
-PRUNED = ("divid's -prunewalletconfs rebuilds the wallet's transactions in memory without the fully spent ones of at "
-         "least that many confirmations and logs the counts (wallet.cpp:1162-1239); irondivid's wallet keeps them "
-         "all, and it names the option as not supported (UNSUPPORTED_OPTIONS)")
 KNOWN = {
     "-help -help-debug: more options than -help": (HELP, lambda c, i: c == ("ok", True) and i == ("ok", False)),
 }
@@ -67,10 +64,6 @@ def unsupported(option):
 def aborts(c, i):
     return (c[0] == i[0] == "ok" and c[1].startswith("exit -6 ") and i[1].startswith("exit 1 ")
             and c[1][len("exit -6 "):] == i[1][len("exit 1 "):])
-
-
-def pruned(c, i):
-    return c[0] == i[0] == "ok" and len(c[1]) == 1 and c[1][0][0] == c[1][0][1] and i[1] == []
 
 
 FORM_LABELS = {"0": "=0", "1": "=1", None: "", "abc": "=abc"}
@@ -412,11 +405,8 @@ OPTIONS = [
 
 for _option, _typical, _forms, _during, _after in OPTIONS:
     for _label in labels(_option, _typical, _forms):
-        if _option in ("accountlabels", "activeversion", "manual_fork", "override_mnpayee", "prunewalletconfs",
-                       "stakeupdatetime", "whitelisted_vault"):
+        if _option in ("accountlabels", "activeversion", "manual_fork", "override_mnpayee", "stakeupdatetime"):
             KNOWN[f"{_label}: log lines naming -{_option}"] = (AIDS, unsupported(_option))
-        if _option == "prunewalletconfs":
-            KNOWN[f"{_label}: log lines"] = (PRUNED, pruned)
         if _option == "socks" or (_option == "tor" and _label not in ("-tor=0", "-tor=abc")):
             KNOWN[f"{_label}: start"] = (ABORT, aborts)
 

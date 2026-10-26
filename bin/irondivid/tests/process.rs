@@ -466,3 +466,36 @@ fn netfulfilled_is_written_after_the_loops_stop() {
         line_of(&lines, "Shutdown: netfulfilled.dat written").expect("netfulfilled.dat written");
     assert!(loops < written, "{lines:#?}");
 }
+
+/// The masternode payment votes are written to mnpayments.dat beside
+/// netfulfilled.dat once the loops have stopped, as SaveMasternodeDataToDisk
+/// writes them (init.cpp:372, :376; MasternodeModule.cpp:284-297)
+#[test]
+fn mnpayments_is_written_after_the_loops_stop() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(dir.path());
+    daemon.stop();
+    let lines = log_lines(dir.path());
+    let loops = line_of(&lines, "Shutdown: node loops stopped").expect("loops stopped");
+    let written =
+        line_of(&lines, "Shutdown: mnpayments.dat written").expect("mnpayments.dat written");
+    assert!(loops < written, "{lines:#?}");
+    let bytes = std::fs::read(dir.path().join("mnpayments.dat")).unwrap();
+    assert_eq!(&bytes[1..29], b"magicMasternodePaymentsCache");
+}
+
+/// With no masternode known, divid does not read mnpayments.dat
+/// (MasternodeModule.cpp:269-280), so a damaged one does not stop the start;
+/// at the stop it is left as it was, as CFlatDB::Dump leaves a file it cannot
+/// read (flat-database.h)
+#[test]
+fn a_damaged_mnpayments_is_left_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("mnpayments.dat"), b"not a votes file").unwrap();
+    let daemon = Daemon::start(dir.path());
+    daemon.stop();
+    assert_eq!(
+        std::fs::read(dir.path().join("mnpayments.dat")).unwrap(),
+        b"not a votes file"
+    );
+}
