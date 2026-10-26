@@ -216,8 +216,9 @@ async fn getdata_of_items_held_by_no_store_is_not_found() {
 
 /// A filtered block item ends a getdata pass as a block item does, so the
 /// unknown transactions before and after it are named in two notfounds
-/// (main.cpp:300-332), with the block's merkleblock, and any matched
-/// transactions, sent between them
+/// (main.cpp:300-332); a pass's notfound goes after what it sent
+/// (main.cpp:337-345), so the block's merkleblock, and any matched
+/// transactions, come first
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn filtered_block_item_ends_a_getdata_pass() {
     let t = TestNode::start().await;
@@ -233,12 +234,12 @@ async fn filtered_block_item_ends_a_getdata_pass() {
         .collect();
     let commands: Vec<&str> = got.iter().map(|(c, _)| c.as_str()).collect();
     assert!(got.len() >= 3, "{commands:?}");
-    assert_eq!(got[0], ("notfound".to_string(), vec![(1, tx1)]));
-    assert_eq!(commands[1], "merkleblock", "{commands:?}");
+    assert_eq!(commands[0], "merkleblock", "{commands:?}");
     assert!(
-        commands[2..got.len() - 1].iter().all(|&c| c == "tx"),
+        commands[1..got.len() - 2].iter().all(|&c| c == "tx"),
         "{commands:?}"
     );
+    assert_eq!(got[got.len() - 2], ("notfound".to_string(), vec![(1, tx1)]));
     assert_eq!(got[got.len() - 1], ("notfound".to_string(), vec![(1, tx2)]));
 }
 

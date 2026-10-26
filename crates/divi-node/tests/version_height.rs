@@ -90,12 +90,14 @@ fn version_without_height() -> Vec<u8> {
     v[..v.len() - 5].to_vec()
 }
 
-/// Wait (bounded) until the node has one peer whose stats show a start
+/// Wait (bounded) until the node has a peer whose stats show a start
 /// height, and return it as getpeerinfo would
 async fn starting_height(t: &TestNode) -> Option<serde_json::Value> {
     let deadline = tokio::time::Instant::now() + WAIT;
     loop {
-        let peers = t.node.peer_manager().get_peer_details();
+        // The peers come in no fixed order; the oldest connection is the first made
+        let mut peers = t.node.peer_manager().get_peer_details();
+        peers.sort_by_key(|p| p.0);
         if let Some((_, _, _, st, _)) = peers.first() {
             if st.version.load(std::sync::atomic::Ordering::Relaxed) != 0 {
                 return Some(serde_json::json!(st

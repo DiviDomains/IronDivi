@@ -434,9 +434,18 @@ def log_mark(node):
 
 
 def log_since(node, mark):
+    """The log text written since `mark`, once the log has stopped growing: irondivid
+    writes its log from a thread of its own, so the lines of what just happened can
+    still be on their way (a second's silence is taken as the end, 5 s at most)"""
     path = log_path(node)
     if not path:
         return ""
+    last, quiet, deadline = -1, 0, time.time() + 5
+    while quiet < 3 and time.time() < deadline:
+        size = os.path.getsize(path)
+        quiet = quiet + 1 if size == last else 0
+        last = size
+        time.sleep(0.3)
     start = mark[1] if mark[0] == path else 0
     text = b""
     # irondivid keeps 1 MiB per log file and renames a full one to debug.log.1: when the

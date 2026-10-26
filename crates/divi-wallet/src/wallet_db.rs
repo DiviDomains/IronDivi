@@ -677,6 +677,18 @@ impl WalletDb {
         }
     }
 
+    /// A send the mempool refused after the wallet signed it: Divi Core has
+    /// committed it to the wallet already, so it stays there unconfirmed and
+    /// is offered to the mempool again at the next start (wallet.cpp:1866-1878,
+    /// rpcwallet.cpp:774-782, init.cpp:1262-1275)
+    pub fn keep_refused_send(&self, tx: &divi_primitives::transaction::Transaction) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.detach(tx.txid(), now, Some(tx.clone()));
+    }
+
     /// A detached transaction is in a block or the mempool again
     fn reattach(&self, txid: &Hash256) {
         if self.detached_txs.write().remove(txid).is_some() {
@@ -2297,6 +2309,70 @@ impl WalletDb {
     }
 
     /// Get transaction history
+    /// Divi Core's -prunewalletconfs (wallet.cpp:900-920, :1162-1240): drop
+    /// from memory each confirmed wallet transaction whose outputs of ours
+    /// are all spent by a transaction with at least `min_confirmations`
+    /// confirmations, and none of whose inputs is an output of ours of a
+    /// transaction kept. The file keeps them, so the next start without the
+    /// option lists them again. `in_block` gives a confirmed transaction and
+    /// its place in its block; one it cannot give is kept. Transactions are
+    /// looked at after those they spend (divid goes in txid order once its
+    /// sort finds no coinbase, and may drop a spender whose funding it keeps:
+    /// docs/divid-differences.md W4). Returns the counts before and after.
+    pub fn prune_transactions(
+        &self,
+        min_confirmations: i64,
+        tip_height: u32,
+        in_block: impl Fn(&WalletTx) -> Option<(divi_primitives::transaction::Transaction, usize)>,
+    ) -> (usize, usize) {
+        let original = self.transactions.read().len()
+            + self.mempool_txs.read().len()
+            + self.detached_txs.read().len();
+        let mut confirmed: Vec<_> = self
+            .transactions
+            .read()
+            .values()
+            .filter_map(|t| {
+                let height = t.block_height?;
+                let (tx, index) = in_block(t)?;
+                Some((height, index, tx))
+            })
+            .collect();
+        confirmed.sort_by_key(|(height, index, _)| (*height, *index));
+        let pruned: HashSet<Hash256> = {
+            let utxos = self.utxos.read();
+            let spent = self.spent_utxo_data.read();
+            // Spent by a transaction with at least `min_confirmations`
+            let spent_deep = |op: &OutPoint| {
+                spent.get(op).is_some_and(|(_, height)| {
+                    i64::from(tip_height) - i64::from(*height) + 1 >= min_confirmations
+                })
+            };
+            let mut pruned = HashSet::new();
+            for (_, _, tx) in &confirmed {
+                let txid = tx.txid();
+                let outputs_gone = (0..tx.vout.len() as u32).all(|vout| {
+                    let op = OutPoint::new(txid, vout);
+                    !utxos.contains_key(&op) && (!spent.contains_key(&op) || spent_deep(&op))
+                });
+                // An input of ours from a transaction kept keeps this one
+                let from_kept = tx.vin.iter().any(|input| {
+                    spent.contains_key(&input.prevout)
+                        && self.transactions.read().contains_key(&input.prevout.txid)
+                        && !pruned.contains(&input.prevout.txid)
+                });
+                if outputs_gone && !from_kept {
+                    pruned.insert(txid);
+                }
+            }
+            pruned
+        };
+        self.transactions
+            .write()
+            .retain(|txid, _| !pruned.contains(txid));
+        (original, original - pruned.len())
+    }
+
     pub fn get_transactions(&self, count: Option<usize>) -> Vec<WalletTx> {
         let mut list: Vec<_> = self.transactions.read().values().cloned().collect();
         list.extend(self.mempool_txs.read().values().map(|e| e.record.clone()));
@@ -2467,15 +2543,39 @@ impl WalletDb {
                 None => None,
             },
         };
+        // Divi Core's CCryptoKeyStore::Unlock (crypter.cpp:225-250) decrypts the
+        // imported keys in CKeyID order, each checked against its public key: a
+        // key that fails first is a wrong passphrase; one that fails after
+        // another decrypted means the wallet is corrupted, which divid logs (and
+        // then stops on an assert). A CKeyID compares as a little-endian number
+        // (uint256.cpp CompareTo), so by its bytes from the last.
+        let mut stored = db.load_encrypted_secrets()?;
+        stored.sort_by_key(|(hash, _)| {
+            let mut bytes = *hash.as_bytes();
+            bytes.reverse();
+            bytes
+        });
         let mut secrets = Vec::new();
-        for (hash, blob) in db.load_encrypted_secrets()? {
-            let bytes = Zeroizing::new(decrypt_blob(&blob, &master_key)?);
-            let arr: [u8; 32] = bytes
-                .as_slice()
-                .try_into()
-                .map_err(|_| WalletError::Storage("corrupt encrypted private key".into()))?;
-            let secret = divi_crypto::keys::SecretKey::from_bytes(&arr)
-                .map_err(|e| WalletError::Storage(format!("corrupt private key: {}", e)))?;
+        let mut imported_decrypted = false;
+        for (hash, blob) in stored {
+            let entry = self.keystore.get_key(&hash);
+            let imported = entry.as_ref().is_some_and(|e| e.hd_path.is_none());
+            let secret = decrypt_blob(&blob, &master_key).ok().and_then(|bytes| {
+                let bytes = Zeroizing::new(bytes);
+                let arr: [u8; 32] = bytes.as_slice().try_into().ok()?;
+                let secret = divi_crypto::keys::SecretKey::from_bytes(&arr).ok()?;
+                match &entry {
+                    Some(e) if secret.public_key() != e.public => None,
+                    _ => Some(secret),
+                }
+            });
+            let Some(secret) = secret else {
+                if imported && imported_decrypted {
+                    error!("The wallet is probably corrupted: Some keys decrypt but not all.");
+                }
+                return Err(WalletError::WrongPassphrase);
+            };
+            imported_decrypted |= imported;
             secrets.push((hash, secret));
         }
 
@@ -2736,6 +2836,11 @@ impl WalletDb {
         rand::rngs::OsRng.fill_bytes(&mut master_key);
 
         let passphrase_key = Zeroizing::new(derive_key_from_passphrase(passphrase, &salt));
+        // wallet.cpp:949, with irondivid's fixed count
+        info!(
+            "Encrypting Wallet with an nDeriveIterations of {}",
+            PBKDF2_ITERATIONS
+        );
         let sealed_master = seal_master_key(&master_key, &passphrase_key);
 
         // Fill the keypool while the seed is still in the clear: the pool keys go
@@ -2843,6 +2948,11 @@ impl WalletDb {
             .ok_or(WalletError::WrongPassphrase)?;
         let old_key = Zeroizing::new(derive_key_from_passphrase(old_pass, &salt));
         let master_key = open_master_key(&sealed, &old_key)?;
+        // wallet.cpp:836, with irondivid's fixed count
+        info!(
+            "Wallet passphrase changed to an nDeriveIterations of {}",
+            PBKDF2_ITERATIONS
+        );
 
         let mut new_salt = vec![0u8; 16];
         rand::rngs::OsRng.fill_bytes(&mut new_salt);

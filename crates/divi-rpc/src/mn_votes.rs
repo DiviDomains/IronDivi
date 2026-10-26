@@ -32,12 +32,34 @@ const KEEP_DEPTH: i64 = 1000;
 /// ActiveProtocol() without -activeversion (version.cpp:11-17)
 const ACTIVE_PROTOCOL: i32 = 70915;
 
-/// The votes for one block (CMasternodeBlockPayees): the payees in the order
-/// they first got a vote, with their counts, and who voted
-#[derive(Debug, Clone, Default)]
+/// The votes for one block (CMasternodeBlockPayees): its height, the payees
+/// in the order they first got a vote, with their counts, and who voted
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct BlockPayees {
+    height: i32,
     payees: Vec<(Vec<u8>, u32)>,
     voters: HashSet<([u8; 32], u32)>,
+}
+
+/// The file Divi Core keeps the votes in, in its data directory, and its
+/// magic message (MasternodeModule.cpp:272-274, :293-294)
+pub const PAYMENTS_FILE: &str = "mnpayments.dat";
+const PAYMENTS_MAGIC: &str = "magicMasternodePaymentsCache";
+
+/// What reading mnpayments.dat came to, as CFlatDB::Read classes it
+/// (flat-database.h, flat-database.cpp:18-60)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PaymentsFile {
+    /// Read: this many votes, before pruning
+    Loaded(usize),
+    /// No file: one is written at the next stop
+    Missing,
+    /// The checksum and the magic are right but the votes do not parse
+    /// (IncorrectFormat): taken as empty, and the file is written anew
+    BadFormat,
+    /// Any other fault (the checksum, the magic message, the network's magic
+    /// number): divid refuses to start and will not overwrite the file
+    Invalid(&'static str),
 }
 
 #[derive(Default)]
@@ -193,7 +215,10 @@ impl MasternodeVotes {
     fn record(&self, winner: CppWinner, hash: [u8; 32], scoring: Hash256, tip: i64) {
         let mut winners = self.winners.write();
         let mut blocks = self.blocks.write();
-        let entry = blocks.entry(scoring).or_default();
+        let entry = blocks.entry(scoring).or_insert_with(|| BlockPayees {
+            height: winner.height,
+            ..BlockPayees::default()
+        });
         entry
             .voters
             .insert((winner.vin.prevout_hash, winner.vin.prevout_n));
@@ -202,17 +227,89 @@ impl MasternodeVotes {
             None => entry.payees.push((winner.payee.clone(), 1)),
         }
         winners.insert(hash, (winner, scoring));
-        // pruneOutdatedMasternodeWinners
-        let old: Vec<[u8; 32]> = winners
-            .iter()
-            .filter(|(_, (w, _))| tip - w.height as i64 > KEEP_DEPTH)
-            .map(|(h, _)| *h)
-            .collect();
-        for h in old {
-            if let Some((_, s)) = winners.remove(&h) {
-                blocks.remove(&s);
+        prune(&mut winners, &mut blocks, tip);
+    }
+
+    /// mnpayments.dat as Divi Core's CFlatDB writes it (flat-database.h
+    /// Write): the magic message, the network's magic number, the votes as
+    /// MasternodePaymentData serialises them for disk, and the double SHA-256
+    /// of all that
+    fn file_bytes(&self, network_magic: [u8; 4]) -> Vec<u8> {
+        let winners = self.winners.read();
+        let blocks = self.blocks.read();
+        let mut out = Vec::new();
+        write_varbytes(&mut out, PAYMENTS_MAGIC.as_bytes());
+        out.extend_from_slice(&network_magic);
+        // mapMasternodePayeeVotes: hash -> the vote with its scoring block (SER_DISK,
+        // MasternodePaymentWinner.h:59-70), in std::map's order
+        let mut hashes: Vec<&[u8; 32]> = winners.keys().collect();
+        hashes.sort_by(|a, b| cmp_u256(a, b));
+        write_compact_size(&mut out, hashes.len());
+        for h in hashes {
+            let (w, scoring) = &winners[h];
+            out.extend_from_slice(h);
+            out.extend_from_slice(&w.encode());
+            out.extend_from_slice(scoring.as_bytes());
+        }
+        // mapMasternodeBlocks: scoring hash -> height, payees and voters
+        // (MasternodePayeeData.h:25-29, :60-65)
+        let mut scorings: Vec<&Hash256> = blocks.keys().collect();
+        scorings.sort_by(|a, b| cmp_u256(a.as_bytes(), b.as_bytes()));
+        write_compact_size(&mut out, scorings.len());
+        for s in scorings {
+            let b = &blocks[s];
+            out.extend_from_slice(s.as_bytes());
+            out.extend_from_slice(&b.height.to_le_bytes());
+            write_compact_size(&mut out, b.payees.len());
+            for (script, votes) in &b.payees {
+                write_varbytes(&mut out, script);
+                out.extend_from_slice(&(*votes as i32).to_le_bytes());
+            }
+            let mut voters: Vec<&([u8; 32], u32)> = b.voters.iter().collect();
+            voters.sort_by(|a, b| cmp_u256(&a.0, &b.0).then(a.1.cmp(&b.1)));
+            write_compact_size(&mut out, voters.len());
+            for (hash, n) in voters {
+                out.extend_from_slice(hash);
+                out.extend_from_slice(&n.to_le_bytes());
             }
         }
+        let checksum = divi_crypto::double_sha256(&out);
+        out.extend_from_slice(&checksum);
+        out
+    }
+
+    /// Write the votes to `path` at a stop, as SaveMasternodeDataToDisk does
+    /// (MasternodeModule.cpp:284-297). Like CFlatDB::Dump it leaves a file it
+    /// cannot read as its own alone. Ok(false) when it was left
+    pub fn save(&self, path: &std::path::Path, network_magic: [u8; 4]) -> std::io::Result<bool> {
+        if let PaymentsFile::Invalid(_) = read_file(path, network_magic).0 {
+            return Ok(false);
+        }
+        let tmp = path.with_extension("dat.new");
+        std::fs::write(&tmp, self.file_bytes(network_magic))?;
+        std::fs::rename(&tmp, path)?;
+        Ok(true)
+    }
+
+    /// Read the votes from `path` at a start, as LoadMasternodeDataFromDisk
+    /// does (MasternodeModule.cpp:269-280), then drop the ones more than 1000
+    /// blocks below `tip`, as pruneOutdatedMasternodeWinners does within the
+    /// first minute (MasternodeModule.cpp:515-519). Votes already taken are
+    /// kept. What the file came to is returned; Invalid stops a start
+    pub fn load(&self, path: &std::path::Path, network_magic: [u8; 4], tip: i64) -> PaymentsFile {
+        let (outcome, data) = read_file(path, network_magic);
+        if let Some((winners, blocks)) = data {
+            let mut w = self.winners.write();
+            let mut b = self.blocks.write();
+            for (hash, vote) in winners {
+                w.entry(hash).or_insert(vote);
+            }
+            for (scoring, payees) in blocks {
+                b.entry(scoring).or_insert(payees);
+            }
+            prune(&mut w, &mut b, tip);
+        }
+        outcome
     }
 
     /// The payees voted for the block scored with `scoring`, as
@@ -324,5 +421,169 @@ fn atoi(v: &str) -> i64 {
         -n
     } else {
         n
+    }
+}
+
+/// pruneOutdatedMasternodeWinners: the votes for heights more than 1000
+/// below `tip` go, with their block's counts (MasternodePaymentData.cpp:46-61)
+fn prune(
+    winners: &mut HashMap<[u8; 32], (CppWinner, Hash256)>,
+    blocks: &mut HashMap<Hash256, BlockPayees>,
+    tip: i64,
+) {
+    let old: Vec<[u8; 32]> = winners
+        .iter()
+        .filter(|(_, (w, _))| tip - w.height as i64 > KEEP_DEPTH)
+        .map(|(h, _)| *h)
+        .collect();
+    for h in old {
+        if let Some((_, s)) = winners.remove(&h) {
+            blocks.remove(&s);
+        }
+    }
+}
+
+/// uint256's order: the bytes compared from the last
+fn cmp_u256(a: &[u8; 32], b: &[u8; 32]) -> std::cmp::Ordering {
+    a.iter().rev().cmp(b.iter().rev())
+}
+
+fn write_compact_size(out: &mut Vec<u8>, n: usize) {
+    match n {
+        0..=0xfc => out.push(n as u8),
+        0xfd..=0xffff => {
+            out.push(0xfd);
+            out.extend_from_slice(&(n as u16).to_le_bytes());
+        }
+        0x1_0000..=0xffff_ffff => {
+            out.push(0xfe);
+            out.extend_from_slice(&(n as u32).to_le_bytes());
+        }
+        _ => {
+            out.push(0xff);
+            out.extend_from_slice(&(n as u64).to_le_bytes());
+        }
+    }
+}
+
+fn write_varbytes(out: &mut Vec<u8>, bytes: &[u8]) {
+    write_compact_size(out, bytes.len());
+    out.extend_from_slice(bytes);
+}
+
+/// A reader over the bytes of a file; None once they run out
+struct Reader<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        let end = self.pos.checked_add(n)?;
+        let out = self.data.get(self.pos..end)?;
+        self.pos = end;
+        Some(out)
+    }
+    fn array<const N: usize>(&mut self) -> Option<[u8; N]> {
+        self.take(N)?.try_into().ok()
+    }
+    fn u32(&mut self) -> Option<u32> {
+        self.array().map(u32::from_le_bytes)
+    }
+    fn i32(&mut self) -> Option<i32> {
+        self.array().map(i32::from_le_bytes)
+    }
+    fn compact_size(&mut self) -> Option<usize> {
+        Some(match self.take(1)?[0] {
+            0xfd => u16::from_le_bytes(self.array()?) as usize,
+            0xfe => u32::from_le_bytes(self.array()?) as usize,
+            0xff => usize::try_from(u64::from_le_bytes(self.array()?)).ok()?,
+            n => n as usize,
+        })
+    }
+    fn varbytes(&mut self) -> Option<Vec<u8>> {
+        let n = self.compact_size()?;
+        self.take(n).map(<[u8]>::to_vec)
+    }
+}
+
+type FileVotes = (
+    HashMap<[u8; 32], (CppWinner, Hash256)>,
+    HashMap<Hash256, BlockPayees>,
+);
+
+/// The votes as MasternodePaymentData serialises them for disk
+fn parse_votes(r: &mut Reader<'_>) -> Option<FileVotes> {
+    let mut winners = HashMap::new();
+    for _ in 0..r.compact_size()? {
+        let hash: [u8; 32] = r.array()?;
+        let vin = divi_masternode::cpp_wire::CppTxIn {
+            prevout_hash: r.array()?,
+            prevout_n: r.u32()?,
+            script_sig: r.varbytes()?,
+            sequence: r.u32()?,
+        };
+        let winner = CppWinner {
+            vin,
+            height: r.i32()?,
+            payee: r.varbytes()?,
+            signature: r.varbytes()?,
+        };
+        let scoring = Hash256(r.array()?);
+        winners.insert(hash, (winner, scoring));
+    }
+    let mut blocks = HashMap::new();
+    for _ in 0..r.compact_size()? {
+        let scoring = Hash256(r.array()?);
+        let height = r.i32()?;
+        let mut payees = Vec::new();
+        for _ in 0..r.compact_size()? {
+            let script = r.varbytes()?;
+            payees.push((script, r.i32()?.max(0) as u32));
+        }
+        let mut voters = HashSet::new();
+        for _ in 0..r.compact_size()? {
+            voters.insert((r.array()?, r.u32()?));
+        }
+        blocks.insert(
+            scoring,
+            BlockPayees {
+                height,
+                payees,
+                voters,
+            },
+        );
+    }
+    Some((winners, blocks))
+}
+
+/// CFlatDB::Read of mnpayments.dat: the data and its checksum, then the magic
+/// message, the network's magic number and the votes (flat-database.h,
+/// flat-database.cpp:18-60)
+fn read_file(path: &std::path::Path, network_magic: [u8; 4]) -> (PaymentsFile, Option<FileVotes>) {
+    let Ok(bytes) = std::fs::read(path) else {
+        return (PaymentsFile::Missing, None);
+    };
+    // The data is all but the last 32 bytes, which are its double SHA-256
+    if bytes.len() < 32 {
+        return (PaymentsFile::Invalid("the checksum cannot be read"), None);
+    }
+    let (data, checksum) = bytes.split_at(bytes.len() - 32);
+    if divi_crypto::double_sha256(data) != checksum {
+        return (PaymentsFile::Invalid("the checksum does not match"), None);
+    }
+    let mut r = Reader { data, pos: 0 };
+    let (Some(magic), Some(network)) = (r.varbytes(), r.array::<4>()) else {
+        return (PaymentsFile::BadFormat, None);
+    };
+    if network != network_magic {
+        return (PaymentsFile::Invalid("another network's file"), None);
+    }
+    if magic != PAYMENTS_MAGIC.as_bytes() {
+        return (PaymentsFile::Invalid("another kind of file"), None);
+    }
+    match parse_votes(&mut r) {
+        Some(votes) => (PaymentsFile::Loaded(votes.0.len()), Some(votes)),
+        None => (PaymentsFile::BadFormat, None),
     }
 }

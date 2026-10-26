@@ -303,18 +303,14 @@ fn resolve_args(mut args: Args) -> Result<Args> {
 /// option change: -accountlabels (the default account's coins in every send,
 /// rpcwallet.cpp:445-467, :715), -activeversion (the masternode protocol,
 /// version.cpp:11-17), -manual_fork (two fork times, ForkActivation.cpp:50-55),
-/// -override_mnpayee (BlockIncentivesPopulator.cpp:224), -prunewalletconfs
-/// (the wallet's transactions in memory, wallet.cpp:1162-1239),
-/// -stakeupdatetime (PoSTransactionCreator.cpp:116) and -whitelisted_vault
-/// (init.cpp:1182-1191)
+/// -override_mnpayee (BlockIncentivesPopulator.cpp:224) and -stakeupdatetime
+/// (PoSTransactionCreator.cpp:116)
 const UNSUPPORTED_OPTIONS: &[&str] = &[
     "accountlabels",
     "activeversion",
     "manual_fork",
     "override_mnpayee",
-    "prunewalletconfs",
     "stakeupdatetime",
-    "whitelisted_vault",
     "checklevel",
     "par",
 ];
@@ -397,6 +393,7 @@ const APPLIED: &[&str] = &[
     "monthlybackups",
     "vault_min",
     "whitelisted_vault",
+    "prunewalletconfs",
     "rpcuser",
     "rpcpassword",
     "rpcport",
@@ -1755,6 +1752,9 @@ struct WalletOptions {
     /// -whitelisted_vault, each read with ParseHex: vault scripts registered
     /// at every load (init.cpp:1182-1191, :1201)
     whitelisted_vaults: Vec<Vec<u8>>,
+    /// -prunewalletconfs, read as a number: wallet transactions spent that
+    /// deep are left out of memory at the start (init.cpp:1574-1577)
+    prune_wallet_confs: Option<i64>,
 }
 
 /// Divi Core's IsHex (utilstrencodings.cpp:64-71): an even number of hex
@@ -1824,6 +1824,7 @@ impl WalletOptions {
                 .iter()
                 .map(|v| parse_hex_prefix(v))
                 .collect(),
+            prune_wallet_confs: settings.get("prunewalletconfs").map(atoi),
         }
     }
 
@@ -2537,6 +2538,25 @@ async fn run_daemon(
 
             resubmit_wallet_txs(&node, wallet_arc);
 
+            // -prunewalletconfs, at least 20, once the wallet has caught up
+            // with the chain (wallet.cpp:1162-1240, init.cpp:1574-1577)
+            if let Some(confs) = wallet_options.prune_wallet_confs {
+                let chain = node.chain();
+                let (original, kept) =
+                    wallet_arc.prune_transactions(confs.max(20), chain.height(), |t| {
+                        let block = chain.get_block(t.block_hash.as_ref()?).ok()??;
+                        let index = block
+                            .transactions
+                            .iter()
+                            .position(|tx| tx.txid() == t.txid)?;
+                        Some((block.transactions[index].clone(), index))
+                    });
+                info!(
+                    "Pruned wallet transactions loaded to memory: Original {} vs. Current {}",
+                    original, kept
+                );
+            }
+
             // Divi Core checks a day after start, and a day after each check,
             // whether a monthly backup is due; on regtest the day is counted
             // on mock time (LegacyWalletDatabaseEndpointFactory.cpp:111-121,
@@ -2576,6 +2596,14 @@ async fn run_daemon(
                 });
             }
         }
+
+        // Divi Core's debug print at the end of the start, 0 without a
+        // wallet (init.cpp:1613-1618)
+        let (pool, book) = wallet
+            .as_ref()
+            .map_or((0, 0), |w| (w.keypool_size(), w.address_book().len()));
+        info!("Key Pool size = {}", pool);
+        info!("Address Book size = {}", book);
 
         wallet
     };

@@ -225,9 +225,7 @@ fn divid_s_test_aids_are_named_as_not_supported() {
         "activeversion",
         "manual_fork",
         "override_mnpayee",
-        "prunewalletconfs",
         "stakeupdatetime",
-        "whitelisted_vault",
     ];
     let dir = tempfile::tempdir().unwrap();
     let args: Vec<String> = options.iter().map(|o| format!("-{o}=1")).collect();

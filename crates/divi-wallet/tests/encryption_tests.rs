@@ -288,3 +288,85 @@ fn unlock_after_an_unnoticed_timeout_keeps_keys() {
     // A send derives its change key from the HD seed
     wallet.new_change_address().unwrap();
 }
+
+/// The log lines written while `f` runs on this thread
+fn logged<T>(f: impl FnOnce() -> T) -> (T, String) {
+    #[derive(Clone)]
+    struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Buf {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(data);
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let buf = Buf(Default::default());
+    let writer = buf.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .finish();
+    let out = tracing::subscriber::with_default(subscriber, f);
+    let text = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+    (out, text)
+}
+
+/// Change a byte of the stored encrypted secret of `hash` in a closed wallet
+fn damage_encrypted_secret(path: &Path, hash: &[u8]) {
+    let cfs = rocksdb::DB::list_cf(&rocksdb::Options::default(), path).unwrap();
+    let db = rocksdb::DB::open_cf(&rocksdb::Options::default(), path, &cfs).unwrap();
+    let cf = db.cf_handle("wallet_keys").unwrap();
+    // The encrypted secret's key: the key hash, then 0x01 (persistence.rs)
+    let key = [hash, &[0x01]].concat();
+    let mut value = db.get_cf(cf, &key).unwrap().expect("an encrypted secret");
+    let last = value.len() - 5;
+    value[last] ^= 0x5a;
+    db.put_cf(cf, &key, &value).unwrap();
+}
+
+/// As Divi Core's CCryptoKeyStore::Unlock (crypter.cpp:225-250): the imported
+/// keys are decrypted in CKeyID order. One that fails first is a wrong
+/// passphrase; one that fails after another decrypted is logged as a corrupted
+/// wallet (divid then stops on an assert; irondivid stays up and locked)
+#[test]
+fn a_damaged_imported_key_is_a_wrong_passphrase_or_logged_as_corruption() {
+    const CORRUPT: &str = "The wallet is probably corrupted: Some keys decrypt but not all.";
+    for damaged in [0, 1] {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("w");
+        let mut hashes = {
+            let wallet = new_wallet(&path);
+            let hashes: Vec<Vec<u8>> = [[0x31u8; 32], [0x62u8; 32]]
+                .iter()
+                .map(|b| {
+                    let address = wallet.import_key(SecretKey::from_bytes(b).unwrap(), None);
+                    address.hash.as_bytes().to_vec()
+                })
+                .collect();
+            wallet.encrypt_wallet("pw").unwrap();
+            hashes
+        };
+        // In divid's CKeyID order: a little-endian number, compared from the last
+        // byte. The keys are chosen so that a byte-by-byte order is the other one.
+        let mut bytewise = hashes.clone();
+        bytewise.sort();
+        hashes.sort_by_key(|h| h.iter().rev().copied().collect::<Vec<u8>>());
+        assert_ne!(bytewise, hashes, "pick keys whose two orders differ");
+        damage_encrypted_secret(&path, &hashes[damaged]);
+
+        let wallet = WalletDb::open(&path, Network::Testnet).unwrap();
+        let (unlocked, log) = logged(|| wallet.unlock("pw", 60));
+        assert!(
+            matches!(unlocked, Err(WalletError::WrongPassphrase)),
+            "damaged key {damaged}: {unlocked:?}"
+        );
+        assert!(wallet.is_locked());
+        assert_eq!(
+            log.contains(CORRUPT),
+            damaged == 1,
+            "damaged key {damaged}: {log}"
+        );
+    }
+}

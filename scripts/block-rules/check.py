@@ -80,7 +80,7 @@ def ordered(text):
 
 
 class Node:
-    def __init__(self, name, binary, index, extra_conf):
+    def __init__(self, name, binary, index, extra_conf, indexed=True):
         self.name, self.binary = name, binary
         self.dir = os.path.join(WORK, name)
         self.p2p = PORT_BASE + 2 * index
@@ -93,8 +93,7 @@ class Node:
             f"rpcuser=sb{index}", f"rpcpassword={password}",
             "daemon=0", "printtoconsole=0", "server=1", "discover=0", "listenonion=0",
             f"bind={HOST}", f"rpcbind={HOST}", f"rpcallowip={HOST}", "dnsseed=0", "staking=0",
-            "txindex=1", "addressindex=1", "spentindex=1",
-        ] + list(extra_conf)
+        ] + (["txindex=1", "addressindex=1", "spentindex=1"] if indexed else ["txindex=0"]) + list(extra_conf)
         self.write_conf()
         self.proc = None
         self.start()
@@ -817,24 +816,25 @@ def offer(node, hexstr, restore=True, watch=False):
     return ("ok", out)
 
 
-def offer_both(hexstr, restore=True, watch=False):
-    """The block offered to divid B and to irondivid at the same time"""
+def offer_both(hexstr, restore=True, watch=False, nodes=None):
+    """The block offered to divid B and to irondivid (or the two given) at the same time"""
+    nodes = nodes or (B, I)
     out = {}
     def run(n):
         try:
             out[n.name] = offer(n, hexstr, restore, watch)
         except Exception as e:      # shown as the node's answer, not lost with its thread
             out[n.name] = ("ok", {"error": f"{e.__class__.__name__}: {str(e)[:100]}"})
-    threads = [threading.Thread(target=run, args=(n,)) for n in (B, I)]
+    threads = [threading.Thread(target=run, args=(n,)) for n in nodes]
     for t in threads:
         t.start()
     for t in threads:
         t.join()
-    return out[B.name], out[I.name]
+    return out[nodes[0].name], out[nodes[1].name]
 
 
-def check_case(name, hexstr, restore=True, watch=False):
-    core, iron = offer_both(hexstr, restore, watch)
+def check_case(name, hexstr, restore=True, watch=False, nodes=None):
+    core, iron = offer_both(hexstr, restore, watch, nodes)
     compare(name, "block", core, iron)
 
 
@@ -854,17 +854,19 @@ def median_time_past(node):
     return sorted(times)[len(times) // 2]
 
 
-def new_coinstake(node, block, txid, n, tag="stake"):
+def new_coinstake(node, block, txid, n, tag="stake", lock=None):
     """The block's coinstake made again to stake output `n` of `txid` (a coin of
     `node`), signed by `node`: the output of the staker's script takes the coin's
-    value and what the coinstake created"""
+    value and what the coinstake created; `lock` is its lock time, if it must differ from the
+    block's own (so that the coinstake is not one the chain has)"""
     old = block["txs"][1]
     created = sum(o[0] for o in old["vout"])
     spent = sum(sats(rawtx(node, bytes(p[:32][::-1]).hex())["vout"][struct.unpack("<I", p[32:])[0]]["value"])
                 for p, _, _ in old["vin"])
     value = sats(rawtx(node, txid)["vout"][n]["value"])
     tx = {"version": old["version"], "vin": [[outpoint(txid, n), b"", old["vin"][0][2]]],
-          "vout": [[0, b""], [value + created - spent, old["vout"][1][1]]], "lock": old["lock"]}
+          "vout": [[0, b""], [value + created - spent, old["vout"][1][1]]],
+          "lock": old["lock"] if lock is None else lock}
     tx["raw"] = tx_bytes(tx)
     return sign_with(node, tx, [(txid, n)])
 
@@ -1265,6 +1267,82 @@ row("after the payment blocks: a valid block from another peer reaches all three
     f"{B.rpc('getblockcount')}", f"{I.rpc('getblockcount')}",
     B.rpc("getblockcount") == I.rpc("getblockcount") == A.rpc("getblockcount") == h
     and len({n.rpc("getbestblockhash") for n in (A, B, I)}) == 1)
+
+# --- without a transaction index ------------------------------------------------------------------
+
+def log_lines(node, start=None):
+    """The number of lines in the node's debug.log, or the lines from `start`"""
+    with open(os.path.join(node.dir, "debug.log"), errors="replace") as f:
+        lines = f.read().splitlines()
+    return len(lines) if start is None else [l[:240] for l in lines[start:]]
+
+
+def block_staked_by_a():
+    """The newest block A staked, its coinstake's first input (spent by it) and its height"""
+    for h in range(A.rpc("getblockcount"), LAST_POW, -1):
+        cs = coinstake_of(A, h)
+        address = cs["vout"][1]["scriptPubKey"].get("addresses", [""])[0]
+        if address and A.rpc("validateaddress", address)["ismine"]:
+            return h, cs["vin"][0]["txid"], cs["vin"][0]["vout"]
+    raise RuntimeError("A staked no block")
+
+
+def without_index():
+    """A divid and an irondivid with no transaction index (-txindex=0, both new and joined to A:
+    the setting cannot change on a datadir without -reindex). divid reads a spent coin only through
+    the index (TransactionDiskAccessor.cpp:73-86), so: a block that stakes a coin the chain has
+    spent, one that stakes a coin in no block, and then a valid block"""
+    C = Node("divid-C", DIVID, 3, ["listen=1", f"connect={HOST}:{PORT_BASE}"], indexed=False)
+    J = Node("irondivid-J", IRONDIVID, 4, ["listen=1", f"connect={HOST}:{PORT_BASE}"], indexed=False)
+    for n in (C, J):
+        if not n.wait_ready():
+            raise RuntimeError(f"{n.name} did not start without the index")
+    if not wait_for(lambda: len({n.rpc("getbestblockhash") for n in (A, C, J)}) == 1, 300):
+        raise RuntimeError("the nodes without the index did not follow A: " +
+                           str({n.name: n.rpc("getblockcount") for n in (A, C, J)}))
+    nodes = (C, J)
+    height = A.rpc("getblockcount")
+    tip_hash = A.rpc("getbestblockhash")
+    tip_hex = A.rpc("getblock", tip_hash, False)
+    secret = staker_secret(A, parse_block(bytes.fromhex(tip_hex)))
+    _, spent_txid, spent_n = block_staked_by_a()
+    compare("without -txindex: getrawtransaction of the transaction that made a spent stake input",
+            "getrawtransaction", C.call("getrawtransaction", spent_txid), J.call("getrawtransaction", spent_txid))
+    A.rpc("sendtoaddress", A.rpc("getnewaddress"), 5)
+    mempool_txid = A.rpc("getrawmempool")[0]
+    mempool_n = next(k for k, o in enumerate(rawtx(A, mempool_txid)["vout"]) if sats(o["value"]) == 5 * COIN)
+    for label, (txid, n) in (("spent in the chain", (spent_txid, spent_n)), ("in no block yet", (mempool_txid, mempool_n))):
+        # only the coinbase and the coinstake, both made different from the tip's: a block that repeats a
+        # transaction of the chain fails (BIP30) when it is connected, which is not what is looked at here
+        sibling = parse_block(bytes.fromhex(tip_hex))
+        sibling["txs"][1] = new_coinstake(A, sibling, txid, n, lock=1)
+        sibling["txs"] = sibling["txs"][:2]
+        sibling["txs"][0]["vin"][0][1] += b"\x01"
+        mark = log_lines(J)
+        check_case(f"without -txindex: stake input {label}, a sibling of the tip", finish(sibling, secret),
+                   watch=True, nodes=nodes)
+        if TRACE:
+            print("#  J's log:", *log_lines(J, mark), sep="\n#    ", flush=True)
+        on_tip = parse_block(bytes.fromhex(child_of(tip_hex, tip_hash, height + 1, secret)))
+        on_tip["txs"][1] = new_coinstake(A, on_tip, txid, n, lock=1)
+        on_tip["txs"] = on_tip["txs"][:2]
+        on_tip["txs"][0]["vin"][0][1] += b"\x02"
+        mark = log_lines(J)
+        check_case(f"without -txindex: stake input {label}, a block on the tip", finish(on_tip, secret),
+                   watch=True, nodes=nodes)
+        if TRACE:
+            print("#  J's log (block on the tip):", *log_lines(J, mark), sep="\n#    ", flush=True)
+    if not wait_for(lambda: A.call("setgenerate", 1)[0] == "ok" and A.rpc("getblockcount") > height, 120):
+        raise RuntimeError("A could not make a block")
+    h = A.rpc("getblockcount")
+    row("without -txindex: a valid block from A reaches both",
+        f"{C.rpc('getblockcount')}", f"{J.rpc('getblockcount')}",
+        wait_for(lambda: C.rpc("getblockcount") == J.rpc("getblockcount") == h, 60))
+    for n in (C, J):
+        n.stop()
+
+
+without_index()
 
 for n in (A, I, B):
     n.stop()

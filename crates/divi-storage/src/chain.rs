@@ -2314,7 +2314,18 @@ impl Chain {
                 if block.header.prev_block == current_tip.hash {
                     // Simple extension - connect the block atomically
                     debug!("  ├─ Simple extension from tip {}", current_tip.hash);
-                    let (utxo_batch, undo_bytes) = self.connect_block(&block, &mut index)?;
+                    let (utxo_batch, undo_bytes) = match self.connect_block(&block, &mut index) {
+                        Ok(connected) => connected,
+                        Err(e) => {
+                            // Divi Core ChainTipManager::connectTip -> InvalidBlockFound: a block
+                            // that fails to connect is marked failed, so that it is not tried
+                            // again when another block arrives
+                            if Self::is_consensus_invalid(&e) {
+                                self.mark_block_failed(&hash)?;
+                            }
+                            return Err(e);
+                        }
+                    };
                     let accepted_height = index.height;
 
                     // Atomic write: UTXOs + undo data + tip update in single WriteBatch
@@ -7196,6 +7207,43 @@ mod tests {
         assert_eq!(err.misbehaviour_score(), 0);
         assert!(chain.get_block_index(&side_hash).unwrap().is_none());
         assert_eq!(chain.get_chain_tips().unwrap().len(), 1);
+    }
+
+    /// A block on the tip that fails to connect (it spends a coin that is not there)
+    /// is marked failed, as Divi Core does in InvalidBlockFound. It was left as the
+    /// best candidate, and the next block to arrive was refused for its error.
+    #[test]
+    fn a_tip_block_that_fails_to_connect_is_not_tried_again() {
+        let (chain, _dir) = create_test_chain();
+        let (genesis_hash, genesis_time) = get_genesis_info(&chain);
+        let block1 = create_child_block(genesis_hash, genesis_time);
+        let hash1 = chain.accept_block(block1.clone()).unwrap().hash;
+
+        let mut bad = create_child_block(hash1, block1.header.time);
+        bad.transactions.push(Transaction {
+            version: 1,
+            vin: vec![TxIn {
+                prevout: OutPoint::new(Hash256::from_bytes([7u8; 32]), 0),
+                script_sig: Script::from_bytes(vec![]),
+                sequence: 0xffffffff,
+            }],
+            vout: vec![TxOut::new(
+                Amount::from_sat(1_00000000),
+                Script::new_p2pkh(&[0x99; 20]),
+            )],
+            lock_time: 0,
+        });
+        seal(&mut bad);
+        let bad_hash = compute_block_hash(&bad.header);
+        assert!(chain.accept_block(bad).is_err());
+        assert_eq!(chain.height(), 1);
+        assert!(chain.get_block_index(&bad_hash).unwrap().unwrap().failed());
+
+        // a sibling of block 1 is a block of a side chain, which runs the choice of
+        // the best chain again: it is stored, whatever the bad block holds
+        let side = create_child_block(genesis_hash, genesis_time + 5);
+        chain.accept_block(side).unwrap();
+        assert_eq!(chain.height(), 1);
     }
 
     #[test]

@@ -530,6 +530,21 @@ def views(when, pairs=None, stale=False):
         q = f"{p}{side} "
         for args in ([], ["*", 1, True], ["*", 0]):
             compare(f"{q}getbalance {json.dumps(args)}", c.call("getbalance", *args), i.call("getbalance", *args))
+        # Each account's balance (divid GetAccountBalance, rpcwallet.cpp:383-415:
+        # credits at minconf or deeper, less debits and fees, leaving out an
+        # immature transaction and a conflicted one, at depth < 0), the default
+        # one and every one either wallet has
+        accounts = {""}
+        for n in (c, i):
+            got = n.call("listaccounts", 0)
+            if got[0] == "ok" and isinstance(got[1], dict):
+                accounts |= set(got[1])
+        for account in sorted(accounts):
+            for minconf in (1, 0):
+                compare(f"{q}getbalance {json.dumps(account)} {minconf}", c.call("getbalance", account, minconf),
+                        i.call("getbalance", account, minconf))
+        for minconf in (1, 0):
+            compare(f"{q}listaccounts {minconf}", c.call("listaccounts", minconf), i.call("listaccounts", minconf))
         compare(f"{q}getunconfirmedbalance", c.call("getunconfirmedbalance"), i.call("getunconfirmedbalance"))
         compare(f"{q}listunspent", c.call("listunspent"), i.call("listunspent"),
                 order=lambda u: (u.get("txid", ""), u.get("vout", 0)), drop=MOMENT | {"ischange", "solvable"})
@@ -537,6 +552,12 @@ def views(when, pairs=None, stale=False):
                 i.call("listtransactions", "*", 100, 0, True), order=txkey)
         for what, txid in TXS:
             cg, ig = c.call("gettransaction", txid, True), i.call("gettransaction", txid, True)
+            # Which transactions this view finds conflicted (depth < 0), for the
+            # account balance rows above
+            if cg[0] == "ok" and isinstance(cg[1], dict) and cg[1].get("confirmations", 0) < 0:
+                ic = ig[1].get("confirmations") if ig[0] == "ok" and isinstance(ig[1], dict) else ig[0]
+                print(f"# {q}conflicted: {what} {txid[:8]}, confirmations divid {cg[1]['confirmations']}, "
+                      f"irondivid {ic}", flush=True)
             if stale and side == "manager" and what.startswith("vault 1 coin") and cg[0] == ig[0] == "ok":
                 compare(f"{q}gettransaction of {what} {txid[:8]}", cg, ig, drop=MOMENT | NOTES | {"amount"})
                 row(f"{q}gettransaction of {what} amount (divid's cached credit)", cg[1]["amount"], ig[1]["amount"],
