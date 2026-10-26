@@ -44,7 +44,7 @@ A test peer of the script's own speaks the regtest wire protocol (version 70915)
 
 | group | what is done, and compared |
 |---|---|
-| files | after one start and clean stop, each file of divid's data directory (its `regtest/` folder merged in): present in irondivid's too; and irondivid's files divid has not |
+| files | after one start and clean stop, each file of divid's data directory (its `regtest/` folder merged in): present in irondivid's too; irondivid's files divid has not; and `mncache.dat` and `netfulfilled.dat` byte for byte (with no peer and no masternode both write the same empty caches) |
 | addresses | the test peer gossips 100 public addresses (each in its own /16) in one `addr`; a new connection asks `getaddr`: right away, after a clean restart, after a `kill -9` and start, and after gossip then a `kill -9` and start. divid answers with 23% of what it holds (`ADDRMAN_GETADDR_MAX_PCT`; a bucket collision can drop one or two of the 100, so 15-23 count as "about 23%"); connections after the restart |
 | bans | a peer of an old protocol version (70000, below divid's 70915) is disconnected and banned, local or not (`main.cpp:370-377`); `listbanned` names it; it cannot connect again; after a restart (divid keeps bans in memory only, `PeerBanningService.h`); after `clearbanned` |
 | masternode list | `listmasternodes` after a restart |
@@ -61,13 +61,10 @@ Core paths are under `divi/src/` of the Divi Core source at v3.0.0 (commit 9e2f7
 
 Each KNOWN row checks the difference is exactly the one below; any other outcome is a FAIL.
 
-- `file blocks/`, `file db.log`, `file wallet.dat`, `file mncache.dat`, `file sporks/`: irondivid keeps the same data
-  in its own stores (blocks and the masternode list and sporks in its chain database, the wallet in `wallet/`), not in
-  files of divid's format; divid never reads irondivid's data directory.
+- `file blocks/`, `file db.log`, `file wallet.dat`, `file sporks/`: irondivid keeps the same data in its own stores
+  (blocks and sporks in its chain database, the wallet in `wallet/`), not in files of divid's format; divid never
+  reads irondivid's data directory.
 - `files only irondivid has`: `wallet/` and `txindex/`, its own stores.
-- `mncache.dat empty|truncated|garbage: start`: divid refuses to start on a `mncache.dat` it cannot read ("Error:
-  Failed to load masternode cache from"): `CFlatDB::Load` gives up on anything but a readable header with bad data
-  (`flat-database.h:225-245`, `MasternodeModule.cpp:262-266`). irondivid does not read `mncache.dat` and starts.
 - `masternode list and payment votes kept across a restart` is not run: regtest has no masternode network to fill the
   list or send votes.
 

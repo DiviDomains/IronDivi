@@ -50,26 +50,13 @@ def elsewhere(where):
             "data directory)", absent)
 
 
-def mncache_refused(c, i):
-    return c[0] == "exit" and c[1] == 1 and "Failed to load masternode cache" in c[2] and i[0] == "up"
-
-
-MNCACHE = ("divid refuses to start on a mncache.dat it cannot read (CFlatDB::Load returns false for anything "
-           "but a readable header with bad data, flat-database.h:225-245; MasternodeModule.cpp:262-266); "
-           "irondivid keeps its masternode list in its chain database and does not read mncache.dat",
-           mncache_refused)
-
 KNOWN = {
     "file blocks/": elsewhere("its chain database (chainstate/), blocks included"),
     "file db.log": elsewhere("its wallet database (wallet/, RocksDB), which writes no Berkeley DB log"),
     "file wallet.dat": elsewhere("wallet/ (RocksDB)"),
-    "file mncache.dat": elsewhere("its chain database (the masternode list, crates/divi-node/src/node.rs)"),
     "file sporks/": elsewhere("its chain database (spork_<id> entries, crates/divi-network/src/spork.rs)"),
     "files only irondivid has": ("its own stores: wallet/ (the wallet), txindex/ (the transaction index, which "
                                  "divid keeps in blocks/index)", lambda c, i: i - c <= {"wallet/", "txindex/"}),
-    "mncache.dat empty: start": MNCACHE,
-    "mncache.dat truncated: start": MNCACHE,
-    "mncache.dat garbage: start": MNCACHE,
 }
 
 fails = 0
@@ -449,6 +436,17 @@ for name in sorted(c_names):
     row(f"file {name}", "present", "present" if name in i_names else "absent", name in i_names)
 row("files only irondivid has", "-", ",".join(sorted(i_names - c_names)) or "-", not (i_names - c_names),
     (c_names, i_names))
+
+
+def file_hex(node, fname):
+    path = os.path.join(node.net_dir(), fname)
+    return open(path, "rb").read().hex() if os.path.exists(path) else "absent"
+
+
+# With no peer and no masternode, both write the same empty caches
+for fname in ("mncache.dat", "netfulfilled.dat"):
+    c, i = file_hex(C, fname), file_hex(I, fname)
+    row(f"{fname} of a new data directory: bytes", c, i, c == i)
 
 # --- addresses learnt from gossip --------------------------------------------------------
 
