@@ -22,6 +22,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::proxy::ProxyTrust;
 use crate::scan::{ScanInfo, ScanState, ScanStatus};
 use axum::extract::{ConnectInfo, Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -143,24 +144,25 @@ impl<K: Hash + Eq> RateLimiter<K> {
     }
 }
 
-/// The limiter and whether its key may come from proxy headers.
+/// The limiter and which peers may name the client in proxy headers.
 #[derive(Clone)]
 struct RateState {
     limiter: Arc<RateLimiter>,
-    trust_proxy_headers: bool,
+    proxy: ProxyTrust,
 }
 
 /// The address a request is rate limited under. The peer address comes from the connection
 /// (`ConnectInfo`); a router served without it (in-process tests) shares one
-/// unspecified-address bucket. With `trust_proxy_headers` the LAST address in
-/// `X-Forwarded-For` (else `X-Real-IP`) wins when it parses, else the peer address: the last
-/// entry is the one the nearest proxy wrote (nginx's `$proxy_add_x_forwarded_for` appends
-/// `$remote_addr`), while earlier entries are whatever the client sent. Without
-/// it the headers are never read: any client can send them, so honouring them by default
-/// would let it pick its own bucket and defeat the limit.
-fn client_ip(headers: &HeaderMap, peer: Option<IpAddr>, trust_proxy_headers: bool) -> IpAddr {
+/// unspecified-address bucket. When `proxy` trusts the peer (`trust_proxy_headers` on and the
+/// peer in `trusted_proxies`), the LAST address in `X-Forwarded-For` (else `X-Real-IP`) wins
+/// when it parses, else the peer address: the last entry is the one the nearest proxy wrote
+/// (nginx's `$proxy_add_x_forwarded_for` appends `$remote_addr`), while earlier entries are
+/// whatever the client sent. From any other peer the headers are never read: any client can
+/// send them, so honouring them from a client that reached the daemon directly would let it
+/// pick its own bucket and defeat the limit.
+fn client_ip(headers: &HeaderMap, peer: Option<IpAddr>, proxy: &ProxyTrust) -> IpAddr {
     let peer = peer.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
-    if !trust_proxy_headers {
+    if !proxy.trusts(peer) {
         return peer;
     }
     let header_ip = |name: &str, first_of_list: bool| -> Option<IpAddr> {
@@ -178,12 +180,12 @@ fn client_ip(headers: &HeaderMap, peer: Option<IpAddr>, trust_proxy_headers: boo
 }
 
 /// [`client_ip`] of a request, its peer taken from `ConnectInfo`.
-fn request_ip(req: &Request, trust_proxy_headers: bool) -> IpAddr {
+fn request_ip(req: &Request, proxy: &ProxyTrust) -> IpAddr {
     let peer = req
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|c| c.0.ip());
-    client_ip(req.headers(), peer, trust_proxy_headers)
+    client_ip(req.headers(), peer, proxy)
 }
 
 fn too_many() -> Response {
@@ -192,7 +194,7 @@ fn too_many() -> Response {
 
 /// 429 past the limit.
 async fn rate_limit(State(l): State<RateState>, req: Request, next: Next) -> Response {
-    let ip = request_ip(&req, l.trust_proxy_headers);
+    let ip = request_ip(&req, &l.proxy);
     if l.limiter.allow(ip, Instant::now()) {
         next.run(req).await
     } else {
@@ -209,7 +211,7 @@ struct XmrGate {
     /// Requests without it, as token misses per IP ([`XMR_TOKEN_MISS_LIMIT_PER_WINDOW`]),
     /// shared with the hashlock `:id` routes. No per-IP bucket: the misses bind first.
     misses: Arc<RateLimiter>,
-    trust_proxy_headers: bool,
+    proxy: ProxyTrust,
 }
 
 /// Gate for every `/xmr/swaps/:id...` route, run before the body is parsed (a 422 for a bad
@@ -238,7 +240,7 @@ async fn xmr_swap_gate(
             too_many()
         };
     }
-    let ip = request_ip(&req, g.trust_proxy_headers);
+    let ip = request_ip(&req, &g.proxy);
     refuse(None, &g.misses, ip, now, || {
         ApiError(StatusCode::NOT_FOUND, format!("no xmr swap {id}")).into_response()
     })
@@ -323,7 +325,7 @@ struct SwapGate {
     /// Token misses per IP on both hashlock `:id` routes ([`XMR_TOKEN_MISS_LIMIT_PER_WINDOW`]),
     /// shared with the XMR ones.
     misses: Arc<RateLimiter>,
-    trust_proxy_headers: bool,
+    proxy: ProxyTrust,
 }
 
 /// Gate for `GET /swaps/:id` and `POST /swaps/:id/lock`, run before the body is parsed. A swap
@@ -346,7 +348,7 @@ async fn hashlock_token_gate(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     let now = Instant::now();
-    let ip = request_ip(&req, g.trust_proxy_headers);
+    let ip = request_ip(&req, &g.proxy);
     let allowed = match g.auth.store.get_doc::<TokenDoc>(TOKEN_KIND, id) {
         Ok(Some(d)) if token_matches(&d.token, given) => g.per_swap.allow(id.to_owned(), now),
         Ok(None) if matches!(g.maker.view(id), Ok(Some(_))) => {
@@ -417,7 +419,8 @@ pub fn router_with_xmr(state: AppState, xmr: Option<Arc<XmrMaker>>, prefix: &str
 
 /// [`router_with_xmr`] with `trust_proxy_headers`: key the rate limit on the client address
 /// a reverse proxy you control puts in `X-Forwarded-For`/`X-Real-IP` instead of the socket
-/// peer (which is the proxy's own address for every client).
+/// peer (which is the proxy's own address for every client), for requests from a proxy on this
+/// host ([`ProxyTrust::loopback`], the default `trusted_proxies`).
 pub fn router_with_proxy(
     state: AppState,
     xmr: Option<Arc<XmrMaker>>,
@@ -427,17 +430,24 @@ pub fn router_with_proxy(
     // Swap tokens in memory only, no operator token: for in-process tests. The daemon calls
     // `router_with_auth` with the maker's own store.
     let auth = HashlockAuth::new(Store::in_memory().expect("in-memory store"));
-    router_with_auth(state, xmr, prefix, trust_proxy_headers, auth)
+    let proxy = if trust_proxy_headers {
+        ProxyTrust::loopback()
+    } else {
+        ProxyTrust::off()
+    };
+    router_with_auth(state, xmr, prefix, proxy, auth)
 }
 
 /// [`router_with_proxy`] with the hashlock routes' credentials: every `/swaps/:id` call needs
 /// the swap's `X-Swap-Token` (the same 404 as an unknown id otherwise; a swap with no token on
 /// record is legacy and stays open), and `GET /swaps` needs the operator token (else 404).
+/// `proxy` names the peers whose `X-Forwarded-For`/`X-Real-IP` the rate limits key on
+/// ([`ProxyTrust::off`]: none).
 pub fn router_with_auth(
     state: AppState,
     xmr: Option<Arc<XmrMaker>>,
     prefix: &str,
-    trust_proxy_headers: bool,
+    proxy: ProxyTrust,
     auth: HashlockAuth,
 ) -> Router {
     let write_ips = Arc::new(RateLimiter::new(WRITE_LIMIT_PER_WINDOW, RATE_WINDOW));
@@ -455,7 +465,7 @@ pub fn router_with_auth(
                 legacy: Arc::new(RateLimiter::new(max, RATE_WINDOW)),
                 per_ip: per_ip.clone(),
                 misses: misses.clone(),
-                trust_proxy_headers,
+                proxy: proxy.clone(),
             },
             hashlock_token_gate,
         )
@@ -463,14 +473,14 @@ pub fn router_with_auth(
     let operator = middleware::from_fn_with_state(auth.clone(), operator_gate);
     let rate = RateState {
         limiter: Arc::new(RateLimiter::new(RATE_LIMIT_PER_WINDOW, RATE_WINDOW)),
-        trust_proxy_headers,
+        proxy: proxy.clone(),
     };
     let limited = || middleware::from_fn_with_state(rate.clone(), rate_limit);
     let on = |limiter: Arc<RateLimiter>| {
         middleware::from_fn_with_state(
             RateState {
                 limiter,
-                trust_proxy_headers,
+                proxy: proxy.clone(),
             },
             rate_limit,
         )
@@ -519,7 +529,7 @@ pub fn router_with_auth(
                                     RATE_WINDOW,
                                 )),
                                 misses: misses.clone(),
-                                trust_proxy_headers,
+                                proxy: proxy.clone(),
                             },
                             xmr_swap_gate,
                         )),
@@ -769,44 +779,88 @@ mod tests {
         h
     }
 
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
     #[test]
     fn proxy_headers_are_ignored_unless_trusted() {
-        let peer: IpAddr = "10.0.0.9".parse().unwrap();
+        let peer = ip("127.0.0.1");
         let h = headers(&[
             ("x-forwarded-for", "203.0.113.7"),
             ("x-real-ip", "203.0.113.8"),
         ]);
+        let off = ProxyTrust::off();
         assert_eq!(
-            client_ip(&h, Some(peer), false),
+            client_ip(&h, Some(peer), &off),
             peer,
-            "default: spoofable, so unread"
+            "flag off: spoofable, so unread, even from loopback"
+        );
+        assert_eq!(client_ip(&h, None, &off), IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        assert_eq!(
+            client_ip(&h, None, &ProxyTrust::loopback()),
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            "no peer address: nothing to trust"
+        );
+    }
+
+    /// Fails on 75c9b7c, where the flag alone made any peer's headers count (the key was
+    /// 1.2.3.4).
+    #[test]
+    fn an_untrusted_peer_is_keyed_on_itself_whatever_its_headers_say() {
+        let proxy = ProxyTrust::loopback();
+        let peer = ip("203.0.113.9");
+        let xff = headers(&[("x-forwarded-for", "1.2.3.4")]);
+        assert_eq!(client_ip(&xff, Some(peer), &proxy), peer);
+        let real = headers(&[("x-real-ip", "1.2.3.4")]);
+        assert_eq!(client_ip(&real, Some(peer), &proxy), peer);
+        assert_eq!(
+            client_ip(&xff, Some(ip("127.0.0.2")), &proxy),
+            ip("127.0.0.2"),
+            "127.0.0.1/32 only"
+        );
+        let elsewhere = ProxyTrust::proxies(["10.0.0.0/8".parse().unwrap()]);
+        assert_eq!(
+            client_ip(&xff, Some(ip("127.0.0.1")), &elsewhere),
+            ip("127.0.0.1"),
+            "loopback is trusted only when listed"
         );
         assert_eq!(
-            client_ip(&h, None, false),
-            IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+            client_ip(&xff, Some(ip("10.2.3.4")), &elsewhere),
+            ip("1.2.3.4")
         );
     }
 
     #[test]
     fn trusted_proxy_headers_pick_the_client_and_garbage_falls_back() {
-        let peer: IpAddr = "10.0.0.9".parse().unwrap();
-        let ip = |s: &str| -> IpAddr { s.parse().unwrap() };
+        let proxy = ProxyTrust::loopback();
+        let peer = ip("127.0.0.1");
         let xff = headers(&[("x-forwarded-for", "10.1.1.1, 203.0.113.7")]);
         assert_eq!(
-            client_ip(&xff, Some(peer), true),
+            client_ip(&xff, Some(peer), &proxy),
             ip("203.0.113.7"),
             "last entry: the one the proxy wrote"
         );
+        assert_eq!(
+            client_ip(&xff, Some(ip("::1")), &proxy),
+            ip("203.0.113.7"),
+            "IPv6 loopback"
+        );
+        assert_eq!(
+            client_ip(&xff, Some(ip("::ffff:127.0.0.1")), &proxy),
+            ip("203.0.113.7"),
+            "IPv4 loopback on a dual-stack listener"
+        );
         let v6 = headers(&[("x-forwarded-for", " 2001:db8::1 ")]);
-        assert_eq!(client_ip(&v6, Some(peer), true), ip("2001:db8::1"));
+        assert_eq!(client_ip(&v6, Some(peer), &proxy), ip("2001:db8::1"));
         let real = headers(&[("x-real-ip", "203.0.113.8")]);
-        assert_eq!(client_ip(&real, Some(peer), true), ip("203.0.113.8"));
+        assert_eq!(client_ip(&real, Some(peer), &proxy), ip("203.0.113.8"));
         let both = headers(&[
             ("x-forwarded-for", "203.0.113.7"),
             ("x-real-ip", "203.0.113.8"),
         ]);
         assert_eq!(
-            client_ip(&both, Some(peer), true),
+            client_ip(&both, Some(peer), &proxy),
             ip("203.0.113.7"),
             "XFF before X-Real-IP"
         );
@@ -814,13 +868,13 @@ mod tests {
             ("x-forwarded-for", "nonsense"),
             ("x-real-ip", "203.0.113.8"),
         ]);
-        assert_eq!(client_ip(&bad_xff, Some(peer), true), ip("203.0.113.8"));
+        assert_eq!(client_ip(&bad_xff, Some(peer), &proxy), ip("203.0.113.8"));
         let garbage = headers(&[("x-forwarded-for", "nonsense"), ("x-real-ip", "also,bad")]);
         assert_eq!(
-            client_ip(&garbage, Some(peer), true),
+            client_ip(&garbage, Some(peer), &proxy),
             peer,
             "socket address"
         );
-        assert_eq!(client_ip(&HeaderMap::new(), Some(peer), true), peer);
+        assert_eq!(client_ip(&HeaderMap::new(), Some(peer), &proxy), peer);
     }
 }

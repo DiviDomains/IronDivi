@@ -33,7 +33,8 @@ use divi_swap_xmr::mock::{
 use divi_swap_xmr::taker::JNext;
 use divi_swap_xmr::{XmrConfig, XmrMaker, XmrMakerState, XmrTaker, XmrTakerState};
 use divi_swapd::{
-    mock_xmr_offers, router_with_auth, spawn_scheduler, AppState, HashlockAuth, ScanStatus,
+    mock_xmr_offers, router_with_auth, spawn_scheduler, AppState, HashlockAuth, ProxyTrust,
+    ScanStatus,
 };
 use tokio::task::JoinHandle;
 
@@ -152,9 +153,21 @@ async fn serve_with(w: &World, db: &std::path::Path, trust_proxy_headers: bool) 
     let base = format!("http://{}/swap", listener.local_addr().unwrap());
     let auth = HashlockAuth::new(Store::in_memory().unwrap())
         .with_operator_token(Some(OPERATOR_TOKEN.into()));
-    let app = router_with_auth(state, Some(xmr.clone()), "/swap", trust_proxy_headers, auth);
+    // With the flag on, the test's loopback connections are the proxy (the default
+    // `trusted_proxies`).
+    let proxy = if trust_proxy_headers {
+        ProxyTrust::loopback()
+    } else {
+        ProxyTrust::off()
+    };
+    let app = router_with_auth(state, Some(xmr.clone()), "/swap", proxy, auth);
     let server = tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
     });
     Daemon {
         base,

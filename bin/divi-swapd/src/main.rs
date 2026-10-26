@@ -908,7 +908,7 @@ async fn main() -> Result<()> {
         },
         xmr,
         &cfg.prefix(),
-        cfg.trust_proxy_headers,
+        cfg.proxy_trust(),
         hashlock_auth,
     );
     let listener = tokio::net::TcpListener::bind(cfg.listen)
@@ -918,6 +918,13 @@ async fn main() -> Result<()> {
         listen = %cfg.listen, backend = ?kind,
         swap_listing = cfg.operator_token_file.is_some(),
         tokenless_swaps = cfg.allow_tokenless_swaps,
+        trust_proxy_headers = cfg.trust_proxy_headers,
+        trusted_proxies = %cfg
+            .trusted_proxies
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
         "divi-swapd up"
     );
     if let Some(job) = scan_job {

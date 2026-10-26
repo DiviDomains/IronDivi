@@ -3,6 +3,7 @@
 profile = "testnet"          # 6h/3h timeouts, 1 BTC / 3 DIVI confirmations
 listen = "127.0.0.1:18480"   # loopback only; takers use an SSH tunnel (nginx /swap/ is opt-in: deploy.sh NGINX=1, DECISIONS #7)
 # trust_proxy_headers = true  # rate-limit on the LAST X-Forwarded-For entry (else X-Real-IP); ONLY behind a proxy you control that sets it (nginx-swap.conf sets $remote_addr) (default false)
+# trusted_proxies = ["127.0.0.1/32", "::1/128"]  # peers whose proxy headers count when trust_proxy_headers is on; any other peer is keyed on its own address. Addresses or CIDR networks; on with an empty list is refused at start (default: loopback)
 db_path = "/var/lib/divi-swapd/swaps.db"
 # operator_token_file = "/etc/divi-swapd/operator.token"  # root:divi-swapd 0640, one random line. GET /swaps (the full listing) needs this value in X-Operator-Token; UNSET = the listing is a 404 for everyone, and swap-watch/redeploy-maker cannot read it. Create it BEFORE installing this version.
 # allow_tokenless_swaps = true  # default false. false: a taker that does not send X-Swap-Token-Support: 1 gets 426 on accept (old takers must upgrade). true: it gets a swap with no token, open by id like before (weak)

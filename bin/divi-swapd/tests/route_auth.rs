@@ -27,7 +27,7 @@ use divi_swap::api::{AcceptRequest, SwapView};
 use divi_swap::{Store, SwapState};
 use divi_swap_cli::{flow, MakerClient, Sessions};
 use divi_swapd::{
-    router_with_auth, AppState, HashlockAuth, ScanStatus, READ_LIMIT_PER_WINDOW,
+    router_with_auth, AppState, HashlockAuth, ProxyTrust, ScanStatus, READ_LIMIT_PER_WINDOW,
     WRITE_LIMIT_PER_WINDOW, XMR_TOKEN_MISS_LIMIT_PER_WINDOW,
 };
 use serde_json::{json, Value};
@@ -46,8 +46,8 @@ async fn serve_with(w: &World, operator: Option<&str>, tokenless: bool) -> Serve
     serve_opts(w, operator, tokenless, false).await
 }
 
-/// [`serve_with`], and `trust_proxy_headers` (a test picks its address with
-/// `X-Forwarded-For`).
+/// [`serve_with`], and `trust_proxy_headers` with the default `trusted_proxies` (the test's
+/// loopback connections are the proxy; a test picks its address with `X-Forwarded-For`).
 async fn serve_opts(
     w: &World,
     operator: Option<&str>,
@@ -63,11 +63,21 @@ async fn serve_opts(
     let auth = HashlockAuth::new(Store::in_memory().unwrap())
         .with_operator_token(operator.map(str::to_string))
         .allow_tokenless(tokenless);
-    let app = router_with_auth(state, None, "/swap", trust_proxy_headers, auth);
+    let proxy = if trust_proxy_headers {
+        ProxyTrust::loopback()
+    } else {
+        ProxyTrust::off()
+    };
+    let app = router_with_auth(state, None, "/swap", proxy, auth);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}/swap", listener.local_addr().unwrap());
     let handle = tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
     });
     Served { base, handle }
 }

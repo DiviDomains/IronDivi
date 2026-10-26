@@ -17,6 +17,7 @@
 //! Maker daemon: HTTP API over [`divi_swap::Maker`] plus the scheduler that drives it.
 
 pub mod config;
+pub mod proxy;
 pub mod routes;
 pub mod scan;
 pub mod scheduler;
@@ -25,6 +26,7 @@ pub use config::{
     mock_counter_offers, mock_divi_per_coin, mock_xmr_offers, BackendKind, BtcSection,
     DaemonConfig, LtcSection, UsdcSection, XmrSection, ZecSection, MOCK_ONLY_CHAINS,
 };
+pub use proxy::{IpCidr, ProxyTrust, DEFAULT_TRUSTED_PROXIES};
 pub use routes::{
     router, router_with_auth, router_with_proxy, router_with_xmr, AppState, HashlockAuth,
     RateLimiter, PUBLIC_READ_LIMIT_PER_WINDOW, RATE_LIMIT_PER_WINDOW, RATE_WINDOW,
