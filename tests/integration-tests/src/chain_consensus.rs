@@ -27,7 +27,7 @@ use divi_primitives::{
     transaction::{OutPoint, Transaction, TxIn, TxOut},
     ChainMode,
 };
-use divi_storage::{Chain, ChainDatabase, ChainParams, NetworkType};
+use divi_storage::{Chain, ChainDatabase, ChainParams, NetworkType, StorageError};
 use std::sync::Arc;
 use tempfile::tempdir;
 
@@ -398,7 +398,10 @@ fn test_reject_block_with_invalid_merkle_root() {
     bad_block.header.merkle_root = Hash256::from_bytes([0xff; 32]);
 
     let result = chain.accept_block(bad_block);
-    assert!(result.is_err());
+    assert!(
+        matches!(&result, Err(StorageError::InvalidBlock(r)) if r.starts_with("bad-txnmrklroot")),
+        "{result:?}"
+    );
 }
 
 #[test]
@@ -409,7 +412,10 @@ fn test_reject_orphan_block() {
     let orphan = create_child_block(1, Hash256::from_bytes([0xaa; 32]), 1000000100, [0x01; 20]);
     let result = chain.accept_block(orphan);
 
-    assert!(result.is_err());
+    assert!(
+        matches!(result, Err(StorageError::OrphanBlock(_))),
+        "{result:?}"
+    );
 }
 
 #[test]
@@ -431,7 +437,10 @@ fn test_reject_block_with_future_timestamp() {
     future_block.header.merkle_root = compute_merkle_root(&future_block.transactions);
 
     let result = chain.accept_block(future_block);
-    assert!(result.is_err());
+    assert!(
+        matches!(&result, Err(StorageError::InvalidBlockScored { reason, .. }) if reason.starts_with("time-too-new")),
+        "{result:?}"
+    );
 }
 
 // ============================================================
