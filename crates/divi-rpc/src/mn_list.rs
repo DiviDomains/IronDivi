@@ -277,8 +277,13 @@ impl MasternodeList {
     }
 
     /// Write the list to `path` as Divi Core writes mncache.dat, which it
-    /// does only at a stop (SaveMasternodeDataToDisk, MasternodeModule.cpp:284-297)
+    /// does only at a stop (SaveMasternodeDataToDisk, MasternodeModule.cpp:284-297).
+    /// Like CFlatDB::Dump it leaves a file it cannot read as its own alone
+    /// (flat-database.h:247-268). Ok(false) when it was left
     pub fn save_file(&self, path: &Path, network_magic: [u8; 4]) -> std::io::Result<bool> {
+        if let Err(Header::Invalid(_)) = flat_file::read(path, MNCACHE_MAGIC, network_magic) {
+            return Ok(false);
+        }
         let bytes = flat_file::bytes(MNCACHE_MAGIC, network_magic, &self.file_data(now()));
         let tmp = path.with_extension("dat.new");
         std::fs::write(&tmp, bytes)?;
@@ -1171,5 +1176,42 @@ mod tests {
         assert!(back.entries()[1].vin_spent);
         let state = back_sync.lock();
         assert_eq!(state.sync.list_asks(), (&asked_us, &we_asked));
+    }
+
+    /// As CFlatDB::Load classes mncache.dat: missing or with data that does
+    /// not parse, the list starts empty; any other fault is Invalid, and a
+    /// write then leaves the file as it was (flat-database.h:225-268)
+    #[test]
+    fn a_mncache_dat_divid_cannot_read_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(MNCACHE_FILE);
+        let list = MasternodeList::new();
+        assert_eq!(list.load_file(&path, MAGIC), MncacheFile::Missing);
+
+        assert!(list.save_file(&path, MAGIC).unwrap());
+        assert_eq!(
+            list.load_file(&path, [0; 4]),
+            MncacheFile::Invalid("another network's file")
+        );
+        assert!(!list.save_file(&path, [0; 4]).unwrap());
+
+        // Right header and checksum, a masternode count with nothing after it
+        std::fs::write(&path, flat_file::bytes(MNCACHE_MAGIC, MAGIC, &[1])).unwrap();
+        *list.entries.write() = vec![NetworkMasternode {
+            mnb: mnb(7, now()),
+            vin_spent: false,
+        }];
+        assert_eq!(list.load_file(&path, MAGIC), MncacheFile::BadFormat);
+        assert!(list.save_file(&path, MAGIC).unwrap());
+
+        for garbage in [&b""[..], b"garbage", &[0u8; 40][..]] {
+            std::fs::write(&path, garbage).unwrap();
+            assert!(matches!(
+                list.load_file(&path, MAGIC),
+                MncacheFile::Invalid(_)
+            ));
+            assert!(!list.save_file(&path, MAGIC).unwrap());
+            assert_eq!(std::fs::read(&path).unwrap(), garbage);
+        }
     }
 }

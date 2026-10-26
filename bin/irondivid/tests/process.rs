@@ -360,6 +360,42 @@ fn mncache_is_written_at_the_stop() {
     assert_eq!(&bytes[1..21], b"magicMasternodeCache");
 }
 
+/// divid will not start on a mncache.dat it cannot read (CFlatDB::Load,
+/// flat-database.h:225-245; MasternodeModule.cpp:262-266) and leaves it as it
+/// was
+#[test]
+fn a_damaged_mncache_stops_the_start() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("mncache.dat"), b"not a masternode list").unwrap();
+    let mut child = irondivid(dir.path(), free_port())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let code = wait_exit(&mut child, 60);
+    // A node that started holds its stderr open, so stop it before reading
+    if code.is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("Failed to load masternode cache from"),
+        "{stderr}"
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("mncache.dat")).unwrap(),
+        b"not a masternode list"
+    );
+}
+
 /// netfulfilled.dat is written once the node's loops have stopped, as Divi
 /// Core's SaveMasternodeDataToDisk follows StopNode (init.cpp:372, :376)
 #[test]
