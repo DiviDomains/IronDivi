@@ -29,6 +29,11 @@ pub enum SwapError {
     /// The chain refused a transaction for any other reason.
     #[error("transaction rejected: {0}")]
     Rejected(String),
+    /// The input-reservation table ([`crate::InputReservations`]) refused a transaction
+    /// before it was sent: another transaction holds one of its inputs. Nothing reached the
+    /// node. Never returned for anything a node said.
+    #[error("transaction not sent: {0}")]
+    InputsHeld(String),
     /// The backend's wallet cannot cover the requested amount plus fee.
     #[error("insufficient funds: {0}")]
     InsufficientFunds(String),

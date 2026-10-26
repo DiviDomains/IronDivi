@@ -25,6 +25,7 @@ use std::sync::Arc;
 use crate::backend::{ChainBackend, ClaimSizes, FeeBump, TipHeader};
 use crate::error::{Result, SwapError};
 use crate::htlc::{HtlcParams, LOCKTIME_THRESHOLD, REFUND_SEQUENCE};
+use crate::reservation::InputReservations;
 use crate::types::{Amount, Chain, Funding, LockedOutput, Outpoint, SignedTx, SpendInfo, Txid};
 
 /// Flat fee every mock funding and refund pays, and a claim at [`MOCK_FEERATE`].
@@ -62,6 +63,11 @@ enum MockTx {
         htlc: HtlcParams,
         amount: Amount,
         nonce: u64,
+        /// The coins it spends: set only by a backend with coins
+        /// ([`MockBackend::with_input_reservations`]); left out while empty, so every other
+        /// funding's bytes and txid are as before.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        inputs: Vec<Outpoint>,
     },
     Claim {
         to: String,
@@ -855,6 +861,8 @@ impl MockChain {
             released: Arc::default(),
             nonce: Arc::new(AtomicU64::new(0)),
             lag: Arc::new(AtomicU64::new(0)),
+            reservations: None,
+            coins: Arc::default(),
         }
     }
 }
@@ -868,6 +876,8 @@ pub struct MockBackend {
     nonce: Arc<AtomicU64>,
     released: Arc<Mutex<Vec<Txid>>>,
     lag: Arc<AtomicU64>,
+    reservations: Option<InputReservations>,
+    coins: Arc<Vec<Outpoint>>,
 }
 
 impl MockBackend {
@@ -909,6 +919,22 @@ impl MockBackend {
             preimage: *preimage,
             feerate: feerate.max(1),
         }))
+    }
+
+    /// Fund from `coins` (one per funding) and take part in `reservations`, as the live
+    /// backends do: `build_funding` picks the first coin the table does not hold and no
+    /// transaction on the chain spends, and `broadcast` reserves a funding's coin before
+    /// anything reaches the chain (another transaction holding it is refused there, nothing
+    /// sent); a confirmation releases it. The chain refuses a funding whose coin another
+    /// transaction already spent. Balances are still what pays. Test-only.
+    pub fn with_input_reservations(
+        mut self,
+        reservations: InputReservations,
+        coins: &[Outpoint],
+    ) -> Self {
+        self.reservations = Some(reservations);
+        self.coins = Arc::new(coins.to_vec());
+        self
     }
 
     /// The underlying chain.
@@ -1108,11 +1134,25 @@ impl ChainBackend for MockBackend {
                 "have {have}, need {amount} + fee"
             )));
         }
+        let inputs = match &self.reservations {
+            None => Vec::new(),
+            Some(res) => {
+                let held = res.reserved(self.chain.chain)?;
+                let s = self.chain.state.lock();
+                let coin = self
+                    .coins
+                    .iter()
+                    .find(|c| !held.contains(c) && !s.spends.contains_key(c))
+                    .ok_or_else(|| SwapError::InsufficientFunds("no unreserved coin".into()))?;
+                vec![*coin]
+            }
+        };
         let tx = Self::sign(&MockTx::Fund {
             from: self.owner(),
             htlc: *htlc,
             amount,
             nonce: self.nonce.fetch_add(1, Ordering::SeqCst),
+            inputs,
         });
         Ok(Funding {
             outpoint: Outpoint {
@@ -1286,6 +1326,12 @@ impl ChainBackend for MockBackend {
         self.check_online()?;
         let parsed: MockTx = serde_json::from_slice(&tx.raw)
             .map_err(|e| SwapError::Rejected(format!("decode: {e}")))?;
+        if let (Some(res), MockTx::Fund { inputs, .. }) = (&self.reservations, &parsed) {
+            if !inputs.is_empty() {
+                // Before the chain sees anything, as the live backends reserve.
+                res.reserve(self.chain.chain, &tx.txid, inputs)?;
+            }
+        }
         let mut s = self.chain.state.lock();
         *s.attempts.entry(parsed.kind()).or_default() += 1;
         if !matches!(parsed, MockTx::Fund { .. }) {
@@ -1317,12 +1363,23 @@ impl ChainBackend for MockBackend {
         }
         MockChain::check_chain_limits(&s, &parsed)?;
         match &parsed {
-            MockTx::Fund { from, amount, .. } => {
+            MockTx::Fund {
+                from,
+                amount,
+                inputs,
+                ..
+            } => {
+                if inputs.iter().any(|c| s.spends.contains_key(c)) {
+                    return Err(SwapError::Rejected("bad-txns-inputs-missingorspent".into()));
+                }
                 let bal = s.balances.entry(from.clone()).or_default();
                 if *bal < amount.0 + MOCK_FEE.0 {
                     return Err(SwapError::Rejected("insufficient funds".into()));
                 }
                 *bal -= amount.0 + MOCK_FEE.0;
+                for c in inputs {
+                    s.spends.insert(*c, tx.txid);
+                }
             }
             MockTx::Claim {
                 to,
@@ -1410,10 +1467,16 @@ impl ChainBackend for MockBackend {
         if s.blind.contains(txid) {
             return Ok(None);
         }
-        Ok(s.txs.get(txid).map(|(_, mined)| match mined {
+        let confs = s.txs.get(txid).map(|(_, mined)| match mined {
             Some(h) => (s.height - h + 1) as u32,
             None => 0,
-        }))
+        });
+        drop(s);
+        if let (Some(res), Some(1..)) = (&self.reservations, confs) {
+            // On chain: its inputs are spent, the reservation has done its job.
+            res.release_tx(self.chain.chain, txid)?;
+        }
+        Ok(confs)
     }
 
     async fn htlc_output(&self, htlc: &HtlcParams, at: &Outpoint) -> Result<Option<LockedOutput>> {

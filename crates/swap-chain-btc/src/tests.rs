@@ -1190,3 +1190,286 @@ async fn in_best_chain_reads_the_block_status() {
         "on the best chain at another height"
     );
 }
+
+// ---- quorum reads (single-source-design.md section 5, BTC row) ----
+
+fn quorum(primary: &MockServer, secondary: &MockServer) -> BtcBackend {
+    backend(vec![primary.uri(), secondary.uri()], MAKER_KEY)
+        .with_quorum_reads(true)
+        .unwrap()
+}
+
+fn transient<T: std::fmt::Debug>(r: Result<T>) -> String {
+    match r {
+        Err(SwapError::Transient(m)) => m,
+        other => panic!("expected Transient, got {other:?}"),
+    }
+}
+
+async fn mock_json(server: &MockServer, p: String, body: Value) {
+    Mock::given(method("GET"))
+        .and(path(p))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .mount(server)
+        .await;
+}
+
+async fn mock_tip(server: &MockServer, height: u64) {
+    Mock::given(method("GET"))
+        .and(path("/blocks/tip/height"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(height.to_string()))
+        .mount(server)
+        .await;
+}
+
+async fn mock_unspent(server: &MockServer, fund: &Outpoint) {
+    mock_json(
+        server,
+        format!("/tx/{}/outspend/{}", fund.txid, fund.vout),
+        json!({"spent": false}),
+    )
+    .await;
+}
+
+/// `spender` spends `fund` (input 0) with a claim witness, confirmed at `height` if any.
+async fn mock_spend(server: &MockServer, fund: &Outpoint, spender: &str, height: Option<u64>) {
+    let status = match height {
+        Some(h) => json!({"confirmed": true, "block_height": h}),
+        None => json!({"confirmed": false}),
+    };
+    mock_json(
+        server,
+        format!("/tx/{}/outspend/{}", fund.txid, fund.vout),
+        json!({"spent": true, "txid": spender, "vin": 0, "status": status}),
+    )
+    .await;
+    mock_json(
+        server,
+        format!("/tx/{spender}"),
+        json!({
+            "txid": spender,
+            "vin": [{"txid": fund.txid.to_rpc_hex(), "vout": fund.vout, "scriptsig": "",
+                     "witness": [hex::encode([0x30u8; 71]), "11".repeat(32), "01"]}]
+        }),
+    )
+    .await;
+}
+
+/// `fund.txid` pays `value` to `spk` at `fund.vout`, confirmed at `height`.
+async fn mock_lock(server: &MockServer, fund: &Outpoint, spk: &str, value: u64, height: u64) {
+    let status = json!({"confirmed": true, "block_height": height});
+    mock_json(
+        server,
+        format!("/tx/{}", fund.txid),
+        json!({
+            "txid": fund.txid.to_rpc_hex(),
+            "vout": [{"scriptpubkey": "00", "value": 5}, {"scriptpubkey": spk, "value": value}],
+            "status": status
+        }),
+    )
+    .await;
+    mock_json(server, format!("/tx/{}/status", fund.txid), status).await;
+}
+
+#[tokio::test]
+async fn quorum_find_spend_a_claim_the_primary_hides_is_transient() {
+    let (primary, secondary) = (MockServer::start().await, MockServer::start().await);
+    let fund = outpoint();
+    mock_unspent(&primary, &fund).await;
+    mock_spend(&secondary, &fund, &"ab".repeat(32), Some(777)).await;
+    let m = transient(quorum(&primary, &secondary).find_spend(&fund, 700).await);
+    assert!(m.contains("unspent") && m.contains(&"ab".repeat(32)), "{m}");
+}
+
+#[tokio::test]
+async fn quorum_find_spend_a_spend_only_the_primary_reports_is_transient() {
+    let (primary, secondary) = (MockServer::start().await, MockServer::start().await);
+    let fund = outpoint();
+    mock_spend(&primary, &fund, &"ab".repeat(32), Some(777)).await;
+    mock_unspent(&secondary, &fund).await;
+    transient(quorum(&primary, &secondary).find_spend(&fund, 700).await);
+}
+
+#[tokio::test]
+async fn quorum_find_spend_two_different_spenders_is_transient() {
+    let (primary, secondary) = (MockServer::start().await, MockServer::start().await);
+    let fund = outpoint();
+    mock_spend(&primary, &fund, &"ab".repeat(32), Some(777)).await;
+    mock_spend(&secondary, &fund, &"cd".repeat(32), Some(777)).await;
+    let m = transient(quorum(&primary, &secondary).find_spend(&fund, 700).await);
+    assert!(
+        m.contains(&"ab".repeat(32)) && m.contains(&"cd".repeat(32)),
+        "{m}"
+    );
+}
+
+#[tokio::test]
+async fn quorum_htlc_output_the_secondary_does_not_have_is_transient() {
+    let (primary, secondary) = (MockServer::start().await, MockServer::start().await);
+    let (_, hash) = new_preimage();
+    let h = htlc(hash);
+    let fund = outpoint();
+    let spk = hex::encode(htlc_script_pubkey(&h).as_bytes());
+    for s in [&primary, &secondary] {
+        mock_tip(s, 110).await;
+    }
+    mock_lock(&primary, &fund, &spk, 20_000, 109).await;
+    // The secondary does not know the transaction (wiremock 404).
+    transient(quorum(&primary, &secondary).htlc_output(&h, &fund).await);
+}
+
+#[tokio::test]
+async fn quorum_htlc_output_with_another_value_is_transient() {
+    let (primary, secondary) = (MockServer::start().await, MockServer::start().await);
+    let (_, hash) = new_preimage();
+    let h = htlc(hash);
+    let fund = outpoint();
+    let spk = hex::encode(htlc_script_pubkey(&h).as_bytes());
+    for s in [&primary, &secondary] {
+        mock_tip(s, 110).await;
+    }
+    mock_lock(&primary, &fund, &spk, 20_000, 109).await;
+    mock_lock(&secondary, &fund, &spk, 2_000, 109).await;
+    let m = transient(quorum(&primary, &secondary).htlc_output(&h, &fund).await);
+    assert!(m.contains("20000") && m.contains("2000"), "{m}");
+}
+
+#[tokio::test]
+async fn quorum_htlc_output_with_another_script_is_transient() {
+    let (primary, secondary) = (MockServer::start().await, MockServer::start().await);
+    let (_, hash) = new_preimage();
+    let (_, other) = new_preimage();
+    let h = htlc(hash);
+    let fund = outpoint();
+    for s in [&primary, &secondary] {
+        mock_tip(s, 110).await;
+    }
+    let spk = hex::encode(htlc_script_pubkey(&h).as_bytes());
+    let other_spk = hex::encode(htlc_script_pubkey(&htlc(other)).as_bytes());
+    mock_lock(&primary, &fund, &spk, 20_000, 109).await;
+    mock_lock(&secondary, &fund, &other_spk, 20_000, 109).await;
+    transient(quorum(&primary, &secondary).htlc_output(&h, &fund).await);
+}
+
+#[tokio::test]
+async fn quorum_confirmations_the_secondary_does_not_know_is_transient() {
+    let (primary, secondary) = (MockServer::start().await, MockServer::start().await);
+    let fund = outpoint();
+    for s in [&primary, &secondary] {
+        mock_tip(s, 110).await;
+    }
+    mock_json(
+        &primary,
+        format!("/tx/{}/status", fund.txid),
+        json!({"confirmed": true, "block_height": 109}),
+    )
+    .await;
+    transient(quorum(&primary, &secondary).confirmations(&fund.txid).await);
+}
+
+/// Agreement: the lower confirmation count wins (a block apart is lag, not a lie), and a
+/// spend one endpoint still has in the mempool is reported with the other's block height.
+#[tokio::test]
+async fn quorum_agreeing_reads_take_the_lower_count() {
+    let (primary, secondary) = (MockServer::start().await, MockServer::start().await);
+    let (_, hash) = new_preimage();
+    let h = htlc(hash);
+    let fund = outpoint();
+    let spk = hex::encode(htlc_script_pubkey(&h).as_bytes());
+    mock_tip(&primary, 111).await;
+    mock_tip(&secondary, 110).await;
+    for s in [&primary, &secondary] {
+        mock_lock(s, &fund, &spk, 20_000, 109).await;
+    }
+    let b = quorum(&primary, &secondary);
+    assert_eq!(b.confirmations(&fund.txid).await.unwrap(), Some(2));
+    let locked = b.htlc_output(&h, &fund).await.unwrap().unwrap();
+    assert_eq!(
+        (locked.amount, locked.confirmations),
+        (Amount::from_sat(20_000), 2)
+    );
+    let unknown = Txid([5; 32]);
+    assert_eq!(b.confirmations(&unknown).await.unwrap(), None);
+
+    let spent = Outpoint {
+        txid: Txid([7; 32]),
+        vout: 0,
+    };
+    mock_spend(&primary, &spent, &"ab".repeat(32), None).await;
+    mock_spend(&secondary, &spent, &"ab".repeat(32), Some(109)).await;
+    let spend = b.find_spend(&spent, 100).await.unwrap().expect("spent");
+    assert_eq!(spend.txid, Txid::from_rpc_hex(&"ab".repeat(32)).unwrap());
+    assert_eq!(spend.height, Some(109));
+    let unspent = Outpoint {
+        txid: Txid([8; 32]),
+        vout: 0,
+    };
+    for s in [&primary, &secondary] {
+        mock_unspent(s, &unspent).await;
+    }
+    assert!(b.find_spend(&unspent, 100).await.unwrap().is_none());
+}
+
+/// Quorum mode fails closed: a secondary that cannot be reached leaves every quorum read
+/// `Transient`, however healthy the primary's answer looks.
+#[tokio::test]
+async fn quorum_unreachable_secondary_is_transient() {
+    let primary = MockServer::start().await;
+    let (_, hash) = new_preimage();
+    let h = htlc(hash);
+    let fund = outpoint();
+    let spk = hex::encode(htlc_script_pubkey(&h).as_bytes());
+    mock_tip(&primary, 110).await;
+    mock_lock(&primary, &fund, &spk, 20_000, 109).await;
+    mock_unspent(&primary, &fund).await;
+    let b = backend(vec![primary.uri(), dead_url()], MAKER_KEY)
+        .with_quorum_reads(true)
+        .unwrap();
+    transient(b.confirmations(&fund.txid).await);
+    transient(b.htlc_output(&h, &fund).await);
+    transient(b.find_spend(&fund, 100).await);
+}
+
+/// Off (the default): the three reads go to the primary alone, exactly as before; the
+/// secondary is not asked anything while the primary answers.
+#[tokio::test]
+async fn quorum_off_never_asks_the_secondary() {
+    let (primary, secondary) = (MockServer::start().await, MockServer::start().await);
+    let (_, hash) = new_preimage();
+    let h = htlc(hash);
+    let fund = outpoint();
+    let spk = hex::encode(htlc_script_pubkey(&h).as_bytes());
+    mock_tip(&primary, 110).await;
+    mock_lock(&primary, &fund, &spk, 20_000, 109).await;
+    mock_spend(&primary, &fund, &"ab".repeat(32), Some(110)).await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .expect(0)
+        .mount(&secondary)
+        .await;
+    for on in [None, Some(false)] {
+        let b = backend(vec![primary.uri(), secondary.uri()], MAKER_KEY);
+        let b = match on {
+            Some(on) => b.with_quorum_reads(on).unwrap(),
+            None => b,
+        };
+        assert_eq!(b.confirmations(&fund.txid).await.unwrap(), Some(2));
+        assert!(b.htlc_output(&h, &fund).await.unwrap().is_some());
+        assert!(b.find_spend(&fund, 100).await.unwrap().is_some());
+    }
+    // The primary saw each read's requests once per pass: status + tip, tx + tip,
+    // outspend + spender.
+    assert_eq!(primary.received_requests().await.unwrap().len(), 12);
+    assert!(secondary.received_requests().await.unwrap().is_empty());
+}
+
+#[test]
+fn quorum_reads_need_two_endpoints() {
+    let one = backend(vec![dead_url()], MAKER_KEY);
+    assert!(matches!(
+        one.with_quorum_reads(true),
+        Err(SwapError::InvalidParams(_))
+    ));
+    let one = backend(vec![dead_url()], MAKER_KEY);
+    assert!(one.with_quorum_reads(false).is_ok());
+}

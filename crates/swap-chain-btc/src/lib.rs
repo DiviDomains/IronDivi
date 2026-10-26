@@ -12,6 +12,7 @@
 //! proof (`examples/*_cltv_proof.rs`) shows the transaction shapes that signet accepts.
 
 mod client;
+mod quorum;
 mod tx;
 
 pub use client::{ClientError, EsploraClient, RetryPolicy};
@@ -107,6 +108,8 @@ pub struct BtcBackend {
     network: Network,
     fees: FeePolicy,
     reservations: Option<InputReservations>,
+    /// The primary alone and the secondary, when quorum reads are on.
+    quorum: Option<(EsploraClient, EsploraClient)>,
 }
 
 impl std::fmt::Debug for BtcBackend {
@@ -125,6 +128,22 @@ impl BtcBackend {
     pub fn with_input_reservations(mut self, reservations: InputReservations) -> Self {
         self.reservations = Some(reservations);
         self
+    }
+
+    /// Read `find_spend`, `htlc_output` and `confirmations` from the primary and the secondary
+    /// Esplora and act only on an answer both give (single-source-design.md section 5, BTC).
+    /// A disagreement, or either endpoint failing, is `Transient` (see `quorum.rs`). Off by
+    /// default; refused with fewer than two endpoints.
+    pub fn with_quorum_reads(mut self, on: bool) -> Result<Self> {
+        self.quorum = match on {
+            false => None,
+            true => Some(self.esplora.split_primary().ok_or_else(|| {
+                SwapError::InvalidParams(
+                    "quorum reads need a primary and a secondary Esplora endpoint".into(),
+                )
+            })?),
+        };
+        Ok(self)
     }
 
     /// `coins` without those reserved by a broadcast transaction that has not confirmed.
@@ -252,6 +271,7 @@ impl BtcBackend {
             network,
             fees,
             reservations: None,
+            quorum: None,
         })
     }
 
@@ -295,15 +315,7 @@ impl BtcBackend {
     }
 
     async fn get_json(&self, path: &str) -> Result<Value> {
-        let body = self.esplora.get(path).await?;
-        parse_json(&body)
-    }
-
-    async fn get_json_opt(&self, path: &str) -> Result<Option<Value>> {
-        match self.esplora.get_opt(path).await? {
-            Some(b) => Ok(Some(parse_json(&b)?)),
-            None => Ok(None),
-        }
+        get_json_on(&self.esplora, path).await
     }
 
     fn to_signed(tx: &bitcoin::Transaction) -> SignedTx {
@@ -326,23 +338,22 @@ impl BtcBackend {
 
     /// Scan blocks `from_height..=tip` for a transaction spending `outpoint`.
     async fn scan_blocks(
-        &self,
+        es: &EsploraClient,
         outpoint: &Outpoint,
         from_height: u64,
     ) -> Result<Option<SpendInfo>> {
-        let tip = self.tip_height().await?;
+        let tip = tip_height_on(es).await?;
         let want_txid = outpoint.txid.to_rpc_hex();
         let last = tip.min(from_height.saturating_add(MAX_SCAN_BLOCKS - 1));
         for height in from_height..=last {
-            let hash = self
-                .esplora
+            let hash = es
                 .get(&format!("/block-height/{height}"))
                 .await?
                 .trim()
                 .to_string();
             let mut start = 0u32;
             loop {
-                let txs = self.get_json(&format!("/block/{hash}/txs/{start}")).await?;
+                let txs = get_json_on(es, &format!("/block/{hash}/txs/{start}")).await?;
                 let txs = txs.as_array().cloned().unwrap_or_default();
                 if txs.is_empty() {
                     break;
@@ -364,6 +375,31 @@ fn parse_json(body: &str) -> Result<Value> {
     // (a truncated or HTML body), not a deliberate answer from the chain: real Esplora
     // error bodies are plain text and never reach this function (see `ClientError::Http`).
     serde_json::from_str(body).map_err(|e| SwapError::Transient(format!("bad Esplora JSON: {e}")))
+}
+
+async fn get_json_on(es: &EsploraClient, path: &str) -> Result<Value> {
+    let body = es.get(path).await?;
+    parse_json(&body)
+}
+
+async fn get_json_opt_on(es: &EsploraClient, path: &str) -> Result<Option<Value>> {
+    match es.get_opt(path).await? {
+        Some(b) => Ok(Some(parse_json(&b)?)),
+        None => Ok(None),
+    }
+}
+
+async fn tip_height_on(es: &EsploraClient) -> Result<u64> {
+    let body = es.get("/blocks/tip/height").await?;
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        // A load-balanced backend occasionally answers 200 with an empty body
+        // mid-reindex; a real tip height is never empty.
+        return Err(SwapError::Transient("empty tip height response".into()));
+    }
+    trimmed
+        .parse()
+        .map_err(|_| SwapError::Transient(format!("unparseable tip height {body:?}")))
 }
 
 fn hex_items(v: &Value) -> Result<Vec<Vec<u8>>> {
@@ -443,16 +479,7 @@ impl ChainBackend for BtcBackend {
     }
 
     async fn tip_height(&self) -> Result<u64> {
-        let body = self.esplora.get("/blocks/tip/height").await?;
-        let trimmed = body.trim();
-        if trimmed.is_empty() {
-            // A load-balanced backend occasionally answers 200 with an empty body
-            // mid-reindex; a real tip height is never empty.
-            return Err(SwapError::Transient("empty tip height response".into()));
-        }
-        trimmed
-            .parse()
-            .map_err(|_| SwapError::Transient(format!("unparseable tip height {body:?}")))
+        tip_height_on(&self.esplora).await
     }
 
     async fn tip_hash(&self) -> Result<String> {
@@ -652,26 +679,72 @@ impl ChainBackend for BtcBackend {
     }
 
     async fn confirmations(&self, txid: &Txid) -> Result<Option<u32>> {
-        let Some(status) = self
-            .get_json_opt(&format!("/tx/{}/status", txid.to_rpc_hex()))
-            .await?
+        let confs = match &self.quorum {
+            None => Self::confirmations_on(&self.esplora, txid).await?,
+            Some((primary, secondary)) => {
+                let (a, b) = tokio::join!(
+                    Self::confirmations_on(primary, txid),
+                    Self::confirmations_on(secondary, txid)
+                );
+                let (a, b) = quorum::pair("confirmations", a, b)?;
+                quorum::agree_confirmations(a, b)?
+            }
+        };
+        if let Some(c) = confs {
+            self.release_confirmed(txid, c);
+        }
+        Ok(confs)
+    }
+
+    async fn htlc_output(&self, htlc: &HtlcParams, at: &Outpoint) -> Result<Option<LockedOutput>> {
+        let Some((primary, secondary)) = &self.quorum else {
+            return Self::htlc_output_on(&self.esplora, htlc, at).await;
+        };
+        let (a, b) = tokio::join!(
+            Self::htlc_output_on(primary, htlc, at),
+            Self::htlc_output_on(secondary, htlc, at)
+        );
+        let (a, b) = quorum::pair("htlc_output", a, b)?;
+        quorum::agree_htlc_output(a, b)
+    }
+
+    async fn find_spend(&self, outpoint: &Outpoint, from_height: u64) -> Result<Option<SpendInfo>> {
+        let Some((primary, secondary)) = &self.quorum else {
+            return Self::find_spend_on(&self.esplora, outpoint, from_height).await;
+        };
+        let (a, b) = tokio::join!(
+            Self::find_spend_on(primary, outpoint, from_height),
+            Self::find_spend_on(secondary, outpoint, from_height)
+        );
+        let (a, b) = quorum::pair("find_spend", a, b)?;
+        quorum::agree_spend(a, b)
+    }
+}
+
+/// The three reads a claim or refund rests on, as one endpoint view answers them. Without
+/// quorum reads the view is the failover client; with them, each endpoint on its own.
+impl BtcBackend {
+    /// `confirmations` as one endpoint view `es` answers it.
+    async fn confirmations_on(es: &EsploraClient, txid: &Txid) -> Result<Option<u32>> {
+        let Some(status) =
+            get_json_opt_on(es, &format!("/tx/{}/status", txid.to_rpc_hex())).await?
         else {
             return Ok(None);
         };
         if status["confirmed"].as_bool() != Some(true) {
             return Ok(Some(0));
         }
-        let tip = self.tip_height().await?;
-        let confs = Self::confs_from_status(&status, tip);
-        self.release_confirmed(txid, confs);
-        Ok(Some(confs))
+        let tip = tip_height_on(es).await?;
+        Ok(Some(Self::confs_from_status(&status, tip)))
     }
 
-    async fn htlc_output(&self, htlc: &HtlcParams, at: &Outpoint) -> Result<Option<LockedOutput>> {
-        let Some(t) = self
-            .get_json_opt(&format!("/tx/{}", at.txid.to_rpc_hex()))
-            .await?
-        else {
+    /// `htlc_output` as one endpoint view `es` answers it.
+    async fn htlc_output_on(
+        es: &EsploraClient,
+        htlc: &HtlcParams,
+        at: &Outpoint,
+    ) -> Result<Option<LockedOutput>> {
+        let Some(t) = get_json_opt_on(es, &format!("/tx/{}", at.txid.to_rpc_hex())).await? else {
             return Ok(None);
         };
         let Some(out) = t["vout"].as_array().and_then(|v| v.get(at.vout as usize)) else {
@@ -685,7 +758,7 @@ impl ChainBackend for BtcBackend {
             .as_u64()
             .ok_or_else(|| SwapError::Other("vout lacks value".into()))?;
         let confirmations = if t["status"]["confirmed"].as_bool() == Some(true) {
-            Self::confs_from_status(&t["status"], self.tip_height().await?)
+            Self::confs_from_status(&t["status"], tip_height_on(es).await?)
         } else {
             0
         };
@@ -695,15 +768,20 @@ impl ChainBackend for BtcBackend {
         }))
     }
 
-    async fn find_spend(&self, outpoint: &Outpoint, from_height: u64) -> Result<Option<SpendInfo>> {
+    /// `find_spend` as one endpoint view `es` answers it.
+    async fn find_spend_on(
+        es: &EsploraClient,
+        outpoint: &Outpoint,
+        from_height: u64,
+    ) -> Result<Option<SpendInfo>> {
         let prev = outpoint.txid.to_rpc_hex();
         let path = format!("/tx/{prev}/outspend/{}", outpoint.vout);
-        let outspend = match self.esplora.get_opt(&path).await {
+        let outspend = match es.get_opt(&path).await {
             Ok(Some(b)) => parse_json(&b)?,
             Ok(None) => return Ok(None),
             // Endpoint without outspend support: fall back to scanning blocks.
             Err(ClientError::Http(f)) if f.status == 400 || f.status == 501 => {
-                return self.scan_blocks(outpoint, from_height).await;
+                return Self::scan_blocks(es, outpoint, from_height).await;
             }
             Err(e) => return Err(e.into()),
         };
@@ -716,7 +794,7 @@ impl ChainBackend for BtcBackend {
         // A load-balanced backend can report the outspend before another replica has
         // indexed the spending tx itself; treat that race as "not found yet" (the caller
         // polls find_spend again), not a permanent error.
-        let Some(t) = self.get_json_opt(&format!("/tx/{spender}")).await? else {
+        let Some(t) = get_json_opt_on(es, &format!("/tx/{spender}")).await? else {
             return Ok(None);
         };
         let height = outspend["status"]["block_height"].as_u64();
