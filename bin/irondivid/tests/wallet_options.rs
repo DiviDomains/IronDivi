@@ -390,8 +390,8 @@ fn hdseed_is_logged_as_divid_logs_it() {
 #[test]
 fn prunewalletconfs_leaves_deeply_spent_transactions_out() {
     let dir = tempfile::tempdir().unwrap();
-    let (rpc, p2p) = (free_port(), free_port());
-    let node = start(dir.path(), rpc, p2p, &[]);
+    let (mut rpc, mut p2p) = (free_port(), free_port());
+    let node = start(dir.path(), &mut rpc, &mut p2p, &[]);
     ok(rpc, "setgenerate", json!([30]));
     // The coinbase of block 1, swept alone to an address not ours
     let hash = ok(rpc, "getblockhash", json!([1]));
@@ -427,7 +427,7 @@ fn prunewalletconfs_leaves_deeply_spent_transactions_out() {
             .is_null()
     };
     let log = || std::fs::read_to_string(dir.path().join("debug.log")).unwrap_or_default();
-    let node = start(dir.path(), rpc, p2p, &["-prunewalletconfs=5"]);
+    let node = start(dir.path(), &mut rpc, &mut p2p, &["-prunewalletconfs=5"]);
     assert!(!known(&coinbase), "the swept coinbase is still listed");
     assert!(!known(&sweep), "its sweep is still listed");
     let line = log()
@@ -438,7 +438,7 @@ fn prunewalletconfs_leaves_deeply_spent_transactions_out() {
     assert!(line.is_some(), "{}", log());
     stop(node, rpc);
 
-    let node = start(dir.path(), rpc, p2p, &[]);
+    let node = start(dir.path(), &mut rpc, &mut p2p, &[]);
     assert!(
         known(&coinbase) && known(&sweep),
         "a start without the option lists them again"
@@ -467,8 +467,8 @@ fn logged(dir: &Path, text: &str) -> bool {
 #[test]
 fn the_start_logs_the_key_pool_and_address_book_sizes() {
     let dir = tempfile::tempdir().unwrap();
-    let (rpc, p2p) = (free_port(), free_port());
-    let node = start(dir.path(), rpc, p2p, &[]);
+    let (mut rpc, mut p2p) = (free_port(), free_port());
+    let node = start(dir.path(), &mut rpc, &mut p2p, &[]);
     let pool = ok(rpc, "getwalletinfo", json!([]))["keypoolsize"].clone();
     assert!(logged(dir.path(), &format!("Key Pool size = {pool}")));
     assert!(logged(dir.path(), "Address Book size = "));
@@ -480,8 +480,8 @@ fn the_start_logs_the_key_pool_and_address_book_sizes() {
 #[test]
 fn backupwallet_logs_where_it_copied_the_wallet() {
     let dir = tempfile::tempdir().unwrap();
-    let (rpc, p2p) = (free_port(), free_port());
-    let node = start(dir.path(), rpc, p2p, &[]);
+    let (mut rpc, mut p2p) = (free_port(), free_port());
+    let node = start(dir.path(), &mut rpc, &mut p2p, &[]);
     let dest = dir.path().join("copy.dat");
     ok(rpc, "backupwallet", json!([dest.to_str().unwrap()]));
     assert!(logged(
@@ -496,8 +496,8 @@ fn backupwallet_logs_where_it_copied_the_wallet() {
 #[test]
 fn encryption_logs_its_derivation_count() {
     let dir = tempfile::tempdir().unwrap();
-    let (rpc, p2p) = (free_port(), free_port());
-    let node = start(dir.path(), rpc, p2p, &[]);
+    let (mut rpc, mut p2p) = (free_port(), free_port());
+    let node = start(dir.path(), &mut rpc, &mut p2p, &[]);
     // Throwaway test passphrases, over RPC
     ok(rpc, "encryptwallet", json!(["first-throwaway"]));
     ok(rpc, "walletpassphrase", json!(["first-throwaway", 60]));
