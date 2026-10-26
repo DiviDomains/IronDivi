@@ -13,12 +13,20 @@ Each step is drawn from a seeded list and applied to node n of both pairs the sa
 every step each pair settles, and node n and the other node of pair C are compared with their twins in pair I. Only
 what does not depend on keys or hashes is compared:
 
-- the step's outcome: success, or the error code (for a raw transaction, of the call that failed);
-- `getbalance "*" 0`, `getbalance "*" 1`, `getunconfirmedbalance`;
+- the step's outcome: success, or the error code and its text (for a raw transaction, of the call that failed; for a
+  helper call that failed, without the node's name);
+- `getbalance "*" 0`, `getbalance "*" 1`, `getunconfirmedbalance`, and `getwalletinfo`'s `immature_balance`;
 - the amounts of `listunspent 0`, as a sorted list (so their number too);
 - the number of locked coins (`listlockunspent`);
+- `getwalletinfo`'s `keypoolsize` and `encryption_status`, and whether `unlocked_until` is there and set (it is a
+  time, so its value is not compared);
 - the mempool size and the height;
 - for `invalidate`, all of these also between `invalidateblock` and `reconsiderblock`.
+
+Txids and block hashes differ between the pairs, so which coin a send spends or which coin stakes can differ, and with
+it the change values and which stake outputs are still immature. Those fields are still compared exactly. A difference
+that one of divid's accidental choices explains (below) is logged as `KNOWN`, with its reason, and the run goes on
+with four fresh nodes. For the stake outputs, the rules check that each side's balance plus immature balance agree.
 
 The first difference ends the run with one `FAIL` line naming the seed, the episode and the step, both values, the
 coins and mempools of both pairs, and the steps of the episode. The run ends with `FAILS <n>`; the exit code is the
@@ -40,12 +48,14 @@ SEED=7 scripts/random-sequences/run.sh target/release ~/divi-3.0.0/bin 53850 /va
 | `SEED` | the seed of the steps (random when not set; the first line prints it) |
 | `STEPS` | number of steps (200) |
 | `REPLAY` | a file with a JSON list of steps, as a FAIL line prints them, run instead of drawn ones |
+| `RANDOM_SEQUENCES_ENCRYPTED` | for a replay: the nodes (`1,2`) whose wallets were encrypted when the episode started, as the FAIL lines print it |
 | `RANDOM_SEQUENCES_INJECT` | a step number whose irondivid outcome is changed, to show a difference is caught |
 | `RANDOM_SEQUENCES_GO_ON` | `1`: go on after a FAIL (for looking into a difference) |
 | `RANDOM_SEQUENCES_TIMEOUT` | seconds before the run is stopped (1500) |
 | `RANDOM_SEQUENCES_LOGS` | a folder to copy the four logs to, for each episode and on a FAIL |
 | `RANDOM_SEQUENCES_DEBUG` | `1`: irondivid logs at debug level and divid with `debug=mempool` |
 | `RANDOM_SEQUENCES_PROFILE` | `stake`: steps that reach stake blocks. The first blocks go to height 95 (work blocks end at 100); `mine` weighs 30 and a new step, `addvault`, 6 (node n takes on a vault the other node funded, once it is in a block); `fundvault` funds 100 to 1100; kills, restarts and invalidates are rare; all four nodes run with `vault=1`, which `addvault` needs (`CWallet::AddVault`, `wallet.cpp:693-705`) and which shuffles the stake set. Unset, the steps of every seed are as before |
+| `RANDOM_SEQUENCES_TWIN` | `1`: the second pair runs divid too, in irondivid's place, to see the differences divid has with itself on the same seed. The twins restore the phrases from `-mnemonic`, a line of their 0600 `divi.conf`. The line is taken out again once the wallet is made, as divid reads it at every start |
 | `RANDOM_SEQUENCES_TRACE` | `1`: before and after each `invalidateblock`, the node's mempool is printed, each transaction with its inputs (`txid:vout@height/kind`) and its outputs |
 
 A run of 200 steps takes 2 to 10 minutes. However it ends, all nodes are stopped and their directories deleted. It
@@ -56,12 +66,17 @@ Secrets:
   (`WALLET_MNEMONIC`).
 - The wallet passphrase is made at random and sent only in RPC requests.
 - RPC passwords are made at random and kept in each node's 0600 `divi.conf`.
-- None of them is printed, written to a file or put on a command line.
+- The keys `importprivkey` steps import are derived from a salt made fresh for the run, and sent only in RPC requests.
+- None of them is printed or put on a command line. The only file one goes to is a twin's 0600 `divi.conf` in
+  `RANDOM_SEQUENCES_TWIN` runs: it holds the phrase for the twin's first start and is rewritten without it right after.
 
 ## Setup of each episode
 
 1. Node 1 mines 15 blocks, node 2 mines 15, node 1 mines 25, so both nodes have mature coins.
-2. Every wallet is encrypted and unlocked for 99999 s. The nodes run with `staking=0`; blocks come from `setgenerate`.
+2. The wallets start unencrypted. Each node's wallet is encrypted by one `encryptwallet` step at a point drawn from the
+   seed. A node whose step has already run in an earlier episode is encrypted at the setup and unlocked for 99999 s.
+3. The nodes run with `staking=0` (blocks come from `setgenerate` and `generateblock`) and `keypool=5`, so a locked
+   wallet runs out of keypool keys within a few calls.
 
 ## Steps
 
@@ -81,6 +96,18 @@ Each step names a node (1 or 2) and a random number `draw`, which picks amounts,
 | `restart` | `stop`, then a start on the same datadir |
 | `kill` | `kill -9`, then a start (see below for divid) |
 | `walletlock`, `walletpassphrase` | lock the wallet, or unlock it for 99999 s |
+| `walletpassphrase timeout` | unlock it for 120 to 720 s |
+| `walletpassphrase staking` | unlock it for staking only (`walletpassphrase … 99999 true`) |
+| `encryptwallet` | once per node and run (see the setup), then a restart |
+| `keypoolrefill` | `keypoolrefill <1 to 10>` |
+| `drain getnewaddress`, `drain getrawchangeaddress` | the call until the keypool runs out (-12), or 15 times: an unlocked wallet tops the keypool up each time |
+| `importprivkey` | a throwaway key, derived from a salt made fresh for the run and the step number, so both pairs import the same key; with rescan for an even `draw`. Neither the salt nor the key is printed |
+| `send imported` | a small `sendtoaddress` to a key an `importprivkey` step of this episode brought in |
+| `generateblock` | `generateblock {}` |
+
+Every step runs whatever the wallet's state is: locked, unlocked for staking only, unlocked, or not encrypted. So the
+sends, stakes, key handouts and imports also show their refusals (-13, -15, -17, -12, -25, and -1 for a stake signed
+with a key of the locked HD seed).
 | `rawtx` | a coin of `listunspent` (picked by `draw`, unlocked) spent to a new address of node n by `createrawtransaction`, `signrawtransaction` and `sendrawtransaction`, with a fee of 0.001 |
 
 ## Differences that come from divid's accidental choices
@@ -97,35 +124,55 @@ episode) and the remaining steps, so every comparison stays exact:
   `removeCoinbaseSpends` drops these too (`txmempool.cpp:139-157`), at each block it disconnects
   (`ChainTipManager.cpp:175-182`). Each side had spent a different coin of the same value, since divid's coin choice
   among equal coins is by txid order. The dropped transactions are those the invalidated node held before the
-  invalidate (its own sends count: the other node may never have had them, when it was restarted and a send reaches
-  it again only by the random rebroadcast) and those the other node holds, less what the chain confirms again. A
-  dropped transaction may also spend, instead, an output of a transaction in a disconnected block that itself spends
-  such a coin: divid refuses that parent when it puts the block's transactions back and removes the parent's
-  descendants from the mempool with it (`remove(..., true)`, `txmempool.cpp:91-126`). `reconsiderblock` confirms the
-  parent again, but the child stays gone.
-- **stake coin choice:** a `mine` step past the last work block, after which only node n's balances and coins differ.
-  On both sides each new block staked a coin of divid's stake set (`CWallet::SelectStakeCoins`,
+  invalidate (its own sends count: the other node may never have had them, when it was restarted and a send reaches it
+  again only by the random rebroadcast) and those the other node holds, less what the chain confirms again. A dropped
+  transaction may also spend, instead, an output of a transaction in a disconnected block that itself spends such a
+  coin: divid refuses that parent when it puts the block's transactions back and removes the parent's descendants from
+  the mempool with it (`remove(..., true)`, `txmempool.cpp:91-126`). `reconsiderblock` confirms the parent again, but
+  the child stays gone. A transaction it lacks that spends no immature coin is allowed only when the other side's node
+  lacks one with the same output values: a node restarted earlier gets its peer's sends back only by divid's random
+  rebroadcast (`main.cpp:1280-1294`), on both sides alike.
+- **stake coin choice:** a `mine` or `generateblock` step past the last work block, after which only node n's balances
+  and coins differ. On both sides each new block staked a coin of divid's stake set (`CWallet::SelectStakeCoins`,
   `wallet.cpp:1433-1465`): unlocked, 10 confirmations at that block (no coin age on regtest, `chainparams.cpp:498`),
   not spent by an earlier block of the step. Two more kinds of coin are not listed by `listunspent` when the step
   begins but count: a vault output the wallet holds, and a coinbase or coinstake output that matures during the step.
-  divid counts a generated coin from 21 confirmations (`MerkleTxConfirmationNumberCalculator.cpp:54-59`).
-  divid tries the set in outpoint order (`StakableCoin.h:21-24`, `PoSTransactionCreator.cpp:261`; shuffled only with
-  `-vault`, `:63-72`, `:99`) and takes the first coin with a kernel hash under the target. That target is weighted
-  by the coin's value (`ProofOfStakeCalculator.cpp:19-24`, `:53-54`), so a small coin is often passed over. Which coin
-  wins depends on the txids, and those differ between the pairs, so the script checks only that each kernel is in the
-  set. A coinstake's outputs are immature, so the balances part by the difference. When a kernel is a vault coin, the
-  vault's owner (the other node) counts the coin in its `getbalance` (`CWallet::GetBalance`, `wallet.cpp:1395-1402`),
-  so its balances may differ too.
+  divid counts a generated coin from 21 confirmations (`MerkleTxConfirmationNumberCalculator.cpp:54-59`). divid tries
+  the set in outpoint order (`StakableCoin.h:21-24`, `PoSTransactionCreator.cpp:261`; shuffled only with `-vault`,
+  `:63-72`, `:99`) and takes the first coin with a kernel hash under the target. That target is weighted by the coin's
+  value (`ProofOfStakeCalculator.cpp:19-24`, `:53-54`), so a small coin is often passed over. Which coin wins depends
+  on the txids, and those differ between the pairs, so the script checks only that each kernel is in the set. A
+  coinstake's outputs are immature, so the balances part by the difference. The rule also checks that node n's balance
+  plus immature balance agree, so the two fields are compared by their total.
+
+  A vault kernel is the vault's owner's coin too (the other node's), and the coinstake pays the kernel's own script
+  (`PoSTransactionCreator.cpp:167`), so the reward stays in the vault. The owner's `getbalance` counts owned vault
+  coins (`CWallet::GetBalance`, `wallet.cpp:1395-1402`) and loses the coin until the coinstake matures, and the
+  immature balance counts only the wallet's own coins (`WalletBalanceCalculator.h:44`). So the owner's balances may
+  differ too: node n's total is taken with each vault block's reward added, and the owner's `getbalance` with each
+  staked vault coin added, and both must agree.
 
   Every stake block is checked, not only those after which the sides differ: a kernel outside the set is a `FAIL`.
-  Each stake step logs its kernels as `#   stake kernels: step <i> node <n>: divid [...] irondivid [...]`, with each
-  block's height, case (`listed`, `matured`, `vault`) and value.
+  Each `mine` or `generateblock` step that makes stake blocks logs its kernels as
+  `#   stake kernels: step <i> node <n>: divid [...] irondivid [...]`, with each block's height, case (`listed`,
+  `matured`, `vault`) and value.
 - **stake proof timing:** both sides end a `mine` step with -25 "failed to generate a valid block", after a
   different number of blocks, and every block either side made staked a coin of its stake set. divid tries one
   timestamp per attempt, the current time (`PoSTransactionCreator.cpp:335-341`), and the kernel hash includes it. So
   whether a coin finds its proof (above all a small one, such as a node's only vault coin) depends on the second the
   attempt runs. `setgenerate` answers -25 at the first attempt that fails (`rpcmining.cpp:104-110`). Seen either way
   round on a replay of the same steps.
+- **divid balance cache:** divid's `getbalance` disagrees with its own unspent coins (`listunspent 1`), while
+  irondivid's agrees with the same coins. divid keeps each wallet transaction's balance in
+  `CachedUtxoBalanceCalculator` (`CachedUtxoBalanceCalculator.cpp:13-30`), recomputed only when a wallet transaction
+  spending it is added (`wallet.cpp:1242-1333`). So a spend that the mempool drops still counts as spending the coin.
+  The coins compared are `listunspent 1` and the confirmed locked coins, which `getbalance` counts and `listunspent`
+  leaves out.
+- **maturity window:** only the middle of an `invalidate` differs, by one or two coins of one value, with mempools
+  of one size, and the end states agree. The two sides had spent different coins of that value (divid's choice among
+  equal coins is by txid order, which shows only in the coins' depths). With the tip lowered, one of those coins sits
+  in the block between the mempool's coinbase maturity (20, `txmempool.cpp:151`) and the wallet's (21,
+  `MerkleTxConfirmationNumberCalculator.cpp:54-59`). The run goes on without a new episode.
 - **maturity in the middle of a reorg:** only the middle of an `invalidate` differs (balances, coins, the mempool's
   size), and the end states agree. While its tip was lowered, one side dropped transactions from the disconnected
   blocks or its mempool, and each spends a coinbase or coinstake output immature at that height, or an output of a
@@ -140,9 +187,16 @@ episode) and the remaining steps, so every comparison stays exact:
   divid writes its wallet to disk 2 s after the last change (`ThreadFlushWalletDB`,
   `LegacyWalletDatabaseEndpointFactory.cpp:23-50`), so a send made just before a `kill -9` is lost. irondivid stores
   a send before the RPC that made it answers.
+- **divid loses a key imported into an encrypted wallet:** divid's node no longer holds an address an
+  `importprivkey` step brought in, and irondivid's does. `CWallet::AddKeyPubKey` writes a key to the wallet file only
+  when the wallet is not encrypted (`wallet.cpp:611-613`). On an encrypted wallet, `CCryptoKeyStore::AddCryptedKey`
+  keeps it in memory alone (`crypter.cpp:295-305`). So divid's next start no longer has the key, nor the coins paid to
+  it. irondivid stores the key, and copying divid would throw a private key and its coins away. In a twin run both
+  divid pairs lose the key alike.
 - **rebroadcast timing:** after a restart, only the restarted node's mempool, unconfirmed balance or unconfirmed coins
-  differ, and each side's restarted node holds only transactions its peer holds too. divid sends some mempool
-  transactions to its peers again at a random time within 30 minutes (`PeriodicallyRebroadcastMempoolTxs`,
+  differ, and each side's restarted node holds only transactions its peer holds too, besides transactions of the same
+  output values on both sides (its own sends, which reach the peer again by the same rebroadcast). divid sends some
+  mempool transactions to its peers again at a random time within 30 minutes (`PeriodicallyRebroadcastMempoolTxs`,
   `main.cpp:1280-1294`; irondivid does the same since `fix/random-sequences`). Whether the restarted node has the
   peer's transactions back by then is chance.
 
@@ -160,5 +214,6 @@ empty at present.
 ## Shortening a difference
 
 A `FAIL` prints the steps of its episode as JSON. Saved to a file and run with `REPLAY=<file>`, they reach the same
-point on four fresh nodes. Removing steps from the file and running it again finds the shortest list that still shows
+point on four fresh nodes, with `RANDOM_SEQUENCES_ENCRYPTED` set as the FAIL prints it (a wallet encrypted in an
+earlier episode is encrypted again at the next one's setup). Removing steps from the file and running it again finds the shortest list that still shows
 the difference. Some differences need a particular coin choice, so a replay can take a few tries.

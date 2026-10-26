@@ -27,7 +27,11 @@ fn start(dir: &Path, txindex: bool, reindex: bool) -> Result<Node, divi_node::No
     config.data_dir = dir.to_path_buf();
     config.index.txindex = txindex;
     config.index.reindex = reindex;
-    Node::new(config)
+    let node = Node::new(config)?;
+    // A start carries a -reindex out on the import thread
+    node.spawn_import();
+    node.wait_for_import();
+    Ok(node)
 }
 
 /// An output anyone can spend with an empty scriptSig (OP_TRUE)

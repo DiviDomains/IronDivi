@@ -2237,6 +2237,10 @@ async fn run_daemon(
     // Never dropped: the process ends without running the destructors of the
     // node's state (databases, caches, mempool), see `exit_after_stop`
     let node = std::mem::ManuallyDrop::new(Node::new(config.clone()).map_err(start_error)?);
+    // Divi Core's import thread (-reindex, bootstrap.dat, -loadblock) starts
+    // once the wallet is loaded (init.cpp:1580); here the wallet is loaded
+    // after the node starts, so the thread waits until then (below)
+    node.hold_import();
 
     // -blocknotify, before any block comes in (init.cpp:1563-1564)
     if let Some(cmd) = config.blocknotify.clone() {
@@ -2739,6 +2743,10 @@ async fn run_daemon(
     } else {
         None
     };
+
+    // The wallet is loaded: the import thread goes on, a -reindex with it,
+    // while RPC answers, as Divi Core's (init.cpp:686-728, :1580, :1639)
+    node.release_import();
 
     // Start RPC server. RPC always requires authentication: without a complete
     // rpcuser/rpcpassword pair a random cookie is written to <datadir>/.cookie
@@ -3742,33 +3750,34 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
         });
     }
 
-    // Set up signal handler
+    // SIGTERM and SIGINT stop the node. They are registered here, before the
+    // pid file is written, as Divi Core sets its handlers (init.cpp:1388-1394)
+    // before CreatePidFile (:1470): a signal sent once the pid file is there is
+    // always handled, never the default action that kills the process
+    #[cfg(unix)]
+    let mut terminate = signal::unix::signal(signal::unix::SignalKind::terminate())
+        .context("Failed to install SIGTERM handler")?;
+    #[cfg(unix)]
+    let mut interrupt = signal::unix::signal(signal::unix::SignalKind::interrupt())
+        .context("Failed to install SIGINT handler")?;
     let shutdown_tx_clone = shutdown_tx.clone();
     tokio::spawn(async move {
-        let ctrl_c = async {
+        #[cfg(unix)]
+        tokio::select! {
+            _ = interrupt.recv() => {
+                info!("Received Ctrl+C, initiating shutdown...");
+            }
+            _ = terminate.recv() => {
+                info!("Received SIGTERM, initiating shutdown...");
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
             signal::ctrl_c()
                 .await
                 .expect("Failed to install Ctrl+C handler");
-        };
-
-        #[cfg(unix)]
-        let terminate = async {
-            signal::unix::signal(signal::unix::SignalKind::terminate())
-                .expect("Failed to install signal handler")
-                .recv()
-                .await;
-        };
-
-        #[cfg(not(unix))]
-        let terminate = std::future::pending::<()>();
-
-        tokio::select! {
-            _ = ctrl_c => {
-                info!("Received Ctrl+C, initiating shutdown...");
-            }
-            _ = terminate => {
-                info!("Received SIGTERM, initiating shutdown...");
-            }
+            info!("Received Ctrl+C, initiating shutdown...");
         }
 
         let _ = shutdown_tx_clone.send(());

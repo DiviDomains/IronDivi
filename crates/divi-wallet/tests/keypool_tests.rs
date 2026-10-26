@@ -153,6 +153,22 @@ fn locked_pool_runs_out_and_unlock_tops_it_up() {
     );
 }
 
+/// walletpassphrase on a wallet already unlocked for everything takes any
+/// passphrase (wallet.cpp:780-783) and still tops the keypool up after it
+/// (rpcwallet.cpp:2617-2620), so a key handed out since is replaced
+#[test]
+fn unlock_of_an_unlocked_wallet_tops_the_pool_up() {
+    let dir = tempdir().unwrap();
+    let wallet = new_encrypted_wallet(&dir.path().join("wallet"));
+    let full = wallet.keypool_size();
+    wallet.unlock_keeping_timer("pw", false).unwrap();
+    wallet.new_receiving_address().unwrap();
+    assert_eq!(wallet.keypool_size(), full - 1);
+
+    wallet.unlock_keeping_timer("any", false).unwrap();
+    assert_eq!(wallet.keypool_size(), full);
+}
+
 #[test]
 fn keypool_size_and_refill_are_real() {
     let hd = HdWallet::from_mnemonic(MNEMONIC, None, ChainMode::Divi).unwrap();

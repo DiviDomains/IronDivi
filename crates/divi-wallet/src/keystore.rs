@@ -282,6 +282,38 @@ impl KeyStore {
         Ok(address)
     }
 
+    /// Give back the change key `address` that [`Self::new_change_address`]
+    /// handed out last, as Divi Core's CReserveKey::ReturnKey puts a reserved
+    /// key back in the pool (reservekey.cpp:44-51, wallet.cpp:2165-2177): the change index steps back
+    /// so the key, still stored, counts in the pool again. A key handed out
+    /// before another one, or not a change key, is left as it is. True when
+    /// the key was given back.
+    pub fn return_change_key(&self, address: &Address) -> bool {
+        let wallet = self.hd_wallet.read();
+        let Some(wallet) = wallet.as_ref() else {
+            return false;
+        };
+        let mut index = self.change_index.write();
+        if *index == 0 {
+            return false;
+        }
+        let last = match wallet
+            .derive_change(0, *index - 1)
+            .and_then(|k| k.secret_key())
+        {
+            Ok(secret) => {
+                KeyEntry::with_hd_path(secret, hd_key_path(wallet.coin_type(), true, *index - 1))
+                    .address(self.network)
+            }
+            Err(_) => return false,
+        };
+        if last.hash != address.hash {
+            return false;
+        }
+        *index -= 1;
+        true
+    }
+
     /// Import a private key
     pub fn import_key(&self, secret: SecretKey, label: Option<String>) -> Address {
         self.import_key_with_compression(secret, true, label)
@@ -447,6 +479,15 @@ impl KeyStore {
     pub fn set_hd_wallet(&self, wallet: HdWallet) {
         *self.hd_public_ids.write() = HdPublicIds::of(&wallet);
         *self.hd_wallet.write() = Some(wallet);
+    }
+
+    /// Drop keys just derived that could not be written, so the key pool is
+    /// as it was before the derivation
+    pub fn remove_keys(&self, hashes: &[Hash160]) {
+        let mut keys = self.keys.write();
+        for hash in hashes {
+            keys.remove(hash);
+        }
     }
 
     /// Add a key entry directly with its hash (for restoration from persistence)
