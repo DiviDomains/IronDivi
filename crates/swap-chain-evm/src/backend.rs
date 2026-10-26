@@ -29,7 +29,7 @@
 use alloy::eips::{BlockNumberOrTag, Encodable2718};
 use alloy::network::{EthereumWallet, NetworkTransactionBuilder, TransactionBuilder};
 use alloy::primitives::{keccak256, Address, FixedBytes, B256, U256};
-use alloy::providers::Provider;
+use alloy::providers::{DynProvider, Provider, ProviderBuilder};
 use alloy::rpc::types::{Filter, TransactionRequest};
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types::SolEvent;
@@ -156,6 +156,9 @@ pub struct UsdcBackend {
     token: Address,
     compressed_pubkey: [u8; 33],
     min_lock_gas_wei: U256,
+    /// A second node `htlc_output`, `find_spend`, `confirmations` and `median_time_past`
+    /// also ask ([`UsdcBackend::with_quorum_rpc`]); `None` reads the one node only.
+    quorum: Option<DynProvider>,
 }
 
 impl std::fmt::Debug for UsdcBackend {
@@ -188,6 +191,7 @@ impl UsdcBackend {
             token,
             compressed_pubkey,
             min_lock_gas_wei: U256::ZERO,
+            quorum: None,
         })
     }
 
@@ -201,6 +205,17 @@ impl UsdcBackend {
     pub fn with_min_lock_gas_wei(mut self, wei: u128) -> Self {
         self.min_lock_gas_wei = U256::from(wei);
         self
+    }
+
+    /// Also read the reads a claim or refund rests on from the node at `rpc_url`
+    /// ([`crate::quorum`]). Off unless called.
+    pub fn with_quorum_rpc(mut self, rpc_url: &str) -> Result<Self> {
+        let url = rpc_url
+            .parse()
+            .map_err(|e| SwapError::Other(format!("bad quorum RPC URL: {e}")))?;
+        // Read-only: nothing is ever signed or sent through the second node.
+        self.quorum = Some(DynProvider::new(ProviderBuilder::new().connect_http(url)));
+        Ok(self)
     }
 
     /// This backend's own ETH (gas) and `self.token` (USDC) balances — e.g. to check a

@@ -19,6 +19,7 @@ mod backend;
 mod contract;
 mod embedded_bytecode;
 mod network;
+mod quorum;
 
 pub mod client;
 
