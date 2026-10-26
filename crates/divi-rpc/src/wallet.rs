@@ -4098,10 +4098,13 @@ impl WalletRpc {
             .into());
         }
 
+        // Divi Core's reply names no cause (rpcwallet.cpp:2729-2730); the
+        // cause goes to the log
         wallet.encrypt_wallet(passphrase).map_err(|e| {
+            tracing::error!("Failed to encrypt the wallet: {}", e);
             RpcError::new(
                 codes::WALLET_ENCRYPTION_FAILED,
-                format!("Error: Failed to encrypt the wallet: {}", e),
+                "Error: Failed to encrypt the wallet.",
             )
         })?;
 

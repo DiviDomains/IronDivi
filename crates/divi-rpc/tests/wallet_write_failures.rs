@@ -245,3 +245,20 @@ fn sends_and_keys_while_writes_fail_answer_as_divid() {
     );
     assert_eq!(reopened.get_account(&own), "lbl", "the label is on disk");
 }
+
+/// encryptwallet whose writes fail answers with Divi Core's text, which
+/// names no cause (rpcwallet.cpp:2729-2730), and leaves the wallet as it was
+#[test]
+fn encryptwallet_while_writes_fail_answers_as_divid() {
+    let _limit = LIMIT.lock();
+    let net = Net::new();
+    let rpc = net.rpc();
+    writes_fail();
+    let reply = rpc.encrypt_wallet(&p(vec![json!("throwaway-pass")]));
+    writes_work();
+    assert_eq!(
+        rpc_error(reply),
+        (-16, "Error: Failed to encrypt the wallet.".to_string())
+    );
+    assert!(!net.wallet.is_encrypted());
+}
