@@ -2297,19 +2297,6 @@ async fn run_daemon(
     // Warnings::setMiscWarning puts it: getinfo's and getmininginfo's "errors"
     // (timedata.cpp:96-97)
     divi_network::timedata::on_clock_warning(divi_rpc::warnings::set_misc_warning);
-    // divid reads masternode.conf (-mnconf) at every start, makes it when
-    // missing, and with -masternode checks the masternode's settings
-    // (MasternodeModule.cpp:210-240; init.cpp:1594-1597)
-    let mn_entries = mn_options.read_conf().map_err(|e| anyhow::anyhow!(e))?;
-    let mn_network = match config.network.network_type {
-        NetworkType::Mainnet => WalletNetwork::Mainnet,
-        NetworkType::Testnet => WalletNetwork::Testnet,
-        NetworkType::Regtest => WalletNetwork::Regtest,
-    };
-    mn_options
-        .check_start(&mn_entries, config.index.txindex, mn_network)
-        .map_err(|e| anyhow::anyhow!(e))?;
-
     // Divi Core Discover: the interfaces' addresses (net.cpp:1385-1425)
     if config.p2p.discover {
         config.p2p.interface_ips = interfaces::addresses();
@@ -2423,10 +2410,6 @@ async fn run_daemon(
                 let message = "Make sure to encrypt your wallet and delete all non-encrypted backups after you verified that wallet works!";
                 warn!("Warning: {}", message);
                 eprintln!("Warning: {}", message);
-            }
-            // -mnconflock, default on (MasternodeModule.cpp:454-466)
-            if mn_options.lock {
-                core_files::lock_masternode_collateral(w, &mn_options.conf_path);
             }
             w.set_vault_mode(config.vault);
             // Before the wallet catches up with the chain, as divid loads
@@ -2755,6 +2738,24 @@ async fn run_daemon(
                 tokio::time::sleep(std::time::Duration::from_secs(60)).await;
             }
         });
+    }
+
+    // Divi Core's step 10, once the chain and the wallet are loaded: it reads
+    // masternode.conf (-mnconf), makes it when missing, with -masternode checks
+    // the masternode's settings, then locks the collaterals masternode.conf
+    // names (-mnconflock, default on), all before staking starts in step 11
+    // (init.cpp:1594-1598, MasternodeModule.cpp:210-240, :454-466)
+    let mn_entries = mn_options.read_conf().map_err(|e| anyhow::anyhow!(e))?;
+    let mn_network = match config.network.network_type {
+        NetworkType::Mainnet => WalletNetwork::Mainnet,
+        NetworkType::Testnet => WalletNetwork::Testnet,
+        NetworkType::Regtest => WalletNetwork::Regtest,
+    };
+    mn_options
+        .check_start(&mn_entries, config.index.txindex, mn_network)
+        .map_err(|e| anyhow::anyhow!(e))?;
+    if let (Some(w), true) = (wallet.as_ref(), mn_options.lock) {
+        core_files::lock_masternode_collateral(w, &mn_options.conf_path);
     }
 
     // Start staker if wallet is available

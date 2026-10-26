@@ -162,3 +162,38 @@ fn the_wallet_is_backed_up_before_the_chain_is_opened() {
     assert_eq!(code, Some(1), "{err}");
     assert_eq!(names(&backups).len(), before + 1, "{:?}", names(&backups));
 }
+
+/// divid reads masternode.conf, and makes it when it is missing, in step 10,
+/// after the chain and the wallet (InitializeMasternodeIfRequested,
+/// init.cpp:1595, MasternodeModule.cpp:211-217): a start that fails at the
+/// chain has not made it
+#[test]
+fn masternode_conf_is_not_made_by_a_start_that_fails_at_the_chain() {
+    let dir = tempfile::tempdir().unwrap();
+    started_once(dir.path());
+    let conf = dir.path().join("masternode.conf");
+    std::fs::remove_file(&conf).unwrap();
+    damage_chain(dir.path());
+    let (code, err) = failed_start(&mut irondivid(dir.path(), free_port()));
+    assert_eq!(code, Some(1), "{err}");
+    assert!(!conf.exists(), "{:?}", names(dir.path()));
+}
+
+/// -masternode with no such masternode in masternode.conf stops divid in
+/// step 10 (init.cpp:1595-1597), after it has made its wallet in step 8
+#[test]
+fn the_masternode_check_comes_after_the_wallet_is_made() {
+    let dir = tempfile::tempdir().unwrap();
+    let (code, err) = failed_start(irondivid(dir.path(), free_port()).arg("-masternode=1"));
+    assert_eq!(code, Some(1), "{err}");
+    assert!(
+        err.lines()
+            .any(|l| l == "Error: Unknown masternode configuration for masternode=<alias>."),
+        "{err}"
+    );
+    assert!(
+        dir.path().join("wallet").exists(),
+        "{:?}",
+        names(dir.path())
+    );
+}
