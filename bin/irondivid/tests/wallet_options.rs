@@ -516,3 +516,32 @@ fn encryption_logs_its_derivation_count() {
     ));
     stop(node, rpc);
 }
+
+/// LoadWallet's lines as divid writes them: the file version and the key
+/// counts, zero for a new wallet (loaded before its keys are made); a wallet
+/// with keys has them all with metadata and none stored as plain keys, so the
+/// log asks for a rescan (walletdb.cpp:529-537)
+#[test]
+fn the_wallet_load_logs_divid_s_counts() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut rpc, mut p2p) = (free_port(), free_port());
+    let node = start(dir.path(), &mut rpc, &mut p2p, &[]);
+    assert!(logged(dir.path(), "nFileVersion = 3000000"));
+    assert!(logged(
+        dir.path(),
+        "Keys: 0 plaintext, 0 encrypted, 0 w/ metadata, 0 total"
+    ));
+    stop(node, rpc);
+    std::fs::remove_file(dir.path().join("debug.log")).unwrap();
+
+    let node = start(dir.path(), &mut rpc, &mut p2p, &[]);
+    assert!(logged(dir.path(), "nFileVersion = 3000000"));
+    assert!(logged(dir.path(), "Keys: 0 plaintext, 0 encrypted, "));
+    assert!(logged(
+        dir.path(),
+        "Some keys lack metadata. Wallet may require a rescan"
+    ));
+    let log = std::fs::read_to_string(dir.path().join("debug.log")).unwrap();
+    assert!(!log.contains(" 0 w/ metadata"), "{log}");
+    stop(node, rpc);
+}

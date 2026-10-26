@@ -1757,6 +1757,22 @@ struct WalletOptions {
     prune_wallet_confs: Option<i64>,
 }
 
+/// Divi Core's LoadWallet lines (walletdb.cpp:529-537): the file version a
+/// 3.0.0 wallet has, and the key counts
+fn log_load_counts(plaintext: usize, encrypted: usize, with_metadata: usize) {
+    info!("nFileVersion = 3000000");
+    info!(
+        "Keys: {} plaintext, {} encrypted, {} w/ metadata, {} total",
+        plaintext,
+        encrypted,
+        with_metadata,
+        plaintext + encrypted
+    );
+    if plaintext + encrypted != with_metadata {
+        info!("Some keys lack metadata. Wallet may require a rescan");
+    }
+}
+
 /// Divi Core's IsHex (utilstrencodings.cpp:64-71): an even number of hex
 /// digits, at least two, and nothing else
 fn core_is_hex(text: &str) -> bool {
@@ -1982,6 +1998,8 @@ fn load_or_restore_wallet_with_seed(
             }
         }
 
+        let (plaintext, encrypted, with_metadata) = wallet.load_counts();
+        log_load_counts(plaintext, encrypted, with_metadata);
         info!("Wallet loaded successfully");
         return Ok(Arc::new(wallet));
     }
@@ -2054,6 +2072,8 @@ fn load_or_restore_wallet_with_seed(
             .with_context(|| "Failed to generate HD wallet")?
     };
 
+    // Divi Core loads the empty wallet file before it makes the keys
+    log_load_counts(0, 0, 0);
     info!("Creating new wallet at {:?}", wallet_path);
     std::fs::create_dir_all(wallet_path)
         .with_context(|| format!("Failed to create wallet directory: {:?}", wallet_path))?;
