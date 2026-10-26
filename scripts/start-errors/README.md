@@ -40,7 +40,8 @@ case cannot spoil the next. Both nodes run a case at the same time. A case's out
 - `up`: RPC answers (with the node's credentials) on its RPC port, or on the other port the case names;
 - `running, no RPC`: neither answers nor exits within 10 s of nothing listening;
 - `exit <code> "<line>"`: the exit code (a negative code is the signal that ended it) and the first stderr line that
-  starts with `Error` (else the first line). The node's own data directory path reads `<datadir>` (divid keeps
+  starts with `Error` (else the first that starts with `EXCEPTION`, as divid prints a line of stars before it; else
+  the first line). The node's own data directory path reads `<datadir>` (divid keeps
   regtest data in `<datadir>/regtest`, irondivid in `<datadir>`), so the two lines compare.
 
 A node still running when its outcome is known is killed: the next case starts from the template again. Rows with

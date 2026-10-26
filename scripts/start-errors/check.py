@@ -238,10 +238,13 @@ class Node:
         return False
 
     def error_line(self):
-        """The first line on stderr that names an error, else the first line"""
+        """The first line on stderr that names an error, else the first that
+        names an uncaught exception (divid prints a line of stars before it),
+        else the first line"""
         with open(self.err, errors="replace") as f:
             lines = [ln.rstrip("\n") for ln in f if ln.strip()]
-        first = next((ln for ln in lines if ln.startswith(("Error", "error"))), lines[0] if lines else "")
+        first = next((ln for ln in lines if ln.startswith(("Error", "error"))),
+                     next((ln for ln in lines if ln.startswith("EXCEPTION")), lines[0] if lines else ""))
         # The node's own paths, so the two lines compare: divid keeps regtest
         # data in a regtest/ folder of the data directory, irondivid in it
         for path, name in ((os.path.join(self.dir, "regtest"), "<datadir>"), (self.dir, "<datadir>"),
