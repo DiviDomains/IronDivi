@@ -488,3 +488,73 @@ fn an_account_named_after_a_note_loses_that_note() {
         ["FromAccount=shop", "comment=a note", "to=a shop"]
     );
 }
+
+/// The log lines written while `f` runs on this thread
+fn logged<T>(f: impl FnOnce() -> T) -> (T, String) {
+    #[derive(Clone)]
+    struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Buf {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(data);
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let buf = Buf(Default::default());
+    let writer = buf.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .finish();
+    let out = tracing::subscriber::with_default(subscriber, f);
+    let text = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+    (out, text)
+}
+
+/// A send logs "CommitTransaction:" and the transaction as Divi Core's
+/// CTransaction::ToString writes it (wallet.cpp:1866;
+/// primitives/transaction.cpp:51-63, :115-118, :261-280)
+#[test]
+fn a_send_logs_the_transaction_it_commits() {
+    let net = Net::new();
+    let funded = net.fund(&[10 * COIN]);
+    let coin: Vec<_> = net
+        .wallet
+        .get_utxos()
+        .into_iter()
+        .filter(|u| u.address == funded[0].to_string())
+        .collect();
+    let rpc = net.rpc();
+    let (txid, log) = logged(|| {
+        rpc.send_to_address(&p(vec![json!(dest().to_string()), json!(1)]))
+            .unwrap()
+    });
+    let txid = txid.as_str().unwrap().to_string();
+    let tx = net.submitted.lock()[0].clone();
+    assert!(log.contains("CommitTransaction:\n"), "{log}");
+    assert!(
+        log.contains(&format!(
+            "CTransaction({}, ver=1, vin.size=1, vout.size={}, nLockTime=0)\n",
+            &txid[..10],
+            tx.vout.len()
+        )),
+        "{log}"
+    );
+    assert!(
+        log.contains(&format!(
+            "    CTxIn(COutPoint({}, {}), scriptSig=",
+            coin[0].txid, coin[0].vout
+        )),
+        "{log}"
+    );
+    let payee = format!("OP_DUP OP_HASH160 {}", hex::encode(dest().hash.as_bytes()));
+    assert!(
+        log.contains(&format!(
+            "    CTxOut(nValue=1.00000000, scriptPubKey={})\n",
+            &payee[..30]
+        )),
+        "{log}"
+    );
+}
