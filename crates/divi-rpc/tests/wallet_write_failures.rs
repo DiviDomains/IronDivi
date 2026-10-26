@@ -262,3 +262,32 @@ fn encryptwallet_while_writes_fail_answers_as_divid() {
     );
     assert!(!net.wallet.is_encrypted());
 }
+
+/// A send that fails after its coins are chosen, here a fee the receiver pays
+/// that would leave the payment as dust, with the key pool one short: Divi
+/// Core reserves the change key first, and the reservation's top-up throws
+/// when it cannot write the new key (wallet.cpp:1786-1793, :2129-2130,
+/// :2339-2347). The reply is the derivation's, and the key pool is as it was
+#[test]
+fn a_failed_send_whose_key_pool_top_up_cannot_be_written_answers_as_divid() {
+    let _limit = LIMIT.lock();
+    let net = Net::new();
+    net.fund();
+    let rpc = net.rpc();
+    rpc.keypool_refill(&p(vec![])).unwrap();
+    net.wallet.new_receiving_address().unwrap();
+    let size = net.wallet.keypool_size();
+    writes_fail();
+    let reply = rpc.send_to_address(&p(vec![
+        json!(dest().to_string()),
+        json!(0.00006),
+        json!("receiver_pays"),
+    ]));
+    let after = net.wallet.keypool_size();
+    writes_work();
+    assert_eq!(
+        rpc_error(reply),
+        (-1, "loadHDChain: WriteHDChain failed".to_string())
+    );
+    assert_eq!(after, size, "the key pool after the failed send");
+}
