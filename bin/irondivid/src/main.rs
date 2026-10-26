@@ -712,6 +712,11 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     let listen_port = config.p2p.port;
     let binds = s.get_multi("bind");
     if let Some(first) = binds.first() {
+        // A node that listens resolves every -bind, this one too, and one
+        // that is no address stops the start (net.cpp:1806-1811)
+        if s.get_bool("listen", true) {
+            bind_address(first, listen_port)?;
+        }
         let (host, p) = host_and_port(first);
         config.p2p.listen_addr = host;
         if let Some(p) = p {

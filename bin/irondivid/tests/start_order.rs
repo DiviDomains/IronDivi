@@ -197,3 +197,27 @@ fn the_masternode_check_comes_after_the_wallet_is_made() {
         names(dir.path())
     );
 }
+
+/// A node that listens resolves each -bind in step 6 and stops at one that is
+/// no address, with "Cannot resolve -bind address" (net.cpp:1806-1811)
+#[test]
+fn a_first_bind_that_is_no_address_stops_the_start_with_divid_s_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_irondivid"));
+    cmd.arg("--regtest")
+        .arg("--datadir")
+        .arg(dir.path())
+        .args(["--rpcport", &free_port().to_string()])
+        .args(["--port", &free_port().to_string()])
+        .args(["-listen=1", "-bind=garbage", "--staking=false"])
+        .args(["--rpcuser", "test", "--rpcpassword", "test"])
+        .env("WALLET_MNEMONIC", WALLET_MNEMONIC)
+        .env("WALLET_LOOKAHEAD", "5");
+    let (code, err) = failed_start(&mut cmd);
+    assert_eq!(code, Some(1), "{err}");
+    assert_eq!(
+        err.lines().find(|l| l.starts_with("Error")),
+        Some("Error: Cannot resolve -bind address: 'garbage'"),
+        "{err}"
+    );
+}
