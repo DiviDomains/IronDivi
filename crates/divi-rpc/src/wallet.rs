@@ -202,9 +202,18 @@ fn new_key_error(e: divi_wallet::WalletError) -> Error {
         divi_wallet::WalletError::WalletLocked => {
             RpcError::new(codes::WALLET_UNLOCK_NEEDED, "Wallet is locked")
         }
+        divi_wallet::WalletError::Storage(_) => key_write_error(e),
         _ => RpcError::new(codes::WALLET_ERROR, e.to_string()),
     }
     .into()
+}
+
+/// New keys that could not be written: Divi Core's derivation throws
+/// (wallet.cpp:2346-2347), and its RPC server answers with the exception's
+/// text (rpcserver.cpp:1107-1108)
+fn key_write_error(e: divi_wallet::WalletError) -> RpcError {
+    warn!("Failed to store new keys: {}", e);
+    RpcError::new(codes::MISC_ERROR, "loadHDChain: WriteHDChain failed")
 }
 
 fn amount_from_value(value: &serde_json::Value, allow_zero: bool) -> Result<Amount, Error> {
@@ -1954,11 +1963,12 @@ impl WalletRpc {
             let script = match change_to {
                 ChangeTo::NewKey => wallet
                     .new_change_address()
-                    .map_err(|e| {
-                        RpcError::new(
+                    .map_err(|e| match e {
+                        divi_wallet::WalletError::Storage(_) => key_write_error(e),
+                        e => RpcError::new(
                             codes::WALLET_ERROR,
                             format!("Failed to generate change address: {}", e),
-                        )
+                        ),
                     })?
                     .script_pubkey(),
                 ChangeTo::Script(script) => script,
@@ -4932,9 +4942,12 @@ impl WalletRpc {
         }
         wallet.set_account(&address, account);
 
-        wallet.save().map_err(|e| {
-            RpcError::new(codes::WALLET_ERROR, format!("Failed to save wallet: {}", e))
-        })?;
+        // Divi Core does not read SetAddressLabel's result (rpcwallet.cpp:616):
+        // a label that cannot be written now is kept in memory and written by
+        // the next save
+        if let Err(e) = wallet.save() {
+            warn!("Failed to save the wallet after setaccount: {}", e);
+        }
 
         Ok(serde_json::Value::Null)
     }

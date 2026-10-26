@@ -2841,6 +2841,7 @@ dependencies = [
  "futures",
  "hex",
  "hyper",
+ "libc",
  "parking_lot",
  "rand 0.8.8",
  "serde",

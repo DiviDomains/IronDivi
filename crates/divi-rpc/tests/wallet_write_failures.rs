@@ -1,0 +1,247 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Bert Shuler
+// IronDivi - https://github.com/DiviDomains/IronDivi
+//
+// Portions derived from Divi Core (https://github.com/DiviProject/Divi)
+// licensed under the MIT License. See LICENSE-MIT-UPSTREAM for details.
+
+//! Wallet RPCs while the wallet's writes fail, as on a full disk, answer as
+//! Divi Core 3.0.0's do (scripts/wallet-write-failures compares the daemons).
+//! The tests lower the file size limit of the whole process, so each holds
+//! LIMIT while it runs and no other test shares this binary.
+
+use divi_crypto::compute_merkle_root;
+use divi_primitives::{
+    amount::Amount,
+    block::Block,
+    hash::{Hash160, Hash256},
+    script::Script,
+    transaction::{OutPoint, Transaction, TxIn, TxOut},
+    ChainMode,
+};
+use divi_rpc::{Error, Params, WalletRpc};
+use divi_storage::{Chain, ChainDatabase, ChainParams, NetworkType};
+use divi_wallet::{Address, HdWallet, Network, TransactionBuilder, TransactionSigner, WalletDb};
+use parking_lot::Mutex;
+use serde_json::{json, Value};
+use std::sync::Arc;
+
+const COIN: i64 = 100_000_000;
+
+/// Held by each test while it changes the file size limit
+static LIMIT: Mutex<()> = Mutex::new(());
+
+/// Set the soft file size limit of the process; a write past it fails with
+/// EFBIG, since SIGXFSZ is ignored
+fn file_size_limit(bytes: libc::rlim_t) {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    unsafe {
+        libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+        assert_eq!(libc::getrlimit(libc::RLIMIT_FSIZE, &mut limit), 0);
+        limit.rlim_cur = bytes.min(limit.rlim_max);
+        assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &limit), 0);
+    }
+}
+
+fn writes_fail() {
+    file_size_limit(1);
+}
+
+fn writes_work() {
+    file_size_limit(libc::RLIM_INFINITY);
+}
+
+/// A regtest chain, a funder wallet in memory, and the wallet under test on disk
+struct Net {
+    chain: Arc<Chain>,
+    dir: tempfile::TempDir,
+    funder: Arc<WalletDb>,
+    wallet: Arc<WalletDb>,
+    miner: Address,
+}
+
+impl Net {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(ChainDatabase::open(dir.path().join("chain")).unwrap());
+        let chain = Chain::new(
+            db,
+            ChainParams::for_network(NetworkType::Regtest, ChainMode::Divi),
+        )
+        .unwrap();
+        let wallet = WalletDb::create_persistent(
+            &dir.path().join("wallet"),
+            Network::Regtest,
+            HdWallet::new(ChainMode::Divi).unwrap(),
+        )
+        .unwrap();
+        Net {
+            chain: Arc::new(chain),
+            funder: Arc::new(WalletDb::with_hd_wallet(
+                Network::Regtest,
+                HdWallet::new(ChainMode::Divi).unwrap(),
+            )),
+            wallet: Arc::new(wallet),
+            dir,
+            miner: Address::from_pubkey_hash(Hash160::from_bytes([0x99; 20]), Network::Regtest),
+        }
+    }
+
+    fn rpc(&self) -> WalletRpc {
+        let rpc = WalletRpc::with_wallet_and_chain(self.wallet.clone(), self.chain.clone());
+        // The node hands a send to the wallet as it takes it into its mempool
+        let wallet = self.wallet.clone();
+        rpc.set_tx_submit(Arc::new(move |tx: Transaction| {
+            wallet.add_mempool_tx(&tx);
+            Ok(tx.txid())
+        }));
+        rpc
+    }
+
+    /// Mine a block holding `txs` whose coinbase pays 1250 DIVI to `pay_to`;
+    /// both wallets scan it
+    fn mine(&self, txs: Vec<Transaction>, pay_to: &Address) -> Transaction {
+        let tip = self.chain.tip().unwrap();
+        let height = tip.height + 1;
+        let mut block = Block::default();
+        block.header.version = 4;
+        block.header.prev_block = tip.hash;
+        block.header.time = tip.time + 60;
+        block.header.bits = 0x207fffff;
+        let mut cb_sig = divi_storage::bip34_height_script(height);
+        cb_sig.extend_from_slice(&height.to_le_bytes());
+        block.transactions.push(Transaction {
+            version: 1,
+            vin: vec![TxIn::coinbase(Script::from_bytes(cb_sig))],
+            vout: vec![TxOut::new(
+                Amount::from_sat(1250 * COIN),
+                Script::new_p2pkh(pay_to.hash.as_bytes()),
+            )],
+            lock_time: 0,
+        });
+        block.transactions.extend(txs);
+        block.header.merkle_root = compute_merkle_root(&block.transactions);
+        let target = Hash256::from_compact(block.header.bits);
+        while divi_crypto::compute_block_hash(&block.header) > target {
+            block.header.nonce += 1;
+        }
+        let time = block.header.time;
+        let txs = block.transactions.clone();
+        let hash = self.chain.accept_block(block).unwrap().hash;
+        for w in [&self.funder, &self.wallet] {
+            w.scan_block(hash, height, time, &txs);
+        }
+        txs[0].clone()
+    }
+
+    /// Give the wallet under test two confirmed coins of 100 DIVI
+    fn fund(&self) {
+        let cb_addr = self.funder.new_receiving_address().unwrap();
+        let coinbase = self.mine(vec![], &cb_addr);
+        // Coinbase maturity 20 on regtest: spendable with 21 confirmations
+        for _ in 0..20 {
+            self.mine(vec![], &self.miner);
+        }
+        let to = self.wallet.new_receiving_address().unwrap();
+        let (mut tx, prev) = TransactionBuilder::new()
+            .add_input(
+                OutPoint::new(coinbase.txid(), 0),
+                coinbase.vout[0].script_pubkey.clone(),
+            )
+            .add_output_to_address(Amount::from_sat(100 * COIN), &to)
+            .add_output_to_address(Amount::from_sat(100 * COIN), &to)
+            .add_output_to_address(Amount::from_sat(1049 * COIN), &self.miner)
+            .build();
+        TransactionSigner::new(self.funder.keystore())
+            .sign_all_inputs(&mut tx, &prev)
+            .unwrap();
+        self.mine(vec![tx], &self.miner);
+        self.wallet.save().unwrap();
+    }
+}
+
+fn p(v: Vec<Value>) -> Params {
+    Params::Array(v)
+}
+
+fn dest() -> Address {
+    Address::from_pubkey_hash(Hash160::from_bytes([0x42; 20]), Network::Regtest)
+}
+
+/// The code and message of an RPC error
+fn rpc_error(result: Result<Value, Error>) -> (i32, String) {
+    match result {
+        Err(Error::Rpc(e)) => (e.code, e.message),
+        other => panic!("not an RPC error: {:?}", other),
+    }
+}
+
+/// With its keypool full, divid sends while its writes fail: the change key
+/// was written when the pool was topped up, KeepKey does not read ErasePool's
+/// result (wallet.cpp:2158-2163) and AddToWallet logs the write it could not
+/// make (wallet.cpp:1271-1274). A key it must derive cannot be written, and
+/// the derivation throws (wallet.cpp:2346-2347): getnewaddress then answers
+/// -1 with that text. setaccount does not read SetAddressLabel's result
+/// (rpcwallet.cpp:616). Once writes work again the wallet writes again
+#[test]
+fn sends_and_keys_while_writes_fail_answer_as_divid() {
+    let _limit = LIMIT.lock();
+    let net = Net::new();
+    net.fund();
+    let rpc = net.rpc();
+    rpc.keypool_refill(&p(vec![])).unwrap();
+    let own = net.wallet.new_receiving_address().unwrap();
+    rpc.keypool_refill(&p(vec![])).unwrap();
+
+    writes_fail();
+    let from_pool = rpc.get_new_address(&p(vec![]));
+    writes_work();
+    let from_pool = from_pool.expect("getnewaddress from a full keypool");
+
+    rpc.keypool_refill(&p(vec![]))
+        .expect("keypoolrefill once writes work again");
+    writes_fail();
+    let sent = rpc.send_to_address(&p(vec![json!(dest().to_string()), json!(10.0)]));
+    let derived = rpc.get_new_address(&p(vec![]));
+    let label = rpc.set_account(&p(vec![json!(own.to_string()), json!("lbl")]));
+    writes_work();
+    let sent = sent.expect("sendtoaddress with a full keypool");
+    assert_eq!(
+        rpc_error(derived),
+        (-1, "loadHDChain: WriteHDChain failed".to_string())
+    );
+    assert_eq!(label.expect("setaccount"), Value::Null);
+
+    let again = rpc
+        .send_to_address(&p(vec![json!(dest().to_string()), json!(11.0)]))
+        .expect("sendtoaddress once writes work again");
+    net.wallet.save().expect("a save once writes work again");
+
+    // The send made while writes failed is kept in memory until a block
+    // confirms it, as Divi Core keeps it in mapWallet (wallet.cpp:1271-1274);
+    // the one made once writes work again is on disk
+    let path = net.dir.path().join("wallet");
+    let again = Hash256::from_hex(again.as_str().unwrap()).unwrap();
+    assert!(net
+        .wallet
+        .get_transaction(&Hash256::from_hex(sent.as_str().unwrap()).unwrap())
+        .is_some());
+    drop(rpc);
+    let Net { wallet, .. } = net;
+    drop(wallet);
+    let reopened = WalletDb::open(&path, Network::Regtest).unwrap();
+    assert!(
+        reopened.get_transaction(&again).is_some(),
+        "{} on disk",
+        again
+    );
+    let from_pool = Address::from_base58(from_pool.as_str().unwrap()).unwrap();
+    assert!(
+        reopened.is_mine(&from_pool),
+        "the key from the pool is on disk"
+    );
+    assert_eq!(reopened.get_account(&own), "lbl", "the label is on disk");
+}

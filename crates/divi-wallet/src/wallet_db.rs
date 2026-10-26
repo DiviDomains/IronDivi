@@ -1787,9 +1787,21 @@ impl WalletDb {
         };
         self.dirty.write().keys = true;
         self.dirty.write().metadata = true; // receiving/change index changed
+        let derived = !store.is_empty();
         store.push(addr.hash);
-        self.persist_keys(&store)?;
-        Ok(addr)
+        match self.persist_keys(&store) {
+            // A key stored by an earlier top-up is handed out even when the
+            // advanced index cannot be written, as Divi Core's KeepKey does not
+            // read ErasePool's result (wallet.cpp:2158-2163); the next save
+            // writes the index. Keys just derived must be on disk first, as
+            // Divi Core's derivation throws when its write fails (wallet.cpp:2346-2347)
+            Err(WalletError::Storage(e)) if !derived => {
+                warn!("Failed to store the next key index: {}", e);
+                Ok(addr)
+            }
+            Err(e) => Err(e),
+            Ok(()) => Ok(addr),
+        }
     }
 
     /// Derive the missing keypool keys (the seed must be in memory) and store
@@ -4076,7 +4088,12 @@ impl WalletDb {
         self.set_account(address, label);
         let db = match self.db() {
             Some(db) => db,
-            None => return self.closed_database(),
+            None => {
+                if let Err(e) = self.closed_database() {
+                    warn!("Failed to store the label of {}: {}", address, e);
+                }
+                return Ok(());
+            }
         };
         let db = &*db;
         let mut batch = db.create_batch();
@@ -4099,7 +4116,13 @@ impl WalletDb {
             format!("addr_{}", address).as_bytes(),
             label.as_bytes(),
         );
-        db.write_batch_sync(batch)
+        // Divi Core's callers do not read SetAddressLabel's result
+        // (rpcwallet.cpp:310, :361, :616; rpcdump.cpp:85, :152): the label is
+        // kept in memory and the next save writes it
+        if let Err(e) = db.write_batch_sync(batch) {
+            warn!("Failed to store the label of {}: {}", address, e);
+        }
+        Ok(())
     }
 
     /// The address book: every address with its name (Divi Core's
