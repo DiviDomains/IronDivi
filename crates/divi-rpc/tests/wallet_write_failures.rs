@@ -163,6 +163,40 @@ impl Net {
     }
 }
 
+impl Net {
+    /// Pay `value` to `to` in a confirmed coin, from a mature coinbase of the funder
+    fn fund_to(&self, to: &Address, value: i64) {
+        let cb_addr = self.funder.new_receiving_address().unwrap();
+        let coinbase = self.mine(vec![], &cb_addr);
+        for _ in 0..20 {
+            self.mine(vec![], &self.miner);
+        }
+        let (mut tx, prev) = TransactionBuilder::new()
+            .add_input(
+                OutPoint::new(coinbase.txid(), 0),
+                coinbase.vout[0].script_pubkey.clone(),
+            )
+            .add_output_to_address(Amount::from_sat(value), to)
+            .add_output_to_address(Amount::from_sat(1249 * COIN - value), &self.miner)
+            .build();
+        TransactionSigner::new(self.funder.keystore())
+            .sign_all_inputs(&mut tx, &prev)
+            .unwrap();
+        self.mine(vec![tx], &self.miner);
+    }
+}
+
+/// A coin the wallet holds the wrong key for, so a send of it cannot be
+/// signed (as crates/divi-rpc/tests/wallet_sends.rs makes one)
+fn unsignable_coin(net: &Net, value: i64) {
+    use divi_crypto::keys::SecretKey;
+    use divi_wallet::KeyEntry;
+    let owner = KeyEntry::imported(SecretKey::new_random(), true).address(Network::Regtest);
+    let wrong = KeyEntry::imported(SecretKey::new_random(), true);
+    net.wallet.keystore().add_key_with_hash(owner.hash, wrong);
+    net.fund_to(&owner, value);
+}
+
 fn p(v: Vec<Value>) -> Params {
     Params::Array(v)
 }
@@ -261,4 +295,98 @@ fn encryptwallet_while_writes_fail_answers_as_divid() {
         (-16, "Error: Failed to encrypt the wallet.".to_string())
     );
     assert!(!net.wallet.is_encrypted());
+}
+
+/// A send that fails after its coins are chosen, here a fee the receiver pays
+/// that would leave the payment as dust, with the key pool one short: Divi
+/// Core reserves the change key first, and the reservation's top-up throws
+/// when it cannot write the new key (wallet.cpp:1786-1793, :2129-2130,
+/// :2339-2347). The reply is the derivation's, and the key pool is as it was
+#[test]
+fn a_failed_send_whose_key_pool_top_up_cannot_be_written_answers_as_divid() {
+    let _limit = LIMIT.lock();
+    let net = Net::new();
+    net.fund();
+    let rpc = net.rpc();
+    rpc.keypool_refill(&p(vec![])).unwrap();
+    net.wallet.new_receiving_address().unwrap();
+    let size = net.wallet.keypool_size();
+    writes_fail();
+    let reply = rpc.send_to_address(&p(vec![
+        json!(dest().to_string()),
+        json!(0.00006),
+        json!("receiver_pays"),
+    ]));
+    let after = net.wallet.keypool_size();
+    writes_work();
+    assert_eq!(
+        rpc_error(reply),
+        (-1, "loadHDChain: WriteHDChain failed".to_string())
+    );
+    assert_eq!(after, size, "the key pool after the failed send");
+}
+
+/// keypoolrefill whose new keys cannot be written: Divi Core derives each key
+/// inside its WritePool call, and the derivation throws when it cannot write
+/// the HD chain (wallet.cpp:2104, :2339-2347), so its reply is that one and
+/// "TopUpKeyPool: writing generated key failed" (:2104-2105) is not reached.
+/// The key pool is as it was
+#[test]
+fn keypoolrefill_whose_keys_cannot_be_written_answers_as_divid() {
+    let _limit = LIMIT.lock();
+    let net = Net::new();
+    let rpc = net.rpc();
+    rpc.keypool_refill(&p(vec![])).unwrap();
+    net.wallet.new_receiving_address().unwrap();
+    let size = net.wallet.keypool_size();
+    writes_fail();
+    let reply = rpc.keypool_refill(&p(vec![]));
+    let after = net.wallet.keypool_size();
+    writes_work();
+    assert_eq!(
+        rpc_error(reply),
+        (-1, "loadHDChain: WriteHDChain failed".to_string())
+    );
+    assert_eq!(after, size, "the key pool after the failed refill");
+}
+
+/// A send that cannot be signed while the wallet's writes fail, the key pool
+/// full: its change key comes from the pool (no key to write), and the send
+/// gives it back in memory, as Divi Core's CReserveKey::ReturnKey does
+/// (reservekey.cpp:44-51, wallet.cpp:1805-1809). The reply is Divi Core's,
+/// the pool and the next change key are as before, during and after a restart
+#[test]
+fn a_send_that_cannot_be_signed_while_writes_fail_leaves_the_key_pool_as_it_was() {
+    let _limit = LIMIT.lock();
+    let net = Net::new();
+    unsignable_coin(&net, 10 * COIN);
+    net.wallet.top_up_keypool().unwrap();
+    net.wallet.save().unwrap();
+    let pool = net.wallet.keypool_size();
+    let indices = net.wallet.keystore().get_indices();
+    let rpc = net.rpc();
+    writes_fail();
+    let reply = rpc.send_to_address(&p(vec![json!(dest().to_string()), json!(1)]));
+    let during = (
+        net.wallet.keypool_size(),
+        net.wallet.keystore().get_indices(),
+    );
+    writes_work();
+    assert_eq!(
+        rpc_error(reply),
+        (-4, "Signing transaction failed".to_string())
+    );
+    assert_eq!(during, (pool, indices), "the key pool and the next keys");
+
+    net.wallet.save().unwrap();
+    let path = net.dir.path().join("wallet");
+    drop(rpc);
+    let Net { wallet, .. } = net;
+    drop(wallet);
+    let reopened = WalletDb::open(&path, Network::Regtest).unwrap();
+    assert_eq!(
+        reopened.keystore().get_indices(),
+        indices,
+        "the next keys after a restart"
+    );
 }

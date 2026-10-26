@@ -481,6 +481,15 @@ impl KeyStore {
         *self.hd_wallet.write() = Some(wallet);
     }
 
+    /// Drop keys just derived that could not be written, so the key pool is
+    /// as it was before the derivation
+    pub fn remove_keys(&self, hashes: &[Hash160]) {
+        let mut keys = self.keys.write();
+        for hash in hashes {
+            keys.remove(hash);
+        }
+    }
+
     /// Add a key entry directly with its hash (for restoration from persistence)
     pub fn add_key_with_hash(&self, hash: Hash160, entry: KeyEntry) {
         self.keys.write().insert(hash, entry);

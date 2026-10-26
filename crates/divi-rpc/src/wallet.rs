@@ -1932,8 +1932,14 @@ impl WalletRpc {
                 && matches!(change_to, ChangeTo::NewKey)
             {
                 if let Ok(wallet) = self.get_wallet() {
-                    if let Err(err) = wallet.top_up_keypool() {
-                        debug!("Keypool not topped up for a failed send: {}", err);
+                    match wallet.top_up_keypool() {
+                        // The reservation throws first when the new keys
+                        // cannot be written (wallet.cpp:2339-2347)
+                        Err(err @ divi_wallet::WalletError::Storage(_)) => {
+                            return key_write_error(err).into();
+                        }
+                        Err(err) => debug!("Keypool not topped up for a failed send: {}", err),
+                        Ok(_) => {}
                     }
                 }
             }
@@ -1963,8 +1969,14 @@ impl WalletRpc {
         // returns the key when no change is needed (:1813-1816): so a send
         // without change still leaves the keypool full
         if plan.change.is_none() && matches!(change_to, ChangeTo::NewKey) {
-            if let Err(e) = wallet.top_up_keypool() {
-                debug!("Keypool not topped up for a send without change: {}", e);
+            match wallet.top_up_keypool() {
+                // The reservation fails the send when the new keys cannot be
+                // written (wallet.cpp:2339-2347)
+                Err(e @ divi_wallet::WalletError::Storage(_)) => {
+                    return Err(key_write_error(e).into())
+                }
+                Err(e) => debug!("Keypool not topped up for a send without change: {}", e),
+                Ok(_) => {}
             }
         }
         let mut builder = TransactionBuilder::new();
@@ -4381,9 +4393,12 @@ impl WalletRpc {
         ensure_fully_unlocked(&wallet)?;
 
         let newsize = (size > 0).then_some(size as u32);
-        let generated = wallet
-            .refill_keypool(newsize)
-            .map_err(|e| RpcError::internal_error(format!("Failed to refill keypool: {}", e)))?;
+        // A key that cannot be written: Divi Core's derivation throws
+        // (wallet.cpp:2104, :2339-2347)
+        let generated = wallet.refill_keypool(newsize).map_err(|e| match e {
+            divi_wallet::WalletError::Storage(_) => key_write_error(e),
+            e => RpcError::internal_error(format!("Failed to refill keypool: {}", e)),
+        })?;
         info!("Keypool refilled with {} new keys", generated);
 
         if wallet.keypool_size() < size as u32 {
