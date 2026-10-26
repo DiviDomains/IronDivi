@@ -341,12 +341,22 @@ impl FeeEscalation {
     /// The feerate for a same-nonce claim with no post-leak ceiling (EVM), with `left`
     /// seconds before the locktime, the first claim having paid `base`. Until
     /// `cap_secs_left` it is [`FeeEscalation::target`]. From there it climbs on
-    /// geometrically from the fixed cap to [`FeeEscalation::cap_after_leak`] at the
-    /// locktime, as [`FeeEscalation::target_after_leak`] does to the ceiling. Either way
-    /// [`FeeEscalation::reach_cap`] applies.
+    /// geometrically from the fixed cap to [`FeeEscalation::cap_after_leak`], reached
+    /// with half of `cap_secs_left` still to go and held from there, so the claim sits at
+    /// `cap_feerate` for blocks before the refund is valid (a climb ending at the locktime
+    /// would put the last versions after the last block that can still mine them). Either
+    /// way [`FeeEscalation::reach_cap`] applies.
     pub fn same_nonce_target(&self, base: u64, left: i64) -> u64 {
         let cap = self.cap_after_leak(base, left);
-        self.reach_cap(self.target_after_leak(base, left, cap), cap)
+        let end = i64::from(self.cap_secs_left);
+        if left >= end || end <= 0 {
+            return self.reach_cap(self.target(base, left), cap);
+        }
+        let fixed = self.cap(base);
+        let half = (end / 2).max(1);
+        let t = ((end - left) as f64 / half as f64).min(1.0);
+        let rate = fixed as f64 * (cap as f64 / fixed as f64).powf(t);
+        self.reach_cap((rate.ceil() as u64).clamp(fixed, cap), cap)
     }
 
     /// A same-nonce `target` under `cap`, or `cap` itself where one more price bump
@@ -1267,8 +1277,9 @@ mod tests {
     }
 
     /// The USDC target: the fixed schedule before the cap point; past it a geometric climb
-    /// from the fixed cap to `cap_feerate`, never above it, never falling. Either way it is
-    /// the cap once one more 10% price bump would pass it, so the last version is the cap.
+    /// from the fixed cap to `cap_feerate`, never above it, never falling, reached halfway
+    /// to the locktime and held. Either way it is the cap once one more 10% price bump
+    /// would pass it, so the last version is the cap.
     #[test]
     fn after_the_leak_the_usdc_target_climbs_to_cap_feerate_and_ends_on_it() {
         let e = FeeEscalation::builtin(Chain::Usdc).unwrap();
@@ -1299,6 +1310,14 @@ mod tests {
                 last = t;
             }
             assert_eq!(e.same_nonce_target(base, 0), e.cap_feerate);
+            for left in [end / 2, end / 4, 1, 0, -60] {
+                assert_eq!(
+                    e.same_nonce_target(base, left),
+                    e.cap_feerate,
+                    "held at {left}"
+                );
+            }
+            assert!(e.same_nonce_target(base, end / 2 + 60) < e.cap_feerate || base >= 10 * gwei);
         }
         let t = e.same_nonce_target(2 * gwei, end - 1);
         assert!(t > 100 * gwei && t < 110 * gwei, "{t}");
@@ -1316,18 +1335,21 @@ mod tests {
             assert_eq!(mock.reach_cap(t, 500), want, "{t}");
         }
         assert_eq!(mock.with_price_bump(30).reach_cap(390, 500), 500);
-        // A node with a stricter bump ends on the cap from further away.
+        // A node with a stricter bump ends on the cap from further away, and never sits
+        // within one of its bumps under it.
         let strict = e.with_price_bump(30);
         let left = (0..end)
             .rev()
             .find(|&l| strict.same_nonce_target(2 * gwei, l) == e.cap_feerate)
             .unwrap();
-        let before = strict.target_after_leak(2 * gwei, left, e.cap_feerate);
-        assert!(before * 130 / 100 > e.cap_feerate && before * 110 / 100 <= e.cap_feerate);
-        assert!(
-            FeeEscalation::should_bump_within(before, e.cap_feerate, e.cap_feerate),
-            "the last step to the cap is always sent"
-        );
+        assert!(e.same_nonce_target(2 * gwei, left) < e.cap_feerate);
+        for l in (-60..end).rev() {
+            let t = strict.same_nonce_target(2 * gwei, l);
+            assert!(
+                t == e.cap_feerate || t * 130 / 100 <= e.cap_feerate,
+                "{l}: {t}"
+            );
+        }
     }
 
     #[test]
