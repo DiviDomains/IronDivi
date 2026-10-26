@@ -46,6 +46,8 @@ pub struct DiviCodec {
     /// When bytes last came, part of a message or not (Divi Core records every
     /// read, Node.cpp:160-164 and :292)
     last_arrival: Option<std::time::Instant>,
+    /// The connection's clock
+    clock: crate::peer_clock::PeerClock,
 }
 
 /// State machine for message decoding
@@ -66,7 +68,14 @@ impl DiviCodec {
             bytes_consumed: 0,
             buffered: 0,
             last_arrival: None,
+            clock: crate::peer_clock::PeerClock::system(),
         }
+    }
+
+    /// Read times from `clock`, the connection's
+    pub fn with_clock(mut self, clock: crate::peer_clock::PeerClock) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// When bytes last came from the peer, a whole message or part of one
@@ -108,7 +117,7 @@ impl Decoder for DiviCodec {
         // FramedRead calls this after each read: more in the buffer than was
         // left last time means bytes came
         if src.len() > self.buffered {
-            self.last_arrival = Some(std::time::Instant::now());
+            self.last_arrival = Some(self.clock.now());
         }
         let decoded = self.decode_frame(src);
         self.buffered = src.len();
