@@ -2,9 +2,9 @@
 
 `run.sh` starts a fresh Divi Core 3.0.0 `divid` and a fresh irondivid on regtest, side by side, and checks what each
 keeps across a clean stop and a `kill -9`: addresses learnt from peers, bans, the masternode list, what a damaged
-`peers.dat` or `mncache.dat` does to a start, and the files a new data directory gets. Then both import divid's own
-block file: `-loadblock`, `-stopafterblockimport`, `bootstrap.dat`, a file with a bad block, a missing file, and
-`-reindex` after an import. Each row prints one line:
+`peers.dat`, `mncache.dat` or `netfulfilled.dat` does to a start, and the files a new data directory gets. Then both
+import divid's own block file: `-loadblock`, `-stopafterblockimport`, `bootstrap.dat`, a file with a bad block, a
+missing file, and `-reindex` after an import. Each row prints one line:
 
 - `PASS`: same as divid;
 - `KNOWN`: differs, in exactly the way listed below with the reason;
@@ -48,7 +48,7 @@ A test peer of the script's own speaks the regtest wire protocol (version 70915)
 | addresses | the test peer gossips 100 public addresses (each in its own /16) in one `addr`; a new connection asks `getaddr`: right away, after a clean restart, after a `kill -9` and start, and after gossip then a `kill -9` and start. divid answers with 23% of what it holds (`ADDRMAN_GETADDR_MAX_PCT`; a bucket collision can drop one or two of the 100, so 15-23 count as "about 23%"); connections after the restart |
 | bans | a peer of an old protocol version (70000, below divid's 70915) is disconnected and banned, local or not (`main.cpp:370-377`); `listbanned` names it; it cannot connect again; after a restart (divid keeps bans in memory only, `PeerBanningService.h`); after `clearbanned` |
 | masternode list | `listmasternodes` after a restart |
-| damaged files | `peers.dat` and `mncache.dat` planted empty, cut in half, or 300 random bytes in a stopped node: whether it starts (or its exact error) and what the file holds after a clean stop (rewritten, as planted, empty, gone) |
+| damaged files | `peers.dat`, `mncache.dat` and `netfulfilled.dat` planted empty, cut in half, or 300 random bytes in a stopped node: whether it starts (or its exact error) and what the file holds after a clean stop (rewritten, as planted, empty, gone) |
 | import | divid mines 30 blocks; its `blocks/blk00000.dat` is imported into new data directories: `-loadblock` (height, tip); `-loadblock -stopafterblockimport` (the exit, then height and tip); the file as `<datadir>/regtest/bootstrap.dat` (height, tip, and the file renamed to `bootstrap.dat.old`, `init.cpp:698-711`); the file with a bad byte in block 15's merkle root (the import stops at 14); `-loadblock=<missing>` (a warning, height 0); `-reindex` after an import |
 
 After a `kill -9` divid usually refuses its block database ("Block database corruption detected") and is started
@@ -66,8 +66,6 @@ Each KNOWN row checks the difference is exactly the one below; any other outcome
   files of divid's format; divid never reads irondivid's data directory.
 - `file mnpayments.dat`: irondivid keeps no payment votes across a restart; it has them from peers again (divid writes
   the file, and reads it only with a masternode list, `MasternodeModule.cpp:270-277`).
-- `file netfulfilled.dat`: irondivid keeps no record of the masternode sync requests it answered across a restart
-  (divid's expire after 5 minutes on regtest, `chainparams.cpp:506`).
 - `files only irondivid has`: `wallet/` and `txindex/`, its own stores.
 - `mncache.dat empty|truncated|garbage: start`: divid refuses to start on a `mncache.dat` it cannot read ("Error:
   Failed to load masternode cache from"): `CFlatDB::Load` gives up on anything but a readable header with bad data
