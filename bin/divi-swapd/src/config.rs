@@ -113,6 +113,12 @@ pub struct BtcSection {
     pub esplora_url: Option<String>,
     /// Fallback Esplora API base.
     pub fallback_esplora_url: Option<String>,
+    /// Read `find_spend`, `htlc_output` and `confirmations` (what a claim or refund rests
+    /// on) from the primary and the secondary endpoint, and treat any disagreement, or either
+    /// endpoint failing, as transient (retried, never acted on). Off by default: the secondary
+    /// is then only a failover. Needs two different endpoints (see [`BtcSection::endpoints`]).
+    #[serde(default)]
+    pub quorum_reads: bool,
     /// Reference (`op://…` or `credential:<name>`) to the maker's BTC key.
     pub key: String,
 }
@@ -130,6 +136,23 @@ impl BtcSection {
             None => swap_chain_btc::esplora_endpoints(&self.network)
                 .map_err(|e| anyhow::anyhow!("[btc].network: {e}"))?,
         })
+    }
+
+    /// With `quorum_reads` on, the endpoints must be a primary and a different secondary.
+    fn validate_quorum_reads(&self) -> Result<()> {
+        if !self.quorum_reads {
+            return Ok(());
+        }
+        let eps = self.endpoints()?;
+        let norm = |u: &String| u.trim().trim_end_matches('/').to_string();
+        if eps.len() < 2 || norm(&eps[0]) == norm(&eps[1]) {
+            bail!(
+                "[btc].quorum_reads = true needs a second, different Esplora endpoint: set \
+                 [btc].fallback_esplora_url next to [btc].esplora_url (or leave both unset \
+                 for the network's two defaults)"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -745,6 +768,7 @@ impl DaemonConfig {
         }
         if let Some(b) = &self.btc {
             self.validate_mainnet_gate("btc", &b.network, b.allow_mainnet, &["signet", "testnet"])?;
+            b.validate_quorum_reads()?;
         }
         if let Some(l) = &self.ltc {
             self.validate_mainnet_gate("ltc", &l.network, l.allow_mainnet, &["testnet"])?;
@@ -863,6 +887,40 @@ key = "credential:btc"
             "[divi]\nkey",
             "[divi]\nnetwork = \"mainnet\"\nallow_mainnet = true\nkey",
         )
+    }
+
+    #[test]
+    fn btc_quorum_reads_are_off_by_default_and_need_two_endpoints() {
+        let b = DaemonConfig::parse(GOOD).unwrap().btc.unwrap();
+        assert!(!b.quorum_reads);
+        let with = |extra: &str| {
+            DaemonConfig::parse(&GOOD.replace("[btc]\n", &format!("[btc]\n{extra}\n")))
+        };
+        // The network's two defaults are a quorum.
+        assert!(
+            with("quorum_reads = true")
+                .unwrap()
+                .btc
+                .unwrap()
+                .quorum_reads
+        );
+        let two = "esplora_url = \"http://a:1\"\nfallback_esplora_url = \"http://b:2\"";
+        assert!(with(&format!("{two}\nquorum_reads = true")).is_ok());
+        // One endpoint, or the same one twice, is refused at load, naming both keys.
+        for one in [
+            "esplora_url = \"http://a:1\"",
+            "esplora_url = \"http://a:1\"\nfallback_esplora_url = \"http://a:1/\"",
+        ] {
+            let err = with(&format!("{one}\nquorum_reads = true"))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("[btc].quorum_reads") && err.contains("[btc].fallback_esplora_url"),
+                "{err}"
+            );
+            // Off, the same single endpoint is fine (failover only, as before).
+            assert!(with(one).is_ok());
+        }
     }
 
     #[test]

@@ -26,6 +26,7 @@ network = "signet"         # or "testnet"; "mainnet" needs allow_mainnet = true 
 # allow_mainnet = false     # default; mainnet moves real money — off until a reviewed mainnet cutover
 esplora_url = "https://mempool.space/signet/api"
 fallback_esplora_url = "https://blockstream.info/signet/api"
+# quorum_reads = false      # default; true: spend/HTLC/confirmation reads must agree on both URLs (README)
 key = "credential:maker-btc"
 
 [ltc]

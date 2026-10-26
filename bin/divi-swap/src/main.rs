@@ -87,6 +87,11 @@ struct Cli {
         default_value = "signet"
     )]
     btc_network: String,
+    /// Read the BTC spend, HTLC output and confirmations (what a claim or refund rests on)
+    /// from both of the network's Esplora endpoints; a disagreement, or either endpoint
+    /// failing, is retried, never acted on. Off = the second endpoint is only a failover.
+    #[arg(long, global = true)]
+    btc_quorum_reads: bool,
     /// Litecoin network: `testnet` (default) or `mainnet` (only with `--allow-mainnet`).
     #[arg(
         long,
@@ -688,6 +693,7 @@ fn live_counter(
                     swap_chain_btc::FeePolicy::default(),
                     swap_chain_btc::RetryPolicy::default(),
                 )?
+                .with_quorum_reads(cli.btc_quorum_reads)?
                 .with_input_reservations(reservations.clone()),
             );
             (backend.clone(), CounterLive::Btc(backend))
@@ -2315,6 +2321,22 @@ mod tests {
         let (_, res) = divi_swap_cli::reservations::open(&cli.db).unwrap();
         let key = bitcoin::secp256k1::SecretKey::from_slice(&WALLET_KEY).unwrap();
         live_counter(cli, key, vec![server.uri()], &res).unwrap()
+    }
+
+    #[test]
+    fn btc_quorum_reads_flag_is_off_by_default_and_needs_two_endpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("cli.db");
+        assert!(!live_cli("btc", &db).btc_quorum_reads);
+        let mut on = live_cli("btc", &db);
+        on.btc_quorum_reads = true;
+        let (_, res) = divi_swap_cli::reservations::open(&on.db).unwrap();
+        let key = bitcoin::secp256k1::SecretKey::from_slice(&WALLET_KEY).unwrap();
+        let one = vec!["http://127.0.0.1:1".to_string()];
+        let err = live_counter(&on, key, one, &res).err().unwrap();
+        assert!(err.to_string().contains("quorum"), "{err}");
+        let two = swap_chain_btc::esplora_endpoints("signet").unwrap();
+        assert!(live_counter(&on, key, two, &res).is_ok());
     }
 
     /// The wallet owns coins `[1; 32]:0` (20,000) and `[2; 32]:0` (15,000) and the address

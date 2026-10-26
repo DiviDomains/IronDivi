@@ -354,8 +354,14 @@ fn live_btc(cfg: &BtcSection, reservations: &InputReservations) -> Result<Arc<dy
         FeePolicy::default(),
         RetryPolicy::default(),
     )?
+    .with_quorum_reads(cfg.quorum_reads)?
     .with_input_reservations(reservations.clone());
-    tracing::info!(address = %backend.address(), network = %cfg.network, "btc backend ready");
+    tracing::info!(
+        address = %backend.address(),
+        network = %cfg.network,
+        quorum_reads = cfg.quorum_reads,
+        "btc backend ready"
+    );
     Ok(Arc::new(backend))
 }
 
