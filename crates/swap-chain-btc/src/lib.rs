@@ -107,6 +107,7 @@ pub struct BtcBackend {
     network: Network,
     fees: FeePolicy,
     reservations: Option<InputReservations>,
+    quorum_reads: bool,
 }
 
 impl std::fmt::Debug for BtcBackend {
@@ -125,6 +126,19 @@ impl BtcBackend {
     pub fn with_input_reservations(mut self, reservations: InputReservations) -> Self {
         self.reservations = Some(reservations);
         self
+    }
+
+    /// Read `find_spend`, `htlc_output` and `confirmations` from the primary and the secondary
+    /// Esplora and act only on an answer both give (single-source-design.md section 5, BTC).
+    /// Off by default; refused with fewer than two endpoints.
+    pub fn with_quorum_reads(mut self, on: bool) -> Result<Self> {
+        if on && self.esplora.endpoint_count() < 2 {
+            return Err(SwapError::InvalidParams(
+                "quorum reads need a primary and a secondary Esplora endpoint".into(),
+            ));
+        }
+        self.quorum_reads = on;
+        Ok(self)
     }
 
     /// `coins` without those reserved by a broadcast transaction that has not confirmed.
@@ -252,6 +266,7 @@ impl BtcBackend {
             network,
             fees,
             reservations: None,
+            quorum_reads: false,
         })
     }
 

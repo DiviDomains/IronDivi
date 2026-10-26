@@ -98,6 +98,11 @@ impl EsploraClient {
         })
     }
 
+    /// How many base URLs this client fails over across.
+    pub fn endpoint_count(&self) -> usize {
+        self.endpoints.len()
+    }
+
     /// GET `path` and return the body.
     pub async fn get(&self, path: &str) -> Result<String, ClientError> {
         self.send(Method::GET, path, None).await
