@@ -390,3 +390,65 @@ fn a_send_that_cannot_be_signed_while_writes_fail_leaves_the_key_pool_as_it_was(
         "the next keys after a restart"
     );
 }
+
+/// The log lines written while `f` runs on this thread. One global subscriber
+/// writes each thread's lines to that thread's buffer (as wallet_sends.rs)
+fn logged<T>(f: impl FnOnce() -> T) -> (T, String) {
+    thread_local! {
+        static LINES: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    struct ThreadLines;
+    impl std::io::Write for ThreadLines {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            LINES.with(|lines| lines.borrow_mut().extend_from_slice(data));
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(|| ThreadLines)
+            .init();
+    });
+    LINES.with(|lines| lines.borrow_mut().clear());
+    let out = f();
+    let text =
+        LINES.with(|lines| String::from_utf8(std::mem::take(&mut *lines.borrow_mut())).unwrap());
+    (out, text)
+}
+
+/// A wallet with a keypool of 2 a chain, one receiving key short, as each
+/// getnewaddress leaves it: its next top-up must write a key
+fn one_key_short(net: &Net) -> WalletRpc {
+    net.wallet.keystore().set_keypool_target(2);
+    let rpc = net.rpc();
+    rpc.keypool_refill(&p(vec![])).unwrap();
+    rpc.get_new_address(&p(vec![])).unwrap();
+    rpc
+}
+
+/// Divi Core's derivation throws before a key it cannot write joins the pool,
+/// so a getnewaddress, keypoolrefill or send whose top-up cannot write logs no
+/// "keypool added", nor a reservation (wallet.cpp:2104-2112, :2339-2347)
+#[test]
+fn a_key_that_cannot_be_written_logs_no_keypool_line() {
+    let _limit = LIMIT.lock();
+    let net = Net::new();
+    let rpc = one_key_short(&net);
+    // Its key comes from the pool, which its top-up leaves one short again
+    net.fund();
+    writes_fail();
+    let (address, address_log) = logged(|| rpc.get_new_address(&p(vec![])));
+    let (refill, refill_log) = logged(|| rpc.keypool_refill(&p(vec![json!(3)])));
+    let (sent, send_log) =
+        logged(|| rpc.send_to_address(&p(vec![json!(dest().to_string()), json!(1)])));
+    writes_work();
+    assert!(address.is_err() && refill.is_err() && sent.is_err());
+    for log in [address_log, refill_log, send_log] {
+        assert!(!log.contains("keypool"), "{log}");
+    }
+}

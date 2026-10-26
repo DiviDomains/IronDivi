@@ -1811,9 +1811,23 @@ impl WalletDb {
         // Held until the key is stored, so a concurrent lock() cannot strip it first
         let locked = self.locked.read();
         let _keys = self.key_lock.lock();
+        // Its keypool lines are logged once its keys are written
+        self.keystore.hold_pool_lines();
+        let address = self.take_address(*locked, is_change, keep_later);
+        self.keystore.release_pool_lines(address.is_ok());
+        address
+    }
+
+    /// [`Self::new_address`]'s work, with the wallet's locks held
+    fn take_address(
+        &self,
+        locked: bool,
+        is_change: bool,
+        keep_later: bool,
+    ) -> Result<Address, WalletError> {
         let mut store = Vec::new();
         let indices = self.keystore.get_indices();
-        let addr = if *locked {
+        let addr = if locked {
             if keep_later {
                 self.keystore.reserve_from_keypool()?
             } else {
@@ -2975,15 +2989,22 @@ impl WalletDb {
     /// here, so getnewaddress keeps working after the wallet is locked again
     fn top_up_keypool_after_unlock(&self) {
         let _keys = self.key_lock.lock();
-        match self.keystore.top_up_keypool(None) {
-            Ok(added) if !added.is_empty() => {
-                if let Err(e) = self.persist_keys(&added) {
+        self.keystore.hold_pool_lines();
+        let written = match self.keystore.top_up_keypool(None) {
+            Ok(added) if !added.is_empty() => match self.persist_keys(&added) {
+                Ok(()) => true,
+                Err(e) => {
                     warn!("Failed to store keypool keys: {}", e);
+                    false
                 }
+            },
+            Ok(_) => true,
+            Err(e) => {
+                debug!("Keypool not topped up on unlock: {}", e);
+                false
             }
-            Ok(_) => {}
-            Err(e) => debug!("Keypool not topped up on unlock: {}", e),
-        }
+        };
+        self.keystore.release_pool_lines(written);
     }
 
     /// Lock the wallet as a failed walletpassphrasechange does (Lock() before
@@ -3020,6 +3041,16 @@ impl WalletDb {
     /// private key are re-written encrypted under the master key, the plaintext
     /// copies are deleted and compacted away, and the wallet is left locked.
     pub fn encrypt_wallet(&self, passphrase: &str) -> Result<(), WalletError> {
+        // The lines of the keys its top-up adds are logged once they are
+        // written with the rest of the encrypted wallet
+        self.keystore.hold_pool_lines();
+        let encrypted = self.encrypt_and_store(passphrase);
+        self.keystore.release_pool_lines(encrypted.is_ok());
+        encrypted
+    }
+
+    /// [`Self::encrypt_wallet`]'s work
+    fn encrypt_and_store(&self, passphrase: &str) -> Result<(), WalletError> {
         use rand::RngCore;
 
         let mut encrypted = self.encrypted.write();
@@ -3262,6 +3293,14 @@ impl WalletDb {
     pub fn refill_keypool(&self, new_size: Option<u32>) -> Result<u32, WalletError> {
         let _locked = self.locked.read();
         let _keys = self.key_lock.lock();
+        self.keystore.hold_pool_lines();
+        let added = self.store_new_pool_keys(new_size);
+        self.keystore.release_pool_lines(added.is_ok());
+        added
+    }
+
+    /// Top the keypool up to `new_size` and write the new keys
+    fn store_new_pool_keys(&self, new_size: Option<u32>) -> Result<u32, WalletError> {
         let added = self.keystore.top_up_keypool(new_size)?;
         if !added.is_empty() {
             self.dirty.write().keys = true;

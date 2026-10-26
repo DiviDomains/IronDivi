@@ -626,12 +626,12 @@ impl KeyStore {
                     let mut pool = self.pool_numbers.write();
                     let number = pool.values().max().map_or(1, |n| n + 1);
                     pool.insert((is_change, i), number);
-                    tracing::info!(
+                    self.pool_line(format!(
                         "keypool added key {}, size={}, internal={}",
                         number,
                         pool.len(),
                         u8::from(is_change)
-                    );
+                    ));
                 }
                 let key = if is_change {
                     wallet.derive_change(0, i)?
@@ -690,13 +690,39 @@ impl KeyStore {
         let Some(number) = self.pool_numbers.write().remove(&(is_change, index)) else {
             return;
         };
-        tracing::info!("keypool reserve {}", number);
+        self.pool_line(format!("keypool reserve {}", number));
         if keep_later {
             self.reserved
                 .write()
                 .insert(*hash, (is_change, index, number));
         } else {
-            tracing::info!("keypool keep {}", number);
+            self.pool_line(format!("keypool keep {}", number));
+        }
+    }
+
+    /// Log a keypool line, or hold it while this thread writes the keys
+    fn pool_line(&self, line: String) {
+        HELD_LINES.with(|held| match held.borrow_mut().as_mut() {
+            Some(lines) => lines.push(line),
+            None => tracing::info!("{}", line),
+        })
+    }
+
+    /// Hold back, on this thread, the keypool lines of the keys about to be
+    /// derived or taken until the wallet knows whether they were written:
+    /// Divi Core's derivation throws before a key it cannot write is added,
+    /// reserved or logged (wallet.cpp:2104-2112, :2339-2347)
+    pub fn hold_pool_lines(&self) {
+        HELD_LINES.with(|held| *held.borrow_mut() = Some(Vec::new()));
+    }
+
+    /// Log the lines held back when the keys were `written`; drop them if not
+    pub fn release_pool_lines(&self, written: bool) {
+        let lines = HELD_LINES.with(|held| held.borrow_mut().take());
+        if written {
+            for line in lines.into_iter().flatten() {
+                tracing::info!("{}", line);
+            }
         }
     }
 
@@ -772,6 +798,11 @@ impl KeyStore {
         self.take_from_pool(is_change, taken, &address.hash, keep_later);
         Ok(address)
     }
+}
+
+thread_local! {
+    /// The keypool lines held back by [`KeyStore::hold_pool_lines`]
+    static HELD_LINES: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Path of the HD key at `index` of the receiving or change chain
