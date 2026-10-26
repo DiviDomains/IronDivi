@@ -416,7 +416,7 @@ fn prunewalletconfs_leaves_deeply_spent_transactions_out() {
     ok(rpc, "setgenerate", json!([25]));
     stop(node, rpc);
 
-    let known = |txid: &Value| {
+    let known = |rpc: u16, txid: &Value| {
         try_rpc(
             rpc,
             "gettransaction",
@@ -428,8 +428,8 @@ fn prunewalletconfs_leaves_deeply_spent_transactions_out() {
     };
     let log = || std::fs::read_to_string(dir.path().join("debug.log")).unwrap_or_default();
     let node = start(dir.path(), &mut rpc, &mut p2p, &["-prunewalletconfs=5"]);
-    assert!(!known(&coinbase), "the swept coinbase is still listed");
-    assert!(!known(&sweep), "its sweep is still listed");
+    assert!(!known(rpc, &coinbase), "the swept coinbase is still listed");
+    assert!(!known(rpc, &sweep), "its sweep is still listed");
     let line = log()
         .lines()
         .rev()
@@ -440,7 +440,7 @@ fn prunewalletconfs_leaves_deeply_spent_transactions_out() {
 
     let node = start(dir.path(), &mut rpc, &mut p2p, &[]);
     assert!(
-        known(&coinbase) && known(&sweep),
+        known(rpc, &coinbase) && known(rpc, &sweep),
         "a start without the option lists them again"
     );
     stop(node, rpc);
