@@ -2121,6 +2121,53 @@ mod tests {
         assert_eq!(divi_rows(&db).len(), 2);
     }
 
+    /// The coin race the maker engine re-selects on (`Maker::on_maker_locked`): both daemons
+    /// build from the same coin, the second to broadcast is refused by the table as
+    /// `InputsHeld` with nothing sent, its wallet file gives the coin back, and its next
+    /// build takes the other coin.
+    #[tokio::test]
+    async fn a_maker_divi_lock_that_loses_the_coin_race_is_refused_unsent_and_rebuilt_from_another_coin(
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("swaps.db");
+        let wallet = maker_divi_wallet(dir.path());
+        let (server, node) = MakerDiviNode::start().await;
+        let (one, two) = (
+            maker_divi(&server.uri(), &wallet, &db),
+            maker_divi(&server.uri(), &wallet, &db),
+        );
+        let lost = one
+            .build_funding(&maker_divi_htlc(&one, 1), MAKER_DIVI_LOCK)
+            .await
+            .unwrap();
+        let won = two
+            .build_funding(&maker_divi_htlc(&two, 2), MAKER_DIVI_LOCK)
+            .await
+            .unwrap();
+        assert_eq!(divi_inputs(&lost), divi_inputs(&won), "both took one coin");
+        two.broadcast(&won.tx).await.unwrap();
+        assert_eq!(node.sent(), 1);
+
+        let err = one.broadcast(&lost.tx).await.unwrap_err();
+        assert!(
+            matches!(err, divi_swap::SwapError::InputsHeld(_)),
+            "{err:?}"
+        );
+        assert_eq!(node.sent(), 1, "the refused lock was never sent");
+        let rows = divi_rows(&db);
+        assert!(rows.iter().all(|(_, by)| *by == won.tx.txid), "{rows:?}");
+
+        let again = one
+            .build_funding(&maker_divi_htlc(&one, 1), MAKER_DIVI_LOCK)
+            .await
+            .unwrap();
+        let (ia, iw) = (divi_inputs(&again), divi_inputs(&won));
+        assert!(ia.iter().all(|i| !iw.contains(i)), "{ia:?} / {iw:?}");
+        one.broadcast(&again.tx).await.unwrap();
+        assert_eq!(node.sent(), 2);
+        assert_eq!(divi_rows(&db).len(), 2);
+    }
+
     #[tokio::test]
     async fn a_maker_divi_lock_row_is_kept_in_the_mempool_and_released_on_its_first_confirmation() {
         let dir = tempfile::tempdir().unwrap();

@@ -1177,7 +1177,7 @@ mod tests {
         let err = r
             .reserve(Chain::Btc, &Txid([8; 32]), &[op(5, 0), op(1, 0)])
             .unwrap_err();
-        assert!(matches!(err, SwapError::Rejected(_)));
+        assert!(matches!(err, SwapError::InputsHeld(_)), "{err:?}");
         assert_eq!(r.reserved(Chain::Btc).unwrap().len(), 1);
     }
 

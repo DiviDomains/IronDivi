@@ -929,7 +929,7 @@ async fn a_lock_whose_input_another_lock_holds_is_never_sent() {
     res.reserve(Chain::Divi, &txid_n(0x77), &[coin(1, 0).outpoint])
         .unwrap();
     let err = b.broadcast(&f.tx).await.unwrap_err();
-    assert!(matches!(err, SwapError::Rejected(_)), "{err:?}");
+    assert!(matches!(err, SwapError::InputsHeld(_)), "{err:?}");
     assert_eq!(sends(&server).await, 0, "never sent");
     assert_eq!(divi_rows(&res), vec![(coin(1, 0).outpoint, txid_n(0x77))]);
     assert_eq!(
