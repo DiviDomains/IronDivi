@@ -89,8 +89,11 @@ class Node:
     def start(self):
         self.log = open(os.path.join(WORK, self.name + ".out"), "a")
         env = dict(os.environ, **self.env) if self.env else None
-        self.proc = subprocess.Popen([self.binary, f"-datadir={self.dir}"], cwd=self.dir, env=env,
-                                     stdout=self.log, stderr=subprocess.STDOUT, start_new_session=True)
+        # SIGXFSZ ignored, as in scripts/disk-errors: once section 3b lowers the
+        # file size limit, a write past it fails with EFBIG instead of ending the node
+        script = "trap '' XFSZ; exec \"$0\" \"$@\""
+        self.proc = subprocess.Popen(["bash", "-c", script, self.binary, f"-datadir={self.dir}"], cwd=self.dir,
+                                     env=env, stdout=self.log, stderr=subprocess.STDOUT, start_new_session=True)
         with open(os.path.join(WORK, "pids"), "a") as f:
             f.write(f"{self.proc.pid}\n")
 
@@ -116,6 +119,10 @@ class Node:
         if out[0] != "ok":
             raise RuntimeError(f"{self.name} {method}: {out[1]} {str(out[2])[:100]}")
         return out[1]
+
+    def limit(self, soft):
+        """The soft file size limit of the running node, in bytes or 'unlimited'"""
+        subprocess.run(["prlimit", f"--pid={self.proc.pid}", f"--fsize={soft}:unlimited"], check=True)
 
     def wait_ready(self):
         deadline = time.time() + START_TIMEOUT
@@ -293,6 +300,75 @@ wallet_state("after getnewaddress (the pool one short)")
 both("sendtoaddress 0.00006 receiver_pays (the fee leaves dust)", "sendtoaddress", next(iter(payees)), 0.00006,
      "receiver_pays")
 wallet_state("after the receiver_pays send that fails")
+
+# --- 3b. the same while the wallet's writes fail ------------------------------------
+# Each node's soft file size limit is lowered to one byte while it runs
+# (prlimit; scripts/wallet-write-failures), so its wallet writes fail and
+# nothing else is written. The change key of a send that fails goes back to
+# the key pool in memory (CReserveKey::ReturnKey, reservekey.cpp:44-51), which
+# writes nothing; a key the pool must derive cannot be written. Each step is
+# followed by the key pool size, the default account's address count, and
+# whether the next change key is the same on both wallets.
+def writes_fail():
+    for n in (C, I):
+        n.limit(1)
+
+
+def writes_work():
+    for n in (C, I):
+        n.limit("unlimited")
+
+
+def next_change(name):
+    """getrawchangeaddress on both: the same key, since both wallets come from one phrase"""
+    c, i = C.call("getrawchangeaddress"), I.call("getrawchangeaddress")
+    same = c[0] == i[0] == "ok" and c[1] == i[1]
+    row(f"{name}: the next change key is the same on both", "ok" if c[0] == "ok" else show(view(c)),
+        "same" if same else ("another" if i[0] == "ok" else show(view(i))), same or (c[0] != "ok" and c == i))
+
+
+# With the key pool full, the change key comes from the pool and nothing is
+# derived: the failed send gives it back in memory (ReturnKey) and the pool is
+# full again. With it one short, the reservation must derive a key, and its
+# write fails first: -1 "loadHDChain: WriteHDChain failed" (wallet.cpp:2339-2347)
+both("keypoolrefill (the pool full)", "keypoolrefill")
+wallet_state("before the writes fail, the pool full")
+for pool in ("the pool full", "the pool one short"):
+    writes_fail()
+    both(f"sendmany \"\" of 3000 outputs, writes failing, {pool}", "sendmany", "", payees)
+    wallet_state(f"after the sendmany that is too large, writes failing, {pool}")
+    both(f"sendtoaddress 0.00006 receiver_pays, writes failing, {pool}", "sendtoaddress", next(iter(payees)),
+         0.00006, "receiver_pays")
+    wallet_state(f"after the receiver_pays send that fails, writes failing, {pool}")
+    writes_work()
+    wallet_state(f"once writes work again, after the failed sends, {pool}")
+    # getrawchangeaddress takes the next change key: the pool is one short after it
+    next_change(f"once writes work again, after the failed sends, {pool}")
+# A key pool one short (getrawchangeaddress took a change key and getnewaddress
+# a receiving one): keypoolrefill must derive keys, and writing them fails,
+# -1 "TopUpKeyPool: writing generated key failed" (wallet.cpp:2104-2105)
+both("getnewaddress (the pool one short again)", "getnewaddress")
+writes_fail()
+both("keypoolrefill, writes failing (the pool one short)", "keypoolrefill")
+wallet_state("after keypoolrefill, writes failing")
+writes_work()
+both("keypoolrefill once writes work again", "keypoolrefill")
+wallet_state("after keypoolrefill once writes work again")
+next_change("after keypoolrefill once writes work again")
+
+# A restart: what is on disk. irondivid starts without the phrase, which would
+# move the wallet it has aside (init.cpp:864-888)
+for n in (I, C):
+    n.stop()
+I.env = None
+for n in (C, I):
+    n.start()
+    if not n.wait_ready():
+        raise RuntimeError(f"{n.name} did not answer after the restart")
+if not wait_for(lambda: I.rpc("getbestblockhash") == C.rpc("getbestblockhash"), 180):
+    raise RuntimeError("irondivid did not follow divid's chain after the restart")
+wallet_state("after a restart")
+next_change("after a restart")
 
 # --- 4. the same with the wallet encrypted -------------------------------------------
 PASS = secrets.token_urlsafe(18)

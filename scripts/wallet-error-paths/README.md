@@ -43,8 +43,16 @@ Divi Core paths are under `divi/src/` at v3.0.0 (9e2f76c).
 | `sendmany` of 3000 outputs | `-4 "Transaction too large"`, after divid reserved the change key; the key goes back, and the key pool ends full (wallet.cpp:1805-1816, reservekey.cpp:44-51) |
 | `sendtoaddress` of more than the balance | `-6 "Insufficient funds: …"`, before any transaction is built (rpcwallet.cpp:750-760) |
 | `getnewaddress`, then `sendtoaddress <payee> 0.00006 receiver_pays` | `-4 "Cannot subtract needed fees from outputs."`: the fee would leave the payment as dust. The change key was reserved first, which tops the key pool up (wallet.cpp:1786-1793, :2129-2130) |
+| while the wallet's writes fail (3b), the pool full (`keypoolrefill` first): `sendmany` of 3000 outputs, `sendtoaddress 0.00006 receiver_pays` | as with writes working, `-4 "Transaction too large"` and `-4 "Cannot subtract needed fees from outputs."`: the change key comes from the pool, nothing is derived, and it goes back in memory (reservekey.cpp:44-51), so `keypoolsize` stays 2000. Then `getrawchangeaddress` once writes work: the same key on both, since both wallets come from one phrase |
+| writes failing, the pool one short (after that `getrawchangeaddress`): the same two sends | `-1 "loadHDChain: WriteHDChain failed"`: the change key's reservation tops the pool up (wallet.cpp:2129-2130), and the derivation throws when it cannot write the HD chain (wallet.cpp:2339-2347), before any key leaves or joins the pool: `keypoolsize` stays 1999 |
+| writes failing, the pool one short: `keypoolrefill` | the same `-1`: the key is derived, and its HD chain written, inside the `WritePool` call (wallet.cpp:2104), so `-1 "TopUpKeyPool: writing generated key failed"` (wallet.cpp:2104-2105) is not reached |
+| once writes work again, and after a restart (irondivid without the phrase, which would move its wallet aside, init.cpp:864-888): `keypoolsize`, the address count, `getrawchangeaddress` | the next change key is the one it would have been without the failed calls |
 | locked and unlocked for staking only: `bip38paperwallet`, `sendtoaddress`, `sendmany`, `keypoolrefill` | `-13 "Error: Please enter the wallet passphrase with walletpassphrase first."` |
 | unlocked again: `bip38paperwallet`, `keypoolrefill 4294967296` | as unlocked before |
+
+Section 3b lowers each node's soft file size limit to one byte with util-linux's `prlimit` while it runs, as
+`scripts/wallet-write-failures` does; the nodes start with SIGXFSZ ignored, so a write past it fails with EFBIG. No
+block is made meanwhile, so only wallet writes fail.
 
 Not reached by any call, on either daemon, and so covered by Rust tests on irondivid's side instead:
 
