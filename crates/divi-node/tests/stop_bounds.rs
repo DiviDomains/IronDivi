@@ -4,11 +4,11 @@
 
 //! A stop ends the peer tasks wherever they wait, as Divi Core's shutdown
 //! interrupts its net threads before it joins them (divid.cpp:42-53): a seed
-//! lookup that never answers, a dial under a -timeout far past the stop's
+//! or -seednode lookup that never answers, a dial under a -timeout far past the stop's
 //! bound, a connection writing to a peer that no longer reads. Stop returns
 //! well inside its 10-s bound for the peer tasks, with none of them left.
 //!
-//! No test leaves the host: the seed lookup is a fake resolver, the peers
+//! No test leaves the host: the lookups are fake resolvers, the peers
 //! are sockets on 127.0.0.2.
 
 use divi_node::config::NodeConfig;
@@ -194,4 +194,23 @@ async fn a_connection_to_a_peer_that_does_not_read_does_not_hold_the_stop() {
     tokio::time::sleep(Duration::from_secs(3)).await;
     stop_quickly(&n).await;
     flood.abort();
+}
+
+/// A -seednode name lookup whose resolver never answers ends at the stop, as
+/// the seed lookup does
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_seednode_lookup_that_never_answers_does_not_hold_the_stop() {
+    let dir = tempfile::tempdir().unwrap();
+    let n = node(&dir, 53823, |c| {
+        c.p2p.connect = vec!["127.0.0.2:53833".into()];
+        c.p2p.seednode = vec!["hang.invalid".into()];
+    });
+    let resolver: divi_network::SeedResolver =
+        std::sync::Arc::new(|_name: String| Box::pin(std::future::pending()));
+    n.peer_manager().set_name_resolver(resolver);
+    n.start().await.unwrap();
+    wait_listening(53823).await;
+    // The -seednode lookup has begun
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    stop_quickly(&n).await;
 }
