@@ -282,8 +282,12 @@ pub struct WalletDb {
     transactions: RwLock<HashMap<Hash256, WalletTx>>,
     /// Addresses we've seen transactions for
     used_addresses: RwLock<HashSet<String>>,
-    /// Database for persistence
-    db: Option<Arc<WalletDatabase>>,
+    /// Database for persistence, through `db()`: closed and opened again
+    /// after a failed write
+    db: RwLock<Option<Arc<WalletDatabase>>>,
+    /// Where the database was when it was closed after a failed write and could
+    /// not be opened again; tried again at the next use
+    closed_path: Mutex<Option<std::path::PathBuf>>,
     /// Whether the wallet is encrypted
     encrypted: RwLock<bool>,
     /// Whether the wallet is locked
@@ -425,7 +429,8 @@ impl WalletDb {
             spent: RwLock::new(HashSet::new()),
             transactions: RwLock::new(HashMap::new()),
             used_addresses: RwLock::new(HashSet::new()),
-            db: None,
+            db: RwLock::new(None),
+            closed_path: Mutex::new(None),
             encrypted: RwLock::new(false),
             locked: RwLock::new(false),
             last_scan_height: RwLock::new(0),
@@ -468,7 +473,8 @@ impl WalletDb {
             spent: RwLock::new(HashSet::new()),
             transactions: RwLock::new(HashMap::new()),
             used_addresses: RwLock::new(HashSet::new()),
-            db: None,
+            db: RwLock::new(None),
+            closed_path: Mutex::new(None),
             encrypted: RwLock::new(false),
             locked: RwLock::new(false),
             last_scan_height: RwLock::new(0),
@@ -515,7 +521,8 @@ impl WalletDb {
             spent: RwLock::new(HashSet::new()),
             transactions: RwLock::new(HashMap::new()),
             used_addresses: RwLock::new(HashSet::new()),
-            db: Some(Arc::clone(&db)),
+            db: RwLock::new(Some(Arc::clone(&db))),
+            closed_path: Mutex::new(None),
             encrypted: RwLock::new(false),
             locked: RwLock::new(false),
             last_scan_height: RwLock::new(0),
@@ -670,7 +677,7 @@ impl WalletDb {
             }
             detached.insert(txid, DetachedTx { timestamp, tx });
         }
-        if let Some(ref db) = self.db {
+        if let Some(ref db) = self.db() {
             if let Err(e) = db.store_detached_tx(&txid, timestamp, &raw) {
                 tracing::warn!("Failed to store detached wallet tx {}: {}", txid, e);
             }
@@ -692,7 +699,7 @@ impl WalletDb {
     /// A detached transaction is in a block or the mempool again
     fn reattach(&self, txid: &Hash256) {
         if self.detached_txs.write().remove(txid).is_some() {
-            if let Some(ref db) = self.db {
+            if let Some(ref db) = self.db() {
                 if let Err(e) = db.remove_detached_tx(txid) {
                     tracing::warn!("Failed to forget detached wallet tx {}: {}", txid, e);
                 }
@@ -801,9 +808,10 @@ impl WalletDb {
     /// and persists the change to the database.
     pub fn migrate_chain_mode(&self, new_mode: ChainMode) -> Result<(), WalletError> {
         let db = self
-            .db
-            .as_ref()
+            .db()
             .ok_or_else(|| WalletError::Storage("No database".into()))?;
+
+        let db = &*db;
 
         let stored_mode = db.load_chain_mode()?;
         if stored_mode == Some(new_mode) {
@@ -873,7 +881,8 @@ impl WalletDb {
             spent: RwLock::new(HashSet::new()),
             transactions: RwLock::new(HashMap::new()),
             used_addresses: RwLock::new(HashSet::new()),
-            db: Some(db),
+            db: RwLock::new(Some(db)),
+            closed_path: Mutex::new(None),
             encrypted: RwLock::new(false),
             locked: RwLock::new(false),
             last_scan_height: RwLock::new(0),
@@ -910,13 +919,14 @@ impl WalletDb {
 
     /// Load wallet data from database
     fn load(&mut self) -> Result<(), WalletError> {
-        let db = match &self.db {
+        let db = match self.db() {
             Some(db) => db,
             None => {
                 info!("No database, starting with empty wallet");
                 return Ok(());
             }
         };
+        let db = &*db;
 
         // Load and verify network
         if let Some(stored_network) = db.load_network()? {
@@ -1167,10 +1177,11 @@ impl WalletDb {
     /// goes through here before it is handed out: the per-block `save_incremental`
     /// is too late, a lock or restart before the next block would lose the key.
     fn persist_keys(&self, hashes: &[Hash160]) -> Result<(), WalletError> {
-        let db = match &self.db {
+        let db = match self.db() {
             Some(db) => db,
-            None => return Ok(()),
+            None => return self.closed_database(),
         };
+        let db = &*db;
         let entries: Vec<_> = hashes
             .iter()
             .filter_map(|h| self.keystore.get_key(h).map(|e| (*h, e)))
@@ -1196,12 +1207,114 @@ impl WalletDb {
         db.write_batch_sync(batch)
     }
 
+    /// The wallet's database. Once a write has failed (a full disk, say),
+    /// RocksDB refuses every later write, so the database is closed and opened
+    /// again first: the wallet writes again once the disk takes writes, as
+    /// Divi Core's does after logging the write it could not make
+    /// (wallet.cpp:1271-1274)
+    fn db(&self) -> Option<Arc<WalletDatabase>> {
+        // The read guard goes before the slot is written below
+        let current = self.db.read().clone();
+        let db = match current {
+            Some(db) => db,
+            None => return self.open_closed_database(),
+        };
+        if !db.has_failed() {
+            return Some(db);
+        }
+        self.reopen(db)
+    }
+
+    /// Close the database whose writes failed and open it again. It is kept as
+    /// it is while another thread still uses it; when it cannot be opened
+    /// again, there is none until the next use opens it
+    fn reopen(&self, failed: Arc<WalletDatabase>) -> Option<Arc<WalletDatabase>> {
+        // closed_path before the slot, as in open_closed_database
+        let mut closed = self.closed_path.lock();
+        let mut slot = self.db.write();
+        match slot.as_ref() {
+            Some(current) if Arc::ptr_eq(current, &failed) => {}
+            // Opened again by another thread meanwhile
+            Some(current) => return Some(Arc::clone(current)),
+            None => {
+                drop(slot);
+                drop(closed);
+                return self.open_closed_database();
+            }
+        }
+        drop(failed);
+        let held = slot.take().expect("checked above");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while Arc::strong_count(&held) > 1 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // One handle at a time may hold RocksDB's files
+        let held = match Arc::try_unwrap(held) {
+            Ok(held) => held,
+            Err(held) => {
+                *slot = Some(Arc::clone(&held));
+                return Some(held);
+            }
+        };
+        let path = held.path().to_path_buf();
+        drop(held);
+        match WalletDatabase::open(&path) {
+            Ok(db) => {
+                info!("Wallet database opened again after a failed write");
+                let db = Arc::new(db);
+                *slot = Some(Arc::clone(&db));
+                Some(db)
+            }
+            Err(e) => {
+                warn!("Wallet database could not be opened again: {}", e);
+                // Saves fail until it opens (closed_database): the next use tries again
+                *closed = Some(path);
+                None
+            }
+        }
+    }
+
+    /// Open the database closed after a failed write, if there is one. Each
+    /// try leaves a LOG.old file behind, of which RocksDB keeps 1000
+    /// (keep_log_file_num)
+    fn open_closed_database(&self) -> Option<Arc<WalletDatabase>> {
+        let mut closed = self.closed_path.lock();
+        let path = closed.clone()?;
+        let mut slot = self.db.write();
+        if let Some(db) = slot.as_ref() {
+            return Some(Arc::clone(db));
+        }
+        match WalletDatabase::open(&path) {
+            Ok(db) => {
+                info!("Wallet database opened again after a failed write");
+                *closed = None;
+                let db = Arc::new(db);
+                *slot = Some(Arc::clone(&db));
+                Some(db)
+            }
+            Err(_) => None,
+        }
+    }
+
+    /// A write with no database: fine for a wallet kept in memory only, an
+    /// error for one whose database could not be opened again
+    fn closed_database(&self) -> Result<(), WalletError> {
+        match &*self.closed_path.lock() {
+            None => Ok(()),
+            Some(path) => Err(WalletError::Storage(format!(
+                "the wallet database at {} is closed after a failed write",
+                path.display()
+            ))),
+        }
+    }
+
     /// Save wallet data to database
     pub fn save(&self) -> Result<(), WalletError> {
-        let db = match &self.db {
+        let db = match self.db() {
             Some(db) => db,
-            None => return Ok(()), // No persistence
+            None => return self.closed_database(),
         };
+        let db = &*db;
         use crate::persistence::{outpoint_key, serialize_tx, serialize_utxo};
 
         // One synced batch: a crash or kill during the save leaves the previous
@@ -1346,7 +1459,7 @@ impl WalletDb {
 
     /// Save only the last scan height to database (lightweight, no flush)
     pub fn save_scan_height(&self) -> Result<(), WalletError> {
-        if let Some(db) = &self.db {
+        if let Some(db) = &self.db() {
             let mut batch = db.create_batch();
             self.put_scan_state(&mut batch, db);
             db.write_batch(batch)?;
@@ -1382,10 +1495,11 @@ impl WalletDb {
     pub fn save_incremental(&self) -> Result<(), WalletError> {
         use crate::persistence::{outpoint_key, serialize_tx, serialize_utxo};
 
-        let db = match &self.db {
+        let db = match self.db() {
             Some(db) => db,
-            None => return Ok(()),
+            None => return self.closed_database(),
         };
+        let db = &*db;
 
         let flags = self.dirty.read().clone();
         let pending = self.pending_deletes_snapshot();
@@ -1541,9 +1655,9 @@ impl WalletDb {
     /// an earlier backup at the destination is replaced. Returns where it went.
     pub fn backup_to(&self, destination: &Path) -> Result<std::path::PathBuf, WalletError> {
         let db = self
-            .db
-            .as_ref()
+            .db()
             .ok_or_else(|| WalletError::Storage("wallet has no database to back up".into()))?;
+        let db = &*db;
         let is_backup = |p: &Path| p.join("CURRENT").is_file();
         let name = db
             .path()
@@ -1614,14 +1728,11 @@ impl WalletDb {
     /// The records the load could not read, by kind (Divi Core's ReadKeyValue
     /// failures, walletdb.cpp:495-511)
     pub fn load_problems(&self) -> crate::persistence::LoadProblems {
-        self.db
-            .as_ref()
-            .map(|db| db.load_problems())
-            .unwrap_or_default()
+        self.db().map(|db| db.load_problems()).unwrap_or_default()
     }
 
     pub fn database_path(&self) -> std::path::PathBuf {
-        match &self.db {
+        match self.db() {
             Some(db) => db.path().to_path_buf(),
             None => std::path::PathBuf::from("wallet.dat"),
         }
@@ -1691,9 +1802,21 @@ impl WalletDb {
         };
         self.dirty.write().keys = true;
         self.dirty.write().metadata = true; // receiving/change index changed
+        let derived = !store.is_empty();
         store.push(addr.hash);
-        self.persist_keys(&store)?;
-        Ok(addr)
+        match self.persist_keys(&store) {
+            // A key stored by an earlier top-up is handed out even when the
+            // advanced index cannot be written, as Divi Core's KeepKey does not
+            // read ErasePool's result (wallet.cpp:2158-2163); the next save
+            // writes the index. Keys just derived must be on disk first, as
+            // Divi Core's derivation throws when its write fails (wallet.cpp:2346-2347)
+            Err(WalletError::Storage(e)) if !derived => {
+                warn!("Failed to store the next key index: {}", e);
+                Ok(addr)
+            }
+            Err(e) => Err(e),
+            Ok(()) => Ok(addr),
+        }
     }
 
     /// Derive the missing keypool keys (the seed must be in memory) and store
@@ -1924,7 +2047,7 @@ impl WalletDb {
                     .write()
                     .insert(*outpoint, (u.clone(), h));
                 // Persist to RocksDB so reorg recovery survives restart
-                if let Some(ref db) = self.db {
+                if let Some(ref db) = self.db() {
                     if let Err(e) = db.store_spent_utxo_data(outpoint, u, h) {
                         debug!("Failed to persist spent_utxo_data: {}", e);
                     }
@@ -2298,7 +2421,7 @@ impl WalletDb {
         }
         self.scanned_hashes.write().clear();
         for (outpoint, _) in self.spent_utxo_data.write().drain() {
-            if let Some(ref db) = self.db {
+            if let Some(ref db) = self.db() {
                 if let Err(e) = db.remove_spent_utxo_data(&outpoint) {
                     debug!("Failed to remove spent_utxo_data from disk: {}", e);
                 }
@@ -2517,9 +2640,11 @@ impl WalletDb {
         let was_staking_only = self.is_unlocked_for_staking_only();
 
         // Load encryption metadata from database
-        let db = self.db.as_ref().ok_or_else(|| {
+        let db = self.db().ok_or_else(|| {
             WalletError::Storage("Cannot unlock wallet without database".to_string())
         })?;
+
+        let db = &*db;
 
         let (salt, encrypted_master_key) = db
             .load_encryption_metadata()?
@@ -2835,9 +2960,11 @@ impl WalletDb {
         if passphrase.is_empty() {
             return Err(WalletError::InvalidPassphrase);
         }
-        let db = self.db.as_ref().ok_or_else(|| {
+        let db = self.db().ok_or_else(|| {
             WalletError::Storage("Cannot encrypt a wallet without a database".to_string())
         })?;
+
+        let db = &*db;
 
         let mut salt = vec![0u8; 16];
         let mut master_key = Zeroizing::new(vec![0u8; 32]);
@@ -2948,9 +3075,11 @@ impl WalletDb {
         if old_pass.is_empty() || new_pass.is_empty() {
             return Err(WalletError::InvalidPassphrase);
         }
-        let db = self.db.as_ref().ok_or_else(|| {
+        let db = self.db().ok_or_else(|| {
             WalletError::Storage("Cannot change passphrase without database".to_string())
         })?;
+
+        let db = &*db;
 
         let (salt, sealed) = db
             .load_encryption_metadata()?
@@ -3418,7 +3547,7 @@ impl WalletDb {
         drop(overlay);
 
         if restored_time.is_none() {
-            if let Some(db) = &self.db {
+            if let Some(db) = &self.db() {
                 if let Err(e) =
                     db.store_unconfirmed_tx(&txid, timestamp, &divi_primitives::serialize(tx))
                 {
@@ -3444,7 +3573,7 @@ impl WalletDb {
             order.1 += 1;
             position
         };
-        if let Some(db) = &self.db {
+        if let Some(db) = &self.db() {
             if let Err(e) = db.store_tx_order(txid, position) {
                 tracing::warn!("Failed to store the position of {}: {}", txid, e);
             }
@@ -3492,7 +3621,7 @@ impl WalletDb {
             }
         };
         self.tx_times.write().insert(*txid, (received, smart));
-        if let Some(db) = &self.db {
+        if let Some(db) = &self.db() {
             if let Err(e) = db.store_tx_times(txid, received, smart) {
                 tracing::warn!("Failed to store the times of {}: {}", txid, e);
             }
@@ -3523,7 +3652,7 @@ impl WalletDb {
         if notes.is_empty() {
             return;
         }
-        if let Some(db) = &self.db {
+        if let Some(db) = &self.db() {
             match serde_json::to_vec(&notes) {
                 Ok(raw) => {
                     if let Err(e) = db.store_tx_notes(txid, &raw) {
@@ -3543,7 +3672,7 @@ impl WalletDb {
 
     /// Delete stored unconfirmed transactions that left the overlay
     fn forget_stored_unconfirmed(&self, txids: &[Hash256]) {
-        if let Some(db) = &self.db {
+        if let Some(db) = &self.db() {
             for txid in txids {
                 if let Err(e) = db.remove_unconfirmed_tx(txid) {
                     tracing::warn!("Failed to forget unconfirmed wallet tx {}: {}", txid, e);
@@ -3709,7 +3838,7 @@ impl WalletDb {
                 spent_data.remove(&outpoint);
                 spent_set.remove(&outpoint);
                 pending.spent.insert(outpoint);
-                if let Some(ref db) = self.db {
+                if let Some(ref db) = self.db() {
                     if let Err(e) = db.remove_spent_utxo_data(&outpoint) {
                         debug!("Failed to remove spent_utxo_data from disk: {}", e);
                     }
@@ -3972,10 +4101,16 @@ impl WalletDb {
     pub fn set_label(&self, address: &Address, label: &str) -> Result<(), WalletError> {
         let old = self.get_account(address);
         self.set_account(address, label);
-        let db = match &self.db {
+        let db = match self.db() {
             Some(db) => db,
-            None => return Ok(()),
+            None => {
+                if let Err(e) = self.closed_database() {
+                    warn!("Failed to store the label of {}: {}", address, e);
+                }
+                return Ok(());
+            }
         };
+        let db = &*db;
         let mut batch = db.create_batch();
         {
             let accounts = self.accounts.read();
@@ -3996,7 +4131,13 @@ impl WalletDb {
             format!("addr_{}", address).as_bytes(),
             label.as_bytes(),
         );
-        db.write_batch_sync(batch)
+        // Divi Core's callers do not read SetAddressLabel's result
+        // (rpcwallet.cpp:310, :361, :616; rpcdump.cpp:85, :152): the label is
+        // kept in memory and the next save writes it
+        if let Err(e) = db.write_batch_sync(batch) {
+            warn!("Failed to store the label of {}: {}", address, e);
+        }
+        Ok(())
     }
 
     /// The address book: every address with its name (Divi Core's
@@ -4048,7 +4189,7 @@ impl WalletDb {
 
         self.scripts.write().insert(hash160, script.clone());
 
-        if let Some(db) = &self.db {
+        if let Some(db) = &self.db() {
             db.store_script(&hash160, &script)?;
         }
 
@@ -4112,7 +4253,7 @@ impl WalletDb {
             .write()
             .insert(metadata.vault_script.clone(), metadata.clone());
 
-        if let Some(ref db) = self.db {
+        if let Some(ref db) = self.db() {
             db.store_vault(&metadata.vault_script, &metadata).ok();
         }
     }
@@ -4231,7 +4372,7 @@ impl WalletDb {
             }
             doomed
         };
-        if let Some(ref db) = self.db {
+        if let Some(ref db) = self.db() {
             for outpoint in doomed.iter().filter(|_| forget) {
                 if let Err(e) = db.remove_utxo(outpoint) {
                     debug!("Failed to delete vault UTXO {:?}: {}", outpoint, e);
@@ -5207,12 +5348,13 @@ mod tests {
         wallet.set_account(&addr, "label");
         wallet.set_last_scan_height(7);
 
-        let db = wallet.db.as_ref().unwrap();
+        let db = wallet.db().unwrap();
         let seq = db.latest_sequence_number();
         wallet.save().unwrap();
         // WAL records written after `seq`
         assert_eq!(db.write_batches_since(seq).unwrap(), 1);
 
+        drop(db);
         drop(wallet);
         let wallet = WalletDb::open(dir.path(), Network::Mainnet).unwrap();
         assert_eq!(wallet.last_scan_height(), 7);
@@ -5596,7 +5738,7 @@ mod tests {
         // record (written by the next save while locked) and no encrypted secret
         wallet.save().unwrap();
         {
-            let db = wallet.db.as_ref().unwrap();
+            let db = wallet.db().unwrap();
             let mut suffixed = addr.hash.as_bytes().to_vec();
             suffixed.push(crate::persistence::ENCRYPTED_SECRET_SUFFIX);
             let mut batch = db.create_batch();
@@ -5614,7 +5756,7 @@ mod tests {
         }
         // The healed secret is on disk now, not just re-derived each time
         let wallet = WalletDb::open(&path, Network::Testnet).unwrap();
-        let db = wallet.db.as_ref().unwrap();
+        let db = wallet.db().unwrap();
         assert!(db
             .load_encrypted_secrets()
             .unwrap()
@@ -6558,12 +6700,7 @@ mod tests {
                 wallet.save().unwrap();
                 // What 0.2.6 removevault did: forget the metadata only
                 wallet.vaults.write().remove(vault.as_bytes());
-                wallet
-                    .db
-                    .as_ref()
-                    .unwrap()
-                    .remove_vault(vault.as_bytes())
-                    .unwrap();
+                wallet.db().unwrap().remove_vault(vault.as_bytes()).unwrap();
                 assert_eq!(wallet.get_utxos().len(), 1);
             }
             let wallet = WalletDb::open(&path, Network::Mainnet).unwrap();
@@ -6572,7 +6709,7 @@ mod tests {
             drop(wallet);
             // and the deletion reached the disk
             let wallet = WalletDb::open(&path, Network::Mainnet).unwrap();
-            assert!(wallet.db.as_ref().unwrap().load_utxos().unwrap().is_empty());
+            assert!(wallet.db().unwrap().load_utxos().unwrap().is_empty());
         }
 
         /// A registered vault whose owner and manager keys are both in the

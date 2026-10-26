@@ -34,6 +34,7 @@ zeroize = "1.7"
 
 [dev-dependencies]
 tempfile = { workspace = true }
+libc = "0.2"
 tracing-subscriber = { workspace = true }
 criterion = { workspace = true }
 
