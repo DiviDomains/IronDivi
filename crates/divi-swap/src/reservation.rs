@@ -712,7 +712,7 @@ mod tests {
         };
         let f = b.build_funding(&htlc, Amount(1_000)).await.unwrap();
         b.broadcast(&f.tx).await.unwrap();
-        r.reserve(Chain::Btc, &f.tx.txid, &[op(n, 0)]).unwrap();
+        r.reserve(b.chain(), &f.tx.txid, &[op(n, 0)]).unwrap();
         f.tx
     }
 
@@ -779,6 +779,79 @@ mod tests {
         // The freed input can fund the next lock.
         r.reserve(Chain::Btc, &Txid([0x77; 32]), &[op(1, 0)])
             .unwrap();
+    }
+
+    /// A DIVI mock chain (60 s target spacing) at MTP `T0` and a funded wallet on it.
+    fn divi_chain() -> (MockChain, MockBackend) {
+        let c = MockChain::new(Chain::Divi, T0, 60);
+        let b = c.backend(4, Amount(10 * Amount::COIN));
+        (c, b)
+    }
+
+    /// One block `gap` seconds after the tip (the mock mines one target spacing on).
+    fn mine_after(c: &MockChain, gap: u32) {
+        c.mine(1);
+        c.advance_time(gap - 60);
+    }
+
+    #[tokio::test]
+    async fn a_sparse_but_live_divi_tip_releases_after_the_usual_absent_blocks() {
+        let (c, b) = divi_chain();
+        let r = InputReservations::in_memory().unwrap();
+        let t = lock(&r, &b, 1).await;
+        c.forget(&t);
+        c.advance_time(DEADLINE - T0);
+        let locks = [(t, DEADLINE)];
+
+        // Ten minutes between blocks; each sweep runs three minutes after the tip block,
+        // so the tip is always more than two 60 s spacings behind the wall clock.
+        let first = c.height();
+        let mut released = 0;
+        for _ in 0..EXPIRY_ABSENT_BLOCKS {
+            released += r.release_expired(&b, &locks, c.mtp() + 180).await.unwrap();
+            assert_eq!(released, 0, "fewer than six blocks past the first check");
+            mine_after(&c, 600);
+        }
+        assert_eq!(c.height(), first + EXPIRY_ABSENT_BLOCKS);
+        assert_eq!(
+            r.release_expired(&b, &locks, c.mtp() + 180).await.unwrap(),
+            1,
+            "six live blocks past the first absent check"
+        );
+        assert!(r.reserved(Chain::Divi).unwrap().is_empty());
+        assert_eq!(r.first_absent_height(Chain::Divi, &t).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_syncing_divi_endpoint_releases_nothing() {
+        let (c, b) = divi_chain();
+        let r = InputReservations::in_memory().unwrap();
+        let t = lock(&r, &b, 1).await;
+        c.forget(&t);
+        let locks = [(t, DEADLINE)];
+        // The wall clock is three hours past the deadline; the endpoint replays the chain
+        // from an hour before the deadline, one block (60 s of chain time) per sweep, its
+        // tip always more than two spacings behind the clock.
+        let mut now = DEADLINE + 3 * 3_600;
+        let mut sweeps = 0;
+        while c.mtp() + 180 < now {
+            assert_eq!(r.release_expired(&b, &locks, now).await.unwrap(), 0);
+            c.mine(1);
+            now += 1;
+            sweeps += 1;
+        }
+        assert!(sweeps > 200);
+        assert_eq!(held_by(&r), HashSet::from([t]), "replayed blocks never count");
+        // Caught up: the count runs over the blocks mined after the first absent check.
+        assert_eq!(r.release_expired(&b, &locks, now).await.unwrap(), 0);
+        for i in 1..=EXPIRY_ABSENT_BLOCKS {
+            mine_after(&c, 600);
+            assert_eq!(
+                r.release_expired(&b, &locks, c.mtp() + 180).await.unwrap(),
+                usize::from(i == EXPIRY_ABSENT_BLOCKS),
+                "live block {i}"
+            );
+        }
     }
 
     #[tokio::test]
