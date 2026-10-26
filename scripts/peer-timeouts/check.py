@@ -15,7 +15,9 @@ a ping it has not answered. Both nodes run at once, each with these raw peers:
   - dialled it, talks every 30 s but never answers a ping;
   - dialled it, sends nothing;
   - dialled it, sends a ping every 10 s but never a version;
-  - dialled, and dialled it, the peer's version only at 45 s (then a well-behaved peer).
+  - dialled, and dialled it, the peer's version only at 45 s (then a well-behaved peer);
+  - dialled, and dialled it, half a message and then nothing: half a version at 5 s, or half an
+    inv at 60 s after a handshake.
 
 Each row is when the node closed the connection, in seconds after it was opened, or that it
 was still up after WATCH seconds; the two count as the same within 10 s. PASS (as divid),
@@ -110,19 +112,35 @@ class Peer:
     otherwise it sends its version first. `handshake`: it does the handshake at all; `pre_ping`:
     without a version, a ping every 10 s; `sporks`: sporkcount 0 after the handshake; `pong`:
     it answers pings; `talk`: an unasked pong every 30 s; `version_at`: its version only that many
-    seconds after the connection opened"""
+    seconds after the connection opened; `half_at`: that many seconds after the connection opened, half a
+    message (its header names 100 bytes of payload, 40 follow: a version when there was no handshake,
+    else an inv), and nothing more after it"""
 
     def __init__(self, name, sock, port, dialled, handshake=True, pre_ping=False, sporks=False, pong=False,
-                 talk=False, version_at=0):
+                 talk=False, version_at=0, half_at=None):
         self.name, self.sock, self.port, self.dialled = name, sock, port, dialled
-        self.version_at = version_at
+        self.version_at, self.half_at, self.stalled = version_at, half_at, False
         self.handshake, self.pre_ping, self.sporks, self.pong, self.talk = handshake, pre_ping, sporks, pong, talk
         self.opened, self.closed, self.log = time.time(), None, []
         self.lock = threading.Lock()
         threading.Thread(target=self.read, daemon=True).start()
         threading.Thread(target=self.speak, daemon=True).start()
 
+    def send_half(self):
+        """A header naming 100 bytes of payload, then 40 of them"""
+        command = "inv" if self.handshake else "version"
+        payload = secrets.token_bytes(100)
+        whole = MAGIC + command.encode().ljust(12, b"\0") + struct.pack("<I", 100) + sha256d(payload)[:4] + payload
+        with self.lock:
+            self.stalled = True
+            try:
+                self.sock.sendall(whole[:24 + 40])
+            except OSError:
+                pass
+
     def send(self, command, payload=b""):
+        if self.stalled:
+            return
         with self.lock:
             try:
                 self.sock.sendall(message(command, payload))
@@ -137,6 +155,8 @@ class Peer:
         while self.closed is None:
             time.sleep(1)
             k += 1
+            if self.half_at is not None and k == self.half_at:
+                self.send_half()
             if self.pre_ping and k % 10 == 0:
                 self.send("ping", struct.pack("<Q", k))
             if self.talk and k % 30 == 0:
@@ -287,6 +307,8 @@ DIALLED = [
     ("dialled, sporkcount 0, then silent", dict(sporks=True)),
     ("dialled, sends nothing", dict(handshake=False)),
     ("dialled, answers with its version at 45 s", dict(version_at=45, sporks=True, pong=True)),
+    ("dialled, half a version at 5 s, then nothing", dict(handshake=False, half_at=5)),
+    ("dialled, sporkcount 0, half an inv at 60 s, then nothing", dict(sporks=True, pong=True, half_at=60)),
 ]
 INBOUND = [
     ("dialled it, answers pings (control)", dict(pong=True)),
@@ -295,6 +317,8 @@ INBOUND = [
     ("dialled it, sends nothing", dict(handshake=False)),
     ("dialled it, a ping every 10 s, no version", dict(handshake=False, pre_ping=True)),
     ("dialled it, its version at 45 s", dict(version_at=45, pong=True)),
+    ("dialled it, half a version at 5 s, then nothing", dict(handshake=False, half_at=5)),
+    ("dialled it, half an inv at 60 s, then nothing", dict(pong=True, half_at=60)),
 ]
 
 

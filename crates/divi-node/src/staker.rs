@@ -3577,20 +3577,24 @@ mod tests {
         scan(&wallet, &blocks);
         assert!(past.has_mintable_coins(), "mature coins from two hours ago");
 
-        let (ahead, wallet, blocks, _b) = staker_with_dated_blocks(now + 300, 30);
-        // Scanned and checked within one second
+        // Scanned and checked within one second. Each attempt has a wallet of
+        // its own: a wallet keeps the time it first saw a transaction, so a
+        // second scan after the clock ticked would date the coins a second back
         let mut seen = None;
+        let mut ahead = None;
         for _ in 0..20 {
+            let (staker, wallet, blocks, dir) = staker_with_dated_blocks(now + 300, 30);
             let second = current_timestamp();
             scan(&wallet, &blocks);
-            let mintable = ahead.has_mintable_coins();
+            let mintable = staker.has_mintable_coins();
             if current_timestamp() == second {
                 seen = Some(mintable);
+                ahead = Some((staker, dir));
                 break;
             }
-            std::thread::sleep(std::time::Duration::from_millis(50));
         }
         assert_eq!(seen, Some(false), "coins that arrived this very second");
+        let (ahead, _b) = ahead.unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(2100));
         assert!(

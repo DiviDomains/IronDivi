@@ -21,7 +21,7 @@ scripts/peer-timeouts/run.sh target/debug ~/divi-3.0.0/bin 55400 /var/tmp
 ```
 
 - `<irondivid-bin-dir>` holds `irondivid`; `<core-bin-dir>` holds Divi Core's `divid`.
-- `<port-base>`: ports `<port-base>` to `<port-base>+11` on 127.0.0.2 (p2p and RPC of the two nodes, then the raw
+- `<port-base>`: ports `<port-base>` to `<port-base>+13` on 127.0.0.2 (p2p and RPC of the two nodes, then the raw
   peers each node dials).
 - `[root]`: a fresh directory is made under it (default `$TMPDIR`, else `/tmp`) and deleted at the end. Give an
   absolute path.
@@ -45,6 +45,9 @@ connect timeout, `net.cpp:1719`) or with regtest.
 | nothing received from the peer | 20 minutes from the last receive, 90 minutes for a peer of protocol 60000 or below (`:826-828`; such a peer is refused at its version anyway) |
 | a ping not answered | 20 minutes from the ping (`:829-831`, on `GetTimeMicros`) |
 
+Bytes count as they arrive, part of a message or not: half a message moves the receive clock, and counts as
+"something received" for the 60 s check.
+
 There is no deadline of its own for the version message. An inbound peer is sent nothing before its version
 (`main.cpp:407`), so one that has not sent its version by 60 s is dropped; a peer the node dialled has been sent its
 version, so it is dropped at 60 s only if it has sent nothing at all. A dialled peer that never sends its sporks is
@@ -65,3 +68,7 @@ however much it talks.
 | dialled it, sends nothing | closed at 60 s |
 | dialled it, a ping every 10 s, no version | closed at 60 s (it was sent nothing) |
 | dialled it, its version at 45 s | up |
+| dialled, half a version at 5 s (24-byte header naming 100 bytes, then 40), then nothing | closed at about 1200 s (it sent something, and was sent the node's version) |
+| dialled, `sporkcount 0`, half an inv at 60 s, then nothing | closed at about 1260 s (20 minutes after the half message) |
+| dialled it, half a version at 5 s, then nothing | closed at 60 s (it was sent nothing) |
+| dialled it, half an inv at 60 s, then nothing | closed at about 1260 s |
