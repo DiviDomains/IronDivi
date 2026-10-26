@@ -28,6 +28,7 @@ import urllib.request
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "lib"))
 import mnsync_stages  # noqa: E402  (scripts/lib: the sync stages of nodes over time)
+import node_ports  # noqa: E402  (scripts/lib: a node whose ports were taken starts again on new ones)
 
 IRONDIVID, DIVID, PORT_BASE, WORK = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
 # For the proof that a difference is caught: irondivid's reply of the named row is
@@ -104,6 +105,10 @@ class Node:
         self.proc = None
         self.log = None
 
+    def ports_moved(self):
+        """node_ports started the node again on other ports"""
+        self.addr = f"{HOST}:{self.p2p}"
+
     def write_conf(self, extra=()):
         tmp = os.path.join(self.dir, "divi.conf.new")
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -120,8 +125,8 @@ class Node:
 
     def start(self):
         self.log = open(os.path.join(WORK, self.name + ".out"), "a")
-        self.proc = subprocess.Popen([self.binary, f"-datadir={self.dir}"], cwd=self.dir,
-                                     stdout=self.log, stderr=subprocess.STDOUT, start_new_session=True)
+        self.proc = node_ports.popen(self, [self.binary, f"-datadir={self.dir}"], cwd=self.dir,
+                                     stdout=self.log, stderr=subprocess.STDOUT, start_new_session=True, work=WORK)
         with open(os.path.join(WORK, "pids"), "a") as f:
             f.write(f"{self.proc.pid}\n")
         need(self.wait_ready(), f"{self.name} did not answer within {START_TIMEOUT} s")

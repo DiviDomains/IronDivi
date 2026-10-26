@@ -19,6 +19,9 @@ import unicodedata
 import urllib.error
 import urllib.request
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "lib"))
+import node_ports  # noqa: E402  (scripts/lib: a node whose ports were taken starts again on new ones)
+
 IRONDIVID, PORT_BASE, WORK = sys.argv[1], int(sys.argv[2]), sys.argv[3]
 RPC_TIMEOUT = 60
 START_TIMEOUT = 120
@@ -61,9 +64,10 @@ class Node:
         with os.fdopen(fd, "w") as f:
             f.write("\n".join(lines) + "\n")
         self.log = open(os.path.join(self.dir, "core_stdout.log"), "w")
-        self.proc = subprocess.Popen(
-            [IRONDIVID, f"-datadir={self.dir}", *args],
+        self.proc = node_ports.popen(
+            self, [IRONDIVID, f"-datadir={self.dir}", *args],
             cwd=self.dir, stdout=self.log, stderr=subprocess.STDOUT,
+            work=WORK,
         )
         with open(os.path.join(WORK, "pids"), "a") as f:
             f.write(f"{self.proc.pid}\n")

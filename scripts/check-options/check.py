@@ -21,6 +21,9 @@ import time
 import urllib.error
 import urllib.request
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "lib"))
+import node_ports  # noqa: E402  (scripts/lib: a node whose ports were taken starts again on new ones)
+
 IRONDIVID, DIVID, PORT_BASE, WORK = sys.argv[1], sys.argv[2], int(sys.argv[3]), os.path.abspath(sys.argv[4])
 RPC_TIMEOUT = 60
 START_TIMEOUT = 240
@@ -142,8 +145,8 @@ class Node:
         self.err = os.path.join(WORK, f"{self.name}.{self.starts}.err")
         env = dict(os.environ, HOME=os.path.join(self.dir, "home"))
         with open(os.path.join(WORK, f"{self.name}.{self.starts}.out"), "w") as o, open(self.err, "w") as e:
-            self.proc = subprocess.Popen([self.binary, f"-datadir={self.dir}", *args], cwd=self.dir, env=env,
-                                         stdout=o, stderr=e, start_new_session=True)
+            self.proc = node_ports.popen(self, [self.binary, f"-datadir={self.dir}", *args], cwd=self.dir, env=env,
+                                         stdout=o, stderr=e, start_new_session=True, work=WORK)
         with open(os.path.join(WORK, "pids"), "a") as f:
             f.write(f"{self.proc.pid}\n")
         deadline = time.time() + START_TIMEOUT

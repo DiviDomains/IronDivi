@@ -27,6 +27,7 @@ import urllib.request
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "lib"))
 import member_order  # noqa: E402  (scripts/lib: the order check the replies scripts share)
+import node_ports  # noqa: E402  (scripts/lib: a node whose ports were taken starts again on new ones)
 
 IRONDIVID, DIVID, PORT_BASE, WORK = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
 # For the proof that a difference is caught: irondivid's body of the named row is
@@ -95,8 +96,8 @@ class Node:
 
     def start(self):
         self.log = open(os.path.join(WORK, self.name + ".out"), "a")
-        self.proc = subprocess.Popen([self.binary, f"-datadir={self.dir}"], cwd=self.dir,
-                                     stdout=self.log, stderr=subprocess.STDOUT, start_new_session=True)
+        self.proc = node_ports.popen(self, [self.binary, f"-datadir={self.dir}"], cwd=self.dir,
+                                     stdout=self.log, stderr=subprocess.STDOUT, start_new_session=True, work=WORK)
         with open(os.path.join(WORK, "pids"), "a") as f:
             f.write(f"{self.proc.pid}\n")
 

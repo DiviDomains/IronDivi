@@ -39,6 +39,9 @@ import time
 import urllib.error
 import urllib.request
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "lib"))
+import node_ports  # noqa: E402  (scripts/lib: a node whose ports were taken starts again on new ones)
+
 IRONDIVID, DIVID, PORT_BASE, WORK = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
 HOST = "127.0.0.2"
 DEAD = PORT_BASE + 49  # the receiver's only -connect peer; nothing listens there
@@ -160,8 +163,9 @@ class Node:
         base = os.path.join(WORK, f"{self.name}.run{self.runs}")
         self.err = base + ".err"
         with open(base + ".out", "w") as o, open(self.err, "w") as e:
-            self.proc = subprocess.Popen([self.binary, f"-datadir={self.dir}"], cwd=WORK,
-                                         stdout=o, stderr=e, stdin=subprocess.DEVNULL, start_new_session=True)
+            self.proc = node_ports.popen(self, [self.binary, f"-datadir={self.dir}"], cwd=WORK,
+                                         stdout=o, stderr=e, stdin=subprocess.DEVNULL, start_new_session=True,
+                                         work=WORK)
         with open(os.path.join(WORK, "pids"), "a") as f:
             f.write(f"{self.proc.pid}\n")
         deadline = time.time() + START_TIMEOUT

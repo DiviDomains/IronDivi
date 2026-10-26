@@ -26,6 +26,9 @@ import time
 import urllib.error
 import urllib.request
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "lib"))
+import node_ports  # noqa: E402  (scripts/lib: a node whose ports were taken starts again on new ones)
+
 IRONDIVID, DIVID, PORT_BASE, WORK = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
 # For the proof that a difference is caught: irondivid gets this extra argument
 # in the named case
@@ -174,8 +177,8 @@ class Node:
         self.out, self.err = base + ".out", base + ".err"
         argv = [self.binary] + ([f"-datadir={self.dir}"] if datadir is True else []) + list(args)
         with open(self.out, "w") as o, open(self.err, "w") as e:
-            proc = subprocess.Popen(argv, cwd=WORK, stdout=o, stderr=e, stdin=subprocess.DEVNULL,
-                                    start_new_session=True)
+            proc = node_ports.popen(self, argv, cwd=WORK, stdout=o, stderr=e, stdin=subprocess.DEVNULL,
+                                    start_new_session=True, work=WORK)
         with open(os.path.join(WORK, "pids"), "a") as f:
             f.write(f"{proc.pid}\n")
         return proc
@@ -191,6 +194,7 @@ class Node:
             if code is not None:
                 return ("exit", code, self.error_line())
             for port in ports:
+                port = node_ports.now(port)  # a node started again on new ports
                 try:
                     if self.call("getblockcount", port=port)[0] == "ok":
                         return ("up", port)
@@ -206,7 +210,7 @@ class Node:
         import socket
         for port in ports:
             try:
-                socket.create_connection(("127.0.0.1", port), timeout=1).close()
+                socket.create_connection(("127.0.0.1", node_ports.now(port)), timeout=1).close()
                 return True
             except OSError:
                 pass
