@@ -4393,9 +4393,12 @@ impl WalletRpc {
         ensure_fully_unlocked(&wallet)?;
 
         let newsize = (size > 0).then_some(size as u32);
-        let generated = wallet
-            .refill_keypool(newsize)
-            .map_err(|e| RpcError::internal_error(format!("Failed to refill keypool: {}", e)))?;
+        // A key that cannot be written: Divi Core's derivation throws
+        // (wallet.cpp:2104, :2339-2347)
+        let generated = wallet.refill_keypool(newsize).map_err(|e| match e {
+            divi_wallet::WalletError::Storage(_) => key_write_error(e),
+            e => RpcError::internal_error(format!("Failed to refill keypool: {}", e)),
+        })?;
         info!("Keypool refilled with {} new keys", generated);
 
         if wallet.keypool_size() < size as u32 {

@@ -291,3 +291,27 @@ fn a_failed_send_whose_key_pool_top_up_cannot_be_written_answers_as_divid() {
     );
     assert_eq!(after, size, "the key pool after the failed send");
 }
+
+/// keypoolrefill whose new keys cannot be written: Divi Core derives each key
+/// inside its WritePool call, and the derivation throws when it cannot write
+/// the HD chain (wallet.cpp:2104, :2339-2347), so its reply is that one and
+/// "TopUpKeyPool: writing generated key failed" (:2104-2105) is not reached.
+/// The key pool is as it was
+#[test]
+fn keypoolrefill_whose_keys_cannot_be_written_answers_as_divid() {
+    let _limit = LIMIT.lock();
+    let net = Net::new();
+    let rpc = net.rpc();
+    rpc.keypool_refill(&p(vec![])).unwrap();
+    net.wallet.new_receiving_address().unwrap();
+    let size = net.wallet.keypool_size();
+    writes_fail();
+    let reply = rpc.keypool_refill(&p(vec![]));
+    let after = net.wallet.keypool_size();
+    writes_work();
+    assert_eq!(
+        rpc_error(reply),
+        (-1, "loadHDChain: WriteHDChain failed".to_string())
+    );
+    assert_eq!(after, size, "the key pool after the failed refill");
+}
