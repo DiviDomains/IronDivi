@@ -327,18 +327,23 @@ def next_change(name):
         "same" if same else ("another" if i[0] == "ok" else show(view(i))), same or (c[0] != "ok" and c == i))
 
 
+# With the key pool full, the change key comes from the pool and nothing is
+# derived: the failed send gives it back in memory (ReturnKey) and the pool is
+# full again. With it one short, the reservation must derive a key, and its
+# write fails first: -1 "loadHDChain: WriteHDChain failed" (wallet.cpp:2339-2347)
 both("keypoolrefill (the pool full)", "keypoolrefill")
-next_change("before the writes fail")
-wallet_state("before the writes fail")
-writes_fail()
-both("sendmany \"\" of 3000 outputs, writes failing", "sendmany", "", payees)
-wallet_state("after the sendmany that is too large, writes failing")
-both("sendtoaddress 0.00006 receiver_pays, writes failing", "sendtoaddress", next(iter(payees)), 0.00006,
-     "receiver_pays")
-wallet_state("after the receiver_pays send that fails, writes failing")
-writes_work()
-wallet_state("once writes work again, after the failed sends")
-next_change("once writes work again, after the failed sends")
+wallet_state("before the writes fail, the pool full")
+for pool in ("the pool full", "the pool one short"):
+    writes_fail()
+    both(f"sendmany \"\" of 3000 outputs, writes failing, {pool}", "sendmany", "", payees)
+    wallet_state(f"after the sendmany that is too large, writes failing, {pool}")
+    both(f"sendtoaddress 0.00006 receiver_pays, writes failing, {pool}", "sendtoaddress", next(iter(payees)),
+         0.00006, "receiver_pays")
+    wallet_state(f"after the receiver_pays send that fails, writes failing, {pool}")
+    writes_work()
+    wallet_state(f"once writes work again, after the failed sends, {pool}")
+    # getrawchangeaddress takes the next change key: the pool is one short after it
+    next_change(f"once writes work again, after the failed sends, {pool}")
 # A key pool one short (getrawchangeaddress took a change key and getnewaddress
 # a receiving one): keypoolrefill must derive keys, and writing them fails,
 # -1 "TopUpKeyPool: writing generated key failed" (wallet.cpp:2104-2105)
