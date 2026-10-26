@@ -3032,6 +3032,7 @@ dependencies = [
  "divi-storage",
  "hex",
  "hmac",
+ "libc",
  "parking_lot",
  "pbkdf2",
  "rand 0.8.8",
