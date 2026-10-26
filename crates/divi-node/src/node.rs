@@ -2416,6 +2416,9 @@ impl Node {
         }
 
         tracing::info!("Stopping Divi node...");
+        // As Divi Core's StopNode, which stops the network and writes
+        // peers.dat (net.cpp:1474-1484)
+        tracing::info!("StopNode()");
         *self.status.write() = NodeStatus::Stopping;
 
         // The network first, as Divi Core's shutdown interrupts and joins its

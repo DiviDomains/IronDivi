@@ -3166,6 +3166,9 @@ async fn run_daemon(
         }
     }
 
+    // Divi Core's first line of its stop (PrepareShutdown, init.cpp:360)
+    info!("PrepareShutdown: In progress...");
+
     // Divi Core stops minting before it flushes the chain state and the wallet
     // (init.cpp:372-373, :381, :386): no block is staked while they are written
     if let Some(staker) = staker.clone() {
@@ -3928,6 +3931,8 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
 
     remove_pid_file(&pid_file);
 
+    // Divi Core's last line, once its pid file is gone (MainShutdown, init.cpp:418)
+    info!("MainShutdown: done");
     info!("IronDivi shutdown complete");
     Ok(())
 }
