@@ -12,7 +12,7 @@
 
 #![cfg(unix)]
 
-use divi_test_support::{free_port, log_tail};
+use divi_test_support::{free_port, log_tail, start_on};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -54,40 +54,35 @@ impl Drop for Node {
     }
 }
 
-fn start(datadir: &Path, rpc_port: u16, p2p_port: u16, extra: &[&str]) -> Node {
-    let child = Command::new(env!("CARGO_BIN_EXE_irondivid"))
-        .arg("--regtest")
-        .arg("--datadir")
-        .arg(datadir)
-        .args(["--rpcport", &rpc_port.to_string()])
-        .args(["--port", &p2p_port.to_string()])
-        .args(["--bind", "127.0.0.1", "--staking=false", "--listen=false"])
-        .args(["--rpcuser", "test", "--rpcpassword", "test"])
-        .args(extra)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn irondivid");
-    let mut node = Node(child);
-    let deadline = Instant::now() + Duration::from_secs(120);
-    while try_rpc(
+fn start(datadir: &Path, rpc_port: &mut u16, p2p_port: &mut u16, extra: &[&str]) -> Node {
+    Node(start_on(
+        datadir,
         rpc_port,
-        "getblockcount",
-        &json!([]),
-        Duration::from_secs(10),
-    )
-    .is_none()
-    {
-        if let Ok(Some(status)) = node.0.try_wait() {
-            panic!("irondivid exited at start: {status}\n{}", log_tail(datadir));
-        }
-        assert!(
-            Instant::now() < deadline,
-            "irondivid did not answer within 120 s"
-        );
-        std::thread::sleep(Duration::from_millis(250));
-    }
-    node
+        p2p_port,
+        |rpc_port, p2p_port| {
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_irondivid"));
+            cmd.arg("--regtest")
+                .arg("--datadir")
+                .arg(datadir)
+                .args(["--rpcport", &rpc_port.to_string()])
+                .args(["--port", &p2p_port.to_string()])
+                .args(["--bind", "127.0.0.1", "--staking=false", "--listen=false"])
+                .args(["--rpcuser", "test", "--rpcpassword", "test"])
+                .args(extra)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            cmd
+        },
+        |rpc_port| {
+            try_rpc(
+                rpc_port,
+                "getblockcount",
+                &json!([]),
+                Duration::from_secs(10),
+            )
+            .is_some()
+        },
+    ))
 }
 
 /// Stop the node with the RPC stop and wait (bounded) until it exits
@@ -126,12 +121,20 @@ fn entries(dir: &Path) -> usize {
 #[test]
 fn createwalletbackups_sets_the_count_kept() {
     let dir = tempfile::tempdir().unwrap();
-    let (rpc_port, p2p_port) = (free_port(), free_port());
+    let (mut rpc_port, mut p2p_port) = (free_port(), free_port());
     // A start that makes the wallet, then three that back it up
-    stop(start(dir.path(), rpc_port, p2p_port, &[]), rpc_port);
+    stop(
+        start(dir.path(), &mut rpc_port, &mut p2p_port, &[]),
+        rpc_port,
+    );
     for i in 0..3 {
         stop(
-            start(dir.path(), rpc_port, p2p_port, &["-createwalletbackups=2"]),
+            start(
+                dir.path(),
+                &mut rpc_port,
+                &mut p2p_port,
+                &["-createwalletbackups=2"],
+            ),
             rpc_port,
         );
         // A backup is named by the minute and not made again under a name
@@ -150,7 +153,12 @@ fn createwalletbackups_sets_the_count_kept() {
     let backups = find_dir(dir.path(), "backups").expect("backups/");
     assert_eq!(entries(&backups), 2, "two kept");
     stop(
-        start(dir.path(), rpc_port, p2p_port, &["-createwalletbackups=0"]),
+        start(
+            dir.path(),
+            &mut rpc_port,
+            &mut p2p_port,
+            &["-createwalletbackups=0"],
+        ),
         rpc_port,
     );
     assert_eq!(entries(&backups), 2, "none made, none removed");
@@ -174,8 +182,11 @@ fn names(dir: &Path) -> Vec<String> {
 #[test]
 fn monthlybackups_sets_the_count_and_zero_leaves_it_off() {
     let dir = tempfile::tempdir().unwrap();
-    let (rpc_port, p2p_port) = (free_port(), free_port());
-    stop(start(dir.path(), rpc_port, p2p_port, &[]), rpc_port);
+    let (mut rpc_port, mut p2p_port) = (free_port(), free_port());
+    stop(
+        start(dir.path(), &mut rpc_port, &mut p2p_port, &[]),
+        rpc_port,
+    );
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -183,7 +194,12 @@ fn monthlybackups_sets_the_count_and_zero_leaves_it_off() {
     let later = now + 31 * 24 * 3600;
     // The time suffix of the backup made at start
     let suffix = {
-        let n = start(dir.path(), rpc_port, p2p_port, &["-monthlybackups=0"]);
+        let n = start(
+            dir.path(),
+            &mut rpc_port,
+            &mut p2p_port,
+            &["-monthlybackups=0"],
+        );
         let monthly = find_dir(dir.path(), "monthlyBackups").expect("monthlyBackups/");
         let before = names(&monthly);
         assert_eq!(before.len(), 1, "the backup at start: {before:?}");
@@ -193,7 +209,12 @@ fn monthlybackups_sets_the_count_and_zero_leaves_it_off() {
         stop(n, rpc_port);
         before[0].rsplit_once('.').unwrap().1.to_string()
     };
-    let n = start(dir.path(), rpc_port, p2p_port, &["-monthlybackups=1"]);
+    let n = start(
+        dir.path(),
+        &mut rpc_port,
+        &mut p2p_port,
+        &["-monthlybackups=1"],
+    );
     let monthly = find_dir(dir.path(), "monthlyBackups").expect("monthlyBackups/");
     ok(rpc_port, "setmocktime", json!([later]));
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -215,11 +236,11 @@ fn monthlybackups_sets_the_count_and_zero_leaves_it_off() {
 #[test]
 fn txconfirmtarget_and_sendfreetransactions_are_taken_silently() {
     let dir = tempfile::tempdir().unwrap();
-    let (rpc_port, p2p_port) = (free_port(), free_port());
+    let (mut rpc_port, mut p2p_port) = (free_port(), free_port());
     let n = start(
         dir.path(),
-        rpc_port,
-        p2p_port,
+        &mut rpc_port,
+        &mut p2p_port,
         &["-txconfirmtarget=25", "-sendfreetransactions=1"],
     );
     stop(n, rpc_port);
@@ -253,13 +274,13 @@ fn stakable_vault_coins(port: u16) -> i64 {
 fn vault_min_leaves_smaller_vault_coins_out_of_staking() {
     // An owner key the managing wallet does not hold
     let other = tempfile::tempdir().unwrap();
-    let (rpc_port, p2p_port) = (free_port(), free_port());
-    let n = start(other.path(), rpc_port, p2p_port, &[]);
+    let (mut rpc_port, mut p2p_port) = (free_port(), free_port());
+    let n = start(other.path(), &mut rpc_port, &mut p2p_port, &[]);
     let owner = ok(rpc_port, "getnewaddress", json!([]));
     stop(n, rpc_port);
 
     let dir = tempfile::tempdir().unwrap();
-    let n = start(dir.path(), rpc_port, p2p_port, &[]);
+    let n = start(dir.path(), &mut rpc_port, &mut p2p_port, &[]);
     ok(rpc_port, "setgenerate", json!([100]));
     let manager = ok(rpc_port, "getnewaddress", json!([]));
     let vault = format!("{}:{}", owner.as_str().unwrap(), manager.as_str().unwrap());
@@ -269,7 +290,12 @@ fn vault_min_leaves_smaller_vault_coins_out_of_staking() {
     assert_eq!(stakable_vault_coins(rpc_port), 1100, "both by default");
     stop(n, rpc_port);
 
-    let n = start(dir.path(), rpc_port, p2p_port, &["-vault_min=500"]);
+    let n = start(
+        dir.path(),
+        &mut rpc_port,
+        &mut p2p_port,
+        &["-vault_min=500"],
+    );
     assert_eq!(stakable_vault_coins(rpc_port), 1000, "the 100 left out");
     stop(n, rpc_port);
 }
@@ -293,19 +319,19 @@ fn vault_hex(owner: &[u8], manager: &[u8]) -> String {
 #[test]
 fn whitelisted_vaults_are_registered_as_divid_registers_them() {
     let dir = tempfile::tempdir().unwrap();
-    let (rpc, p2p) = (free_port(), free_port());
-    let node = start(dir.path(), rpc, p2p, &[]);
+    let (mut rpc, mut p2p) = (free_port(), free_port());
+    let node = start(dir.path(), &mut rpc, &mut p2p, &[]);
     let key_hash = |n: &Value| {
         let a: divi_wallet::Address = n.as_str().unwrap().parse().unwrap();
         a.hash.as_bytes().to_vec()
     };
     let manager = key_hash(&ok(rpc, "getnewaddress", json!([])));
     let owner = key_hash(&ok(rpc, "getnewaddress", json!([])));
-    let registered = || {
+    let registered = |rpc: u16| {
         let reply = ok(rpc, "getcoinavailability", json!([]));
         reply["vaults"].as_array().unwrap().len()
     };
-    assert_eq!(registered(), 0);
+    assert_eq!(registered(rpc), 0);
     stop(node, rpc);
 
     let managed = format!("-whitelisted_vault={}", vault_hex(&[0x42; 20], &manager));
@@ -313,15 +339,15 @@ fn whitelisted_vaults_are_registered_as_divid_registers_them() {
     let p2pkh = format!("-whitelisted_vault=76a914{}88ac", hex::encode(&manager));
     let node = start(
         dir.path(),
-        rpc,
-        p2p,
+        &mut rpc,
+        &mut p2p,
         &[&managed, &owned, &p2pkh, "-whitelisted_vault=nothex"],
     );
-    assert_eq!(registered(), 1);
+    assert_eq!(registered(rpc), 1);
     stop(node, rpc);
 
-    let node = start(dir.path(), rpc, p2p, &[]);
-    assert_eq!(registered(), 1);
+    let node = start(dir.path(), &mut rpc, &mut p2p, &[]);
+    assert_eq!(registered(rpc), 1);
     stop(node, rpc);
 }
 
@@ -336,19 +362,22 @@ fn hdseed_is_logged_as_divid_logs_it() {
     let log = |dir: &Path| std::fs::read_to_string(dir.join("debug.log")).unwrap_or_default();
     let seed = format!("-hdseed={}", "5a".repeat(32));
     let words = "-mnemonic=these words are dropped unread";
-    let (rpc, p2p) = (free_port(), free_port());
+    let (mut rpc, mut p2p) = (free_port(), free_port());
 
     let dir = tempfile::tempdir().unwrap();
-    stop(start(dir.path(), rpc, p2p, &[&seed, words]), rpc);
+    stop(start(dir.path(), &mut rpc, &mut p2p, &[&seed, words]), rpc);
     assert!(log(dir.path()).contains(PREFER), "{}", log(dir.path()));
     assert!(!log(dir.path()).contains(INCORRECT), "{}", log(dir.path()));
     // A wallet already there: logged all the same
     std::fs::remove_file(dir.path().join("debug.log")).unwrap();
-    stop(start(dir.path(), rpc, p2p, &[&seed, words]), rpc);
+    stop(start(dir.path(), &mut rpc, &mut p2p, &[&seed, words]), rpc);
     assert!(log(dir.path()).contains(PREFER), "{}", log(dir.path()));
 
     let dir = tempfile::tempdir().unwrap();
-    stop(start(dir.path(), rpc, p2p, &["-hdseed=nothex"]), rpc);
+    stop(
+        start(dir.path(), &mut rpc, &mut p2p, &["-hdseed=nothex"]),
+        rpc,
+    );
     assert!(log(dir.path()).contains(INCORRECT), "{}", log(dir.path()));
     assert!(!log(dir.path()).contains(PREFER), "{}", log(dir.path()));
 }

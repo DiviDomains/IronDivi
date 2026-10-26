@@ -14,9 +14,9 @@
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use divi_test_support::free_port;
+use divi_test_support::{free_port, start_on};
 
 struct Node(Child);
 
@@ -82,32 +82,66 @@ fn call(port: u16) -> Option<(String, bool)> {
 #[test]
 fn rpckeepalive_0_closes_each_rpc_connection() {
     let dir = tempfile::tempdir().unwrap();
-    let rpc_port = free_port();
-    let child = Command::new(env!("CARGO_BIN_EXE_irondivid"))
-        .args([
-            "-regtest".to_string(),
-            format!("-datadir={}", dir.path().display()),
-            format!("-rpcport={rpc_port}"),
-            format!("-port={}", free_port()),
-            "-bind=127.0.0.1".into(),
-            "-rpcuser=test".into(),
-            "-rpcpassword=test".into(),
-            "-disablewallet".into(),
-            "-rpckeepalive=0".into(),
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn irondivid");
-    let mut node = Node(child);
-    let deadline = Instant::now() + Duration::from_secs(120);
-    let reply = loop {
-        if let Some(reply) = call(rpc_port) {
-            break reply;
-        }
-        assert!(node.0.try_wait().unwrap().is_none(), "irondivid exited");
-        assert!(Instant::now() < deadline, "RPC server did not come up");
-        std::thread::sleep(Duration::from_millis(250));
-    };
+    let (mut rpc_port, mut p2p_port) = (free_port(), free_port());
+    let child = start_on(
+        dir.path(),
+        &mut rpc_port,
+        &mut p2p_port,
+        |rpc_port, p2p_port| {
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_irondivid"));
+            cmd.args([
+                "-regtest".to_string(),
+                format!("-datadir={}", dir.path().display()),
+                format!("-rpcport={rpc_port}"),
+                format!("-port={p2p_port}"),
+                "-bind=127.0.0.1".into(),
+                "-rpcuser=test".into(),
+                "-rpcpassword=test".into(),
+                "-disablewallet".into(),
+                "-rpckeepalive=0".into(),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+            cmd
+        },
+        |rpc_port| call(rpc_port).is_some(),
+    );
+    let _node = Node(child);
+    let reply = call(rpc_port).expect("the RPC server answers");
     assert_eq!(reply, ("close".to_string(), true));
+}
+
+/// A node whose RPC port is taken by another process is started again on new
+/// ports (`start_on`), where it used to exit and fail the test
+#[test]
+fn a_taken_rpc_port_starts_the_node_again_on_another() {
+    let dir = tempfile::tempdir().unwrap();
+    let taken = free_port();
+    let _holder = std::net::TcpListener::bind(("127.0.0.1", taken)).unwrap();
+    let (mut rpc_port, mut p2p_port) = (taken, free_port());
+    let child = start_on(
+        dir.path(),
+        &mut rpc_port,
+        &mut p2p_port,
+        |rpc_port, p2p_port| {
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_irondivid"));
+            cmd.args([
+                "-regtest".to_string(),
+                format!("-datadir={}", dir.path().display()),
+                format!("-rpcport={rpc_port}"),
+                format!("-port={p2p_port}"),
+                "-bind=127.0.0.1".into(),
+                "-rpcuser=test".into(),
+                "-rpcpassword=test".into(),
+                "-disablewallet".into(),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+            cmd
+        },
+        |rpc_port| call(rpc_port).is_some(),
+    );
+    let _node = Node(child);
+    assert_ne!(rpc_port, taken, "the node took the RPC port that was held");
+    assert!(call(rpc_port).is_some(), "the node answers on its new port");
 }

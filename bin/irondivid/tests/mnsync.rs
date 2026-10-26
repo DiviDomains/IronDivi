@@ -13,7 +13,7 @@
 
 #![cfg(unix)]
 
-use divi_test_support::{free_port, log_tail};
+use divi_test_support::{free_port, start_on};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -55,44 +55,39 @@ impl Drop for Node {
     }
 }
 
-fn start(datadir: &Path, rpc_port: u16, p2p_port: u16) -> Node {
+fn start(datadir: &Path, rpc_port: &mut u16, p2p_port: &mut u16) -> Node {
     start_with(datadir, rpc_port, p2p_port, &["--listen=false"])
 }
 
-fn start_with(datadir: &Path, rpc_port: u16, p2p_port: u16, extra: &[&str]) -> Node {
-    let child = Command::new(env!("CARGO_BIN_EXE_irondivid"))
-        .arg("--regtest")
-        .arg("--datadir")
-        .arg(datadir)
-        .args(["--rpcport", &rpc_port.to_string()])
-        .args(["--port", &p2p_port.to_string()])
-        .args(["--bind", "127.0.0.1", "--staking=false"])
-        .args(extra)
-        .args(["--rpcuser", "test", "--rpcpassword", "test"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn irondivid");
-    let mut node = Node(child);
-    let deadline = Instant::now() + Duration::from_secs(120);
-    while try_rpc(
+fn start_with(datadir: &Path, rpc_port: &mut u16, p2p_port: &mut u16, extra: &[&str]) -> Node {
+    Node(start_on(
+        datadir,
         rpc_port,
-        "getblockcount",
-        &json!([]),
-        Duration::from_secs(10),
-    )
-    .is_none()
-    {
-        if let Ok(Some(status)) = node.0.try_wait() {
-            panic!("irondivid exited at start: {status}\n{}", log_tail(datadir));
-        }
-        assert!(
-            Instant::now() < deadline,
-            "irondivid did not answer within 120 s"
-        );
-        std::thread::sleep(Duration::from_millis(250));
-    }
-    node
+        p2p_port,
+        |rpc_port, p2p_port| {
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_irondivid"));
+            cmd.arg("--regtest")
+                .arg("--datadir")
+                .arg(datadir)
+                .args(["--rpcport", &rpc_port.to_string()])
+                .args(["--port", &p2p_port.to_string()])
+                .args(["--bind", "127.0.0.1", "--staking=false"])
+                .args(extra)
+                .args(["--rpcuser", "test", "--rpcpassword", "test"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            cmd
+        },
+        |rpc_port| {
+            try_rpc(
+                rpc_port,
+                "getblockcount",
+                &json!([]),
+                Duration::from_secs(10),
+            )
+            .is_some()
+        },
+    ))
 }
 
 fn status(port: u16) -> Value {
@@ -114,8 +109,8 @@ fn wait_status(port: u16, secs: u64, done: impl Fn(&Value) -> bool) -> Value {
 #[test]
 fn mnsync_stages_follow_the_chain_and_reset() {
     let dir = tempfile::tempdir().unwrap();
-    let (rpc_port, p2p_port) = (free_port(), free_port());
-    let _node = start(dir.path(), rpc_port, p2p_port);
+    let (mut rpc_port, mut p2p_port) = (free_port(), free_port());
+    let _node = start(dir.path(), &mut rpc_port, &mut p2p_port);
     // The genesis block is old: the chain is not synced, the sync not begun
     let s = status(rpc_port);
     assert_eq!(s["IsBlockchainSynced"], json!(false), "{s}");
@@ -146,10 +141,16 @@ fn mnsync_stages_follow_the_chain_and_reset() {
 #[test]
 fn getstakingstatus_mnsync_is_the_finished_sync() {
     let (dir_a, dir_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-    let (rpc_a, p2p_a, rpc_b, p2p_b) = (free_port(), free_port(), free_port(), free_port());
-    let _a = start_with(dir_a.path(), rpc_a, p2p_a, &["--listen=1"]);
+    let (mut rpc_a, mut p2p_a, mut rpc_b, mut p2p_b) =
+        (free_port(), free_port(), free_port(), free_port());
+    let _a = start_with(dir_a.path(), &mut rpc_a, &mut p2p_a, &["--listen=1"]);
     let connect = format!("-connect=127.0.0.1:{p2p_a}");
-    let _b = start_with(dir_b.path(), rpc_b, p2p_b, &["--listen=false", &connect]);
+    let _b = start_with(
+        dir_b.path(),
+        &mut rpc_b,
+        &mut p2p_b,
+        &["--listen=false", &connect],
+    );
     ok(rpc_a, "setgenerate", json!([3]));
     let deadline = Instant::now() + Duration::from_secs(60);
     while ok(rpc_b, "getblockcount", json!([])) != json!(3) {

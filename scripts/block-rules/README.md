@@ -22,7 +22,7 @@ scripts/block-rules/run.sh <irondivid-bin-dir> <core-bin-dir> <port-base> [root]
 ```
 
 - `<irondivid-bin-dir>` holds `irondivid`; `<core-bin-dir>` holds Divi Core's `divid`.
-- `<port-base>`: ports `<port-base>` to `<port-base>+5` on 127.0.0.2: p2p and RPC of A, I and B.
+- `<port-base>`: ports `<port-base>` to `<port-base>+9` on 127.0.0.2: p2p and RPC of A, I and B, then of the two nodes without a transaction index.
 - `[root]`: a fresh directory is made under it and deleted at the end, with every node stopped.
 
 A run takes about 6 minutes. `BLOCK_RULES_TRACE=1` also prints each node's full reject text.
@@ -47,6 +47,7 @@ a transaction to carry, A sent one before it staked.
 | lottery block (first from 170 with winners) | the first winner paid one satoshi less, paid to another address; the last winner left out |
 | side chain | 15 of the above built on the tip block's parent, so the node holds them as a side chain |
 | side chain with a bad proof | a sibling of the tip block whose coinstake signature is damaged, then two blocks built on it so that this side chain would be the longer; per block: the reject, the connection, the tip, whether the node asks the sender for blocks (a new peer is first given 2 s to be sent what a node sends it unasked); then whether each block is held (`getblock`), what `getchaintips` gained, and whether another peer was told of any of them |
+| without `-txindex` | a new divid and a new irondivid with `-txindex=0`, joined to A (the setting cannot change on a datadir without `-reindex`): `getrawtransaction` of the transaction that made a spent stake input; a block that stakes a coin the chain has spent, and one that stakes a coin in no block, each as a sibling of the tip and as a block on it (only a coinbase and a coinstake, both different from the chain's, so that nothing repeats a transaction); then a valid block from A. divid reads a spent coin only through the index (`TransactionDiskAccessor.cpp:73-86`), so with it off the spent coin is not found at all |
 
 A masternode payee rule is not active: DeprecateMasternodes holds from 2023-08-23 on every network
 (`BlockConnectionService.cpp:321-326`).
