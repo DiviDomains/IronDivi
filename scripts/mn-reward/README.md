@@ -20,7 +20,7 @@ scripts/mn-reward/run.sh target/release ~/divi-3.0.0/bin 53900 /var/tmp
 ```
 
 - Ports `<port-base>` to `<port-base>+15` on 127.0.0.2 (eight nodes: mn-life's six and two fresh wallets).
-- A run takes about 50 minutes and is stopped after 60: a masternode is ranked, and so can be paid, only 25 minutes
+- A run takes about 30 minutes and is stopped after 60: a masternode is ranked, and so can be paid, only 25 minutes
   after its broadcast was signed (`divi/src/masternode-payments.cpp:558`).
 
 ## How a masternode gets paid on regtest
@@ -37,7 +37,9 @@ reaches 2023-08-23 (`divi/src/ForkActivation.cpp:31`, `:47-57`), and then `FillB
   network has had it since 2023. Its blocks pay no masternode, and it accepts C's blocks, as it checks what a block
   mints, not who is paid.
 
-So the payments are made by divid C's blocks, to C's masternodes and to I's. That is enough for the wallet rows,
+So the payments are made by divid C's blocks, to C's masternodes and to I's. divid picks the payee, and in one run it
+paid I's masternode in all ten of its blocks, so the payment phase mines on, up to 40 blocks, until a block has paid
+each controller's masternode. If one is still not paid, C's masternode list is printed. That is enough for the wallet rows,
 which this script is for: a wallet's view of a coinstake does not depend on who made it.
 
 ## The rows (section 9 of scripts/mn-life/check.py)

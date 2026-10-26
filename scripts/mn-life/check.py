@@ -472,12 +472,24 @@ def enabled_on(node, alias):
     return out[0] == "ok" and any(e.get("status") == "ENABLED" for e in out[1])
 
 
-starts = {}
-compare("broadcaststartmasternode <signed broadcast> from the controller",
-        C.call("broadcaststartmasternode", mn["mnc"]["signed"]),
-        I.call("broadcaststartmasternode", mn["mni"]["signed"]))
-for alias in ("mnc", "mni"):
-    starts[alias] = time.time()
+def start_in_turn(name, c_alias, i_alias):
+    """C's broadcast, then I's once I lists C's masternode. A node lists the
+    masternodes in the order it took them, and a controller takes its own
+    broadcast before relaying it; sent one right after the other, whether C's
+    relay reaches I before I's own call is a race. In turn, both nodes take C's
+    first. Returns when each was sent"""
+    sent = {c_alias: time.time()}
+    c_out = C.call("broadcaststartmasternode", mn[c_alias]["signed"])
+    t0 = time.time()
+    listed = wait_for(lambda: bool(I.rpc("listmasternodes", mn[c_alias]["txhash"])), 60, step=0.5)
+    info(f"{c_alias} listed on {I.name} before {i_alias} was sent: {listed} after {round(time.time() - t0)} s")
+    sent[i_alias] = time.time()
+    i_out = I.call("broadcaststartmasternode", mn[i_alias]["signed"])
+    compare(name, c_out, i_out)
+    return sent
+
+
+starts = start_in_turn("broadcaststartmasternode <signed broadcast> from the controller", "mnc", "mni")
 times = {}
 for alias in ("mnc", "mni"):
     for observer in (C, I):
@@ -493,15 +505,14 @@ row("each controller's own masternode ENABLED on the network (seen on C)", times
 
 
 def views(label):
-    # Each node lists masternodes in the order it took them, its own controller's
-    # first (RelayParsedMasternodeBroadcast takes it before relaying), so the
-    # lists are compared in txhash order and the first entry on its own
+    # Each node lists masternodes in the order it took them, and both took C's
+    # first (start_in_turn), so the lists are compared in txhash order and the
+    # first entry on its own
     lists = [C.call("listmasternodes"), I.call("listmasternodes")]
     compare(f"{label}: listmasternodes (in txhash order)", *lists, mask=sorted_list)
-    own = {C.name: {mn[a]["txhash"] for a in mn if mn[a]["controller"] is C},
-           I.name: {mn[a]["txhash"] for a in mn if mn[a]["controller"] is I}}
-    first = [o[1][0].get("txhash") in own[n.name] if o[0] == "ok" and o[1] else None for o, n in zip(lists, (C, I))]
-    row(f"{label}: the controller's own masternode listed first", first[0], first[1], first[0] == first[1])
+    took_first = {mn[a]["txhash"] for a in mn if mn[a]["controller"] is C}
+    first = [o[1][0].get("txhash") in took_first if o[0] == "ok" and o[1] else None for o in lists]
+    row(f"{label}: the masternode taken first (C's) listed first", first[0], first[1], first[0] == first[1])
     both(f"{label}: getmasternodecount", "getmasternodecount", mask=count_view)
     compare_mnsync(f"{label}: mnsync status", C.call("mnsync", "status"), I.call("mnsync", "status"))
     both(f"{label}: getmasternodestatus (a controller)", "getmasternodestatus")
@@ -534,9 +545,7 @@ for alias in ("mnc2", "mni2"):
 mesh()
 need(synced(secs=180), "the second masternode nodes did not reach the tip")
 wait_for(lambda: all(sync_state(n) == 999 for n in (M3, M4)), 240, step=2)
-compare("silver: broadcaststartmasternode from the controller",
-        C.call("broadcaststartmasternode", mn["mnc2"]["signed"]),
-        I.call("broadcaststartmasternode", mn["mni2"]["signed"]))
+start_in_turn("silver: broadcaststartmasternode from the controller", "mnc2", "mni2")
 for alias in ("mnc2", "mni2"):
     wait_for(lambda: enabled_on(C, alias) and enabled_on(I, alias), 120)
 views("four masternodes")
@@ -649,7 +658,12 @@ if PAYMENTS:
     # it minted; the votes still flow and are compared after each block
     views_by = {C.name: [], I.name: []}
     paid = []  # (height, miner, masternode payments) of each block
-    for k in range(20):
+    paid_owners = lambda: {mn[a]["controller"].name for _, _, p in paid for a, _ in p}
+    # With MN_LIFE_REWARDS, on until a block paid each controller's masternode
+    # (divid picks the payee: in one run it paid one masternode 10 times)
+    for k in range(40 if REWARDS else 20):
+        if k >= 20 and paid_owners() >= {C.name, I.name}:
+            break
         miner = (C, I)[k % 2]
         height = miner.rpc("getblockcount") + 1
         out = miner.call("setgenerate", 1)
@@ -665,6 +679,9 @@ if PAYMENTS:
         wait_for(same, 30)
         compare(f"payments: getmasternodewinners 20 after height {height}",
                 C.call("getmasternodewinners", "20"), I.call("getmasternodewinners", "20"))
+    if REWARDS and not paid_owners() >= {C.name, I.name}:
+        info("masternodes on divid-C: " + json.dumps(
+            [{k: e.get(k) for k in ("txhash", "status", "lastpaid", "activetime")} for e in C.rpc("listmasternodes")]))
     voted = C.call("getmasternodewinners", "20")
     row("payments: divid's winners carry votes", any(
         (w["winner"].get("nVotes", 0) if isinstance(w["winner"], dict) else 1) for w in voted[1])

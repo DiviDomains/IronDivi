@@ -5,7 +5,7 @@
 #
 #   run.sh <irondivid-bin-dir> <core-bin-dir> <port-base> [root]
 #
-# <port-base> .. <port-base>+15 are used on 127.0.0.2. A run takes about 50
+# <port-base> .. <port-base>+15 are used on 127.0.0.2. A run takes about 30
 # minutes and is stopped after 60. Exit code = FAILs (255: usage error,
 # interrupted, or over the time limit).
 set -u

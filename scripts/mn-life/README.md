@@ -61,8 +61,8 @@ divid, but their masternodes were set up and started by different controllers.
 | before | `mnsync status`, `listmasternodes`, `getmasternodecount`, `getmasternodestatus` (not a masternode), `listmnbroadcasts` |
 | copper set-up, on C and on I | `allocatefunds masternode <alias> copper` (by shape) and the collateral amount (100 DIVI on regtest, `divi/src/chainparams.cpp:147-148`); 16 blocks for the 15 confirmations a broadcast needs (`divi/src/masternode.h:16`); `setupmasternode` (by shape; `protocol_version`; `config_line` is alias, the masternode node's address, key, txhash, index); `signmnbroadcast` (by shape); `importmnbroadcast` twice; `listmnbroadcasts` (by shape, and the entry's txhash and outidx); `startmasternode <alias>` and `<alias> true` on the controller |
 | masternode nodes | M1 and M2 start with `masternode=<alias>` and the controller's config line; `mnsync status` once the divid nodes finished their sync; `getmasternodestatus` on M1 and M2 before the start |
-| start | `broadcaststartmasternode <signed broadcast>` from each controller; each masternode ENABLED on C and on I within 120 s (the seconds it took are printed) |
-| views after each step below | `listmasternodes` (in txhash order); whether the controller's own masternode is listed first; `getmasternodecount`; `mnsync status`; `getmasternodestatus` on a controller and on M1 and M2; `getmasternodewinners 5` |
+| start | `broadcaststartmasternode <signed broadcast>` from C, then from I once I lists C's masternode; each masternode ENABLED on C and on I within 120 s (the seconds it took are printed) |
+| views after each step below | `listmasternodes` (in txhash order); whether C's masternode, which both nodes took first, is listed first; `getmasternodecount`; `mnsync status`; `getmasternodestatus` on a controller and on M1 and M2; `getmasternodewinners 5` |
 | silver | the same set-up and start for a second masternode of each controller (300 DIVI), on M3 and M4 |
 | restarts | C and I stopped and started; then M1 and M2 |
 | collateral spent | each controller spends its copper collateral; its status on C and on I 1, 2 and 6 blocks later |
@@ -82,6 +82,9 @@ How a row compares:
   masternode's own.
 
 Timing:
+- A node lists the masternodes in the order it took them, and a controller takes its own broadcast before it relays
+  it. Sent one right after the other, whether C's relay reaches I before I's own call is a race. So C's broadcast is
+  sent first and I's only once I lists C's masternode: both nodes take C's first.
 - divid shows the state of its last check in `listmasternodes`. It checks every masternode once a minute and on
   `getmasternodecount`, each at most every 5 s (`divi/src/MasternodeModule.cpp:524-529`, `divi/src/masternode.h:22`,
   `divi/src/masternodeman.cpp:152-180`).
