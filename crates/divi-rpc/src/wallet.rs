@@ -1968,31 +1968,30 @@ impl WalletRpc {
         let (mut tx, prev_scripts) = builder.build();
 
         // Every coin type the wallet spends (P2PKH, P2PK, multisig, P2SH with
-        // a stored redeem script), as Core's SignSignature (wallet.cpp:1609-1624)
+        // a stored redeem script), as Core's SignSignature (wallet.cpp:1609-1624).
+        // An input it cannot sign fails the send as Divi Core's CreateTransaction
+        // does, -4 "Signing transaction failed" (wallet.cpp:1805-1809,
+        // rpcwallet.cpp:796-800)
         let signer = TransactionSigner::new(wallet.keystore());
         let redeem_script = |hash: &Hash160| wallet.get_script(hash);
-        let mut signed_count = 0;
+        let signing_failed = || RpcError::new(codes::WALLET_ERROR, "Signing transaction failed");
         for (i, script) in prev_scripts.iter().enumerate() {
-            let verified = signer
-                .sign_and_merge_input(&mut tx, i, script, &redeem_script)
-                .map_err(|e| {
-                    RpcError::new(
-                        codes::WALLET_ERROR,
-                        format!("Failed to sign transaction: {}", e),
-                    )
-                })?;
-            signed_count += usize::from(verified);
-        }
-        if signed_count != plan.inputs.len() {
-            return Err(RpcError::new(
-                codes::WALLET_ERROR,
-                format!(
-                    "Only signed {} of {} inputs",
-                    signed_count,
-                    plan.inputs.len()
-                ),
-            )
-            .into());
+            match signer.sign_and_merge_input(&mut tx, i, script, &redeem_script) {
+                Ok(true) => {}
+                Ok(false) => {
+                    debug!("Send input {} of {} not signed", i, plan.inputs.len());
+                    return Err(signing_failed().into());
+                }
+                Err(e) => {
+                    debug!(
+                        "Send input {} of {} not signed: {}",
+                        i,
+                        plan.inputs.len(),
+                        e
+                    );
+                    return Err(signing_failed().into());
+                }
+            }
         }
         check_signed(&tx, plan.fee, self.fee_policy()).map_err(send_error)?;
         wallet.note_committed(&tx.txid());
