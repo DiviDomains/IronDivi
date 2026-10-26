@@ -268,11 +268,12 @@ fn onion_network_in_getnetworkinfo() {
     }
 }
 
-/// A -onion that does not resolve stops the start (net.cpp:1790-1794)
+/// A -onion that does not resolve stops the start (net.cpp:1790-1794). With
+/// -dns=0 the name is refused without a lookup, so the test asks no resolver
 #[test]
 fn bad_onion_stops_the_start() {
     let dir = tempfile::tempdir().unwrap();
-    match start(dir.path(), &["-onion=notahost.invalid"]) {
+    match start(dir.path(), &["-onion=notahost.invalid", "-dns=0"]) {
         Started::Exited(code, text) => {
             assert_ne!(code, 0);
             assert!(
