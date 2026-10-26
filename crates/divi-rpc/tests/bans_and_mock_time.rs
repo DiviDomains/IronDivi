@@ -15,9 +15,7 @@
 //! ban's end, and the newest block time the chain takes. The clock is one for
 //! the process, so the tests take a lock and set it back to 0.
 
-use divi_network::{
-    regtest_peer_manager, NetworkMessage, PeerManager, VersionMessage, REGTEST_MAGIC,
-};
+use divi_network::{NetworkMessage, PeerManager, PeerManagerConfig, VersionMessage, REGTEST_MAGIC};
 use divi_primitives::ChainMode;
 use divi_rpc::{Params, Request, RequestId, RpcServer};
 use divi_storage::{Chain, ChainDatabase, ChainParams, NetworkType};
@@ -55,13 +53,21 @@ fn call(server: &RpcServer, method: &str, params: Vec<Value>) -> Result<Value, (
     }
 }
 
-/// A PeerManager listening on a free loopback port
+/// A regtest PeerManager listening on a free loopback port, with no peers of
+/// its own: no seeds and no static peers, so it dials nothing off the host
 async fn listening() -> (Arc<PeerManager>, SocketAddr) {
     let addr = TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
         .unwrap();
-    let pm = regtest_peer_manager(Some(addr));
+    let pm = PeerManager::new(PeerManagerConfig {
+        magic: REGTEST_MAGIC,
+        dns_seeds: vec![],
+        static_peers: vec![],
+        dns_seed: false,
+        listen_addr: Some(addr),
+        ..Default::default()
+    });
     tokio::spawn(pm.clone().start());
     let deadline = Instant::now() + Duration::from_secs(10);
     while TcpStream::connect(addr).is_err() {
