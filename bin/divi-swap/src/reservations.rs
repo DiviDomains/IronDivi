@@ -22,11 +22,11 @@
 //! the taker never asks for its own lock's confirmations, so [`release_finished`] releases
 //! the lock of every finished taker swap instead.
 
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use divi_swap::{Chain, ChainBackend, InputReservations, Store, Txid};
+use divi_swap::{Chain, ChainBackend, InputReservations, Store};
 
 /// Open the swap database at `db` and its reservation table. The store opens first, so a
 /// new file is created at mode 0600 before SQLite touches it (it holds the preimages).
@@ -37,79 +37,32 @@ pub fn open(db: &Path) -> Result<(Store, InputReservations)> {
     Ok((store, res))
 }
 
-/// Release the reservations held by the taker-leg funding tx of every terminal
-/// ([`divi_swap::TakerState::is_terminal`]) taker swap in `store`; returns how many inputs
-/// were released. A finished swap's lock is on chain (its refund or the maker's claim spent
-/// it), so its inputs can never be selected again anyway. Only rows still held are touched:
-/// running it again, or after a restart, releases nothing twice, and a swap that is not
-/// finished keeps its reservation however often it runs.
+/// Release the reservations held by the lock of every terminal swap in `store`, on every
+/// chain ([`InputReservations::release_finished_swaps`]: for a taker, its taker-leg funding
+/// tx of each [`divi_swap::TakerState::is_terminal`] swap); returns how many inputs were
+/// released. Running it again, or after a restart, releases nothing twice.
 pub fn release_finished(store: &Store, res: &InputReservations) -> Result<usize> {
-    let held: HashSet<_> = res
-        .list_all()?
-        .into_iter()
-        .map(|r| (r.chain, r.reserved_by))
-        .collect();
-    if held.is_empty() {
-        return Ok(0);
-    }
+    let chains: BTreeSet<Chain> = res.list_all()?.into_iter().map(|r| r.chain).collect();
     let mut released = 0;
-    for s in store.list_taker_swaps()? {
-        let Some(f) = s.taker_leg_funding.as_ref() else {
-            continue;
-        };
-        let lock = (s.quote.taker_chain(), f.tx.txid);
-        if s.state.is_terminal() && held.contains(&lock) {
-            released += res.release_tx(lock.0, &lock.1)?;
-        }
+    for chain in chains {
+        released += res.release_finished_swaps(store, chain)?;
     }
     Ok(released)
 }
 
-/// The transactions holding a reservation on `chain`.
-fn holders(res: &InputReservations, chain: Chain) -> Result<HashSet<Txid>> {
-    Ok(res
-        .list_all()?
-        .into_iter()
-        .filter(|r| r.chain == chain)
-        .map(|r| r.reserved_by)
-        .collect())
-}
-
-/// [`InputReservations::release_expired_swaps`] on the DIVI backend `divi`, then the wallet
-/// booking of each DIVI-leg lock it released: the DIVI wallet file tombstoned that lock's
-/// inputs when it was broadcast, and [`ChainBackend::release_dead_lock`] gives them back
-/// once the node shows them unspent (no proof, nothing given back: the coins stay out of the
-/// wallet file, never spent twice). Returns how many inputs the table released.
+/// [`InputReservations::release_expired_swaps_and_bookings`] on the DIVI backend `divi`: the
+/// expiry sweep, then the wallet booking of each DIVI lock it released (the DIVI wallet file
+/// tombstoned that lock's inputs when it was broadcast, and gets them back only once the node
+/// shows them unspent). Returns how many inputs the table released.
 pub async fn release_expired_divi(
     store: &Store,
     res: &InputReservations,
     divi: &dyn ChainBackend,
     now: u32,
 ) -> Result<usize> {
-    let before = holders(res, Chain::Divi)?;
-    if before.is_empty() {
-        return Ok(0);
-    }
-    let released = res.release_expired_swaps(store, divi, now).await?;
-    if released == 0 {
-        return Ok(0);
-    }
-    let after = holders(res, Chain::Divi)?;
-    for s in store.list_taker_swaps()? {
-        let Some(f) = s.taker_leg_funding.as_ref() else {
-            continue;
-        };
-        let txid = f.tx.txid;
-        if s.quote.taker_chain() != Chain::Divi || !before.contains(&txid) || after.contains(&txid)
-        {
-            continue;
-        }
-        match divi.release_dead_lock(&f.tx).await {
-            Ok(_) => {}
-            Err(e) => tracing::warn!(%txid, error = %e, "dropped DIVI lock: wallet booking kept"),
-        }
-    }
-    Ok(released)
+    Ok(res
+        .release_expired_swaps_and_bookings(store, divi, now)
+        .await?)
 }
 
 #[cfg(test)]
@@ -118,6 +71,7 @@ mod tests {
     use divi_swap::api::{Direction, Quote};
     use divi_swap::store::TakerRecord;
     use divi_swap::{Amount, Chain, Funding, HtlcParams, Outpoint, SignedTx, TakerState, Txid};
+    use std::collections::HashSet;
 
     fn op(n: u8) -> Outpoint {
         Outpoint {
