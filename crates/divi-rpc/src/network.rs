@@ -231,8 +231,9 @@ impl NetworkRpc {
             })?;
 
         match command {
+            // The node is kept and matched as written (net.cpp:1183-1206)
             "add" => {
-                if !peer_manager.add_node(addr) {
+                if !peer_manager.add_node_as(addr_str.to_string(), addr) {
                     return Err(RpcError::new(
                         codes::CLIENT_NODE_ALREADY_ADDED,
                         "Error: Node already added",
@@ -241,7 +242,7 @@ impl NetworkRpc {
                 }
             }
             "remove" => {
-                if !peer_manager.remove_added_node(&addr) {
+                if !peer_manager.remove_added_node_as(addr_str) {
                     return Err(RpcError::new(
                         codes::CLIENT_NODE_NOT_ADDED,
                         "Error: Node has not been added.",
@@ -277,16 +278,9 @@ impl NetworkRpc {
             .into());
         }
         let dns = params.get(0).and_then(|v| v.as_bool()).unwrap_or(false);
-        // The node as addnode takes it: without a port, the network's
-        let filter_addr: Option<std::net::SocketAddr> = params.get_str(1).and_then(|s| {
-            s.parse().ok().or_else(|| {
-                s.parse::<IpAddr>()
-                    .ok()
-                    .map(|ip| std::net::SocketAddr::new(ip, peer_manager.default_port()))
-            })
-        });
-
-        if params.get_str(1).is_some() && !added_nodes.iter().any(|n| filter_addr == Some(n.addr)) {
+        // The node as it was added, compared as text (rpcnet.cpp:225-233)
+        let filter = params.get_str(1);
+        if filter.is_some() && !added_nodes.iter().any(|n| Some(n.name.as_str()) == filter) {
             return Err(RpcError::new(
                 codes::CLIENT_NODE_NOT_ADDED,
                 "Error: Node has not been added.",
@@ -299,13 +293,13 @@ impl NetworkRpc {
         // (rpcnet.cpp:220-284)
         let result: Vec<_> = added_nodes
             .iter()
-            .filter(|n| filter_addr.is_none() || filter_addr == Some(n.addr))
+            .filter(|n| filter.is_none_or(|f| n.name == f))
             .map(|node| {
                 if !dns {
-                    return serde_json::json!({ "addednode": node.addr.to_string() });
+                    return serde_json::json!({ "addednode": node.name });
                 }
                 serde_json::json!({
-                    "addednode": node.addr.to_string(),
+                    "addednode": node.name,
                     "connected": node.connected,
                     "addresses": [{
                         "address": node.addr.to_string(),
@@ -1017,12 +1011,21 @@ mod tests {
             pm.get_added_node_info()[0].addr,
             "192.0.2.1:51476".parse().unwrap()
         );
+        assert_eq!(pm.get_added_node_info()[0].name, "192.0.2.1");
         assert_eq!(
-            rpc_err(call(vec![
-                serde_json::json!("192.0.2.1:51476"),
-                add.clone()
-            ])),
+            rpc_err(call(vec![node.clone(), add.clone()])),
             (-23, "Error: Node already added".to_string())
+        );
+        // Another text of the same address is another entry, as divid
+        // compares the text (net.cpp:1183-1206)
+        let with_port = serde_json::json!("192.0.2.1:51476");
+        assert_eq!(
+            call(vec![with_port.clone(), add.clone()]).unwrap(),
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            call(vec![with_port, remove.clone()]).unwrap(),
+            serde_json::Value::Null
         );
         assert_eq!(
             call(vec![node.clone(), remove.clone()]).unwrap(),
@@ -1065,13 +1068,13 @@ mod tests {
             "addresses": [{ "address": "192.0.2.1:51476", "connected": "false" }],
         }]);
         assert_eq!(info(vec![serde_json::json!(false)]).unwrap(), plain);
+        // The node is matched as written (rpcnet.cpp:225-233)
         assert_eq!(
-            info(vec![
+            rpc_err(info(vec![
                 serde_json::json!(false),
                 serde_json::json!("192.0.2.1")
-            ])
-            .unwrap(),
-            plain
+            ])),
+            (-24, "Error: Node has not been added.".to_string())
         );
         assert_eq!(info(vec![serde_json::json!(true)]).unwrap(), with_dns);
         assert_eq!(
@@ -1089,6 +1092,21 @@ mod tests {
             ])),
             (-24, "Error: Node has not been added.".to_string())
         );
+
+        // An address added without a port is listed as written, and looked
+        // up with the network's port (rpcnet.cpp:238-246)
+        rpc.add_node(&Params::Array(vec![
+            serde_json::json!("192.0.2.3"),
+            serde_json::json!("add"),
+        ]))
+        .unwrap();
+        let three = info(vec![
+            serde_json::json!(true),
+            serde_json::json!("192.0.2.3"),
+        ])
+        .unwrap();
+        assert_eq!(three[0]["addednode"], "192.0.2.3");
+        assert_eq!(three[0]["addresses"][0]["address"], "192.0.2.3:51476");
     }
 
     #[test]

@@ -990,7 +990,7 @@ impl Node {
                 });
             match addr {
                 Some(addr) => {
-                    peer_manager.add_node(addr);
+                    peer_manager.add_node_as(node.clone(), addr);
                 }
                 None => {
                     tracing::debug!("-addnode {} is not an address; dialled by name only", node)
