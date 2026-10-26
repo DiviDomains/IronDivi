@@ -37,6 +37,8 @@ struct Node {
     list: Arc<MasternodeList>,
     votes: Arc<MasternodeVotes>,
     sent: Arc<Mutex<Vec<Transaction>>>,
+    /// The masternode key of the last set_up, from its config line (WIF)
+    mn_key: Mutex<Option<String>>,
     dir: tempfile::TempDir,
 }
 
@@ -79,6 +81,7 @@ fn node_with(params: ChainParams) -> Node {
         list,
         votes,
         sent,
+        mn_key: Mutex::new(None),
         dir,
     }
 }
@@ -191,10 +194,10 @@ fn set_up(n: &Node, alias: &str, confirmations: usize) -> (String, u32, String, 
     )
 }
 
-/// The masternode key of the last set_up, from its config line (WIF)
-fn n_key(_n: &Node) -> &'static Mutex<Option<String>> {
-    static KEY: Mutex<Option<String>> = parking_lot::const_mutex(None);
-    &KEY
+/// The masternode key of the node's last set_up; each node keeps its own,
+/// as the tests run side by side
+fn n_key(n: &Node) -> &Mutex<Option<String>> {
+    &n.mn_key
 }
 
 fn funded() -> Node {
