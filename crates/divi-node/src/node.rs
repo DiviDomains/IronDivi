@@ -1071,7 +1071,6 @@ impl Node {
         // The network's masternodes, kept in the datadir as Divi Core keeps
         // mncache.dat, and their payment votes
         let masternode_list = Arc::new(divi_rpc::mn_list::MasternodeList::new());
-        masternode_list.set_path(config.data_dir.join("masternodes.list"));
         let masternode_votes = Arc::new(divi_rpc::mn_votes::MasternodeVotes::new());
         // The masternode sync, with the requests kept from the last run
         let masternode_sync = divi_masternode::mnsync::shared(
@@ -1107,6 +1106,13 @@ impl Node {
                 }
             }
         }
+        // mncache.dat next (MasternodeModule.cpp:262-266), with the sync's
+        // asks for the list in it
+        masternode_list.follow_sync(Arc::clone(&masternode_sync));
+        masternode_list.set_file(
+            config.data_dir.join(divi_rpc::mn_list::MNCACHE_FILE),
+            config.network.magic,
+        );
         // Votes are checked against the sync's stage (masternode-payments.cpp:241-245, :320)
         masternode_votes.follow_sync(Arc::clone(&masternode_sync));
         // The payment votes of the last run, read when there are masternodes,

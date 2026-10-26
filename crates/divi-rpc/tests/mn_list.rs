@@ -56,7 +56,7 @@ fn node() -> Node {
     ));
     let server = RpcServer::with_wallet(chain.clone(), wallet.clone());
     let list = Arc::new(MasternodeList::new());
-    list.set_path(dir.path().join("masternodes.list"));
+    list.set_file(dir.path().join("mncache.dat"), REGTEST_MAGIC);
     server.set_masternode_list(list.clone());
     let votes = Arc::new(MasternodeVotes::new());
     server.set_masternode_votes(votes.clone());
@@ -242,9 +242,12 @@ fn started_masternode_is_listed_as_divid_lists_it() {
     ] {
         assert_eq!(count[field], json!(value), "{field}: {count}");
     }
-    // The list is kept in the datadir and read back, as mncache.dat
+    // The list is kept in the datadir in divid's mncache.dat and read back
+    let file = std::fs::read(n.dir.path().join("mncache.dat")).unwrap();
+    assert_eq!(&file[1..21], b"magicMasternodeCache");
+    assert_eq!(file[21..25], REGTEST_MAGIC);
     let again = MasternodeList::new();
-    again.set_path(n.dir.path().join("masternodes.list"));
+    again.set_file(n.dir.path().join("mncache.dat"), REGTEST_MAGIC);
     assert_eq!(again.list_json(&n.chain, None), listed);
 }
 

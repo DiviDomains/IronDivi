@@ -259,12 +259,18 @@ impl CppPing {
 
     /// Parse a ping (`mnp`); the whole input must be consumed
     pub fn decode_bytes(data: &[u8]) -> Result<Self, WireError> {
-        let mut r = Reader { data, pos: 0 };
-        let ping = Self::decode(&mut r)?;
-        if r.pos != data.len() {
+        let (ping, used) = Self::decode_from(data)?;
+        if used != data.len() {
             return Err(WireError::TrailingData);
         }
         Ok(ping)
+    }
+
+    /// Parse a ping at the start of `data`; the bytes it took
+    pub fn decode_from(data: &[u8]) -> Result<(Self, usize), WireError> {
+        let mut r = Reader { data, pos: 0 };
+        let ping = Self::decode(&mut r)?;
+        Ok((ping, r.pos))
     }
 
     /// C++ `CMasternodePing::getMessageToSign`: `vin.ToString() + blockHash.ToString() + sigTime`
@@ -330,8 +336,58 @@ impl CppBroadcast {
 
     /// Parse a broadcast; the whole input must be consumed
     pub fn decode(data: &[u8]) -> Result<Self, WireError> {
+        let (mnb, used) = Self::decode_from(data)?;
+        if used != data.len() {
+            return Err(WireError::TrailingData);
+        }
+        Ok(mnb)
+    }
+
+    /// Parse a broadcast at the start of `data`; the bytes it took
+    pub fn decode_from(data: &[u8]) -> Result<(Self, usize), WireError> {
         let mut r = Reader { data, pos: 0 };
-        let vin = CppTxIn::decode(&mut r)?;
+        let mnb = Self::decode_fields(&mut r, false)?.0;
+        Ok((mnb, r.pos))
+    }
+
+    /// CMasternode as Divi Core serialises it for mncache.dat
+    /// (masternode.h:104-126): the broadcast's fields with the state Check
+    /// gave it after the protocol version, and after the last ping the
+    /// collateral block cache (always null: nothing sets it,
+    /// masternode.cpp:51, :91), allowFreeTx (always true, :52, :92) and the
+    /// two scanning error counts (always 0, :55-56, :95-96)
+    pub fn encode_disk(&self, active_state: i32) -> Vec<u8> {
+        let mut out = Vec::with_capacity(450);
+        self.vin.encode(&mut out);
+        out.extend_from_slice(&self.ip);
+        out.extend_from_slice(&self.port.to_be_bytes());
+        write_varbytes(&mut out, &self.pubkey_collateral);
+        write_varbytes(&mut out, &self.pubkey_masternode);
+        write_varbytes(&mut out, &self.signature);
+        out.extend_from_slice(&self.sig_time.to_le_bytes());
+        out.extend_from_slice(&self.protocol_version.to_le_bytes());
+        out.extend_from_slice(&active_state.to_le_bytes());
+        self.last_ping.encode(&mut out);
+        out.extend_from_slice(&[0u8; 32]);
+        out.push(1);
+        out.extend_from_slice(&0i32.to_le_bytes());
+        out.extend_from_slice(&0i32.to_le_bytes());
+        out.extend_from_slice(&self.tier.to_le_bytes());
+        out
+    }
+
+    /// Parse `encode_disk`'s form at the start of `data`: the broadcast, its
+    /// state and the bytes it took. The cached fields are read and left, as
+    /// irondivid has nothing to keep them in
+    pub fn decode_disk_from(data: &[u8]) -> Result<(Self, i32, usize), WireError> {
+        let mut r = Reader { data, pos: 0 };
+        let (mnb, state) = Self::decode_fields(&mut r, true)?;
+        Ok((mnb, state, r.pos))
+    }
+
+    /// The fields in either form; the disk form's state, or 0
+    fn decode_fields(r: &mut Reader<'_>, disk: bool) -> Result<(Self, i32), WireError> {
+        let vin = CppTxIn::decode(r)?;
         let ip: [u8; 16] = r.take(16)?.try_into().unwrap();
         let port = u16::from_be_bytes(r.take(2)?.try_into().unwrap());
         let pubkey_collateral = r.varbytes()?;
@@ -339,23 +395,29 @@ impl CppBroadcast {
         let signature = r.varbytes()?;
         let sig_time = r.i64_le()?;
         let protocol_version = r.i32_le()?;
-        let last_ping = CppPing::decode(&mut r)?;
-        let tier = r.i32_le()?;
-        if r.pos != data.len() {
-            return Err(WireError::TrailingData);
+        let state = if disk { r.i32_le()? } else { 0 };
+        let last_ping = CppPing::decode(r)?;
+        if disk {
+            // collateralBlock, allowFreeTx, nScanningErrorCount,
+            // nLastScanningErrorBlockHeight
+            r.take(32 + 1 + 4 + 4)?;
         }
-        Ok(Self {
-            vin,
-            ip,
-            port,
-            pubkey_collateral,
-            pubkey_masternode,
-            signature,
-            sig_time,
-            protocol_version,
-            last_ping,
-            tier,
-        })
+        let tier = r.i32_le()?;
+        Ok((
+            Self {
+                vin,
+                ip,
+                port,
+                pubkey_collateral,
+                pubkey_masternode,
+                signature,
+                sig_time,
+                protocol_version,
+                last_ping,
+                tier,
+            },
+            state,
+        ))
     }
 
     /// Set the address from an IPv4/IPv6 address and port

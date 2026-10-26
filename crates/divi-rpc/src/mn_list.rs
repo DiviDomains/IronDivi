@@ -13,18 +13,21 @@
 //! broadcasts (`mnb`) in Core's wire format that pass its checks, in the order
 //! they arrived (CMasternodeMan's vector), each with its last ping (`mnp`).
 //! `listmasternodes` and `getmasternodecount` read this list. It is saved in
-//! the datadir as Core saves mncache.dat, so it is there after a restart.
+//! the datadir in Core's mncache.dat, so it is there after a restart.
 
+use crate::flat_file::{self, cmp_u256, write_compact_size, Header, Reader};
 use crate::mn_broadcast::{find_collateral, ping_signature_valid, tier_for_collateral};
 use divi_masternode::cpp_wire::{CppBroadcast, CppPing, CppTxIn};
+use divi_masternode::mnsync::SharedMasternodeSync;
 use divi_primitives::hash::{Hash160, Hash256};
 use divi_primitives::transaction::OutPoint;
 use divi_storage::{Chain, NetworkType};
 use divi_wallet::address::Address;
 use divi_wallet::Network;
 use parking_lot::{Mutex, RwLock};
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::{BTreeMap, HashMap};
+use std::net::{IpAddr, Ipv6Addr};
+use std::path::{Path, PathBuf};
 
 /// MASTERNODE_MIN_CONFIRMATIONS (masternode.h:16)
 const MIN_CONFIRMATIONS: u32 = 15;
@@ -77,6 +80,111 @@ impl NetworkMasternode {
     pub fn is_enabled(&self, now: i64) -> bool {
         self.status(now) == "ENABLED"
     }
+
+    /// The state as CMasternode keeps it (masternode.h:44-49): ENABLED 0,
+    /// EXPIRED 1, REMOVE 2, VIN_SPENT 3
+    fn state(&self, now: i64) -> i32 {
+        match self.status(now) {
+            "ENABLED" => 0,
+            "EXPIRED" => 1,
+            "REMOVE" => 2,
+            _ => 3,
+        }
+    }
+}
+
+/// The file Divi Core keeps its masternode list in, and its magic message
+/// (MasternodeModule.cpp:262-266, :289-290)
+pub const MNCACHE_FILE: &str = "mncache.dat";
+const MNCACHE_MAGIC: &str = "magicMasternodeCache";
+
+/// What reading mncache.dat came to, as CFlatDB::Read classes it
+/// (flat-database.h:178-216, flat-database.cpp:18-60)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MncacheFile {
+    /// Read: this many masternodes
+    Loaded(usize),
+    /// No file: one is written at the next stop
+    Missing,
+    /// The checksum and the magic are right but the data does not parse
+    /// (IncorrectFormat): taken as empty, and the file is written anew
+    BadFormat,
+    /// Any other fault (the checksum, the magic message, the network's magic
+    /// number): divid refuses to start and will not overwrite the file
+    Invalid(&'static str),
+}
+
+/// mncache.dat's contents
+struct Cache {
+    entries: Vec<NetworkMasternode>,
+    asked_us: HashMap<String, i64>,
+    we_asked: HashMap<String, i64>,
+    asked_entries: HashMap<([u8; 32], u32), i64>,
+    broadcasts: HashMap<[u8; 32], CppBroadcast>,
+    pings: HashMap<[u8; 32], CppPing>,
+}
+
+/// Read `file_data`'s form; None where it does not parse. A key seen twice
+/// keeps its first value (std::map)
+fn parse_cache(data: &[u8]) -> Option<Cache> {
+    let mut r = Reader::new(data);
+    let mut entries = Vec::new();
+    for _ in 0..r.compact_size()? {
+        let (mnb, state, used) = CppBroadcast::decode_disk_from(r.rest()).ok()?;
+        r.take(used)?;
+        entries.push(NetworkMasternode {
+            mnb,
+            vin_spent: state == 3,
+        });
+    }
+    let mut asks = [HashMap::new(), HashMap::new()];
+    for map in asks.iter_mut() {
+        for _ in 0..r.compact_size()? {
+            let addr: [u8; 16] = r.array()?;
+            let until = r.i64()?;
+            let ip = IpAddr::V6(Ipv6Addr::from(addr)).to_canonical().to_string();
+            map.entry(ip).or_insert(until);
+        }
+    }
+    let [asked_us, we_asked] = asks;
+    let mut asked_entries = HashMap::new();
+    for _ in 0..r.compact_size()? {
+        let key = (r.array()?, r.u32()?);
+        let until = r.i64()?;
+        asked_entries.entry(key).or_insert(until);
+    }
+    // nDsqCount
+    r.i64()?;
+    let mut broadcasts = HashMap::new();
+    for _ in 0..r.compact_size()? {
+        let hash: [u8; 32] = r.array()?;
+        let (mnb, used) = CppBroadcast::decode_from(r.rest()).ok()?;
+        r.take(used)?;
+        broadcasts.entry(hash).or_insert(mnb);
+    }
+    let mut pings = HashMap::new();
+    for _ in 0..r.compact_size()? {
+        let hash: [u8; 32] = r.array()?;
+        let (ping, used) = CppPing::decode_from(r.rest()).ok()?;
+        r.take(used)?;
+        pings.entry(hash).or_insert(ping);
+    }
+    Some(Cache {
+        entries,
+        asked_us,
+        we_asked,
+        asked_entries,
+        broadcasts,
+        pings,
+    })
+}
+
+/// A peer's IP as CNetAddr holds it: 16 bytes, an IPv4 address IPv4-mapped
+fn net_addr_of(ip: &str) -> Option<[u8; 16]> {
+    Some(match ip.parse::<IpAddr>().ok()? {
+        IpAddr::V4(v4) => v4.to_ipv6_mapped().octets(),
+        IpAddr::V6(v6) => v6.octets(),
+    })
 }
 
 /// Why a masternode message from a peer was not taken, and the misbehaviour
@@ -135,7 +243,10 @@ pub const INV_PING: u32 = 15;
 #[derive(Default)]
 pub struct MasternodeList {
     entries: RwLock<Vec<NetworkMasternode>>,
-    path: RwLock<Option<PathBuf>>,
+    /// mncache.dat and the network's magic number it is written with
+    file: RwLock<Option<(PathBuf, [u8; 4])>>,
+    /// The masternode sync, whose list asks mncache.dat keeps too
+    sync: RwLock<Option<SharedMasternodeSync>>,
     /// The broadcasts and pings taken, by hash, which a peer may ask for
     /// (mapSeenMasternodeBroadcast, mapSeenMasternodePing)
     seen_broadcasts: RwLock<HashMap<[u8; 32], CppBroadcast>>,
@@ -162,61 +273,124 @@ impl MasternodeList {
         Self::default()
     }
 
-    /// Keep the list in `path` and read what is there
-    pub fn set_path(&self, path: PathBuf) {
-        if let Ok(text) = std::fs::read_to_string(&path) {
-            let mut loaded = Vec::new();
-            for line in text.lines() {
-                let mut parts = line.split_whitespace();
-                let (Some(hex), spent) = (parts.next(), parts.next()) else {
-                    continue;
-                };
-                if let Some(mnb) = hex::decode(hex)
-                    .ok()
-                    .and_then(|b| CppBroadcast::decode(&b).ok())
-                {
-                    loaded.push(NetworkMasternode {
-                        mnb,
-                        vin_spent: spent == Some("spent"),
-                    });
-                }
-            }
-            // Core keeps its seen broadcasts and pings in mncache.dat with the
-            // list (MasternodeNetworkMessageManager.h:68-78), so after a restart
-            // it still knows and serves them: each entry's broadcast and last ping
-            {
-                let mut broadcasts = self.seen_broadcasts.write();
-                let mut pings = self.seen_pings.write();
-                for e in &loaded {
-                    broadcasts.insert(e.mnb.hash(), e.mnb.clone());
-                    pings.insert(e.mnb.last_ping.hash(), e.mnb.last_ping.clone());
-                }
-            }
-            *self.entries.write() = loaded;
-        }
-        *self.path.write() = Some(path);
+    /// Follow the masternode sync, whose asks for the list are kept with it
+    pub fn follow_sync(&self, sync: SharedMasternodeSync) {
+        *self.sync.write() = Some(sync);
+    }
+
+    /// Keep the list in `path` (mncache.dat) for the network of
+    /// `network_magic`, and read what is there
+    pub fn set_file(&self, path: PathBuf, network_magic: [u8; 4]) {
+        self.load_file(&path, network_magic);
+        *self.file.write() = Some((path, network_magic));
     }
 
     fn save(&self) {
-        let Some(path) = self.path.read().clone() else {
+        let Some((path, network_magic)) = self.file.read().clone() else {
             return;
         };
-        let text: String = self
-            .entries
-            .read()
-            .iter()
-            .map(|e| {
-                format!(
-                    "{} {}\n",
-                    hex::encode(e.mnb.encode()),
-                    if e.vin_spent { "spent" } else { "ok" }
-                )
-            })
-            .collect();
-        let tmp = path.with_extension("tmp");
-        if std::fs::write(&tmp, text).is_ok() {
-            let _ = std::fs::rename(&tmp, &path);
+        let _ = self.save_file(&path, network_magic);
+    }
+
+    /// Write the list to `path` as Divi Core writes mncache.dat
+    pub fn save_file(&self, path: &Path, network_magic: [u8; 4]) -> std::io::Result<bool> {
+        let bytes = flat_file::bytes(MNCACHE_MAGIC, network_magic, &self.file_data(now()));
+        let tmp = path.with_extension("dat.new");
+        std::fs::write(&tmp, bytes)?;
+        std::fs::rename(&tmp, path)?;
+        Ok(true)
+    }
+
+    /// MasternodeNetworkMessageManager as Divi Core serialises it into
+    /// mncache.dat (MasternodeNetworkMessageManager.h:68-78): the masternodes
+    /// in list order, each with the state Check gives it now
+    /// (masternodeman.cpp:152-180); who asked us and whom we asked for the
+    /// list, by IP (CNetAddr: 16 bytes); the masternodes asked for, by
+    /// collateral (COutPoint); nDsqCount, always 0; and the broadcasts and
+    /// pings taken, by hash. Maps are in std::map's order
+    fn file_data(&self, now: i64) -> Vec<u8> {
+        let mut out = Vec::new();
+        let entries = self.entries.read();
+        write_compact_size(&mut out, entries.len());
+        for e in entries.iter() {
+            out.extend_from_slice(&e.mnb.encode_disk(e.state(now)));
         }
+        let (asked_us, we_asked) = match self.sync.read().as_ref() {
+            Some(sync) => {
+                let state = sync.lock();
+                let (us, we) = state.sync.list_asks();
+                (us.clone(), we.clone())
+            }
+            None => Default::default(),
+        };
+        for asks in [&asked_us, &we_asked] {
+            let by_addr: BTreeMap<[u8; 16], i64> = asks
+                .iter()
+                .filter_map(|(ip, until)| Some((net_addr_of(ip)?, *until)))
+                .collect();
+            write_compact_size(&mut out, by_addr.len());
+            for (addr, until) in by_addr {
+                out.extend_from_slice(&addr);
+                out.extend_from_slice(&until.to_le_bytes());
+            }
+        }
+        let asked = self.asked_entries.lock();
+        let mut outpoints: Vec<(&([u8; 32], u32), &i64)> = asked.iter().collect();
+        outpoints.sort_by(|a, b| cmp_u256(&a.0 .0, &b.0 .0).then(a.0 .1.cmp(&b.0 .1)));
+        write_compact_size(&mut out, outpoints.len());
+        for ((hash, n), until) in outpoints {
+            out.extend_from_slice(hash);
+            out.extend_from_slice(&n.to_le_bytes());
+            out.extend_from_slice(&until.to_le_bytes());
+        }
+        // nDsqCount
+        out.extend_from_slice(&0i64.to_le_bytes());
+        let broadcasts = self.seen_broadcasts.read();
+        let mut hashes: Vec<&[u8; 32]> = broadcasts.keys().collect();
+        hashes.sort_by(|a, b| cmp_u256(a, b));
+        write_compact_size(&mut out, hashes.len());
+        for h in hashes {
+            out.extend_from_slice(h);
+            out.extend_from_slice(&broadcasts[h].encode());
+        }
+        let pings = self.seen_pings.read();
+        let mut hashes: Vec<&[u8; 32]> = pings.keys().collect();
+        hashes.sort_by(|a, b| cmp_u256(a, b));
+        write_compact_size(&mut out, hashes.len());
+        for h in hashes {
+            out.extend_from_slice(h);
+            out.extend_from_slice(&pings[h].to_bytes());
+        }
+        out
+    }
+
+    /// Read the list back from `path`, as LoadMasternodeDataFromDisk reads
+    /// mncache.dat (MasternodeModule.cpp:262-266; CFlatDB::Read,
+    /// flat-database.h:178-216). What the file came to is returned. Data that
+    /// does not parse leaves everything empty, as Core's Clear does
+    /// (MasternodeNetworkMessageManager.cpp:209-218); a good read is kept as
+    /// it is (its CheckAndRemove does nothing, MasternodeNetworkMessageManager.h:49)
+    pub fn load_file(&self, path: &Path, network_magic: [u8; 4]) -> MncacheFile {
+        let data = match flat_file::read(path, MNCACHE_MAGIC, network_magic) {
+            Ok(data) => data,
+            Err(Header::Missing) => return MncacheFile::Missing,
+            Err(Header::BadFormat) => return MncacheFile::BadFormat,
+            Err(Header::Invalid(why)) => return MncacheFile::Invalid(why),
+        };
+        let Some(cache) = parse_cache(&data) else {
+            return MncacheFile::BadFormat;
+        };
+        let count = cache.entries.len();
+        *self.entries.write() = cache.entries;
+        *self.asked_entries.lock() = cache.asked_entries;
+        *self.seen_broadcasts.write() = cache.broadcasts;
+        *self.seen_pings.write() = cache.pings;
+        if let Some(sync) = self.sync.read().as_ref() {
+            sync.lock()
+                .sync
+                .set_list_asks(cache.asked_us, cache.we_asked);
+        }
+        MncacheFile::Loaded(count)
     }
 
     /// A broadcast from a peer: checked as Divi Core checks one
@@ -784,11 +958,6 @@ pub fn calculate_score(mnb: &CppBroadcast, scoring: &Hash256) -> [u8; 32] {
     best
 }
 
-/// Compare two little-endian 256-bit numbers
-fn cmp_u256(a: &[u8; 32], b: &[u8; 32]) -> std::cmp::Ordering {
-    a.iter().rev().cmp(b.iter().rev())
-}
-
 /// arith_uint256::GetCompact(false)
 pub fn get_compact(n: &[u8; 32]) -> u32 {
     let mut size = 32usize;
@@ -882,5 +1051,152 @@ fn tier_name(tier: i32) -> &'static str {
         3 => "PLATINUM",
         4 => "DIAMOND",
         _ => "INVALID",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use divi_masternode::cpp_wire::CppTxIn;
+    use std::sync::Arc;
+
+    const MAGIC: [u8; 4] = [0xa1, 0xcf, 0x7e, 0xac];
+
+    fn mnb(n: u8, ping_time: i64) -> CppBroadcast {
+        let vin = CppTxIn::new([n; 32], 1);
+        let mut ip = [0u8; 16];
+        ip[10..].copy_from_slice(&[0xff, 0xff, 8, 8, 4, n]);
+        CppBroadcast {
+            vin: vin.clone(),
+            ip,
+            port: 51476,
+            pubkey_collateral: vec![2; 33],
+            pubkey_masternode: vec![3; 33],
+            signature: vec![n; 65],
+            sig_time: ping_time - 100,
+            protocol_version: 70920,
+            last_ping: CppPing {
+                vin,
+                block_hash: [0x22; 32],
+                sig_time: ping_time,
+                signature: vec![0x1f; 65],
+            },
+            tier: 1,
+        }
+    }
+
+    /// A hash whose most significant byte (the last) is `top`
+    fn hash(top: u8, low: u8) -> [u8; 32] {
+        let mut h = [0u8; 32];
+        h[0] = low;
+        h[31] = top;
+        h
+    }
+
+    /// mncache.dat byte for byte as Divi Core writes MasternodeNetworkMessageManager
+    /// (MasternodeNetworkMessageManager.h:68-78, masternode.h:104-126): the
+    /// masternodes in list order with their state, the asks by CNetAddr, the
+    /// entries asked for by COutPoint, nDsqCount, the seen broadcasts and pings
+    /// by uint256, maps in std::map's order; and read back as it was
+    #[test]
+    fn mncache_dat_is_written_as_core_serialises_it() {
+        let now = super::now();
+        let list = MasternodeList::new();
+        let sync = divi_masternode::mnsync::shared(now, false);
+        list.follow_sync(Arc::clone(&sync));
+        let (a, b) = (mnb(7, now - 60), mnb(5, now - 3 * 60 * 60));
+        *list.entries.write() = vec![
+            NetworkMasternode {
+                mnb: a.clone(),
+                vin_spent: false,
+            },
+            NetworkMasternode {
+                mnb: b.clone(),
+                vin_spent: true,
+            },
+        ];
+        let mut asked_us = HashMap::new();
+        asked_us.insert("203.0.113.9".to_string(), now + 10);
+        asked_us.insert("10.0.0.1".to_string(), now + 20);
+        let mut we_asked = HashMap::new();
+        we_asked.insert("2001:db8::1".to_string(), now + 30);
+        sync.lock()
+            .sync
+            .set_list_asks(asked_us.clone(), we_asked.clone());
+        list.asked_entries.lock().insert((hash(2, 9), 0), now + 40);
+        list.asked_entries.lock().insert((hash(1, 9), 3), now + 50);
+        list.seen_broadcasts.write().insert(hash(9, 1), b.clone());
+        list.seen_broadcasts.write().insert(hash(3, 2), a.clone());
+        list.seen_pings
+            .write()
+            .insert(hash(4, 0), a.last_ping.clone());
+
+        let mut want = vec![2];
+        want.extend(a.encode_disk(0));
+        // Seen spent: VIN_SPENT, whatever its ping
+        want.extend(b.encode_disk(3));
+        let v4 = |o: [u8; 4]| {
+            let mut x = vec![0u8; 10];
+            x.extend_from_slice(&[0xff, 0xff]);
+            x.extend_from_slice(&o);
+            x
+        };
+        want.push(2);
+        want.extend(v4([10, 0, 0, 1]));
+        want.extend((now + 20).to_le_bytes());
+        want.extend(v4([203, 0, 113, 9]));
+        want.extend((now + 10).to_le_bytes());
+        want.push(1);
+        want.extend("2001:db8::1".parse::<Ipv6Addr>().unwrap().octets());
+        want.extend((now + 30).to_le_bytes());
+        want.push(2);
+        want.extend(hash(1, 9));
+        want.extend(3u32.to_le_bytes());
+        want.extend((now + 50).to_le_bytes());
+        want.extend(hash(2, 9));
+        want.extend(0u32.to_le_bytes());
+        want.extend((now + 40).to_le_bytes());
+        want.extend(0i64.to_le_bytes());
+        want.push(2);
+        want.extend(hash(3, 2));
+        want.extend(a.encode());
+        want.extend(hash(9, 1));
+        want.extend(b.encode());
+        want.push(1);
+        want.extend(hash(4, 0));
+        want.extend(a.last_ping.to_bytes());
+        assert_eq!(list.file_data(now), want);
+
+        // In the CMasternode form the state follows the protocol version and
+        // the four cached fields follow the last ping
+        let disk = a.encode_disk(1);
+        let net = a.encode();
+        let ping_at = net.len() - 4 - a.last_ping.to_bytes().len();
+        assert_eq!(disk[..ping_at], net[..ping_at]);
+        assert_eq!(disk[ping_at..ping_at + 4], 1i32.to_le_bytes());
+        let after_ping = ping_at + 4 + a.last_ping.to_bytes().len();
+        assert_eq!(disk[after_ping..after_ping + 32], [0u8; 32]);
+        assert_eq!(
+            disk[after_ping + 32..after_ping + 41],
+            [1, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(disk[after_ping + 41..], 1i32.to_le_bytes());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(MNCACHE_FILE);
+        assert!(list.save_file(&path, MAGIC).unwrap());
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(&bytes[1..21], b"magicMasternodeCache");
+        assert_eq!(bytes[21..25], MAGIC);
+        assert_eq!(bytes[25..bytes.len() - 32], want[..]);
+
+        let back = MasternodeList::new();
+        let back_sync = divi_masternode::mnsync::shared(now, false);
+        back.follow_sync(Arc::clone(&back_sync));
+        assert_eq!(back.load_file(&path, MAGIC), MncacheFile::Loaded(2));
+        assert_eq!(back.file_data(now), want);
+        assert!(back.entries()[1].vin_spent);
+        let state = back_sync.lock();
+        assert_eq!(state.sync.list_asks(), (&asked_us, &we_asked));
     }
 }

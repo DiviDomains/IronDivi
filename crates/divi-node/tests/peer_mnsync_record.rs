@@ -97,10 +97,9 @@ fn inv(inv_type: u32, hash: &[u8; 32]) -> Vec<u8> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_known_broadcast_announced_in_the_list_stage_counts() {
     let mnb = broadcast();
-    let hex: String = mnb.encode().iter().map(|b| format!("{b:02x}")).collect();
-    let line = format!("{hex} ok\n");
     let t = TestNode::start_with(|c| {
-        std::fs::write(c.data_dir.join("masternodes.list"), &line).unwrap();
+        let file = common::mncache::mncache_with(&mnb, c.network.magic);
+        std::fs::write(c.data_dir.join("mncache.dat"), file).unwrap();
     })
     .await;
     mine_now(&t);

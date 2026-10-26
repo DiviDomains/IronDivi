@@ -73,10 +73,9 @@ fn getdata(inv_type: u32, hash: &[u8; 32]) -> Vec<u8> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn masternode_items_are_served_on_getdata() {
     let mnb = broadcast();
-    let hex: String = mnb.encode().iter().map(|b| format!("{b:02x}")).collect();
-    let line = format!("{hex} ok\n");
     let t = TestNode::start_with(|c| {
-        std::fs::write(c.data_dir.join("masternodes.list"), &line).unwrap();
+        let file = common::mncache::mncache_with(&mnb, c.network.magic);
+        std::fs::write(c.data_dir.join("mncache.dat"), file).unwrap();
     })
     .await;
     let mut peer = RawPeer::connect(&t, "127.0.0.2").await;
