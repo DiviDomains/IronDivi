@@ -481,3 +481,29 @@ fn a_key_that_cannot_be_written_leaves_the_pool_numbers_as_they_were() {
         "{log}"
     );
 }
+
+/// A send that needs no change reserves a change key and returns it after its
+/// top-up; a top-up that cannot write throws first (wallet.cpp:2104-2106,
+/// :2129-2130), so the send logs no reservation nor return
+#[test]
+fn a_send_without_change_whose_top_up_cannot_be_written_logs_no_reservation() {
+    let _limit = LIMIT.lock();
+    let net = Net::new();
+    let rpc = one_key_short(&net);
+    // Its key comes from the pool, which its top-up leaves one short again
+    net.fund();
+    writes_fail();
+    let (sent, log) = logged(|| {
+        rpc.send_to_address(&p(vec![
+            json!(dest().to_string()),
+            json!(1),
+            json!("sweep_funds"),
+        ]))
+    });
+    writes_work();
+    assert_eq!(
+        rpc_error(sent),
+        (-1, "loadHDChain: WriteHDChain failed".to_string())
+    );
+    assert!(!log.contains("keypool"), "{log}");
+}

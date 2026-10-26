@@ -1892,9 +1892,14 @@ impl WalletDb {
 
     /// A send that needs no change: Divi Core tops the keypool up, reserves a
     /// change key and returns it (wallet.cpp:2122-2176), with its log lines.
+    /// A top-up whose keys cannot be written throws before the reservation
+    /// (wallet.cpp:2104-2106, :2129-2130), so it logs neither line; a locked
+    /// wallet's top-up does nothing and the reservation goes on
     pub fn reserve_and_return_change(&self) -> Result<u32, WalletError> {
         let added = self.top_up_keypool();
-        self.keystore.reserve_and_return_change();
+        if !matches!(added, Err(WalletError::Storage(_))) {
+            self.keystore.reserve_and_return_change();
+        }
         added
     }
 
