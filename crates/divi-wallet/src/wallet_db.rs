@@ -1652,6 +1652,21 @@ impl WalletDb {
         self.new_address(true)
     }
 
+    /// Give back the change key a send took and did not use, as Divi Core's
+    /// CReserveKey::ReturnKey does when a send fails (reservekey.cpp:44-51):
+    /// it counts in the key pool again and is the next change key. Only the
+    /// last change key handed out can be given back; another is left used.
+    pub fn return_change_address(&self, address: &Address) -> Result<bool, WalletError> {
+        let _locked = self.locked.read();
+        let _keys = self.key_lock.lock();
+        if !self.keystore.return_change_key(address) {
+            return Ok(false);
+        }
+        self.dirty.write().metadata = true; // the change index changed
+        self.persist_keys(&[])?;
+        Ok(true)
+    }
+
     /// Hand out the next receiving or change key. As in Divi Core, a locked
     /// wallet hands out a pre-generated keypool key (its secret is already on
     /// disk, encrypted) and fails with `KeypoolRanOut` when none is left; an
