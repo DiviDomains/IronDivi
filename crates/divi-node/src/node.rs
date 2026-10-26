@@ -3374,6 +3374,11 @@ mod tests {
         // A port of its own: a node that cannot listen does not start
         config.p2p.listen_addr = "127.0.0.1".into();
         config.p2p.port = 0;
+        // No DNS seeding: a test node looks nothing up and dials no one off
+        // the host. The seed lookup and its dials run in tasks of their own,
+        // which on a slow resolver kept the peer manager past
+        // stop_ends_the_node_loops' deadline
+        config.p2p.dns_seed = Some(false);
         config
     }
 
