@@ -620,16 +620,18 @@ fn test_regression_reorg_succeeds_on_longer_competing_chain() {
     let genesis_time = genesis.time;
 
     // Helper: build a simple block on top of a parent
-    let build_block = |prev_hash: Hash256, prev_time: u32, tag: u8| -> Block {
+    let build_block = |height: u32, prev_hash: Hash256, prev_time: u32, tag: u8| -> Block {
         let mut block = Block::default();
-        block.header.version = 1;
+        block.header.version = 4;
         block.header.prev_block = prev_hash;
         block.header.time = prev_time + 60;
         block.header.bits = 0x207fffff;
 
         let coinbase = Transaction {
             version: 1,
-            vin: vec![TxIn::coinbase(Script::from_bytes(vec![tag]))],
+            vin: vec![TxIn::coinbase(Script::from_bytes(
+                [divi_storage::bip34_height_script(height), vec![0x01, tag]].concat(),
+            ))],
             vout: vec![TxOut::new(
                 Amount::from_sat(1250_00000000),
                 Script::new_p2pkh(&[tag; 20]),
@@ -638,13 +640,17 @@ fn test_regression_reorg_succeeds_on_longer_competing_chain() {
         };
         block.transactions.push(coinbase);
         block.header.merkle_root = compute_merkle_root(&block.transactions);
+        let target = Hash256::from_compact(block.header.bits);
+        while divi_crypto::compute_block_hash(&block.header) > target {
+            block.header.nonce += 1;
+        }
         block
     };
 
     // Build chain A: genesis → A1 → A2 (height 2)
-    let block_a1 = build_block(genesis_hash, genesis_time, 0x0A);
+    let block_a1 = build_block(1, genesis_hash, genesis_time, 0x0A);
     let hash_a1 = chain.accept_block(block_a1.clone()).unwrap().hash;
-    let block_a2 = build_block(hash_a1, block_a1.header.time, 0x0B);
+    let block_a2 = build_block(2, hash_a1, block_a1.header.time, 0x0B);
     let hash_a2 = chain.accept_block(block_a2.clone()).unwrap().hash;
 
     assert_eq!(chain.height(), 2);
@@ -655,11 +661,11 @@ fn test_regression_reorg_succeeds_on_longer_competing_chain() {
     );
 
     // Build competing chain B: genesis → B1 → B2 → B3 (height 3, more work)
-    let block_b1 = build_block(genesis_hash, genesis_time + 1, 0x1A);
+    let block_b1 = build_block(1, genesis_hash, genesis_time + 1, 0x1A);
     let hash_b1 = chain.accept_block(block_b1.clone()).unwrap().hash;
-    let block_b2 = build_block(hash_b1, block_b1.header.time, 0x1B);
+    let block_b2 = build_block(2, hash_b1, block_b1.header.time, 0x1B);
     let hash_b2 = chain.accept_block(block_b2.clone()).unwrap().hash;
-    let block_b3 = build_block(hash_b2, block_b2.header.time, 0x1C);
+    let block_b3 = build_block(3, hash_b2, block_b2.header.time, 0x1C);
     let hash_b3 = chain.accept_block(block_b3).unwrap().hash;
 
     // Chain must have reorged to B (higher chain work)

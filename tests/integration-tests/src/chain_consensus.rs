@@ -43,17 +43,24 @@ fn create_test_chain() -> (Chain, tempfile::TempDir) {
     (chain, dir)
 }
 
-/// Helper to create a child block
-fn create_child_block(parent_hash: Hash256, parent_time: u32, pubkey_hash: [u8; 20]) -> Block {
+/// Helper to create a child block at `height`
+fn create_child_block(
+    height: u32,
+    parent_hash: Hash256,
+    parent_time: u32,
+    pubkey_hash: [u8; 20],
+) -> Block {
     let mut block = Block::default();
-    block.header.version = 1;
+    block.header.version = 4;
     block.header.prev_block = parent_hash;
     block.header.time = parent_time + 60;
     block.header.bits = 0x207fffff;
 
     let coinbase = Transaction {
         version: 1,
-        vin: vec![TxIn::coinbase(Script::from_bytes(vec![0x05]))],
+        vin: vec![TxIn::coinbase(Script::from_bytes(
+            [divi_storage::bip34_height_script(height), vec![0x01, 0x05]].concat(),
+        ))],
         vout: vec![TxOut::new(
             Amount::from_sat(1250_00000000), // Standard block reward
             Script::new_p2pkh(&pubkey_hash),
@@ -62,6 +69,11 @@ fn create_child_block(parent_hash: Hash256, parent_time: u32, pubkey_hash: [u8; 
     };
     block.transactions.push(coinbase);
     block.header.merkle_root = compute_merkle_root(&block.transactions);
+    // Proof of work for the block's bits
+    let target = Hash256::from_compact(block.header.bits);
+    while divi_crypto::compute_block_hash(&block.header) > target {
+        block.header.nonce += 1;
+    }
     block
 }
 
@@ -79,7 +91,7 @@ fn build_chain(chain: &Chain, num_blocks: usize) -> Vec<Hash256> {
     let mut prev_time = genesis_time;
 
     for i in 0..num_blocks {
-        let block = create_child_block(prev_hash, prev_time, [(i as u8 + 1); 20]);
+        let block = create_child_block(i as u32 + 1, prev_hash, prev_time, [(i as u8 + 1); 20]);
         let hash = chain.accept_block(block).unwrap().hash;
         hashes.push(hash);
         prev_hash = hash;
@@ -172,23 +184,23 @@ fn test_reorg_replaces_shorter_chain() {
     let genesis_time = genesis_index.time;
 
     // Build chain A: genesis -> A1 -> A2
-    let block_a1 = create_child_block(genesis_hash, genesis_time, [0x0a; 20]);
+    let block_a1 = create_child_block(1, genesis_hash, genesis_time, [0x0a; 20]);
     let hash_a1 = chain.accept_block(block_a1.clone()).unwrap().hash;
 
-    let block_a2 = create_child_block(hash_a1, block_a1.header.time, [0x0b; 20]);
+    let block_a2 = create_child_block(2, hash_a1, block_a1.header.time, [0x0b; 20]);
     let hash_a2 = chain.accept_block(block_a2.clone()).unwrap().hash;
 
     assert_eq!(chain.height(), 2);
     assert_eq!(chain.tip().unwrap().hash, hash_a2);
 
     // Build competing chain B: genesis -> B1 -> B2 -> B3 (longer)
-    let block_b1 = create_child_block(genesis_hash, genesis_time + 1, [0x1a; 20]);
+    let block_b1 = create_child_block(1, genesis_hash, genesis_time + 1, [0x1a; 20]);
     let hash_b1 = chain.accept_block(block_b1.clone()).unwrap().hash;
 
-    let block_b2 = create_child_block(hash_b1, block_b1.header.time, [0x1b; 20]);
+    let block_b2 = create_child_block(2, hash_b1, block_b1.header.time, [0x1b; 20]);
     let hash_b2 = chain.accept_block(block_b2.clone()).unwrap().hash;
 
-    let block_b3 = create_child_block(hash_b2, block_b2.header.time, [0x1c; 20]);
+    let block_b3 = create_child_block(3, hash_b2, block_b2.header.time, [0x1c; 20]);
     let hash_b3 = chain.accept_block(block_b3).unwrap().hash;
 
     // Should have reorged to B chain
@@ -206,7 +218,7 @@ fn test_reorg_maintains_utxo_consistency() {
     let genesis_time = genesis_index.time;
 
     // Chain A
-    let block_a1 = create_child_block(genesis_hash, genesis_time, [0x0a; 20]);
+    let block_a1 = create_child_block(1, genesis_hash, genesis_time, [0x0a; 20]);
     let hash_a1 = chain.accept_block(block_a1.clone()).unwrap().hash;
 
     // Get UTXO from A1
@@ -220,10 +232,10 @@ fn test_reorg_maintains_utxo_consistency() {
     );
 
     // Build longer competing chain B
-    let block_b1 = create_child_block(genesis_hash, genesis_time + 1, [0x1a; 20]);
+    let block_b1 = create_child_block(1, genesis_hash, genesis_time + 1, [0x1a; 20]);
     let hash_b1 = chain.accept_block(block_b1.clone()).unwrap().hash;
 
-    let block_b2 = create_child_block(hash_b1, block_b1.header.time, [0x1b; 20]);
+    let block_b2 = create_child_block(2, hash_b1, block_b1.header.time, [0x1b; 20]);
     let _hash_b2 = chain.accept_block(block_b2.clone()).unwrap().hash;
 
     // After reorg, A1's UTXO should be gone
@@ -257,7 +269,7 @@ fn test_coinbase_utxo_created_and_tracked() {
     let genesis_time = genesis_index.time;
 
     // Add a block on top of genesis to have a UTXO we control
-    let block1 = create_child_block(genesis_hash, genesis_time, [0x01; 20]);
+    let block1 = create_child_block(1, genesis_hash, genesis_time, [0x01; 20]);
     let hash1 = chain.accept_block(block1).unwrap().hash;
 
     let block1_data = chain.get_block(&hash1).unwrap().unwrap();
@@ -382,7 +394,7 @@ fn test_reject_block_with_invalid_merkle_root() {
     let genesis_time = genesis_index.time;
 
     // Create block with invalid merkle root
-    let mut bad_block = create_child_block(genesis_hash, genesis_time, [0x01; 20]);
+    let mut bad_block = create_child_block(1, genesis_hash, genesis_time, [0x01; 20]);
     bad_block.header.merkle_root = Hash256::from_bytes([0xff; 32]);
 
     let result = chain.accept_block(bad_block);
@@ -394,7 +406,7 @@ fn test_reject_orphan_block() {
     let (chain, _dir) = create_test_chain();
 
     // Try to accept block with unknown parent (Chain already has genesis)
-    let orphan = create_child_block(Hash256::from_bytes([0xaa; 32]), 1000000100, [0x01; 20]);
+    let orphan = create_child_block(1, Hash256::from_bytes([0xaa; 32]), 1000000100, [0x01; 20]);
     let result = chain.accept_block(orphan);
 
     assert!(result.is_err());
@@ -410,7 +422,7 @@ fn test_reject_block_with_future_timestamp() {
     let genesis_time = genesis_index.time;
 
     // Create block with timestamp 3 hours in future
-    let mut future_block = create_child_block(genesis_hash, genesis_time, [0x01; 20]);
+    let mut future_block = create_child_block(1, genesis_hash, genesis_time, [0x01; 20]);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -451,7 +463,7 @@ fn test_concurrent_block_acceptance() {
     for i in 0..4 {
         let chain_clone = Arc::clone(&chain);
         let handle = thread::spawn(move || {
-            let block = create_child_block(genesis_hash, genesis_time, [(i + 10) as u8; 20]);
+            let block = create_child_block(1, genesis_hash, genesis_time, [(i + 10) as u8; 20]);
             chain_clone.accept_block(block)
         });
         handles.push(handle);
@@ -514,7 +526,8 @@ fn test_concurrent_reads_and_writes() {
             let mut prev_hash = genesis_hash;
             let mut prev_time = genesis_time;
             for i in 0..10 {
-                let block = create_child_block(prev_hash, prev_time, [(i + 20) as u8; 20]);
+                let block =
+                    create_child_block(i as u32 + 1, prev_hash, prev_time, [(i + 20) as u8; 20]);
                 let hash = chain_clone.accept_block(block).unwrap().hash;
                 prev_hash = hash;
                 prev_time += 60;
