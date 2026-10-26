@@ -593,27 +593,35 @@ fn a_send_failing_after_coin_selection_tops_the_key_pool_up() {
     assert_eq!(net.wallet.keypool_size(), full, "the key pool is topped up");
 }
 
-/// The log lines written while `f` runs on this thread
+/// The log lines written while `f` runs on this thread. One global subscriber
+/// writes each thread's lines to that thread's buffer: a subscriber set for
+/// one thread can miss lines whose call sites another test thread, with no
+/// subscriber, registered at the same time
 fn logged<T>(f: impl FnOnce() -> T) -> (T, String) {
-    #[derive(Clone)]
-    struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-    impl std::io::Write for Buf {
+    thread_local! {
+        static LINES: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    struct ThreadLines;
+    impl std::io::Write for ThreadLines {
         fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(data);
+            LINES.with(|lines| lines.borrow_mut().extend_from_slice(data));
             Ok(data.len())
         }
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
     }
-    let buf = Buf(Default::default());
-    let writer = buf.clone();
-    let subscriber = tracing_subscriber::fmt()
-        .with_ansi(false)
-        .with_writer(move || writer.clone())
-        .finish();
-    let out = tracing::subscriber::with_default(subscriber, f);
-    let text = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(|| ThreadLines)
+            .init();
+    });
+    LINES.with(|lines| lines.borrow_mut().clear());
+    let out = f();
+    let text =
+        LINES.with(|lines| String::from_utf8(std::mem::take(&mut *lines.borrow_mut())).unwrap());
     (out, text)
 }
 
