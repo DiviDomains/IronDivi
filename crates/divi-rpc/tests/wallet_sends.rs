@@ -688,3 +688,33 @@ fn a_send_logs_its_relay_once_the_mempool_takes_it() {
     assert!(sent.is_err());
     assert!(!log.contains("Relaying wtx"), "{log}");
 }
+
+/// A sweep that fails once its coins are chosen, the fee leaving the swept
+/// payment as dust ("Cannot sweep inputs.", wallet.cpp:1795-1799), leaves the
+/// key pool topped up, as Divi Core's change key reservation before it does
+/// (wallet.cpp:1786, :2129-2130)
+#[test]
+fn a_sweep_failing_after_coin_selection_tops_the_key_pool_up() {
+    let net = Net::new();
+    // One coin above the dust threshold that its sweep's fee leaves below it
+    net.fund(&[6_000]);
+    net.wallet.top_up_keypool().unwrap();
+    let full = net.wallet.keypool_size();
+    net.wallet.new_receiving_address().unwrap();
+    assert_eq!(net.wallet.keypool_size(), full - 1);
+    let rpc = net.rpc();
+    let err = rpc
+        .send_to_address(&p(vec![
+            json!(dest().to_string()),
+            json!(0.00006),
+            json!("sweep_funds"),
+        ]))
+        .unwrap_err();
+    match err {
+        divi_rpc::Error::Rpc(e) => {
+            assert_eq!((e.code, e.message.as_str()), (-4, "Cannot sweep inputs."))
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(net.wallet.keypool_size(), full, "the key pool is topped up");
+}
