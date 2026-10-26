@@ -535,3 +535,30 @@ fn a_send_that_cannot_be_signed_fails_with_divi_core_s_reply() {
     }
     assert!(net.submitted.lock().is_empty(), "nothing is sent");
 }
+
+/// A send that fails after it took a change key gives the key back, as Divi
+/// Core's CReserveKey returns it (reservekey.cpp:44-51, wallet.cpp:1805-1825):
+/// the key pool is as full as before and the next change key is the same
+#[test]
+fn a_failed_send_gives_its_change_key_back() {
+    let net = Net::new();
+    unsignable_coin(&net, 10 * COIN);
+    net.wallet.top_up_keypool().unwrap();
+    let pool = net.wallet.keypool_size();
+    let indices = net.wallet.keystore().get_indices();
+    let rpc = net.rpc();
+    // 1 of the 10 DIVI coin: the send has change, so it takes a change key
+    assert!(rpc
+        .send_to_address(&p(vec![json!(dest().to_string()), json!(1)]))
+        .is_err());
+    assert_eq!(
+        net.wallet.keypool_size(),
+        pool,
+        "the key pool is as full as before"
+    );
+    assert_eq!(
+        net.wallet.keystore().get_indices(),
+        indices,
+        "the change key is unused"
+    );
+}

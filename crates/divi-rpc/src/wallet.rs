@@ -1950,21 +1950,39 @@ impl WalletRpc {
         for out in &plan.outputs {
             builder = builder.add_output(out.value, out.script_pubkey.clone());
         }
+        // The change key a send takes, given back if the send then fails
+        // before it is committed, as Divi Core's CReserveKey returns it: only
+        // a send that succeeds keeps it (reservekey.cpp:44-51,
+        // wallet.cpp:1805-1825)
+        let mut change_key = None;
         if let Some(change) = plan.change {
             let script = match change_to {
-                ChangeTo::NewKey => wallet
-                    .new_change_address()
-                    .map_err(|e| {
+                ChangeTo::NewKey => {
+                    let address = wallet.new_change_address().map_err(|e| {
                         RpcError::new(
                             codes::WALLET_ERROR,
                             format!("Failed to generate change address: {}", e),
                         )
-                    })?
-                    .script_pubkey(),
+                    })?;
+                    let script = address.script_pubkey();
+                    change_key = Some(address);
+                    script
+                }
                 ChangeTo::Script(script) => script,
             };
             builder = builder.add_output(change, script);
         }
+        let give_back = |e: Error| -> Error {
+            if let Some(address) = &change_key {
+                if let Err(err) = wallet.return_change_address(address) {
+                    debug!(
+                        "The change key of a failed send was not given back: {}",
+                        err
+                    );
+                }
+            }
+            e
+        };
         let (mut tx, prev_scripts) = builder.build();
 
         // Every coin type the wallet spends (P2PKH, P2PK, multisig, P2SH with
@@ -1980,7 +1998,7 @@ impl WalletRpc {
                 Ok(true) => {}
                 Ok(false) => {
                     debug!("Send input {} of {} not signed", i, plan.inputs.len());
-                    return Err(signing_failed().into());
+                    return Err(give_back(signing_failed().into()));
                 }
                 Err(e) => {
                     debug!(
@@ -1989,11 +2007,11 @@ impl WalletRpc {
                         plan.inputs.len(),
                         e
                     );
-                    return Err(signing_failed().into());
+                    return Err(give_back(signing_failed().into()));
                 }
             }
         }
-        check_signed(&tx, plan.fee, self.fee_policy()).map_err(send_error)?;
+        check_signed(&tx, plan.fee, self.fee_policy()).map_err(|e| give_back(send_error(e)))?;
         wallet.note_committed(&tx.txid());
         let callback = self.tx_submit.read();
         let callback = callback.as_ref().ok_or_else(|| {
