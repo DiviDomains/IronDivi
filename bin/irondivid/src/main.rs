@@ -2283,15 +2283,26 @@ async fn run_daemon(
     node.start().await.with_context(|| "Failed to start node")?;
 
     // Divi Core's -stopafterblockimport: the import thread asks for shutdown
-    // once it is done (init.cpp:724-727)
+    // once it is done (init.cpp:724-727). divid starts that thread once its
+    // chain and wallet are loaded and scanned (init.cpp:1578), so its stop
+    // comes after its init has returned, and it exits 0 (divid.cpp:146-180).
+    // irondivid's import goes on once its wallet is loaded (`release_import`),
+    // still before the end of its start, and a short one can end there: the
+    // stop is asked for once the start is done (`start_done`), so that only a
+    // signal or `stop` counts as a stop during the start (exit 1, below)
+    let start_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
     if config.stop_after_block_import {
         let chain = node.chain().clone();
         let tx = shutdown_tx.clone();
+        let start_done = Arc::clone(&start_done);
         tokio::spawn(async move {
             while chain.is_importing() {
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             }
             info!("Stopping after block import");
+            while !start_done.load(std::sync::atomic::Ordering::Acquire) {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
             let _ = tx.send(());
         });
     }
@@ -2827,6 +2838,7 @@ async fn run_daemon(
         shutdown_rx.try_recv(),
         Err(broadcast::error::TryRecvError::Empty)
     );
+    start_done.store(true, std::sync::atomic::Ordering::Release);
     if stopped_during_start {
         info!("Shutdown requested. Exiting.");
     } else if !config.rpc.enabled {
