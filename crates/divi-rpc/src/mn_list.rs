@@ -98,6 +98,10 @@ impl NetworkMasternode {
 pub const MNCACHE_FILE: &str = "mncache.dat";
 const MNCACHE_MAGIC: &str = "magicMasternodeCache";
 
+/// The file irondivid kept the list in before, removed once mncache.dat is
+/// written beside it
+const OLD_LIST_FILE: &str = "masternodes.list";
+
 /// What reading mncache.dat came to, as CFlatDB::Read classes it
 /// (flat-database.h:178-216, flat-database.cpp:18-60)
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -288,6 +292,9 @@ impl MasternodeList {
         let tmp = path.with_extension("dat.new");
         std::fs::write(&tmp, bytes)?;
         std::fs::rename(&tmp, path)?;
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::remove_file(dir.join(OLD_LIST_FILE));
+        }
         Ok(true)
     }
 

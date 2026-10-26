@@ -360,6 +360,18 @@ fn mncache_is_written_at_the_stop() {
     assert_eq!(&bytes[1..21], b"magicMasternodeCache");
 }
 
+/// The list file irondivid kept before mncache.dat goes once mncache.dat is
+/// written
+#[test]
+fn an_old_masternodes_list_goes_at_the_stop() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("masternodes.list"), b"").unwrap();
+    let daemon = Daemon::start(dir.path());
+    daemon.stop();
+    assert!(dir.path().join("mncache.dat").exists());
+    assert!(!dir.path().join("masternodes.list").exists());
+}
+
 /// divid will not start on a mncache.dat it cannot read (CFlatDB::Load,
 /// flat-database.h:225-245; MasternodeModule.cpp:262-266) and leaves it as it
 /// was
