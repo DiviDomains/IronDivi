@@ -493,8 +493,13 @@ def status(when, pairs=None, stale=False):
                 print(f"#   {n.name}: Stakable {n.rpc('getcoinavailability')['Stakable']}, vaults "
                       f"{json.dumps(n.rpc('getcoinavailability', True)['Stakable']['AllVaults'])[:300]}", flush=True)
             pick = lambda o: {k: o[1][k] for k in ("staking_balance", "enoughcoins")}
-            row(f"{p}manager getstakingstatus staking_balance and enoughcoins (divid's cached balance)",
-                json.dumps(pick(cs)), json.dumps(pick(is_)), pick(cs) == pick(is_))
+            # divid's cache is filled by whatever asked for a transaction's balance since its
+            # last start, so it may already be empty here: equal values are an ordinary row,
+            # a difference is the listed one
+            same = pick(cs) == pick(is_)
+            row(f"{p}manager getstakingstatus staking_balance and enoughcoins"
+                + (" (divid's cache empty)" if same else " (divid's cached balance)"),
+                json.dumps(pick(cs)), json.dumps(pick(is_)), same)
         if cs[0] == is_[0] == "ok":
             a, b = cs[1].get("mnsync"), is_[1].get("mnsync")
             name = f"{p}{side} getstakingstatus mnsync" + ("" if a == b else " (divid's masternode sync not finished)")
@@ -527,8 +532,9 @@ def views(when, pairs=None, stale=False):
             cg, ig = c.call("gettransaction", txid, True), i.call("gettransaction", txid, True)
             if stale and side == "manager" and what.startswith("vault 1 coin") and cg[0] == ig[0] == "ok":
                 compare(f"{q}gettransaction of {what} {txid[:8]}", cg, ig, drop=MOMENT | NOTES | {"amount"})
-                row(f"{q}gettransaction of {what} amount (divid's cached credit)", cg[1]["amount"], ig[1]["amount"],
-                    cg[1]["amount"] == ig[1]["amount"])
+                same = cg[1]["amount"] == ig[1]["amount"]
+                row(f"{q}gettransaction of {what} amount" + (" (divid's cache empty)" if same else " (divid's cached credit)"),
+                    cg[1]["amount"], ig[1]["amount"], same)
             else:
                 compare(f"{q}gettransaction of {what} {txid[:8]}", cg, ig)
         compare(f"{q}getcoinavailability", c.call("getcoinavailability"), i.call("getcoinavailability"),

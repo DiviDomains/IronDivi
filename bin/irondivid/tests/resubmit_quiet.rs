@@ -14,7 +14,7 @@
 
 #![cfg(unix)]
 
-use divi_test_support::{free_port, log_tail};
+use divi_test_support::{free_port, start_on};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -66,33 +66,28 @@ impl Drop for Node {
     }
 }
 
-fn start(datadir: &Path, rpc: u16, p2p: u16, extra: &[String]) -> Node {
-    let child = Command::new(env!("CARGO_BIN_EXE_irondivid"))
-        .arg("--regtest")
-        .arg("--datadir")
-        .arg(datadir)
-        .args(["--rpcport", &rpc.to_string()])
-        .args(["--port", &p2p.to_string()])
-        .args(["--bind", "127.0.0.1", "--staking=0"])
-        .args(["--rpcuser", "test", "--rpcpassword", "test"])
-        .args(extra)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn irondivid");
-    let mut node = Node { child, rpc };
-    let deadline = Instant::now() + Duration::from_secs(120);
-    while try_rpc(rpc, "getblockcount", &json!([]), Duration::from_secs(10)).is_none() {
-        if let Ok(Some(status)) = node.child.try_wait() {
-            panic!("irondivid exited at start: {status}\n{}", log_tail(datadir));
-        }
-        assert!(
-            Instant::now() < deadline,
-            "irondivid did not answer within 120 s"
-        );
-        std::thread::sleep(Duration::from_millis(250));
-    }
-    node
+fn start(datadir: &Path, rpc: &mut u16, p2p: &mut u16, extra: &[String]) -> Node {
+    let child = start_on(
+        datadir,
+        rpc,
+        p2p,
+        |rpc, p2p| {
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_irondivid"));
+            cmd.arg("--regtest")
+                .arg("--datadir")
+                .arg(datadir)
+                .args(["--rpcport", &rpc.to_string()])
+                .args(["--port", &p2p.to_string()])
+                .args(["--bind", "127.0.0.1", "--staking=0"])
+                .args(["--rpcuser", "test", "--rpcpassword", "test"])
+                .args(extra)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            cmd
+        },
+        |rpc| try_rpc(rpc, "getblockcount", &json!([]), Duration::from_secs(10)).is_some(),
+    );
+    Node { child, rpc: *rpc }
 }
 
 fn wait_until(what: &str, secs: u64, mut done: impl FnMut() -> bool) {
@@ -113,13 +108,14 @@ fn in_pool(port: u16, txid: &Value) -> bool {
 #[test]
 fn a_resubmitted_send_is_not_announced_at_start() {
     let (dir_a, dir_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-    let (rpc_a, p2p_a, rpc_b, p2p_b) = (free_port(), free_port(), free_port(), free_port());
-    // A dials B, which listens
-    let to_b = vec![format!("--connect=127.0.0.1:{p2p_b}"), "--listen=0".into()];
+    let (mut rpc_a, mut p2p_a, mut rpc_b, mut p2p_b) =
+        (free_port(), free_port(), free_port(), free_port());
+    // A dials B, which listens (B's port is read after B has started)
     let b_args = vec!["--listen=1".to_string()];
+    let to_b = |p2p_b: u16| vec![format!("--connect=127.0.0.1:{p2p_b}"), "--listen=0".into()];
 
-    let b = start(dir_b.path(), rpc_b, p2p_b, &b_args);
-    let a = start(dir_a.path(), rpc_a, p2p_a, &to_b);
+    let b = start(dir_b.path(), &mut rpc_b, &mut p2p_b, &b_args);
+    let a = start(dir_a.path(), &mut rpc_a, &mut p2p_a, &to_b(p2p_b));
     ok(rpc_a, "setgenerate", json!([101]));
     wait_until("B follows A", 60, || {
         ok(rpc_b, "getblockcount", json!([])) == json!(101)
@@ -134,8 +130,8 @@ fn a_resubmitted_send_is_not_announced_at_start() {
     );
     a.stop();
 
-    let _b = start(dir_b.path(), rpc_b, p2p_b, &b_args);
-    let _a = start(dir_a.path(), rpc_a, p2p_a, &to_b);
+    let _b = start(dir_b.path(), &mut rpc_b, &mut p2p_b, &b_args);
+    let _a = start(dir_a.path(), &mut rpc_a, &mut p2p_a, &to_b(p2p_b));
     assert!(in_pool(rpc_a, &txid), "the send is back in A's mempool");
     wait_until("A and B connected", 30, || {
         ok(rpc_b, "getconnectioncount", json!([])).as_u64() >= Some(1)

@@ -215,8 +215,9 @@ fn getnetworkinfo_and_version_message_as_divid() {
     // Divi Core 3.0.0's PROTOCOL_VERSION (version.h:21)
     assert_eq!(net["protocolversion"], 70915, "{net}");
     assert_eq!(d.rpc("getinfo")["protocolversion"], 70915);
-    // irondivid serves no bloom filters: NODE_NETWORK, as divid with -peerbloomfilters=0
-    assert_eq!(net["localservices"], "0000000000000001", "{net}");
+    // NODE_NETWORK | NODE_BLOOM, as divid with the default -peerbloomfilters
+    // (defaultValues.h:100, net.cpp:1722-1723)
+    assert_eq!(net["localservices"], "0000000000000005", "{net}");
     // -externalip at the listen port, LOCAL_MANUAL (4); port and score as strings
     assert_eq!(
         net["localaddresses"],
@@ -229,8 +230,9 @@ fn getnetworkinfo_and_version_message_as_divid() {
     let me: SocketAddr = format!("1.2.3.4:{port}").parse().unwrap();
     let (_s, v) = handshake(&d, me);
     assert_eq!(v.version, 70915);
-    assert_eq!(v.services, 1);
-    assert_eq!(v.addr_from, (1, me), "our address");
+    assert_eq!(v.services, 5);
+    // Our address carries our services too (NetworkLocalAddressHelpers.cpp:210)
+    assert_eq!(v.addr_from, (5, me), "our address");
     assert_eq!(v.addr_recv.1, "0.0.0.0:0".parse::<SocketAddr>().unwrap());
     // The inbound peer named our address: score 5 (Divi Core SeenLocal)
     let deadline = Instant::now() + WAIT;
@@ -248,7 +250,7 @@ fn without_a_local_address_the_version_names_the_listen_port() {
     assert_eq!(local_addresses(&d), json!([]));
     let (_s, v) = handshake(&d, "0.0.0.0:0".parse().unwrap());
     let any: SocketAddr = format!("0.0.0.0:{}", d.p2p_port).parse().unwrap();
-    assert_eq!(v.addr_from, (1, any), "0.0.0.0 with our listen port");
+    assert_eq!(v.addr_from, (5, any), "0.0.0.0 with our listen port");
 }
 
 #[test]
@@ -295,4 +297,56 @@ fn externalip_that_is_not_an_address_stops_the_start() {
         text.contains("Cannot resolve -externalip address: '[2001:db8::1]'"),
         "{text}"
     );
+}
+
+/// -onlynet limits every network it does not name (net.cpp:1734-1746):
+/// getnetworkinfo shows it limited and not reachable (rpcnet.cpp:323-324), and
+/// an -externalip of a limited network is not one of our addresses
+/// (AddLocal, NetworkLocalAddressHelpers.cpp:90)
+#[test]
+fn onlynet_limits_the_other_networks() {
+    let net = |info: &Value, name: &str| {
+        info["networks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["name"] == name)
+            .cloned()
+            .unwrap_or_else(|| panic!("network {name}"))
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let node = Daemon::start(
+        dir.path(),
+        &[
+            "-onlynet=IPv6",
+            "-externalip=1.2.3.4",
+            "-externalip=[2a00:1450:4001:80b::200e]",
+        ],
+    );
+    let info = node.rpc("getnetworkinfo");
+    assert_eq!(net(&info, "ipv4")["limited"], true, "{info}");
+    assert_eq!(net(&info, "ipv4")["reachable"], false, "{info}");
+    assert_eq!(net(&info, "ipv6")["limited"], false, "{info}");
+    assert_eq!(net(&info, "ipv6")["reachable"], true, "{info}");
+    let local: Vec<&str> = info["localaddresses"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["address"].as_str().unwrap())
+        .collect();
+    assert_eq!(local, ["2a00:1450:4001:80b::200e"], "{info}");
+    drop(node);
+    // An option irondivid acts on: no "not supported" or "Unknown option" line
+    let log = std::fs::read_to_string(dir.path().join("regtest").join("debug.log"))
+        .or_else(|_| std::fs::read_to_string(dir.path().join("debug.log")))
+        .unwrap_or_default();
+    assert!(!log.contains("-onlynet"), "{log}");
+
+    // Without -onlynet nothing is limited, and both addresses are ours
+    let dir = tempfile::tempdir().unwrap();
+    let node = Daemon::start(dir.path(), &["-externalip=1.2.3.4"]);
+    let info = node.rpc("getnetworkinfo");
+    assert_eq!(net(&info, "ipv4")["limited"], false, "{info}");
+    assert_eq!(net(&info, "ipv6")["limited"], false, "{info}");
+    assert_eq!(info["localaddresses"][0]["address"], "1.2.3.4", "{info}");
 }

@@ -48,6 +48,11 @@ pub enum WalletError {
     #[error("wallet is locked")]
     WalletLocked,
 
+    /// A key record of the wallet could not be read: Divi Core's DB_CORRUPT
+    /// (walletdb.cpp:495-503), refused at start (init.cpp:1153-1156)
+    #[error("Error loading wallet.dat: Wallet corrupted")]
+    Corrupt,
+
     /// No pre-generated key left to hand out while the wallet is locked
     #[error("keypool ran out")]
     KeypoolRanOut,

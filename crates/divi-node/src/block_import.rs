@@ -122,9 +122,20 @@ pub fn import_block_file(
     message_start: [u8; 4],
     stop: &AtomicBool,
 ) -> std::io::Result<ImportResult> {
+    import_opened(chain, File::open(path)?, path, message_start, stop)
+}
+
+/// The import of a block file already open (`path` names it in the log)
+fn import_opened(
+    chain: &Chain,
+    file: File,
+    path: &Path,
+    message_start: [u8; 4],
+    stop: &AtomicBool,
+) -> std::io::Result<ImportResult> {
     let started = std::time::Instant::now();
     let mut window = Window {
-        file: File::open(path)?,
+        file,
         buf: Vec::new(),
         base: 0,
         eof: false,
@@ -257,22 +268,28 @@ pub fn import_at_start(
         total.refused += r.refused;
         total.unreadable += r.unreadable;
     };
+    // Each file is named once it is open; one that does not open is named in
+    // divid's warning instead (init.cpp:698-722)
     let bootstrap = bootstrap_dir.join("bootstrap.dat");
     if bootstrap.exists() {
-        tracing::info!("Importing bootstrap.dat...");
-        match import_block_file(chain, &bootstrap, message_start, stop) {
-            Ok(_) if stop.load(Ordering::SeqCst) => return total,
-            Ok(r) => {
-                add(r);
+        match File::open(&bootstrap) {
+            Ok(file) => {
+                tracing::info!("Importing bootstrap.dat...");
+                match import_opened(chain, file, &bootstrap, message_start, stop) {
+                    Ok(_) if stop.load(Ordering::SeqCst) => return total,
+                    Ok(r) => add(r),
+                    Err(e) => {
+                        tracing::warn!("LoadExternalBlockFile : Deserialize or I/O error - {}", e)
+                    }
+                }
                 let old = bootstrap_dir.join("bootstrap.dat.old");
                 if let Err(e) = std::fs::rename(&bootstrap, &old) {
                     tracing::warn!("Could not rename bootstrap.dat to bootstrap.dat.old: {}", e);
                 }
             }
-            Err(e) => tracing::warn!(
-                "Warning: could not open bootstrap file {}: {}",
-                bootstrap.display(),
-                e
+            Err(_) => tracing::warn!(
+                "Warning: Could not open bootstrap file {}",
+                bootstrap.display()
             ),
         }
     }
@@ -280,14 +297,17 @@ pub fn import_at_start(
         if stop.load(Ordering::SeqCst) {
             break;
         }
-        tracing::info!("Importing blocks file {}...", path.display());
-        match import_block_file(chain, path, message_start, stop) {
-            Ok(r) => add(r),
-            Err(e) => tracing::warn!(
-                "Warning: could not open blocks file {}: {}",
-                path.display(),
-                e
-            ),
+        match File::open(path) {
+            Ok(file) => {
+                tracing::info!("Importing blocks file {}...", path.display());
+                match import_opened(chain, file, path, message_start, stop) {
+                    Ok(r) => add(r),
+                    Err(e) => {
+                        tracing::warn!("LoadExternalBlockFile : Deserialize or I/O error - {}", e)
+                    }
+                }
+            }
+            Err(_) => tracing::warn!("Warning: Could not open blocks file {}", path.display()),
         }
     }
     total

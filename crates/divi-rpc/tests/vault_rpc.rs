@@ -659,6 +659,76 @@ fn reclaim_answers_the_txid_alone() {
     assert_eq!(res, json!(tx.txid().to_string()));
 }
 
+/// addvault stores the vault before it syncs the transaction: a mined
+/// transaction of the wallet's that pays the vault nothing still registers it
+/// and succeeds; one that is not the wallet's is refused with "Unable to sync
+/// TX!", the vault registered all the same (rpcwallet.cpp:1295-1301,
+/// wallet.cpp:695-704)
+#[test]
+fn addvault_registers_a_vault_its_transaction_does_not_fund() {
+    let s = setup();
+    let other = |b: u8| {
+        Address::from_pubkey_hash(
+            divi_primitives::hash::Hash160::from_bytes([b; 20]),
+            Network::Regtest,
+        )
+    };
+    let rpc = s.net.rpc(&s.manager);
+    // The funding transaction pays the manager a plain coin, so it is the
+    // manager's, but it pays this second vault nothing
+    let second = format!("{}:{}", other(0x42), s.manager_addr);
+    let res = rpc
+        .add_vault(&p(vec![json!(second), json!(s.fund_txid.to_string())]))
+        .unwrap();
+    assert_eq!(res, json!({"succeeded": true}));
+    assert!(s
+        .manager
+        .get_vault(vault_script(&other(0x42), &s.manager_addr).as_bytes())
+        .is_some());
+
+    // A coinbase to someone else: not the manager's
+    let block = s.net.mine(vec![], &other(0x99));
+    let coinbase = s.net.chain.get_block(&block).unwrap().unwrap().transactions[0].txid();
+    let third = format!("{}:{}", other(0x43), s.manager_addr);
+    let e = rpc
+        .add_vault(&p(vec![json!(third), json!(coinbase.to_string())]))
+        .unwrap_err();
+    assert_eq!(error_message(e), "AddingVaultScript: Unable to sync TX!");
+    assert!(s
+        .manager
+        .get_vault(vault_script(&other(0x43), &s.manager_addr).as_bytes())
+        .is_some());
+}
+
+/// reclaimvaultfunds' "metadata" mode keeps its comment and comment-to with
+/// the wallet's transaction, as sendtoaddress's does (rpcwallet.cpp:1170-1176)
+#[test]
+fn reclaim_keeps_its_metadata_notes() {
+    let s = setup();
+    let rpc = make_self_vault(&s);
+    let dest = s.owner.new_receiving_address().unwrap();
+    rpc.reclaim_vault_funds(&p(vec![
+        json!(dest.to_string()),
+        json!(10.0),
+        json!("metadata"),
+        json!("a note"),
+        json!("a shop"),
+    ]))
+    .unwrap();
+    let tx = submitted_tx(&s);
+    let notes = s.owner.tx_notes(&tx.txid());
+    assert_eq!(
+        notes.get("comment").map(String::as_str),
+        Some("a note"),
+        "{notes:?}"
+    );
+    assert_eq!(
+        notes.get("to").map(String::as_str),
+        Some("a shop"),
+        "{notes:?}"
+    );
+}
+
 fn output_to(tx: &Transaction, script: &Script) -> Vec<i64> {
     tx.vout
         .iter()
@@ -1163,5 +1233,64 @@ fn coin_availability_lists_vault_txids_in_text_order() {
         json!(txids),
         "{}",
         ca
+    );
+}
+
+/// fundvault's object form (rpcwallet.cpp:989-1036, :1059-1062): each encoding
+/// with an amount, or {"amount", "repetitions"} for that many outputs, in one
+/// transaction; the reply names every encoding. A value of another kind, or
+/// an amount or repetitions of the wrong kind, is refused with -8.
+#[test]
+fn fundvault_takes_an_object_of_encodings() {
+    let s = setup();
+    let rpc = s.net.rpc(&s.manager);
+    let code = |e: divi_rpc::Error| match e {
+        divi_rpc::Error::Rpc(r) => (r.code, r.message),
+        other => panic!("not an RPC error: {:?}", other),
+    };
+    let other_manager = s.owner.new_receiving_address().unwrap().to_string();
+    for (details, message) in [
+        (
+            json!({"amount": "x", "repetitions": 2}),
+            "Unable to parse amount for: ",
+        ),
+        (json!({"amount": 2}), "Unable to parse repetitions for: "),
+        (
+            json!({"amount": 2, "repetitions": 1.5}),
+            "Unable to parse repetitions for: ",
+        ),
+        (json!([1]), "Unknown json input. Unable to parse input for "),
+        (json!("2"), "Unknown json input. Unable to parse input for "),
+    ] {
+        let refused = rpc
+            .fund_vault(&p(vec![json!({ s.encoding.clone(): details })]))
+            .unwrap_err();
+        assert_eq!(code(refused), (-8, format!("{message}{}", s.encoding)));
+    }
+    assert!(s.net.submitted.lock().is_empty());
+
+    let funded = rpc
+        .fund_vault(&p(vec![json!({
+            s.encoding.clone(): 3,
+            other_manager.clone(): {"amount": 2, "repetitions": 2},
+        })]))
+        .unwrap_or_else(|e| panic!("fundvault failed: {}", error_message(e)));
+    let encodings = funded["vault"].as_array().unwrap();
+    assert_eq!(encodings.len(), 2);
+    assert_eq!(encodings[0]["encoding"], json!(s.encoding));
+    // Without an owner a new key of the wallet owns the vault
+    let second = encodings[1]["encoding"].as_str().unwrap();
+    let (new_owner, manager) = second.split_once(':').unwrap();
+    assert_eq!(manager, other_manager);
+    let new_owner: Address = new_owner.parse().unwrap();
+    assert!(s.manager.is_mine(&new_owner));
+
+    let tx = submitted_tx(&s);
+    assert_eq!(funded["txhash"], json!(tx.txid().to_string()));
+    assert_eq!(output_to(&tx, &s.vault), vec![3 * COIN]);
+    let other_manager: Address = other_manager.parse().unwrap();
+    assert_eq!(
+        output_to(&tx, &vault_script(&new_owner, &other_manager)),
+        vec![2 * COIN, 2 * COIN]
     );
 }

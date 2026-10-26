@@ -82,19 +82,7 @@ fn block_on(node: &Node, kp: &KeyPair, parent: Hash256, tag: u8, txs: &[Transact
     block
 }
 
-fn free_port() -> u16 {
-    use std::hash::{BuildHasher, Hasher};
-    let seed = std::collections::hash_map::RandomState::new();
-    for i in 0u32..1000 {
-        let mut h = seed.build_hasher();
-        h.write_u32(i);
-        let port = 20000 + (h.finish() % 12768) as u16;
-        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
-            return port;
-        }
-    }
-    panic!("no free port in 20000-32767");
-}
+use divi_test_support::free_port;
 
 struct Subscriber(TcpStream);
 

@@ -170,7 +170,7 @@ fn parse_fee_mode(mode: Option<&str>, allow_metadata: bool) -> Result<FeeMode, E
 
 /// Divi Core `EnsureWalletIsUnlocked`: sends, signing and key exports need a full
 /// unlock, so a wallet unlocked for staking only is refused like a locked one.
-fn ensure_fully_unlocked(wallet: &WalletDb) -> Result<(), Error> {
+pub(crate) fn ensure_fully_unlocked(wallet: &WalletDb) -> Result<(), Error> {
     if !wallet.is_fully_unlocked() {
         return Err(RpcError::new(
             codes::WALLET_UNLOCK_NEEDED,
@@ -956,6 +956,10 @@ impl WalletRpc {
         &self,
         send: impl FnOnce() -> Result<serde_json::Value, Error>,
     ) -> Result<serde_json::Value, Error> {
+        // A walletlock, or the unlock timer ending, during the send leaves the
+        // keys for it, as Divi Core's come before or after the send
+        let wallet = self.get_wallet().ok();
+        let _spend = wallet.as_ref().map(|w| w.begin_spend());
         let Some(mempool) = self.mempool.read().clone() else {
             return send();
         };
@@ -972,7 +976,17 @@ impl WalletRpc {
 
     /// fundvault, picking its coins and committing with no relayed transaction let in between
     pub fn fund_vault(&self, params: &Params) -> Result<serde_json::Value, Error> {
-        self.exclusive(|| self.fund_vault_held(params))
+        self.fund_vault_with(params, None)
+    }
+
+    /// fundvault with its fundings object's pairs as the request wrote them,
+    /// equal encodings included; None reads them from `params`
+    pub fn fund_vault_with(
+        &self,
+        params: &Params,
+        fundings: Option<&[(String, serde_json::Value)]>,
+    ) -> Result<serde_json::Value, Error> {
+        self.exclusive(|| self.fund_vault_held(params, fundings))
     }
 
     /// debitvaultbyname, picking its coins and committing with no relayed transaction let in between
@@ -992,7 +1006,17 @@ impl WalletRpc {
 
     /// sendmany, picking its coins and committing with no relayed transaction let in between
     pub fn send_many(&self, params: &Params) -> Result<serde_json::Value, Error> {
-        self.exclusive(|| self.send_many_held(params))
+        self.send_many_with(params, None)
+    }
+
+    /// sendmany with its amounts object's pairs as the request wrote them,
+    /// equal addresses included; None reads them from `params`
+    pub fn send_many_with(
+        &self,
+        params: &Params,
+        amounts: Option<&[(String, serde_json::Value)]>,
+    ) -> Result<serde_json::Value, Error> {
+        self.exclusive(|| self.send_many_held(params, amounts))
     }
 
     /// sendfrom, picking its coins and committing with no relayed transaction let in between
@@ -1516,28 +1540,13 @@ impl WalletRpc {
         }))
     }
 
-    /// walletpassphrase - Unlock wallet for specified time
+    /// walletpassphrase as Divi Core's (rpcwallet.cpp:2573-2625): the
+    /// passphrase and the staking-only flag are read, the wallet unlocked, and
+    /// only then the timeout read (get_int64): a timeout that is no integer is
+    /// refused with the wallet left unlocked and unlocked_until as it was, and
+    /// one of 0 or less unlocks with no timer, unlocked_until now plus it
     pub fn wallet_passphrase(&self, params: &Params) -> Result<serde_json::Value, Error> {
-        if let Ok(wallet) = self.get_wallet() {
-            if !wallet.is_encrypted() {
-                return Err(RpcError::new(
-                    codes::WALLET_WRONG_ENC_STATE,
-                    "Error: running with an unencrypted wallet, but walletpassphrase was called.",
-                )
-                .into());
-            }
-        }
-        let passphrase = params
-            .get_str(0)
-            .ok_or_else(|| RpcError::invalid_params("Passphrase required"))?;
-        let timeout = params
-            .get_u64(1)
-            .ok_or_else(|| RpcError::invalid_params("Timeout required"))?;
-        // Divi Core's third argument: unlock for staking only
-        let staking_only = params.get_bool(2).unwrap_or(false);
-
         let wallet = self.get_wallet()?;
-
         if !wallet.is_encrypted() {
             return Err(RpcError::new(
                 codes::WALLET_WRONG_ENC_STATE,
@@ -1545,7 +1554,12 @@ impl WalletRpc {
             )
             .into());
         }
-
+        let passphrase = spirit_str(params, 0)?;
+        let staking_only = if params.len() == 3 {
+            spirit_bool(params, 2)?
+        } else {
+            false
+        };
         if staking_only && wallet.is_unlocked_for_staking_only() {
             return Err(RpcError::new(
                 codes::WALLET_ALREADY_UNLOCKED,
@@ -1553,9 +1567,10 @@ impl WalletRpc {
             )
             .into());
         }
-
+        // A timer of a wallet unlocked for staking only goes back to staking
+        let revert_to_staking = wallet.is_unlocked_for_staking_only();
         wallet
-            .unlock_for(passphrase, timeout as u32, staking_only)
+            .unlock_keeping_timer(passphrase, staking_only)
             .map_err(|e| match e {
                 divi_wallet::WalletError::WrongPassphrase
                 | divi_wallet::WalletError::InvalidPassphrase => RpcError::new(
@@ -1564,7 +1579,13 @@ impl WalletRpc {
                 ),
                 other => RpcError::new(codes::WALLET_ERROR, other.to_string()),
             })?;
-
+        let timeout = match params.get(1) {
+            Some(serde_json::Value::Number(n)) if n.is_i64() || n.is_u64() => n
+                .as_i64()
+                .unwrap_or_else(|| n.as_u64().unwrap_or_default() as i64),
+            other => return Err(spirit_type_error(other, "int")),
+        };
+        wallet.set_unlock_timeout(timeout, revert_to_staking);
         Ok(serde_json::Value::Null)
     }
 
@@ -2929,9 +2950,25 @@ impl WalletRpc {
             .map(|(vout, _)| OutPoint::new(funding_txid, vout as u32))
             .collect();
 
-        // CWallet::AddVault finding nothing to add
+        // CWallet::AddVault stores the script before it syncs the transaction,
+        // so a transaction that pays the vault nothing still registers it; the
+        // call succeeds only if the transaction is the wallet's
+        // (rpcwallet.cpp:1295-1301, wallet.cpp:695-704)
         if vault_outpoints.is_empty() {
-            return Err(sync_failed().into());
+            let wallet = self.get_wallet()?;
+            if !wallet.vault_mode() {
+                return Err(sync_failed().into());
+            }
+            wallet.store_vault(VaultMetadata {
+                owner_address: owner_str.to_string(),
+                manager_address: manager_str.to_string(),
+                vault_script: vault_script_bytes.to_vec(),
+                funding_txid: *funding_txid.as_bytes(),
+            });
+            if wallet.get_transaction(&funding_txid).is_none() {
+                return Err(sync_failed().into());
+            }
+            return Ok(json!({"succeeded": true}));
         }
 
         // Divi Core's AddVault changes nothing without -vault (wallet.cpp:693-706)
@@ -3185,55 +3222,127 @@ impl WalletRpc {
     }
 
     /// Fund a vault - Adds funds to existing vault
-    fn fund_vault_held(&self, params: &Params) -> Result<serde_json::Value, Error> {
+    fn fund_vault_held(
+        &self,
+        params: &Params,
+        written: Option<&[(String, serde_json::Value)]>,
+    ) -> Result<serde_json::Value, Error> {
         let wallet = self.get_wallet()?;
 
         ensure_fully_unlocked(&wallet)?;
 
-        let vault_encoding = params.get_str(0).ok_or_else(|| {
-            RpcError::invalid_params("Missing required parameter: [owner_address:]manager_address")
-        })?;
-
-        let send_amount = amount_from_value(
-            params
-                .get(1)
-                .ok_or_else(|| RpcError::invalid_params("Missing required parameter: amount"))?,
-            false,
-        )?;
-
         // parseVaultAddressEncoding (rpcwallet.cpp:920-950): without an owner
         // a new key of the wallet owns the vault, put in the address book
         // with the name "" (rpcwallet.cpp:943)
-        let (owner_addr, manager_addr) = match vault_encoding.split_once(':') {
-            Some((owner, manager)) => (owner.to_string(), manager.to_string()),
-            None => {
-                let owner = wallet.new_receiving_address().map_err(new_key_error)?;
-                wallet.set_label(&owner, "").map_err(|e| {
-                    RpcError::new(codes::WALLET_ERROR, format!("Failed to store label: {}", e))
-                })?;
-                (owner.to_base58(), vault_encoding.to_string())
-            }
-        };
-        // validateAndConstructVaultScriptFromParsedAddresses (rpcwallet.cpp:952-966)
-        let key_hash = |address: &str, which: &str| -> Result<[u8; 20], Error> {
-            match self.decode_address(address) {
-                Ok(a) if a.addr_type == divi_wallet::address::AddressType::P2PKH => {
-                    Ok(*a.hash.as_bytes())
+        let mut payees: Vec<TxOut> = Vec::new();
+        let mut vaults: Vec<VaultMetadata> = Vec::new();
+        let mut encodings: Vec<serde_json::Value> = Vec::new();
+        let mut fund = |vault_encoding: &str, amount: Amount, repetitions: usize| {
+            let (owner_addr, manager_addr) = match vault_encoding.split_once(':') {
+                Some((owner, manager)) => (owner.to_string(), manager.to_string()),
+                None => {
+                    let owner = wallet.new_receiving_address().map_err(new_key_error)?;
+                    wallet.set_label(&owner, "").map_err(|e| {
+                        RpcError::new(codes::WALLET_ERROR, format!("Failed to store label: {}", e))
+                    })?;
+                    (owner.to_base58(), vault_encoding.to_string())
                 }
-                _ => Err(RpcError::new(
-                    codes::INVALID_ADDRESS_OR_KEY,
-                    format!("Invalid {which} DIVI address"),
-                )
-                .into()),
+            };
+            // validateAndConstructVaultScriptFromParsedAddresses (rpcwallet.cpp:952-966)
+            let key_hash = |address: &str, which: &str| -> Result<[u8; 20], Error> {
+                match self.decode_address(address) {
+                    Ok(a) if a.addr_type == divi_wallet::address::AddressType::P2PKH => {
+                        Ok(*a.hash.as_bytes())
+                    }
+                    _ => Err(RpcError::new(
+                        codes::INVALID_ADDRESS_OR_KEY,
+                        format!("Invalid {which} DIVI address"),
+                    )
+                    .into()),
+                }
+            };
+            let manager_hash = key_hash(&manager_addr, "manager")?;
+            let owner_hash = key_hash(&owner_addr, "owner")?;
+            let vault_script = StakingVaultScript::new(owner_hash, manager_hash).to_script();
+            for _ in 0..repetitions {
+                payees.push(TxOut::new(amount, vault_script.clone()));
             }
+            encodings.push(serde_json::json!({"encoding": format!("{owner_addr}:{manager_addr}")}));
+            vaults.push(VaultMetadata {
+                owner_address: owner_addr,
+                manager_address: manager_addr,
+                vault_script: vault_script.as_bytes().to_vec(),
+                funding_txid: [0; 32],
+            });
+            Ok::<(), Error>(())
         };
-        let manager_hash = key_hash(&manager_addr, "manager")?;
-        let owner_hash = key_hash(&owner_addr, "owner")?;
-        let encoding = format!("{owner_addr}:{manager_addr}");
-        let vault_script = StakingVaultScript::new(owner_hash, manager_hash).to_script();
-        let payees = [TxOut::new(send_amount, vault_script.clone())];
+
+        // parseFundVaultRPCParameters (rpcwallet.cpp:989-1036): an encoding and
+        // an amount, or one object of encodings, each with an amount or
+        // {"amount": a, "repetitions": n} for n outputs of a
+        match params.get(0) {
+            Some(serde_json::Value::Object(fundings)) => {
+                let fundings: Vec<(&String, &serde_json::Value)> = match written {
+                    Some(pairs) => pairs.iter().map(|(k, v)| (k, v)).collect(),
+                    None => fundings.iter().collect(),
+                };
+                for (encoding, value) in fundings {
+                    let unparsed = |what: &str| -> Error {
+                        RpcError::new(
+                            codes::INVALID_PARAMETER,
+                            format!("Unable to parse {what} for: {encoding}"),
+                        )
+                        .into()
+                    };
+                    match value {
+                        serde_json::Value::Number(_) => {
+                            fund(encoding, amount_from_value(value, false)?, 1)?
+                        }
+                        serde_json::Value::Object(details) => {
+                            let amount = details
+                                .get("amount")
+                                .filter(|v| v.is_number())
+                                .ok_or_else(|| unparsed("amount"))?;
+                            let repetitions = details
+                                .get("repetitions")
+                                .and_then(crate::protocol::json_spirit_int)
+                                .ok_or_else(|| unparsed("repetitions"))?;
+                            // std::max<int>(repetitions.get_int(), 1) (:1023)
+                            fund(
+                                encoding,
+                                amount_from_value(amount, false)?,
+                                repetitions.max(1) as usize,
+                            )?
+                        }
+                        _ => {
+                            return Err(RpcError::new(
+                                codes::INVALID_PARAMETER,
+                                format!("Unknown json input. Unable to parse input for {encoding}"),
+                            )
+                            .into())
+                        }
+                    }
+                }
+            }
+            _ => {
+                let send_amount = amount_from_value(
+                    params.get(1).ok_or_else(|| {
+                        RpcError::invalid_params("Missing required parameter: amount")
+                    })?,
+                    false,
+                )?;
+                let vault_encoding = params.get_str(0).ok_or_else(|| {
+                    RpcError::invalid_params(
+                        "Missing required parameter: [owner_address:]manager_address",
+                    )
+                })?;
+                fund(vault_encoding, send_amount, 1)?;
+            }
+        }
         check_send_total(&payees, spendable_balance(&wallet, self.current_height()))?;
-        ensure_not_dust(send_amount, &vault_script)?;
+        for out in &payees {
+            ensure_not_dust(out.value, &out.script_pubkey)?;
+        }
 
         let height = self.current_height();
 
@@ -3246,29 +3355,22 @@ impl WalletRpc {
             ChangeKind::P2pkh,
             &ChangeTo::NewKey,
         )?;
-        let vault_script_bytes = vault_script.as_bytes().to_vec();
         let txid = self.sign_and_submit(&wallet, &plan, ChangeTo::NewKey)?;
 
-        // Register the vault in the wallet so it can be tracked for staking/reclaiming
-        let metadata = VaultMetadata {
-            owner_address: owner_addr,
-            manager_address: manager_addr,
-            vault_script: vault_script_bytes,
-            funding_txid: *txid.as_bytes(),
-        };
-        wallet.store_vault(metadata);
-
-        info!(
-            "Funded vault {} with {} DIVI (txid: {})",
-            vault_encoding,
-            send_amount.as_divi_f64(),
-            txid
-        );
+        // Register each vault in the wallet so it can be tracked for staking/reclaiming
+        for mut metadata in vaults {
+            metadata.funding_txid = *txid.as_bytes();
+            info!(
+                "Funded vault {}:{} (txid: {})",
+                metadata.owner_address, metadata.manager_address, txid
+            );
+            wallet.store_vault(metadata);
+        }
 
         // rpcwallet.cpp:1059-1062
         Ok(serde_json::json!({
             "txhash": txid.to_string(),
-            "vault": [{"encoding": encoding}],
+            "vault": encodings,
         }))
     }
 
@@ -3407,6 +3509,14 @@ impl WalletRpc {
         let payees = [TxOut::new(send_amount, dest_addr.script_pubkey())];
         let plan = self.plan(&payees, &coins, mode, ChangeKind::Vault, &ChangeTo::NewKey)?;
         let txid = self.sign_and_submit(&wallet, &plan, ChangeTo::NewKey)?;
+        // The "metadata" mode carries a comment and a comment-to, as
+        // sendtoaddress's (rpcwallet.cpp:1170-1176)
+        if params.get_str(2) == Some("metadata") {
+            wallet.set_tx_notes(
+                &txid,
+                send_notes(&[("comment", params.get_str(3)), ("to", params.get_str(4))]),
+            );
+        }
         // SendMoneyToAddress: the txid alone (rpcwallet.cpp:1189)
         Ok(json!(txid.to_string()))
     }
@@ -3709,7 +3819,11 @@ impl WalletRpc {
     }
 
     /// sendmany - Send to multiple addresses in one transaction
-    fn send_many_held(&self, params: &Params) -> Result<serde_json::Value, Error> {
+    fn send_many_held(
+        &self,
+        params: &Params,
+        written: Option<&[(String, serde_json::Value)]>,
+    ) -> Result<serde_json::Value, Error> {
         // Divi Core spends only the named account's coins ("" for all)
         let account = account_from_value(
             params
@@ -3722,6 +3836,10 @@ impl WalletRpc {
             .get(1)
             .and_then(|v| v.as_object())
             .ok_or_else(|| RpcError::invalid_params("Amounts object required"))?;
+        let amounts: Vec<(&String, &serde_json::Value)> = match written {
+            Some(pairs) => pairs.iter().map(|(k, v)| (k, v)).collect(),
+            None => amounts.iter().collect(),
+        };
 
         // Divi Core's sendmany takes no minconf: the third argument is the
         // comment, whatever it reads as (rpcwallet.cpp:1716-1723), and the
@@ -3749,6 +3867,7 @@ impl WalletRpc {
         // {"amount": a, "repetitions": n} for n outputs of a
         let mut payees: Vec<TxOut> = Vec::new();
         let mut subtract_outputs: Vec<usize> = Vec::new();
+        let mut addresses = HashSet::new();
         for (addr_str, amount_value) in amounts {
             let addr = self.decode_address(addr_str).map_err(|_| {
                 RpcError::new(
@@ -3793,6 +3912,13 @@ impl WalletRpc {
                 }
                 None => (amount_from_value(amount_value, false)?, 1),
             };
+            if !addresses.insert(addr.to_base58()) {
+                return Err(RpcError::new(
+                    codes::INVALID_PARAMETER,
+                    format!("Invalid parameter, duplicated address: {}", addr_str),
+                )
+                .into());
+            }
             for _ in 0..repetitions {
                 if subtract_fee_from.contains(addr_str) {
                     subtract_outputs.push(payees.len());
@@ -3888,10 +4014,17 @@ impl WalletRpc {
         wallet
             .change_passphrase(old_passphrase, new_passphrase)
             .map_err(|e| match e {
-                divi_wallet::WalletError::WrongPassphrase => RpcError::new(
-                    codes::WALLET_PASSPHRASE_INCORRECT,
-                    "Error: The wallet passphrase entered was incorrect.",
-                ),
+                divi_wallet::WalletError::WrongPassphrase => {
+                    // divid locks the wallet before it checks the old passphrase
+                    // and does not unlock it again (wallet.cpp:815, :820-823)
+                    if !wallet.is_locked() {
+                        wallet.lock_keeping_unlock_time();
+                    }
+                    RpcError::new(
+                        codes::WALLET_PASSPHRASE_INCORRECT,
+                        "Error: The wallet passphrase entered was incorrect.",
+                    )
+                }
                 other => RpcError::new(codes::WALLET_ENCRYPTION_FAILED, other.to_string()),
             })?;
 
@@ -3987,7 +4120,9 @@ impl WalletRpc {
         let wallet = self.get_wallet()?;
 
         // Try to parse as address first
-        let addr = if let Ok(address) = self.decode_address(addr_or_script) {
+        let parsed = self.decode_address(addr_or_script).ok();
+        let from_address = parsed.is_some();
+        let addr = if let Some(address) = parsed {
             address
         } else {
             // Try as hex script
@@ -4022,6 +4157,9 @@ impl WalletRpc {
         } else {
             None
         };
+        // Only an address is labelled; a script in hex is watched without
+        // an address book entry (rpcdump.cpp:150-151)
+        let label = label.filter(|_| from_address);
         let rescan = if params.len() > 2 {
             spirit_bool(params, 2)?
         } else {
@@ -4039,9 +4177,11 @@ impl WalletRpc {
         // As Core: an address already watched only gets its label
         // (rpcdump.cpp:150-156)
         if wallet.is_watch_only(&addr) {
-            wallet.set_label(&addr, label.unwrap_or("")).map_err(|e| {
-                RpcError::new(codes::WALLET_ERROR, format!("Failed to store label: {}", e))
-            })?;
+            if from_address {
+                wallet.set_label(&addr, label.unwrap_or("")).map_err(|e| {
+                    RpcError::new(codes::WALLET_ERROR, format!("Failed to store label: {}", e))
+                })?;
+            }
             return Ok(serde_json::Value::Null);
         }
 
@@ -4056,9 +4196,11 @@ impl WalletRpc {
             })?;
 
         info!("Imported watch-only address: {}", addr);
-        wallet.set_label(&addr, label.unwrap_or("")).map_err(|e| {
-            RpcError::new(codes::WALLET_ERROR, format!("Failed to store label: {}", e))
-        })?;
+        if from_address {
+            wallet.set_label(&addr, label.unwrap_or("")).map_err(|e| {
+                RpcError::new(codes::WALLET_ERROR, format!("Failed to store label: {}", e))
+            })?;
+        }
 
         // Save wallet
         wallet.save().map_err(|e| {

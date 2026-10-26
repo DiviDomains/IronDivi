@@ -92,6 +92,9 @@ pub struct StakingConfig {
     /// Size below which transactions under the fee floor still go in, Divi
     /// Core `-blockminsize`
     pub block_min_size: usize,
+    /// The version of the blocks made, Divi Core `-blockversion` on regtest
+    /// (BlockFactory.cpp:90-95); 4 when not given
+    pub block_version: Option<i32>,
     /// Maximum block weight
     pub max_block_weight: usize,
     /// Staking loop interval (milliseconds)
@@ -259,6 +262,7 @@ impl Default for StakingConfig {
             max_block_size: DEFAULT_BLOCK_MAX_SIZE,
             block_priority_size: DEFAULT_BLOCK_PRIORITY_SIZE,
             block_min_size: DEFAULT_BLOCK_MIN_SIZE,
+            block_version: None,
             max_block_weight: 4_000_000,
             loop_interval_ms: 500, // Try every 500ms
             max_tip_age_secs: DEFAULT_MAX_TIP_AGE_SECS,
@@ -676,6 +680,14 @@ impl Staker {
         }
     }
 
+    /// Stop staking and wait for a round under way to end, as Divi Core's
+    /// ShutdownCoinMintingModule stops and joins its minting thread before the
+    /// shutdown goes on (miner.cpp:110-115, init.cpp:373). Blocks the caller
+    pub fn stop_and_wait(&self) {
+        self.stop();
+        drop(self.producing.lock());
+    }
+
     /// Main staking loop
     async fn staking_loop(&self) {
         let interval = tokio::time::Duration::from_millis(self.config.read().loop_interval_ms);
@@ -706,6 +718,8 @@ impl Staker {
 
             // Try to stake; skip the round while setgenerate is producing
             let result = match self.producing.try_lock() {
+                // stop_and_wait may have come in since the loop's check
+                Some(_) if !self.running.load(Ordering::SeqCst) => break,
                 Some(_producing) => {
                     let result = self.try_stake();
                     if let StakeResult::Success {
@@ -1041,7 +1055,7 @@ impl Staker {
         }];
         transactions.extend(self.mempool_block_txs(height, time));
         let mut header = BlockHeader {
-            version: 4,
+            version: self.config.read().block_version.unwrap_or(4),
             prev_block: tip.hash,
             merkle_root: compute_merkle_root(&transactions),
             time,
@@ -1874,7 +1888,7 @@ impl Staker {
 
         // Create block header
         let header = BlockHeader {
-            version: 4, // PoS blocks use version 4+
+            version: self.config.read().block_version.unwrap_or(4),
             prev_block: tip.hash,
             merkle_root,
             time: timestamp,
@@ -2463,40 +2477,32 @@ impl BlockAssembly {
     }
 }
 
-/// A candidate's place in Divi Core's `TxPriorityCompare`
-/// (BlockMemoryPoolTransactionCollector.cpp:65-87): by priority with ties by
-/// fee rate, or by fee rate with ties by priority. Core's heap leaves equal
-/// keys in no set order; here they go by txid.
+/// A candidate in Divi Core's block assembly heap: what `TxPriorityCompare`
+/// weighs (BlockMemoryPoolTransactionCollector.cpp:65-87)
+#[derive(Clone)]
 struct HeapItem {
-    by_fee: bool,
     index: usize,
     priority: f64,
     fee_rate: i64,
-    txid: Hash256,
 }
 
-impl PartialEq for HeapItem {
-    fn eq(&self, other: &Self) -> bool {
-        self.cmp(other) == std::cmp::Ordering::Equal
-    }
-}
-impl Eq for HeapItem {}
-impl PartialOrd for HeapItem {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-impl Ord for HeapItem {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        let by_priority = self.priority.total_cmp(&other.priority);
-        let by_fee = self.fee_rate.cmp(&other.fee_rate);
-        let order = if self.by_fee {
-            by_fee.then(by_priority)
+/// Divi Core's TxPriorityCompare (BlockMemoryPoolTransactionCollector.cpp:66-87):
+/// true when `a` goes after `b`; by priority then fee rate, or by fee rate then
+/// priority once the block is filled by fee. Equal candidates are left where
+/// the heap steps put them (core_heap).
+fn tx_priority_less(by_fee: bool) -> impl Fn(&HeapItem, &HeapItem) -> bool {
+    move |a, b| {
+        if by_fee {
+            if a.fee_rate == b.fee_rate {
+                a.priority < b.priority
+            } else {
+                a.fee_rate < b.fee_rate
+            }
+        } else if a.priority == b.priority {
+            a.fee_rate < b.fee_rate
         } else {
-            by_priority.then(by_fee)
-        };
-        // The lower txid first among equal keys (a max-heap pops the greatest)
-        order.then_with(|| other.txid.cmp(&self.txid))
+            a.priority < b.priority
+        }
     }
 }
 
@@ -2522,11 +2528,21 @@ fn select_block_txs(
     maturity: u32,
     utxo: impl Fn(&OutPoint) -> Option<divi_storage::Utxo>,
 ) -> Vec<Transaction> {
-    use std::collections::{BinaryHeap, HashSet};
-    let candidates: Vec<_> = candidates
+    use crate::core_heap::{make_heap, pop_heap, push_heap};
+    use std::collections::HashSet;
+    // In the order Divi Core walks its mempool, a std::map by txid: the txids
+    // as numbers, compared from the last byte (uint256.cpp:139-148)
+    let mut candidates: Vec<_> = candidates
         .into_iter()
         .filter(|c| c.tx.is_final(height, time))
         .collect();
+    candidates.sort_by(|a, b| {
+        a.txid
+            .as_bytes()
+            .iter()
+            .rev()
+            .cmp(b.txid.as_bytes().iter().rev())
+    });
     let index: HashMap<Hash256, usize> = candidates
         .iter()
         .enumerate()
@@ -2548,24 +2564,27 @@ fn select_block_txs(
         }
     }
     let mut by_fee = limits.priority_size == 0;
-    let item = |i: usize, by_fee: bool| HeapItem {
-        by_fee,
+    let item = |i: usize| HeapItem {
         index: i,
         priority: candidates[i].priority,
         fee_rate: candidates[i].fee_rate_per_kb,
-        txid: candidates[i].txid,
     };
-    let mut heap: BinaryHeap<HeapItem> = (0..candidates.len())
+    // vecPriority and its heap (:202-235, :276-277)
+    let mut heap: Vec<HeapItem> = (0..candidates.len())
         .filter(|&i| needs[i] == 0 && !blocked[i])
-        .map(|i| item(i, by_fee))
+        .map(item)
         .collect();
+    make_heap(&mut heap, tx_priority_less(by_fee));
 
     let mut kept = Vec::new();
     let mut created: HashMap<OutPoint, TxOut> = HashMap::new();
     let mut spent: HashSet<OutPoint> = HashSet::new();
     let mut block_size = 1000usize;
     let mut block_sig_ops = 100u32;
-    while let Some(best) = heap.pop() {
+    while !heap.is_empty() {
+        let best = heap[0].clone();
+        pop_heap(&mut heap, tx_priority_less(by_fee));
+        heap.pop();
         let c = &candidates[best.index];
         let tx = &c.tx;
         let size = c.size;
@@ -2587,7 +2606,7 @@ fn select_block_txs(
             // This one is still weighed below, now by fee
             if block_size + size >= limits.priority_size || must_pay {
                 by_fee = true;
-                heap = heap.into_iter().map(|h| item(h.index, true)).collect();
+                make_heap(&mut heap, tx_priority_less(true));
             }
         } else if !c.prioritised
             && c.fee_rate_per_kb < limits.fee_floor_per_kb
@@ -2653,7 +2672,9 @@ fn select_block_txs(
         for &child in waiting.get(&c.txid).map(Vec::as_slice).unwrap_or(&[]) {
             needs[child] -= 1;
             if needs[child] == 0 && !blocked[child] {
-                heap.push(item(child, by_fee));
+                // AddDependingTransactionsToPriorityQueue (:149-167)
+                heap.push(item(child));
+                push_heap(&mut heap, tx_priority_less(by_fee));
             }
         }
     }
@@ -4064,6 +4085,41 @@ mod tests {
             &set,
         );
         assert_eq!(ids(&kept), ids(&[t[0].clone(), t[1].clone(), t[2].clone()]));
+    }
+
+    /// Candidates that tie on priority and fee rate (a chain's transactions,
+    /// many sends of one wallet) come out as Divi Core's heap gives them: the
+    /// pool in txid order (mapTx), then std::make_heap and std::pop_heap
+    /// (BlockMemoryPoolTransactionCollector.cpp:276-337). For ten equal keys
+    /// libstdc++ gives the positions 6, 2, 0, 1, 3, 5, 7, 4, 9, 8
+    #[test]
+    fn equal_candidates_follow_divi_cores_heap() {
+        let coins: Vec<OutPoint> = (1..=10).map(|n| op(n, 0)).collect();
+        let set = utxos(
+            coins
+                .iter()
+                .map(|o| (*o, chain_coin(10, OP_TRUE, 1, false)))
+                .collect(),
+        );
+        let txs: Vec<Transaction> = coins
+            .iter()
+            .enumerate()
+            .map(|(i, c)| spend_tx(&[*c], i as u32 + 1))
+            .collect();
+        let mut by_txid = txs.clone();
+        by_txid.sort_by_key(|t| t.txid().to_string());
+        let expected: Vec<Transaction> = [6, 2, 0, 1, 3, 5, 7, 4, 9, 8]
+            .iter()
+            .map(|&i| by_txid[i].clone())
+            .collect();
+        for assembly in [
+            BlockAssembly::new(750_000, 0, 0, 10_000),
+            BlockAssembly::new(750_000, 50_000, 0, 10_000),
+        ] {
+            let pool = txs.iter().map(|t| cand(t, HIGH, 20_000, &[])).collect();
+            let kept = select_block_txs(pool, 50, 0, &assembly, 20, &set);
+            assert_eq!(ids(&kept), ids(&expected));
+        }
     }
 
     /// The sizes are kept within -blockmaxsize, which is kept between 1,000

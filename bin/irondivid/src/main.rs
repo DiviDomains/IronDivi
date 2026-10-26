@@ -38,7 +38,7 @@ use divi_rpc::{start_server_with_wallet_peer_and_staker, RpcConfig};
 use divi_wallet::{HdWallet, Network as WalletNetwork, WalletDb};
 use settings::{atoi, Settings};
 use std::error::Error as StdError;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::signal;
 use tokio::sync::broadcast;
@@ -58,6 +58,9 @@ struct Args {
     daemon: bool,
     printtoconsole: bool,
     debug: bool,
+    logips: bool,
+    logtimestamps: bool,
+    shrinkdebugfile: bool,
     wallet: Option<PathBuf>,
     disablewallet: bool,
     sysperms: bool,
@@ -173,6 +176,10 @@ impl Args {
         // -debug=<category> may repeat; -debug=0 is no debugging
         let debug = s.get_multi("debug");
         self.debug = !debug.is_empty() && !debug.iter().any(|c| c == "0");
+        self.logips = s.get_bool("logips", false);
+        self.logtimestamps = s.get_bool("logtimestamps", true);
+        // Default: shrink unless debugging (Logging.cpp:204)
+        self.shrinkdebugfile = s.get_bool("shrinkdebugfile", !self.debug);
         self.wallet = path("wallet");
         self.disablewallet = s.get_bool("disablewallet", false);
         self.sysperms = s.get_bool("sysperms", false);
@@ -291,35 +298,68 @@ fn resolve_args(mut args: Args) -> Result<Args> {
     Ok(args)
 }
 
-/// Options divid takes that irondivid has nothing for: accepted, with a warning
+/// Options divid takes that irondivid has nothing for: accepted, with a warning.
+/// Among them divid's test aids for parts irondivid has but does not let an
+/// option change: -accountlabels (the default account's coins in every send,
+/// rpcwallet.cpp:445-467, :715), -activeversion (the masternode protocol,
+/// version.cpp:11-17), -manual_fork (two fork times, ForkActivation.cpp:50-55),
+/// -override_mnpayee (BlockIncentivesPopulator.cpp:224), -prunewalletconfs
+/// (the wallet's transactions in memory, wallet.cpp:1162-1239),
+/// and -stakeupdatetime (PoSTransactionCreator.cpp:116)
 const UNSUPPORTED_OPTIONS: &[&str] = &[
+    "accountlabels",
+    "activeversion",
+    "manual_fork",
+    "override_mnpayee",
+    "prunewalletconfs",
+    "stakeupdatetime",
     "checklevel",
-    "dns",
-    "listenonion",
-    "logips",
-    "logtimestamps",
-    "maxreceivebuffer",
-    "maxsendbuffer",
-    "onion",
-    "onlynet",
     "par",
-    "peerbloomfilters",
-    "proxyrandomize",
-    "shrinkdebugfile",
-    "torcontrol",
-    "torpassword",
-    "upnp",
 ];
 
 /// Options divid takes and does nothing with, only naming them in its help:
 /// accepted without a word, as divid does (LicenseAndInfo.cpp:135, :143;
-/// -disablesystemnotifications :142, -mining and -genproclimit :186-187, :205)
+/// -disablesystemnotifications :142, -mining and -genproclimit :186-187, :205;
+/// -checkpoints :165, -printpriority :201; -windowtitle :150,
+/// -printstakemodifier and -printcoinstake :215-216)
 const UNUSED_BY_DIVID: &[&str] = &[
     "sendfreetransactions",
     "txconfirmtarget",
     "disablesystemnotifications",
     "mining",
     "genproclimit",
+    "checkpoints",
+    "printpriority",
+    "windowtitle",
+    "printstakemodifier",
+    "printcoinstake",
+];
+
+/// Options divid reads for checks and test aids of its own that irondivid has
+/// no counterpart for, taken without a word as divid takes them: consistency
+/// checks of its block index and mempool (BlockCheckingHelpers.cpp:162,
+/// init.cpp:795), its wallet flush thread (init.cpp:1281) and signature cache
+/// size (script/sigcache.cpp:51), none of which shows outside, and its message
+/// fault injection (-dropmessagestest main.cpp:473, Node.cpp:479;
+/// -fuzzmessagestest Node.cpp:484-485), which irondivid does not do; its
+/// Berkeley DB wallet environment (-dblogsize db.cpp:101, -privdb
+/// dbenv.cpp:68); the debug section of its -help (-help-debug
+/// LicenseAndInfo.cpp:140-231); and the shutdown flag of its block index with
+/// the recovery after a stop that was not prepared (-safe_shutdown, -recoverblockdb
+/// BlockIndexLoading.cpp:258-283), a check irondivid does not make (see
+/// -forcestart)
+const NO_COUNTERPART: &[&str] = &[
+    "checkblockindex",
+    "checkmempool",
+    "flushwallet",
+    "maxsigcachesize",
+    "dropmessagestest",
+    "fuzzmessagestest",
+    "dblogsize",
+    "privdb",
+    "help-debug",
+    "safe_shutdown",
+    "recoverblockdb",
 ];
 
 /// Options apply_settings reads
@@ -344,13 +384,17 @@ const APPLIED: &[&str] = &[
     "litemode",
     "budgetvotemode",
     "rescan",
+    "force_rescan",
     "salvagewallet",
+    "dbloadfailexit",
+    "allowunencryptedwallet",
     "spendzeroconfchange",
     "keypool",
     "upgradewallet",
     "createwalletbackups",
     "monthlybackups",
     "vault_min",
+    "whitelisted_vault",
     "rpcuser",
     "rpcpassword",
     "rpcport",
@@ -370,8 +414,26 @@ const APPLIED: &[&str] = &[
     "maxconnections",
     "timeout",
     "proxy",
+    "proxyrandomize",
+    "onion",
+    "dns",
+    "listenonion",
+    "torcontrol",
+    "torpassword",
+    "upnp",
+    // read by retired_options
+    "socks",
+    "tor",
+    "debugnet",
+    "benchmark",
     "discover",
     "externalip",
+    "onlynet",
+    "maxreceivebuffer",
+    "maxsendbuffer",
+    "logips",
+    "logtimestamps",
+    "shrinkdebugfile",
     "protocolversion",
     "banscore",
     "bantime",
@@ -382,6 +444,7 @@ const APPLIED: &[&str] = &[
     "maxreorg",
     "maxorphantx",
     "minrelaytxfee",
+    "peerbloomfilters",
     "acceptnonstandard",
     "permitbaremultisig",
     "datacarrier",
@@ -393,6 +456,7 @@ const APPLIED: &[&str] = &[
     "staking",
     "stakeonstaletip",
     "stakesplitthreshold",
+    "blockversion",
     "blockmaxsize",
     "blockprioritysize",
     "blockminsize",
@@ -444,6 +508,10 @@ const READ_ELSEWHERE: &[&str] = &[
     "snapshot-signer",
     "maxlogsize",
     "maxlogfiles",
+    // read by main before the runtime starts
+    "mocktime",
+    "testsafemode",
+    "disablesafemode",
     "?",
     "help",
     "h",
@@ -489,24 +557,81 @@ fn host_and_port(value: &str) -> (String, Option<u16>) {
 fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     let mut s = settings.clone();
     let regtest = config.network.network_type == NetworkType::Regtest;
-    // -bind or -whitebind means listening; -connect means no DNS seeds and
-    // no listening; -proxy means no listening (net.cpp:1672-1700)
+    // divid's parameter interactions, each logged as divid logs it when it
+    // sets an option not given (net.cpp:1672-1716). -bind or -whitebind means
+    // listening; -connect means no DNS seeds and no listening
+    let interaction = |set: bool, text: &str| {
+        if set {
+            info!("{}", text);
+        }
+    };
     if s.is_set("bind") || s.is_set("whitebind") {
-        s.soft_set_bool("listen", true);
+        let set = s.soft_set_bool("listen", true);
+        interaction(
+            set,
+            "InitializeDivi : parameter interaction: -bind or -whitebind set -> setting -listen=1",
+        );
     }
     if !s.get_multi("connect").is_empty() {
-        if s.soft_set_bool("dnsseed", false) {
-            info!("InitializeDivi : parameter interaction: -connect set -> setting -dnsseed=0");
-        }
-        s.soft_set_bool("listen", false);
+        let set = s.soft_set_bool("dnsseed", false);
+        interaction(
+            set,
+            "InitializeDivi : parameter interaction: -connect set -> setting -dnsseed=0",
+        );
+        let set = s.soft_set_bool("listen", false);
+        interaction(
+            set,
+            "InitializeDivi : parameter interaction: -connect set -> setting -listen=0",
+        );
     }
+    // -proxy means no listening, no UPnP and no discovery
     if s.is_set("proxy") {
-        s.soft_set_bool("listen", false);
+        let set = s.soft_set_bool("listen", false);
+        interaction(
+            set,
+            "SetNetworkingParameters: parameter interaction: -proxy set -> setting -listen=0",
+        );
+        let set = s.soft_set_bool("upnp", false);
+        interaction(
+            set,
+            "SetNetworkingParameters: parameter interaction: -proxy set -> setting -upnp=0",
+        );
+        let set = s.soft_set_bool("discover", false);
+        interaction(
+            set,
+            "InitializeDivi : parameter interaction: -proxy set -> setting -discover=0",
+        );
     }
-    // -proxy, -listen=0 and -externalip each turn -discover off unless it is
-    // given (net.cpp:1690-1716)
-    if s.is_set("proxy") || !s.get_bool("listen", true) || s.is_set("externalip") {
-        s.soft_set_bool("discover", false);
+    // -salvagewallet rewrites nothing in Divi Core 3.0.0: it sets -rescan
+    // (EnableWalletFeatures, init.cpp:763-766)
+    if s.get_bool("salvagewallet", false) && s.soft_set_bool("rescan", true) {
+        info!("InitializeDivi : parameter interaction: -salvagewallet=1 -> setting -rescan=1");
+    }
+    // -listen=0 turns -upnp, -discover and -listenonion off unless given
+    if !s.get_bool("listen", true) {
+        let set = s.soft_set_bool("upnp", false);
+        interaction(
+            set,
+            "InitializeDivi : parameter interaction: -listen=0 -> setting -upnp=0",
+        );
+        let set = s.soft_set_bool("discover", false);
+        interaction(
+            set,
+            "InitializeDivi : parameter interaction: -listen=0 -> setting -discover=0",
+        );
+        let set = s.soft_set_bool("listenonion", false);
+        interaction(
+            set,
+            "InitializeDivi : parameter interaction: -listen=0 -> setting -listenonion=0",
+        );
+    }
+    // -externalip turns -discover off unless given
+    if s.is_set("externalip") {
+        let set = s.soft_set_bool("discover", false);
+        interaction(
+            set,
+            "InitializeDivi : parameter interaction: -externalip set -> setting -discover=0",
+        );
     }
     // Regtest does not stake unless asked (init.cpp:242); no wallet, no staking
     if regtest && !s.is_set("staking") {
@@ -584,12 +709,20 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     if let Some(p) = port("port") {
         config.p2p.port = p;
     }
-    if let Some(first) = s.get_multi("bind").first() {
+    // GetListenPort: -port, else the network's (net.cpp)
+    let listen_port = config.p2p.port;
+    let binds = s.get_multi("bind");
+    if let Some(first) = binds.first() {
         let (host, p) = host_and_port(first);
         config.p2p.listen_addr = host;
         if let Some(p) = p {
             config.p2p.port = p;
         }
+    }
+    // Every further -bind is listened on too, on its own port or the listen
+    // port (net.cpp:1809-1814)
+    for raw in binds.iter().skip(1) {
+        config.p2p.more_bind.push(bind_address(raw, listen_port)?);
     }
     if s.is_set("listen") {
         config.p2p.listen = Some(s.get_bool("listen", true));
@@ -632,10 +765,15 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         config.p2p.dns_seed = Some(s.get_bool("dnsseed", true));
     }
     config.p2p.force_dns_seed = s.get_bool("forcednsseed", false);
-    // -maxconnections counts inbound and outbound; at most 16 are outbound
-    // (net.cpp:106, :757, :1727)
-    if let Some(n) = number_option(&s, "maxconnections", 0..=i64::from(u32::MAX)) {
-        let n = n as usize;
+    // -maxconnections as divid reads it: atoi64, at most FD_SETSIZE (1024) less
+    // one for -bind and one for -whitebind (at least one) less 150 kept for
+    // files, at least 0, with no warning (net.cpp:1726-1728). Inbound peers
+    // may use it less 16 (net.cpp:757); at most 16 learnt addresses are dialled
+    if s.is_set("maxconnections") {
+        let binds = (i64::from(s.is_set("bind")) + i64::from(s.is_set("whitebind"))).max(1);
+        let n = settings::atoi(s.get("maxconnections").unwrap_or(""))
+            .min(1024 - binds - 150)
+            .max(0) as usize;
         config.p2p.max_outbound = n.min(16);
         config.p2p.max_inbound = n.saturating_sub(16);
     }
@@ -647,11 +785,27 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     if let Some(proxy) = s.get("proxy") {
         config.p2p.proxy = Some(proxy.to_string());
     }
+    // GetBoolArg("-proxyrandomize", true) (net.cpp:1761)
+    config.p2p.proxy_randomize = s.get_bool("proxyrandomize", true);
+    // -onion=<ip:port>, -onion=0 / -noonion (net.cpp:1785-1800)
+    config.p2p.onion = s.get("onion").map(str::to_string);
+    // GetBoolArg("-dns", DEFAULT_NAME_LOOKUP): host names are looked up only
+    // with it (net.cpp:1759)
+    config.p2p.name_lookup = s.get_bool("dns", true);
+    // The Tor controller (init.cpp:1621, torcontrol.cpp:640, :744)
+    config.p2p.listen_onion = s.get_bool("listenonion", true);
+    config.p2p.tor_control = s
+        .get("torcontrol")
+        .unwrap_or(divi_network::torcontrol::DEFAULT_TOR_CONTROL)
+        .to_string();
+    config.p2p.tor_password = s.get("torpassword").unwrap_or("").to_string();
+    config.p2p.upnp = s.get_bool("upnp", divi_network::upnp::DEFAULT_UPNP);
     config.p2p.discover = s.get_bool("discover", true);
+    config.p2p.peer_bloom_filters = s.get_bool("peerbloomfilters", true);
     // -externalip=<ip>[:port], the listen port when none is given; one that
     // does not resolve to a valid address stops the start (net.cpp:1834-1839)
     for raw in s.get_multi("externalip") {
-        let addr = resolve_service(raw, config.p2p.port)
+        let addr = resolve_service(raw, config.p2p.port, config.p2p.name_lookup)
             .filter(|a| divi_network::local::is_valid(&a.ip()))
             .ok_or_else(|| anyhow::anyhow!("Cannot resolve -externalip address: '{}'", raw))?;
         config.p2p.external_ips.push(addr);
@@ -730,12 +884,18 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     // -onlynet: each one of Divi Core's network names (ParseNetwork,
     // netbase.cpp:70-77; init.cpp:1734-1740)
     for net in s.get_multi("onlynet") {
-        if !matches!(
-            net.to_lowercase().as_str(),
-            "ipv4" | "ipv6" | "tor" | "onion"
-        ) {
+        if divi_network::local::Network::parse(net).is_none() {
             anyhow::bail!("Unknown network specified in -onlynet: '{}'", net);
         }
+        config.p2p.only_nets.push(net.to_lowercase());
+    }
+    // -maxreceivebuffer: thousands of bytes, read as divid's GetArg
+    if let Some(v) = s.get("maxreceivebuffer") {
+        config.p2p.max_receive_buffer = settings::atoi(v);
+    }
+    // -maxsendbuffer: thousands of bytes, read as divid's GetArg
+    if let Some(v) = s.get("maxsendbuffer") {
+        config.p2p.max_send_buffer = settings::atoi(v);
     }
     if let Some(wif) = s.get("sporkkey") {
         // Divi Core's SetSporkKey (init.cpp:968-975): a key that is not this
@@ -761,14 +921,23 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
             _ => warn!("Invalid stakesplitthreshold value, expected DIVI"),
         }
     }
-    // Divi Core reads these as unsigned int (BlockMemoryPoolTransactionCollector.cpp:18-42)
+    // -blockversion: the version of the blocks made, on regtest only, read
+    // as a number into the header's int (BlockFactory.cpp:90-95)
+    if regtest {
+        if let Some(text) = s.get("blockversion") {
+            config.staking.block_version = Some(atoi(text) as i32);
+        }
+    }
+    // Divi Core reads these with atoi64 into an unsigned int, never refusing
+    // one: a word or nothing is 0, a negative one wraps; the staker clamps
+    // them (BlockMemoryPoolTransactionCollector.cpp:18-42)
     for (key, slot) in [
         ("blockmaxsize", &mut config.staking.block_max_size),
         ("blockprioritysize", &mut config.staking.block_priority_size),
         ("blockminsize", &mut config.staking.block_min_size),
     ] {
-        if let Some(n) = number_option(&s, key, 0..=i64::from(u32::MAX)) {
-            *slot = n as usize;
+        if let Some(text) = s.get(key) {
+            *slot = atoi(text) as u32 as usize;
         }
     }
     for (key, slot) in [
@@ -831,17 +1000,11 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     }
     config.p2p.alerts = s.get_bool("alerts", true);
 
+    retired_options(settings)?;
     let mut keys: Vec<&String> = settings.keys().collect();
     keys.sort();
     for key in keys {
         let k = key.as_str();
-        if k == "checklevel" {
-            // divid refuses any -checklevel: it always checks at level 4
-            // (init.cpp:782-784)
-            anyhow::bail!(
-                "Error: Unsupported argument -checklevel found. Checklevel must be level 4."
-            );
-        }
         if let Some(text) = option_warning(settings, k) {
             warn!("{}", text);
         }
@@ -849,10 +1012,44 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     Ok(())
 }
 
+/// divid's check of the options it no longer takes, in its order
+/// (CheckCriticalUnsupportedFeaturesAreNotUsed, init.cpp:770-790): a true
+/// -debugnet or -benchmark draws a warning; -socks given at all and a true
+/// -tor stop the start, as any -checklevel does (it always checks at level 4)
+fn retired_options(s: &Settings) -> Result<()> {
+    if s.get_bool("debugnet", false) {
+        init_warning("Warning: Unsupported argument -debugnet ignored, use -debug=net.");
+    }
+    if s.is_set("socks") {
+        anyhow::bail!("Error: Unsupported argument -socks found. Setting SOCKS version isn't possible anymore, only SOCKS5 proxies are supported.");
+    }
+    if s.get_bool("tor", false) {
+        anyhow::bail!("Error: Unsupported argument -tor found, use -onion.");
+    }
+    if s.is_set("checklevel") {
+        anyhow::bail!("Error: Unsupported argument -checklevel found. Checklevel must be level 4.");
+    }
+    if s.get_bool("benchmark", false) {
+        init_warning("Warning: Unsupported argument -benchmark ignored, use -debug=bench.");
+    }
+    Ok(())
+}
+
+/// divid's InitWarning: "Warning: " and the text, in debug.log and on stderr
+/// (init.cpp:303-307, noui.cpp:38-40)
+fn init_warning(text: &str) {
+    info!("Warning: {}", text);
+    eprintln!("Warning: {}", text);
+}
+
 /// The warning an option read nowhere gets: one divid takes and irondivid
 /// has nothing for, or one neither knows; none for an option that is read
 fn option_warning(settings: &Settings, k: &str) -> Option<String> {
-    if APPLIED.contains(&k) || READ_ELSEWHERE.contains(&k) || UNUSED_BY_DIVID.contains(&k) {
+    if APPLIED.contains(&k)
+        || READ_ELSEWHERE.contains(&k)
+        || UNUSED_BY_DIVID.contains(&k)
+        || NO_COUNTERPART.contains(&k)
+    {
         return None;
     }
     Some(if UNSUPPORTED_OPTIONS.contains(&k) {
@@ -863,6 +1060,22 @@ fn option_warning(settings: &Settings, k: &str) -> Option<String> {
     } else {
         format!("Unknown option -{}; ignored", settings.written_name(k))
     })
+}
+
+/// A -bind value as Divi Core's Lookup reads it without name lookup: `ip`,
+/// `ip:port` or `[ipv6]:port`, `port` when none is given; else the start stops
+/// with "Cannot resolve -bind address" (net.cpp:1809-1813)
+fn bind_address(text: &str, port: u16) -> Result<std::net::SocketAddr> {
+    let text = text.trim();
+    text.parse::<std::net::SocketAddr>()
+        .ok()
+        .or_else(|| {
+            text.trim_matches(['[', ']'])
+                .parse::<std::net::IpAddr>()
+                .ok()
+                .map(|ip| std::net::SocketAddr::new(ip, port))
+        })
+        .ok_or_else(|| anyhow::anyhow!("Cannot resolve -bind address: '{}'", text))
 }
 
 /// A -whitebind value as Divi Core's Lookup reads it without name lookup:
@@ -919,7 +1132,11 @@ fn is_spork_key(wif: &str, mainnet: bool, spork: &[u8]) -> bool {
 
 /// A host with an optional port, as Divi Core's CService reads it: `ip`,
 /// `ip:port`, `[ipv6]:port`, or a name, with `default_port` when none is given
-fn resolve_service(text: &str, default_port: u16) -> Option<std::net::SocketAddr> {
+fn resolve_service(
+    text: &str,
+    default_port: u16,
+    name_lookup: bool,
+) -> Option<std::net::SocketAddr> {
     use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
     let text = text.trim();
     if let Ok(addr) = text.parse::<SocketAddr>() {
@@ -927,6 +1144,10 @@ fn resolve_service(text: &str, default_port: u16) -> Option<std::net::SocketAddr
     }
     if let Ok(ip) = text.trim_matches(['[', ']']).parse::<IpAddr>() {
         return Some(SocketAddr::new(ip, default_port));
+    }
+    // A host name only with -dns (CService(strAddr, port, fNameLookup))
+    if !name_lookup {
+        return None;
     }
     let (host, port) = match text.rsplit_once(':') {
         Some((h, p)) if !h.contains(':') => (h, p.parse().ok()?),
@@ -1074,6 +1295,32 @@ struct RotatingLog {
     redirect_std: bool,
     file: Option<std::fs::File>,
     size: u64,
+    /// -shrinkdebugfile, and when the size was last checked for it
+    shrink: bool,
+    shrink_checked: std::time::Instant,
+}
+
+/// Over this size debug.log is shrunk (Logging.cpp:99)
+const SHRINK_ABOVE: u64 = 10 * 1_000_000;
+/// What a shrink keeps of the end of debug.log (Logging.cpp:105)
+const SHRINK_KEEP: u64 = 200_000;
+/// How often a running node checks whether to shrink (Logging.cpp:186)
+const SHRINK_EVERY: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// Divi Core ShrinkDebugFile (Logging.cpp:94-118): a debug.log over 10 MB is
+/// cut to its last 200 000 bytes
+fn shrink_debug_file(path: &std::path::Path) -> std::io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    let size = std::fs::metadata(path)?.len();
+    if size <= SHRINK_ABOVE {
+        return Ok(());
+    }
+    let mut file = std::fs::File::open(path)?;
+    file.seek(SeekFrom::End(-(SHRINK_KEEP as i64)))?;
+    let mut tail = Vec::with_capacity(SHRINK_KEEP as usize);
+    file.read_to_end(&mut tail)?;
+    drop(file);
+    std::fs::write(path, tail)
 }
 
 impl RotatingLog {
@@ -1082,6 +1329,7 @@ impl RotatingLog {
         max_size: u64,
         max_files: u32,
         redirect_std: bool,
+        shrink: bool,
     ) -> std::io::Result<Self> {
         let mut log = RotatingLog {
             dir: dir.to_path_buf(),
@@ -1090,7 +1338,14 @@ impl RotatingLog {
             redirect_std,
             file: None,
             size: 0,
+            shrink,
+            shrink_checked: std::time::Instant::now(),
         };
+        // Shrunk at start as divid does (Logging.cpp:205); a file that is
+        // still over the size limit after that is rotated
+        if shrink {
+            let _ = shrink_debug_file(&dir.join("debug.log"));
+        }
         log.reopen()?;
         // The log may already be too big from an earlier run
         if log.size >= max_size {
@@ -1133,6 +1388,15 @@ impl std::io::Write for RotatingLog {
         if REOPEN_LOG.swap(false, std::sync::atomic::Ordering::Relaxed) {
             self.file = None;
             self.reopen()?;
+        }
+        // And every five minutes while running (Logging.cpp:186-191)
+        if self.shrink && self.shrink_checked.elapsed() > SHRINK_EVERY {
+            self.shrink_checked = std::time::Instant::now();
+            if self.size > SHRINK_ABOVE {
+                self.file = None;
+                let _ = shrink_debug_file(&self.dir.join("debug.log"));
+                self.reopen()?;
+            }
         }
         if self.size > 0 && self.size + buf.len() as u64 > self.max_size {
             self.rotate()?;
@@ -1227,6 +1491,8 @@ mod flush_log_tests {
 
 /// Initialize logging
 fn init_logging(log_config: &LogConfig, data_dir: &PathBuf) {
+    // -logips: whether log lines name peers by address too (Logging.cpp:202)
+    divi_network::peer_log::set_log_ips(log_config.log_ips);
     // Use RUST_LOG if set, otherwise use default based on debug config
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         if log_config.debug {
@@ -1267,6 +1533,7 @@ fn init_logging(log_config: &LogConfig, data_dir: &PathBuf) {
             log_config.max_file_size,
             log_config.max_files,
             std_is_log,
+            log_config.shrink,
         ) {
             Ok(log) => log,
             Err(e) => {
@@ -1290,19 +1557,58 @@ fn init_logging(log_config: &LogConfig, data_dir: &PathBuf) {
         // still holds
         *LOG_GUARD.lock().unwrap_or_else(|e| e.into_inner()) = Some(_guard);
 
-        // Set up file logging with timestamps
+        // Lines as divid writes them, without ANSI colours
         tracing_subscriber::registry()
             .with(
-                fmt::layer().with_writer(non_blocking).with_ansi(false), // No ANSI colors in file
+                fmt::layer()
+                    .with_writer(non_blocking)
+                    .with_ansi(false)
+                    .event_format(DividLogFormat {
+                        timestamps: log_config.timestamps,
+                    }),
             )
             .with(filter)
             .init();
 
-        eprintln!("Logging to {:?}", data_dir.join("debug.log"));
-        eprintln!(
-            "Log rotation: max {} bytes per file, {} files kept",
-            log_config.max_file_size, log_config.max_files
-        );
+        // Nothing more on stderr: divid writes there only its warnings and
+        // errors (InitWarning, InitError, noui.cpp:38-40), and a -daemon child
+        // keeps the stderr of the terminal it was started from
+    }
+}
+
+/// A debug.log line as Divi Core writes it (Logging.cpp:179-184): with
+/// -logtimestamps (default 1) the time, `%Y-%m-%d %H:%M:%S` in UTC, and a
+/// space; then the message. Warnings and errors begin `WARNING: ` and
+/// `ERROR: ` (divid's error() writes `ERROR: `); no level or module name.
+struct DividLogFormat {
+    timestamps: bool,
+}
+
+impl<S, N> fmt::FormatEvent<S, N> for DividLogFormat
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    N: for<'a> fmt::FormatFields<'a> + 'static,
+{
+    fn format_event(
+        &self,
+        ctx: &fmt::FmtContext<'_, S, N>,
+        mut writer: fmt::format::Writer<'_>,
+        event: &tracing::Event<'_>,
+    ) -> std::fmt::Result {
+        if self.timestamps {
+            write!(
+                writer,
+                "{} ",
+                chrono::Utc::now().format("%Y-%m-%d %H:%M:%S")
+            )?;
+        }
+        match *event.metadata().level() {
+            tracing::Level::ERROR => write!(writer, "ERROR: ")?,
+            tracing::Level::WARN => write!(writer, "WARNING: ")?,
+            _ => {}
+        }
+        ctx.field_format().format_fields(writer.by_ref(), event)?;
+        writeln!(writer)
     }
 }
 
@@ -1355,6 +1661,9 @@ struct WalletSeed {
     mnemonic: Option<String>,
     passphrase: Option<String>,
     hdseed: Option<String>,
+    /// -hdseed or -mnemonic is set, even empty: a wallet already there is
+    /// moved out of the way for the restore (init.cpp:864-888)
+    restore: bool,
 }
 
 impl WalletSeed {
@@ -1364,16 +1673,63 @@ impl WalletSeed {
             mnemonic: get("mnemonic"),
             passphrase: get("mnemonicpassphrase"),
             hdseed: get("hdseed"),
+            restore: settings.is_set("hdseed") || settings.is_set("mnemonic"),
         }
     }
 }
 
+/// A start that stops with exit code 1 and no error line, as Divi Core's
+/// AppInit2 returning false without an InitError (-dbloadfailexit, or a stop
+/// asked for before the start was done)
+#[derive(Debug)]
+struct QuietExit;
+
+impl std::fmt::Display for QuietExit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the start ended before it was done")
+    }
+}
+
+impl std::error::Error for QuietExit {}
+
+/// Divi Core's CheckWalletFileExists (init.cpp:864-888): with -hdseed or
+/// -mnemonic set, a wallet already there is renamed to `<wallet><time>.moved`
+/// beside it, so a new one is made from the seed
+fn move_wallet_for_restore(wallet_path: &Path) -> Result<()> {
+    if !wallet_path.exists() {
+        return Ok(());
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let mut moved = wallet_path.as_os_str().to_os_string();
+    moved.push(format!("{now}.moved"));
+    std::fs::rename(wallet_path, &moved).map_err(|_| {
+        anyhow::anyhow!(
+            "Unable to move wallet out of the way for seed restore: {}",
+            wallet_path.display()
+        )
+    })
+}
+
 /// Wallet start options
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct WalletOptions {
     /// -rescan: scan the whole chain at the start; -salvagewallet sets it
     /// unless it is given (init.cpp:763-766, :1242)
     rescan: bool,
+    /// Whether -rescan is given: a transaction record that cannot be read
+    /// asks for a rescan only when it is not (SoftSetBoolArg, walletdb.cpp:508)
+    rescan_given: bool,
+    /// -force_rescan: the start's scan from the genesis block, as divid's
+    /// seed restore asks for it (wallet.cpp:261, :2327)
+    force_rescan: bool,
+    /// -dbloadfailexit, read as a number: a wallet that loads with a warning
+    /// stops the start (init.cpp:1307-1309)
+    db_load_fail_exit: bool,
+    /// -allowunencryptedwallet: no warning at start about an unencrypted
+    /// wallet (init.cpp:1228-1231)
+    allow_unencrypted: bool,
     /// -spendzeroconfchange: sends may use unconfirmed outputs of our own
     /// transactions (wallet.cpp:1848)
     spend_zero_conf_change: bool,
@@ -1394,6 +1750,36 @@ struct WalletOptions {
     /// -vault_min, whole DIVI read as a number: managed vault coins below it
     /// are not staked (AvailableUtxoCollector.cpp:22)
     vault_min: Amount,
+    /// -whitelisted_vault, each read with ParseHex: vault scripts registered
+    /// at every load (init.cpp:1182-1191, :1201)
+    whitelisted_vaults: Vec<Vec<u8>>,
+}
+
+/// Divi Core's IsHex (utilstrencodings.cpp:64-71): an even number of hex
+/// digits, at least two, and nothing else
+fn core_is_hex(text: &str) -> bool {
+    !text.is_empty() && text.len().is_multiple_of(2) && text.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Divi Core's ParseHex (utilstrencodings.cpp:73-91): pairs of hex digits,
+/// spaces skipped before each pair, up to the first pair that is not one
+fn parse_hex_prefix(text: &str) -> Vec<u8> {
+    let mut bytes = text.bytes().peekable();
+    let nibble = |b: Option<u8>| b.and_then(|b| (b as char).to_digit(16));
+    let mut out = Vec::new();
+    loop {
+        while bytes
+            .next_if(|b| matches!(b, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r'))
+            .is_some()
+        {}
+        let Some(high) = nibble(bytes.next()) else {
+            return out;
+        };
+        let Some(low) = nibble(bytes.next()) else {
+            return out;
+        };
+        out.push((high << 4 | low) as u8);
+    }
 }
 
 /// divid's defaults: the options as when none is given
@@ -1407,6 +1793,10 @@ impl WalletOptions {
     fn from_settings(settings: &Settings) -> Self {
         WalletOptions {
             rescan: settings.get_bool("rescan", settings.get_bool("salvagewallet", false)),
+            rescan_given: settings.get("rescan").is_some(),
+            force_rescan: settings.get_bool("force_rescan", false),
+            db_load_fail_exit: settings.get("dbloadfailexit").is_some_and(|v| atoi(v) != 0),
+            allow_unencrypted: settings.get_bool("allowunencryptedwallet", false),
             spend_zero_conf_change: settings.get_bool("spendzeroconfchange", false),
             keypool: settings
                 .get("keypool")
@@ -1427,6 +1817,11 @@ impl WalletOptions {
                     .get("vault_min")
                     .map_or(0, |v| atoi(v).saturating_mul(100_000_000)),
             ),
+            whitelisted_vaults: settings
+                .get_multi("whitelisted_vault")
+                .iter()
+                .map(|v| parse_hex_prefix(v))
+                .collect(),
         }
     }
 
@@ -1449,6 +1844,16 @@ fn load_or_create_wallet(
     seed: WalletSeed,
     options: &WalletOptions,
 ) -> Result<Arc<WalletDb>> {
+    if seed.restore {
+        move_wallet_for_restore(wallet_path)?;
+    }
+    // A hex -hdseed is preferred over -mnemonic and -mnemonicpassphrase,
+    // logged at every start, a wallet there or not (init.cpp:945-951)
+    if seed.hdseed.as_deref().is_some_and(core_is_hex)
+        && (seed.mnemonic.is_some() || seed.passphrase.is_some())
+    {
+        info!("PruneHDSeedParameterInteraction: parameter interaction: can't use -hdseed and -mnemonic/-mnemonicpassphrase together, will prefer -seed");
+    }
     let env = |name: &str| std::env::var(name).ok();
     // An empty mnemonic asks for a new one, as in Core
     let mnemonic = seed
@@ -1458,7 +1863,6 @@ fn load_or_create_wallet(
     let passphrase = seed
         .passphrase
         .or_else(|| env("WALLET_MNEMONIC_PASSPHRASE"));
-    // -hdseed is preferred over a mnemonic (init.cpp:947-951)
     let hdseed = seed.hdseed.or_else(|| env("WALLET_HDSEED"));
     load_or_restore_wallet_with_seed(
         wallet_path,
@@ -1527,8 +1931,33 @@ fn load_or_restore_wallet_with_seed(
             }
         }
         info!("Loading wallet from {:?}", wallet_path);
-        let wallet = WalletDb::open(wallet_path, network)
-            .with_context(|| format!("Failed to open wallet at {:?}", wallet_path))?;
+        let wallet = match WalletDb::open(wallet_path, network) {
+            // A key record that cannot be read: Divi Core's DB_CORRUPT, an
+            // InitError (init.cpp:1153-1156, :1299-1305)
+            Err(divi_wallet::WalletError::Corrupt) => {
+                let message = divi_wallet::WalletError::Corrupt.to_string();
+                error!("Errors detected during wallet loading\n{}", message);
+                return Err(anyhow::Error::msg(message));
+            }
+            other => {
+                other.with_context(|| format!("Failed to open wallet at {:?}", wallet_path))?
+            }
+        };
+        // Other records that cannot be read: a warning, and the start goes
+        // on unless -dbloadfailexit (DB_NONCRITICAL_ERROR, init.cpp:1157-1162,
+        // :1299-1310)
+        let problems = wallet.load_problems();
+        if problems.transactions + problems.others > 0 {
+            let message = "Warning: error reading wallet.dat! All keys read correctly, but transaction data or address book entries might be missing or incorrect.";
+            info!("Errors detected during wallet loading\n{}", message);
+            // InitWarning: "Warning: " and the message, logged and on stderr
+            // (noui.cpp:38-40)
+            warn!("Warning: {}", message);
+            eprintln!("Warning: {}", message);
+            if options.db_load_fail_exit {
+                return Err(anyhow::Error::new(QuietExit));
+            }
+        }
 
         // Migrate chain_mode if needed (fixes wallets created before ChainMode was configurable)
         wallet
@@ -1560,24 +1989,23 @@ fn load_or_restore_wallet_with_seed(
     // Divi Core takes -hdseed when it is hex and logs anything else, then
     // goes on with the mnemonic or a new seed (wallet.cpp:2286-2297)
     let seed = match seed {
-        Some(hex_seed) => match hex::decode(hex_seed.trim()) {
-            Ok(bytes) if !bytes.is_empty() => Some(bytes),
-            _ => {
-                warn!("-hdseed is not a hex seed; not using it");
-                None
-            }
-        },
+        Some(hex_seed) if core_is_hex(&hex_seed) => hex::decode(&hex_seed).ok(),
+        Some(_) => {
+            info!("CWallet::GenerateNewHDChain -- Incorrect seed, generating random one instead");
+            None
+        }
         None => None,
     };
-    if seed.is_some() && (restoring.is_some() || passphrase.is_some()) {
-        warn!("-hdseed and -mnemonic/-mnemonicpassphrase together: using the seed");
-    }
     let restoring = if seed.is_some() { None } else { restoring };
     let passphrase = if seed.is_some() { None } else { passphrase };
     // The version limit is checked before the seed is made
     // (wallet.cpp:1963-1979), and before anything is written
     if options.refuses_new_wallet() {
-        anyhow::bail!("Error loading wallet.dat: database load failure");
+        // As Divi Core logs it (wallet.cpp:1969, init.cpp:1303)
+        info!("Unable to downgrade wallet version. -upgradewallet=<custom_version> might be incorrectly set");
+        let message = "Error loading wallet.dat: database load failure";
+        error!("Errors detected during wallet loading\n{}", message);
+        anyhow::bail!(message);
     }
     // Checked only when words make the wallet, before anything is written
     // (wallet.cpp:2302-2305, reported by init.cpp:1203-1209)
@@ -1587,9 +2015,6 @@ fn load_or_restore_wallet_with_seed(
         );
     }
 
-    info!("Creating new wallet at {:?}", wallet_path);
-    std::fs::create_dir_all(wallet_path)
-        .with_context(|| format!("Failed to create wallet directory: {:?}", wallet_path))?;
     let hd_wallet = if let Some(ref seed) = seed {
         info!("Restoring wallet from -hdseed");
         HdWallet::from_seed(seed, chain_mode)
@@ -1609,14 +2034,26 @@ fn load_or_restore_wallet_with_seed(
             "Restoring wallet from -mnemonic (chain_mode={:?})",
             restore_chain_mode
         );
-        HdWallet::from_mnemonic(mnemonic, passphrase.as_deref(), restore_chain_mode)
-            .with_context(|| "Failed to restore HD wallet from mnemonic")?
+        // Words of an unknown count, outside the word list or failing their
+        // checksum: CMnemonic::Check refuses them, before the wallet is made
+        // (hdchain.cpp:63-65, init.cpp:1203-1209)
+        HdWallet::from_mnemonic(mnemonic, passphrase.as_deref(), restore_chain_mode).map_err(
+            |_| {
+                anyhow::anyhow!(
+                    "Error loading or creating wallet.dat, SetMnemonic: invalid mnemonic: please check your words`"
+                )
+            },
+        )?
     } else {
         // No mnemonic: new words, with the passphrase if one is given
         // (hdchain.cpp:56-67)
         HdWallet::generate(passphrase.as_deref(), chain_mode)
             .with_context(|| "Failed to generate HD wallet")?
     };
+
+    info!("Creating new wallet at {:?}", wallet_path);
+    std::fs::create_dir_all(wallet_path)
+        .with_context(|| format!("Failed to create wallet directory: {:?}", wallet_path))?;
 
     // Never log the mnemonic: logs go to journald and log files, which are
     // neither encrypted nor access-controlled like the wallet. Point the
@@ -1724,17 +2161,28 @@ fn lock_data_dir(dir: &std::path::Path) -> Result<std::fs::File> {
         .append(true)
         .open(dir.join(".lock"))
         .with_context(|| format!("Failed to open {:?}", dir.join(".lock")))?;
-    match file.try_lock() {
-        Ok(()) => Ok(file),
-        Err(std::fs::TryLockError::WouldBlock) => anyhow::bail!(
-            "Cannot obtain a lock on data directory {}. Divi Core or irondivid is probably already running.",
-            dir.display()
-        ),
-        Err(std::fs::TryLockError::Error(e)) => {
-            Err(e).with_context(|| format!("Failed to lock {:?}", dir.join(".lock")))
+    // Divi Core waits up to 10 seconds for the lock, for a node still on its
+    // way out (init.cpp:858-860)
+    let deadline = std::time::Instant::now() + LOCK_WAIT;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(std::fs::TryLockError::WouldBlock) => anyhow::bail!(
+                "Cannot obtain a lock on data directory {}. Divi Core or irondivid is probably already running.",
+                dir.display()
+            ),
+            Err(std::fs::TryLockError::Error(e)) => {
+                return Err(e).with_context(|| format!("Failed to lock {:?}", dir.join(".lock")))
+            }
         }
     }
 }
+
+/// How long a start waits for the data directory lock (init.cpp:858-860)
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Run the daemon
 #[allow(clippy::too_many_arguments)]
@@ -1747,6 +2195,7 @@ async fn run_daemon(
     mn_options: masternode_options::MasternodeOptions,
     shutdown_tx: broadcast::Sender<()>,
     shutdown_rx: broadcast::Receiver<()>,
+    pid_file: PathBuf,
 ) -> Result<()> {
     // Create data directory if it doesn't exist
     std::fs::create_dir_all(&config.data_dir)
@@ -1754,6 +2203,10 @@ async fn run_daemon(
     // One process per data directory, held until this one exits
     // (TryLockDataDirectory, init.cpp:850-862)
     let _datadir_lock = lock_data_dir(&config.data_dir)?;
+    // Divi Core writes its pid file once it holds the lock, with or without
+    // -daemon (init.cpp:1470), so a second start leaves a running node's alone
+    #[cfg(unix)]
+    write_pid_file(&pid_file);
     // The clock warning of the network time offset goes where Divi Core's
     // Warnings::setMiscWarning puts it: getinfo's and getmininginfo's "errors"
     // (timedata.cpp:96-97)
@@ -1824,7 +2277,7 @@ async fn run_daemon(
 
     // Load or create wallet (unless disabled)
     let wallet = if disable_wallet {
-        info!("Wallet disabled");
+        info!("Wallet disabled!");
 
         // Still need mempool cleanup + fee estimation callback even without wallet
         let block_sync = node.block_sync();
@@ -1859,11 +2312,30 @@ async fn run_daemon(
             &wallet_options,
         )?);
         if let Some(ref w) = wallet {
+            // Divi Core warns at every start of a wallet that is not locked,
+            // unless -allowunencryptedwallet; not after the load's own warning,
+            // which returns first (init.cpp:1220-1231)
+            let problems = w.load_problems();
+            if !wallet_options.allow_unencrypted
+                && !w.is_locked()
+                && problems.transactions + problems.others == 0
+            {
+                let message = "Make sure to encrypt your wallet and delete all non-encrypted backups after you verified that wallet works!";
+                warn!("Warning: {}", message);
+                eprintln!("Warning: {}", message);
+            }
             // -mnconflock, default on (MasternodeModule.cpp:454-466)
             if mn_options.lock {
                 core_files::lock_masternode_collateral(w, &mn_options.conf_path);
             }
             w.set_vault_mode(config.vault);
+            // Before the wallet catches up with the chain, as divid loads
+            // them with the wallet (init.cpp:1201, :1242)
+            for script in &wallet_options.whitelisted_vaults {
+                if w.whitelist_vault(script) {
+                    info!("Whitelisted vault {} registered", hex::encode(script));
+                }
+            }
             w.set_spend_zero_conf_change(wallet_options.spend_zero_conf_change);
             w.set_vault_min(wallet_options.vault_min);
             w.set_relay_fee_per_kb(config.mempool.min_relay_fee_per_kb);
@@ -1993,14 +2465,32 @@ async fn run_daemon(
             // wallet holds, as Divi Core's verifySyncToActiveChain from the
             // genesis block (init.cpp:1242, wallet.cpp:279-313)
             let chain_height = node.chain().height();
-            if wallet_options.rescan {
+            // A transaction record that could not be read asks for a rescan,
+            // unless -rescan is given (walletdb.cpp:505-508)
+            let rescan = wallet_options.rescan
+                || (!wallet_options.rescan_given && wallet_arc.load_problems().transactions > 0);
+            if rescan {
                 info!("Rescanning... from height 0 to {}", chain_height);
+                wallet_arc.set_last_scan_height(0);
+            } else if wallet_options.force_rescan {
+                // -force_rescan scans from the genesis block too, under the
+                // word for a scan that was not asked for (wallet.cpp:261-262, :292)
+                info!("Scanning... from height 0 to {}", chain_height);
                 wallet_arc.set_last_scan_height(0);
             } else {
                 // Divi Core scans from the wallet's stored best block, itself
                 // included (wallet.cpp:258-269, :279-313): the last block is
-                // scanned again at every start
+                // scanned again at every start. A wallet that never scanned
+                // starts at the genesis block. Its line names both ends
+                // (wallet.cpp:292-294)
+                let scanned = wallet_arc.last_scan_height();
                 divi_rpc::wallet::resume_wallet_scan(wallet_arc, node.chain());
+                let from = if scanned == 0 {
+                    0
+                } else {
+                    wallet_arc.last_scan_height() + 1
+                };
+                info!("Scanning... from height {} to {}", from, chain_height);
             }
             let last_scan = wallet_arc.last_scan_height();
             if last_scan > chain_height {
@@ -2272,7 +2762,16 @@ async fn run_daemon(
     });
     let wallet_for_shutdown = wallet.clone();
 
-    if !config.rpc.enabled {
+    // Divi Core's init returns !fRequestShutdown (init.cpp:1536-1539, :1661):
+    // a SIGTERM or SIGINT that came while the node was starting stops it here,
+    // with exit code 1 (divid.cpp:180)
+    let stopped_during_start = !matches!(
+        shutdown_rx.try_recv(),
+        Err(broadcast::error::TryRecvError::Empty)
+    );
+    if stopped_during_start {
+        info!("Shutdown requested. Exiting.");
+    } else if !config.rpc.enabled {
         // -server=0: no RPC server, the node runs until it is told to stop
         info!("RPC server disabled (-server=0)");
         let _ = shutdown_rx.recv().await;
@@ -2529,6 +3028,14 @@ async fn run_daemon(
         }
     }
 
+    // Divi Core stops minting before it flushes the chain state and the wallet
+    // (init.cpp:372-373, :381, :386): no block is staked while they are written
+    if let Some(staker) = staker.clone() {
+        let started = std::time::Instant::now();
+        let _ = tokio::task::spawn_blocking(move || staker.stop_and_wait()).await;
+        shutdown_stage("staking stopped", started);
+    }
+
     // Stop the node
     info!("Stopping node...");
     let started = std::time::Instant::now();
@@ -2558,6 +3065,7 @@ async fn run_daemon(
     info!("Node stopped");
     match rpc_error {
         Some(e) => Err(anyhow::anyhow!("RPC server error: {}", e)),
+        None if stopped_during_start => Err(anyhow::Error::new(QuietExit)),
         None => Ok(()),
     }
 }
@@ -2652,6 +3160,7 @@ fn staking_config(config: &NodeConfig, chain: &divi_storage::ChainParams) -> Sta
         max_block_size: config.staking.block_max_size,
         block_priority_size: config.staking.block_priority_size,
         block_min_size: config.staking.block_min_size,
+        block_version: config.staking.block_version,
         ..StakingConfig::default()
     }
 }
@@ -2955,6 +3464,11 @@ async fn export_chain_command(config: NodeConfig, args: &Args) -> Result<()> {
     Ok(())
 }
 
+/// CreatePidFile: the process id and a newline (util.cpp:122-128)
+fn write_pid_file(pid_file: &std::path::Path) {
+    let _ = std::fs::write(pid_file, format!("{}\n", std::process::id()));
+}
+
 /// -pid, default divid.pid, relative to the data directory (util.cpp:115-119)
 fn pid_file_path(args: &Args, data_dir: &std::path::Path) -> PathBuf {
     match &args.pid {
@@ -3040,65 +3554,30 @@ fn main() -> Result<()> {
         std::process::exit(1);
     }
 
-    // Handle daemonization BEFORE initializing tokio runtime (Unix only)
+    // -daemon as Divi Core's AppInit does it, before the tokio runtime: the
+    // line on stdout, one fork, the parent exits 0 and the child calls setsid,
+    // keeping its working directory and its standard streams (divid.cpp:122-140)
     #[cfg(unix)]
     if args.daemon {
-        use std::os::unix::io::AsRawFd;
-
-        // Ensure data directory exists before daemonizing
-        if let Err(e) = std::fs::create_dir_all(&data_dir) {
-            eprintln!("Failed to create data directory {:?}: {}", data_dir, e);
-            std::process::exit(1);
-        }
-
-        let log_file = data_dir.join("debug.log");
-
-        eprintln!("Logging to {:?}", log_file);
-
-        // First fork
+        println!("DIVI server starting");
+        use std::io::Write as _;
+        let _ = std::io::stdout().flush();
         match unsafe { libc::fork() } {
             -1 => {
-                eprintln!("Failed to fork: {}", std::io::Error::last_os_error());
+                eprintln!(
+                    "Error: fork() returned -1 errno {}",
+                    std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+                );
                 std::process::exit(1);
             }
-            pid if pid > 0 => std::process::exit(0), // Parent exits
-            _ => {}                                  // Child continues
+            pid if pid > 0 => std::process::exit(0), // the parent
+            _ => {}                                  // the child goes on
         }
-
-        // Create new session
         if unsafe { libc::setsid() } == -1 {
-            eprintln!("Failed to setsid: {}", std::io::Error::last_os_error());
-            std::process::exit(1);
-        }
-
-        // Second fork (prevent reacquiring a controlling terminal)
-        match unsafe { libc::fork() } {
-            -1 => {
-                eprintln!("Failed to fork: {}", std::io::Error::last_os_error());
-                std::process::exit(1);
-            }
-            pid if pid > 0 => std::process::exit(0), // Intermediate parent exits
-            _ => {}                                  // Grandchild continues
-        }
-
-        // Set working directory
-        let _ = std::env::set_current_dir(&data_dir);
-
-        // Redirect stdout/stderr to log file
-        let log = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_file)
-            .unwrap_or_else(|e| {
-                eprintln!("Failed to open log file: {}", e);
-                std::process::exit(1);
-            });
-        let log_fd = log.as_raw_fd();
-        unsafe {
-            libc::dup2(log_fd, libc::STDOUT_FILENO);
-            libc::dup2(log_fd, libc::STDERR_FILENO);
-            // Close stdin
-            libc::close(libc::STDIN_FILENO);
+            eprintln!(
+                "Error: setsid() returned -1 errno {}",
+                std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+            );
         }
     }
 
@@ -3106,6 +3585,18 @@ fn main() -> Result<()> {
     if args.daemon {
         eprintln!("Warning: Daemon mode is only supported on Unix systems, running in foreground");
     }
+
+    // -mocktime: the node's clock from here on, set as divid sets it after
+    // daemonizing (divid.cpp:140-143); read as a number, 0 is the real clock
+    if let Some(text) = args.settings.get("mocktime") {
+        divi_primitives::clock::set_mock_time(atoi(text));
+    }
+    // -testsafemode puts the RPC server in safe mode, -disablesafemode lets
+    // it run every call all the same (rpcserver.cpp:185, :1052)
+    divi_rpc::warnings::set_safe_mode(
+        args.settings.get_bool("testsafemode", false),
+        args.settings.get_bool("disablesafemode", false),
+    );
 
     // Now enter the tokio runtime (after daemonization)
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -3129,7 +3620,10 @@ fn exit_after_stop(runtime: tokio::runtime::Runtime, result: Result<()>) -> ! {
     let code = match &result {
         Ok(()) => 0,
         Err(e) => {
+            // divid's InitError: the line on stderr and in debug.log
+            // (noui.cpp:38-40)
             eprintln!("Error: {:#}", e);
+            info!("Error: {:#}", e);
             1
         }
     };
@@ -3151,6 +3645,9 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
         max_file_size: args.maxlogsize.unwrap_or(1) as u64 * 1_048_576, // Convert MB to bytes
         max_files: args.maxlogfiles.unwrap_or(5),
         debug: args.debug,
+        log_ips: args.logips,
+        timestamps: args.logtimestamps,
+        shrink: args.shrinkdebugfile,
         // An export only reads the data directory: it logs to the console
         print_to_console: args.printtoconsole || args.export_chain,
     };
@@ -3186,9 +3683,6 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
     }
 
     // Set up shutdown channel
-    // Divi Core writes its pid file with or without -daemon (init.cpp:1470)
-    #[cfg(unix)]
-    let _ = std::fs::write(&pid_file, format!("{}", std::process::id()));
 
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
 
@@ -3265,9 +3759,17 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
         mn_options,
         shutdown_tx,
         shutdown_rx,
+        pid_file.clone(),
     )
     .await
     {
+        // A start stopped without an InitError (-dbloadfailexit) prints nothing
+        // more (init.cpp:1307-1309)
+        if e.downcast_ref::<QuietExit>().is_some() {
+            remove_pid_file(&pid_file);
+            flush_log();
+            std::process::exit(1);
+        }
         error!("Daemon error: {:#}", e);
         // Also on stderr, as Divi Core's InitError (noui.cpp:38-40)
         {
@@ -3676,6 +4178,106 @@ mod wallet_log_tests {
         assert_eq!(wallet.mnemonic().as_deref(), Some(mnemonic.as_str()));
         assert_mnemonic_not_logged(&logs, &mnemonic);
     }
+    /// The names in `dir` that end in ".moved"
+    fn moved_wallets(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".moved"))
+            .collect()
+    }
+
+    /// As init.cpp:864-888: -mnemonic with a wallet already there moves it to
+    /// `<wallet><time>.moved` and restores a new one from the words; without
+    /// -mnemonic or -hdseed the wallet there is loaded
+    #[test]
+    fn a_mnemonic_moves_a_wallet_already_there() {
+        let _env = WALLET_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let mnemonic = "abandon abandon abandon abandon abandon abandon \
+                        abandon abandon abandon abandon abandon about";
+        let mnemonic = mnemonic.split_whitespace().collect::<Vec<_>>().join(" ");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wallet");
+        let old = load_or_create_wallet_from(&path, WalletNetwork::Regtest, ChainMode::Divi, None)
+            .unwrap()
+            .mnemonic();
+        let open = |seed: WalletSeed| {
+            load_or_create_wallet(
+                &path,
+                WalletNetwork::Regtest,
+                ChainMode::Divi,
+                seed,
+                &WalletOptions::default(),
+            )
+            .unwrap()
+            .mnemonic()
+        };
+        // Compared without printing: the words are never shown
+        assert!(
+            open(WalletSeed::default()) == old,
+            "the wallet there was not loaded"
+        );
+        assert!(moved_wallets(dir.path()).is_empty());
+
+        let restored = open(WalletSeed {
+            mnemonic: Some(mnemonic.clone()),
+            restore: true,
+            ..WalletSeed::default()
+        });
+        assert!(
+            restored.as_deref() == Some(mnemonic.as_str()),
+            "the wallet was not restored from -mnemonic"
+        );
+        let moved = moved_wallets(dir.path());
+        assert_eq!(moved.len(), 1, "{moved:?}");
+        let time = moved[0]
+            .strip_prefix("wallet")
+            .and_then(|n| n.strip_suffix(".moved"))
+            .unwrap();
+        assert!(time.parse::<u64>().unwrap() > 1_600_000_000, "{moved:?}");
+        // The moved wallet is the old one, whole
+        let back = WalletDb::open(&dir.path().join(&moved[0]), WalletNetwork::Regtest).unwrap();
+        assert!(
+            back.mnemonic() == old,
+            "the moved wallet is not the old one"
+        );
+    }
+
+    /// As hdchain.cpp:63-65 and init.cpp:1203-1209: words that fail their
+    /// checksum stop the start with divid's text, after the wallet there was
+    /// moved, and leave no new wallet
+    #[test]
+    fn invalid_mnemonic_words_stop_the_start() {
+        let _env = WALLET_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        // "abandon" twelve times: every word is in the list, the checksum fails
+        let words = ["abandon"; 12].join(" ");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wallet");
+        drop(
+            load_or_create_wallet_from(&path, WalletNetwork::Regtest, ChainMode::Divi, None)
+                .unwrap(),
+        );
+        let refused = load_or_create_wallet(
+            &path,
+            WalletNetwork::Regtest,
+            ChainMode::Divi,
+            WalletSeed {
+                mnemonic: Some(words),
+                restore: true,
+                ..WalletSeed::default()
+            },
+            &WalletOptions::default(),
+        )
+        .map(|_| ())
+        .unwrap_err();
+        assert_eq!(
+            format!("{refused:#}"),
+            "Error loading or creating wallet.dat, SetMnemonic: invalid mnemonic: please check your words`"
+        );
+        assert_eq!(moved_wallets(dir.path()).len(), 1);
+        assert!(!path.exists(), "a wallet was left at {path:?}");
+    }
+
     #[test]
     fn test_restored_wallet_issues_from_index_zero() {
         // Core's keypool hands out its oldest key, so a restored wallet's first
@@ -3961,7 +4563,7 @@ mod log_rotation_tests {
     /// Write `lines` records of 50 bytes, checking the files after each
     fn write_and_check(max_size: u64, max_files: u32, lines: usize) -> Vec<(String, u64)> {
         let dir = tempfile::tempdir().unwrap();
-        let mut log = RotatingLog::open(dir.path(), max_size, max_files, false).unwrap();
+        let mut log = RotatingLog::open(dir.path(), max_size, max_files, false, false).unwrap();
         for i in 0..lines {
             let line = format!("{:049}\n", i);
             log.write_all(line.as_bytes()).unwrap();
@@ -4014,7 +4616,7 @@ mod log_rotation_tests {
     fn log_rotation_rotates_oversized_log_at_startup() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("debug.log"), vec![b'x'; 2000]).unwrap();
-        let mut log = RotatingLog::open(dir.path(), 1000, 3, false).unwrap();
+        let mut log = RotatingLog::open(dir.path(), 1000, 3, false, false).unwrap();
         log.write_all(b"new\n").unwrap();
         assert_eq!(
             log_files(dir.path()),
@@ -4210,6 +4812,12 @@ mod submit_error_tests {
     }
 }
 
+/// Held by the tests that set the WALLET_* environment variables or call
+/// `load_or_create_wallet`, which reads them: tests run in parallel threads
+/// of one process
+#[cfg(test)]
+static WALLET_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod wallet_move_tests {
     use super::*;
@@ -4219,9 +4827,11 @@ mod wallet_move_tests {
     const CORE_FIRST_ADDRESS: &str = "y7VQ7R3SDRxzNuUsUuFzuq2FT1uVtW8iBz";
 
     /// WALLET_HDSEED restores a wallet from a hex seed, as Core's -hdseed, and
-    /// is taken over WALLET_MNEMONIC (the only test here that sets them)
+    /// is taken over WALLET_MNEMONIC (the only test here that sets them; it
+    /// holds `WALLET_ENV`)
     #[test]
     fn hex_seed_restores_cores_first_address() {
+        let _env = WALLET_ENV.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wallet");
         std::env::set_var("WALLET_HDSEED", "000102030405060708090a0b0c0d0e0f");
@@ -4363,6 +4973,26 @@ mod divid_option_tests {
             .static_peers
             .contains(&"127.0.0.2:10".to_string()));
         assert!(!UNSUPPORTED_OPTIONS.contains(&"seednode"));
+    }
+
+    /// -blockmaxsize, -blockprioritysize and -blockminsize are read as divid
+    /// reads them, into an unsigned int with no warning: nothing or a word is
+    /// 0, a negative value wraps (BlockMemoryPoolTransactionCollector.cpp:18-42)
+    #[test]
+    fn block_sizes_are_read_as_divid_reads_them() {
+        let c = cfg_in(
+            "divi.conf",
+            "rpcuser=u\n",
+            &[
+                "-blockmaxsize",
+                "-blockminsize=-1",
+                "-blockprioritysize=abc",
+            ],
+        )
+        .unwrap();
+        assert_eq!(c.staking.block_max_size, 0);
+        assert_eq!(c.staking.block_min_size, u32::MAX as usize);
+        assert_eq!(c.staking.block_priority_size, 0);
     }
 
     /// -dbcache is applied as divid splits it (init.cpp:1030, :1046-1056):
@@ -4632,6 +5262,8 @@ mod divid_option_tests {
     #[test]
     fn help_only_options_draw_no_warning() {
         let s = Settings::default();
+        assert_eq!(option_warning(&s, "checkpoints"), None);
+        assert_eq!(option_warning(&s, "printpriority"), None);
         assert_eq!(option_warning(&s, "litemode"), None);
         assert_eq!(option_warning(&s, "budgetvotemode"), None);
         assert_eq!(option_warning(&s, "masternode"), None);
@@ -4641,6 +5273,24 @@ mod divid_option_tests {
         assert!(option_warning(&s, "nosuchoption")
             .unwrap()
             .starts_with("Unknown option"));
+    }
+
+    /// divid's own check and test-aid options are taken without a warning
+    /// (BlockCheckingHelpers.cpp:162, init.cpp:795, :1281, script/sigcache.cpp:51,
+    /// main.cpp:473, Node.cpp:479-485)
+    #[test]
+    fn divids_check_and_test_options_draw_no_warning() {
+        let s = Settings::default();
+        for k in [
+            "checkblockindex",
+            "checkmempool",
+            "flushwallet",
+            "maxsigcachesize",
+            "dropmessagestest",
+            "fuzzmessagestest",
+        ] {
+            assert_eq!(option_warning(&s, k), None, "{k}");
+        }
     }
 
     /// The masternode options are read when the node starts, after
@@ -4784,6 +5434,22 @@ mod start_errors {
         assert!(!parse("-V").version);
     }
 
+    /// A lock let go within 10 seconds is taken: Divi Core waits that long for
+    /// a node still on its way out (init.cpp:858-860)
+    #[test]
+    fn the_data_directory_lock_is_waited_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = lock_data_dir(dir.path()).unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            drop(first);
+        });
+        let started = std::time::Instant::now();
+        assert!(lock_data_dir(dir.path()).is_ok());
+        assert!(started.elapsed() >= std::time::Duration::from_millis(900));
+        release.join().unwrap();
+    }
+
     /// One process per data directory, with divid's text (init.cpp:850-862)
     #[test]
     fn a_held_data_directory_stops_a_second_start() {
@@ -4802,5 +5468,83 @@ mod start_errors {
             lock_data_dir(dir.path()).is_ok(),
             "free again once the first exits"
         );
+    }
+}
+
+#[cfg(test)]
+mod proxy_tor_settings_tests {
+    use super::*;
+
+    fn p2p(argv: &[&str]) -> divi_node::config::P2pConfig {
+        let dir = tempfile::tempdir().unwrap();
+        let mut v = vec![
+            "irondivid".to_string(),
+            "--regtest".to_string(),
+            format!("--datadir={}", dir.path().display()),
+        ];
+        v.extend(argv.iter().map(|s| s.to_string()));
+        build_config(&Args::parse_from(v)).unwrap().p2p
+    }
+
+    /// -maxconnections as divid reads it: a number below 0, a text or nothing
+    /// is 0, and at most FD_SETSIZE less the binds less 150 (net.cpp:1726-1728);
+    /// inbound peers get it less 16 (net.cpp:757)
+    #[test]
+    fn maxconnections_is_read_as_divid_reads_it() {
+        let slots = |argv: &[&str]| {
+            let c = p2p(argv);
+            (c.max_inbound, c.max_outbound)
+        };
+        for none in [
+            "-maxconnections=-1",
+            "-maxconnections=",
+            "-maxconnections=abc",
+        ] {
+            assert_eq!(slots(&[none]), (0, 0), "{none}");
+        }
+        assert_eq!(slots(&["-maxconnections=17"]), (1, 16));
+        assert_eq!(slots(&["-maxconnections=5"]), (0, 5));
+        assert_eq!(slots(&["-maxconnections=2000"]), (857, 16));
+        assert_eq!(
+            slots(&[
+                "-maxconnections=2000",
+                "-bind=127.0.0.1",
+                "-whitebind=127.0.0.1:1"
+            ]),
+            (856, 16)
+        );
+    }
+
+    /// -upnp: off by default; -proxy and -listen=0 turn it off unless it is
+    /// given (DEFAULT_UPNP, net.cpp:1690-1706)
+    #[test]
+    fn upnp_default_and_soft_sets() {
+        assert!(!p2p(&[]).upnp);
+        assert!(p2p(&["-upnp=1"]).upnp);
+        assert!(p2p(&["-upnp"]).upnp);
+        assert!(!p2p(&["-upnp=0"]).upnp);
+        assert!(p2p(&["-upnp=1", "-listen=0"]).upnp);
+        assert!(p2p(&["-upnp=1", "-proxy=127.0.0.1:9050"]).upnp);
+    }
+
+    /// -listenonion: on by default, off under -listen=0 (also by -connect or
+    /// -proxy) unless given; -torcontrol and -torpassword as given
+    #[test]
+    fn tor_settings_default_and_soft_sets() {
+        let d = p2p(&[]);
+        assert!(d.listen_onion);
+        assert_eq!(d.tor_control, "127.0.0.1:9051");
+        assert_eq!(d.tor_password, "");
+        assert!(!p2p(&["-listen=0"]).listen_onion);
+        assert!(!p2p(&["-connect=127.0.0.1:1"]).listen_onion);
+        assert!(!p2p(&["-proxy=127.0.0.1:9050"]).listen_onion);
+        assert!(p2p(&["-listen=0", "-listenonion=1"]).listen_onion);
+        assert!(p2p(&["-bind=127.0.0.1", "-connect=127.0.0.1:1"]).listen_onion);
+        let t = p2p(&[
+            "-torcontrol=127.0.0.1:9999",
+            "-torpassword=dummy-not-a-password",
+        ]);
+        assert_eq!(t.tor_control, "127.0.0.1:9999");
+        assert_eq!(t.tor_password, "dummy-not-a-password");
     }
 }

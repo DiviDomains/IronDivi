@@ -5,11 +5,13 @@
 //! Two messages a peer sends rarely, answered as Divi Core answers them: a
 //! pong that ends the node's ping without timing it (nonce 0, or under 8
 //! bytes: Node.cpp:754-808), and a dstx, which divid checks as an empty
-//! transaction (main.cpp:705-812).
+//! transaction (main.cpp:705-812). And the order of the answers: a pong
+//! comes after the answers to the messages before its ping.
 
 mod common;
 use common::raw_peer::*;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 /// A peer past the handshake that has read the node's first ping and left it
 /// unanswered; the ping's nonce
@@ -109,4 +111,42 @@ async fn dstx_scores_110() {
     p.send("dstx", &[1, 2, 3]).await;
     assert_eq!(t.wait_score(p.ip, 110).await, Some(110));
     assert!(p.alive().await);
+}
+
+/// A peer's messages are answered in the order they came, the ones the
+/// connection answers itself included: Divi Core handles them one at a time
+/// (main.cpp:1023-1077), so the notfound of a getdata comes before the reject
+/// of a malformed message sent after it, and that before the pong of a ping
+/// sent last, even when all come in one write and the getdata takes long
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn answers_come_in_the_order_of_the_messages() {
+    let t = TestNode::start().await;
+    let mut p = RawPeer::connect(&t, "127.0.0.3").await;
+    p.handshake().await;
+    while let Recv::Message(..) = p.recv(Duration::from_secs(2)).await {}
+    // The most items a getdata may name (MAX_INV_SZ), none of them known
+    let mut items = compact(50_000);
+    for n in 0..50_000u32 {
+        items.extend_from_slice(&1u32.to_le_bytes());
+        let mut hash = [0x5a; 32];
+        hash[..4].copy_from_slice(&n.to_le_bytes());
+        items.extend_from_slice(&hash);
+    }
+    let mut burst = frame("getdata", &items);
+    // A spork that does not parse: answered by the connection itself
+    burst.extend(frame("spork", &[1, 2]));
+    let nonce = rand_nonce();
+    burst.extend(frame("ping", &nonce.to_le_bytes()));
+    p.send_raw(&burst).await;
+    let mut got = Vec::new();
+    loop {
+        match p.recv(WAIT).await {
+            Recv::Message(c, m) if c == "pong" && m == nonce.to_le_bytes() => break,
+            Recv::Message(c, _) if c == "ping" || c == "pong" => {}
+            Recv::Message(c, _) => got.push(c),
+            other => panic!("no pong: {other:?} after {got:?}"),
+        }
+    }
+    got.dedup();
+    assert_eq!(got, vec!["notfound".to_string(), "reject".to_string()]);
 }

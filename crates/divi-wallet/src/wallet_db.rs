@@ -318,6 +318,13 @@ pub struct WalletDb {
     /// catch-up, reorg rollback and rescans must not interleave, or a spend
     /// can be scanned before the coin it spends and be lost
     scan_lock: Mutex<()>,
+    /// Held while a key is made and stored with the HD indices, as Divi Core
+    /// makes keys under cs_wallet (wallet.cpp:2122-2195): two callers never get
+    /// the same index, and the indices are stored in the order they advanced.
+    /// Taken after `locked`.
+    key_lock: Mutex<()>,
+    /// Sends in progress (`begin_spend`), so that a lock lets them finish
+    spends: Mutex<SpendState>,
     /// Told each wallet transaction added or seen again (-walletnotify)
     tx_listener: RwLock<Option<TxListener>>,
     /// Transactions that left their block in a reorg and were told to the
@@ -358,6 +365,32 @@ pub struct WalletDb {
     tx_notes: RwLock<HashMap<Hash256, BTreeMap<String, String>>>,
 }
 
+/// Sends in progress, and whether a lock waits for them to finish
+#[derive(Debug, Default)]
+struct SpendState {
+    in_flight: u32,
+    lock_deferred: bool,
+}
+
+/// A send in progress (`WalletDb::begin_spend`). While one is held, a lock
+/// leaves the keys in memory for it; the last one dropped takes them out.
+pub struct SpendGuard<'a> {
+    wallet: &'a WalletDb,
+}
+
+impl Drop for SpendGuard<'_> {
+    fn drop(&mut self) {
+        let mut spends = self.wallet.spends.lock();
+        spends.in_flight -= 1;
+        if spends.in_flight == 0 && std::mem::take(&mut spends.lock_deferred) {
+            let still_locked = *self.wallet.locked.read();
+            if still_locked {
+                self.wallet.lock_now();
+            }
+        }
+    }
+}
+
 /// Unlock state of an encrypted wallet (Divi Core `walletStakingOnly` plus the
 /// `walletpassphrase` timer of rpcserver.cpp `UnlockWalletBriefly`)
 #[derive(Debug, Clone, Copy, Default)]
@@ -368,6 +401,11 @@ struct UnlockState {
     staking_only: bool,
     /// When `until` passes, go back to staking-only instead of locking
     revert_to_staking: bool,
+    /// What getwalletinfo reports as unlocked_until: Divi Core's
+    /// nWalletUnlockTime, set by walletpassphrase to now plus its timeout
+    /// (also 0 or less, which sets no timer) and cleared by walletlock or
+    /// when the timer runs out (rpcserver.cpp:1195-1220)
+    unlock_time: i64,
 }
 
 /// How many recently scanned block hashes the wallet remembers
@@ -403,6 +441,8 @@ impl WalletDb {
             mempool_txs: RwLock::new(HashMap::new()),
             detached_txs: RwLock::new(HashMap::new()),
             scan_lock: Mutex::new(()),
+            key_lock: Mutex::new(()),
+            spends: Mutex::new(SpendState::default()),
             tx_listener: RwLock::new(None),
             reorg_accepted: RwLock::new(HashSet::new()),
             pending_deletes: RwLock::new(PendingDeletes::default()),
@@ -444,6 +484,8 @@ impl WalletDb {
             mempool_txs: RwLock::new(HashMap::new()),
             detached_txs: RwLock::new(HashMap::new()),
             scan_lock: Mutex::new(()),
+            key_lock: Mutex::new(()),
+            spends: Mutex::new(SpendState::default()),
             tx_listener: RwLock::new(None),
             reorg_accepted: RwLock::new(HashSet::new()),
             pending_deletes: RwLock::new(PendingDeletes::default()),
@@ -489,6 +531,8 @@ impl WalletDb {
             mempool_txs: RwLock::new(HashMap::new()),
             detached_txs: RwLock::new(HashMap::new()),
             scan_lock: Mutex::new(()),
+            key_lock: Mutex::new(()),
+            spends: Mutex::new(SpendState::default()),
             tx_listener: RwLock::new(None),
             reorg_accepted: RwLock::new(HashSet::new()),
             pending_deletes: RwLock::new(PendingDeletes::default()),
@@ -833,6 +877,8 @@ impl WalletDb {
             mempool_txs: RwLock::new(HashMap::new()),
             detached_txs: RwLock::new(HashMap::new()),
             scan_lock: Mutex::new(()),
+            key_lock: Mutex::new(()),
+            spends: Mutex::new(SpendState::default()),
             tx_listener: RwLock::new(None),
             reorg_accepted: RwLock::new(HashSet::new()),
             pending_deletes: RwLock::new(PendingDeletes::default()),
@@ -890,7 +936,7 @@ impl WalletDb {
                 Ok(notes) => {
                     self.tx_notes.write().insert(txid, notes);
                 }
-                Err(e) => debug!("Skipping unreadable notes of {}: {}", txid, e),
+                Err(e) => db.note_unreadable_transaction(&format!("notes of {txid}"), e),
             }
         }
 
@@ -1045,6 +1091,12 @@ impl WalletDb {
             "Restored {} spent UTXO data entries for reorg recovery",
             self.spent_utxo_data.read().len()
         );
+
+        // A key that could not be read stops the load (DB_CORRUPT,
+        // walletdb.cpp:499-500)
+        if db.load_problems().keys > 0 {
+            return Err(WalletError::Corrupt);
+        }
 
         info!(
             "Wallet loaded: {} keys, {} UTXOs, {} transactions, {} accounts, {} scripts, balance = {}",
@@ -1547,6 +1599,15 @@ impl WalletDb {
         Ok(target)
     }
 
+    /// The records the load could not read, by kind (Divi Core's ReadKeyValue
+    /// failures, walletdb.cpp:495-511)
+    pub fn load_problems(&self) -> crate::persistence::LoadProblems {
+        self.db
+            .as_ref()
+            .map(|db| db.load_problems())
+            .unwrap_or_default()
+    }
+
     pub fn database_path(&self) -> std::path::PathBuf {
         match &self.db {
             Some(db) => db.path().to_path_buf(),
@@ -1587,6 +1648,7 @@ impl WalletDb {
     fn new_address(&self, is_change: bool) -> Result<Address, WalletError> {
         // Held until the key is stored, so a concurrent lock() cannot strip it first
         let locked = self.locked.read();
+        let _keys = self.key_lock.lock();
         let mut store = Vec::new();
         let addr = if *locked {
             self.keystore.take_from_keypool(is_change)?
@@ -1875,16 +1937,19 @@ impl WalletDb {
             .flat_map(|e| e.spends.iter().copied())
             .collect();
 
-        let mut result: Vec<(WalletUtxo, CoinSource)> = self
-            .utxos
-            .read()
+        let utxos = self.utxos.read();
+        let mut result: Vec<(WalletUtxo, CoinSource)> = utxos
             .values()
             .filter(|u| !spent.contains(&u.outpoint()))
             .map(|u| (u.clone(), CoinSource::Block))
             .collect();
         for entry in overlay.values() {
             for u in &entry.outputs {
-                if !spent.contains(&u.outpoint()) {
+                // A block scan adds a transaction's coins before it drops the
+                // transaction from the mempool overlay: the confirmed coin is
+                // the one, as in Divi Core, where the block's wallet update
+                // and a wallet call do not overlap (both under cs_main)
+                if !spent.contains(&u.outpoint()) && !utxos.contains_key(&u.outpoint()) {
                     result.push((
                         u.clone(),
                         CoinSource::Mempool {
@@ -2264,8 +2329,34 @@ impl WalletDb {
         self.used_addresses.read().contains(address)
     }
 
-    /// Lock the wallet
+    /// A send starts: until the guard is dropped, a lock (walletlock, or the
+    /// unlock timer ending) leaves the keys in memory for it. In Divi Core a
+    /// send runs under cs_main and cs_wallet, so walletlock and the timer's
+    /// relock come before or after it, never in the middle
+    /// (rpcserver.cpp:1060-1094, :1160-1174). Take it before the send checks
+    /// that the wallet is unlocked.
+    pub fn begin_spend(&self) -> SpendGuard<'_> {
+        self.spends.lock().in_flight += 1;
+        SpendGuard { wallet: self }
+    }
+
+    /// Lock the wallet. With a send in progress the wallet reads as locked at
+    /// once, so a later send is refused, and the keys go when the last send in
+    /// progress is done (`begin_spend`)
     pub fn lock(&self) {
+        let mut spends = self.spends.lock();
+        if spends.in_flight > 0 {
+            *self.locked.write() = true;
+            *self.unlock.write() = UnlockState::default();
+            spends.lock_deferred = true;
+            info!("Wallet locked; its keys stay in memory until the send in progress is done");
+            return;
+        }
+        self.lock_now();
+    }
+
+    /// Lock the wallet and take the keys out of memory now
+    fn lock_now(&self) {
         // Held throughout, so no key is created between storing and stripping
         let mut locked = self.locked.write();
         *locked = true;
@@ -2376,15 +2467,39 @@ impl WalletDb {
                 None => None,
             },
         };
+        // Divi Core's CCryptoKeyStore::Unlock (crypter.cpp:225-250) decrypts the
+        // imported keys in CKeyID order, each checked against its public key: a
+        // key that fails first is a wrong passphrase; one that fails after
+        // another decrypted means the wallet is corrupted, which divid logs (and
+        // then stops on an assert). A CKeyID compares as a little-endian number
+        // (uint256.cpp CompareTo), so by its bytes from the last.
+        let mut stored = db.load_encrypted_secrets()?;
+        stored.sort_by_key(|(hash, _)| {
+            let mut bytes = *hash.as_bytes();
+            bytes.reverse();
+            bytes
+        });
         let mut secrets = Vec::new();
-        for (hash, blob) in db.load_encrypted_secrets()? {
-            let bytes = Zeroizing::new(decrypt_blob(&blob, &master_key)?);
-            let arr: [u8; 32] = bytes
-                .as_slice()
-                .try_into()
-                .map_err(|_| WalletError::Storage("corrupt encrypted private key".into()))?;
-            let secret = divi_crypto::keys::SecretKey::from_bytes(&arr)
-                .map_err(|e| WalletError::Storage(format!("corrupt private key: {}", e)))?;
+        let mut imported_decrypted = false;
+        for (hash, blob) in stored {
+            let entry = self.keystore.get_key(&hash);
+            let imported = entry.as_ref().is_some_and(|e| e.hd_path.is_none());
+            let secret = decrypt_blob(&blob, &master_key).ok().and_then(|bytes| {
+                let bytes = Zeroizing::new(bytes);
+                let arr: [u8; 32] = bytes.as_slice().try_into().ok()?;
+                let secret = divi_crypto::keys::SecretKey::from_bytes(&arr).ok()?;
+                match &entry {
+                    Some(e) if secret.public_key() != e.public => None,
+                    _ => Some(secret),
+                }
+            });
+            let Some(secret) = secret else {
+                if imported && imported_decrypted {
+                    error!("The wallet is probably corrupted: Some keys decrypt but not all.");
+                }
+                return Err(WalletError::WrongPassphrase);
+            };
+            imported_decrypted |= imported;
             secrets.push((hash, secret));
         }
 
@@ -2419,6 +2534,7 @@ impl WalletDb {
 
         // As Divi Core's walletpassphrase: top the keypool up while the seed is
         // here, so getnewaddress keeps working after the wallet is locked again
+        let keys = self.key_lock.lock();
         match self.keystore.top_up_keypool(None) {
             Ok(added) if !added.is_empty() => {
                 if let Err(e) = self.persist_keys(&added) {
@@ -2428,6 +2544,7 @@ impl WalletDb {
             Ok(_) => {}
             Err(e) => debug!("Keypool not topped up on unlock: {}", e),
         }
+        drop(keys);
 
         // Set unlock expiration time
         let expiration = if timeout_secs > 0 {
@@ -2439,6 +2556,11 @@ impl WalletDb {
             until: expiration,
             staking_only,
             revert_to_staking: was_staking_only && expiration.is_some(),
+            unlock_time: if timeout_secs > 0 {
+                unix_time_now() + i64::from(timeout_secs)
+            } else {
+                0
+            },
         };
 
         *self.locked.write() = false;
@@ -2532,23 +2654,78 @@ impl WalletDb {
         }
     }
 
-    /// Unix time at which the wallet re-locks; 0 when locked, unencrypted, or unlocked
-    /// without a timeout.
-    pub fn unlocked_until(&self) -> u64 {
-        if !self.is_encrypted() || self.is_locked() {
+    /// getwalletinfo's unlocked_until, Divi Core's nWalletUnlockTime: the time
+    /// the last walletpassphrase set, until walletlock or the end of its timer
+    /// clears it; 0 for an unencrypted wallet
+    pub fn unlocked_until(&self) -> i64 {
+        if !self.is_encrypted() {
             return 0;
         }
-        match self.unlock.read().until {
-            Some(t) => {
-                let remaining = t.saturating_duration_since(Instant::now()).as_secs();
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0)
-                    + remaining
-            }
-            None => 0,
+        // Lets a timer that has run out lock the wallet (or go back to staking)
+        self.is_locked();
+        let state = self.unlock.read();
+        if state.until.is_some_and(|t| Instant::now() >= t) {
+            return 0;
         }
+        state.unlock_time
+    }
+
+    /// Divi Core walletpassphrase's unlock (CWallet::Unlock, wallet.cpp:778-803):
+    /// the keys, fully or for staking only, leaving the timer and
+    /// unlocked_until as they are; walletpassphrase sets them once it has read
+    /// its timeout (`set_unlock_timeout`)
+    pub fn unlock_keeping_timer(
+        &self,
+        passphrase: &str,
+        staking_only: bool,
+    ) -> Result<(), WalletError> {
+        // Settle a timer that has run out first
+        self.is_locked();
+        // A wallet unlocked for everything takes any passphrase: only the
+        // staking-only flag changes (wallet.cpp:780-783)
+        if self.is_fully_unlocked() {
+            self.unlock.write().staking_only = staking_only;
+            return Ok(());
+        }
+        let mut before = *self.unlock.read();
+        if before.until.is_some_and(|t| Instant::now() >= t) {
+            // A timer that ran out while the wallet was locked has cleared
+            // unlocked_until (revertWalletUnlockStatus, rpcserver.cpp:1160-1174)
+            before = UnlockState::default();
+        }
+        self.unlock_for(passphrase, 0, staking_only)?;
+        let mut state = self.unlock.write();
+        state.until = before.until;
+        state.revert_to_staking = before.revert_to_staking;
+        state.unlock_time = before.unlock_time;
+        Ok(())
+    }
+
+    /// Lock the wallet as a failed walletpassphrasechange does (Lock() before
+    /// the old passphrase is checked, wallet.cpp:815-823): unlocked_until and
+    /// the timer stay as they were
+    pub fn lock_keeping_unlock_time(&self) {
+        let before = *self.unlock.read();
+        self.lock();
+        let mut state = self.unlock.write();
+        state.until = before.until;
+        state.revert_to_staking = before.revert_to_staking;
+        state.unlock_time = before.unlock_time;
+    }
+
+    /// walletpassphrase's timeout (UnlockWalletBriefly, rpcserver.cpp:1195-1220):
+    /// unlocked_until becomes now plus `timeout_secs`, and only a timeout above
+    /// 0 sets a timer; when it ends the wallet locks, or goes back to staking
+    /// only with `revert_to_staking`
+    pub fn set_unlock_timeout(&self, timeout_secs: i64, revert_to_staking: bool) {
+        let mut state = self.unlock.write();
+        state.unlock_time = unix_time_now().saturating_add(timeout_secs);
+        state.until = (timeout_secs > 0)
+            .then(|| {
+                Instant::now().checked_add(std::time::Duration::from_secs(timeout_secs as u64))
+            })
+            .flatten();
+        state.revert_to_staking = revert_to_staking && state.until.is_some();
     }
 
     /// Encrypt the wallet with `passphrase`.
@@ -2785,6 +2962,7 @@ impl WalletDb {
     /// Returns the number of keys generated
     pub fn refill_keypool(&self, new_size: Option<u32>) -> Result<u32, WalletError> {
         let _locked = self.locked.read();
+        let _keys = self.key_lock.lock();
         let added = self.keystore.top_up_keypool(new_size)?;
         if !added.is_empty() {
             self.dirty.write().keys = true;
@@ -3838,6 +4016,48 @@ impl WalletDb {
         }
     }
 
+    /// Divi Core's loadWhitelistedVaults (wallet.cpp:1992-2003), for one
+    /// -whitelisted_vault script: a staking vault the wallet holds the
+    /// manager key of, and not the owner key, is registered as addvault
+    /// registers it, without a funding transaction; any other script, or one
+    /// already registered, is left out. True when it was registered.
+    pub fn whitelist_vault(&self, script_bytes: &[u8]) -> bool {
+        let script = Script::from_bytes(script_bytes.to_vec());
+        let Some(vault) = divi_script::StakingVaultScript::from_script(&script) else {
+            return false;
+        };
+        let (owner, manager) = (vault.owner_pubkey_hash, vault.vault_pubkey_hash);
+        // IsStakingVaultScript: the 2-key form only
+        if divi_script::StakingVaultScript::new(owner, manager)
+            .to_script()
+            .as_bytes()
+            != script_bytes
+            || self.vaults.read().contains_key(script_bytes)
+        {
+            return false;
+        }
+        let has_signing_key = |hash: [u8; 20]| {
+            self.keystore
+                .get_key(&Hash160::from_bytes(hash))
+                .is_some_and(|entry| !entry.is_watch_only)
+        };
+        // The owner key makes it an owned vault, not a managed one, so
+        // divid takes the script out again (wallet_ismine.cpp:80-91)
+        if has_signing_key(owner) || !has_signing_key(manager) {
+            return false;
+        }
+        let address = |hash: [u8; 20]| {
+            Address::from_pubkey_hash(Hash160::from_bytes(hash), self.network()).to_string()
+        };
+        self.store_vault(VaultMetadata {
+            owner_address: address(owner),
+            manager_address: address(manager),
+            vault_script: script_bytes.to_vec(),
+            funding_txid: [0; 32],
+        });
+        true
+    }
+
     /// Get vault metadata by script
     pub fn get_vault(&self, vault_script: &[u8]) -> Option<VaultMetadata> {
         self.vaults.read().get(vault_script).cloned()
@@ -4189,6 +4409,13 @@ fn parents_first(
         ordered.push((timestamp, tx));
     }
     ordered
+}
+
+/// Seconds since the Unix epoch
+fn unix_time_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
 }
 
 #[cfg(test)]

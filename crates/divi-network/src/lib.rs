@@ -56,6 +56,7 @@
 //! ```
 
 pub mod alert;
+pub mod bloom;
 pub mod constants;
 pub mod error;
 pub mod message;
@@ -65,12 +66,14 @@ mod wire;
 
 // P2P networking
 pub mod addrbook;
+pub mod buffers;
 pub mod codec;
 pub mod connection;
 pub mod gossip;
 pub mod local;
 pub mod masternode_handler;
 pub mod peer;
+pub mod peer_log;
 pub mod peer_manager;
 pub mod relay;
 pub mod scoring;
@@ -79,6 +82,8 @@ pub mod spork;
 pub mod subnet;
 pub mod sync;
 pub mod timedata;
+pub mod torcontrol;
+pub mod upnp;
 
 pub use constants::{
     services, Magic, MAINNET_MAGIC, MAX_MESSAGE_SIZE, MIN_PEER_PROTO_VERSION, PROTOCOL_VERSION,
@@ -98,10 +103,12 @@ pub use masternode_handler::MasternodeHandler;
 pub use peer::{LivePeerStats, PeerDirection, PeerEvent, PeerHandle, PeerId, PeerInfo, PeerState};
 pub use peer_manager::{
     mainnet_peer_manager, regtest_peer_manager, testnet_peer_manager, AddedNode, PeerManager,
-    PeerManagerConfig,
+    PeerManagerConfig, TrySend,
 };
 pub use relay::{TxRelay, TxRelayEvent, TxRelayStats};
 pub use scoring::{BanEntry, Misbehavior, MisbehaviourOutcome, PeerScoring, PeerStats};
 pub use spork::{SporkManager, SporkSyncProgress, SporkSyncState};
 pub use subnet::Subnet;
-pub use sync::{BlockConnectedCallback, BlockSync, ReorgCallback, SyncProgress, SyncState};
+pub use sync::{
+    BlockConnectedCallback, BlockSync, ReorgCallback, SyncPeer, SyncProgress, SyncState,
+};

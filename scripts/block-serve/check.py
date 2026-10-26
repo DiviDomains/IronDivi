@@ -32,6 +32,16 @@ IRONDIVID, DIVID, PORT_BASE, WORK = sys.argv[1], sys.argv[2], int(sys.argv[3]), 
 RPC_TIMEOUT = 60
 START_TIMEOUT = 120
 NODE_IP = "127.0.0.2"
+# A row in which divid is made to rebroadcast its mempool (setmocktime past
+# its next rebroadcast time), to show the rebroadcast is left out
+FORCE_REBROADCAST = os.environ.get("BLOCK_SERVE_FORCE_REBROADCAST", "")
+# A row in which irondivid is taken to have sent an inv of a transaction not in
+# any mempool, unasked: the row must FAIL
+INJECT_INV = os.environ.get("BLOCK_SERVE_INJECT_INV", "")
+# The transactions this run puts in the mempools, and the invs of only these
+# that a node sent unasked, left out as its mempool rebroadcast (see compared)
+RUN_MEMPOOL = set()
+LEFT_OUT = []  # by node name
 
 
 # --- rows ------------------------------------------------------------------------------
@@ -464,6 +474,7 @@ HEIGHT_OF = {h: n for n, h in enumerate(HASH)}
 
 # A transaction in both mempools: one of divid's wallet sends, given to irondivid too
 POOL_TX = C.rpc("sendtoaddress", C.rpc("getnewaddress"), 1)
+RUN_MEMPOOL.add(POOL_TX)
 I.rpc("sendrawtransaction", C.rpc("getrawtransaction", POOL_TX))
 
 # Both alone from here: no peer but the raw ones
@@ -526,16 +537,45 @@ def summary(command, payload):
     return command
 
 
-def ask(peer, command, payload=b"", quiet=2.0, most=30.0):
-    """Send one request; the replies (summaries, in order) until `quiet` seconds pass with none"""
-    peer.log.clear()
+# Each node announces some of its mempool again, unasked, at a random time
+# within 30 minutes of the last time (divid's PeriodicallyRebroadcastMempoolTxs,
+# main.cpp:1245-1294; irondivid's crates/divi-node/src/rebroadcast.rs). So an
+# inv that lists only transactions this run put in the mempools (RUN_MEMPOOL)
+# is that rebroadcast, not an answer, and is left out of what a row compares.
+# Any other message nobody asked for is kept
+def rebroadcast(command, payload):
+    if command != "inv":
+        return False
+    items = invs_of(payload)
+    return bool(items) and all(k == 1 and h in RUN_MEMPOOL for k, h in items)
+
+
+def compared(peer):
+    """The messages in the peer's log a row compares: all but a rebroadcast"""
+    if getattr(peer, "inject_inv", False):
+        peer.log.append(("inv", inv_msg([(1, secrets.token_hex(32))])))
+        peer.inject_inv = False
+    out = []
+    for c, p in peer.log:
+        if rebroadcast(c, p):
+            LEFT_OUT.append(peer.node.name)
+        else:
+            out.append((c, p))
+    return out
+
+
+def ask(peer, command, payload=b"", quiet=2.0, most=30.0, keep=False):
+    """Send one request; the replies (summaries, in order) until `quiet` seconds pass with none
+    (with `keep`, what the peer had logged before is kept with them)"""
+    if not keep:
+        peer.log.clear()
     peer.send(command, payload)
     deadline, seen, last = time.time() + most, 0, time.time()
     while time.time() < deadline and time.time() - last < quiet:
         peer.pump(0.25)
         if len(peer.log) != seen:
             seen, last = len(peer.log), time.time()
-    return [summary(c, p) for c, p in peer.log]
+    return [summary(c, p) for c, p in compared(peer)]
 
 
 def locator_msg(hashes, stop=None):
@@ -567,7 +607,22 @@ def case(name, command, payload=b"", then=None):
     got = {}
     for node in (C, I):
         p = fresh(node, src)
-        replies = ask(p, command, payload)
+        forced = name == FORCE_REBROADCAST and node is C
+        if forced:
+            # divid's next rebroadcast is at most 30 minutes after its last check
+            # (main.cpp:1280-1294); its clock goes there in steps of 10 minutes,
+            # each answered by a ping, as a peer it heard nothing from for 20
+            # minutes (on the same clock) is dropped (Node.cpp:815-830)
+            left, now = len(LEFT_OUT), int(time.time())
+            for step in range(1, 5):
+                node.rpc("setmocktime", now + 600 * step)
+                p.send("ping", secrets.token_bytes(8))
+                p.pump(1)
+        p.inject_inv = name == INJECT_INV and node is I
+        replies = ask(p, command, payload, keep=forced)
+        if forced:
+            node.rpc("setmocktime", 0)
+            print(f"# forced rebroadcast in \"{name}\": {len(LEFT_OUT) - left} inv left out on divid", flush=True)
         if then:
             replies += ["|"] + then(p)
         got[node] = {"replies": replies, "connected": p.pump(0.5) == "up"}
@@ -587,7 +642,7 @@ after = {}
 for node in (C, I):
     p = Peer(node, src)
     p.pump(4)
-    after[node] = sorted({c for c, _ in p.log})
+    after[node] = sorted({c for c, _ in compared(p)})
     p.close()
 compare("messages a node sends unasked after the handshake", ("ok", after[C]), ("ok", after[I]))
 
@@ -742,6 +797,7 @@ raw = C.rpc("createrawtransaction", [{"txid": coin["txid"], "vout": coin["vout"]
             {C.rpc("getnewaddress"): round(float(coin["amount"]) - 0.001, 8)})
 RELAYED = C.rpc("signrawtransaction", raw)["hex"]
 RELAYED_ID = sha256d(bytes.fromhex(RELAYED))[::-1].hex()
+RUN_MEMPOOL.add(RELAYED_ID)
 src = next(SRC)
 for node in (C, I):
     p = Peer(node, src)
@@ -757,6 +813,8 @@ compare("the relayed transaction mined", ("ok", RELAYED_ID not in C.rpc("getrawm
         ("ok", RELAYED_ID not in I.rpc("getrawmempool")))
 case("getdata of the relayed transaction, once in a block", "getdata", inv_msg([(1, RELAYED_ID)]))
 
+print(f"# rebroadcast invs left out: divid {LEFT_OUT.count(C.name)}, irondivid {LEFT_OUT.count(I.name)}",
+      flush=True)
 for n in (C, I):
     n.stop()
 print(f"# rows: {counts['PASS']} PASS, {counts['KNOWN']} KNOWN, {counts['FAIL']} FAIL", flush=True)

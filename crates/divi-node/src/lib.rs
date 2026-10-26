@@ -52,6 +52,7 @@
 
 pub mod block_import;
 pub mod config;
+mod core_heap;
 pub mod error;
 pub mod fee_estimator;
 pub mod history_fetch;

@@ -118,21 +118,28 @@ episode) and the remaining steps, so every comparison stays exact:
 - **coin choice:** a send where each side spent one coin, of different values. divid ranks the coins that each cover
   a send by signature size alone (`MinimumFeeCoinSelectionAlgorithm.cpp:127-139`), so among them it takes the first
   in its wallet map, ordered by txid.
-- **stake coin choice:** a `mine` or `generateblock` step where each side's new blocks staked coins of different
-  values, only balances and coins differ, and each node's balance plus immature balance agree. divid tries its stake
-  set in outpoint order (`StakableCoin.h:20-23`, `PoSTransactionCreator.cpp:261`), so the first coin whose kernel
-  meets the target depends on the txids, which differ between the pairs. The staked coin and its reward move from
-  the balance to the immature balance, so the two fields are compared here by their total.
 - **maturity after a reorg:** after an `invalidateblock`, the two sides dropped different mempool transactions, and
   every one of them spends a coinbase or coinstake output that is immature at the new height. divid's
   `removeCoinbaseSpends` drops these too (`txmempool.cpp:139-157`), at each block it disconnects
   (`ChainTipManager.cpp:175-182`). Each side had spent a different coin of the same value, since divid's coin choice
   among equal coins is by txid order. The dropped transactions are those the invalidated node held before the
   invalidate (its own sends count: the other node may never have had them, when it was restarted and a send reaches it
-  again only by the random rebroadcast) and those the other node holds, less what the chain confirms again. A
-  transaction it lacks that spends no immature coin is allowed only when the other side's node lacks one with the same
-  output values: a node restarted earlier gets its peer's sends back only by divid's random rebroadcast
-  (`main.cpp:1280-1294`), on both sides alike.
+  again only by the random rebroadcast) and those the other node holds, less what the chain confirms again. A dropped
+  transaction may also spend, instead, an output of a transaction in a disconnected block that itself spends such a
+  coin: divid refuses that parent when it puts the block's transactions back and removes the parent's descendants from
+  the mempool with it (`remove(..., true)`, `txmempool.cpp:91-126`). `reconsiderblock` confirms the parent again, but
+  the child stays gone. A transaction it lacks that spends no immature coin is allowed only when the other side's node
+  lacks one with the same output values: a node restarted earlier gets its peer's sends back only by divid's random
+  rebroadcast (`main.cpp:1280-1294`), on both sides alike.
+- **stake coin choice:** a `mine` or `generateblock` step past the last work block, after which only node n's balances
+  and coins differ. On both sides each new block staked the coin divid's rule picks: the first, in outpoint order, of
+  the wallet's coins that are unlocked, have 10 confirmations at that block, and were not spent by an earlier block of
+  the step. divid tries its stake set in `std::set` order (`StakableCoin.h:21-24`), shuffled only with `-vault`
+  (`PoSTransactionCreator.cpp:63-72`, `:99`, `:261`), and on regtest the first coin tried finds its proof. The set
+  holds the coins of `CWallet::SelectStakeCoins` (`wallet.cpp:1433-1465`): depth 10, and no coin age on regtest
+  (`chainparams.cpp:498`). The pairs' txids differ, so the first coin can differ in value. A coinstake's outputs are
+  immature, so the balances part by the difference. The rule also checks that node n's balance plus immature balance
+  agree, so the two fields are compared by their total.
 - **divid balance cache:** divid's `getbalance` disagrees with its own unspent coins (`listunspent 1`), while
   irondivid's agrees with the same coins. divid keeps each wallet transaction's balance in
   `CachedUtxoBalanceCalculator` (`CachedUtxoBalanceCalculator.cpp:13-30`), recomputed only when a wallet transaction
@@ -144,6 +151,12 @@ episode) and the remaining steps, so every comparison stays exact:
   equal coins is by txid order, which shows only in the coins' depths). With the tip lowered, one of those coins sits
   in the block between the mempool's coinbase maturity (20, `txmempool.cpp:151`) and the wallet's (21,
   `MerkleTxConfirmationNumberCalculator.cpp:54-59`). The run goes on without a new episode.
+- **maturity in the middle of a reorg:** only the middle of an `invalidate` differs (balances, coins, the mempool's
+  size), and the end states agree. While its tip was lowered, one side dropped transactions from the disconnected
+  blocks or its mempool, and each spends a coinbase or coinstake output immature at that height, or an output of a
+  disconnected transaction that does. divid drops these with their descendants (`txmempool.cpp:139-157`, `:91-126`),
+  and `reconsiderblock` confirms them again. The other side had spent an older coin of the same value. The run goes
+  on without a new episode.
 - **divid reindex after a kill:** see below. divid's reindex runs on a thread of its own (`init.cpp:1580`), while
   its wallet's unconfirmed transactions are offered to the mempool at the end of the start (`init.cpp:1646`), before
   the chain is rebuilt. So they are refused, and divid's wallet counts their inputs unspent.

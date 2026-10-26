@@ -2767,9 +2767,11 @@ dependencies = [
  "divi-test-support",
  "futures",
  "hex",
+ "hmac",
  "parking_lot",
  "proptest",
  "rand 0.8.8",
+ "sha2",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
@@ -3040,6 +3042,7 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tracing",
+ "tracing-subscriber",
  "zeroize",
 ]
 
@@ -4164,6 +4167,7 @@ version = "0.2.6"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "chrono",
  "clap",
  "dirs",
  "divi-crypto",
@@ -4177,6 +4181,7 @@ dependencies = [
  "divi-wallet",
  "hex",
  "libc",
+ "rocksdb",
  "serde",
  "serde_json",
  "tempfile",

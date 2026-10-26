@@ -188,7 +188,8 @@ class Pair:
         self.restarted = set()  # nodes stopped and started again in this episode
         self.imported = {1: [], 2: []}  # addresses importprivkey steps brought in, per node
         self.pool_before = {}  # an invalidate's node: its mempool before, txid -> inputs
-        self.height_before = None  # the step's node: its height before the step
+        self.stake = None  # a mine step's stake blocks: the coins staked, and whether divid's rule picks them
+        self.reorg = None  # an invalidate: the height it left, the disconnected blocks' transactions, the mempool then
 
     def node(self, n):
         return self.nodes[n - 1]
@@ -439,7 +440,11 @@ def run_step(pair, step):
         dest = node.rpc("getnewaddress")
         return sent(pair, node, node.call("reclaimvaultfunds", dest, float(f"{0.5 + draw % 20:.8f}"))), None
     if kind == "mine":
-        return outcome(node.call("setgenerate", 1 + draw % 3)), None
+        h0 = node.rpc("getblockcount")
+        before, locks = node.call("listunspent", 0), node.call("listlockunspent")
+        result = outcome(node.call("setgenerate", 1 + draw % 3))
+        pair.stake = stake_kernels(node, h0, before, locks)
+        return result, None
     if kind == "invalidate":
         depth = 1 + draw % 3
         height = node.rpc("getblockcount")
@@ -448,9 +453,18 @@ def run_step(pair, step):
         target = node.rpc("getblockhash", height - depth + 1)
         trace_mempool(pair, node, f"before invalidateblock of {height - depth + 1}")
         pair.pool_before = pool_inputs(node)
+        # the transactions of the blocks about to be disconnected, but their
+        # coinbases and coinstakes, which no node puts back in its mempool
+        block_txs = []
+        for h in range(height - depth + 1, height + 1):
+            txs = node.rpc("getblock", node.rpc("getblockhash", h))["tx"]
+            block_txs += [t for t in txs[1:] if not is_coinstake(pair, t)]
         first = node.call("invalidateblock", target)
         trace_mempool(pair, node, f"after invalidateblock of {height - depth + 1}")
         mid = snapshot(node)
+        mid_pool = node.call("getrawmempool")
+        pair.reorg = {"mid": height - depth, "block_txs": block_txs,
+                      "mid_pool": set(mid_pool[1]) if mid_pool[0] == "ok" else None}
         # the coins in full, printed with a FAIL but not compared
         coins = node.call("listunspent", 0)
         mid["_coins (amount, confirmations)"] = sorted(
@@ -529,7 +543,11 @@ def run_step(pair, step):
         args = as_number(amount_args(pair, n, "small", draw))
         return sent(pair, node, node.call("sendtoaddress", target, *args)), None
     if kind == "generateblock":
-        return outcome(node.call("generateblock", {})), None
+        h0 = node.rpc("getblockcount")
+        before, locks = node.call("listunspent", 0), node.call("listlockunspent")
+        result = outcome(node.call("generateblock", {}))
+        pair.stake = stake_kernels(node, h0, before, locks)
+        return result, None
     if kind == "rawtx":
         coin = coin_at(node, draw)
         if coin is None:
@@ -724,10 +742,16 @@ EXPLAINED = {
         "(crypter.cpp:295-305), so the next start no longer has it, nor the coins paid to it. irondivid "
         "stores the key"),
     "stake coin choice": (
-        "each side staked a coin of a different value, and each node's balance plus immature balance "
-        "agree: divid tries its stake set in outpoint order (StakableCoin.h:20-23, "
-        "PoSTransactionCreator.cpp:261), and the two pairs' txids differ, so the first coin whose kernel "
-        "meets the target differs"),
+        "each side staked, in each new block, the first of its coins in outpoint order with 10 confirmations "
+        "(divid tries its stake set in std::set order, StakableCoin.h:21-24, unshuffled without -vault, "
+        "PoSTransactionCreator.cpp:63-72, :99, :261; the set from CWallet::SelectStakeCoins, wallet.cpp:1433-1465); "
+        "the two pairs' txids differ, so the coins staked differ in value, and a coinstake's outputs are immature"),
+    "maturity in the middle of a reorg": (
+        "only the middle of the invalidate differs: while its tip was lowered, one side dropped transactions that "
+        "spend a coinbase or coinstake output immature at that height, or an output of one that does, which "
+        "divid's removeCoinbaseSpends drops with their descendants (txmempool.cpp:139-157, :91-126); the other "
+        "side had spent an older coin of the same value (divid's coin choice among equal coins is by txid order); "
+        "reconsiderblock confirms them again, so the end states agree"),
     "maturity after a reorg": (
         "after invalidateblock the dropped mempool transactions all spend a coinbase or coinstake "
         "output that is immature at the new height, which divid's removeCoinbaseSpends drops too "
@@ -748,6 +772,78 @@ def lost_imported_key():
     return False
 
 
+def stake_kernels(node, h0, before, locks):
+    """The coin each stake block of a mine or generateblock step staked (its coinstake's first
+    input), and whether each is the one divid's rule picks: the first, in
+    outpoint order, of the wallet's coins that are unlocked, have 10
+    confirmations at that block, and no earlier block of the step spent. divid
+    tries its stake set in std::set order (StakableCoin.h:21-24), unshuffled
+    without -vault (PoSTransactionCreator.cpp:63-72, :99, :261), and on
+    regtest the first coin tried finds its proof. The set is the coins of
+    CWallet::SelectStakeCoins (wallet.cpp:1433-1465): depth 10 (a coinstake
+    output's is already mature to be listed), no coin age on regtest
+    (chainparams.cpp:498). None when no stake block was made"""
+    if before[0] != "ok" or locks[0] != "ok":
+        return None
+    locked = {(o["txid"], o["vout"]) for o in locks[1]}
+    coins = sorted((u for u in before[1] if (u["txid"], u["vout"]) not in locked),
+                   key=lambda u: (u["txid"], u["vout"]))
+    value = {(u["txid"], u["vout"]): str(u["amount"]) for u in before[1]}
+    used, kernels, rule, misses = set(), [], True, []
+    try:
+        for h in range(h0 + 1, node.rpc("getblockcount") + 1):
+            block = node.rpc("getblock", node.rpc("getblockhash", h))
+            if len(block["tx"]) < 2:
+                continue  # a work block
+            stake = node.call("gettransaction", block["tx"][1])
+            if stake[0] != "ok":
+                continue  # not the wallet's: a work block with others' transactions
+            decoded = node.rpc("decoderawtransaction", stake[1]["hex"])
+            if not decoded["vout"] or float(decoded["vout"][0]["value"]) != 0:
+                continue  # a work block with transactions: no coinstake
+            vin = decoded["vin"]
+            kernel = (vin[0].get("txid"), vin[0].get("vout"))
+            # the coin's depth when block h was made on block h - 1
+            first = next((u for u in coins if (u["txid"], u["vout"]) not in used
+                          and u["confirmations"] + (h - 1 - h0) >= 10), None)
+            if first is None or (first["txid"], first["vout"]) != kernel:
+                rule = False
+                staked = next((u for u in before[1] if (u["txid"], u["vout"]) == kernel), None)
+                misses.append(f"block {h}: staked {value.get(kernel, '?')}"
+                              f"{'' if staked is None else ' at ' + str(staked['confirmations'] + h - 1 - h0)}"
+                              f"{' (locked)' if kernel in locked else ''}, rule picks "
+                              f"{'none' if first is None else str(first['amount']) + ' at ' + str(first['confirmations'] + h - 1 - h0)}")
+            used.update((v.get("txid"), v.get("vout")) for v in vin)
+            kernels.append(value.get(kernel, "?"))
+    except RuntimeError:
+        return None
+    return {"rule": rule, "kernels": kernels, "misses": misses, "locked": len(locked)} if kernels else None
+
+
+def stake_choice_explains(n, diff):
+    """A mine or generateblock step after which only node n's balances and
+    coins differ, with its balance plus immature balance the same on both
+    sides, where on both sides each stake block staked the coin divid's rule
+    picks (stake_kernels), and the coins staked differ in value"""
+    stakes = [p.stake for p in PAIRS]
+    log(f"#   stake rule: divid {stakes[0]}, irondivid {stakes[1]}"[:1500])
+    if None in stakes or not all(s["rule"] for s in stakes):
+        return False
+    if stakes[0]["kernels"] == stakes[1]["kernels"]:
+        return False
+    allowed = {f"node {n}: {k}" for k in ("getbalance * 0", "getbalance * 1", "listunspent 0 amounts",
+                                          "immature balance")}
+    if not all(k in allowed for k in diff):
+        return False
+    totals = []
+    for pair in PAIRS:
+        info, balance = pair.node(n).call("getwalletinfo"), pair.node(n).call("getbalance", "*", 0)
+        if info[0] != "ok" or balance[0] != "ok":
+            return False
+        totals.append(round(float(balance[1]) + float(info[1].get("immature_balance", 0)), 8))
+    return totals[0] == totals[1]
+
+
 def coin_choice_differs():
     """Both sides made one send, each spending one coin, of different values"""
     txs = [p.last_tx for p in PAIRS]
@@ -758,44 +854,6 @@ def coin_choice_differs():
     except RuntimeError:
         return False
     return len(spent[0]) == len(spent[1]) == 1 and spent[0] != spent[1]
-
-
-def stake_kernels(pair, n):
-    """The values of the coins the blocks node n made in this step staked"""
-    node = pair.node(n)
-    kernels = []
-    for height in range(pair.height_before + 1, node.rpc("getblockcount") + 1):
-        block = node.rpc("getblock", node.rpc("getblockhash", height))
-        if len(block["tx"]) > 1:
-            kernels.append(input_values(node, block["tx"][1]))
-    return kernels
-
-
-def stake_choice_differs(n, diff):
-    """A mine or generateblock step whose only differences are balances and
-    coins, with each node's balance plus immature balance the same on both
-    sides, and the two sides' new blocks staking coins of different values"""
-    if any(k.split(": ")[-1] not in ("getbalance * 0", "getbalance * 1", "immature balance", "listunspent 0 amounts")
-           for k in diff):
-        return False
-    for m in (1, 2):
-        totals = []
-        for pair in PAIRS:
-            info = pair.node(m).call("getwalletinfo")
-            balance = pair.node(m).call("getbalance", "*", 0)
-            if info[0] != "ok" or balance[0] != "ok":
-                return False
-            totals.append(round(float(balance[1]) + float(info[1].get("immature_balance", 0)), 8))
-        if totals[0] != totals[1]:
-            return False
-    try:
-        if None in (p.height_before for p in PAIRS):
-            return False
-        kernels = [stake_kernels(p, n) for p in PAIRS]
-    except RuntimeError:
-        return False
-    log(f"#   stake rule: kernels {kernels}")
-    return any(kernels) and kernels[0] != kernels[1]
 
 
 def pool_inputs(node):
@@ -826,6 +884,95 @@ def spends_immature(pair, holder, txid, next_height, inputs=None):
                 if next_height - height < MATURITY:
                     return True
                 break
+    return False
+
+
+def wallet_inputs(pair, txid):
+    """The outpoints a transaction of one of the pair's wallets spends, or None"""
+    for wallet in pair.nodes:
+        tx = wallet.call("gettransaction", txid)
+        if tx[0] == "ok":
+            decoded = wallet.call("decoderawtransaction", tx[1]["hex"])
+            if decoded[0] == "ok":
+                return [(i.get("txid", ""), i.get("vout")) for i in decoded[1]["vin"]]
+    return None
+
+
+def is_coinstake(pair, txid):
+    """A coinstake of one of the pair's wallets: its first output is empty"""
+    for wallet in pair.nodes:
+        tx = wallet.call("gettransaction", txid)
+        if tx[0] == "ok":
+            decoded = wallet.call("decoderawtransaction", tx[1]["hex"])
+            return decoded[0] == "ok" and bool(decoded[1]["vout"]) and float(decoded[1]["vout"][0]["value"]) == 0
+    return False
+
+
+def mid_maturity_explains(n, diff):
+    """Only the middle of an invalidate differs (the end states agree), in
+    balances, coins and the mempool's size. On each side every transaction
+    node n lost while its tip was lowered (from the disconnected blocks or its
+    mempool before) spends a coin immature at the height after the one left,
+    or an output of a disconnected transaction that does; divid drops these
+    (removeCoinbaseSpends, txmempool.cpp:139-157, with their descendants,
+    :91-126), and reconsiderblock confirms them again. The two sides lost
+    different transactions: each had spent a different coin of the same
+    value (divid's coin choice among equal coins is by txid order)"""
+    allowed = {"after invalidateblock: " + k for k in
+               ("getbalance * 0", "getbalance * 1", "getunconfirmedbalance", "listunspent 0 amounts", "mempool size",
+                "immature balance")}
+    if not diff or any(k not in allowed for k in diff):
+        return False
+    lost_values = []
+    for pair in PAIRS:
+        reorg = pair.reorg
+        if reorg is None or reorg["mid_pool"] is None:
+            return False
+        next_height = reorg["mid"] + 1
+        values = []
+        for txid in (set(reorg["block_txs"]) | set(pair.pool_before)) - reorg["mid_pool"]:
+            inputs = pair.pool_before.get(txid) or wallet_inputs(pair, txid)
+            if inputs is None:
+                log(f"#   mid maturity rule: {pair.name} lost {txid[:8]}, whose inputs no wallet of the pair knows")
+                return False
+            holder = pair.node(n)
+            if not (spends_immature(pair, holder, txid, next_height, inputs)
+                    or parent_spends_immature(pair, holder, txid, reorg["mid"], next_height, inputs)):
+                log(f"#   mid maturity rule: {pair.name} lost {txid[:8]}, not immature at {next_height}")
+                return False
+            values.append(txid)
+        lost_values.append(len(values))
+    log(f"#   mid maturity rule: lost {lost_values}")
+    return lost_values[0] != lost_values[1]
+
+
+def parent_spends_immature(pair, holder, txid, mid, next_height, inputs=None):
+    """Whether the transaction spends an output of one that sat in a block
+    the invalidate disconnected (above `mid`, and confirmed again since) and
+    itself spends a coin immature at `next_height`. divid refuses that parent
+    when it puts the block's transactions back (removeCoinbaseSpends,
+    txmempool.cpp:139-157) and removes its descendants from the mempool with
+    it (remove(..., true), txmempool.cpp:91-126); reconsiderblock confirms
+    the parent again, but the child stays gone"""
+    if inputs is None:
+        tx = holder.call("getrawtransaction", txid, 1)
+        if tx[0] != "ok":
+            return False
+        inputs = [(i.get("txid", ""), i.get("vout")) for i in tx[1]["vin"]]
+    for prev_txid, _ in inputs:
+        for wallet in pair.nodes:
+            prev = wallet.call("gettransaction", prev_txid)
+            if prev[0] != "ok" or prev[1].get("confirmations", 0) <= 0:
+                continue
+            height = wallet.rpc("getblockcount") - prev[1]["confirmations"] + 1
+            decoded = wallet.call("decoderawtransaction", prev[1]["hex"])
+            if height > mid and decoded[0] == "ok" and spends_immature(
+                    pair, wallet, prev_txid, next_height,
+                    [(i.get("txid", ""), i.get("vout")) for i in decoded[1]["vin"]]):
+                log(f"#   maturity rule: {pair.name}: {txid[:8]} spends {prev_txid[:8]} of block {height}, "
+                    f"which spends a coin immature at {next_height}")
+                return True
+            break
     return False
 
 
@@ -870,13 +1017,15 @@ def maturity_explains(n, mid_heights):
             if known[0] == "ok" and known[1].get("confirmations", 0) > 0:
                 continue
             holder = other if txid in theirs else node
+            inputs = None if txid in theirs else before[txid]
             tx = holder.call("getrawtransaction", txid, 1) if txid in theirs else node.call("gettransaction", txid)
             if txid in theirs:
                 outs = sorted(str(o["value"]) for o in tx[1]["vout"]) if tx[0] == "ok" else []
             else:
                 decoded = node.call("decoderawtransaction", tx[1]["hex"]) if tx[0] == "ok" else tx
                 outs = sorted(str(o["value"]) for o in decoded[1]["vout"]) if decoded[0] == "ok" else []
-            if spends_immature(pair, holder, txid, next_height, None if txid in theirs else before[txid]):
+            if spends_immature(pair, holder, txid, next_height, inputs) \
+                    or parent_spends_immature(pair, holder, txid, mid, next_height, inputs):
                 values.append(outs)
             else:
                 log(f"#   maturity rule: {pair.name} node {n} lacks {txid[:8]}, not immature at {next_height}")
@@ -1006,8 +1155,8 @@ for step in steps:
         pair.last_tx = None
         pair.note = None
         pair.pool_before = {}
-        height = pair.node(step["node"]).call("getblockcount")
-        pair.height_before = height[1] if height[0] == "ok" else None
+        pair.stake = None
+        pair.reorg = None
         try:
             result = run_step(pair, step)
         except RuntimeError as e:
@@ -1048,7 +1197,7 @@ for step in steps:
     elif diff and "outcome" not in diff:
         if coin_choice_differs():
             explained = "coin choice"
-        elif step["kind"] in ("mine", "generateblock") and stake_choice_differs(n, diff):
+        elif step["kind"] in ("mine", "generateblock") and stake_choice_explains(n, diff):
             explained = "stake coin choice"
         elif step["kind"] == "invalidate" and c_res[1] and i_res[1] \
                 and c_res[1]["height"][0] == i_res[1]["height"][0] == "ok" \
@@ -1057,6 +1206,8 @@ for step in steps:
         elif step["kind"] == "invalidate" and c_res[1] and i_res[1] \
                 and maturity_window_explains(c_res[1], i_res[1], diff):
             explained = "maturity window"
+        elif step["kind"] == "invalidate" and mid_maturity_explains(n, diff):
+            explained = "maturity in the middle of a reorg"
         elif step["kind"] == "kill" and PAIRS[0].note:
             explained = "divid reindex after a kill"
         elif step["kind"] == "kill" and (
@@ -1079,7 +1230,7 @@ for step in steps:
     if diff and (explained or known):
         log(f"KNOWN  {line}  {explained or ''}  [{EXPLAINED[explained] if explained else known}]")
         # the end states agree after a maturity window: the run goes on
-        if explained != "maturity window":
+        if explained not in ("maturity window", "maturity in the middle of a reorg"):
             new_episode()
             episode_steps = []
         continue

@@ -54,19 +54,38 @@ impl NetworkRpc {
         let connections = pm.map(|pm| pm.peer_count()).unwrap_or(0);
         let connections_in = pm.map(|pm| pm.inbound_count()).unwrap_or(0);
         let connections_out = pm.map(|pm| pm.outbound_count()).unwrap_or(0);
-        let proxy = pm
-            .and_then(|pm| pm.proxy())
-            .map(|p| p.to_string())
-            .unwrap_or_default();
+        let proxy_type = pm.and_then(|pm| pm.proxy());
+        let proxy = proxy_type.map(|p| p.addr.to_string()).unwrap_or_default();
+        // Divi Core's proxyType: randomize_credentials of the proxy set for the
+        // network, false where none is (netbase.h:182-183, rpcnet.cpp:326)
+        let randomize = proxy_type.is_some_and(|p| p.randomize_credentials);
         let local_services = pm
             .map(|pm| pm.services())
             .unwrap_or(divi_network::constants::services::NODE_NETWORK);
         let local = pm.map(|pm| pm.local_addresses().list()).unwrap_or_default();
         // Divi Core: a network is reachable once a local address of it is known,
         // and an IPv6 one marks IPv4 too (NetworkLocalAddressHelpers.cpp:73-105,
-        // :163-167)
-        let ipv6_reachable = local.iter().any(|a| a.address.is_ipv6());
+        // :163-167); an onion address is the onion network's
+        let is_onion = |a: &std::net::IpAddr| divi_network::local::is_onion(a);
+        let ipv6_reachable = local
+            .iter()
+            .any(|a| a.address.is_ipv6() && !is_onion(&a.address));
         let ipv4_reachable = ipv6_reachable || local.iter().any(|a| a.address.is_ipv4());
+        // The onion network: its proxy (-onion, else -proxy), reachable with one
+        // set and not with -onion=0, or once an onion address of ours is known
+        // (net.cpp:1774-1800)
+        let tor_proxy = pm.and_then(|pm| pm.tor_proxy());
+        let tor_reachable =
+            pm.is_some_and(|pm| pm.tor_reachable()) || local.iter().any(|a| is_onion(&a.address));
+        // -onlynet: the networks it left out are limited, and a limited
+        // network is not reachable (rpcnet.cpp:323-324,
+        // NetworkLocalAddressHelpers.cpp:163-167)
+        let limited = |net| pm.is_some_and(|pm| pm.local_addresses().is_net_limited(net));
+        let (ipv4_limited, ipv6_limited, tor_limited) = (
+            limited(divi_network::local::Network::Ipv4),
+            limited(divi_network::local::Network::Ipv6),
+            limited(divi_network::local::Network::Tor),
+        );
 
         Ok(serde_json::json!({
             "version": format!("{}.0", env!("CARGO_PKG_VERSION")),
@@ -80,25 +99,24 @@ impl NetworkRpc {
             "networks": [
                 {
                     "name": "ipv4",
-                    "limited": false,
-                    "reachable": ipv4_reachable,
+                    "limited": ipv4_limited,
+                    "reachable": ipv4_reachable && !ipv4_limited,
                     "proxy": proxy,
-                    "proxy_randomize_credentials": false
+                    "proxy_randomize_credentials": randomize
                 },
                 {
                     "name": "ipv6",
-                    "limited": false,
-                    "reachable": ipv6_reachable,
+                    "limited": ipv6_limited,
+                    "reachable": ipv6_reachable && !ipv6_limited,
                     "proxy": proxy,
-                    "proxy_randomize_credentials": false
+                    "proxy_randomize_credentials": randomize
                 },
                 {
-                    // .onion peers cannot be addressed (peer addresses are IP only)
                     "name": "onion",
-                    "limited": true,
-                    "reachable": false,
-                    "proxy": "",
-                    "proxy_randomize_credentials": false
+                    "limited": tor_limited,
+                    "reachable": tor_reachable && !tor_limited,
+                    "proxy": tor_proxy.map(|p| p.addr.to_string()).unwrap_or_default(),
+                    "proxy_randomize_credentials": tor_proxy.is_some_and(|p| p.randomize_credentials)
                 }
             ],
             "relayfee": 0.0001,
@@ -106,7 +124,9 @@ impl NetworkRpc {
             "localaddresses": local
                 .into_iter()
                 .map(|a| serde_json::json!({
-                    "address": a.address.to_string(),
+                    // An onion address as its name (CNetAddr::ToStringIP)
+                    "address": divi_network::local::onion_name(&a.address)
+                        .unwrap_or_else(|| a.address.to_string()),
                     "port": a.port.to_string(),
                     "score": a.score.to_string(),
                 }))
@@ -644,20 +664,34 @@ mod tests {
         }
     }
 
+    /// A peer manager listening on a port from `free_port`. The listener is
+    /// bound before `start` runs (`bind_listeners`), so a port that was taken
+    /// since is reported at once, and the manager built again on another port.
+    async fn listening_server() -> (Arc<PeerManager>, std::net::SocketAddr) {
+        for _ in 0..5 {
+            let listen =
+                std::net::SocketAddr::from(([127, 0, 0, 1], divi_test_support::free_port()));
+            let server = PeerManager::new(divi_network::PeerManagerConfig {
+                listen_addr: Some(listen),
+                ..quiet_config()
+            });
+            if let Err(e) = server.bind_listeners().await {
+                eprintln!("{e}: trying another port");
+                continue;
+            }
+            tokio::spawn(Arc::clone(&server).start());
+            return (server, listen);
+        }
+        panic!("no listening port could be bound in 5 tries");
+    }
+
     /// Two nodes on localhost: the per-peer counters and the in/out split must be real.
     /// getpeerinfo used to show pingtime 0 (no ping until 30 s in, then rounded to whole
     /// milliseconds) and getnetworkinfo had no in/out split, so `-getinfo` printed 0/0.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_peer_counters_and_connection_split_are_real() {
         use std::time::Duration;
-        let listen: std::net::SocketAddr = format!("127.0.0.1:{}", divi_test_support::free_port())
-            .parse()
-            .unwrap();
-        let server = PeerManager::new(divi_network::PeerManagerConfig {
-            listen_addr: Some(listen),
-            ..quiet_config()
-        });
-        tokio::spawn(Arc::clone(&server).start());
+        let (server, listen) = listening_server().await;
         let client = PeerManager::new(quiet_config());
         let mut connected = false;
         for _ in 0..50 {
@@ -716,14 +750,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_ping_rpc_pings_every_peer() {
         use std::time::Duration;
-        let listen: std::net::SocketAddr = format!("127.0.0.1:{}", divi_test_support::free_port())
-            .parse()
-            .unwrap();
-        let server = PeerManager::new(divi_network::PeerManagerConfig {
-            listen_addr: Some(listen),
-            ..quiet_config()
-        });
-        tokio::spawn(Arc::clone(&server).start());
+        let (server, listen) = listening_server().await;
         let client = PeerManager::new(quiet_config());
         let mut connected = false;
         for _ in 0..50 {
@@ -795,14 +822,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_addnode_onetry_dials_once_now() {
         use std::time::Duration;
-        let listen: std::net::SocketAddr = format!("127.0.0.1:{}", divi_test_support::free_port())
-            .parse()
-            .unwrap();
-        let server = PeerManager::new(divi_network::PeerManagerConfig {
-            listen_addr: Some(listen),
-            ..quiet_config()
-        });
-        tokio::spawn(Arc::clone(&server).start());
+        let (server, listen) = listening_server().await;
         let client = PeerManager::new(quiet_config());
         let mut connected = false;
         for _ in 0..50 {
@@ -832,8 +852,14 @@ mod tests {
     #[test]
     fn test_network_info_reports_proxy() {
         let proxy: std::net::SocketAddr = "127.0.0.1:9050".parse().unwrap();
+        let proxy_type = divi_network::socks5::Proxy {
+            addr: proxy,
+            randomize_credentials: true,
+        };
         let pm = PeerManager::new(divi_network::PeerManagerConfig {
-            proxy: Some(proxy),
+            proxy: Some(proxy_type),
+            tor_proxy: Some(proxy_type),
+            tor_reachable: true,
             ..quiet_config()
         });
         let ni = NetworkRpc::with_peer_manager(pm)
@@ -843,7 +869,11 @@ mod tests {
         assert_eq!(nets[0]["name"], "ipv4");
         assert_eq!(nets[0]["proxy"], "127.0.0.1:9050");
         assert_eq!(nets[1]["proxy"], "127.0.0.1:9050");
-        assert_eq!(nets[2]["reachable"], false);
+        assert_eq!(nets[0]["proxy_randomize_credentials"], true);
+        // -proxy makes onion reachable through it (net.cpp:1774-1779)
+        assert_eq!(nets[2]["reachable"], true);
+        assert_eq!(nets[2]["limited"], false);
+        assert_eq!(nets[2]["proxy"], "127.0.0.1:9050");
         let ni = NetworkRpc::with_peer_manager(PeerManager::new(quiet_config()))
             .get_network_info(&Params::None)
             .unwrap();
@@ -1037,14 +1067,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_peer_info_members_are_in_cores_order() {
         use std::time::Duration;
-        let listen: std::net::SocketAddr = format!("127.0.0.1:{}", divi_test_support::free_port())
-            .parse()
-            .unwrap();
-        let server = PeerManager::new(divi_network::PeerManagerConfig {
-            listen_addr: Some(listen),
-            ..quiet_config()
-        });
-        tokio::spawn(Arc::clone(&server).start());
+        let (server, listen) = listening_server().await;
         let client = PeerManager::new(quiet_config());
         let mut connected = false;
         for _ in 0..50 {

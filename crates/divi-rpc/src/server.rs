@@ -552,6 +552,17 @@ impl RpcServer {
 
     /// Dispatch a method call
     fn dispatch(&self, method: &str, params: &Params) -> Result<serde_json::Value, Error> {
+        self.dispatch_with(method, params, None)
+    }
+
+    /// Dispatch a method call; `amounts` is sendmany's or fundvault's amounts
+    /// object with every pair as the request wrote it, when it came as JSON text
+    fn dispatch_with(
+        &self,
+        method: &str,
+        params: &Params,
+        amounts: Option<&[(String, serde_json::Value)]>,
+    ) -> Result<serde_json::Value, Error> {
         // Divi Core's dispatcher refuses a wallet call without a wallet before
         // the call runs (rpcserver.cpp:1043-1047)
         if WALLET_CALLS.contains(&method) && self.wallet.wallet_db().is_none() {
@@ -561,12 +572,26 @@ impl RpcServer {
             )
             .into());
         }
+        // Then safe mode, for the calls Divi Core's table does not mark
+        // okSafeMode (rpcserver.cpp:329-465, :1049-1054)
+        if NOT_IN_SAFE_MODE.contains(&method) {
+            if let Some(refusal) = crate::warnings::safe_mode_refusal() {
+                return Err(RpcError::new(codes::FORBIDDEN_BY_SAFE_MODE, refusal).into());
+            }
+        }
         // Then the call's own `if (fHelp || params.size() ...)`: a wrong
         // argument count answers -1 with the call's help text
         let encrypted = self.wallet.wallet_db().map(|w| w.is_encrypted());
         if crate::core_help::usage_refused(method, params, encrypted) {
             let help = self.help(&Params::Array(vec![serde_json::json!(method)]))?;
             return Err(RpcError::new(codes::MISC_ERROR, help.as_str().unwrap_or_default()).into());
+        }
+        // signmessage and setupmasternode check that the wallet is unlocked
+        // before they read an argument (rpcwallet.cpp:1385, rpcmasternode.cpp:204)
+        if matches!(method, "signmessage" | "setupmasternode") {
+            if let Some(wallet) = self.wallet.wallet_db() {
+                crate::wallet::ensure_fully_unlocked(&wallet)?;
+            }
         }
         rpc_type_check(method, params)?;
         // The wallet passphrase calls check the encryption state before they
@@ -675,7 +700,7 @@ impl RpcServer {
             "listaccounts" => self.wallet.list_accounts(params),
             "getreceivedbyaccount" => self.wallet.get_received_by_account(params),
             "listreceivedbyaccount" => self.wallet.list_received_by_account(params),
-            "sendmany" => self.wallet.send_many(params),
+            "sendmany" => self.wallet.send_many_with(params, amounts),
             "sendfrom" => self.wallet.send_from(params),
             "walletpassphrasechange" => self.wallet.wallet_passphrase_change(params),
             "encryptwallet" => self.wallet.encrypt_wallet(params),
@@ -708,7 +733,6 @@ impl RpcServer {
             "getstakingstatus" => self.staking.get_staking_status(params),
             "getmintinginfo" => self.staking.get_minting_info(params),
             "setstaking" => self.staking.set_staking(params),
-            "reservebalance" => self.staking.reserve_balance(params),
             "getstakesplitthreshold" => self.staking.get_stake_split_threshold(params),
             "setstakesplitthreshold" => self.staking.set_stake_split_threshold(params),
 
@@ -780,7 +804,7 @@ impl RpcServer {
             "addvault" => self.wallet.add_vault(params),
             "removevault" => self.wallet.remove_vault(params),
             "getcoinavailability" => self.wallet.get_coin_availability(params),
-            "fundvault" => self.wallet.fund_vault(params),
+            "fundvault" => self.wallet.fund_vault_with(params, amounts),
             "debitvaultbyname" => self.wallet.debit_vault_by_name(params),
             "reclaimvaultfunds" => self.wallet.reclaim_vault_funds(params),
 
@@ -913,7 +937,6 @@ impl RpcServer {
                 "getstakingstatus" => "getstakingstatus\n\nReturns an object containing staking information.",
                 "getmintinginfo" => "getmintinginfo\n\nReturns detailed staking/minting information.",
                 "setstaking" => "setstaking true|false\n\nEnable or disable staking.",
-                "reservebalance" => "reservebalance ( true|false amount )\n\nShow or set reserve balance for staking.",
                 "getstakesplitthreshold" => "getstakesplitthreshold\n\nReturns the stake split threshold in DIVI (startup value: -stakesplitthreshold, default 20000).",
                 "setstakesplitthreshold" => "setstakesplitthreshold value\n\nSet the stake split threshold in whole DIVI for this run: a stake whose value plus reward exceeds it is paid back as two outputs; smaller coins of the same address are combined up to half of it.",
                 // Lite wallet (external address queries)
@@ -1087,7 +1110,6 @@ impl RpcServer {
                 "== Staking ==",
                 "getmintinginfo",
                 "getstakingstatus",
-                "reservebalance",
                 "getstakesplitthreshold",
                 "setstakesplitthreshold",
                 "setstaking",
@@ -1170,6 +1192,38 @@ impl RpcServer {
         ))
     }
 }
+
+/// The calls Divi Core's table does not mark okSafeMode: refused while a
+/// warning puts the server in safe mode (rpcserver.cpp:329-465)
+const NOT_IN_SAFE_MODE: &[&str] = &[
+    "getblockheader",
+    "sendrawtransaction",
+    "signtransactionwithaddresskey",
+    "signrawtransaction",
+    "getbalance",
+    "getreceivedbyaccount",
+    "getreceivedbyaddress",
+    "getstakingstatus",
+    "gettransaction",
+    "getunconfirmedbalance",
+    "getwalletinfo",
+    "listaccounts",
+    "listlockunspent",
+    "listreceivedbyaccount",
+    "listreceivedbyaddress",
+    "listsinceblock",
+    "listtransactions",
+    "listunspent",
+    "sendfrom",
+    "sendmany",
+    "sendtoaddress",
+    "fundvault",
+    "reclaimvaultfunds",
+    "debitvaultbyname",
+    "removevault",
+    "addvault",
+    "getcoinavailability",
+];
 
 /// The calls Divi Core's table marks as needing a wallet (requiresWalletLock or
 /// requiresWalletInstance, rpcserver.cpp:329-465); without one they answer
@@ -1376,7 +1430,8 @@ fn core_argument_types(method: &str) -> &'static [(usize, &'static str)] {
         // rpcmisc.cpp:485
         "verifymessage" => &[(0, "str"), (1, "str"), (2, "str")],
         // rpcwallet.cpp:2573
-        "walletpassphrase" => &[(0, "str"), (1, "int"), (2, "bool")],
+        // (the timeout is read after the unlock, by the call: rpcwallet.cpp:2622)
+        "walletpassphrase" => &[(0, "str"), (2, "bool")],
         // rpcwallet.cpp:2628
         "walletpassphrasechange" => &[(0, "str"), (1, "str")],
         _ => &[],
@@ -1386,7 +1441,7 @@ fn core_argument_types(method: &str) -> &'static [(usize, &'static str)] {
 /// The arguments of `core_argument_types` Divi Core reads with no test for
 /// null first, so a null makes the getter throw too: every one of the calls
 /// listed first (rpcwallet.cpp:550, :1576-1584, :1752, :1798-1808,
-/// :2272-2283, :2342-2348, :2410-2427; rpcrawtransaction.cpp:206-207,
+/// :2272-2283, :2342-2348, :2410-2427, :2593-2600; rpcrawtransaction.cpp:206-207,
 /// :571-572; rpcblockchain.cpp:418-420), and the account names, addresses,
 /// messages and paths of the others, which take them with get_str or
 /// AccountFromValue while their comments are read only when not null
@@ -1406,6 +1461,7 @@ fn getter_reads_null(method: &str, index: usize) -> bool {
             | "listtransactions"
             | "signtransactionwithaddresskey"
             | "verifychain"
+            | "walletpassphrase"
     ) || matches!(
         (method, index),
         ("getnewaddress", 0)
@@ -1418,6 +1474,8 @@ fn getter_reads_null(method: &str, index: usize) -> bool {
             | ("verifymessage", 0..=2)
             | ("backupwallet", 0)
             | ("importaddress", 0..=2)
+            // get_bool whenever it is given (rpcwallet.cpp:828)
+            | ("getcoinavailability", 0)
     )
 }
 
@@ -1645,15 +1703,17 @@ impl RpcServer {
         // divi-cli's byte escapes of non-ASCII text, read as divid reads them
         let body = crate::json_spirit_text::byte_escapes_as_divid(body_text);
         let body = body.as_deref().unwrap_or(body_text);
-        // json_spirit's reading: of two equal keys the first counts
-        let request: Value = match crate::http::parse_json(body) {
+        // json_spirit's reading: of two equal keys the first counts, but an
+        // object keeps both (for sendmany's amounts)
+        let tree = match crate::http::parse_json_members(body) {
             Ok(v) => v,
             Err(_) => return error_reply(RpcError::parse_error(), Value::Null),
         };
+        let request = tree.first_wins();
         match &request {
             Value::Object(_) => {
                 let id = request.get("id").cloned().unwrap_or(Value::Null);
-                match self.execute_json_request(&request) {
+                match self.execute_json_request(&request, &tree) {
                     Ok(result) => (StatusCode::OK, reply_text(Ok(result), &id) + "\n"),
                     Err(e) => error_reply(e, id),
                 }
@@ -1662,9 +1722,11 @@ impl RpcServer {
                 // JSONRPCExecBatch: every entry answered, the batch itself is 200
                 let replies: Vec<String> = requests
                     .iter()
-                    .map(|r| {
+                    .enumerate()
+                    .map(|(i, r)| {
                         let id = r.get("id").cloned().unwrap_or(Value::Null);
-                        reply_text(self.execute_json_request(r), &id)
+                        let tree = tree.element(i).expect("the batch's own entry");
+                        reply_text(self.execute_json_request(r, tree), &id)
                     })
                     .collect();
                 (StatusCode::OK, format!("[{}]\n", replies.join(",")))
@@ -1677,10 +1739,12 @@ impl RpcServer {
     }
 
     /// Check and run one request object (rpcserver.cpp JSONRequest::parse):
-    /// "method" must be a string, "params" an array or absent/null
+    /// "method" must be a string, "params" an array or absent/null. `tree` is
+    /// the same request with every member of its objects.
     fn execute_json_request(
         &self,
         request: &serde_json::Value,
+        tree: &crate::http::Json,
     ) -> Result<serde_json::Value, RpcError> {
         use serde_json::Value;
         let Value::Object(obj) = request else {
@@ -1696,7 +1760,20 @@ impl RpcServer {
             Some(Value::Array(a)) => Params::Array(a.clone()),
             Some(_) => return Err(RpcError::invalid_request("Params must be an array")),
         };
-        match self.dispatch(method, &params) {
+        // sendmany and fundvault read each pair of their amounts object, equal
+        // keys included (rpcwallet.cpp parseMultiSendJson, parseFundVaultRPCParameters)
+        let amounts = match method.as_str() {
+            "sendmany" => tree
+                .member("params")
+                .and_then(|p| p.element(1))
+                .and_then(|a| a.members()),
+            "fundvault" => tree
+                .member("params")
+                .and_then(|p| p.element(0))
+                .and_then(|a| a.members()),
+            _ => None,
+        };
+        match self.dispatch_with(method, &params, amounts.as_deref()) {
             Ok(result) => Ok(result),
             Err(Error::Rpc(e)) => Err(e),
             Err(e) => Err(RpcError::internal_error(e.to_string())),

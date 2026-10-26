@@ -12,7 +12,7 @@
 
 #![cfg(unix)]
 
-use divi_test_support::{free_port, log_tail};
+use divi_test_support::{free_port, log_tail, start_on};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -54,39 +54,34 @@ impl Drop for Node {
     }
 }
 
-fn start(datadir: &Path, rpc_port: u16, p2p_port: u16) -> Node {
-    let child = Command::new(env!("CARGO_BIN_EXE_irondivid"))
-        .arg("--regtest")
-        .arg("--datadir")
-        .arg(datadir)
-        .args(["--rpcport", &rpc_port.to_string()])
-        .args(["--port", &p2p_port.to_string()])
-        .args(["--bind", "127.0.0.1", "--staking=false", "--listen=false"])
-        .args(["--rpcuser", "test", "--rpcpassword", "test"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn irondivid");
-    let mut node = Node(child);
-    let deadline = Instant::now() + Duration::from_secs(120);
-    while try_rpc(
+fn start(datadir: &Path, rpc_port: &mut u16, p2p_port: &mut u16) -> Node {
+    Node(start_on(
+        datadir,
         rpc_port,
-        "getblockcount",
-        &json!([]),
-        Duration::from_secs(10),
-    )
-    .is_none()
-    {
-        if let Ok(Some(status)) = node.0.try_wait() {
-            panic!("irondivid exited at start: {status}\n{}", log_tail(datadir));
-        }
-        assert!(
-            Instant::now() < deadline,
-            "irondivid did not answer within 120 s"
-        );
-        std::thread::sleep(Duration::from_millis(250));
-    }
-    node
+        p2p_port,
+        |rpc_port, p2p_port| {
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_irondivid"));
+            cmd.arg("--regtest")
+                .arg("--datadir")
+                .arg(datadir)
+                .args(["--rpcport", &rpc_port.to_string()])
+                .args(["--port", &p2p_port.to_string()])
+                .args(["--bind", "127.0.0.1", "--staking=false", "--listen=false"])
+                .args(["--rpcuser", "test", "--rpcpassword", "test"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            cmd
+        },
+        |rpc_port| {
+            try_rpc(
+                rpc_port,
+                "getblockcount",
+                &json!([]),
+                Duration::from_secs(10),
+            )
+            .is_some()
+        },
+    ))
 }
 
 fn stop(port: u16, mut node: Node) {
@@ -101,15 +96,15 @@ fn stop(port: u16, mut node: Node) {
 #[test]
 fn resync_starts_the_chain_again_and_keeps_the_wallet() {
     let dir = tempfile::tempdir().unwrap();
-    let (rpc_port, p2p_port) = (free_port(), free_port());
-    let node = start(dir.path(), rpc_port, p2p_port);
+    let (mut rpc_port, mut p2p_port) = (free_port(), free_port());
+    let node = start(dir.path(), &mut rpc_port, &mut p2p_port);
     ok(rpc_port, "setgenerate", json!([10]));
     let address = ok(rpc_port, "getnewaddress", json!([]));
     stop(rpc_port, node);
     assert!(dir.path().join("txindex").exists());
 
     std::fs::write(dir.path().join("divi.conf"), "resync=1\n").unwrap();
-    let node = start(dir.path(), rpc_port, p2p_port);
+    let node = start(dir.path(), &mut rpc_port, &mut p2p_port);
     assert_eq!(
         ok(rpc_port, "getblockcount", json!([])),
         json!(0),

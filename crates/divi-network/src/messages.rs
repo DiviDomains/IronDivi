@@ -87,6 +87,8 @@ pub enum NetworkMessage {
     FilterAdd(Vec<u8>),
     /// Clear bloom filter
     FilterClear,
+    /// A filtered block: header and partial merkle tree (Divi Core CMerkleBlock)
+    MerkleBlock(Vec<u8>),
 
     // Send headers preference
     /// Prefer headers announcements
@@ -124,6 +126,11 @@ pub enum NetworkMessage {
 }
 
 impl NetworkMessage {
+    /// Bytes this message takes on the wire, its 24-byte header included
+    pub fn wire_size(&self) -> u64 {
+        24 + self.serialize_payload().map_or(0, |p| p.len() as u64)
+    }
+
     /// Get the command name for this message
     pub fn command(&self) -> &str {
         match self {
@@ -147,6 +154,7 @@ impl NetworkMessage {
             NetworkMessage::FilterLoad(_) => "filterload",
             NetworkMessage::FilterAdd(_) => "filteradd",
             NetworkMessage::FilterClear => "filterclear",
+            NetworkMessage::MerkleBlock(_) => "merkleblock",
             NetworkMessage::SporkCount(_) => "sporkcount",
             NetworkMessage::GetSporks => "getsporks",
             NetworkMessage::Spork(_) => "spork",
@@ -227,6 +235,7 @@ impl NetworkMessage {
             NetworkMessage::Alert(data)
             | NetworkMessage::FilterLoad(data)
             | NetworkMessage::FilterAdd(data)
+            | NetworkMessage::MerkleBlock(data)
             | NetworkMessage::RequestMasternodeList(data)
             | NetworkMessage::MasternodeBroadcast(data)
             | NetworkMessage::MasternodePing(data)
@@ -322,6 +331,7 @@ impl NetworkMessage {
             }
             "filterload" => NetworkMessage::FilterLoad(payload.to_vec()),
             "filteradd" => NetworkMessage::FilterAdd(payload.to_vec()),
+            "merkleblock" => NetworkMessage::MerkleBlock(payload.to_vec()),
 
             "sporkcount" => NetworkMessage::SporkCount(r.u32()?),
             "getsporks" => NetworkMessage::GetSporks,

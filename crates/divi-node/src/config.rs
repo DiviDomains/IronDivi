@@ -494,6 +494,45 @@ pub struct P2pConfig {
     #[serde(default)]
     pub proxy: Option<String>,
 
+    /// Random credentials for each connection through a proxy, which gives each
+    /// its own Tor circuit (Divi Core's `-proxyrandomize`, on by default;
+    /// net.cpp:1761)
+    #[serde(default = "default_proxy_randomize")]
+    pub proxy_randomize: bool,
+
+    /// A SOCKS5 proxy for onion peers only (`-onion=<ip:port>`), or `0` (also
+    /// `-noonion`) for no onion peers at all; unset, onion peers use `-proxy`
+    #[serde(default)]
+    pub onion: Option<String>,
+
+    /// Resolve host names given for -proxy, -onion, -externalip, -addnode and
+    /// -connect (Divi Core's `-dns`, on by default; net.cpp:1759). Off, only
+    /// addresses are read; a peer name still goes to the proxy, if one is set.
+    #[serde(default = "default_name_lookup")]
+    pub name_lookup: bool,
+
+    /// Ask Tor for a hidden service at start (Divi Core's `-listenonion`).
+    /// Off here, so an embedded or test node only contacts a control port
+    /// when asked; irondivid applies divid's default, on, and off under
+    /// -listen=0 unless given (init.cpp:1621, net.cpp:1706-1711)
+    #[serde(default)]
+    pub listen_onion: bool,
+
+    /// The Tor control port, a numeric `ip:port` (Divi Core's `-torcontrol`)
+    #[serde(default = "default_tor_control")]
+    pub tor_control: String,
+
+    /// The Tor control password (Divi Core's `-torpassword`), empty for none.
+    /// Never written out.
+    #[serde(default, skip_serializing)]
+    pub tor_password: String,
+
+    /// Map the listen port on the gateway by UPnP (Divi Core's `-upnp`, off by
+    /// default; off under -proxy or -listen=0 unless given; net.cpp:1454,
+    /// :1690-1706)
+    #[serde(default)]
+    pub upnp: bool,
+
     /// Connection timeout in milliseconds (Divi Core's -timeout)
     #[serde(default = "default_connect_timeout_ms")]
     pub connect_timeout_ms: u64,
@@ -506,6 +545,19 @@ pub struct P2pConfig {
     /// Addresses this node is reachable at (Divi Core -externalip)
     #[serde(default)]
     pub external_ips: Vec<SocketAddr>,
+
+    /// Divi Core -onlynet: the only networks dialled from learnt addresses
+    /// (`ipv4`, `ipv6`, `onion`); empty: every network
+    #[serde(default)]
+    pub only_nets: Vec<String>,
+
+    /// Divi Core -maxreceivebuffer, in thousands of bytes (default 5000)
+    #[serde(default = "default_max_receive_buffer")]
+    pub max_receive_buffer: i64,
+
+    /// Divi Core -maxsendbuffer, in thousands of bytes (default 1000)
+    #[serde(default = "default_max_send_buffer")]
+    pub max_send_buffer: i64,
 
     /// The machine's interface addresses, found at start with `discover`
     #[serde(default)]
@@ -521,44 +573,108 @@ pub struct P2pConfig {
     #[serde(default)]
     pub white_bind: Vec<SocketAddr>,
 
+    /// The -bind addresses after the first, each listened on as the first is
+    /// (Divi Core binds every -bind, net.cpp:1809-1814)
+    #[serde(default)]
+    pub more_bind: Vec<SocketAddr>,
+
     /// Listen on `listen_addr`. Divi Core listens only on the -bind and
     /// -whitebind addresses when either is given, so -whitebind alone leaves
     /// this off (net.cpp:1808-1823)
     #[serde(default = "default_listen_on_addr")]
     pub listen_on_addr: bool,
+
+    /// Serve bloom-filtered connections and advertise NODE_BLOOM (Divi Core
+    /// `-peerbloomfilters`, on by default: defaultValues.h:100, net.cpp:1722-1723)
+    #[serde(default = "default_peer_bloom_filters")]
+    pub peer_bloom_filters: bool,
 }
 
 impl P2pConfig {
     /// The `proxy` setting as a socket address: `ip:port`, `host:port`, or a bare IP
     /// or host with the Tor default port 9050 (C++ `-proxy` accepts the same).
+    /// Empty and `0` (also `-noproxy`) are no proxy (net.cpp:1763-1765).
     pub fn proxy_addr(&self) -> Result<Option<SocketAddr>, String> {
         let Some(raw) = self
             .proxy
             .as_deref()
             .map(str::trim)
-            .filter(|s| !s.is_empty())
+            .filter(|s| !s.is_empty() && *s != "0")
         else {
             return Ok(None);
         };
-        if let Ok(addr) = raw.parse::<SocketAddr>() {
-            return Ok(Some(addr));
-        }
-        if let Ok(ip) = raw.trim_matches(['[', ']']).parse::<std::net::IpAddr>() {
-            return Ok(Some(SocketAddr::new(ip, 9050)));
-        }
-        use std::net::ToSocketAddrs;
-        let with_port = if raw.contains(':') {
-            raw.to_string()
-        } else {
-            format!("{raw}:9050")
-        };
-        with_port
-            .to_socket_addrs()
-            .ok()
-            .and_then(|mut a| a.next())
-            .map(Some)
-            .ok_or_else(|| format!("Invalid -proxy address or hostname: '{raw}'"))
+        lookup_proxy(raw, "proxy", self.name_lookup).map(Some)
     }
+
+    /// The `onion` setting: unset or empty (onion peers go through `-proxy`, if
+    /// any), `0` (no onion peers), or a proxy for them, read as `-proxy` is
+    /// (net.cpp:1785-1800)
+    pub fn onion_setting(&self) -> Result<OnionSetting, String> {
+        match self.onion.as_deref().map(str::trim) {
+            None | Some("") => Ok(OnionSetting::Unset),
+            Some("0") => Ok(OnionSetting::Off),
+            Some(raw) => lookup_proxy(raw, "onion", self.name_lookup).map(OnionSetting::Proxy),
+        }
+    }
+}
+
+/// Divi Core's `-onion` (net.cpp:1785-1800)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnionSetting {
+    /// Onion peers through `-proxy`, reachable when it is set
+    Unset,
+    /// `-onion=0` / `-noonion`: onion is not reachable
+    Off,
+    /// Onion peers through this proxy, reachable
+    Proxy(SocketAddr),
+}
+
+/// A `-proxy` or `-onion` value as divid's Lookup reads it: `ip:port`,
+/// `host:port`, or a bare IP or host with the Tor port 9050, a host only with
+/// `name_lookup`; else "Invalid -<option> address or hostname: '<value>'"
+/// (net.cpp:1767-1771, :1790-1794)
+fn lookup_proxy(raw: &str, option: &str, name_lookup: bool) -> Result<SocketAddr, String> {
+    let invalid = || format!("Invalid -{option} address or hostname: '{raw}'");
+    if let Ok(addr) = raw.parse::<SocketAddr>() {
+        return Ok(addr);
+    }
+    if let Ok(ip) = raw.trim_matches(['[', ']']).parse::<std::net::IpAddr>() {
+        return Ok(SocketAddr::new(ip, 9050));
+    }
+    if !name_lookup {
+        return Err(invalid());
+    }
+    use std::net::ToSocketAddrs;
+    let with_port = if raw.contains(':') {
+        raw.to_string()
+    } else {
+        format!("{raw}:9050")
+    };
+    with_port
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut a| a.next())
+        .ok_or_else(invalid)
+}
+
+fn default_name_lookup() -> bool {
+    true
+}
+
+fn default_tor_control() -> String {
+    divi_network::torcontrol::DEFAULT_TOR_CONTROL.to_string()
+}
+
+fn default_proxy_randomize() -> bool {
+    true
+}
+
+fn default_max_receive_buffer() -> i64 {
+    5000
+}
+
+fn default_max_send_buffer() -> i64 {
+    1000
 }
 
 fn default_discover() -> bool {
@@ -570,6 +686,10 @@ fn default_listen_on_addr() -> bool {
 }
 
 fn default_alerts() -> bool {
+    true
+}
+
+fn default_peer_bloom_filters() -> bool {
     true
 }
 
@@ -603,13 +723,25 @@ impl Default for P2pConfig {
             alerts: true,
             user_agent: format!("/DiviRust:{}/", env!("CARGO_PKG_VERSION")),
             proxy: None,
+            proxy_randomize: default_proxy_randomize(),
+            onion: None,
+            name_lookup: default_name_lookup(),
+            listen_onion: false,
+            tor_control: default_tor_control(),
+            tor_password: String::new(),
+            upnp: divi_network::upnp::DEFAULT_UPNP,
             connect_timeout_ms: default_connect_timeout_ms(),
             discover: default_discover(),
             external_ips: Vec::new(),
+            only_nets: Vec::new(),
+            max_receive_buffer: default_max_receive_buffer(),
+            max_send_buffer: default_max_send_buffer(),
             interface_ips: Vec::new(),
             whitelist: Vec::new(),
             white_bind: Vec::new(),
+            more_bind: Vec::new(),
             listen_on_addr: true,
+            peer_bloom_filters: true,
         }
     }
 }
@@ -768,6 +900,11 @@ pub struct StakingConfig {
     pub block_priority_size: usize,
     #[serde(default)]
     pub block_min_size: usize,
+
+    /// Divi Core `-blockversion`, read on regtest only: the version of the
+    /// blocks made (BlockFactory.cpp:90-95)
+    #[serde(default)]
+    pub block_version: Option<i32>,
 }
 
 fn default_block_max_size() -> usize {
@@ -790,6 +927,7 @@ impl Default for StakingConfig {
             block_max_size: default_block_max_size(),
             block_priority_size: default_block_priority_size(),
             block_min_size: crate::staker::DEFAULT_BLOCK_MIN_SIZE,
+            block_version: None,
         }
     }
 }
@@ -940,6 +1078,19 @@ pub struct LogConfig {
 
     /// Print to console instead of file
     pub print_to_console: bool,
+
+    /// Divi Core -logips: log lines carry peers' addresses (default off)
+    #[serde(default)]
+    pub log_ips: bool,
+
+    /// Divi Core -logtimestamps: debug.log lines begin with the time (default on)
+    #[serde(default = "default_discover")]
+    pub timestamps: bool,
+
+    /// Divi Core -shrinkdebugfile: cut a debug.log over 10 MB to its last
+    /// 200 000 bytes at start and every five minutes (default: without -debug)
+    #[serde(default = "default_discover")]
+    pub shrink: bool,
 }
 
 impl Default for LogConfig {
@@ -949,6 +1100,9 @@ impl Default for LogConfig {
             max_files: 5,
             debug: false,
             print_to_console: false,
+            log_ips: false,
+            timestamps: true,
+            shrink: true,
         }
     }
 }
@@ -1128,6 +1282,7 @@ mod tests {
         };
         assert_eq!(P2pConfig::default().proxy_addr(), Ok(None));
         assert_eq!(with("").proxy_addr(), Ok(None));
+        assert_eq!(with("0").proxy_addr(), Ok(None));
         assert_eq!(
             with("127.0.0.1:9150").proxy_addr(),
             Ok(Some("127.0.0.1:9150".parse().unwrap()))

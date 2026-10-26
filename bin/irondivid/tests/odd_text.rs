@@ -10,7 +10,7 @@
 
 #![cfg(unix)]
 
-use divi_test_support::{free_port, log_tail};
+use divi_test_support::{free_port, start_on};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -52,40 +52,35 @@ impl Drop for Node {
     }
 }
 
-fn start(datadir: &Path, rpc_port: u16, p2p_port: u16, extra: &[&str]) -> Node {
-    let child = Command::new(env!("CARGO_BIN_EXE_irondivid"))
-        .arg("--regtest")
-        .arg("--datadir")
-        .arg(datadir)
-        .args(["--rpcport", &rpc_port.to_string()])
-        .args(["--port", &p2p_port.to_string()])
-        .args(["--bind", "127.0.0.1", "--staking=false", "--listen=false"])
-        .args(["--rpcuser", "test", "--rpcpassword", "test"])
-        .args(extra)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn irondivid");
-    let mut node = Node(child);
-    let deadline = Instant::now() + Duration::from_secs(120);
-    while try_rpc(
+fn start(datadir: &Path, rpc_port: &mut u16, p2p_port: &mut u16, extra: &[&str]) -> Node {
+    Node(start_on(
+        datadir,
         rpc_port,
-        "getblockcount",
-        &json!([]),
-        Duration::from_secs(10),
-    )
-    .is_none()
-    {
-        if let Ok(Some(status)) = node.0.try_wait() {
-            panic!("irondivid exited at start: {status}\n{}", log_tail(datadir));
-        }
-        assert!(
-            Instant::now() < deadline,
-            "irondivid did not answer within 120 s"
-        );
-        std::thread::sleep(Duration::from_millis(250));
-    }
-    node
+        p2p_port,
+        |rpc_port, p2p_port| {
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_irondivid"));
+            cmd.arg("--regtest")
+                .arg("--datadir")
+                .arg(datadir)
+                .args(["--rpcport", &rpc_port.to_string()])
+                .args(["--port", &p2p_port.to_string()])
+                .args(["--bind", "127.0.0.1", "--staking=false", "--listen=false"])
+                .args(["--rpcuser", "test", "--rpcpassword", "test"])
+                .args(extra)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            cmd
+        },
+        |rpc_port| {
+            try_rpc(
+                rpc_port,
+                "getblockcount",
+                &json!([]),
+                Duration::from_secs(10),
+            )
+            .is_some()
+        },
+    ))
 }
 
 /// Stop the node with the RPC stop and wait (bounded) until it exits
@@ -108,13 +103,13 @@ const ODD: &str = "caf\u{e9} \u{4e2d}\u{6587} \u{1f4b0} \"q\" \t\n\u{0}x";
 fn sends_list_under_the_account_they_came_from() {
     // An address of another wallet to pay
     let other = tempfile::tempdir().unwrap();
-    let (rpc_port, p2p_port) = (free_port(), free_port());
-    let n = start(other.path(), rpc_port, p2p_port, &[]);
+    let (mut rpc_port, mut p2p_port) = (free_port(), free_port());
+    let n = start(other.path(), &mut rpc_port, &mut p2p_port, &[]);
     let payee = ok(rpc_port, "getnewaddress", json!([]));
     stop(n, rpc_port);
 
     let dir = tempfile::tempdir().unwrap();
-    let n = start(dir.path(), rpc_port, p2p_port, &[]);
+    let n = start(dir.path(), &mut rpc_port, &mut p2p_port, &[]);
     ok(rpc_port, "setgenerate", json!([101]));
     let own = ok(rpc_port, "getnewaddress", json!([ODD]));
     for _ in 0..2 {
@@ -130,7 +125,7 @@ fn sends_list_under_the_account_they_came_from() {
         ),
     ];
     let plain = ok(rpc_port, "sendtoaddress", json!([payee, 1]));
-    let check = |when: &str| {
+    let check = |when: &str, rpc_port: u16| {
         let listed = ok(rpc_port, "listtransactions", json!([ODD, 100]));
         for txid in &sends {
             let tx = ok(rpc_port, "gettransaction", json!([txid]));
@@ -157,10 +152,10 @@ fn sends_list_under_the_account_they_came_from() {
             assert_eq!(d["account"], json!(""), "{when}: {tx}");
         }
     };
-    check("before a restart");
+    check("before a restart", rpc_port);
     stop(n, rpc_port);
-    let n = start(dir.path(), rpc_port, p2p_port, &[]);
-    check("after a restart");
+    let n = start(dir.path(), &mut rpc_port, &mut p2p_port, &[]);
+    check("after a restart", rpc_port);
     stop(n, rpc_port);
 }
 
@@ -170,13 +165,13 @@ fn sends_list_under_the_account_they_came_from() {
 #[test]
 fn a_comment_that_reads_as_a_number_is_a_comment() {
     let other = tempfile::tempdir().unwrap();
-    let (rpc_port, p2p_port) = (free_port(), free_port());
-    let n = start(other.path(), rpc_port, p2p_port, &[]);
+    let (mut rpc_port, mut p2p_port) = (free_port(), free_port());
+    let n = start(other.path(), &mut rpc_port, &mut p2p_port, &[]);
     let payee = ok(rpc_port, "getnewaddress", json!([]));
     stop(n, rpc_port);
 
     let dir = tempfile::tempdir().unwrap();
-    let n = start(dir.path(), rpc_port, p2p_port, &[]);
+    let n = start(dir.path(), &mut rpc_port, &mut p2p_port, &[]);
     ok(rpc_port, "setgenerate", json!([101]));
     let own = ok(rpc_port, "getnewaddress", json!(["acct"]));
     for _ in 0..2 {

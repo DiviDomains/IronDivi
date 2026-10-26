@@ -39,6 +39,17 @@ const DNS_SEED_DELAY: Duration = Duration::from_secs(11);
 /// Reads the node's current chain height
 pub type HeightSource = Arc<dyn Fn() -> u32 + Send + Sync>;
 
+/// What `try_send_to_peer` did
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrySend {
+    /// Queued
+    Sent,
+    /// The peer's queue is full: try again later
+    Full,
+    /// No such peer, or it is going
+    Gone,
+}
+
 /// Configuration for the peer manager
 #[derive(Debug, Clone)]
 pub struct PeerManagerConfig {
@@ -52,13 +63,25 @@ pub struct PeerManagerConfig {
     pub dns_seeds: Vec<String>,
     /// Static peers to connect to
     pub static_peers: Vec<SocketAddr>,
+    /// `-connect` and `-addnode` peers given by host name while a proxy is set:
+    /// dialled through `proxy` by name, the proxy resolving them (Divi Core
+    /// ConnectSocketByName with a name proxy, netbase.cpp:631-660; net.cpp:1221-1236)
+    pub named_peers: Vec<(String, u16)>,
     /// Listen address for inbound connections
     pub listen_addr: Option<SocketAddr>,
     /// Default P2P port for DNS seed resolution
     pub default_port: u16,
-    /// SOCKS5 proxy for every outbound connection (C++ `-proxy`). When set, no
-    /// outbound connection is made directly and DNS seeds are not resolved locally.
-    pub proxy: Option<SocketAddr>,
+    /// SOCKS5 proxy for outbound connections to IPv4 and IPv6 peers (C++ `-proxy`,
+    /// with `-proxyrandomize`). When set, no such connection is made directly and
+    /// DNS seeds are not resolved locally; a peer at an address that is not
+    /// routable (127.0.0.1, a private network) is dialled directly, as Divi
+    /// Core keeps no proxy for those (netbase.cpp:620-629).
+    pub proxy: Option<crate::socks5::Proxy>,
+    /// The proxy for onion peers (Divi Core's NET_TOR proxy: `-onion`, else
+    /// `-proxy`) and whether onion is reachable (`-proxy`, `-onion`; not with
+    /// `-onion=0`; net.cpp:1774-1800). The Tor controller changes both later.
+    pub tor_proxy: Option<crate::socks5::Proxy>,
+    pub tor_reachable: bool,
     /// `static_peers` are `-connect` peers (dialled by address and port, as
     /// Divi Core dials `-connect`) rather than `-addnode` and built-in peers
     pub connect_only: bool,
@@ -67,6 +90,9 @@ pub struct PeerManagerConfig {
     /// More listen addresses; every peer coming in on one is whitelisted
     /// (Divi Core -whitebind)
     pub white_listen: Vec<SocketAddr>,
+    /// More listen addresses (the -bind addresses after the first), their
+    /// peers not whitelisted
+    pub more_listen: Vec<SocketAddr>,
     /// `-seednode` peers: each dialled once, asked for addresses and dropped
     /// after its answer, `-connect` or not (Divi Core AddOneShot,
     /// net.cpp:1071-1084, :1096, :1112, :1842-1843)
@@ -147,12 +173,16 @@ impl Default for PeerManagerConfig {
                 "178.62.221.33:51472".parse().unwrap(),
                 "178.128.251.20:51472".parse().unwrap(),
             ],
+            named_peers: Vec::new(),
             listen_addr: None,
             default_port: 51472, // Mainnet P2P port
             proxy: None,
+            tor_proxy: None,
+            tor_reachable: false,
             connect_only: false,
             whitelist: Vec::new(),
             white_listen: Vec::new(),
+            more_listen: Vec::new(),
             seed_nodes: Vec::new(),
             dns_seed: true,
             force_dns_seed: false,
@@ -191,6 +221,12 @@ pub struct PeerManager {
     local_nonces: crate::connection::LocalNonces,
     /// The node's own addresses (Divi Core mapLocalHost)
     local_addresses: RwLock<Arc<crate::local::LocalAddresses>>,
+    /// The onion network's proxy and whether onion is reachable, which the Tor
+    /// controller changes once it has authenticated (torcontrol.cpp:533-541)
+    tor: RwLock<(Option<crate::socks5::Proxy>, bool)>,
+    /// Named peers connected (the peer each one is) and being dialled
+    named_connected: RwLock<HashMap<String, PeerId>>,
+    named_dialling: RwLock<HashSet<String>>,
     /// Added nodes, in the order they were added: -addnode, then the addnode
     /// RPC (Divi Core's vAddedNodes list, net.cpp:1218)
     added_nodes: RwLock<Vec<SocketAddr>>,
@@ -230,6 +266,7 @@ impl PeerManager {
     pub fn new(config: PeerManagerConfig) -> Arc<Self> {
         let config_magic = config.magic;
         let seed_nodes = config.seed_nodes.clone();
+        let tor = (config.tor_proxy, config.tor_reachable);
         let (event_tx, _) = broadcast::channel(1000);
         let (shutdown_tx, _) = broadcast::channel(1);
 
@@ -243,6 +280,9 @@ impl PeerManager {
             scoring: PeerScoring::new(),
             local_nonces: Default::default(),
             local_addresses: RwLock::new(Arc::new(Default::default())),
+            tor: RwLock::new(tor),
+            named_connected: RwLock::new(HashMap::new()),
+            named_dialling: RwLock::new(HashSet::new()),
             added_nodes: RwLock::new(Vec::new()),
             connecting_addrs: RwLock::new(HashSet::new()),
             total_bytes_sent: Arc::new(AtomicU64::new(0)),
@@ -285,6 +325,7 @@ impl PeerManager {
         }
         // GetAdjustedTime (net.cpp:1147)
         let now = divi_primitives::clock::adjusted_now();
+        let local = self.local_addresses();
         let mut slots = self.config.max_outbound;
         while slots > 0 && self.can_connect_outbound() {
             slots -= 1;
@@ -293,6 +334,10 @@ impl PeerManager {
                 let Some((addr, last_try)) = self.address_book.select() else {
                     return;
                 };
+                // A network -onlynet left out is not dialled (net.cpp:1164-1165)
+                if local.is_limited(&addr.ip()) {
+                    continue;
+                }
                 if now - last_try < 600 && tries < 30 {
                     continue;
                 }
@@ -575,6 +620,14 @@ impl PeerManager {
         self.peers.read().get(&peer_id).map(|p| p.addr)
     }
 
+    /// A connected peer's live stats, with its bloom filter
+    pub fn peer_stats(&self, peer_id: PeerId) -> Option<Arc<crate::peer::LivePeerStats>> {
+        self.peers
+            .read()
+            .get(&peer_id)
+            .map(|p| Arc::clone(&p.stats))
+    }
+
     /// Whether a connected peer dialled us
     pub fn is_inbound(&self, peer_id: PeerId) -> bool {
         self.peers.read().get(&peer_id).is_some_and(|p| p.inbound)
@@ -671,8 +724,9 @@ impl PeerManager {
     /// Get info about added nodes
     pub fn get_added_node_info(&self) -> Vec<AddedNode> {
         let added = self.added_nodes.read();
-        let peers = self.peers.read();
+        // the dialled set before the peers, as claim_dial takes them
         let connecting = self.connecting_addrs.read();
+        let peers = self.peers.read();
 
         let connected_addrs: HashSet<_> = peers.values().map(|p| p.addr).collect();
 
@@ -691,6 +745,19 @@ impl PeerManager {
         self.added_nodes.read().contains(addr)
     }
 
+    /// The addresses to listen on, each with whether its peers are
+    /// whitelisted: the listen address, the other -bind addresses, and each
+    /// -whitebind address, whose peers are (net.cpp:1808-1823)
+    fn listen_addresses(&self) -> Vec<(SocketAddr, bool)> {
+        self.config
+            .listen_addr
+            .iter()
+            .chain(self.config.more_listen.iter())
+            .map(|a| (*a, false))
+            .chain(self.config.white_listen.iter().map(|a| (*a, true)))
+            .collect()
+    }
+
     /// Bind the listeners before the node starts: the listen address and each
     /// -whitebind address. As Divi Core, an address that cannot be bound is
     /// reported ("Unable to bind to ... on this computer", net.cpp:1355-1365,
@@ -699,13 +766,7 @@ impl PeerManager {
     /// you want this.", net.cpp:1829-1831). Before, a listener that could not
     /// bind only logged it, and the node ran on without listening.
     pub async fn bind_listeners(&self) -> Result<(), String> {
-        let wanted: Vec<(SocketAddr, bool)> = self
-            .config
-            .listen_addr
-            .iter()
-            .map(|a| (*a, false))
-            .chain(self.config.white_listen.iter().map(|a| (*a, true)))
-            .collect();
+        let wanted = self.listen_addresses();
         let mut bound = Vec::new();
         let mut failures = Vec::new();
         for (addr, white) in wanted.iter().copied() {
@@ -737,15 +798,8 @@ impl PeerManager {
     pub async fn start(self: Arc<Self>) -> Result<(), NetworkError> {
         info!("Starting peer manager");
 
-        // Start listeners for inbound connections: the listen address, and
-        // each -whitebind address, whose peers are whitelisted
-        let listeners: Vec<(SocketAddr, bool)> = self
-            .config
-            .listen_addr
-            .iter()
-            .map(|a| (*a, false))
-            .chain(self.config.white_listen.iter().map(|a| (*a, true)))
-            .collect();
+        // Start listeners for inbound connections
+        let listeners = self.listen_addresses();
         // The sockets bind_listeners bound, when it ran; else bind each here
         let to_run: Vec<(SocketAddr, bool, Option<TcpListener>)> = match self.prebound.lock().take()
         {
@@ -785,7 +839,11 @@ impl PeerManager {
                 let self_clone = Arc::clone(&self);
                 tokio::spawn(async move {
                     if let Err(e) = self_clone.connect_to_peer(addr).await {
-                        warn!("Failed to connect to static peer {}: {}", addr, e);
+                        warn!(
+                            "Failed to connect to static peer {}: {}",
+                            crate::peer_log::address(addr),
+                            e
+                        );
                     }
                 })
             })
@@ -795,6 +853,7 @@ impl PeerManager {
         for handle in static_handles {
             let _ = handle.await;
         }
+        self.dial_named();
 
         // Then addresses learnt from peers, then DNS seeds
         self.dial_learnt();
@@ -813,8 +872,42 @@ impl PeerManager {
     }
 
     /// SOCKS5 proxy used for outbound connections, if any
-    pub fn proxy(&self) -> Option<SocketAddr> {
+    pub fn proxy(&self) -> Option<crate::socks5::Proxy> {
         self.config.proxy
+    }
+
+    /// The onion network's proxy, if any (Divi Core GetProxy(NET_TOR))
+    pub fn tor_proxy(&self) -> Option<crate::socks5::Proxy> {
+        self.tor.read().0
+    }
+
+    /// Whether onion was made reachable (Divi Core vfReachable[NET_TOR])
+    pub fn tor_reachable(&self) -> bool {
+        self.tor.read().1
+    }
+
+    /// Set the onion network's proxy (Divi Core SetProxy(NET_TOR, ...))
+    pub fn set_tor_proxy(&self, proxy: Option<crate::socks5::Proxy>) {
+        self.tor.write().0 = proxy;
+    }
+
+    /// Mark onion reachable or not (Divi Core SetReachable(NET_TOR, ...))
+    pub fn set_tor_reachable(&self, reachable: bool) {
+        self.tor.write().1 = reachable;
+    }
+
+    /// The proxy a connection to `addr` goes through: Divi Core's GetProxy for
+    /// the address's network: the onion proxy for an onion address, `-proxy`
+    /// for another routable one, and none for an address that is not routable
+    /// (ConnectSocket, netbase.cpp:620-629)
+    fn proxy_for(&self, addr: &SocketAddr) -> Option<crate::socks5::Proxy> {
+        if crate::local::is_onion(&addr.ip()) {
+            self.tor_proxy()
+        } else if crate::local::is_routable(&addr.ip()) {
+            self.config.proxy
+        } else {
+            None
+        }
     }
 
     /// Divi Core's DNS seed thread (net.cpp:1015-1060): the seeds are asked
@@ -841,7 +934,7 @@ impl PeerManager {
             debug!("No DNS seeds configured; skipping DNS peer discovery");
             return 0;
         }
-        if let Some(proxy) = self.config.proxy {
+        if let Some(proxy) = self.config.proxy.map(|p| p.addr) {
             // A local lookup would reveal the node outside the proxy
             info!(
                 "Proxy {} set: not resolving DNS seeds locally; using configured peers only",
@@ -860,15 +953,21 @@ impl PeerManager {
                     let addrs: Vec<SocketAddr> = addrs.collect();
                     found += addrs.len();
                     self.address_book.add_seeds(&addrs);
+                    let local = self.local_addresses();
                     for addr in addrs {
                         if self.config.connect_only {
                             break;
                         }
                         if self.can_connect_outbound() {
-                            if !self.claim_dial(addr, DialRule::Automatic) {
+                            // A seed address dialled at once: as from the
+                            // book, not in a network -onlynet left out
+                            // (net.cpp:1164-1165)
+                            if local.is_limited(&addr.ip())
+                                || !self.claim_dial(addr, DialRule::Automatic)
+                            {
                                 continue;
                             }
-                            info!("Discovered peer: {}", addr);
+                            info!("Discovered peer: {}", crate::peer_log::address(addr));
                             let self_clone = Arc::clone(&self);
                             tokio::spawn(async move {
                                 if let Err(e) = self_clone.connect_to_peer(addr).await {
@@ -914,13 +1013,14 @@ impl PeerManager {
                 result = listener.accept() => {
                     match result {
                         Ok((stream, peer_addr)) => {
-                            info!("Accepted connection from {}", peer_addr);
+                            info!("Accepted connection from {}", crate::peer_log::address(peer_addr));
 
                             // Divi Core counts every inbound connection, handshake
                             // done or not, against -maxconnections less the outbound
                             // slots; outbound peers do not use them (net.cpp:744-759)
                             if !self.has_inbound_room() {
-                                warn!("Connection from {} dropped (full)", peer_addr);
+                                // divid's text, in its "net" debug category (net.cpp:757-759)
+                                debug!("connection from {} dropped (full)", peer_addr);
                                 continue;
                             }
 
@@ -958,13 +1058,24 @@ impl PeerManager {
     /// is marked as being dialled, so a second dial to it (or, by address, to
     /// its IP) is skipped until `connect_to_peer` has finished with it.
     pub fn claim_dial(&self, addr: SocketAddr, rule: DialRule) -> bool {
+        self.claim_dial_with(addr, rule, || {})
+    }
+
+    /// `claim_dial`, with `between` run after the dialled set is locked and
+    /// before the connected peers are read: the moment a dial that is just
+    /// finishing could be missed. `connect_peer` stores the peer and only then
+    /// removes the address from the dialled set, and the set stays locked here
+    /// while the peers are read, so an address is always in one of the two (it
+    /// was read from the peers first, which let a second dial in between)
+    fn claim_dial_with(&self, addr: SocketAddr, rule: DialRule, between: impl FnOnce()) -> bool {
+        let mut connecting = self.connecting_addrs.write();
+        between();
         let peers: Vec<(SocketAddr, bool)> = self
             .peers
             .read()
             .values()
             .map(|p| (p.addr, p.inbound))
             .collect();
-        let mut connecting = self.connecting_addrs.write();
         let taken = match rule {
             DialRule::ByName => connecting.contains(&addr) || peers.iter().any(|(a, _)| *a == addr),
             DialRule::ByAddress | DialRule::Automatic => {
@@ -1030,7 +1141,7 @@ impl PeerManager {
 
         let result = Connection::connect(
             addr,
-            self.config.proxy,
+            self.proxy_for(&addr),
             self.config.magic,
             our_height,
             self.services(),
@@ -1083,6 +1194,82 @@ impl PeerManager {
         Ok(peer_id)
     }
 
+    /// Dial each named peer that is neither connected nor being dialled,
+    /// through the proxy by name
+    fn dial_named(self: &Arc<Self>) {
+        let Some(proxy) = self.config.proxy else {
+            return;
+        };
+        for (host, port) in self.config.named_peers.clone() {
+            if !self.can_connect_outbound() {
+                break;
+            }
+            let key = format!("{host}:{port}");
+            let connected = self
+                .named_connected
+                .read()
+                .get(&key)
+                .is_some_and(|id| self.peers.read().contains_key(id));
+            if connected || !self.named_dialling.write().insert(key.clone()) {
+                continue;
+            }
+            let self_clone = Arc::clone(self);
+            tokio::spawn(async move {
+                if let Err(e) = Arc::clone(&self_clone)
+                    .connect_to_named(&host, port, proxy)
+                    .await
+                {
+                    debug!(
+                        "Failed to connect to {}:{} via the proxy: {}",
+                        host, port, e
+                    );
+                }
+                self_clone.named_dialling.write().remove(&key);
+            });
+        }
+    }
+
+    /// Dial `host:port` through `proxy` by name
+    async fn connect_to_named(
+        self: Arc<Self>,
+        host: &str,
+        port: u16,
+        proxy: crate::socks5::Proxy,
+    ) -> Result<PeerId, NetworkError> {
+        let (conn, handle) = Connection::connect_named(
+            host,
+            port,
+            proxy,
+            self.config.magic,
+            self.current_height(),
+            self.services(),
+            self.event_tx.clone(),
+            self.shutdown_tx.subscribe(),
+            self.bytes_sent_counter(),
+            self.bytes_recv_counter(),
+            Arc::clone(&self.local_nonces),
+            self.local_addresses(),
+        )
+        .await?;
+        let peer_id = handle.id;
+        let addr = handle.addr;
+        self.scoring.register_peer(peer_id, addr.ip());
+        self.scoring.reset_connection_failures(peer_id);
+        self.peers.write().insert(peer_id, handle);
+        self.named_connected
+            .write()
+            .insert(format!("{host}:{port}"), peer_id);
+        let self_clone = Arc::clone(&self);
+        tokio::spawn(async move {
+            if let Err(e) = conn.run().await {
+                debug!("Connection to {} ended: {}", addr, e);
+            }
+            self_clone.peers.write().remove(&peer_id);
+            self_clone.scoring.unregister_peer(peer_id);
+        });
+        Ok(peer_id)
+    }
+
     /// Whether an inbound peer from `ip` is whitelisted: it came in on a
     /// -whitebind address or is in a -whitelist network (net.cpp:742)
     fn whitelisted_inbound(&self, ip: IpAddr, white_listener: bool) -> bool {
@@ -1107,7 +1294,8 @@ impl PeerManager {
         let peer_addr = stream.peer_addr()?;
         let whitelisted = self.whitelisted_inbound(peer_addr.ip(), white_listener);
         if !whitelisted && self.is_banned(&peer_addr.ip()) {
-            warn!("Rejecting connection from banned IP {}", peer_addr.ip());
+            // divid's text (net.cpp:760-762)
+            info!("connection from {} dropped (banned)", peer_addr);
             return Err(NetworkError::ConnectionRefused(format!(
                 "{} is banned",
                 peer_addr.ip()
@@ -1257,30 +1445,40 @@ impl PeerManager {
         );
     }
 
-    /// Send a full block to a specific peer (in response to a getdata request).
-    ///
-    /// Uses async `send` with a timeout for reliable delivery.
-    pub async fn send_block_to_peer(
-        &self,
-        peer_id: PeerId,
-        msg: NetworkMessage,
-    ) -> Result<(), NetworkError> {
-        let handle = self.peers.read().get(&peer_id).cloned();
+    /// The node took a message of `size` bytes from `peer_id`: that peer may
+    /// be read again once it is within the receive limits
+    pub fn message_taken(&self, peer_id: PeerId, size: u64) {
+        if let Some(handle) = self.peers.read().get(&peer_id) {
+            handle.stats.message_taken(size);
+        }
+    }
 
-        if let Some(handle) = handle {
-            match tokio::time::timeout(Duration::from_secs(10), handle.send(msg)).await {
-                Ok(Ok(())) => Ok(()),
-                Ok(Err(e)) => {
-                    warn!("Failed to send block to peer {}: {}", peer_id, e);
-                    Err(NetworkError::Disconnected)
-                }
-                Err(_) => {
-                    warn!("Timeout sending block to peer {}", peer_id);
-                    Err(NetworkError::Timeout)
-                }
+    /// Bytes queued for `peer_id` and not yet written; None for no such peer
+    pub fn send_queued(&self, peer_id: PeerId) -> Option<u64> {
+        self.peers
+            .read()
+            .get(&peer_id)
+            .map(|h| h.stats.send_queued_bytes.load(Ordering::Relaxed))
+    }
+
+    /// Queue a message for `peer_id` without waiting
+    pub fn try_send_to_peer(&self, peer_id: PeerId, msg: NetworkMessage) -> TrySend {
+        let Some(handle) = self.peers.read().get(&peer_id).cloned() else {
+            return TrySend::Gone;
+        };
+        match handle.try_send(msg) {
+            Ok(()) => TrySend::Sent,
+            Err(e) if matches!(*e, tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                TrySend::Full
             }
-        } else {
-            Err(NetworkError::PeerNotFound(peer_id))
+            Err(_) => TrySend::Gone,
+        }
+    }
+
+    /// The node missed messages it cannot count: every peer may be read again
+    pub fn clear_receive_queues(&self) {
+        for handle in self.peers.read().values() {
+            handle.stats.clear_queued();
         }
     }
 
@@ -1417,8 +1615,8 @@ impl PeerManager {
 
     /// Periodic maintenance loop that ensures we maintain target outbound peer count.
     ///
-    /// Runs every 30 seconds and reconnects to peers if we've dropped below
-    /// `max_outbound`. Tries added nodes first, then static peers (with exponential
+    /// Runs every 30 seconds: dials the added nodes not connected, then, if
+    /// we've dropped below `max_outbound`, static peers (with exponential
     /// backoff for repeatedly-failing peers), then DNS seeds.
     ///
     /// Backoff schedule for static peers (consecutive failures → min wait before retry):
@@ -1436,24 +1634,13 @@ impl PeerManager {
 
             self.dial_one_shots();
 
-            let outbound = self.outbound_count();
-            let target = self.config.max_outbound;
-
-            if outbound >= target {
-                continue;
-            }
-
-            info!(
-                "Peer maintenance: {}/{} outbound peers, attempting reconnection",
-                outbound, target
-            );
-
-            // 1. Try added nodes first (manually added via RPC)
+            // 1. The added nodes (-addnode, addnode add), with -connect or
+            // not and whatever -maxconnections says: divid's added-node
+            // thread runs beside the -connect loop and counts no outbound
+            // slot since Divi Core f8c0d2e67 took its semaphore grant out; it skips a
+            // banned address (net.cpp:1214-1271, :1275-1285)
             let added: Vec<SocketAddr> = self.added_nodes.read().iter().copied().collect();
             for addr in added {
-                if !self.can_connect_outbound() {
-                    break;
-                }
                 if self.is_banned(&addr.ip()) {
                     continue;
                 }
@@ -1465,7 +1652,10 @@ impl PeerManager {
                 if !self.claim_dial(addr, DialRule::ByAddress) {
                     continue;
                 }
-                info!("Reconnecting to added node: {}", addr);
+                info!(
+                    "Reconnecting to added node: {}",
+                    crate::peer_log::address(addr)
+                );
                 let self_clone = Arc::clone(&self);
                 tokio::spawn(async move {
                     let self_for_record = Arc::clone(&self_clone);
@@ -1480,6 +1670,18 @@ impl PeerManager {
                     }
                 });
             }
+
+            let outbound = self.outbound_count();
+            let target = self.config.max_outbound;
+
+            if outbound >= target {
+                continue;
+            }
+
+            info!(
+                "Peer maintenance: {}/{} outbound peers, attempting reconnection",
+                outbound, target
+            );
 
             // 2. Try static peers (with exponential backoff for known-failing
             // peers); -connect peers have run_connect_loop instead
@@ -1500,7 +1702,10 @@ impl PeerManager {
                     if !self.claim_dial(addr, rule) {
                         continue;
                     }
-                    info!("Reconnecting to static peer: {}", addr);
+                    info!(
+                        "Reconnecting to static peer: {}",
+                        crate::peer_log::address(addr)
+                    );
                     let self_clone = Arc::clone(&self);
                     tokio::spawn(async move {
                         let self_for_record = Arc::clone(&self_clone);
@@ -1517,10 +1722,13 @@ impl PeerManager {
                 }
             }
 
-            // 3. Addresses learnt from peers
+            // 3. Peers named by host name, through the proxy
+            self.dial_named();
+
+            // 4. Addresses learnt from peers
             self.dial_learnt();
 
-            // 4. Re-query DNS seeds as last resort
+            // 5. Re-query DNS seeds as last resort
             if self.can_connect_outbound()
                 && self.config.dns_seed
                 && !self.config.connect_only
@@ -1587,8 +1795,84 @@ mod tests {
         }
     }
 
+    /// A dial that finishes while a second is being claimed (connect_peer stores
+    /// the peer, then drops the address from the dialled set) must not let the
+    /// second through: Divi Core's OpenNetworkConnection finds the node with the
+    /// name it dials (net.cpp, FindNode) and does not dial it twice. The node
+    /// used to read the peers first and lock the dialled set after, so a dial
+    /// that finished in between was in neither.
+    #[test]
+    fn claim_dial_sees_a_dial_that_finishes_meanwhile() {
+        let pm = PeerManager::new(PeerManagerConfig {
+            magic: crate::REGTEST_MAGIC,
+            connect_only: true,
+            dns_seeds: vec![],
+            ..Default::default()
+        });
+        let addr = sa("127.0.0.1:51477");
+        assert!(pm.claim_dial(addr, DialRule::ByName), "the first dial");
+        let (started, go) = std::sync::mpsc::channel::<()>();
+        let finisher = {
+            let pm = Arc::clone(&pm);
+            std::thread::spawn(move || {
+                go.recv().unwrap();
+                let handle = test_handle("127.0.0.1:51477", false);
+                pm.peers.write().insert(handle.id, handle);
+                pm.connecting_addrs.write().remove(&addr);
+            })
+        };
+        // the first dial finishes inside the claim of the second
+        let second = pm.claim_dial_with(addr, DialRule::ByName, || {
+            started.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+        });
+        finisher.join().unwrap();
+        assert!(!second, "a second dial to the same peer got through");
+    }
+
     fn sa(s: &str) -> SocketAddr {
         s.parse().unwrap()
+    }
+
+    /// The learnt addresses `dial_learnt` picks, under `-onlynet` `only`. Each
+    /// dial goes through a proxy on a closed local port, so none leaves the
+    /// machine; the picks are read before any dial task runs.
+    fn learnt_dials(only: &[crate::local::Network]) -> HashSet<SocketAddr> {
+        let closed = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let pm = PeerManager::new(PeerManagerConfig {
+            magic: crate::REGTEST_MAGIC,
+            dns_seeds: vec![],
+            default_port: 51476,
+            proxy: Some(crate::socks5::Proxy {
+                addr: closed,
+                randomize_credentials: true,
+            }),
+            ..Default::default()
+        });
+        let local = crate::local::LocalAddresses::new(true, true, 51476);
+        local.limit_to(only);
+        pm.set_local_addresses(local);
+        pm.address_book
+            .add_seeds(&[sa("1.2.3.4:51476"), sa("[2a00:1450:4001:80b::200e]:51476")]);
+        pm.dial_learnt();
+        let picked = pm.connecting_addrs.read().clone();
+        picked
+    }
+
+    /// -onlynet: a learnt address of a network it leaves out is not dialled
+    /// (net.cpp:1164-1165), one of a network it names is
+    #[tokio::test]
+    async fn onlynet_keeps_learnt_addresses_of_a_limited_network_from_being_dialled() {
+        let (v4, v6) = (sa("1.2.3.4:51476"), sa("[2a00:1450:4001:80b::200e]:51476"));
+        let picked = learnt_dials(&[crate::local::Network::Ipv6]);
+        assert!(!picked.contains(&v4), "{picked:?}");
+        assert!(picked.contains(&v6), "{picked:?}");
+        // Without -onlynet both are dialled
+        let picked = learnt_dials(&[]);
+        assert!(picked.contains(&v4) && picked.contains(&v6), "{picked:?}");
     }
 
     #[test]
@@ -1999,31 +2283,61 @@ mod tests {
         }
     }
 
+    /// An address in Divi Core's OnionCat range (fd87:d87e:eb43::/48): routable,
+    /// and not reachable from the host without Tor
+    fn onion_test_ip() -> std::net::IpAddr {
+        "fd87:d87e:eb43:1:2:3:4:5".parse().unwrap()
+    }
+
     fn local_only(listen_addr: Option<SocketAddr>, proxy: Option<SocketAddr>) -> PeerManagerConfig {
         PeerManagerConfig {
             magic: crate::REGTEST_MAGIC,
             dns_seeds: vec![],
             static_peers: vec![],
             listen_addr,
-            proxy,
+            proxy: proxy.map(|addr| crate::socks5::Proxy {
+                addr,
+                randomize_credentials: true,
+            }),
+            tor_proxy: proxy.map(|addr| crate::socks5::Proxy {
+                addr,
+                randomize_credentials: true,
+            }),
+            tor_reachable: proxy.is_some(),
             ..Default::default()
         }
     }
 
-    /// With a proxy set, the outbound P2P connection goes through it (SOCKS5 CONNECT
-    /// to the peer) and completes the handshake end to end.
+    /// With a proxy set, the outbound P2P connection to a routable peer goes
+    /// through it (SOCKS5 CONNECT to the peer, with random credentials) and
+    /// completes the handshake end to end. The client names an onion (OnionCat)
+    /// address, routable to Divi Core and never dialled directly here; the stub
+    /// opens the local server in its place, so nothing leaves the host.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_outbound_connection_goes_through_socks5_proxy() {
-        let listen = SocketAddr::from(([127, 0, 0, 1], divi_test_support::free_port()));
-        let server = PeerManager::new(local_only(Some(listen), None));
+        // The listener is bound before start runs, so a port taken since free_port is
+        // reported at once and another is tried
+        let (server, listen) = {
+            let mut found = None;
+            for _ in 0..5 {
+                let listen = SocketAddr::from(([127, 0, 0, 1], divi_test_support::free_port()));
+                let server = PeerManager::new(local_only(Some(listen), None));
+                if server.bind_listeners().await.is_ok() {
+                    found = Some((server, listen));
+                    break;
+                }
+            }
+            found.expect("a listening port could be bound in 5 tries")
+        };
         tokio::spawn(Arc::clone(&server).start());
-        let (proxy, seen) = crate::socks5::stub::start().await;
+        let (proxy, seen, greetings) = crate::socks5::stub::start_redirecting(listen).await;
         let client = PeerManager::new(local_only(None, Some(proxy)));
-        assert_eq!(client.proxy(), Some(proxy));
+        assert_eq!(client.proxy().map(|p| p.addr), Some(proxy));
+        let routable = SocketAddr::new(onion_test_ip(), listen.port());
 
         let mut connected = false;
         for _ in 0..50 {
-            if Arc::clone(&client).connect_to_peer(listen).await.is_ok() {
+            if Arc::clone(&client).connect_to_peer(routable).await.is_ok() {
                 connected = true;
                 break;
             }
@@ -2041,7 +2355,42 @@ mod tests {
         }
         assert_eq!(inbound, 1);
         assert_eq!(client.outbound_count(), 1);
-        assert!(!seen.lock().is_empty() && seen.lock().iter().all(|t| *t == listen));
+        // The onion address goes to the proxy as its .onion name
+        let name = format!(
+            "{}:{}",
+            crate::local::onion_name(&routable.ip()).unwrap(),
+            routable.port()
+        );
+        assert!(!seen.lock().is_empty() && seen.lock().iter().all(|t| *t == name));
+        assert!(greetings.lock().iter().all(|(_, creds)| creds.is_some()));
+        client.disconnect_all();
+        server.disconnect_all();
+    }
+
+    /// A peer at an address that is not routable (127.0.0.1) is dialled
+    /// directly even with a proxy set: Divi Core has no proxy for that network
+    /// (netbase.cpp:620-629)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unroutable_peer_is_dialled_without_the_proxy() {
+        let listen = SocketAddr::from(([127, 0, 0, 1], divi_test_support::free_port()));
+        let server = PeerManager::new(local_only(Some(listen), None));
+        tokio::spawn(Arc::clone(&server).start());
+        let (proxy, seen, _) = crate::socks5::stub::start_recording().await;
+        let client = PeerManager::new(local_only(None, Some(proxy)));
+        let mut connected = false;
+        for _ in 0..50 {
+            if Arc::clone(&client).connect_to_peer(listen).await.is_ok() {
+                connected = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(connected, "could not connect directly");
+        assert!(
+            seen.lock().is_empty(),
+            "went through the proxy: {:?}",
+            seen.lock()
+        );
         client.disconnect_all();
         server.disconnect_all();
     }
@@ -2049,14 +2398,17 @@ mod tests {
     /// A dead proxy must fail the connection, never fall back to connecting directly.
     #[tokio::test]
     async fn test_dead_proxy_does_not_fall_back_to_direct() {
-        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let target_addr = target.local_addr().unwrap();
+        // A routable onion (OnionCat) target: a direct dial of it fails on the
+        // host, so nothing leaves it even if the proxy were skipped
         let dead_proxy = SocketAddr::from(([127, 0, 0, 1], divi_test_support::free_port()));
         let client = PeerManager::new(local_only(None, Some(dead_proxy)));
-        let err = Arc::clone(&client).connect_to_peer(target_addr).await;
+        let routable = SocketAddr::new(onion_test_ip(), 51476);
+        let err = Arc::clone(&client).connect_to_peer(routable).await;
         assert!(err.is_err());
-        let direct = tokio::time::timeout(Duration::from_millis(300), target.accept()).await;
-        assert!(direct.is_err(), "connected to the peer directly");
+        assert!(
+            err.unwrap_err().to_string().contains("cannot reach proxy"),
+            "did not try the proxy"
+        );
     }
 
     #[test]
@@ -2110,8 +2462,11 @@ mod tests {
     /// addresses again and again (net.cpp:1094-1105), with no backoff
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_connect_peer_is_dialled_again_once_it_is_up() {
-        let port = divi_test_support::free_port();
-        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        // A bound socket that does not listen yet refuses connects and keeps its port
+        // from every other process: the peer is "down" until listen() is called on it
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+        let addr = socket.local_addr().unwrap();
         let pm = PeerManager::new(PeerManagerConfig {
             magic: crate::REGTEST_MAGIC,
             static_peers: vec![addr],
@@ -2122,7 +2477,7 @@ mod tests {
         // The peer is down at first: the first dials fail
         tokio::spawn(Arc::clone(&pm).run_connect_loop());
         tokio::time::sleep(Duration::from_secs(4)).await;
-        let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+        let listener = socket.listen(16).unwrap();
         let accepted = tokio::time::timeout(Duration::from_secs(12), listener.accept()).await;
         assert!(
             accepted.is_ok(),
