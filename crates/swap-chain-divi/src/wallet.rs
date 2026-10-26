@@ -19,8 +19,12 @@
 //! coin this process gave back itself ([`Wallet::release_dead_tx`]) is left untombstoned.
 //! Which process selects which coin is settled by the swap database's `input_reservation`
 //! table, not here.
+//!
+//! A write goes to `<wallet file name>.tmp.<pid>.<n>` and is renamed over the file; a write
+//! that fails removes its own temporary file. One left by a process that died mid-write is
+//! removed by the next [`Wallet::open`], once no running process has that pid.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use divi_swap::{Outpoint, SwapError, Txid};
 use serde::{Deserialize, Serialize};
@@ -60,7 +64,11 @@ pub struct Wallet {
 
 impl Wallet {
     /// Load from `path` (created empty if missing); `None` keeps everything in memory.
+    /// Temporary files of writers that are no longer running are removed first.
     pub fn open(path: Option<PathBuf>) -> Result<Self, SwapError> {
+        if let Some(p) = &path {
+            sweep_dead_temp_files(p);
+        }
         let mut w = match &path {
             Some(p) if p.exists() => {
                 let text = std::fs::read_to_string(p)
@@ -104,12 +112,16 @@ impl Wallet {
         // Each write has its own temporary file: two processes (or two backends in one) on
         // the same wallet file must not interleave their bytes in one before the rename.
         let n = WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let tmp = p.with_extension(format!("tmp.{}.{n}", std::process::id()));
+        let tmp = temp_path(p, std::process::id(), n);
         let text = serde_json::to_string_pretty(self)
             .map_err(|e| SwapError::Storage(format!("serialize wallet: {e}")))?;
         std::fs::write(&tmp, text)
             .and_then(|_| std::fs::rename(&tmp, p))
-            .map_err(|e| SwapError::Storage(format!("write {}: {e}", p.display())))
+            .map_err(|e| {
+                // Ours alone (our pid and counter); it may not exist if the write failed early.
+                let _ = std::fs::remove_file(&tmp);
+                SwapError::Storage(format!("write {}: {e}", p.display()))
+            })
     }
 
     /// Never use outputs of `txid` (e.g. another process's probe funds).
@@ -279,6 +291,75 @@ impl Wallet {
     }
 }
 
+/// The temporary file of write `n` by process `pid` to `wallet`.
+fn temp_path(wallet: &Path, pid: u32, n: u64) -> PathBuf {
+    let mut name = wallet.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".tmp.{pid}.{n}"));
+    wallet.with_file_name(name)
+}
+
+/// The writer pid in `name` if it is exactly `<wallet_name>.tmp.<pid>.<n>` (digits only).
+fn temp_file_pid(name: &str, wallet_name: &str) -> Option<u32> {
+    let rest = name.strip_prefix(wallet_name)?.strip_prefix(".tmp.")?;
+    let (pid, n) = rest.split_once('.')?;
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if !digits(pid) || !digits(n) {
+        return None;
+    }
+    n.parse::<u64>().ok()?;
+    pid.parse().ok()
+}
+
+/// Whether a process with this pid is running. When it cannot be told, it is taken to be
+/// running, so its file is kept.
+fn pid_running(pid: u32) -> bool {
+    if Path::new("/proc/self").exists() {
+        return Path::new(&format!("/proc/{pid}")).exists();
+    }
+    if cfg!(unix) {
+        // macOS and other Unix without /proc: `ps -p` succeeds when the pid exists, whatever
+        // its owner (unlike `kill -0`).
+        return std::process::Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "pid="])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map_or(true, |s| s.success());
+    }
+    true
+}
+
+/// Remove the temporary files next to `wallet` left by writers that are no longer running.
+/// Only regular files are removed (never a symlink or what it points to); errors are
+/// ignored, as another process may sweep the same file.
+fn sweep_dead_temp_files(wallet: &Path) {
+    let Some(wallet_name) = wallet.file_name().and_then(|n| n.to_str()) else {
+        return;
+    };
+    let dir = match wallet.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => Path::new("."),
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name.to_str().and_then(|n| temp_file_pid(n, wallet_name)) else {
+            continue;
+        };
+        // `file_type` does not follow symlinks.
+        if !entry.file_type().is_ok_and(|t| t.is_file()) || pid_running(pid) {
+            continue;
+        }
+        match std::fs::remove_file(entry.path()) {
+            Ok(()) => tracing::info!("removed stale wallet temp file {}", entry.path().display()),
+            Err(e) => tracing::debug!("stale wallet temp file {}: {e}", entry.path().display()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod orphan_tests {
     use super::*;
@@ -439,7 +520,7 @@ mod temp_file_tests {
             // Not the exact pattern.
             format!("w.json.tmp.{dead}"),
             format!("w.json.tmp.{dead}."),
-            format!("w.json.tmp..0"),
+            "w.json.tmp..0".to_string(),
             format!("w.json.tmp.{dead}.0.bak"),
             format!("w.json.tmp.{dead}.x"),
             format!("w.json.tmp.+{dead}.0"),
