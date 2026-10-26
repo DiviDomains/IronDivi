@@ -591,6 +591,7 @@ fn a_send_failing_after_coin_selection_tops_the_key_pool_up() {
         other => panic!("{other:?}"),
     }
     assert_eq!(net.wallet.keypool_size(), full, "the key pool is topped up");
+}
 
 /// The log lines written while `f` runs on this thread
 fn logged<T>(f: impl FnOnce() -> T) -> (T, String) {
