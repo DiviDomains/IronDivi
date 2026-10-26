@@ -2063,6 +2063,9 @@ impl WalletRpc {
             )
             .into());
         }
+        // Once in the mempool, SendMoney relays it and logs so, its format's
+        // arguments the other way round (rpcwallet.cpp:785-788)
+        info!("{}: Relaying wtx SendMoney", &txid.to_string()[..10]);
         Ok(txid)
     }
 

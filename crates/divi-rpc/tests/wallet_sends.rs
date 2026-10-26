@@ -558,3 +558,30 @@ fn a_send_logs_the_transaction_it_commits() {
         "{log}"
     );
 }
+
+/// A send the mempool takes logs SendMoney's "<txid's first 10 digits>:
+/// Relaying wtx SendMoney"; one it refuses does not (rpcwallet.cpp:778-788)
+#[test]
+fn a_send_logs_its_relay_once_the_mempool_takes_it() {
+    let net = Net::new();
+    net.fund(&[10 * COIN, 10 * COIN]);
+    let rpc = net.rpc();
+    let (txid, log) = logged(|| {
+        rpc.send_to_address(&p(vec![json!(dest().to_string()), json!(1)]))
+            .unwrap()
+    });
+    let txid = txid.as_str().unwrap().to_string();
+    assert!(
+        log.contains(&format!("{}: Relaying wtx SendMoney", &txid[..10])),
+        "{log}"
+    );
+
+    let refusing = WalletRpc::with_wallet_and_chain(net.wallet.clone(), net.chain.clone());
+    refusing.set_tx_submit(Arc::new(|_tx: Transaction| {
+        Err(divi_rpc::TxSubmitError::Failed(String::new()))
+    }));
+    let (sent, log) =
+        logged(|| refusing.send_to_address(&p(vec![json!(dest().to_string()), json!(1)])));
+    assert!(sent.is_err());
+    assert!(!log.contains("Relaying wtx"), "{log}");
+}
