@@ -4213,6 +4213,7 @@ impl WalletRpc {
         // is a new one, so lockunspent's locks are gone, the masternode
         // collateral's too: LoadAndSelectWallet does not lock it again
         // (init.cpp:282-292, :1291-1318)
+        wallet.read_names_back();
         for outpoint in wallet.locked_coins() {
             wallet.set_coin_locked(outpoint, false);
         }
@@ -5081,8 +5082,10 @@ impl WalletRpc {
         account: &str,
         force_new: bool,
     ) -> Result<String, Error> {
-        let addresses = wallet.get_addresses_by_account(account);
-        if let (Some(last), false) = (addresses.last(), force_new) {
+        // The last address given the name, even one since moved to another
+        // name (GetAccountAddress, rpcwallet.cpp:341-343)
+        let last = wallet.last_address_of_label(account);
+        if let (Some(last), false) = (last.as_ref(), force_new) {
             // Any wallet transaction paying its script, a watched address's too
             // (AccountShouldUseNewKey, rpcwallet.cpp:314-332)
             let paid = Address::from_base58(last)

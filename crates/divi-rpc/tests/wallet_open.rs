@@ -349,3 +349,21 @@ fn setaccount_of_the_current_address_gives_the_old_account_a_new_one() {
         .unwrap()
         .contains(&json!(third.to_string())));
 }
+
+/// An account's current address is the last one ever given its name, kept
+/// when another call names the address otherwise (addmultisigaddress or
+/// importaddress set the name with no setaccount check): divid's
+/// destinationByLabel_ (AddressBookManager.cpp:16-22, rpcwallet.cpp:341-343)
+#[test]
+fn an_accounts_current_address_is_the_last_given_its_name() {
+    let net = Net::new();
+    let rpc = net.rpc();
+    let first = book_address(&net);
+    let second = book_address(&net);
+    net.wallet.set_label(&second, "msig").unwrap();
+    assert_eq!(
+        rpc.get_account_address(&p(vec![json!("")])).unwrap(),
+        json!(second.to_string()),
+        "not the last address named \"\" ({first} is the last still named so)"
+    );
+}

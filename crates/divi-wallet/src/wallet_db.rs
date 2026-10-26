@@ -298,6 +298,10 @@ pub struct WalletDb {
     accounts: RwLock<HashMap<String, Vec<String>>>,
     /// Address to account mapping
     address_accounts: RwLock<HashMap<String, String>>,
+    /// Each name's last address: the last one given that name, kept when the
+    /// address moves to another name (Divi Core's destinationByLabel_,
+    /// AddressBookManager.cpp:16-22)
+    last_by_label: RwLock<HashMap<String, String>>,
     /// Redeem scripts (for P2SH addresses, especially multisig)
     scripts: RwLock<HashMap<Hash160, Script>>,
     /// Vault metadata storage
@@ -436,6 +440,7 @@ impl WalletDb {
             last_scan_height: RwLock::new(0),
             accounts: RwLock::new(HashMap::new()),
             address_accounts: RwLock::new(HashMap::new()),
+            last_by_label: RwLock::new(HashMap::new()),
             scripts: RwLock::new(HashMap::new()),
             vaults: RwLock::new(HashMap::new()),
             locked_coins: RwLock::new(HashSet::new()),
@@ -480,6 +485,7 @@ impl WalletDb {
             last_scan_height: RwLock::new(0),
             accounts: RwLock::new(HashMap::new()),
             address_accounts: RwLock::new(HashMap::new()),
+            last_by_label: RwLock::new(HashMap::new()),
             scripts: RwLock::new(HashMap::new()),
             vaults: RwLock::new(HashMap::new()),
             locked_coins: RwLock::new(HashSet::new()),
@@ -528,6 +534,7 @@ impl WalletDb {
             last_scan_height: RwLock::new(0),
             accounts: RwLock::new(HashMap::new()),
             address_accounts: RwLock::new(HashMap::new()),
+            last_by_label: RwLock::new(HashMap::new()),
             scripts: RwLock::new(HashMap::new()),
             vaults,
             locked_coins: RwLock::new(HashSet::new()),
@@ -888,6 +895,7 @@ impl WalletDb {
             last_scan_height: RwLock::new(0),
             accounts: RwLock::new(HashMap::new()),
             address_accounts: RwLock::new(HashMap::new()),
+            last_by_label: RwLock::new(HashMap::new()),
             scripts: RwLock::new(HashMap::new()),
             vaults: RwLock::new(HashMap::new()),
             locked_coins: RwLock::new(HashSet::new()),
@@ -1078,6 +1086,7 @@ impl WalletDb {
                 accounts_map.insert(account, addresses);
             }
         }
+        self.rebuild_last_by_label();
         debug!("Restored {} accounts", self.accounts.read().len());
 
         // Load address to account mappings
@@ -4163,11 +4172,44 @@ impl WalletDb {
         }
 
         address_accounts.insert(addr_str.clone(), account.to_string());
+        self.last_by_label
+            .write()
+            .insert(account.to_string(), addr_str.clone());
         accounts
             .entry(account.to_string())
             .or_default()
             .push(addr_str);
         self.dirty.write().accounts = true;
+    }
+
+    /// The last address given `label`, which may since have moved to another
+    /// name (Divi Core's getLastDestinationByLabel, rpcwallet.cpp:341-343)
+    pub fn last_address_of_label(&self, label: &str) -> Option<String> {
+        self.last_by_label.read().get(label).cloned()
+    }
+
+    /// Each name's last address as Divi Core has it after reading its wallet
+    /// back: the names are read in key order, so a name's last address is its
+    /// greatest (walletdb.cpp:242-251, AddressBookManager.cpp:17-22)
+    fn rebuild_last_by_label(&self) {
+        let accounts = self.accounts.read();
+        let mut last = self.last_by_label.write();
+        last.clear();
+        for (name, addresses) in accounts.iter() {
+            if let Some(a) = addresses.last() {
+                last.insert(name.clone(), a.clone());
+            }
+        }
+    }
+
+    /// The names as a wallet read back has them (Divi Core reloads its wallet
+    /// after encryptwallet): each name's addresses in key order, and its last
+    /// address the greatest
+    pub fn read_names_back(&self) {
+        for addresses in self.accounts.write().values_mut() {
+            addresses.sort_by(|a, b| (a.len(), a).cmp(&(b.len(), b)));
+        }
+        self.rebuild_last_by_label();
     }
 
     /// Set the account (label) of `address` and store it before returning, so a
