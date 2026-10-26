@@ -13,10 +13,13 @@ network = "testnet"        # or "mainnet"; "mainnet" needs allow_mainnet = true 
 # allow_mainnet = false     # default; mainnet moves real money — off until a reviewed mainnet cutover
 # rpc_url is optional: unset, it defaults per network (testnet .../api/testnet/rpc/, mainnet .../api/rpc/)
 rpc_url = "https://services.divi.domains/api/testnet/rpc/"
-# fallback_rpc_url is optional and off by default (a second DIVI RPC, ideally your own node). When set, every swap read
-# (confirmations, HTLC output, find-spend, MTP) is made on both endpoints; any disagreement is Transient (retried), never
-# a decision, and a broadcast goes to both. Must differ from rpc_url. Unset = single source, as before.
+# fallback_rpc_url is a second DIVI RPC, ideally your own node. When set, every swap read (confirmations, HTLC output,
+# find-spend, MTP) is made on both endpoints; any disagreement is Transient (retried), never a decision, and a broadcast
+# goes to both. Must differ from rpc_url. Optional on testnet (unset = single source); required on mainnet: a
+# profile = "mainnet" config without it refuses to start, unless allow_single_source = true below.
 # fallback_rpc_url = "http://127.0.0.1:51473"
+# allow_single_source = false  # default; true lets a mainnet config start without fallback_rpc_url (one endpoint is
+#                              # trusted for every swap read) and logs a warning at every start. Waives [divi] only.
 key = "credential:maker-divi"   # systemd LoadCredential, see divi-swapd.service
 wallet_path = "/var/lib/divi-swapd/divi-wallet.json"  # known UTXOs (public data only)
 scan_from_height = 339800
@@ -37,7 +40,11 @@ esplora_url = "https://litecoinspace.org/testnet/api"
 # crosscheck = "off"        # "blockbook" | "blockcypher" | "off" (default). MAINNET ONLY: refused on
 #                           # testnet at config load. Once at startup, compares the block hash 6 below
 #                           # the tip from esplora_url with an independent explorer: a mismatch refuses
-#                           # to start, an unreachable source only logs a warning.
+#                           # to start, an unreachable source only logs a warning. It is required on mainnet: a
+#                           # profile = "mainnet" config with crosscheck "off" (or unset) refuses to start,
+#                           # unless allow_single_source = true below.
+# allow_single_source = false  # default; true lets a mainnet config start with crosscheck "off" and logs a
+#                              # warning at every start. Waives [ltc] only.
 # Testnets reuse the BTC swap key on every secp256k1 chain (docs/plans/swap-poc/funding.md,
 # decision 64ae2a0): no maker-ltc 1Password item or credential file exists or is needed —
 # this is the same maker-btc credential already loaded above.
