@@ -671,6 +671,31 @@ fn a_send_logs_the_transaction_it_commits() {
     );
 }
 
+/// The position of `line` in `log`, which must have it
+fn at(log: &str, line: &str) -> usize {
+    log.find(line)
+        .unwrap_or_else(|| panic!("no {line:?} in\n{log}"))
+}
+
+/// A send reserves its change key as it makes the change output and keeps it
+/// after CommitTransaction's dump, as Divi Core's CReserveKey does
+/// (wallet.cpp:1786, :1866-1868, :2154, :2162)
+#[test]
+fn a_send_keeps_its_change_key_after_logging_the_commit() {
+    let net = Net::new();
+    net.fund(&[10 * COIN]);
+    let rpc = net.rpc();
+    let (_, log) = logged(|| {
+        rpc.send_to_address(&p(vec![json!(dest().to_string()), json!(1)]))
+            .unwrap()
+    });
+    let reserve = at(&log, "keypool reserve ");
+    let number = log[reserve..].split_whitespace().nth(2).unwrap();
+    let commit = at(&log, "CommitTransaction:\n");
+    let keep = at(&log, &format!("keypool keep {number}\n"));
+    assert!(reserve < commit && commit < keep, "{log}");
+}
+
 /// A send the mempool takes logs SendMoney's "<txid's first 10 digits>:
 /// Relaying wtx SendMoney"; one it refuses does not (rpcwallet.cpp:778-788)
 #[test]

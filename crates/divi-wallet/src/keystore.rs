@@ -131,6 +131,9 @@ pub struct KeyStore {
     /// Divi Core's pool index of each HD key in the keypool, by (change chain,
     /// child index): what its keypool log lines number
     pool_numbers: RwLock<std::collections::BTreeMap<(bool, u32), u64>>,
+    /// Keys reserved for a send and not yet kept or given back, by key hash:
+    /// (change chain, child index, pool index)
+    reserved: RwLock<HashMap<Hash160, (bool, u32, u64)>>,
     /// Public ids of the HD chain; kept when the seed is stripped on lock
     hd_public_ids: RwLock<Option<HdPublicIds>>,
 }
@@ -178,6 +181,7 @@ impl KeyStore {
             keypool_target: RwLock::new(DEFAULT_KEYPOOL_SIZE),
             keypool_oldest: RwLock::new(now),
             pool_numbers: RwLock::new(std::collections::BTreeMap::new()),
+            reserved: RwLock::new(HashMap::new()),
             hd_public_ids: RwLock::new(None),
         }
     }
@@ -198,6 +202,7 @@ impl KeyStore {
             keypool_target: RwLock::new(DEFAULT_KEYPOOL_SIZE),
             keypool_oldest: RwLock::new(now),
             pool_numbers: RwLock::new(std::collections::BTreeMap::new()),
+            reserved: RwLock::new(HashMap::new()),
         }
     }
 
@@ -260,12 +265,12 @@ impl KeyStore {
 
         let index = *self.receiving_index.read();
         self.number_pool();
-        self.keep_from_pool(false, index);
         let key = wallet.derive_receiving(0, index)?;
         let secret = key.secret_key()?;
         let entry = KeyEntry::with_hd_path(secret, hd_key_path(wallet.coin_type(), false, index));
         let address = entry.address(self.network);
         self.add_key(entry);
+        self.take_from_pool(false, index, &address.hash, false);
 
         *self.receiving_index.write() += 1;
         Ok(address)
@@ -273,6 +278,17 @@ impl KeyStore {
 
     /// Generate a new change address
     pub fn new_change_address(&self) -> Result<Address, WalletError> {
+        self.change_address(false)
+    }
+
+    /// A change key for a send, as Divi Core's CReserveKey takes it: its
+    /// reservation is logged now, its keep once the send is committed
+    /// ([`Self::keep_key`]) (wallet.cpp:1786, :1866-1868, :2154, :2162)
+    pub fn reserve_change_address(&self) -> Result<Address, WalletError> {
+        self.change_address(true)
+    }
+
+    fn change_address(&self, keep_later: bool) -> Result<Address, WalletError> {
         let wallet = self.hd_wallet.read();
         let wallet = wallet
             .as_ref()
@@ -280,12 +296,12 @@ impl KeyStore {
 
         let index = *self.change_index.read();
         self.number_pool();
-        self.keep_from_pool(true, index);
         let key = wallet.derive_change(0, index)?;
         let secret = key.secret_key()?;
         let entry = KeyEntry::with_hd_path(secret, hd_key_path(wallet.coin_type(), true, index));
         let address = entry.address(self.network);
         self.add_key(entry);
+        self.take_from_pool(true, index, &address.hash, keep_later);
 
         *self.change_index.write() += 1;
         Ok(address)
@@ -658,12 +674,28 @@ impl KeyStore {
         }
     }
 
-    /// The key at `index` of a chain leaves the keypool: Divi Core reserves its
-    /// oldest key and keeps it (wallet.cpp:2154, :2162). A key derived outside
-    /// the pool has no number and no line.
-    fn keep_from_pool(&self, is_change: bool, index: u32) {
-        if let Some(number) = self.pool_numbers.write().remove(&(is_change, index)) {
-            tracing::info!("keypool reserve {}", number);
+    /// The key at `index` of a chain, `hash`, leaves the keypool: Divi Core
+    /// reserves its oldest key and keeps it (wallet.cpp:2154, :2162), or with
+    /// `keep_later` keeps it when [`Self::keep_key`] is called. A key derived
+    /// outside the pool has no number and no line.
+    fn take_from_pool(&self, is_change: bool, index: u32, hash: &Hash160, keep_later: bool) {
+        let Some(number) = self.pool_numbers.write().remove(&(is_change, index)) else {
+            return;
+        };
+        tracing::info!("keypool reserve {}", number);
+        if keep_later {
+            self.reserved
+                .write()
+                .insert(*hash, (is_change, index, number));
+        } else {
+            tracing::info!("keypool keep {}", number);
+        }
+    }
+
+    /// Keep the key `hash` reserved for a send, now that the send is committed
+    /// (wallet.cpp:1866-1868, :2162)
+    pub fn keep_key(&self, hash: &Hash160) {
+        if let Some((_, _, number)) = self.reserved.write().remove(hash) {
             tracing::info!("keypool keep {}", number);
         }
     }
@@ -696,6 +728,17 @@ impl KeyStore {
     /// without the HD seed, as Divi Core does from its keypool while the wallet
     /// is locked. The key's secret was stored encrypted when it was derived.
     pub fn take_from_keypool(&self, is_change: bool) -> Result<Address, WalletError> {
+        self.take_pool_key(is_change, false)
+    }
+
+    /// A change key for a send from the keypool of a locked wallet, kept once
+    /// the send is committed ([`Self::keep_key`]), as
+    /// [`Self::reserve_change_address`]
+    pub fn reserve_from_keypool(&self) -> Result<Address, WalletError> {
+        self.take_pool_key(true, true)
+    }
+
+    fn take_pool_key(&self, is_change: bool, keep_later: bool) -> Result<Address, WalletError> {
         // Before the counter's lock: number_pool reads both counters
         self.number_pool();
         let counter = if is_change {
@@ -714,8 +757,11 @@ impl KeyStore {
             })
             .map(|entry| entry.address(self.network))
             .ok_or(WalletError::KeypoolRanOut)?;
-        self.keep_from_pool(is_change, *index);
+        let taken = *index;
         *index += 1;
+        // After the counter's lock, which number_pool takes after the pool's
+        drop(index);
+        self.take_from_pool(is_change, taken, &address.hash, keep_later);
         Ok(address)
     }
 }
