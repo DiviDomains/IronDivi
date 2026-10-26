@@ -62,10 +62,6 @@ const READ_TIMEOUT: Duration = Duration::from_secs(90);
 /// long after the last ping was sent, when none is unanswered
 const PING_INTERVAL: Duration = Duration::from_secs(2 * 60);
 
-/// How often the connection checks whether a keepalive ping is due (Divi Core
-/// checks on each pass of its send loop, about every 100 ms)
-const PING_CHECK: Duration = Duration::from_secs(1);
-
 /// Channel buffer size for outgoing messages
 /// Messages that may wait for a peer's connection; what getdata answers put
 /// there is bounded in bytes by -maxsendbuffer (crate::buffers)
@@ -342,6 +338,13 @@ impl Connection {
         self
     }
 
+    /// Read the connection's times from `clock` (the system clock unless a test
+    /// gives one it moves on)
+    pub fn with_clock(mut self, clock: crate::peer_clock::PeerClock) -> Self {
+        self.info.clock = clock;
+        self
+    }
+
     /// Run the connection handler
     pub async fn run(mut self) -> Result<(), NetworkError> {
         // Perform handshake, which a stop ends: it reads without the message
@@ -608,8 +611,8 @@ impl Connection {
         let mut got = 0;
         while got < buf.len() {
             let deadline = handshake_deadline(&self.info);
-            let read = tokio::time::timeout_at(deadline.into(), self.stream.read(&mut buf[got..]));
-            let Ok(read) = read.await else {
+            let now = self.info.clock.now();
+            if now >= deadline {
                 info!(
                     "{} sent no version in time ({} bytes in, {} out), disconnecting",
                     crate::peer_log::peer(self.peer_id, self.info.addr),
@@ -617,6 +620,12 @@ impl Connection {
                     self.info.bytes_sent
                 );
                 return Err(NetworkError::Timeout);
+            }
+            // Waits no longer than a check of the clock, which a test may move on;
+            // a read cut off by it has taken nothing, and is made again
+            let wait = (deadline - now).min(self.info.clock.check_interval());
+            let Ok(read) = timeout(wait, self.stream.read(&mut buf[got..])).await else {
+                continue;
             };
             let n = read?;
             if n == 0 {
@@ -624,7 +633,7 @@ impl Connection {
             }
             got += n;
             self.info.bytes_recv += n as u64;
-            self.info.last_recv = std::time::Instant::now();
+            self.info.last_recv = self.info.clock.now();
             self.info.last_recv_unix = crate::peer::unix_now();
             self.total_bytes_recv.fetch_add(n as u64, Ordering::Relaxed);
         }
@@ -703,14 +712,14 @@ impl Connection {
         let (reader, mut writer) = tokio::io::split(stream);
 
         // Wrap reader in FramedRead with our codec - this is CANCELLATION SAFE!
-        let codec = DiviCodec::new(magic);
+        let codec = DiviCodec::new(magic).with_clock(info.clock.clone());
         let mut framed = FramedRead::new(reader, codec);
 
         // Keepalive pings as Divi Core's MaybeSendPing: the first goes out now,
         // after what the version handler sent and before anything else, as the
         // message handler sends it before SendMessages (net.cpp:871-893); then
         // one each PING_INTERVAL after the last ping sent (a `ping` call included)
-        let mut ping_timer = tokio::time::interval(PING_CHECK);
+        let mut ping_timer = tokio::time::interval(info.clock.check_interval());
         let mut last_ping_sent = None;
         // A peer we dialled is sent no ping until its sporks are in (Node.cpp:1032)
         if !stats.sporks_wait.load(Ordering::Acquire) {
@@ -764,11 +773,11 @@ impl Connection {
 
                 // Proactive keepalive ping
                 _ = ping_timer.tick() => {
-                    if inactivity_exceeded(info.last_send, last_bytes_in(&info, framed.decoder()), info.ping_time, std::time::Instant::now()) {
+                    if inactivity_exceeded(info.last_send, last_bytes_in(&info, framed.decoder()), info.ping_time, info.clock.now()) {
                         info!("{} inactive for {:?}, disconnecting", crate::peer_log::peer(peer_id, info.addr), TIMEOUT_INTERVAL);
                         break;
                     }
-                    let now = std::time::Instant::now();
+                    let now = info.clock.now();
                     // none before the first, which waits for a dialled peer's sporks
                     if last_ping_sent.is_some()
                         && keepalive_ping_due(info.ping_nonce.is_some(), last_ping_sent, now)
@@ -810,7 +819,7 @@ impl Connection {
                         Ok(Some(Ok(Decoded::Malformed { command, error }))) => {
                             let bytes_received = framed.decoder_mut().take_bytes_consumed();
                             info.bytes_recv += bytes_received;
-                            info.last_recv = std::time::Instant::now();
+                            info.last_recv = info.clock.now();
                             info.last_recv_unix = crate::peer::unix_now();
                             total_bytes_recv.fetch_add(bytes_received, Ordering::Relaxed);
                             debug!("{} from {} does not parse: {}", command, info.addr, error);
@@ -835,7 +844,7 @@ impl Connection {
 
                             // Update stats
                             info.bytes_recv += bytes_received;
-                            info.last_recv = std::time::Instant::now();
+                            info.last_recv = info.clock.now();
                             info.last_recv_unix = crate::peer::unix_now();
                             info.last_message_command = Some(msg.command().to_string());
                             total_bytes_recv.fetch_add(bytes_received, Ordering::Relaxed);
@@ -861,7 +870,7 @@ impl Connection {
                         Err(_) => {
                             // A quiet peer gets no extra ping: the keepalive above
                             // runs on its own interval, as in Divi Core
-                            if inactivity_exceeded(info.last_send, last_bytes_in(&info, framed.decoder()), info.ping_time, std::time::Instant::now()) {
+                            if inactivity_exceeded(info.last_send, last_bytes_in(&info, framed.decoder()), info.ping_time, info.clock.now()) {
                                 info!("{} inactive for {:?}, disconnecting", crate::peer_log::peer(peer_id, info.addr), TIMEOUT_INTERVAL);
                                 break;
                             }
@@ -911,8 +920,8 @@ impl Connection {
                     if sent_nonce == *nonce {
                         if let Some(ping_time) = info.ping_time {
                             // Microseconds: a LAN or localhost round trip is well under 1 ms
-                            info.ping_latency_us =
-                                Some((ping_time.elapsed().as_micros() as u64).max(1));
+                            let latency = info.clock.now().saturating_duration_since(ping_time);
+                            info.ping_latency_us = Some((latency.as_micros() as u64).max(1));
                         }
                         info.ping_nonce = None;
                         info.ping_time = None;
@@ -1000,7 +1009,7 @@ impl Connection {
     ) -> Result<(), NetworkError> {
         let nonce = rand::random();
         info.ping_nonce = Some(nonce);
-        info.ping_time = Some(std::time::Instant::now());
+        info.ping_time = Some(info.clock.now());
         *last_ping_sent = info.ping_time;
         Self::write_message(
             writer,
@@ -1036,7 +1045,7 @@ impl Connection {
             NetworkMessage::Ping(_) => {
                 let nonce = rand::random();
                 info.ping_nonce = Some(nonce);
-                info.ping_time = Some(std::time::Instant::now());
+                info.ping_time = Some(info.clock.now());
                 *last_ping_sent = info.ping_time;
                 NetworkMessage::Ping(nonce)
             }
@@ -1063,7 +1072,7 @@ impl Connection {
         // Update stats
         let bytes_sent = bytes.len() as u64;
         info.bytes_sent += bytes_sent;
-        info.last_send = std::time::Instant::now();
+        info.last_send = info.clock.now();
         info.last_send_unix = crate::peer::unix_now();
         total_bytes_sent.fetch_add(bytes_sent, Ordering::Relaxed);
 
@@ -1081,7 +1090,7 @@ impl Connection {
 
         let bytes_sent = bytes.len() as u64;
         self.info.bytes_sent += bytes_sent;
-        self.info.last_send = std::time::Instant::now();
+        self.info.last_send = self.info.clock.now();
         self.info.last_send_unix = crate::peer::unix_now();
         self.total_bytes_sent
             .fetch_add(bytes_sent, Ordering::Relaxed);

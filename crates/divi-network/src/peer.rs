@@ -105,6 +105,8 @@ pub struct PeerInfo {
     pub last_message_command: Option<String>,
     /// Last message payload size (for debugging)
     pub last_message_size: u32,
+    /// The clock the connection's times are read from
+    pub clock: crate::peer_clock::PeerClock,
 }
 
 impl PeerInfo {
@@ -134,6 +136,7 @@ impl PeerInfo {
             misbehavior_score: 0,
             last_message_command: None,
             last_message_size: 0,
+            clock: crate::peer_clock::PeerClock::system(),
         }
     }
 
