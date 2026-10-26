@@ -1271,7 +1271,8 @@ impl PeerManager {
 
         let our_height = self.current_height();
 
-        let result = Connection::connect(
+        // Raced against the stop, whatever -timeout gives the connect
+        let connect = Connection::connect(
             addr,
             self.proxy_for(&addr),
             self.config.magic,
@@ -1283,8 +1284,13 @@ impl PeerManager {
             self.bytes_recv_counter(),
             Arc::clone(&self.local_nonces),
             self.local_addresses(),
-        )
-        .await;
+        );
+        let result = match self.until_stop(connect).await {
+            Some(result) => result,
+            None => Err(NetworkError::ConnectionRefused(
+                "the node is stopping".to_string(),
+            )),
+        };
 
         let (conn, handle) = match result {
             Ok((conn, handle)) => (
@@ -1368,7 +1374,8 @@ impl PeerManager {
         port: u16,
         proxy: crate::socks5::Proxy,
     ) -> Result<PeerId, NetworkError> {
-        let (conn, handle) = Connection::connect_named(
+        // Raced against the stop, whatever -timeout gives the connect
+        let connect = Connection::connect_named(
             host,
             port,
             proxy,
@@ -1381,8 +1388,11 @@ impl PeerManager {
             self.bytes_recv_counter(),
             Arc::clone(&self.local_nonces),
             self.local_addresses(),
-        )
-        .await?;
+        );
+        let (conn, handle) = self
+            .until_stop(connect)
+            .await
+            .ok_or_else(|| NetworkError::ConnectionRefused("the node is stopping".to_string()))??;
         let peer_id = handle.id;
         let addr = handle.addr;
         self.scoring.register_peer(peer_id, addr.ip());

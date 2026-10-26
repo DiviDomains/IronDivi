@@ -4,17 +4,18 @@
 
 //! A stop ends the peer tasks wherever they wait, as Divi Core's shutdown
 //! interrupts its net threads before it joins them (divid.cpp:42-53): a seed
-//! lookup that never answers. Stop returns well inside its 10-s bound for the
-//! peer tasks, with none of them left.
+//! lookup that never answers, a dial under a -timeout far past the stop's
+//! bound. Stop returns well inside its 10-s bound for the peer tasks, with
+//! none of them left.
 //!
-//! No test leaves the host: the seed lookup is a fake resolver, the node
-//! listens on 127.0.0.2.
+//! No test leaves the host: the seed lookup is a fake resolver, the peers
+//! are sockets on 127.0.0.2.
 
 use divi_node::config::NodeConfig;
 use divi_node::Node;
 use divi_primitives::ChainMode;
 use std::time::{Duration, Instant};
-use tokio::net::TcpStream;
+use tokio::net::{TcpSocket, TcpStream};
 
 /// How long to wait for something that should happen
 const WAIT: Duration = Duration::from_secs(10);
@@ -74,4 +75,37 @@ async fn a_seed_lookup_that_never_answers_does_not_hold_the_stop() {
     // The lookup has begun (start dials its -connect peer, refused at once)
     tokio::time::sleep(Duration::from_secs(1)).await;
     stop_quickly(&n).await;
+}
+
+/// A dial under a -timeout of a minute ends at the stop. The peer is a
+/// listener whose accept queue is full, so a new connection to it is never
+/// answered: the dial waits for its -timeout
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dial_under_a_long_timeout_does_not_hold_the_stop() {
+    let socket = TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.2:53831".parse().unwrap()).unwrap();
+    let full = socket.listen(1).unwrap();
+    // Fill its accept queue; none is ever accepted
+    let mut held = Vec::new();
+    for _ in 0..4 {
+        if let Ok(Ok(s)) = tokio::time::timeout(
+            Duration::from_millis(300),
+            TcpStream::connect("127.0.0.2:53831"),
+        )
+        .await
+        {
+            held.push(s);
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let n = node(&dir, 53821, |c| {
+        c.p2p.connect = vec!["127.0.0.2:53831".into()];
+        c.p2p.connect_timeout_ms = 60_000;
+    });
+    n.start().await.unwrap();
+    wait_listening(53821).await;
+    // The dial is under way, waiting for an answer that does not come
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    stop_quickly(&n).await;
+    drop((held, full));
 }
