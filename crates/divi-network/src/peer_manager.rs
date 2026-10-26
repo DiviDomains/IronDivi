@@ -474,7 +474,11 @@ impl PeerManager {
         } else {
             format!("{}:{}", dest, self.config.default_port)
         };
-        tokio::net::lookup_host(with_port).await.ok()?.next()
+        // Raced against the stop, as the seed lookup
+        self.until_stop(tokio::net::lookup_host(with_port))
+            .await?
+            .ok()?
+            .next()
     }
 
     /// The network magic of this peer manager's network
@@ -1039,9 +1043,18 @@ impl PeerManager {
 
             let name = format!("{}:{}", seed, self.config.default_port);
             let resolver = self.seed_resolver.read().clone();
-            let resolved = match resolver {
-                Some(resolve) => resolve(name).await,
-                None => tokio::net::lookup_host(name).await.map(|a| a.collect()),
+            // Raced against the stop, so a resolver that hangs does not hold it;
+            // an abandoned system lookup ends on its own thread and holds
+            // nothing the node needs
+            let lookup = async {
+                match resolver {
+                    Some(resolve) => resolve(name).await,
+                    None => tokio::net::lookup_host(name).await.map(|a| a.collect()),
+                }
+            };
+            let Some(resolved) = self.until_stop(lookup).await else {
+                debug!("DNS seed {} not looked up: the node is stopping", seed);
+                break;
             };
             // A lookup that returns once the node has begun to stop adds
             // nothing: Divi Core's dnsseed thread is interrupted and joined at
@@ -1258,7 +1271,8 @@ impl PeerManager {
 
         let our_height = self.current_height();
 
-        let result = Connection::connect(
+        // Raced against the stop, whatever -timeout gives the connect
+        let connect = Connection::connect(
             addr,
             self.proxy_for(&addr),
             self.config.magic,
@@ -1270,8 +1284,13 @@ impl PeerManager {
             self.bytes_recv_counter(),
             Arc::clone(&self.local_nonces),
             self.local_addresses(),
-        )
-        .await;
+        );
+        let result = match self.until_stop(connect).await {
+            Some(result) => result,
+            None => Err(NetworkError::ConnectionRefused(
+                "the node is stopping".to_string(),
+            )),
+        };
 
         let (conn, handle) = match result {
             Ok((conn, handle)) => (
@@ -1355,7 +1374,8 @@ impl PeerManager {
         port: u16,
         proxy: crate::socks5::Proxy,
     ) -> Result<PeerId, NetworkError> {
-        let (conn, handle) = Connection::connect_named(
+        // Raced against the stop, whatever -timeout gives the connect
+        let connect = Connection::connect_named(
             host,
             port,
             proxy,
@@ -1368,8 +1388,11 @@ impl PeerManager {
             self.bytes_recv_counter(),
             Arc::clone(&self.local_nonces),
             self.local_addresses(),
-        )
-        .await?;
+        );
+        let (conn, handle) = self
+            .until_stop(connect)
+            .await
+            .ok_or_else(|| NetworkError::ConnectionRefused("the node is stopping".to_string()))??;
         let peer_id = handle.id;
         let addr = handle.addr;
         self.scoring.register_peer(peer_id, addr.ip());
@@ -1659,6 +1682,21 @@ impl PeerManager {
         let mut left: Vec<String> = self.running.lock().values().cloned().collect();
         left.sort();
         left
+    }
+
+    /// `work` until it ends, or None once the node has begun to stop: Divi
+    /// Core interrupts its net threads at shutdown (divid.cpp:42-53), and
+    /// irondivid ends where they would wait on (a lookup, a connect, a write).
+    /// Subscribed before the flag is read, so a stop is seen either way
+    async fn until_stop<T>(&self, work: impl std::future::Future<Output = T>) -> Option<T> {
+        let mut stop = self.shutdown_tx.subscribe();
+        if self.is_stopping() {
+            return None;
+        }
+        tokio::select! {
+            out = work => Some(out),
+            _ = stop.recv() => None,
+        }
     }
 
     /// Look DNS seeds up with `resolver` instead of the system resolver, so a
