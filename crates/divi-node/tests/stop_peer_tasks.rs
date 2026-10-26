@@ -6,13 +6,18 @@
 //! shutdown interrupts and joins the net threads (dnsseed, net, addcon,
 //! opencon) before anything else (divid.cpp:42-53), then closes the listen
 //! sockets (init.cpp:414-418, net.cpp:272-290). After stop the P2P port takes
-//! no connection and no peer is dialled.
+//! no connection, no peer is dialled and no seed is looked up.
 //!
-//! No test leaves the host: peers are listeners on 127.0.0.1.
+//! No test leaves the host: peers are listeners on 127.0.0.1, and the seed is
+//! an IP literal (240.0.0.77, an address of no host), which resolves without
+//! DNS. With -connect set, a seed's addresses only go into the address book,
+//! so its lookup shows there and is never dialled.
 
+use divi_network::NetAddr;
 use divi_node::config::NodeConfig;
 use divi_node::Node;
 use divi_primitives::ChainMode;
+use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -88,6 +93,44 @@ async fn no_peer_is_dialled_after_stop() {
     assert!(
         !dialled_within(&peer, Duration::from_secs(5)).await,
         "the -connect peer was dialled after stop"
+    );
+}
+
+/// After stop no seed is looked up: the seed task waits 11 s when the address
+/// book has addresses (net.cpp:1020-1022, here 240.0.0.1), and stop comes
+/// before that; its lookup would add the seed's address to the book
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_seed_is_looked_up_after_stop() {
+    let dir = tempfile::tempdir().unwrap();
+    let n = node(&dir, 53802, |c| {
+        c.p2p.connect = vec!["127.0.0.1:53812".into()];
+        c.p2p.dns_seed = Some(true);
+        c.network.dns_seeds = vec!["240.0.0.77".into()];
+    });
+    let book = n.peer_manager().address_book().clone();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as u32;
+    book.add(
+        &[(now, NetAddr::from_ipv4([240, 0, 0, 1], 51476, 1))],
+        IpAddr::from([240, 0, 0, 1]),
+    );
+    let before = book.len();
+    assert_eq!(before, 1, "the address book holds the one address");
+    n.start().await.unwrap();
+    wait_listening(53802).await;
+    // Time for start to dial its -connect peer (refused at once) and start
+    // the seed task, well inside the task's 11 s wait
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    n.stop().await.unwrap();
+    // Past the seed task's 11 s wait
+    tokio::time::sleep(Duration::from_secs(13)).await;
+    let seed: SocketAddr = "240.0.0.77:51476".parse().unwrap();
+    assert_eq!(
+        book.len(),
+        before,
+        "a seed was looked up after stop ({seed} went into the address book)"
     );
 }
 

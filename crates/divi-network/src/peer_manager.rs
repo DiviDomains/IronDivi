@@ -25,7 +25,7 @@ use divi_primitives::hash::Hash256;
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
@@ -215,6 +215,10 @@ pub struct PeerManager {
     event_tx: broadcast::Sender<PeerEvent>,
     /// Shutdown signal sender
     shutdown_tx: broadcast::Sender<()>,
+    /// Set once the node has begun to stop: no peer is accepted, dialled or
+    /// looked up from then on, as Divi Core interrupts and joins its net
+    /// threads first when it shuts down (divid.cpp:42-53)
+    stopping: AtomicBool,
     /// Peer scoring and ban management
     scoring: PeerScoring,
     /// Nonces of our version messages on open connections (self-connection check)
@@ -277,6 +281,7 @@ impl PeerManager {
             our_services: AtomicU64::new(crate::constants::services::NODE_NETWORK),
             event_tx,
             shutdown_tx,
+            stopping: AtomicBool::new(false),
             scoring: PeerScoring::new(),
             local_nonces: Default::default(),
             local_addresses: RwLock::new(Arc::new(Default::default())),
@@ -800,6 +805,8 @@ impl PeerManager {
     /// you want this.", net.cpp:1829-1831). Before, a listener that could not
     /// bind only logged it, and the node ran on without listening.
     pub async fn bind_listeners(&self) -> Result<(), String> {
+        // A node started again after a stop takes and dials peers again
+        self.stopping.store(false, Ordering::SeqCst);
         let wanted = self.listen_addresses();
         let mut bound = Vec::new();
         let mut failures = Vec::new();
@@ -950,7 +957,21 @@ impl PeerManager {
     /// after the start
     async fn seed_from_dns(self: Arc<Self>) {
         if !self.address_book.is_empty() && !self.config.force_dns_seed {
-            tokio::time::sleep(DNS_SEED_DELAY).await;
+            // Divi Core's dnsseed thread sleeps interruptibly and is joined at
+            // shutdown (net.cpp:1020-1022, divid.cpp:42-53): the wait ends when
+            // the node stops, and then nothing is looked up. Subscribed before
+            // the flag is read, so a stop is seen either way
+            let mut shutdown = self.shutdown_tx.subscribe();
+            if self.is_stopping() {
+                return;
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(DNS_SEED_DELAY) => {}
+                _ = shutdown.recv() => return,
+            }
+            if self.is_stopping() {
+                return;
+            }
             if self.peer_count() >= 2 {
                 info!("P2P peers available. Skipped DNS seeding.");
                 return;
@@ -979,6 +1000,9 @@ impl PeerManager {
         let mut found = 0;
 
         for seed in &self.config.dns_seeds {
+            if self.is_stopping() {
+                break;
+            }
             debug!("Resolving DNS seed: {}", seed);
 
             match tokio::net::lookup_host(format!("{}:{}", seed, self.config.default_port)).await {
@@ -1029,13 +1053,18 @@ impl PeerManager {
         white: bool,
         bound: Option<TcpListener>,
     ) -> Result<(), NetworkError> {
+        // Subscribed before the stop flag is read, so a stop is seen either
+        // way: by the flag, or by the signal sent after it. Nothing is bound
+        // once the node has begun to stop
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
+        if self.is_stopping() {
+            return Ok(());
+        }
         let listener = match bound {
             Some(listener) => listener,
             None => TcpListener::bind(addr).await?,
         };
         info!("Listening for connections on {}", addr);
-
-        let mut shutdown_rx = self.shutdown_tx.subscribe();
 
         loop {
             tokio::select! {
@@ -1047,6 +1076,11 @@ impl PeerManager {
                 result = listener.accept() => {
                     match result {
                         Ok((stream, peer_addr)) => {
+                            // Accepted as the node began to stop: not taken
+                            if self.is_stopping() {
+                                drop(stream);
+                                break;
+                            }
                             info!("Accepted connection from {}", crate::peer_log::address(peer_addr));
 
                             // Divi Core counts every inbound connection, handshake
@@ -1159,6 +1193,13 @@ impl PeerManager {
         addr: SocketAddr,
         one_shot: bool,
     ) -> Result<PeerId, NetworkError> {
+        // No peer is dialled once the node has begun to stop
+        if self.is_stopping() {
+            self.connecting_addrs.write().remove(&addr);
+            return Err(NetworkError::ConnectionRefused(
+                "the node is stopping".to_string(),
+            ));
+        }
         // Check if IP is banned
         if self.is_banned(&addr.ip()) {
             self.connecting_addrs.write().remove(&addr);
@@ -1533,6 +1574,22 @@ impl PeerManager {
         if self.peers.write().remove(&peer_id).is_some() {
             debug!("Disconnected peer {}", peer_id);
         }
+    }
+
+    /// The node has begun to stop: from now on no peer is accepted, dialled
+    /// or looked up, and the listeners, the open connections and the seed
+    /// lookup end, as Divi Core interrupts and joins its net threads before
+    /// the rest of its shutdown (divid.cpp:42-53, net.cpp:1440-1470)
+    pub fn stop_network(&self) {
+        self.stopping.store(true, Ordering::SeqCst);
+        // A socket bound for a listener that has not started yet closes now
+        self.prebound.lock().take();
+        let _ = self.shutdown_tx.send(());
+    }
+
+    /// Whether the node has begun to stop (see [`Self::stop_network`])
+    pub fn is_stopping(&self) -> bool {
+        self.stopping.load(Ordering::SeqCst)
     }
 
     /// Disconnect all peers

@@ -2356,6 +2356,11 @@ impl Node {
         tracing::info!("Stopping Divi node...");
         *self.status.write() = NodeStatus::Stopping;
 
+        // The network first, as Divi Core's shutdown interrupts and joins its
+        // net threads before anything else (divid.cpp:42-53): no peer is
+        // accepted, dialled or looked up once stop has begun
+        self.peer_manager.stop_network();
+
         // Stop the block import between two records and wait for it, for a
         // minute at most (a read can block where the flag is not seen)
         let started = std::time::Instant::now();
