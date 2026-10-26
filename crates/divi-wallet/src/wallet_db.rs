@@ -2757,19 +2757,7 @@ impl WalletDb {
             }
         }
 
-        // As Divi Core's walletpassphrase: top the keypool up while the seed is
-        // here, so getnewaddress keeps working after the wallet is locked again
-        let keys = self.key_lock.lock();
-        match self.keystore.top_up_keypool(None) {
-            Ok(added) if !added.is_empty() => {
-                if let Err(e) = self.persist_keys(&added) {
-                    warn!("Failed to store keypool keys: {}", e);
-                }
-            }
-            Ok(_) => {}
-            Err(e) => debug!("Keypool not topped up on unlock: {}", e),
-        }
-        drop(keys);
+        self.top_up_keypool_after_unlock();
 
         // Set unlock expiration time
         let expiration = if timeout_secs > 0 {
@@ -2910,6 +2898,9 @@ impl WalletDb {
         // staking-only flag changes (wallet.cpp:780-783)
         if self.is_fully_unlocked() {
             self.unlock.write().staking_only = staking_only;
+            // walletpassphrase tops the keypool up after any unlock that
+            // succeeds, this one too (rpcwallet.cpp:2617-2620)
+            self.top_up_keypool_after_unlock();
             return Ok(());
         }
         let mut before = *self.unlock.read();
@@ -2924,6 +2915,21 @@ impl WalletDb {
         state.revert_to_staking = before.revert_to_staking;
         state.unlock_time = before.unlock_time;
         Ok(())
+    }
+
+    /// As Divi Core's walletpassphrase: top the keypool up while the seed is
+    /// here, so getnewaddress keeps working after the wallet is locked again
+    fn top_up_keypool_after_unlock(&self) {
+        let _keys = self.key_lock.lock();
+        match self.keystore.top_up_keypool(None) {
+            Ok(added) if !added.is_empty() => {
+                if let Err(e) = self.persist_keys(&added) {
+                    warn!("Failed to store keypool keys: {}", e);
+                }
+            }
+            Ok(_) => {}
+            Err(e) => debug!("Keypool not topped up on unlock: {}", e),
+        }
     }
 
     /// Lock the wallet as a failed walletpassphrasechange does (Lock() before
