@@ -178,12 +178,14 @@ class Node:
         base = os.path.join(WORK, f"{self.name}.run{self.runs}")
         self.err = base + ".err"
         self.out = base + ".out"
+        # taken before the launch: a node can write its first lines before
+        # Popen returns, and they belong to this run
+        self.log_from = self.log_size()
         with open(self.out, "w") as o, open(self.err, "w") as e:
             self.proc = subprocess.Popen([self.binary, f"-datadir={self.dir}", *args], cwd=WORK,
                                          stdout=o, stderr=e, stdin=subprocess.DEVNULL, start_new_session=True)
         with open(os.path.join(WORK, "pids"), "a") as f:
             f.write(f"{self.proc.pid}\n")
-        self.log_from = self.log_size()
 
     def log_size(self):
         p = os.path.join(self.net_dir(), "debug.log")
@@ -478,6 +480,8 @@ def load_row(name, args=(), bootstrap=None, stop_after=False, extra_rows=()):
         if c[2] is not None and i[2] is not None:
             for key in c[2]:
                 compare(f"{name}: {key}", ("ok", c[2][key]), ("ok", i[2][key]))
+        # read once both have stopped (see check_row)
+        both(lambda n: n.stop())
         compare(f"{name}: log lines", ("ok", log_lines(C)), ("ok", log_lines(I)))
     for option in extra_rows:
         compare(f"{name}: log lines naming -{option}", ("ok", naming(C, option)), ("ok", naming(I, option)))
@@ -522,11 +526,13 @@ def check_row(name, args, option):
     compare(f"{name}: start", ("ok", outcome(c[0])), ("ok", outcome(i[0])))
     if c[1] is not None and i[1] is not None:
         compare(f"{name}: the chain", ("ok", c[1]), ("ok", i[1]))
+    # the logs are read once both have stopped: irondivid writes debug.log
+    # from a thread of its own, so a running node may still hold a line
+    both(lambda n: n.stop())
     compare(f"{name}: verifying line", ("ok", [x for x in log_lines(C) if x[0] == "verifying"]),
             ("ok", [x for x in log_lines(I) if x[0] == "verifying"]))
     if option != "checklevel":  # the start row has the error line
         compare(f"{name}: log lines naming -{option}", ("ok", naming(C, option)), ("ok", naming(I, option)))
-    both(lambda n: n.stop())
 
 
 check_row("a plain start on the chain", [], "checkblocks")
