@@ -178,12 +178,14 @@ class Node:
         base = os.path.join(WORK, f"{self.name}.run{self.runs}")
         self.err = base + ".err"
         self.out = base + ".out"
+        # taken before the launch: a node can write its first lines before
+        # Popen returns, and they belong to this run
+        self.log_from = self.log_size()
         with open(self.out, "w") as o, open(self.err, "w") as e:
             self.proc = subprocess.Popen([self.binary, f"-datadir={self.dir}", *args], cwd=WORK,
                                          stdout=o, stderr=e, stdin=subprocess.DEVNULL, start_new_session=True)
         with open(os.path.join(WORK, "pids"), "a") as f:
             f.write(f"{self.proc.pid}\n")
-        self.log_from = self.log_size()
 
     def log_size(self):
         p = os.path.join(self.net_dir(), "debug.log")
