@@ -24,19 +24,28 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::sync::Arc;
 
-/// The fulfilled and pending requests across a restart (Core's netfulfilled.dat)
-pub const NETFULFILLED_FILE: &str = "netfulfilled.list";
+/// The fulfilled and pending requests across a restart, in the file and with
+/// the magic message Divi Core keeps them in (MasternodeModule.cpp:256-258,
+/// :295)
+pub const NETFULFILLED_FILE: &str = "netfulfilled.dat";
+const NETFULFILLED_MAGIC: &str = "magicFulfilledCache";
+
+/// The file irondivid kept them in before, removed once netfulfilled.dat is
+/// written
+const OLD_NETFULFILLED_FILE: &str = "netfulfilled.list";
 
 /// ActiveProtocol() without -activeversion (version.cpp:11-17)
 pub const ACTIVE_PROTOCOL: i32 = 70915;
 
 /// A peer's key in the fulfilled requests: the whole address on regtest, where
-/// local peers share an IP, else the IP (netfulfilledman.cpp:14-22)
+/// local peers share an IP, else the IP (netfulfilledman.cpp:14-22). An
+/// IPv4-mapped address is its IPv4 address, as CNetAddr holds one
 pub fn peer_key(addr: SocketAddr, regtest: bool) -> String {
+    let ip = addr.ip().to_canonical();
     if regtest {
-        addr.to_string()
+        SocketAddr::new(ip, addr.port()).to_string()
     } else {
-        addr.ip().to_string()
+        ip.to_string()
     }
 }
 
@@ -113,24 +122,121 @@ pub fn blockchain_synced(sync: &SharedMasternodeSync, chain: &Chain, now: i64) -
     sync.lock().chain.check(now, tip_time, chain.is_importing())
 }
 
-/// Write the fulfilled and pending requests to the datadir
-pub fn save(sync: &SharedMasternodeSync, data_dir: &Path) {
-    let text = sync.lock().sync.requests.to_text();
-    let path = data_dir.join(NETFULFILLED_FILE);
-    let tmp = path.with_extension("tmp");
-    if std::fs::write(&tmp, text)
-        .and_then(|_| std::fs::rename(&tmp, &path))
-        .is_err()
-    {
-        tracing::warn!("Could not write {}", path.display());
-    }
+/// What reading netfulfilled.dat came to, as CFlatDB::Read classes it
+/// (flat-database.h:178-216, flat-database.cpp:18-60)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FulfilledFile {
+    Loaded,
+    /// No file: one is written at the next stop
+    Missing,
+    /// The checksum and the magic are right but the requests do not parse
+    /// (IncorrectFormat): taken as read so far, and the file is written anew
+    BadFormat,
+    /// Any other fault (the checksum, the magic message, the network's magic
+    /// number): divid refuses to start and will not overwrite the file
+    Invalid(&'static str),
 }
 
-/// Read them back at start; a missing file is an empty cache
-pub fn load(sync: &SharedMasternodeSync, data_dir: &Path) {
-    if let Ok(text) = std::fs::read_to_string(data_dir.join(NETFULFILLED_FILE)) {
-        sync.lock().sync.requests.load_text(&text);
+/// netfulfilled.dat's checksum, magic message and network magic number
+/// checked; the requests' bytes when they are right
+fn read_file(path: &Path, network_magic: [u8; 4]) -> (FulfilledFile, Option<Vec<u8>>) {
+    let Ok(bytes) = std::fs::read(path) else {
+        return (FulfilledFile::Missing, None);
+    };
+    // The data is all but the last 32 bytes, which are its double SHA-256
+    if bytes.len() < 32 {
+        return (FulfilledFile::Invalid("the checksum cannot be read"), None);
     }
+    let (data, checksum) = bytes.split_at(bytes.len() - 32);
+    if divi_crypto::double_sha256(data) != checksum {
+        return (FulfilledFile::Invalid("the checksum does not match"), None);
+    }
+    let Some((magic, network, requests)) = split_header(data) else {
+        return (FulfilledFile::BadFormat, None);
+    };
+    if network != network_magic {
+        return (FulfilledFile::Invalid("another network's file"), None);
+    }
+    if magic != NETFULFILLED_MAGIC.as_bytes() {
+        return (FulfilledFile::Invalid("another kind of file"), None);
+    }
+    (FulfilledFile::Loaded, Some(requests.to_vec()))
+}
+
+/// The magic message (a string: its compact size, then its bytes), the
+/// network's magic number and what follows them
+fn split_header(data: &[u8]) -> Option<(&[u8], &[u8], &[u8])> {
+    let (len, start): (usize, usize) = match *data.first()? {
+        0xFD => (
+            u16::from_le_bytes(data.get(1..3)?.try_into().ok()?) as usize,
+            3,
+        ),
+        0xFE => (
+            u32::from_le_bytes(data.get(1..5)?.try_into().ok()?) as usize,
+            5,
+        ),
+        0xFF => (
+            u64::from_le_bytes(data.get(1..9)?.try_into().ok()?) as usize,
+            9,
+        ),
+        n => (n as usize, 1),
+    };
+    let magic_end = start.checked_add(len)?;
+    let magic = data.get(start..magic_end)?;
+    let network = data.get(magic_end..magic_end.checked_add(4)?)?;
+    Some((magic, network, &data[magic_end + 4..]))
+}
+
+/// Write the fulfilled and pending requests to netfulfilled.dat at a stop, as
+/// SaveMasternodeDataToDisk does (MasternodeModule.cpp:284-297): the magic
+/// message, the network's magic number, the requests and the double SHA-256
+/// of all that (FlatDataFile::Write, flat-database.h:59-97). Like
+/// CFlatDB::Dump it leaves a file it cannot read as its own alone. Ok(false)
+/// when it was left
+pub fn save(
+    sync: &SharedMasternodeSync,
+    data_dir: &Path,
+    network_magic: [u8; 4],
+) -> std::io::Result<bool> {
+    let path = data_dir.join(NETFULFILLED_FILE);
+    if let FulfilledFile::Invalid(_) = read_file(&path, network_magic).0 {
+        return Ok(false);
+    }
+    let mut out = vec![NETFULFILLED_MAGIC.len() as u8];
+    out.extend_from_slice(NETFULFILLED_MAGIC.as_bytes());
+    out.extend_from_slice(&network_magic);
+    out.extend_from_slice(&sync.lock().sync.requests.to_file_data());
+    let checksum = divi_crypto::double_sha256(&out);
+    out.extend_from_slice(&checksum);
+    let tmp = path.with_extension("dat.new");
+    std::fs::write(&tmp, out)?;
+    std::fs::rename(&tmp, &path)?;
+    let _ = std::fs::remove_file(data_dir.join(OLD_NETFULFILLED_FILE));
+    Ok(true)
+}
+
+/// Read them back at start, as LoadMasternodeDataFromDisk does
+/// (MasternodeModule.cpp:252-260; CFlatDB::Load, flat-database.h:225-245);
+/// once read, the expired fulfilled requests go (CheckAndRemove,
+/// flat-database.h:209-213). What the file came to is returned; Invalid
+/// stops a start
+pub fn load(
+    sync: &SharedMasternodeSync,
+    data_dir: &Path,
+    network_magic: [u8; 4],
+    regtest: bool,
+    now: i64,
+) -> FulfilledFile {
+    let (outcome, data) = read_file(&data_dir.join(NETFULFILLED_FILE), network_magic);
+    let Some(data) = data else {
+        return outcome;
+    };
+    let mut state = sync.lock();
+    if !state.sync.requests.read_file_data(&data, regtest) {
+        return FulfilledFile::BadFormat;
+    }
+    state.sync.requests.check_and_remove(now);
+    FulfilledFile::Loaded
 }
 
 /// One second of the sync thread (MasternodeModule.cpp:486-529): a restart
@@ -467,5 +573,101 @@ mod tests {
             assert_eq!(is_local(ip), local, "{ip}");
             assert_eq!(is_rfc1918(ip), rfc1918, "{ip}");
         }
+    }
+
+    const MAGIC: [u8; 4] = [0xa1, 0xcf, 0x7e, 0xac];
+
+    /// netfulfilled.dat is written as Divi Core's CFlatDB writes it and read
+    /// back at the next start, the old netfulfilled.list removed
+    #[test]
+    fn netfulfilled_dat_is_written_and_read_as_divid_s() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(OLD_NETFULFILLED_FILE), "f a b 1\n").unwrap();
+        let sync = divi_masternode::mnsync::shared(1000, false);
+        sync.lock()
+            .sync
+            .requests
+            .add_fulfilled("127.0.0.2:5000", "mnsync", 1000);
+        assert!(save(&sync, dir.path(), MAGIC).unwrap());
+        assert!(!dir.path().join(OLD_NETFULFILLED_FILE).exists());
+
+        let bytes = std::fs::read(dir.path().join(NETFULFILLED_FILE)).unwrap();
+        let (data, checksum) = bytes.split_at(bytes.len() - 32);
+        assert_eq!(divi_crypto::double_sha256(data), checksum);
+        assert_eq!(data[0] as usize, NETFULFILLED_MAGIC.len());
+        assert_eq!(&data[1..20], b"magicFulfilledCache");
+        assert_eq!(data[20..24], MAGIC);
+        assert_eq!(data[24..], sync.lock().sync.requests.to_file_data()[..]);
+
+        let back = divi_masternode::mnsync::shared(1000, false);
+        assert_eq!(
+            load(&back, dir.path(), MAGIC, true, 1200),
+            FulfilledFile::Loaded
+        );
+        assert!(back
+            .lock()
+            .sync
+            .requests
+            .has_fulfilled("127.0.0.2:5000", "mnsync", 1200));
+        // Read after they expired: CheckAndRemove takes them out
+        let late = divi_masternode::mnsync::shared(1000, false);
+        assert_eq!(
+            load(&late, dir.path(), MAGIC, true, 1400),
+            FulfilledFile::Loaded
+        );
+        assert!(late.lock().sync.requests.to_file_data() == vec![0, 0]);
+    }
+
+    /// As CFlatDB::Load classes a file: missing or with requests that do not
+    /// parse, the start goes on; any other fault stops it, and a stop then
+    /// leaves the file as it was
+    #[test]
+    fn a_netfulfilled_dat_divid_cannot_read_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(NETFULFILLED_FILE);
+        let sync = divi_masternode::mnsync::shared(1000, false);
+        assert_eq!(
+            load(&sync, dir.path(), MAGIC, true, 0),
+            FulfilledFile::Missing
+        );
+
+        assert!(save(&sync, dir.path(), MAGIC).unwrap());
+        let other = [0u8; 4];
+        assert_eq!(
+            load(&sync, dir.path(), other, true, 0),
+            FulfilledFile::Invalid("another network's file")
+        );
+        assert!(!save(&sync, dir.path(), other).unwrap());
+
+        // Right header and checksum, requests that do not parse
+        let mut data = vec![NETFULFILLED_MAGIC.len() as u8];
+        data.extend_from_slice(NETFULFILLED_MAGIC.as_bytes());
+        data.extend_from_slice(&MAGIC);
+        data.push(5);
+        let checksum = divi_crypto::double_sha256(&data);
+        data.extend_from_slice(&checksum);
+        std::fs::write(&path, &data).unwrap();
+        assert_eq!(
+            load(&sync, dir.path(), MAGIC, true, 0),
+            FulfilledFile::BadFormat
+        );
+        assert!(save(&sync, dir.path(), MAGIC).unwrap());
+
+        for garbage in [&b""[..], b"garbage", &[0u8; 40][..]] {
+            std::fs::write(&path, garbage).unwrap();
+            assert!(matches!(
+                load(&sync, dir.path(), MAGIC, true, 0),
+                FulfilledFile::Invalid(_)
+            ));
+            assert!(!save(&sync, dir.path(), MAGIC).unwrap());
+            assert_eq!(std::fs::read(&path).unwrap(), garbage);
+        }
+    }
+
+    #[test]
+    fn an_ipv4_mapped_peer_is_keyed_by_its_ipv4_address() {
+        let a: SocketAddr = "[::ffff:127.0.0.2]:5000".parse().unwrap();
+        assert_eq!(peer_key(a, true), "127.0.0.2:5000");
+        assert_eq!(peer_key(a, false), "127.0.0.2");
     }
 }

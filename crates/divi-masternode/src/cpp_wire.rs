@@ -58,7 +58,7 @@ impl fmt::Display for WireError {
 
 impl std::error::Error for WireError {}
 
-fn write_compact_size(out: &mut Vec<u8>, n: usize) {
+pub(crate) fn write_compact_size(out: &mut Vec<u8>, n: usize) {
     if n < 0xFD {
         out.push(n as u8);
     } else if n <= 0xFFFF {
@@ -73,18 +73,22 @@ fn write_compact_size(out: &mut Vec<u8>, n: usize) {
     }
 }
 
-fn write_varbytes(out: &mut Vec<u8>, bytes: &[u8]) {
+pub(crate) fn write_varbytes(out: &mut Vec<u8>, bytes: &[u8]) {
     write_compact_size(out, bytes.len());
     out.extend_from_slice(bytes);
 }
 
-struct Reader<'a> {
+pub(crate) struct Reader<'a> {
     data: &'a [u8],
     pos: usize,
 }
 
 impl<'a> Reader<'a> {
-    fn take(&mut self, n: usize) -> Result<&'a [u8], WireError> {
+    pub(crate) fn new(data: &'a [u8]) -> Self {
+        Self { data, pos: 0 }
+    }
+
+    pub(crate) fn take(&mut self, n: usize) -> Result<&'a [u8], WireError> {
         let end = self.pos.checked_add(n).ok_or(WireError::BadLength)?;
         if end > self.data.len() {
             return Err(WireError::Truncated);
@@ -102,11 +106,11 @@ impl<'a> Reader<'a> {
         Ok(i32::from_le_bytes(self.take(4)?.try_into().unwrap()))
     }
 
-    fn i64_le(&mut self) -> Result<i64, WireError> {
+    pub(crate) fn i64_le(&mut self) -> Result<i64, WireError> {
         Ok(i64::from_le_bytes(self.take(8)?.try_into().unwrap()))
     }
 
-    fn compact_size(&mut self) -> Result<usize, WireError> {
+    pub(crate) fn compact_size(&mut self) -> Result<usize, WireError> {
         let first = self.take(1)?[0];
         let n = match first {
             0xFD => u16::from_le_bytes(self.take(2)?.try_into().unwrap()) as u64,
@@ -121,7 +125,7 @@ impl<'a> Reader<'a> {
         Ok(n as usize)
     }
 
-    fn varbytes(&mut self) -> Result<Vec<u8>, WireError> {
+    pub(crate) fn varbytes(&mut self) -> Result<Vec<u8>, WireError> {
         let n = self.compact_size()?;
         Ok(self.take(n)?.to_vec())
     }
