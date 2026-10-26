@@ -352,6 +352,41 @@ fn netfulfilled_is_written_after_the_loops_stop() {
     let written =
         line_of(&lines, "Shutdown: netfulfilled.dat written").expect("netfulfilled.dat written");
     assert!(loops < written, "{lines:#?}");
+    // In Divi Core's format and under its name (MasternodeModule.cpp:295)
+    let bytes = std::fs::read(dir.path().join("netfulfilled.dat")).unwrap();
+    assert_eq!(&bytes[1..20], b"magicFulfilledCache");
+    assert!(!dir.path().join("netfulfilled.list").exists());
+}
+
+/// divid will not start on a netfulfilled.dat it cannot read
+/// (CFlatDB::Load, flat-database.h:225-245; MasternodeModule.cpp:256-260) and
+/// leaves it as it was
+#[test]
+fn a_damaged_netfulfilled_stops_the_start() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("netfulfilled.dat"), b"not a requests file").unwrap();
+    let mut child = irondivid(dir.path(), free_port())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let code = wait_exit(&mut child, 60);
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("Failed to load fulfilled requests cache from"),
+        "{stderr}"
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("netfulfilled.dat")).unwrap(),
+        b"not a requests file"
+    );
 }
 
 /// The masternode payment votes are written to mnpayments.dat beside

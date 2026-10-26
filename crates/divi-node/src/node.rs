@@ -1078,7 +1078,35 @@ impl Node {
             divi_primitives::clock::now(),
             chain.network_type() == divi_storage::chain::NetworkType::Mainnet,
         );
-        crate::masternode_sync::load(&masternode_sync, &config.data_dir);
+        // netfulfilled.dat, read first as LoadMasternodeDataFromDisk reads it
+        // (MasternodeModule.cpp:252-260); a file that is not one of this
+        // network stops the start
+        {
+            use crate::masternode_sync::{FulfilledFile, NETFULFILLED_FILE};
+            match crate::masternode_sync::load(
+                &masternode_sync,
+                &config.data_dir,
+                config.network.magic,
+                chain.network_type() == divi_storage::chain::NetworkType::Regtest,
+                divi_primitives::clock::now(),
+            ) {
+                FulfilledFile::Loaded => {}
+                FulfilledFile::Missing => {
+                    tracing::info!("Missing file {}, will try to recreate", NETFULFILLED_FILE)
+                }
+                FulfilledFile::BadFormat => tracing::warn!(
+                    "Error reading {}: Magic is ok but data has invalid format, will try to recreate",
+                    NETFULFILLED_FILE
+                ),
+                FulfilledFile::Invalid(why) => {
+                    tracing::error!("Error reading {}: {}", NETFULFILLED_FILE, why);
+                    return Err(NodeError::Init(format!(
+                        "Failed to load fulfilled requests cache from\n{}",
+                        config.data_dir.display()
+                    )));
+                }
+            }
+        }
         // Votes are checked against the sync's stage (masternode-payments.cpp:241-245, :320)
         masternode_votes.follow_sync(Arc::clone(&masternode_sync));
         // The payment votes of the last run, read when there are masternodes,
@@ -1383,25 +1411,19 @@ impl Node {
             let chain = Arc::clone(&self.chain);
             let peers = Arc::clone(&self.peer_manager);
             let sporks = Arc::clone(&self.spork_manager);
-            let data_dir = self.config.data_dir.clone();
             let mut shutdown = self.shutdown_tx.subscribe();
+            // The fulfilled requests are written only at a stop and cleaned
+            // only when read, as divid's (MasternodeModule.cpp:284-297;
+            // flat-database.h:209-213)
             self.keep(tokio::spawn(async move {
                 let mut every = tokio::time::interval(std::time::Duration::from_secs(1));
-                let mut last_cleanup = divi_primitives::clock::now();
                 loop {
                     tokio::select! {
                         _ = every.tick() => {}
                         _ = shutdown.recv() => break,
                     }
                     let now = divi_primitives::clock::now();
-                    if !crate::masternode_sync::tick(&sync, &chain, &peers, &sporks, now).await {
-                        continue;
-                    }
-                    if now >= last_cleanup + 60 {
-                        last_cleanup = now;
-                        sync.lock().sync.requests.check_and_remove(now);
-                        crate::masternode_sync::save(&sync, &data_dir);
-                    }
+                    crate::masternode_sync::tick(&sync, &chain, &peers, &sporks, now).await;
                 }
             }));
         }
@@ -2412,7 +2434,22 @@ impl Node {
         // Divi Core's SaveMasternodeDataToDisk follows StopNode
         // (init.cpp:372, :376; MasternodeModule.cpp:284-297)
         let started = std::time::Instant::now();
-        crate::masternode_sync::save(&self.masternode_sync, &self.config.data_dir);
+        match crate::masternode_sync::save(
+            &self.masternode_sync,
+            &self.config.data_dir,
+            self.config.network.magic,
+        ) {
+            Ok(true) => {}
+            Ok(false) => tracing::warn!(
+                "Error reading {}: File format is unknown or invalid, please fix it manually",
+                crate::masternode_sync::NETFULFILLED_FILE
+            ),
+            Err(e) => tracing::error!(
+                "Failed to write {}: {}",
+                crate::masternode_sync::NETFULFILLED_FILE,
+                e
+            ),
+        }
         shutdown_stage("netfulfilled.dat written", started);
 
         // The payment votes beside it, as SaveMasternodeDataToDisk writes

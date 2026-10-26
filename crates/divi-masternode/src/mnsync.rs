@@ -14,8 +14,10 @@
 //! Times are Unix seconds from the caller, so the stages can be driven by a
 //! test clock; the node passes Core's GetTime (mock time included).
 
+use crate::cpp_wire::{write_compact_size, write_varbytes, Reader, WireError};
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
 /// MasternodeSyncCode (masternode-sync.h:40-48)
@@ -113,39 +115,101 @@ impl FulfilledRequests {
         self.fulfilled.retain(|_, m| !m.is_empty());
     }
 
-    /// One line per request: `f|p <peer> <request> <until>` (netfulfilled.dat
-    /// keeps both maps across a restart, MasternodeModule.cpp:252-260)
-    pub fn to_text(&self) -> String {
-        let mut out = String::new();
-        for (kind, map) in [("f", &self.fulfilled), ("p", &self.pending)] {
+    /// Both maps as Divi Core serialises CNetFulfilledRequestManager into
+    /// netfulfilled.dat (netfulfilledman.h:33-38): the fulfilled, then the
+    /// pending, each its peers in CService order (16 address bytes, then the
+    /// port big-endian, netbase.h:169-176; operator<, netbase.cpp:1202-1205)
+    /// with their requests in name order and the time each expires
+    pub fn to_file_data(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        for map in [&self.fulfilled, &self.pending] {
+            let mut services: BTreeMap<([u8; 16], u16), BTreeMap<&str, i64>> = BTreeMap::new();
             for (peer, requests) in map {
+                let Some(service) = service_of(peer) else {
+                    continue;
+                };
+                let entry = services.entry(service).or_default();
                 for (request, until) in requests {
-                    out.push_str(&format!("{kind} {peer} {request} {until}\n"));
+                    entry.entry(request.as_str()).or_insert(*until);
+                }
+            }
+            write_compact_size(&mut out, services.len());
+            for ((ip, port), requests) in services {
+                out.extend_from_slice(&ip);
+                out.extend_from_slice(&port.to_be_bytes());
+                write_compact_size(&mut out, requests.len());
+                for (request, until) in requests {
+                    write_varbytes(&mut out, request.as_bytes());
+                    out.extend_from_slice(&until.to_le_bytes());
                 }
             }
         }
         out
     }
 
-    /// Read `to_text`'s lines back; a line that does not parse is left out
-    pub fn load_text(&mut self, text: &str) {
-        for line in text.lines() {
-            let parts: Vec<&str> = line.split(' ').collect();
-            let [kind, peer, request, until] = parts[..] else {
-                continue;
-            };
-            let Ok(until) = until.parse::<i64>() else {
-                continue;
-            };
-            let map = match kind {
-                "f" => &mut self.fulfilled,
-                "p" => &mut self.pending,
-                _ => continue,
-            };
-            map.entry(peer.to_string())
-                .or_default()
-                .insert(request.to_string(), until);
+    /// Read `to_file_data`'s maps back as Core's ParseChunk does
+    /// (flat-database.h:150-164). False when they do not parse
+    /// (IncorrectFormat): then Core's Clear empties the fulfilled requests and
+    /// keeps the pending ones read until then (netfulfilledman.cpp:142-146)
+    pub fn read_file_data(&mut self, data: &[u8], regtest: bool) -> bool {
+        let mut r = Reader::new(data);
+        // std::map's Unserialize empties the map, then inserts what it reads
+        self.fulfilled.clear();
+        let read = read_requests(&mut r, &mut self.fulfilled, regtest).is_ok() && {
+            self.pending.clear();
+            read_requests(&mut r, &mut self.pending, regtest).is_ok()
+        };
+        if !read {
+            self.fulfilled.clear();
         }
+        read
+    }
+}
+
+/// One map of requests from netfulfilled.dat; a peer goes in only once its
+/// requests are all read, and a key seen before is not replaced (std::map)
+fn read_requests(
+    r: &mut Reader,
+    map: &mut HashMap<String, HashMap<String, i64>>,
+    regtest: bool,
+) -> Result<(), WireError> {
+    for _ in 0..r.compact_size()? {
+        let ip: [u8; 16] = r.take(16)?.try_into().unwrap();
+        let port = u16::from_be_bytes(r.take(2)?.try_into().unwrap());
+        let mut requests = HashMap::new();
+        for _ in 0..r.compact_size()? {
+            let request = String::from_utf8_lossy(&r.varbytes()?).into_owned();
+            let until = r.i64_le()?;
+            requests.entry(request).or_insert(until);
+        }
+        map.entry(peer_of(ip, port, regtest)).or_insert(requests);
+    }
+    Ok(())
+}
+
+/// A peer's key as the CService Core keys it by: the address and port, or the
+/// IP alone with port 0 (SquashAddress, netfulfilledman.cpp:14-22); an IPv4
+/// address is held IPv4-mapped, as CNetAddr holds it
+fn service_of(peer: &str) -> Option<([u8; 16], u16)> {
+    let (ip, port) = match peer.parse::<SocketAddr>() {
+        Ok(addr) => (addr.ip(), addr.port()),
+        Err(_) => (peer.parse::<IpAddr>().ok()?, 0),
+    };
+    let ip = match ip {
+        IpAddr::V4(v4) => v4.to_ipv6_mapped().octets(),
+        IpAddr::V6(v6) => v6.octets(),
+    };
+    Some((ip, port))
+}
+
+/// The key of a CService read back: the address with the port on regtest, the
+/// IP elsewhere, as the node keys its peers
+fn peer_of(ip: [u8; 16], port: u16, regtest: bool) -> String {
+    let ip = IpAddr::V6(Ipv6Addr::from(ip)).to_canonical();
+    if regtest {
+        SocketAddr::new(ip, port).to_string()
+    } else {
+        ip.to_string()
     }
 }
 
@@ -816,13 +880,80 @@ mod tests {
         assert!(!r.has_pending("a", LIST_REQUEST, 150));
         assert!(r.has_fulfilled("a", LIST_REQUEST, 449));
         assert!(!r.has_fulfilled("a", LIST_REQUEST, 450));
-        r.add_pending("b", WINNER_REQUEST, 100);
+        r.add_pending("127.0.0.2:5001", WINNER_REQUEST, 100);
         let mut back = FulfilledRequests::new(300);
-        back.load_text(&r.to_text());
-        assert!(back.has_fulfilled("a", LIST_REQUEST, 449));
-        assert!(back.has_pending("b", WINNER_REQUEST, 400));
+        assert!(back.read_file_data(&r.to_file_data(), true));
+        // "a" is no address, so it is not in the file
+        assert!(!back.has_fulfilled("a", LIST_REQUEST, 449));
+        assert!(back.has_pending("127.0.0.2:5001", WINNER_REQUEST, 400));
+        r.add_fulfilled("127.0.0.2:5000", LIST_REQUEST, 150);
+        assert!(back.read_file_data(&r.to_file_data(), true));
+        assert!(back.has_fulfilled("127.0.0.2:5000", LIST_REQUEST, 449));
         back.check_and_remove(451);
-        assert!(!back.has_fulfilled("a", LIST_REQUEST, 0));
+        assert!(!back.has_fulfilled("127.0.0.2:5000", LIST_REQUEST, 0));
+    }
+
+    /// netfulfilled.dat's maps byte for byte as Divi Core writes them: a
+    /// count, each CService (IPv4-mapped address, port big-endian) with its
+    /// requests (a string and an int64), peers in address order
+    #[test]
+    fn fulfilled_requests_are_written_as_core_serialises_them() {
+        let mut r = FulfilledRequests::new(300);
+        r.add_fulfilled("127.0.0.3:51476", LIST_REQUEST, 1000);
+        r.add_fulfilled("127.0.0.2:51476", WINNER_REQUEST, 1000);
+        r.add_fulfilled("127.0.0.2:51476", LIST_REQUEST, 1000);
+        let service = |last: u8| {
+            let mut s = vec![0u8; 10];
+            s.extend_from_slice(&[0xff, 0xff, 127, 0, 0, last]);
+            s.extend_from_slice(&[0xc9, 0x14]);
+            s
+        };
+        let request = |name: &str| {
+            let mut s = vec![name.len() as u8];
+            s.extend_from_slice(name.as_bytes());
+            s.extend_from_slice(&1300i64.to_le_bytes());
+            s
+        };
+        let mut want = vec![2];
+        want.extend(service(2));
+        want.push(2);
+        want.extend(request("mnsync"));
+        want.extend(request("mnwsync"));
+        want.extend(service(3));
+        want.push(1);
+        want.extend(request("mnsync"));
+        // No pending requests
+        want.push(0);
+        assert_eq!(r.to_file_data(), want);
+
+        // Elsewhere a peer is its IP, written with port 0
+        let mut m = FulfilledRequests::new(1800);
+        m.add_fulfilled("203.0.113.9", LIST_REQUEST, 0);
+        let data = m.to_file_data();
+        assert_eq!(
+            &data[1..19],
+            &[&[0u8; 10][..], &[0xff, 0xff, 203, 0, 113, 9, 0, 0]].concat()[..]
+        );
+        let mut back = FulfilledRequests::new(1800);
+        assert!(back.read_file_data(&data, false));
+        assert!(back.has_fulfilled("203.0.113.9", LIST_REQUEST, 1799));
+    }
+
+    /// Maps that do not parse leave the fulfilled requests empty and keep the
+    /// pending ones read before the fault, as Core's ParseChunk and Clear do
+    #[test]
+    fn fulfilled_requests_that_do_not_parse_are_cleared_as_core_clears_them() {
+        let mut r = FulfilledRequests::new(300);
+        r.add_fulfilled("127.0.0.2:1", LIST_REQUEST, 0);
+        r.add_pending("127.0.0.2:2", LIST_REQUEST, 0);
+        r.add_pending("127.0.0.2:3", LIST_REQUEST, 0);
+        let data = r.to_file_data();
+        let mut back = FulfilledRequests::new(300);
+        // Cut inside the second pending peer
+        assert!(!back.read_file_data(&data[..data.len() - 3], true));
+        assert!(!back.has_fulfilled("127.0.0.2:1", LIST_REQUEST, 0));
+        assert!(back.has_pending("127.0.0.2:2", LIST_REQUEST, 0));
+        assert!(!back.has_pending("127.0.0.2:3", LIST_REQUEST, 0));
     }
 
     #[test]
