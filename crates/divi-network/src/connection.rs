@@ -549,19 +549,7 @@ impl Connection {
     /// Wait for version message (during handshake - uses blocking read, ok because no select!)
     async fn recv_version(&mut self) -> Result<VersionMessage, NetworkError> {
         loop {
-            // A timeout drops the peer, so a message cut off by it is not lost to anyone
-            let deadline = handshake_deadline(&self.info);
-            let read = tokio::time::timeout_at(deadline.into(), self.read_message_handshake());
-            let Ok(read) = read.await else {
-                info!(
-                    "{} sent no version in time ({} bytes in, {} out), disconnecting",
-                    crate::peer_log::peer(self.peer_id, self.info.addr),
-                    self.info.bytes_recv,
-                    self.info.bytes_sent
-                );
-                return Err(NetworkError::Timeout);
-            };
-            match read? {
+            match self.read_message_handshake().await? {
                 Some(Decoded::Message(NetworkMessage::Version(v))) => return Ok(v),
                 Some(Decoded::Malformed { command, error }) if command == "version" => {
                     self.reject_malformed(&command, &error).await?;
@@ -599,12 +587,46 @@ impl Connection {
     /// Read a message during handshake (not cancellation-safe, but OK since no
     /// select!). It reads exactly one message, so nothing is buffered past it,
     /// and applies the codec's framing rules: `None` is a skipped message.
+    /// Fill `buf` from a peer that has not sent its version, counting each
+    /// part as it arrives. Each read waits only until `handshake_deadline` as it
+    /// stands then, so bytes that came move it; a timeout drops the peer, so
+    /// a message cut off by it is not lost to anyone
+    async fn read_counted(&mut self, buf: &mut [u8]) -> Result<(), NetworkError> {
+        use tokio::io::AsyncReadExt;
+        let mut got = 0;
+        while got < buf.len() {
+            let deadline = handshake_deadline(&self.info);
+            let read = tokio::time::timeout_at(deadline.into(), self.stream.read(&mut buf[got..]));
+            let Ok(read) = read.await else {
+                info!(
+                    "{} sent no version in time ({} bytes in, {} out), disconnecting",
+                    crate::peer_log::peer(self.peer_id, self.info.addr),
+                    self.info.bytes_recv,
+                    self.info.bytes_sent
+                );
+                return Err(NetworkError::Timeout);
+            };
+            let n = read?;
+            if n == 0 {
+                return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+            }
+            got += n;
+            self.info.bytes_recv += n as u64;
+            self.info.last_recv = std::time::Instant::now();
+            self.info.last_recv_unix = crate::peer::unix_now();
+            self.total_bytes_recv.fetch_add(n as u64, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
     async fn read_message_handshake(&mut self) -> Result<Option<Decoded>, NetworkError> {
         use crate::message::{MessageHeader, HEADER_SIZE};
-        use tokio::io::AsyncReadExt;
 
+        // Every byte counts as it comes, part of a message or not, as Divi Core
+        // records each read (Node.cpp:160-164, :292): a peer that sends half a
+        // message has sent something
         let mut header_buf = [0u8; HEADER_SIZE];
-        self.stream.read_exact(&mut header_buf).await?;
+        self.read_counted(&mut header_buf).await?;
         let header = MessageHeader::deserialize(&header_buf)?;
         if !header.validate_magic(&self.magic) {
             return Err(NetworkError::InvalidMagic);
@@ -618,21 +640,14 @@ impl Connection {
 
         // Read the payload as it arrives instead of reserving all of it
         // up front for a size the peer has only announced
+        let size = header.payload_size as usize;
         let mut payload = Vec::new();
-        (&mut self.stream)
-            .take(u64::from(header.payload_size))
-            .read_to_end(&mut payload)
-            .await?;
-        if payload.len() != header.payload_size as usize {
-            return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+        let mut chunk = [0u8; 8192];
+        while payload.len() < size {
+            let want = (size - payload.len()).min(chunk.len());
+            self.read_counted(&mut chunk[..want]).await?;
+            payload.extend_from_slice(&chunk[..want]);
         }
-
-        let bytes_received = HEADER_SIZE as u64 + header.payload_size as u64;
-        self.info.bytes_recv += bytes_received;
-        self.info.last_recv = std::time::Instant::now();
-        self.info.last_recv_unix = crate::peer::unix_now();
-        self.total_bytes_recv
-            .fetch_add(bytes_received, Ordering::Relaxed);
 
         if !header.command_is_valid() || !header.validate_checksum(&payload) {
             debug!("Skipping a damaged message from {}", self.info.addr);
@@ -737,7 +752,7 @@ impl Connection {
 
                 // Proactive keepalive ping
                 _ = ping_timer.tick() => {
-                    if inactivity_exceeded(info.last_send, info.last_recv, info.ping_time, std::time::Instant::now()) {
+                    if inactivity_exceeded(info.last_send, last_bytes_in(&info, framed.decoder()), info.ping_time, std::time::Instant::now()) {
                         info!("{} inactive for {:?}, disconnecting", crate::peer_log::peer(peer_id, info.addr), TIMEOUT_INTERVAL);
                         break;
                     }
@@ -834,7 +849,7 @@ impl Connection {
                         Err(_) => {
                             // A quiet peer gets no extra ping: the keepalive above
                             // runs on its own interval, as in Divi Core
-                            if inactivity_exceeded(info.last_send, info.last_recv, info.ping_time, std::time::Instant::now()) {
+                            if inactivity_exceeded(info.last_send, last_bytes_in(&info, framed.decoder()), info.ping_time, std::time::Instant::now()) {
                                 info!("{} inactive for {:?}, disconnecting", crate::peer_log::peer(peer_id, info.addr), TIMEOUT_INTERVAL);
                                 break;
                             }
@@ -1121,6 +1136,15 @@ fn inactivity_exceeded(
     now.saturating_duration_since(last_send) > TIMEOUT_INTERVAL
         || now.saturating_duration_since(last_recv) > TIMEOUT_INTERVAL
         || ping_sent.is_some_and(|sent| now.saturating_duration_since(sent) > TIMEOUT_INTERVAL)
+}
+
+/// When bytes last came from the peer: its last whole message, or later bytes
+/// of a message not yet whole (Divi Core's receive clock counts bytes,
+/// Node.cpp:160-164)
+fn last_bytes_in(info: &PeerInfo, codec: &DiviCodec) -> std::time::Instant {
+    codec
+        .last_arrival()
+        .map_or(info.last_recv, |at| at.max(info.last_recv))
 }
 
 /// When a peer that has not sent its version is dropped: 60 s after the

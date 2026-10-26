@@ -41,6 +41,11 @@ pub struct DiviCodec {
     state: DecodeState,
     /// Bytes taken off the wire since the last `take_bytes_consumed`
     bytes_consumed: u64,
+    /// Bytes left in the read buffer after the last decode, to see new ones come
+    buffered: usize,
+    /// When bytes last came, part of a message or not (Divi Core records every
+    /// read, Node.cpp:160-164 and :292)
+    last_arrival: Option<std::time::Instant>,
 }
 
 /// State machine for message decoding
@@ -59,7 +64,14 @@ impl DiviCodec {
             magic,
             state: DecodeState::Header,
             bytes_consumed: 0,
+            buffered: 0,
+            last_arrival: None,
         }
+    }
+
+    /// When bytes last came from the peer, a whole message or part of one
+    pub fn last_arrival(&self) -> Option<std::time::Instant> {
+        self.last_arrival
     }
 
     /// Bytes consumed from the stream (headers, payloads and skipped garbage) since
@@ -93,6 +105,20 @@ impl Decoder for DiviCodec {
     /// checksum skips the message, and a payload that does not parse is
     /// reported as malformed
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        // FramedRead calls this after each read: more in the buffer than was
+        // left last time means bytes came
+        if src.len() > self.buffered {
+            self.last_arrival = Some(std::time::Instant::now());
+        }
+        let decoded = self.decode_frame(src);
+        self.buffered = src.len();
+        decoded
+    }
+}
+
+impl DiviCodec {
+    /// Take one message off the buffer, when it is all there
+    fn decode_frame(&mut self, src: &mut BytesMut) -> Result<Option<Decoded>, NetworkError> {
         loop {
             match &self.state {
                 DecodeState::Header => {
@@ -307,5 +333,32 @@ mod tests {
         codec.encode(NetworkMessage::Ping(42), &mut buf).unwrap();
         let expected = NetworkMessage::Ping(42).to_bytes(MAINNET_MAGIC).unwrap();
         assert_eq!(&buf[..], &expected[..]);
+    }
+
+    /// Part of a message is still bytes from the peer: Divi Core's receive
+    /// clock moves on every read (Node.cpp:160-164, :292), whole message or not
+    #[test]
+    fn part_of_a_message_counts_as_bytes_that_came() {
+        let mut codec = DiviCodec::new(MAINNET_MAGIC);
+        let whole = NetworkMessage::Ping(7).to_bytes(MAINNET_MAGIC).unwrap();
+        let mut buf = BytesMut::new();
+        assert!(codec.decode(&mut buf).unwrap().is_none());
+        assert!(codec.last_arrival().is_none(), "nothing came");
+
+        buf.extend_from_slice(&whole[..30]);
+        assert!(codec.decode(&mut buf).unwrap().is_none());
+        let first = codec.last_arrival().expect("half a ping came");
+
+        // asked again with nothing new: the time stays
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(codec.decode(&mut buf).unwrap().is_none());
+        assert_eq!(codec.last_arrival(), Some(first));
+
+        buf.extend_from_slice(&whole[30..]);
+        assert!(matches!(
+            message(codec.decode(&mut buf).unwrap()),
+            NetworkMessage::Ping(7)
+        ));
+        assert!(codec.last_arrival().unwrap() > first);
     }
 }
