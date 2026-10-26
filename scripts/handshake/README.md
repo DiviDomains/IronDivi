@@ -32,7 +32,7 @@ are stopped and their directories deleted. Needs bash and python3 (standard libr
 random for each run and kept in each node's 0600 `divi.conf`.
 
 Run with divid in both places (a directory whose `irondivid` is a link to `divid`), every row gives the same answer
-on both: each compares something divid itself does the same way each time. The 9 KNOWN rows then print FAIL
+on both: each compares something divid itself does the same way each time. The 3 KNOWN rows then print FAIL
 ("listed as KNOWN, but now the same as divid"), and nothing else does.
 
 ## Nodes and peers
@@ -85,9 +85,6 @@ Core paths are under `divi/src/` of the Divi Core source at v3.0.0.
 
 Each KNOWN row checks that the difference is exactly the one below; any other outcome is a FAIL.
 
-- `handshake: version: services`, `addr_from`, and the `filteradd before filterload` and `filterclear` rows:
-  irondivid offers no bloom filters, so it does not set NODE_BLOOM (4) and scores a filter message 100, as divid run
-  with `-peerbloomfilters=0` does (`net.cpp:1722`, `main.cpp:892-898`). By design.
 - `handshake: version: subver`: each names itself, divid `DIVI Core: 3.0.0.0` (`clientversion.cpp:82-86`),
   irondivid `/IronDivi:<version>/`. By design (divid's `ban outdated` reads it: KNOWN in `scripts/bans`).
 - `version with a 300-byte sub-version` and `version of 85 bytes`, `getpeerinfo`: divid sets the peer's version and
