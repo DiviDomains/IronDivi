@@ -57,10 +57,15 @@ Core paths are under `divi/src/` of the Divi Core source at v3.0.0 (commit 9e2f7
 
 **The refused send.** S pays a key of its own, then spends that coin in X, which every mempool holds. The twins
 import the key with a rescan. The rescan reads blocks only, so the coin looks unspent to them, and their send of it is
-committed to the wallet, then refused by their own mempool (MempoolConsensus.cpp:296-305).
+committed to the wallet, then refused by their own mempool (MempoolConsensus.cpp:296-305). X pays none of the twins'
+keys, so divid's prune would drop it, as it drops pair B's sweep, if its txid sorted below its funding's; X is built
+as a raw transaction whose txid is picked to sort above it, its funding paid again to a fresh key of S's while that
+txid starts with `f` (`WALLET_GAPS_4_X_BELOW=1` picks one below instead, and
+divid then also drops X: the balance 7 higher, one more unspent coin, one transaction fewer in memory).
 
 **The pruned transactions.** Two pairs, each a funding from S and a sweep of its coin from C 25 blocks back, the sweep
-built as a raw transaction whose txid is picked to sort above (A) or below (B) its funding's. divid's prune looks at the
+built as a raw transaction whose txid is picked to sort above (A) or below (B) its funding's. Both fundings are mined
+before either sweep is sent, and the one whose txid sorts lower goes to A. divid's prune looks at the
 transactions in txid order (below), so the two pairs cover both orders whatever the run's txids.
 
 ## KNOWN
