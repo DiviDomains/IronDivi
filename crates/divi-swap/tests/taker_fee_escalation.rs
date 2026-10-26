@@ -524,39 +524,59 @@ fn geth_floor(old: u64) -> u64 {
     (old * 110 / 100).max(old + 1)
 }
 
+/// `cap_feerate` at the mock's scale for the USDC rides to the locktime: ten times the
+/// fixed cap of a claim first priced at `MOCK_FEERATE` (50 x 10), and a fee (5000 x 100)
+/// that fits the mock's 1M unit leg, out of which the mock pays it.
+const USDC_MOCK_CAP: u64 = 5000;
+
 /// An EVM (USDC) claim stuck in the mempool is replaced by re-signing the same call at the
 /// same nonce with higher fees (the mock's same-nonce conflict is the HTLC outpoint): each
 /// version clears geth's price bump over the one it replaces, the feerate climbs only
-/// inside the window, and the fixed cap holds to the locktime (no post-leak ceiling: the fee
-/// is paid in ETH, the leg is USDC).
+/// inside the window, and the fixed cap holds to the cap point. There is no post-leak
+/// ceiling (the fee is paid in ETH, the leg is USDC): past the cap point the multiple no
+/// longer binds and the claim climbs on to `cap_feerate`, the last version on it.
 #[tokio::test]
 async fn usdc_claim_is_replaced_at_the_same_nonce_up_to_the_fixed_cap() {
     let w = world(Chain::Usdc, 12, FeeBump::SameNonce);
     let store = Store::in_memory().unwrap();
     let maker = maker(&w, &store);
-    let taker = taker(&w, &store);
+    let esc = FeeEscalation::builtin(Chain::Usdc)
+        .expect("USDC claims escalate")
+        .with_cap_feerate(USDC_MOCK_CAP);
+    let taker = taker(&w, &store).with_fee_escalation(Chain::Usdc, Some(esc));
     let (tid, view) = to_claimed(&w, &maker, &taker).await;
     let rec = store.get_taker_swap(&tid).unwrap().unwrap();
     assert_eq!(rec.claim_base_feerate, Some(MOCK_FEERATE));
     let at = view.maker_leg.as_ref().unwrap().outpoint.unwrap();
     let first = rec.maker_leg_claim.clone().unwrap();
 
-    let esc = FeeEscalation::builtin(Chain::Usdc).expect("USDC claims escalate");
     let cap = esc.cap(MOCK_FEERATE);
-    let seen = ride_to_locktime(&w, &store, &taker, &tid, &view, 300).await;
+    assert_eq!(cap, 500);
+    let seen = ride_to_locktime(&w, &store, &taker, &tid, &view, 60).await;
     let mut last = MOCK_FEERATE;
     for &(left, rate) in &seen {
         assert!(rate >= last, "never falls: {seen:?}");
-        assert!(
-            rate <= cap,
-            "the fixed cap {cap} holds to the end: {seen:?}"
-        );
+        assert!(rate <= USDC_MOCK_CAP, "never over cap_feerate: {seen:?}");
+        if left >= i64::from(esc.cap_secs_left) {
+            assert!(
+                rate <= cap,
+                "the fixed cap {cap} holds to the cap point: {seen:?}"
+            );
+        }
         if left >= i64::from(esc.start_secs_left) {
             assert_eq!(rate, MOCK_FEERATE, "no bump before the window: {seen:?}");
         }
         last = rate;
     }
-    assert_eq!(last, cap, "at the cap by the locktime: {seen:?}");
+    assert!(
+        seen.iter()
+            .any(|&(left, rate)| left < i64::from(esc.cap_secs_left) && rate > cap),
+        "past the fixed cap only after the cap point: {seen:?}"
+    );
+    assert_eq!(
+        last, USDC_MOCK_CAP,
+        "at cap_feerate by the locktime: {seen:?}"
+    );
 
     let rec = store.get_taker_swap(&tid).unwrap().unwrap();
     let claim = rec.maker_leg_claim.clone().unwrap();
@@ -795,6 +815,7 @@ async fn usdc_configured_price_bump_matches_the_node_and_is_never_refused() {
     let maker = maker(&w, &store);
     let esc = FeeEscalation::builtin(Chain::Usdc)
         .unwrap()
+        .with_cap_feerate(USDC_MOCK_CAP)
         .with_price_bump(30);
     let taker = taker(&w, &store).with_fee_escalation(Chain::Usdc, Some(esc));
     let (tid, view) = to_claimed(&w, &maker, &taker).await;
@@ -826,21 +847,23 @@ async fn usdc_configured_price_bump_matches_the_node_and_is_never_refused() {
     for pair in rates.windows(2) {
         assert!(pair[1] * 100 >= pair[0] * 130, "under 30%: {rates:?}");
     }
-    // Within the cap, and short of it only by less than one 30% bump (a last step the
-    // node would refuse is not sent).
-    let last = rec.claim_feerate.unwrap();
-    let cap = esc.cap(MOCK_FEERATE);
-    assert!(last <= cap && last * 130 / 100 > cap, "{rates:?}");
+    // On the cap at the end: where one more 30% bump would pass it, the step goes to the
+    // cap itself rather than stopping short of it.
+    assert_eq!(rec.claim_feerate, Some(USDC_MOCK_CAP), "{rates:?}");
 }
 
-/// No version of a USDC claim ever pays over the cap, whatever the node's price bump and
-/// whatever cap the chain is configured with, through every refusal and doubling to the
-/// locktime; and wherever the node's floor fits under the cap the claim it holds climbs.
+/// No version of a USDC claim ever pays over the cap (the fixed one to the cap point,
+/// `cap_feerate` after it), whatever the node's price bump and whatever cap the chain is
+/// configured with, through every refusal and doubling to the locktime; and wherever the
+/// node's floor fits under the cap the claim it holds climbs.
 #[tokio::test]
 async fn usdc_claim_never_goes_over_the_cap_for_any_node_price_bump() {
     let builtin = FeeEscalation::builtin(Chain::Usdc).unwrap();
-    for esc in [builtin, builtin.with_cap_feerate(40)] {
-        let cap = esc.cap(MOCK_FEERATE);
+    for esc in [
+        builtin.with_cap_feerate(USDC_MOCK_CAP),
+        builtin.with_cap_feerate(40),
+    ] {
+        let (fixed, cap) = (esc.cap(MOCK_FEERATE), esc.cap_feerate);
         for node_bump in [0u64, 10, 25, 30, 50, 100, 400] {
             let w = world(Chain::Usdc, 12, FeeBump::SameNonce);
             w.ml.set_price_bump(node_bump);
@@ -851,8 +874,11 @@ async fn usdc_claim_never_goes_over_the_cap_for_any_node_price_bump() {
             let at = view.maker_leg.as_ref().unwrap().outpoint.unwrap();
             let seen = ride_to_locktime(&w, &store, &taker, &tid, &view, 120).await;
             let ctx = format!("cap {cap}, node bump {node_bump}: {seen:?}");
-            for &(_, rate) in &seen {
+            for &(left, rate) in &seen {
                 assert!(rate <= cap, "{ctx}");
+                if left >= i64::from(esc.cap_secs_left) {
+                    assert!(rate <= fixed, "{ctx}");
+                }
             }
             let rec = store.get_taker_swap(&tid).unwrap().unwrap();
             for (_, rate) in &rec.claim_replaced {
@@ -959,4 +985,148 @@ async fn ltc_claim_replacing_its_child_keeps_climbing_after_a_crash_where_the_no
         taker.step(&tid, Some(&view)).await.unwrap(),
         TakerState::Done
     );
+}
+
+/// How a claim first priced at `base` fared once the preimage was out and the block floor
+/// rose to `floor`: the taker's final state, every feerate it paid in order (replaced
+/// versions, then the newest, as a package feerate under CPFP), the feerate of the version
+/// that confirmed, if any, and its CPFP children's own feerates.
+struct AfterTheLeak {
+    state: TakerState,
+    rates: Vec<u64>,
+    mined: Option<u64>,
+    /// Each CPFP child's own feerate, in spend order.
+    children: Vec<u64>,
+}
+
+/// The taker claims at `base`; from then on the maker-leg chain mines nothing under
+/// `floor`. A block every `block_secs` with a step and a maker tick each; once the locktime
+/// passes the hostile maker sends a refund paying far more than any claim may, so the
+/// taker keeps the leg only if a version confirms first.
+async fn ride_after_the_leak(
+    chain: Chain,
+    bump: FeeBump,
+    block_secs: u32,
+    esc: FeeEscalation,
+    base: u64,
+    floor: u64,
+) -> AfterTheLeak {
+    let w = world(chain, block_secs, bump);
+    w.ml.set_price_bump(10);
+    w.ml.set_fee_estimate(base);
+    w.ml.set_refund_feerate(9_000);
+    let store = Store::in_memory().unwrap();
+    let maker = maker(&w, &store);
+    let taker = taker(&w, &store).with_fee_escalation(chain, Some(esc));
+    let (tid, view) = to_claimed(&w, &maker, &taker).await;
+    let rec = store.get_taker_swap(&tid).unwrap().unwrap();
+    assert_eq!(rec.claim_base_feerate, Some(base));
+    w.ml.set_block_floor(floor);
+    let at = view.maker_leg.as_ref().unwrap().outpoint.unwrap();
+    let mid = view.id.clone();
+    for _ in 0..2000 {
+        let _ = taker.step(&tid, Some(&view)).await;
+        let _ = maker.tick().await;
+        let mrec = store.get_maker_swap(&mid).unwrap().unwrap();
+        if let (Some(htlc), Some(f)) = (mrec.maker_leg_htlc, mrec.maker_leg_funding) {
+            if w.ml.mtp() >= htlc.locktime {
+                if let Ok(tx) = w.mml.build_refund(&htlc, &f.outpoint, f.amount).await {
+                    let _ = w.mml.broadcast(&tx).await;
+                }
+            }
+        }
+        w.ml.mine(1);
+        w.divi.advance_time(block_secs);
+        w.divi.mine(1);
+        let rec = store.get_taker_swap(&tid).unwrap().unwrap();
+        if rec.state.is_terminal() || w.ml.mtp() > locktime(&view) + 3600 {
+            break;
+        }
+    }
+    let rec = store.get_taker_swap(&tid).unwrap().unwrap();
+    let mut rates: Vec<u64> = rec.claim_replaced.iter().map(|(_, f)| *f).collect();
+    rates.extend(rec.claim_feerate);
+    let mined =
+        w.ml.spender(&at)
+            .filter(|id| {
+                rec.maker_leg_claim.iter().any(|c| c.txid == *id)
+                    || rec.claim_replaced.iter().any(|(c, _)| c.txid == *id)
+            })
+            .and_then(|id| w.ml.feerate_of(&id));
+    let children = rec
+        .claim_children
+        .iter()
+        .filter_map(|c| w.ml.feerate_of(&c.txid))
+        .collect();
+    AfterTheLeak {
+        state: rec.state,
+        rates,
+        mined,
+        children,
+    }
+}
+
+/// The USDC schedule at the mock's scale: one mock unit stands for one gwei, so the
+/// builtin 500 gwei cap is 500 (the mock pays a claim's fee out of the 1M unit leg, where a
+/// wei-denominated fee would not fit). Every rule of the schedule is a ratio, so the shape
+/// is the builtin's.
+fn usdc_in_gwei() -> FeeEscalation {
+    let esc = FeeEscalation::builtin(Chain::Usdc).unwrap();
+    assert_eq!(esc.cap_feerate, 500_000_000_000);
+    esc.with_cap_feerate(500)
+}
+
+/// A USDC claim first priced at 2 gwei: the fixed cap `min(500, 50 x 2)` is 100 gwei. Once
+/// the preimage is out the block floor rises to 300 gwei (geth's 10% price bump). A claim
+/// held to 100 gwei never confirms and the hostile refund takes the leg; past the cap point
+/// the multiple no longer binds, the claim climbs to `cap_feerate` (500) and confirms.
+#[tokio::test]
+async fn usdc_claim_after_the_leak_outbids_a_floor_above_the_fifty_x_cap() {
+    let esc = usdc_in_gwei();
+    assert_eq!(esc.cap(2), 100);
+    let o = ride_after_the_leak(Chain::Usdc, FeeBump::SameNonce, 12, esc, 2, 300).await;
+    let ctx = format!("{:?} rates {:?} mined {:?}", o.state, o.rates, o.mined);
+    assert_eq!(o.state, TakerState::Done, "{ctx}");
+    let last = *o.rates.last().unwrap();
+    assert!((300..=500).contains(&last), "{ctx}");
+    assert!(o.mined.is_some_and(|m| m >= 300), "{ctx}");
+    assert!(
+        o.rates.iter().all(|&r| r <= 500),
+        "never over cap_feerate: {ctx}"
+    );
+    for pair in o.rates.windows(2) {
+        assert!(pair[1] >= geth_floor(pair[0]), "under geth's bump: {ctx}");
+    }
+}
+
+/// The same leak on BTC (RBF) and LTC (CPFP), first priced at 2/vB with the floor at 300/vB:
+/// their post-leak ceiling (a share of the leg) governs past the cap point, as before this
+/// lane. Pinned to the feerates paid, so a change to the USDC cap cannot move them.
+#[tokio::test]
+async fn btc_and_ltc_claims_after_the_leak_still_climb_to_their_ceiling() {
+    for (chain, bump, secs, want) in [
+        (
+            Chain::Btc,
+            FeeBump::Rbf,
+            600,
+            (vec![2u64, 4, 5, 8, 12, 18, 28, 42, 65, 100, 437], vec![]),
+        ),
+        (
+            Chain::Ltc,
+            FeeBump::Cpfp,
+            150,
+            (vec![319u64], vec![6, 16, 48, 138, 390, 667, 1285]),
+        ),
+    ] {
+        let esc = FeeEscalation::builtin(chain).unwrap();
+        assert_eq!(esc.cap(2), 100);
+        let o = ride_after_the_leak(chain, bump, secs, esc, 2, 300).await;
+        let ctx = format!(
+            "{chain}: {:?} rates {:?} mined {:?} children {:?}",
+            o.state, o.rates, o.mined, o.children
+        );
+        assert_eq!(o.state, TakerState::Done, "{ctx}");
+        assert!(o.rates.last().is_some_and(|&r| r >= 300), "{ctx}");
+        assert_eq!((o.rates, o.children), want, "{ctx}");
+    }
 }

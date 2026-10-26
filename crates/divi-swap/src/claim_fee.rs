@@ -272,13 +272,20 @@ impl ClaimCtx<'_> {
         {
             let left = i64::from(self.htlc.locktime) - i64::from(b.median_time_past().await?);
             let estimate = b.claim_feerate().await?.unwrap_or(0);
-            let (target, cap) = match self.ceiling(left, 0) {
-                Some(ceiling) => (esc.target_after_leak(base, left, ceiling), ceiling),
-                None => (esc.target(base, left), esc.cap(base)),
+            let (target, cap, fixed) = match self.ceiling(left, 0) {
+                Some(ceiling) => (
+                    esc.target_after_leak(base, left, ceiling),
+                    ceiling,
+                    esc.cap(base),
+                ),
+                None => {
+                    let cap = esc.cap_after_leak(base, left);
+                    (esc.same_nonce_target(base, left), cap, cap)
+                }
             };
             // Refused at the fixed cap or above: the mempool wants more than the cap, so
             // step up by a bump's worth rather than one unit per vbyte.
-            let step = if current >= esc.cap(base) {
+            let step = if current >= fixed {
                 (current / 4).max(1)
             } else {
                 1
@@ -365,11 +372,16 @@ impl ClaimCtx<'_> {
         if kind == FeeBump::Cpfp {
             return self.bump_child(r, claim, &esc, base, current, left).await;
         }
-        let target = match self.ceiling(left, 0) {
-            Some(c) => esc.target_after_leak(base, left, c),
-            None => esc.target(base, left),
+        // With no post-leak ceiling (EVM: the fee is not paid out of the leg), the fixed cap
+        // gives way to `cap_feerate` past the cap point.
+        let (target, cap) = match self.ceiling(left, 0) {
+            Some(c) => (esc.target_after_leak(base, left, c), esc.cap(base)),
+            None => (
+                esc.same_nonce_target(base, left),
+                esc.cap_after_leak(base, left),
+            ),
         };
-        if !esc.should_bump(base, current, target) {
+        if !FeeEscalation::should_bump_within(current, target, cap) {
             return Ok(());
         }
         // Refused as underpriced at least twice since the node last took a version: it holds
@@ -377,7 +389,10 @@ impl ClaimCtx<'_> {
         // refusal, within the cap.
         let target = match kind {
             FeeBump::SameNonce if underpriced >= 2 => {
-                let raised = esc.underpriced_target(base, current, target, underpriced);
+                let raised = esc.reach_cap(
+                    esc.underpriced_target_within(current, target, underpriced, cap),
+                    cap,
+                );
                 tracing::warn!(
                     swap = %r.swap_id(),
                     chain = %self.chain,
@@ -386,7 +401,7 @@ impl ClaimCtx<'_> {
                     old_feerate = current,
                     step_feerate = target,
                     new_feerate = raised,
-                    cap = esc.cap(base),
+                    cap,
                     "claim replacements refused as underpriced; doubling the step"
                 );
                 raised

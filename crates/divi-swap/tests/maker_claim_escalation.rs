@@ -63,20 +63,42 @@ struct Outcome {
 /// One swap with the taker paying `chain` (the maker claims on `chain`), revealed at the
 /// taker's claim deadline, the taker-leg chain mining nothing under `floor` from then on.
 async fn race(chain: Chain, escalation: bool) -> Outcome {
-    let divi = MockChain::new(Chain::Divi, T0, 60);
-    let tl = MockChain::new(chain, T0, block_secs(chain));
-    tl.set_fee_bump(bump(chain));
     let esc = FeeEscalation::builtin(chain).unwrap();
     let floor = (MOCK_FEERATE * 10).min(esc.cap(MOCK_FEERATE) / 2);
     assert!(floor > MOCK_FEERATE && floor < esc.cap(MOCK_FEERATE));
-    tl.set_refund_feerate(esc.cap(MOCK_FEERATE) * 4);
+    let refund_feerate = esc.cap(MOCK_FEERATE) * 4;
+    race_with(
+        chain,
+        escalation.then_some(esc),
+        MOCK_FEERATE,
+        floor,
+        refund_feerate,
+    )
+    .await
+}
+
+/// [`race`] with the maker's schedule `esc` (`None`: off), its first claim priced at
+/// `base`, the block floor `floor` from the reveal on and the hostile refund paying
+/// `refund_feerate`.
+async fn race_with(
+    chain: Chain,
+    esc: Option<FeeEscalation>,
+    base: u64,
+    floor: u64,
+    refund_feerate: u64,
+) -> Outcome {
+    let divi = MockChain::new(Chain::Divi, T0, 60);
+    let tl = MockChain::new(chain, T0, block_secs(chain));
+    tl.set_fee_bump(bump(chain));
+    tl.set_fee_estimate(base);
+    tl.set_refund_feerate(refund_feerate);
     let (mdivi, mtl): (MockBackend, MockBackend) =
         (divi.backend(1, Amount(FUNDS)), tl.backend(2, Amount(FUNDS)));
     let (tdivi, ttl) = (divi.backend(3, Amount(FUNDS)), tl.backend(4, Amount(FUNDS)));
     let hostile = ttl.clone();
     let maker_pk = mtl.pubkey();
     let store = Store::in_memory().unwrap();
-    let mut maker = Maker::new(
+    let maker = Maker::new(
         SwapConfig::profile(Profile::Testnet),
         Arc::new(mdivi),
         Arc::new(mtl),
@@ -90,10 +112,8 @@ async fn race(chain: Chain, escalation: bool) -> Outcome {
             max_btc_sats: 5_000_000,
         }],
     )
-    .unwrap();
-    if !escalation {
-        maker = maker.with_fee_escalation(chain, None);
-    }
+    .unwrap()
+    .with_fee_escalation(chain, esc);
     let taker = Taker::new(Arc::new(tdivi), Arc::new(ttl), store.clone());
 
     let q = maker.quote("o", SATS).await.unwrap();
@@ -222,6 +242,31 @@ async fn a_stuck_ltc_maker_claim_is_bumped_by_cpfp_and_beats_the_taker_refund() 
 #[tokio::test]
 async fn a_stuck_usdc_maker_claim_is_replaced_at_its_nonce_and_beats_the_taker_refund() {
     wins_with_escalation(Chain::Usdc).await;
+}
+
+/// The maker twin of `taker_fee_escalation::usdc_claim_after_the_leak_outbids_a_floor_above_the_fifty_x_cap`:
+/// the maker's USDC claim of the taker leg, first priced at 2 gwei (mock units as gwei,
+/// `cap_feerate` 500), meets a 300 gwei floor from the reveal on. Past the cap point the
+/// 50x cap (100 gwei) no longer binds; the claim climbs to `cap_feerate` and beats the
+/// hostile taker's refund.
+#[tokio::test]
+async fn a_usdc_maker_claim_after_the_leak_outbids_a_floor_above_the_fifty_x_cap() {
+    let esc = FeeEscalation::builtin(Chain::Usdc)
+        .unwrap()
+        .with_cap_feerate(500);
+    assert_eq!(esc.cap(2), 100);
+    let o = race_with(Chain::Usdc, Some(esc), 2, 300, 9000).await;
+    let f = &o.fees;
+    let ctx = format!("{:?} {f:?} {:?}", o.maker, o.record.last_error);
+    assert!(!o.refunded, "the taker refunded the taker leg: {ctx}");
+    assert!(o.maker_gained, "the maker's claim never paid out: {ctx}");
+    assert_eq!(o.maker, SwapState::Done, "{ctx}");
+    assert_eq!(f.claim_base_feerate, Some(2), "{ctx}");
+    assert!(
+        f.claim_feerate.is_some_and(|r| (300..=500).contains(&r)),
+        "{ctx}"
+    );
+    assert!(f.claim_replaced.iter().all(|(_, r)| *r <= 500), "{ctx}");
 }
 
 #[tokio::test]

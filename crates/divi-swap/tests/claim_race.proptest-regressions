@@ -10,3 +10,6 @@
 cc 97a46c089086481e828472017cdb7a8f278b67df285a11b80cd22073ea90aaee # recorded as Btc, estimate 1, delay 0, floors [(1020, 0)], refund 1000; replays as Market { chain: Btc, estimate: 55, delay_secs: 6675, floors: [(190, 191), (1141, 964)], refund_feerate: 2066 }
 cc 701c1fe3623381b586bec0f4f389f72b4d130e86ece7d6e46c68a8fec7a5f999 # recorded as Ltc, estimate 10, delay 294, floors [(1472, 0)], refund 1000; replays as Market { chain: Ltc, estimate: 20, delay_secs: 789, floors: 32 entries from (1558, 1304) to (1672, 50), refund_feerate: 17303 }
 cc 6d92e0593dfa06cfe58ebe3416e16a92f5536f77e52a9c7643db0f27ee343844 # recorded as Btc, estimate 19, delay 6601, floors [(1128, 0)], refund 1000; replays as Market { chain: Ltc, estimate: 6, delay_secs: 5889, floors: [(1110, 1455), (1430, 845)], refund_feerate: 19076 }
+cc 76744d0460f7a65b7c09dc819928b3ca0bdc8a08ae125079305bf1f96a9491b2 # shrinks to m = Market { chain: Usdc, estimate: 1, delay_secs: 0, floors: [(102, 0)], refund_feerate: 2000 }
+cc e84f3c00763ee519564533c9247456f00f0e2cedeef48681a5ebe211284418cd # shrinks to m = Market { chain: Usdc, estimate: 15, delay_secs: 13, floors: [(914, 0)], refund_feerate: 2000 }
+cc 10a6284207d95563e863bfcc1bd45d82d12feab1e127ec25c4e8ac4ec4f63b7d # shrinks to m = Market { chain: Usdc, estimate: 1, delay_secs: 2545, floors: [(740, 188)], refund_feerate: 2000 }
