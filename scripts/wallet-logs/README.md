@@ -46,6 +46,7 @@ waits until the log stops growing, then reads what the step wrote.
 | `nFileVersion = <n>`, `Keys: <n> plaintext, <n> encrypted, <n> w/ metadata, <n> total`, `Some keys lack metadata. Wallet may require a rescan` | LoadWallet at each start (walletdb.cpp:529-537) | the lines |
 | `CommitTransaction:` and the transaction | CTransaction::ToString of the send (wallet.cpp:1866; primitives/transaction.cpp:51-63, :115-118, :261-280; OutPoint.cpp:29-32) | the header (the hash checked against the send's txid; version, sizes, lock time), each input (whether it spends the funding coin, checked by hash and index rather than compared, since S puts the coin at a random index; the length of the cut scriptSig, a sequence if any), each output (value, and the scriptPubKey as written for the payee, `<own>` for the wallet's change) |
 | `<txid's first 10 digits>: Relaying wtx SendMoney` | after the mempool takes a send, SendMoney's format with its arguments the other way round (rpcwallet.cpp:785-788) | that the line is there, for the send's txid |
+| the order of a send's lines | the change key reserved as the change output is made, returned at once when the send needs no change, and kept after CommitTransaction's dump (wallet.cpp:1786, :1813-1816, :1866-1868) | the order of its `keypool reserve`, `keep` and `return` lines, the dump and the relay line |
 
 ## Steps
 
@@ -54,7 +55,7 @@ waits until the log stops growing, then reads what the step wrote.
 2. `getnewaddress` twice, `getrawchangeaddress`, `getaccountaddress acct` twice (the second gives the same address).
 3. Two coins from S, then sends from each with the other locked: `sendtoaddress <payee> 1` (with change) and
    `sendtoaddress <payee> 1 "sweep_funds"` (no change: the change key is reserved and returned): keypool lines, the
-   dump, the relay line.
+   dump, the relay line, and the order of the lines.
 4. `keypoolrefill 1003`, then `keypoolsize`.
 5. A restart: keypool lines and LoadWallet's lines.
 6. `encryptwallet` (an HD wallet's keypool stays), `keypoolsize`; locked `getnewaddress` and `getrawchangeaddress`
@@ -66,13 +67,13 @@ None.
 
 ## Results on hp1 (divid 3.0.0)
 
-Each run is 33 rows.
+Each run is 35 rows.
 
 | irondivid | PASS | KNOWN | FAIL |
 |---|---|---|---|
-| before the fixes | 10 | 0 | 23 |
-| with the fixes, run 1 | 33 | 0 | 0 |
-| with the fixes, run 2 | 33 | 0 | 0 |
+| before the keep-order fix (base-d1f3fd1) | 34 | 0 | 1 |
+| with it, run 1 | 35 | 0 | 0 |
+| with it, run 2 | 35 | 0 | 0 |
 
-Before the fixes, irondivid wrote none of these lines. The 10 rows that passed are the steps where divid writes no
-keypool line, the first start (which has no "lack metadata" line), `keypoolsize` and the replies to the sends.
+Before the fix, irondivid logged the change key's `keypool keep` before CommitTransaction's dump: the row for the send
+with change read `reserve, keep, dump, relay` where divid's reads `reserve, dump, keep, relay`.
