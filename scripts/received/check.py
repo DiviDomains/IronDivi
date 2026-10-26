@@ -47,15 +47,11 @@ KNOWN = {
         "irondivid adds label, the account's newer name (as in scripts/wallet-replies)",
     "getstakingstatus: fields divid lacks":
         "irondivid adds \"staking status text\", the staker's state in words",
-    **{f"getaccountaddress {label}":
-       "divid's last address of an account is the last one ever given its name, also after setaccount moved it to "
-       "another account (AddressBookManager, rpcwallet.cpp:339-341): here the 1-of-[K3] address, now in \"msig\"; "
-       "irondivid gives the account's last address that still has its name"
-       for label in ('"" (the default account)', '"" again')},
-    "getaccountaddress \"fresh\" (locked, divid's greatest fresh address the paid one)":
-        "divid reloads its wallet after encryptwallet (\"Wallet reloaded!\"), and a wallet read back takes an "
-        "account's greatest address as its last (the address records in key order): here the paid fresh#1, so "
-        "divid hands out a new one; irondivid keeps running its wallet, whose last is still fresh#3",
+    "getaccountaddress \"fresh\" (locked, the nodes' greatest fresh addresses differ)":
+        "chance, not a difference: both read their wallets back after encryptwallet, and a wallet read back takes "
+        "an account's greatest address as its last (divid reloads, \"Wallet reloaded!\"; the address records in "
+        "key order). The nodes' keys are random, so on one the greatest is the paid fresh#1 and a new address is "
+        "handed out, on the other the unpaid fresh#3",
     "getaccount <the \"Zürich ✓\" address>: the text as written":
         "divid writes each byte of non-ASCII text as its own \\u00XX escape (json_spirit), which divi-cli reads back "
         "as bytes; irondivid writes the text as UTF-8. Every other row reads divid's text as divi-cli does",
@@ -841,11 +837,17 @@ send_both("sendfrom \"\" X 1 (locked)", "sendfrom", "", X, 1)
 send_both("sendfrom \"\" notanaddress 1 (locked)", "sendfrom", "", "notanaddress", 1)
 send_both("sendfrom \"\" X 0 (locked)", "sendfrom", "", X, 0)
 # divid reloads its wallet on encryptwallet, and a wallet read back takes an
-# account's greatest address as its last: when that is the paid fresh#1, divid
-# hands out a new address (KNOWN); when it is fresh#3, the same as irondivid
-by_name = {v: k for k, v in names[0].items()}
-reloaded_paid = max(by_name["fresh#1"], by_name["fresh#3"]) == by_name["fresh#1"]
-account_address("\"fresh\" (locked" + (", divid's greatest fresh address the paid one)" if reloaded_paid else ")"),
+# account's greatest address as its last (irondivid does the same): when that
+# is the paid fresh#1 a new address is handed out, when it is fresh#3 fresh#3.
+# Which is greatest depends on each node's keys, so the row is compared when
+# the two nodes' greatest are the same one of the three
+def greatest_is_paid(side):
+    by_name = {v: k for k, v in names[side].items()}
+    return max(by_name["fresh#1"], by_name["fresh#3"]) == by_name["fresh#1"]
+
+
+paid = (greatest_is_paid(0), greatest_is_paid(1))
+account_address("\"fresh\" (locked" + (")" if paid[0] == paid[1] else ", the nodes' greatest fresh addresses differ)"),
                 "fresh", "fresh#5")
 account_address("\"new while locked\" (locked)", "new while locked", "locked#1")
 both("addmultisigaddress 1 [K1] (locked)", "addmultisigaddress", 1, [K1])

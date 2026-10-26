@@ -91,5 +91,4 @@ The 1000-entry message is sent last, so its addresses do not take the places of 
 
 | row | divid | irondivid | reason |
 |---|---|---|---|
-| `addr port 0: kept` | kept | not kept | divid checks only the IP (`CNetAddr::IsRoutable`, `netbase.cpp:875-878`; `addrman.cpp:249-250`), though nothing can connect to port 0; irondivid relays such an address as divid does (`main.cpp:545-548`) but leaves it out of its book |
 | `no -externalip: addr of 10 public IPv4 addresses, kept` | 0 | 10 | divid counts IPv4 and IPv6 as reachable only once it knows a routable local address of its own (`vfReachable` starts false and only `AddLocal` sets it, `NetworkLocalAddressHelpers.cpp:18`, `:73-79`, `:163-167`) and keeps no gossiped address of a network it cannot reach (`main.cpp:544-551`): a node with `-discover=0` and no `-externalip`, or behind NAT with only private interface addresses, never keeps one. irondivid keeps them |

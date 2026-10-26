@@ -52,6 +52,9 @@ class StagePoller:
             self._stop.wait(self.interval)
 
     def start(self):
+        # One sample of every node before the caller's next step, so a stage
+        # the step ends (a reset) is seen on each node, not only on the first
+        self._sample()
         self._thread.start()
         return self
 

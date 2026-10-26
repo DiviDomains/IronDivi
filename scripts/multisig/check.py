@@ -43,11 +43,6 @@ KNOWN = {
     "decodescript: fields divid lacks": (
         "hex, the script given (divid: rpcrawtransaction.cpp:556-563 calls ScriptPubKeyToJSON without it; the "
         "same KNOWN as scripts/raw-replies and chain-replies)", lambda c, i: i == {"hex"} and not c),
-    "importaddress of the redeemScript hex (w0)": (
-        "irondivid watches P2PKH and P2SH scripts only (its watch list is keyed by address); divid watches any "
-        "script (rpcdump.cpp:122-148), but a watched script never brings a transaction into its wallet "
-        "(wallet.cpp:1299-1309 adds only what credits or debits a spendable output), so the reply is the "
-        "only difference", lambda c, i: c == ("ok", None) and i[0] == "err" and i[1] == -4),
 }
 
 # Fields irondivid adds on purpose: compared without them, and named in one row each

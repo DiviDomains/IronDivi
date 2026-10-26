@@ -72,7 +72,7 @@ a live node, a replay, or a datadir anyone else uses.
 | `block-bad` at height 1 with `-checkblocks=0` | refused |
 | `block-bad` at height 0 (genesis) with `-checkblocks=0` | starts: a block with no parent is never checked (`:83`) |
 | `-checklevel=` 4, 3, 0 | refused: `Error: Unsupported argument -checklevel found. Checklevel must be level 4.` (`init.cpp:783-784`; see KNOWN for the exit code) |
-| `-par=` 0, 1, -1, 17 | starts, and a block mined then connects; the log (see KNOWN) |
+| `-par=` 0, 1, -1, 17 | starts, and a block mined then connects; the log has `Using <n> threads for script verification` with divid's count (`init.cpp:965`, `TransactionInputChecker.cpp:16-26`) |
 | `-resync`, with the original divid as the only peer | starts; every chain folder is cleared (divid: blocks, chainstate, sporks; irondivid: chainstate, txindex) and every other folder kept; both sync back to the tip; the wallet and `divi.conf` are kept; the deletion is logged (`-resync: folder deleted: <path>`) |
 
 ## KNOWN
@@ -81,4 +81,3 @@ a live node, a replay, or a datadir anyone else uses.
 |---|---|---|---|
 | the log's `No coin database inconsistencies` | `Verifying last 100 blocks at level 4`, then `No coin database inconsistencies in last …` | the same `Verifying` line, then `Verified the last N blocks in M ms` | irondivid's check covers divid's levels 0 to 3. It reads each block, checks its hash, merkle root and parent link, decodes its undo data, and undoes the tip blocks in memory against the coins (`crates/divi-storage/src/chain.rs` `verify_recent_blocks`, `verify_utxo_set_at_tip`). It does not run level 4, connecting those blocks again (`verifyDb.cpp:122-157`) |
 | `-checklevel=` 4, 3, 0 | the error, then exit -6 | the same error, exit 1 | divid aborts (SIGABRT) in the shutdown after this early InitError, before the chain state exists (`init.cpp:381`, `ChainstateManager.cpp:102`); also KNOWN in `scripts/restart-options` |
-| `-par=…: the log` | `Using <n> threads for script verification` (`init.cpp:965`) | `Option -par is not supported by irondivid; ignored` | `-par` sets divid's script check threads (`init.cpp:801`, `TransactionInputChecker.cpp:16-26`). irondivid checks scripts on the block's own thread. What is accepted is the same: the row before it checks a block still connects |

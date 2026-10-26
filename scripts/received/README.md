@@ -102,16 +102,11 @@ Core paths are under `divi/src/` of the Divi Core source at v3.0.0 (commit 9e2f7
 
 - **`listreceivedbyaddress: fields divid lacks`:** irondivid adds `label` (as in `scripts/wallet-replies`).
 - **`getstakingstatus: fields divid lacks`:** irondivid adds `staking status text`, the staker's state in words.
-- **`getaccountaddress ""`** (both rows):
-  - divid's last address of an account is the last one ever given that name, even after `setaccount` or
-    `addmultisigaddress` moved it to another account (`AddressBookManager`, `rpcwallet.cpp:339-341`).
-  - Here divid answers the 1-of-[K3] multisig address, which is now in `msig`.
-  - irondivid answers the account's last address that still has the name.
-- **`getaccountaddress "fresh" (locked, divid's greatest fresh address the paid one)`:** divid reloads its wallet
-  after `encryptwallet` ("Wallet reloaded!"). A wallet read back takes an account's greatest address as its last (the
-  address records come in key order). When that is the paid fresh#1 (about half the runs, the keys being random),
-  divid hands out a new address; irondivid keeps running its wallet, whose last address is still the unpaid fresh#3.
-  In the other runs the row is `getaccountaddress "fresh" (locked)` and both answer fresh#3. (After a restart irondivid does as divid, `crates/divi-wallet/tests/account_order_tests.rs`.)
+- **`getaccountaddress "fresh" (locked, the nodes' greatest fresh addresses differ)`:** chance, not a difference.
+  Both nodes read their wallets back after `encryptwallet` (divid: "Wallet reloaded!"), and a wallet read back takes
+  an account's greatest address as its last (the address records come in key order). The keys are random, so when
+  one node's greatest is the paid fresh#1 (a new address is handed out) and the other's the unpaid fresh#3, the row
+  has this name; when both are the same one, the row is `getaccountaddress "fresh" (locked)` and is compared.
 - **`getaccount <the "Zürich ✓" address>: the text as written`:** divid writes each byte of non-ASCII text as its own
   `\u00XX` escape (json_spirit), which divi-cli reads back as bytes. irondivid writes the text as UTF-8. Every other
   row reads divid's text as divi-cli does.

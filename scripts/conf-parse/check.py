@@ -35,10 +35,6 @@ RUNNING = 6
 # (reason, shape). Each is listed in README.md with divid's source line. shape
 # takes the two raw outcomes and is true only for the difference described, so
 # a KNOWN row that matches divid, or differs in another way, is a FAIL.
-def core_reads_a_directory(c, i):
-    return c[0] == "running" and i[0] == "exit" and "Error reading configuration file" in i[2]
-
-
 def core_aborts(c, i):
     return c[0] == i[0] == "exit" and c[1] == -6 and i[1] == 1 and c[2] == i[2]
 
@@ -49,10 +45,6 @@ ABORT = ("same message; divid then aborts (SIGABRT) in the shutdown after this e
 KNOWN = {
     "a quoted value: start": ABORT,
     "a quoted value in a file that is also valid TOML: start": ABORT,
-    "-conf=<a directory>: start": (
-        "divid opens the directory as a stream, which reports no error, reads no line and runs without a "
-        "config file (divi/src/Settings.cpp:186-205: only a stream that is not good() is taken as missing); "
-        "irondivid says it cannot read the file and stops", core_reads_a_directory),
 }
 
 fails = 0

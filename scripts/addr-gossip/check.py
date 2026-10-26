@@ -54,16 +54,12 @@ def pair(core, iron):
     return lambda c, i: c == core and i == iron
 
 
-PORT_0 = ("divid keeps an address with port 0, as it checks only the IP (CNetAddr::IsRoutable, "
-          "netbase.cpp:875-878; addrman.cpp:249-250), though nothing can connect to it; irondivid relays it as divid "
-          "does but leaves it out of its book (crates/divi-network/src/addrbook.rs)")
 NO_LOCAL = ("divid counts IPv4 and IPv6 as reachable only once it knows a routable local address of its own "
             "(vfReachable starts false and only AddLocal sets it, NetworkLocalAddressHelpers.cpp:18, :73-79, "
             ":163-167), and keeps no gossiped address of an unreachable network (main.cpp:544-551): a node with "
             "-discover=0 and no -externalip, or behind NAT with only private interface addresses, never keeps one. "
             "irondivid keeps them (crates/divi-node/src/node.rs, the addr handler)")
 KNOWN = {
-    "addr port 0: kept": (PORT_0, pair(("ok", ["kept"]), ("ok", ["not kept"]))),
     "no -externalip: addr of 10 public IPv4 addresses, kept": (
         NO_LOCAL, lambda c, i: c == ("ok", 0) and i[0] == "ok" and i[1] >= 9),
 }
@@ -640,8 +636,7 @@ def kept(book, addrs, src):
     for ip, port in addrs:
         if (ip, port) in book["addrs"]:
             out.append("kept")
-        elif ip not in ips and not (book is books["i"] and port == 0) and collided(book, ip, port, src):
-            # (irondivid keeps no port 0 address, collision or not)
+        elif ip not in ips and collided(book, ip, port, src):
             out.append("collision")
         else:
             out.append("not kept")

@@ -390,7 +390,7 @@ if not C.wait_ready():
     print(f"FAIL   start: divid did not answer within {START_TIMEOUT} s", flush=True)
     sys.exit(1)
 phrase = C.rpc("dumphdinfo")["mnemonic"]
-I = Node("irondivid", IRONDIVID, 1, ["listen=0", f"connect=127.0.0.1:{PORT_BASE}"],
+I = Node("irondivid", IRONDIVID, 1, ["listen=0", f"connect=127.0.0.1:{PORT_BASE}", "acceptnonstandard=1"],
          env={"WALLET_MNEMONIC": phrase})
 del phrase
 if not I.wait_ready():
