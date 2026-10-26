@@ -1627,12 +1627,16 @@ impl Node {
                             // Spork messages - required for Divi protocol
                             NetworkMessage::SporkCount(count) => {
                                 spork_manager.handle_sporkcount(peer_id, count).await;
+                                block_sync.ask_peers_to_sync().await;
+                                peer_manager.release_held(peer_id);
                             }
                             NetworkMessage::GetSporks => {
                                 spork_manager.handle_getsporks(peer_id).await;
                             }
                             NetworkMessage::Spork(spork) => {
                                 spork_manager.handle_spork(peer_id, spork).await;
+                                block_sync.ask_peers_to_sync().await;
+                                peer_manager.release_held(peer_id);
                             }
                             // Masternode sync messages
                             // A peer's count for what the masternode sync asked

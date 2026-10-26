@@ -135,8 +135,10 @@ async fn inbound_peer_naming_a_lower_height_is_asked_for_blocks() {
     );
 }
 
-/// A fresh -connect node asks the peer it dials for blocks at once, though
-/// the peer names height 0 and announces no new block
+/// A fresh -connect node asks the peer it dials for blocks once the peer's
+/// sporks are in (Divi Core sends a peer it dialled nothing from its send loop
+/// before, Node.cpp:1025-1034), though the peer names height 0 and announces
+/// no new block
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn connect_node_asks_its_peer_for_blocks_without_a_new_block() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -160,6 +162,13 @@ async fn connect_node_asks_its_peer_for_blocks_without_a_new_block() {
     )
     .await;
     seed.send("verack", &[]).await;
+    assert!(
+        seed.expect("getblocks", std::time::Duration::from_secs(2))
+            .await
+            .is_none(),
+        "no getblocks before the peer's sporks"
+    );
+    seed.send("sporkcount", &0i32.to_le_bytes()).await;
     assert!(
         seed.expect("getblocks", WAIT).await.is_some(),
         "getblocks to the -connect peer"
