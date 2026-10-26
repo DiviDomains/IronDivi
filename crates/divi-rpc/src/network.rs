@@ -1100,11 +1100,17 @@ mod tests {
 
     /// A peer's members as Divi Core pushes them (rpcnet.cpp:116-148);
     /// pingwait comes only while a ping is unanswered
+    /// getpeerinfo's members in Divi Core's order (rpcnet.cpp), `pingwait` included
+    /// right after `pingtime`. The client pings once the server's spork count is in
+    /// (`handle_sporks`); the server takes none of the client's messages, so its pong
+    /// waits behind them and the client's ping stays outstanding: `pingwait` shows
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_peer_info_members_are_in_cores_order() {
         use std::time::Duration;
         let (server, listen) = listening_server().await;
+        let _untaken = server.subscribe();
         let client = PeerManager::new(quiet_config());
+        handle_sporks(&client);
         let mut connected = false;
         for _ in 0..50 {
             if Arc::clone(&client).connect_to_peer(listen).await.is_ok() {
@@ -1115,20 +1121,24 @@ mod tests {
         }
         assert!(connected, "client could not reach the local listener");
         let rpc = NetworkRpc::with_peer_manager(Arc::clone(&client));
-        let mut peers = serde_json::json!([]);
+        let mut peer = serde_json::Value::Null;
         for _ in 0..50 {
-            peers = rpc.get_peer_info(&Params::None).unwrap();
-            if peers.as_array().is_some_and(|a| !a.is_empty()) {
+            let peers = rpc.get_peer_info(&Params::None).unwrap();
+            if peers[0].get("pingwait").is_some() {
+                peer = peers[0].clone();
                 break;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        let keys: Vec<&str> = peers[0]
+        assert!(
+            peer.get("pingwait").is_some(),
+            "no ping outstanding after 5 s"
+        );
+        let keys: Vec<&str> = peer
             .as_object()
             .unwrap()
             .keys()
             .map(String::as_str)
-            .filter(|k| *k != "pingwait")
             .collect();
         assert_eq!(
             keys,
@@ -1142,6 +1152,7 @@ mod tests {
                 "bytesrecv",
                 "conntime",
                 "pingtime",
+                "pingwait",
                 "version",
                 "subver",
                 "inbound",
@@ -1153,14 +1164,6 @@ mod tests {
                 "whitelisted"
             ]
         );
-        if let Some(n) = peers[0]
-            .as_object()
-            .unwrap()
-            .keys()
-            .position(|k| k == "pingwait")
-        {
-            assert_eq!(n, 9, "pingwait after pingtime: {}", peers[0]);
-        }
         client.disconnect_all();
         server.disconnect_all();
     }
