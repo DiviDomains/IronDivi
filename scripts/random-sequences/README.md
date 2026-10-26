@@ -45,6 +45,7 @@ SEED=7 scripts/random-sequences/run.sh target/release ~/divi-3.0.0/bin 53850 /va
 | `RANDOM_SEQUENCES_TIMEOUT` | seconds before the run is stopped (1500) |
 | `RANDOM_SEQUENCES_LOGS` | a folder to copy the four logs to, for each episode and on a FAIL |
 | `RANDOM_SEQUENCES_DEBUG` | `1`: irondivid logs at debug level and divid with `debug=mempool` |
+| `RANDOM_SEQUENCES_PROFILE` | `stake`: steps that reach stake blocks. The first blocks go to height 95 (work blocks end at 100); `mine` weighs 30 and a new step, `addvault`, 6 (node n takes on a vault the other node funded, once it is in a block); `fundvault` funds 100 to 1100; kills, restarts and invalidates are rare; all four nodes run with `vault=1`, which `addvault` needs (`CWallet::AddVault`, `wallet.cpp:693-705`) and which shuffles the stake set. Unset, the steps of every seed are as before |
 | `RANDOM_SEQUENCES_TRACE` | `1`: before and after each `invalidateblock`, the node's mempool is printed, each transaction with its inputs (`txid:vout@height/kind`) and its outputs |
 
 A run of 200 steps takes 2 to 10 minutes. However it ends, all nodes are stopped and their directories deleted. It
@@ -112,7 +113,19 @@ episode) and the remaining steps, so every comparison stays exact:
   `-vault`, `:63-72`, `:99`) and takes the first coin with a kernel hash under the target. That target is weighted
   by the coin's value (`ProofOfStakeCalculator.cpp:19-24`, `:53-54`), so a small coin is often passed over. Which coin
   wins depends on the txids, and those differ between the pairs, so the script checks only that each kernel is in the
-  set. A coinstake's outputs are immature, so the balances part by the difference.
+  set. A coinstake's outputs are immature, so the balances part by the difference. When a kernel is a vault coin, the
+  vault's owner (the other node) counts the coin in its `getbalance` (`CWallet::GetBalance`, `wallet.cpp:1395-1402`),
+  so its balances may differ too.
+
+  Every stake block is checked, not only those after which the sides differ: a kernel outside the set is a `FAIL`.
+  Each stake step logs its kernels as `#   stake kernels: step <i> node <n>: divid [...] irondivid [...]`, with each
+  block's height, case (`listed`, `matured`, `vault`) and value.
+- **stake proof timing:** both sides end a `mine` step with -25 "failed to generate a valid block", after a
+  different number of blocks, and every block either side made staked a coin of its stake set. divid tries one
+  timestamp per attempt, the current time (`PoSTransactionCreator.cpp:335-341`), and the kernel hash includes it. So
+  whether a coin finds its proof (above all a small one, such as a node's only vault coin) depends on the second the
+  attempt runs. `setgenerate` answers -25 at the first attempt that fails (`rpcmining.cpp:104-110`). Seen either way
+  round on a replay of the same steps.
 - **maturity in the middle of a reorg:** only the middle of an `invalidate` differs (balances, coins, the mempool's
   size), and the end states agree. While its tip was lowered, one side dropped transactions from the disconnected
   blocks or its mempool, and each spends a coinbase or coinstake output immature at that height, or an output of a

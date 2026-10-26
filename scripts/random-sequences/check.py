@@ -35,6 +35,12 @@ from concurrent.futures import ThreadPoolExecutor
 IRONDIVID, DIVID, PORT_BASE, WORK = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
 SEED = int(os.environ.get("SEED") or secrets.randbelow(2**32))
 STEPS = int(os.environ.get("STEPS") or 200)
+# "stake": more blocks and vaults, setup up to height 95, so runs reach stake
+# blocks; the default profile, and so every seed's steps, are unchanged
+PROFILE = os.environ.get("RANDOM_SEQUENCES_PROFILE", "")
+# a manager can take on a vault only with -vault (CWallet::AddVault,
+# wallet.cpp:693-705); it also shuffles the stake set (PoSTransactionCreator.cpp:71, :99)
+PROFILE_CONF = ["vault=1"] if PROFILE == "stake" else []
 # A file with a JSON list of steps, as the run prints them, to run instead of
 # drawn ones (to shorten a difference)
 REPLAY = os.environ.get("REPLAY", "")
@@ -176,6 +182,7 @@ class Pair:
         self.name, self.nodes = name, nodes
         self.addresses = {}  # step -> address handed out at that step
         self.vault_funded = {1: [], 2: []}
+        self.vaults = []  # fundvault's vaults: "owner:manager", funding txid, funding node, added by the manager
         self.lock_order = {1: [], 2: []}  # coins in the order the steps locked them
         self.last_tx = None  # (node, txid) of the step's wallet send
         self.note = None  # what the step needed besides itself
@@ -390,11 +397,29 @@ def run_step(pair, step):
         return outcome(node.call("lockunspent", True)), None
     if kind == "fundvault":
         owner, manager = node.rpc("getnewaddress"), other.rpc("getnewaddress")
-        out = node.call("fundvault", f"{owner}:{manager}", float(f"{1 + draw % 50:.8f}"))
+        # the stake profile funds vaults that can compete with 1250 coins as kernels
+        amount = 100 + draw % 1000 if PROFILE == "stake" else 1 + draw % 50
+        out = node.call("fundvault", f"{owner}:{manager}", float(f"{amount:.8f}"))
         sent(pair, node, ("ok", out[1]["txhash"]) if out[0] == "ok" else out)
         if out[0] == "ok":
             pair.vault_funded[n].append(i)
+            pair.vaults.append({"vault": f"{owner}:{manager}", "txid": out[1]["txhash"], "funder": n,
+                                "added": False})
         return outcome(out), None
+    if kind == "addvault":
+        # the manager takes on a vault the other node funded, once it is in a
+        # block, so the vault's coin is in its stake set (wallet_ismine.cpp:86-91)
+        waiting = [v for v in pair.vaults if v["funder"] == 3 - n and not v["added"]]
+        if not waiting:
+            return "no vault", None
+        v = waiting[draw % len(waiting)]
+        funded = other.call("gettransaction", v["txid"])
+        if funded[0] != "ok" or funded[1].get("confirmations", 0) < 1:
+            return "vault not in a block", None
+        out = node.call("addvault", v["vault"], v["txid"])
+        if out[0] == "ok" and out[1].get("succeeded"):
+            v["added"] = True
+        return outcome(out) + (f" succeeded={out[1].get('succeeded')}" if out[0] == "ok" else ""), None
     if kind == "reclaim":
         dest = node.rpc("getnewaddress")
         return sent(pair, node, node.call("reclaimvaultfunds", dest, float(f"{0.5 + draw % 20:.8f}"))), None
@@ -487,10 +512,20 @@ KINDS = [
 ]
 
 
+# The stake profile: mostly blocks, vaults funded and taken on by their
+# managers, few steps that start a node again
+STAKE_KINDS = [
+    ("getnewaddress", 2), ("send own", 6), ("send other", 6), ("sendmany", 4), ("lock", 2),
+    ("unlock one", 2), ("unlock all", 1), ("fundvault", 6), ("addvault", 6), ("reclaim", 1), ("mine", 30),
+    ("invalidate", 1), ("restart", 1), ("walletlock", 1), ("walletpassphrase", 3), ("rawtx", 3),
+]
+
+
 def draw_steps(seed, count):
     rng = random.Random(seed)
-    names = [k for k, _ in KINDS]
-    weights = [w for _, w in KINDS]
+    kinds = STAKE_KINDS if PROFILE == "stake" else KINDS
+    names = [k for k, _ in kinds]
+    weights = [w for _, w in kinds]
     steps = []
     for i in range(1, count + 1):
         kind = rng.choices(names, weights)[0]
@@ -523,7 +558,10 @@ def both(fn):
 
 def setup(pair):
     a, b = pair.nodes
-    for node, blocks in ((a, 15), (b, 15), (a, 25)):
+    # the stake profile ends near the last work block (100), with coinbases of
+    # both nodes that mature in the first stake steps
+    first = ((a, 15), (b, 15), (a, 30), (b, 35)) if PROFILE == "stake" else ((a, 15), (b, 15), (a, 25))
+    for node, blocks in first:
         node.rpc("setgenerate", blocks)
         if not pair.settle():
             raise RuntimeError(f"{pair.name} pair did not settle after the first blocks")
@@ -560,11 +598,12 @@ def new_episode():
         for name in ("divid1", "divid2", "irondivid1", "irondivid2"):
             shutil.rmtree(os.path.join(WORK, name), ignore_errors=True)
     episode += 1
-    c1 = Node("divid1", DIVID, 0, ["listen=1"] + CORE_DEBUG)
-    c2 = Node("divid2", DIVID, 1, ["listen=0", f"connect={HOST}:{PORT_BASE}"] + CORE_DEBUG)
+    c1 = Node("divid1", DIVID, 0, ["listen=1"] + CORE_DEBUG + PROFILE_CONF)
+    c2 = Node("divid2", DIVID, 1, ["listen=0", f"connect={HOST}:{PORT_BASE}"] + CORE_DEBUG + PROFILE_CONF)
     phrases = [c1.rpc("dumphdinfo")["mnemonic"], c2.rpc("dumphdinfo")["mnemonic"]]
-    i1 = Node("irondivid1", IRONDIVID, 2, ["listen=1"] + IRON_DEBUG, env={"WALLET_MNEMONIC": phrases[0]})
-    i2 = Node("irondivid2", IRONDIVID, 3, ["listen=0", f"connect={HOST}:{PORT_BASE + 4}"] + IRON_DEBUG,
+    i1 = Node("irondivid1", IRONDIVID, 2, ["listen=1"] + IRON_DEBUG + PROFILE_CONF,
+              env={"WALLET_MNEMONIC": phrases[0]})
+    i2 = Node("irondivid2", IRONDIVID, 3, ["listen=0", f"connect={HOST}:{PORT_BASE + 4}"] + IRON_DEBUG + PROFILE_CONF,
               env={"WALLET_MNEMONIC": phrases[1]})
     del phrases
     PAIRS = [Pair("divid", [c1, c2]), Pair("irondivid", [i1, i2])]
@@ -620,6 +659,12 @@ EXPLAINED = {
         "kernel hash under the target, which is weighted by the coin's value (ProofOfStakeCalculator.cpp:19-24, "
         ":53-54); the two pairs' txids differ, so the coins staked differ in value, and a coinstake's outputs are "
         "immature"),
+    "stake proof timing": (
+        "both sides ended the mine step with -25 \"failed to generate a valid block\" after a different number "
+        "of blocks, each staking a coin of its stake set: divid tries one timestamp per attempt, the current time "
+        "(PoSTransactionCreator.cpp:335-341), and the kernel hash includes it, so whether a coin, above all a small "
+        "one, finds its proof depends on the second the attempt runs; setgenerate answers -25 at the first attempt "
+        "that fails (rpcmining.cpp:104-110)"),
     "maturity in the middle of a reorg": (
         "only the middle of the invalidate differs: while its tip was lowered, one side dropped transactions that "
         "spend a coinbase or coinstake output immature at that height, or an output of one that does, which "
@@ -696,7 +741,7 @@ def stake_kernels(node, h0, before, locks):
         return None
     locked = {(o["txid"], o["vout"]) for o in locks[1]}
     listed = {(u["txid"], u["vout"]): u for u in before[1]}
-    used, kernels, rule, misses = set(), [], True, []
+    used, kernels, rule, misses, cases = set(), [], True, [], []
     try:
         tip = node.rpc("getblockcount")
         for h in range(h0 + 1, tip + 1):
@@ -716,23 +761,40 @@ def stake_kernels(node, h0, before, locks):
                 # the coin's depth when block h was made on block h - 1
                 depth = coin["confirmations"] + (h - 1 - h0)
                 value = str(coin["amount"])
+                case = "listed"
                 why = ("locked" if kernel in locked else "spent earlier in the step" if kernel in used
                        else f"at depth {depth}" if depth < 10 else None)
             else:
-                value = vault_output(node, kernel) or matured_in_step(node, kernel, h, tip)
-                why = "spent earlier in the step" if value is not None and kernel in used else None
+                value = vault_output(node, kernel)
+                case = "vault"
+                why = None
+                if value is not None:
+                    # a vault coin needs the depth of any other coin: 10
+                    funded = node.call("gettransaction", kernel[0])
+                    depth = (funded[1].get("confirmations", 0) - (tip - (h - 1))) if funded[0] == "ok" else 0
+                    case = f"vault@{depth}"
+                    if depth < 10:
+                        why = f"a vault coin at depth {depth}"
+                else:
+                    value = matured_in_step(node, kernel, h, tip)
+                    case = "matured"
+                if value is not None and kernel in used:
+                    why = "spent earlier in the step"
                 if value is None:
                     why = f"not a listed coin or vault output of the wallet: {coin_detail(node, kernel)}"
                 elif kernel in locked:
                     why = "locked"
             if why:
                 rule = False
+                case = "outside"
                 misses.append(f"block {h}: staked {value or '?'}, {why}")
             used.update((v.get("txid"), v.get("vout")) for v in vin)
             kernels.append(value or "?")
+            cases.append(f"{h}:{case}:{value or '?'}")
     except RuntimeError:
         return None
-    return {"rule": rule, "kernels": kernels, "misses": misses, "locked": len(locked)} if kernels else None
+    return {"rule": rule, "kernels": kernels, "misses": misses, "locked": len(locked),
+            "cases": cases} if kernels else None
 
 
 def stake_choice_explains(n, diff):
@@ -746,7 +808,29 @@ def stake_choice_explains(n, diff):
     if stakes[0]["kernels"] == stakes[1]["kernels"]:
         return False
     allowed = {f"node {n}: {k}" for k in ("getbalance * 0", "getbalance * 1", "listunspent 0 amounts")}
+    if any(c.split(":")[1].startswith("vault") for st in stakes for c in st["cases"]):
+        # a staked vault's coin is its owner's (the other node's) too: getbalance
+        # counts owned vault coins (CWallet::GetBalance, wallet.cpp:1395-1402),
+        # and the coinstake leaves them immature
+        allowed |= {f"node {3 - n}: {k}" for k in ("getbalance * 0", "getbalance * 1")}
     return all(k in allowed for k in diff)
+
+
+def stake_timing_explains(diff, c_out, i_out):
+    """A mine step that both sides ended with -25 "failed to generate a valid
+    block", having made different numbers of blocks, each block staking a
+    coin of the stake set. divid tries one timestamp per attempt, the current
+    time (PoSTransactionCreator.cpp:335-341), and the kernel hash includes it,
+    so whether a coin finds its proof depends on the second the attempt runs;
+    setgenerate answers -25 at the first attempt that fails
+    (rpcmining.cpp:104-110)"""
+    if not (c_out.startswith("error -25") and i_out.startswith("error -25")):
+        return False
+    if not any(k.endswith(": height") for k in diff):
+        return False
+    stakes = [p.stake for p in PAIRS]
+    log(f"#   stake timing: divid {stakes[0]}, irondivid {stakes[1]}"[:1500])
+    return all(st is None or st["rule"] for st in stakes)
 
 
 def coin_choice_differs():
@@ -1005,7 +1089,8 @@ if REPLAY:
 else:
     steps = draw_steps(SEED, STEPS)
 
-log(f"# random-sequences: SEED={SEED} STEPS={STEPS}" + (f" REPLAY={REPLAY}" if REPLAY else ""))
+log(f"# random-sequences: SEED={SEED} STEPS={STEPS}" + (f" REPLAY={REPLAY}" if REPLAY else "")
+    + (f" PROFILE={PROFILE}" if PROFILE else ""))
 new_episode()
 episode_steps = []
 fails = 0
@@ -1046,6 +1131,14 @@ for step in steps:
         if not diff or time.time() > deadline:
             break
         time.sleep(1)
+    # Every stake block's coin must be one of divid's stake set, whether the
+    # two sides then differ or not
+    stakes = [p.stake for p in PAIRS] if step["kind"] == "mine" else [None, None]
+    if any(stakes):
+        log(f"#   stake kernels: step {step['i']} node {n}: "
+            + "  ".join(f"{p.name} {s['cases'] if s else None}" for p, s in zip(PAIRS, stakes)))
+        if any(s and not s["rule"] for s in stakes):
+            diff.append("stake kernel outside the stake set")
     line = f"step {step['i']:>3}  {step['kind']:<16} node {n}  divid={c_res[0]}  irondivid={i_res[0]}"
     for p in PAIRS:
         if p.note:
@@ -1053,11 +1146,13 @@ for step in steps:
     if not c_settled or not i_settled:
         line += f"  [settled: divid {c_settled}, irondivid {i_settled}]"
     explained = None
-    if diff and "outcome" not in diff:
+    if diff and "outcome" not in diff and "stake kernel outside the stake set" not in diff:
         if coin_choice_differs():
             explained = "coin choice"
         elif step["kind"] == "mine" and stake_choice_explains(n, diff):
             explained = "stake coin choice"
+        elif step["kind"] == "mine" and stake_timing_explains(diff, c_res[0], i_res[0]):
+            explained = "stake proof timing"
         elif step["kind"] == "invalidate" and c_res[1] and i_res[1] \
                 and c_res[1]["height"][0] == i_res[1]["height"][0] == "ok" \
                 and maturity_explains(n, [c_res[1]["height"][1], i_res[1]["height"][1]]):
@@ -1099,6 +1194,9 @@ for step in steps:
         for k in diff:
             if k == "outcome":
                 log(f"#   outcome: divid {c_res[0]!r} irondivid {i_res[0]!r}")
+            elif k == "stake kernel outside the stake set":
+                for p, st in zip(PAIRS, stakes):
+                    log(f"#   {p.name} stake blocks: {st}"[:1500])
             elif k.startswith("after invalidateblock: "):
                 f = k.split(": ", 1)[1]
                 log(f"#   {k}: divid {json.dumps(c_res[1][f])[:3000]} irondivid {json.dumps(i_res[1][f])[:3000]}")
