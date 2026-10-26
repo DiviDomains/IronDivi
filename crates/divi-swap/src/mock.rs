@@ -889,6 +889,28 @@ impl MockBackend {
         self.lag.store(blocks, Ordering::SeqCst);
     }
 
+    /// [`ChainBackend::build_claim`] paying `feerate` instead of [`MOCK_FEERATE`], whatever
+    /// the chain's [`FeeBump`]: a test backend that prices its claim with a real chain's
+    /// spend builder signs it here. Test-only.
+    pub fn build_claim_paying(
+        &self,
+        htlc: &HtlcParams,
+        at: &Outpoint,
+        amount: Amount,
+        preimage: &[u8; 32],
+        feerate: u64,
+    ) -> Result<SignedTx> {
+        self.check_online()?;
+        Ok(Self::sign(&MockTx::Claim {
+            to: self.owner(),
+            htlc: *htlc,
+            at: *at,
+            amount,
+            preimage: *preimage,
+            feerate: feerate.max(1),
+        }))
+    }
+
     /// The underlying chain.
     pub fn mock_chain(&self) -> &MockChain {
         &self.chain
