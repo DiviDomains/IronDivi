@@ -364,3 +364,135 @@ mod orphan_tests {
         assert!(w.available().is_empty());
     }
 }
+
+#[cfg(test)]
+mod temp_file_tests {
+    use super::*;
+    use std::path::Path;
+
+    fn coin(n: u8, value: u64) -> Utxo {
+        Utxo {
+            outpoint: Outpoint {
+                txid: Txid([n; 32]),
+                vout: 0,
+            },
+            value,
+        }
+    }
+
+    fn names(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// The pid of a child that has exited and been reaped: no running process has it.
+    fn dead_pid() -> u32 {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        pid
+    }
+
+    #[test]
+    fn a_failed_write_removes_its_own_temp_file_and_returns_the_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("w.json");
+        let mut w = Wallet::open(Some(path.clone())).unwrap();
+        // A directory where the wallet file should be: the temp file is written, the
+        // rename over it fails.
+        std::fs::create_dir(&path).unwrap();
+        let err = w.record_broadcast(&[], &[coin(1, 10)]).unwrap_err();
+        assert!(matches!(err, SwapError::Storage(_)), "{err:?}");
+        assert_eq!(names(dir.path()), vec!["w.json".to_string()]);
+        // The write itself fails (no such directory): an error, and nothing left behind.
+        let gone = dir.path().join("gone");
+        let mut w = Wallet::open(Some(gone.join("w.json"))).unwrap();
+        assert!(w.record_broadcast(&[], &[coin(1, 10)]).is_err());
+        assert!(!gone.exists());
+        assert_eq!(names(dir.path()), vec!["w.json".to_string()]);
+    }
+
+    #[test]
+    fn opening_a_wallet_removes_only_dead_writers_temp_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("w.json");
+        let mut w = Wallet::open(Some(path.clone())).unwrap();
+        w.record_broadcast(&[], &[coin(1, 10)]).unwrap();
+        let wallet_bytes = std::fs::read(&path).unwrap();
+        let (dead, live) = (dead_pid(), std::process::id());
+        let touch = |name: String| std::fs::write(dir.path().join(name), b"partial").unwrap();
+        let swept = [
+            format!("w.json.tmp.{dead}.0"),
+            format!("w.json.tmp.{dead}.17"),
+        ];
+        let kept = [
+            // A running writer (this test stands in for it).
+            format!("w.json.tmp.{live}.3"),
+            // Other wallets in the same directory.
+            format!("other.json.tmp.{dead}.0"),
+            format!("w.json2.tmp.{dead}.0"),
+            format!("x.w.json.tmp.{dead}.0"),
+            // Not the exact pattern.
+            format!("w.json.tmp.{dead}"),
+            format!("w.json.tmp.{dead}."),
+            format!("w.json.tmp..0"),
+            format!("w.json.tmp.{dead}.0.bak"),
+            format!("w.json.tmp.{dead}.x"),
+            format!("w.json.tmp.+{dead}.0"),
+            format!("w.json.tmp.{dead}.+0"),
+            format!("w.json.TMP.{dead}.0"),
+        ];
+        for n in swept.iter().chain(&kept) {
+            touch(n.clone());
+        }
+        // A symlink and a directory with a matching name are never removed, nor is what
+        // the symlink points to.
+        let target = dir.path().join("target");
+        std::fs::write(&target, b"keep").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, dir.path().join(format!("w.json.tmp.{dead}.5")))
+            .unwrap();
+        std::fs::create_dir(dir.path().join(format!("w.json.tmp.{dead}.6"))).unwrap();
+
+        let w = Wallet::open(Some(path.clone())).unwrap();
+        assert_eq!(w.available(), vec![coin(1, 10)]);
+        let mut expect: Vec<String> = kept.to_vec();
+        expect.extend([
+            "w.json".to_string(),
+            "target".to_string(),
+            format!("w.json.tmp.{dead}.6"),
+        ]);
+        #[cfg(unix)]
+        expect.push(format!("w.json.tmp.{dead}.5"));
+        expect.sort();
+        assert_eq!(names(dir.path()), expect);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            wallet_bytes,
+            "wallet unchanged"
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep");
+        for n in &kept {
+            assert_eq!(
+                std::fs::read(dir.path().join(n)).unwrap(),
+                b"partial",
+                "{n}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_crash_before_the_first_rename_is_swept_with_no_wallet_file_yet() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("w.json");
+        let dead = dead_pid();
+        std::fs::write(dir.path().join(format!("w.json.tmp.{dead}.0")), b"{").unwrap();
+        let w = Wallet::open(Some(path.clone())).unwrap();
+        assert!(w.available().is_empty());
+        assert!(names(dir.path()).is_empty(), "{:?}", names(dir.path()));
+    }
+}
