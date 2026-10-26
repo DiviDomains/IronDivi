@@ -453,6 +453,74 @@ fn peers_are_written_before_and_closed_after_the_flush() {
     assert!(dir.path().join("peers.dat").exists());
 }
 
+/// mncache.dat is written only at a stop, once the node's loops have stopped
+/// and before netfulfilled.dat, as Divi Core's SaveMasternodeDataToDisk
+/// writes it first after StopNode (init.cpp:372, :376;
+/// MasternodeModule.cpp:284-297)
+#[test]
+fn mncache_is_written_at_the_stop() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(dir.path());
+    assert!(!dir.path().join("mncache.dat").exists());
+    daemon.stop();
+    let lines = log_lines(dir.path());
+    let loops = line_of(&lines, "Shutdown: node loops stopped").expect("loops stopped");
+    let written = line_of(&lines, "Shutdown: mncache.dat written").expect("mncache.dat written");
+    let fulfilled =
+        line_of(&lines, "Shutdown: netfulfilled.dat written").expect("netfulfilled.dat written");
+    assert!(loops < written && written < fulfilled, "{lines:#?}");
+    let bytes = std::fs::read(dir.path().join("mncache.dat")).unwrap();
+    assert_eq!(&bytes[1..21], b"magicMasternodeCache");
+}
+
+/// The list file irondivid kept before mncache.dat goes once mncache.dat is
+/// written
+#[test]
+fn an_old_masternodes_list_goes_at_the_stop() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("masternodes.list"), b"").unwrap();
+    let daemon = Daemon::start(dir.path());
+    daemon.stop();
+    assert!(dir.path().join("mncache.dat").exists());
+    assert!(!dir.path().join("masternodes.list").exists());
+}
+
+/// divid will not start on a mncache.dat it cannot read (CFlatDB::Load,
+/// flat-database.h:225-245; MasternodeModule.cpp:262-266) and leaves it as it
+/// was
+#[test]
+fn a_damaged_mncache_stops_the_start() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("mncache.dat"), b"not a masternode list").unwrap();
+    let mut child = irondivid(dir.path(), free_port())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let code = wait_exit(&mut child, 60);
+    // A node that started holds its stderr open, so stop it before reading
+    if code.is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("Failed to load masternode cache from"),
+        "{stderr}"
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("mncache.dat")).unwrap(),
+        b"not a masternode list"
+    );
+}
+
 /// netfulfilled.dat is written once the node's loops have stopped, as Divi
 /// Core's SaveMasternodeDataToDisk follows StopNode (init.cpp:372, :376)
 #[test]

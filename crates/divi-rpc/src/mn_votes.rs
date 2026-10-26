@@ -14,6 +14,7 @@
 //! with, one vote per masternode (MasternodePaymentData, MasternodePayeeData).
 //! `getmasternodewinners` reads them.
 
+use crate::flat_file::{self, cmp_u256, write_compact_size, write_varbytes, Header, Reader};
 use crate::mn_list::{scoring_hash, MasternodeList, Refusal};
 use divi_masternode::cpp_wire::CppWinner;
 use divi_primitives::hash::Hash256;
@@ -457,70 +458,6 @@ fn prune(
     }
 }
 
-/// uint256's order: the bytes compared from the last
-fn cmp_u256(a: &[u8; 32], b: &[u8; 32]) -> std::cmp::Ordering {
-    a.iter().rev().cmp(b.iter().rev())
-}
-
-fn write_compact_size(out: &mut Vec<u8>, n: usize) {
-    match n {
-        0..=0xfc => out.push(n as u8),
-        0xfd..=0xffff => {
-            out.push(0xfd);
-            out.extend_from_slice(&(n as u16).to_le_bytes());
-        }
-        0x1_0000..=0xffff_ffff => {
-            out.push(0xfe);
-            out.extend_from_slice(&(n as u32).to_le_bytes());
-        }
-        _ => {
-            out.push(0xff);
-            out.extend_from_slice(&(n as u64).to_le_bytes());
-        }
-    }
-}
-
-fn write_varbytes(out: &mut Vec<u8>, bytes: &[u8]) {
-    write_compact_size(out, bytes.len());
-    out.extend_from_slice(bytes);
-}
-
-/// A reader over the bytes of a file; None once they run out
-struct Reader<'a> {
-    data: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> Reader<'a> {
-    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
-        let end = self.pos.checked_add(n)?;
-        let out = self.data.get(self.pos..end)?;
-        self.pos = end;
-        Some(out)
-    }
-    fn array<const N: usize>(&mut self) -> Option<[u8; N]> {
-        self.take(N)?.try_into().ok()
-    }
-    fn u32(&mut self) -> Option<u32> {
-        self.array().map(u32::from_le_bytes)
-    }
-    fn i32(&mut self) -> Option<i32> {
-        self.array().map(i32::from_le_bytes)
-    }
-    fn compact_size(&mut self) -> Option<usize> {
-        Some(match self.take(1)?[0] {
-            0xfd => u16::from_le_bytes(self.array()?) as usize,
-            0xfe => u32::from_le_bytes(self.array()?) as usize,
-            0xff => usize::try_from(u64::from_le_bytes(self.array()?)).ok()?,
-            n => n as usize,
-        })
-    }
-    fn varbytes(&mut self) -> Option<Vec<u8>> {
-        let n = self.compact_size()?;
-        self.take(n).map(<[u8]>::to_vec)
-    }
-}
-
 type FileVotes = (
     HashMap<[u8; 32], (CppWinner, Hash256)>,
     HashMap<Hash256, BlockPayees>,
@@ -575,27 +512,13 @@ fn parse_votes(r: &mut Reader<'_>) -> Option<FileVotes> {
 /// message, the network's magic number and the votes (flat-database.h,
 /// flat-database.cpp:18-60)
 fn read_file(path: &std::path::Path, network_magic: [u8; 4]) -> (PaymentsFile, Option<FileVotes>) {
-    let Ok(bytes) = std::fs::read(path) else {
-        return (PaymentsFile::Missing, None);
+    let data = match flat_file::read(path, PAYMENTS_MAGIC, network_magic) {
+        Ok(data) => data,
+        Err(Header::Missing) => return (PaymentsFile::Missing, None),
+        Err(Header::BadFormat) => return (PaymentsFile::BadFormat, None),
+        Err(Header::Invalid(why)) => return (PaymentsFile::Invalid(why), None),
     };
-    // The data is all but the last 32 bytes, which are its double SHA-256
-    if bytes.len() < 32 {
-        return (PaymentsFile::Invalid("the checksum cannot be read"), None);
-    }
-    let (data, checksum) = bytes.split_at(bytes.len() - 32);
-    if divi_crypto::double_sha256(data) != checksum {
-        return (PaymentsFile::Invalid("the checksum does not match"), None);
-    }
-    let mut r = Reader { data, pos: 0 };
-    let (Some(magic), Some(network)) = (r.varbytes(), r.array::<4>()) else {
-        return (PaymentsFile::BadFormat, None);
-    };
-    if network != network_magic {
-        return (PaymentsFile::Invalid("another network's file"), None);
-    }
-    if magic != PAYMENTS_MAGIC.as_bytes() {
-        return (PaymentsFile::Invalid("another kind of file"), None);
-    }
+    let mut r = Reader::new(&data);
     match parse_votes(&mut r) {
         Some(votes) => (PaymentsFile::Loaded(votes.0.len()), Some(votes)),
         None => (PaymentsFile::BadFormat, None),

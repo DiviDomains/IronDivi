@@ -1075,7 +1075,6 @@ impl Node {
         // The network's masternodes, kept in the datadir as Divi Core keeps
         // mncache.dat, and their payment votes
         let masternode_list = Arc::new(divi_rpc::mn_list::MasternodeList::new());
-        masternode_list.set_path(config.data_dir.join("masternodes.list"));
         let masternode_votes = Arc::new(divi_rpc::mn_votes::MasternodeVotes::new());
         // The masternode sync, with the requests kept from the last run
         let masternode_sync = divi_masternode::mnsync::shared(
@@ -1106,6 +1105,33 @@ impl Node {
                     tracing::error!("Error reading {}: {}", NETFULFILLED_FILE, why);
                     return Err(NodeError::Init(format!(
                         "Failed to load fulfilled requests cache from\n{}",
+                        config.data_dir.display()
+                    )));
+                }
+            }
+        }
+        // mncache.dat next (MasternodeModule.cpp:262-266), with the sync's
+        // asks for the list in it
+        masternode_list.follow_sync(Arc::clone(&masternode_sync));
+        // and a file that is not one of this network stops the start
+        {
+            use divi_rpc::mn_list::{MncacheFile, MNCACHE_FILE};
+            let path = config.data_dir.join(MNCACHE_FILE);
+            match masternode_list.load_file(&path, config.network.magic) {
+                MncacheFile::Loaded(n) => {
+                    tracing::info!("Loaded {} masternodes from {}", n, MNCACHE_FILE)
+                }
+                MncacheFile::Missing => {
+                    tracing::info!("Missing file {}, will try to recreate", MNCACHE_FILE)
+                }
+                MncacheFile::BadFormat => tracing::warn!(
+                    "Error reading {}: Magic is ok but data has invalid format, will try to recreate",
+                    MNCACHE_FILE
+                ),
+                MncacheFile::Invalid(why) => {
+                    tracing::error!("Error reading {}: {}", MNCACHE_FILE, why);
+                    return Err(NodeError::Init(format!(
+                        "Failed to load masternode cache from\n{}",
                         config.data_dir.display()
                     )));
                 }
@@ -2457,6 +2483,24 @@ impl Node {
             );
         }
         shutdown_stage("node loops stopped", started);
+
+        // mncache.dat once the loops that change the list have stopped,
+        // first of the three files SaveMasternodeDataToDisk writes
+        // (init.cpp:372, :376; MasternodeModule.cpp:284-297)
+        let started = std::time::Instant::now();
+        let path = self.config.data_dir.join(divi_rpc::mn_list::MNCACHE_FILE);
+        match self
+            .masternode_list
+            .save_file(&path, self.config.network.magic)
+        {
+            Ok(true) => {}
+            Ok(false) => tracing::warn!(
+                "Error reading {}: File format is unknown or invalid, please fix it manually",
+                divi_rpc::mn_list::MNCACHE_FILE
+            ),
+            Err(e) => tracing::error!("Failed to write {}: {}", divi_rpc::mn_list::MNCACHE_FILE, e),
+        }
+        shutdown_stage("mncache.dat written", started);
 
         // netfulfilled.dat once the loops that change it have stopped, as
         // Divi Core's SaveMasternodeDataToDisk follows StopNode

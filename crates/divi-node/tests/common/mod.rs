@@ -2,4 +2,5 @@
 // Copyright (C) 2026 Bert Shuler
 // IronDivi - https://github.com/DiviDomains/IronDivi
 
+pub mod mncache;
 pub mod raw_peer;

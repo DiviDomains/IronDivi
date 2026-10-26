@@ -461,6 +461,22 @@ impl MasternodeSync {
         false
     }
 
+    /// mAskedUsForMasternodeList and mWeAskedForMasternodeList by IP, which
+    /// Divi Core keeps in mncache.dat (MasternodeNetworkMessageManager.h:68-78)
+    pub fn list_asks(&self) -> (&HashMap<String, i64>, &HashMap<String, i64>) {
+        (&self.asked_us_for_list, &self.asked_for_list)
+    }
+
+    /// Put back the asks read from mncache.dat
+    pub fn set_list_asks(
+        &mut self,
+        asked_us: HashMap<String, i64>,
+        we_asked: HashMap<String, i64>,
+    ) {
+        self.asked_us_for_list = asked_us;
+        self.asked_for_list = we_asked;
+    }
+
     /// Process (masternode-sync.cpp:424-454), called once a second while the
     /// chain is synced. `peers` are the peers it may ask, in connection order;
     /// a peer below `active_protocol` is passed over. Returns what to send.
