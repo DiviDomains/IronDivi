@@ -2,8 +2,8 @@
 """What a node keeps across a restart, and block import, on a fresh Divi Core
 divid and a fresh irondivid side by side on regtest: peer addresses learnt from
 addr gossip (asked back with getaddr) after a clean and an unclean stop, bans,
-the masternode list, damaged peers.dat and mncache.dat, the files a new data
-directory gets, and -loadblock / bootstrap.dat / -stopafterblockimport with
+the masternode list, damaged peers.dat, mncache.dat and netfulfilled.dat, the
+files a new data directory gets, and -loadblock / bootstrap.dat / -stopafterblockimport with
 divid's own block file. Each row prints PASS, KNOWN (a difference listed in
 README.md) or FAIL. Exit code = FAILs.
 
@@ -64,11 +64,6 @@ KNOWN = {
     "file db.log": elsewhere("its wallet database (wallet/, RocksDB), which writes no Berkeley DB log"),
     "file wallet.dat": elsewhere("wallet/ (RocksDB)"),
     "file mncache.dat": elsewhere("its chain database (the masternode list, crates/divi-node/src/node.rs)"),
-    "file mnpayments.dat": ("irondivid keeps no payment votes across a restart: it has them from peers again "
-                            "(divid writes the file, and reads it only with a masternode list, "
-                            "MasternodeModule.cpp:270-277)", absent),
-    "file netfulfilled.dat": ("irondivid keeps no record of the sync requests it answered across a restart "
-                              "(divid's expire after 5 minutes on regtest, chainparams.cpp:506)", absent),
     "file sporks/": elsewhere("its chain database (spork_<id> entries, crates/divi-network/src/spork.rs)"),
     "files only irondivid has": ("its own stores: wallet/ (the wallet), txindex/ (the transaction index, which "
                                  "divid keeps in blocks/index)", lambda c, i: i - c <= {"wallet/", "txindex/"}),
@@ -571,7 +566,7 @@ def damaged(fname, label, content):
     return outs
 
 
-for fname in ("peers.dat", "mncache.dat"):
+for fname in ("peers.dat", "mncache.dat", "netfulfilled.dat"):
     for label, content in (("empty", b""), ("truncated", None), ("garbage", secrets.token_bytes(300))):
         if content is None:
             # The node's own file, cut in half
