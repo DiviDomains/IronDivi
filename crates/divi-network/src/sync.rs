@@ -633,6 +633,8 @@ impl BlockSync {
                     p.full_node() && (p.preferred() || (!have_preferred && !p.one_shot))
                 })
                 .map(|(&id, _)| id)
+                // a peer we dialled is asked once its sporks are in (Node.cpp:1032)
+                .filter(|&id| !self.peer_manager.waiting_for_sporks(id))
                 .collect();
             candidates.sort_unstable();
             let mut started = self.sync_started_peers.write();
@@ -4333,5 +4335,28 @@ mod tests {
         // neither stands in the way of a peer that dialled us
         sync.begin_syncing_with_peer(3, full_node(true)).await;
         assert_eq!(getblocks_recipients(&mut rxs), vec![3]);
+    }
+
+    /// Divi Core sends a peer it dialled nothing of its own until that peer's
+    /// sporks are in (Node.cpp:1025-1034): the start getblocks waits for them
+    #[tokio::test]
+    async fn a_dialled_peer_is_asked_once_its_sporks_are_in() {
+        let (sync, mut rxs, _dir) = sync_with_peers(1);
+        let stats = sync.peer_manager.test_peer_stats(1).unwrap();
+        stats.sporks_wait.store(true, Ordering::Release);
+        sync.begin_syncing_with_peer(1, full_node(false)).await;
+        assert!(getblocks_recipients(&mut rxs).is_empty());
+
+        sync.peer_manager.sporks_arrived(1);
+        sync.ask_peers_to_sync().await;
+        assert_eq!(getblocks_recipients(&mut rxs), vec![1]);
+    }
+
+    /// A peer that dialled us is not held back for sporks
+    #[tokio::test]
+    async fn a_peer_that_dialled_us_does_not_wait_for_sporks() {
+        let (sync, mut rxs, _dir) = sync_with_peers(1);
+        sync.begin_syncing_with_peer(1, full_node(true)).await;
+        assert_eq!(getblocks_recipients(&mut rxs), vec![1]);
     }
 }

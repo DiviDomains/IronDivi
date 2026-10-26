@@ -161,3 +161,73 @@ async fn no_sendheaders_after_the_handshake() {
         seen
     );
 }
+
+/// A peer we dialled, its version and verack sent after ours, and what keeps
+/// the connection open
+async fn dialled_peer() -> (TcpStream, (PeerHandle, broadcast::Sender<()>)) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (event_tx, _) = broadcast::channel(64);
+    let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+    let dial = tokio::spawn(Connection::connect(
+        addr,
+        None,
+        MAINNET_MAGIC,
+        0,
+        1,
+        event_tx,
+        shutdown_rx,
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(AtomicU64::new(0)),
+        Default::default(),
+        Default::default(),
+    ));
+    let (mut peer, _) = listener.accept().await.unwrap();
+    let (conn, handle) = dial.await.unwrap().unwrap();
+    tokio::spawn(conn.run());
+    assert!(matches!(
+        read_message(&mut peer).await,
+        NetworkMessage::Version(_)
+    ));
+    send(
+        &mut peer,
+        NetworkMessage::Version(VersionMessage {
+            version: PROTOCOL_VERSION,
+            services: 1,
+            timestamp: 0,
+            addr_recv: NetAddr::from_ipv4([127, 0, 0, 1], 0, 0),
+            addr_from: NetAddr::from_ipv4([127, 0, 0, 1], 0, 1),
+            nonce: 0x5eee,
+            user_agent: "/peer/".into(),
+            start_height: 0,
+            relay: true,
+        }),
+    )
+    .await;
+    send(&mut peer, NetworkMessage::Verack).await;
+    (peer, (handle, shutdown_tx))
+}
+
+/// Divi Core sends a peer it dialled nothing from its send loop until that
+/// peer's sporks are in (CNode::CanSendMessagesToPeer, Node.cpp:1025-1034):
+/// no keepalive ping and no inventory, while what its handlers answer (verack,
+/// getaddr, a pong) goes
+#[tokio::test]
+async fn a_dialled_peer_without_sporks_gets_no_ping_or_inventory() {
+    let (mut peer, (handle, _shutdown)) = dialled_peer().await;
+    handle
+        .send(NetworkMessage::Inv(vec![divi_network::InvItem::new(
+            divi_network::InvType::Block,
+            divi_primitives::hash::Hash256::from_bytes([4; 32]),
+        )]))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    send(&mut peer, NetworkMessage::Ping(9)).await;
+    let seen: Vec<String> = until_pong(&mut peer, 9)
+        .await
+        .iter()
+        .map(|m| m.command().to_string())
+        .collect();
+    assert_eq!(seen, ["verack", "getaddr"]);
+}
