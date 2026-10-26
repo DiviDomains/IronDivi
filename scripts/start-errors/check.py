@@ -80,6 +80,26 @@ def name_shape(c, i):
 NAMES = ("irondivid names itself and its version (IronDivi Daemon version v<irondivid's>) where divid prints "
          "Divi Core Daemon version v3.0.0 (divi/src/divid.cpp:70-85); same exit code", name_shape)
 
+def leveldb_shape(c, i):
+    """divid dies on its unreadable block index; irondivid refuses with exit 1"""
+    return (c[0] == i[0] == "exit" and c[1] == -6 and c[2].startswith("EXCEPTION: 13leveldb_error")
+            and i[1] == 1 and i[2].startswith("Error: Failed to open chain database"))
+
+
+LEVELDB = ("divid dies on the uncaught leveldb_error of its unreadable block index (\"EXCEPTION: "
+           "13leveldb_error\", SIGABRT; divi/src/init.cpp:1503-1531, divid.cpp AppInit's catch-all); irondivid "
+           "refuses with exit 1 and the error", leveldb_shape)
+
+
+def early_bind_files(c, i):
+    """divid checks -bind in step 6, after its wallet backup; irondivid before it writes anything"""
+    return c == ["backups +1"] and i == []
+
+
+EARLY_BIND = ("divid resolves -bind in step 6 (divi/src/net.cpp:1806-1811), after its pid file and its wallet "
+              "backup (init.cpp:1479); irondivid reads -bind with the other options, before it takes the lock, "
+              "and makes no backup", early_bind_files)
+
 KNOWN = {
     "start -maxtxfee=abc": ABORT,
     "start -maxtxfee=-1": ABORT,
@@ -98,6 +118,11 @@ KNOWN = {
         "N5boost10filesystem16filesystem_errorE ... Permission denied\", divi/src/divid.cpp AppInit's catch-all "
         "rethrows, SIGABRT); irondivid refuses with exit 1 and the error",
         lambda c, i: c[0] == i[0] == "exit" and c[1] == -6 and i[1] == 1 and i[2].startswith("Error")),
+    "the chain cannot be opened": LEVELDB,
+    "the chain cannot be opened, -hdseed in divi.conf": LEVELDB,
+    "the chain cannot be opened, no masternode.conf": LEVELDB,
+    "-listen=1 -bind=garbage": ABORT,
+    "-listen=1 -bind=garbage: files": EARLY_BIND,
     "-?: first line": NAMES,
     "-help: first line": NAMES,
     "--help: first line": NAMES,
@@ -270,6 +295,39 @@ class Node:
         return False
 
 
+def net_dir(n):
+    return os.path.join(n.dir, "regtest") if n is C else n.dir
+
+
+def wallet_path(n):
+    return os.path.join(net_dir(n), "wallet.dat" if n is C else "wallet")
+
+
+def snapshot(n):
+    d = net_dir(n)
+    backups = os.path.join(d, "backups")
+    return {"backups": len(os.listdir(backups)) if os.path.isdir(backups) else 0,
+            "moved": sum(1 for f in os.listdir(d) if f.endswith(".moved")) if os.path.isdir(d) else 0,
+            "wallet": os.path.exists(wallet_path(n)),
+            "mnconf": os.path.exists(os.path.join(d, "masternode.conf"))}
+
+
+def made(n, before):
+    """What a start did to the data directory, next to `before` (a snapshot):
+    a wallet backup, the wallet moved for a restore, a wallet or masternode.conf made"""
+    after = snapshot(n)
+    out = []
+    if after["backups"] > before["backups"]:
+        out.append(f"backups +{after['backups'] - before['backups']}")
+    if after["moved"] > before["moved"]:
+        out.append("wallet moved")
+    if after["wallet"] and not before["wallet"]:
+        out.append("wallet made")
+    if after["mnconf"] and not before["mnconf"]:
+        out.append("masternode.conf made")
+    return out
+
+
 def show(o):
     if o[0] == "up":
         return "up" if o[1] in (C.rpcport, I.rpcport) else f"up on port {o[1] - PORT_BASE:+d}"
@@ -289,12 +347,13 @@ def same_outcome(c, i):
 
 
 def case(name, args=(), extra=(), drop=(), conf=None, restore=True, alt_port=None, warn=None,
-         setup=None, datadir=True):
+         setup=None, datadir=True, files=False):
     """Start both with the same case; compare the outcome, then stop them.
     args: argv after -datadir; extra/drop: divi.conf lines added or keys left
     out; conf: a function node -> divi.conf text; alt_port: another RPC port
     offset the node may answer on; warn: a pattern looked for in the log of a
-    node that starts; setup: a function node -> argv list, run before the start."""
+    node that starts; setup: a function node -> argv list, run before the start;
+    files: also compare what the start did to the data directory (made)."""
     results = {}
 
     def one(n):
@@ -302,6 +361,7 @@ def case(name, args=(), extra=(), drop=(), conf=None, restore=True, alt_port=Non
             n.restore()
         n.write_conf(conf(n) if conf else n.conf_text(extra, drop))
         argv = list(args) if setup is None else setup(n)
+        before = snapshot(n)
         if n is I and INJECT == name:
             argv = argv + [f"-datadir={os.path.join(WORK, 'injected-missing')}"]
         proc = n.launch(argv, datadir)
@@ -309,7 +369,7 @@ def case(name, args=(), extra=(), drop=(), conf=None, restore=True, alt_port=Non
         o = n.outcome(proc, ports)
         log = n.log_has(warn) if warn else None
         n.finish(proc, o)
-        results[n] = (o, log)
+        results[n] = (o, log, made(n, before))
 
     # Both nodes at once: they share nothing but the work directory
     threads = [threading.Thread(target=one, args=(n,)) for n in (C, I)]
@@ -317,11 +377,13 @@ def case(name, args=(), extra=(), drop=(), conf=None, restore=True, alt_port=Non
         t.start()
     for t in threads:
         t.join()
-    (c, lc), (i, li) = results[C], results[I]
+    (c, lc, fc), (i, li, fi) = results[C], results[I]
     logs = [lc, li]
     row(name, show(c), show(i), same_outcome(c, i), (c, i))
     if warn:
         row(f"{name}: warns", logs[0], logs[1], logs[0] == logs[1], (c, i))
+    if files:
+        row(f"{name}: files", fc, fi, fc == fi, (fc, fi))
     return c, i
 
 
@@ -436,6 +498,46 @@ def unreadable_conf(n):
 
 
 case("divi.conf unreadable", setup=unreadable_conf)
+
+# --- a start that fails part way: what it has done by then (init.cpp:1454-1598) --------
+
+
+def unreadable_chain(n):
+    """divid's block index, irondivid's chain database: neither opens"""
+    with open(os.path.join(net_dir(n), "blocks", "index", "CURRENT") if n is C
+              else os.path.join(n.dir, "chainstate", "CURRENT"), "w") as f:
+        f.write("garbage")
+    return []
+
+
+def unreadable_chain_and(more):
+    def setup(n):
+        more(n)
+        return unreadable_chain(n)
+    return setup
+
+
+def no_mnconf(n):
+    os.remove(os.path.join(net_dir(n), "masternode.conf"))
+
+
+def no_wallet(n):
+    p = wallet_path(n)
+    shutil.rmtree(p) if os.path.isdir(p) else os.remove(p)
+    return ["-masternode=1"]
+
+
+# step 5's wallet backup, then step 7 fails
+case("the chain cannot be opened", setup=unreadable_chain, files=True)
+# step 4 moves the wallet for the restore (the seed in the 0600 divi.conf: BIP32 test vector 1)
+case("the chain cannot be opened, -hdseed in divi.conf", extra=["hdseed=000102030405060708090a0b0c0d0e0f"],
+     setup=unreadable_chain, files=True)
+# step 10 reads masternode.conf, and makes it when missing
+case("the chain cannot be opened, no masternode.conf", setup=unreadable_chain_and(no_mnconf), files=True)
+# step 10 stops at -masternode without its entry, after step 8 made the wallet
+case("-masternode=1 without its entry, no wallet", setup=no_wallet, files=True)
+# step 6 resolves -bind on a node that listens
+case("-listen=1 -bind=garbage", ["-listen=1", "-bind=garbage"], files=True)
 
 # --- data directories ----------------------------------------------------------------
 
