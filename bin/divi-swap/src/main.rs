@@ -73,6 +73,12 @@ struct Cli {
     /// endpoint; unset = single endpoint. Not used by the xmr arm.
     #[arg(long, global = true)]
     divi_fallback_rpc_url: Option<String>,
+    /// Where the DIVI lock-expiry sweep may start counting a dropped lock's absent blocks:
+    /// `tip` (default) counts at once from a tip whose own time is within two spacings of
+    /// the clock; `mtp` waits until the node's median time past reaches the first absent
+    /// check, however fresh the tip looks (about five blocks later on every release).
+    #[arg(long, global = true, default_value = "tip")]
+    divi_expiry_start: divi_swap::reservation::ExpiryStart,
     /// DIVI network: `testnet` (default) or `mainnet` (only with `--allow-mainnet`). Picks the
     /// DIVI RPC endpoint and address version; with `--profile` it must agree (not used by the
     /// xmr arm, whose DIVI side follows `--xmr-network`).
@@ -766,7 +772,15 @@ async fn sweep_locks(cli: &Cli, divi: &dyn ChainBackend, counter: &dyn ChainBack
             Err(e) => tracing::warn!(error = %e, "could not check taker locks for expiry"),
         }
     }
-    match divi_swap_cli::reservations::release_expired_divi(&store, &res, divi, now).await {
+    match divi_swap_cli::reservations::release_expired_divi(
+        &store,
+        &res,
+        divi,
+        now,
+        divi_swap::reservation::ExpiryStart::default(),
+    )
+    .await
+    {
         Ok(0) => {}
         Ok(n) => tracing::info!(
             n,
@@ -3194,6 +3208,80 @@ mod tests {
             vec![lock_of(&s)],
             "the wallet file gets the lock's inputs back too"
         );
+    }
+
+    #[tokio::test]
+    async fn the_divi_lock_sweep_starts_each_count_where_divi_expiry_start_says() {
+        use divi_swap::reservation::{ExpiryStart, EXPIRY_ABSENT_BLOCKS};
+        let dir = tempfile::tempdir().unwrap();
+        let args = |db: &std::path::Path, start: Option<&'static str>| {
+            let mut a = vec![
+                "--backend".to_string(),
+                "live".into(),
+                "--counter-chain".into(),
+                "btc".into(),
+                "--db".into(),
+                db.to_str().unwrap().into(),
+            ];
+            if let Some(s) = start {
+                a.extend(["--divi-expiry-start".into(), s.into()]);
+            }
+            a
+        };
+        let parse = |a: &[String]| cli(&a.iter().map(String::as_str).collect::<Vec<_>>());
+        let db = dir.path().join("x.db");
+        assert_eq!(parse(&args(&db, None)).divi_expiry_start, ExpiryStart::Tip);
+        assert_eq!(
+            parse(&args(&db, Some("mtp"))).divi_expiry_start,
+            ExpiryStart::Mtp
+        );
+        let Err(e) = Cli::try_parse_from(
+            ["divi-swap".to_string()]
+                .into_iter()
+                .chain(args(&db, Some("median")))
+                .chain(
+                    [
+                        "quote",
+                        "--maker",
+                        "http://x",
+                        "--offer",
+                        "o",
+                        "--btc-sats",
+                        "1",
+                    ]
+                    .map(String::from),
+                ),
+        ) else {
+            panic!("--divi-expiry-start median parsed");
+        };
+        let e = e.to_string();
+        assert!(e.contains("--divi-expiry-start"), "{e}");
+
+        let mut released_at = Vec::new();
+        for (i, start) in [None, Some("tip"), Some("mtp")].into_iter().enumerate() {
+            let db = dir.path().join(format!("cli{i}.db"));
+            let (c, b) = divi_chain();
+            let s = locked_swap(&db, b.as_ref(), "dropped", TakerState::Locked, 1).await;
+            c.forget(&lock_of(&s));
+            c.advance_time(3_601);
+            // Tips that look fresh (swept at the tip's own time) while MTP trails them by
+            // five blocks.
+            b.set_tip_lead(5 * 60);
+            let cli = parse(&args(&db, start));
+            let first = c.height();
+            loop {
+                sweep_locks(&cli, b.as_ref(), idle_btc().as_ref(), c.mtp() + 5 * 60).await;
+                if held(&db).is_empty() {
+                    break;
+                }
+                assert!(c.height() < first + 20, "{start:?}: never released");
+                c.mine(1);
+            }
+            assert_eq!(b.released_locks(), vec![lock_of(&s)]);
+            released_at.push(c.height() - first);
+        }
+        let n = EXPIRY_ABSENT_BLOCKS;
+        assert_eq!(released_at, [n, n, n + 4]);
     }
 
     #[tokio::test]

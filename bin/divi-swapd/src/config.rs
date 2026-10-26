@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use divi_swap::api::{Direction, Offer};
+use divi_swap::reservation::ExpiryStart;
 use divi_swap::{Chain, Profile};
 use serde::Deserialize;
 
@@ -59,6 +60,10 @@ pub struct DiviSection {
     pub wallet_path: Option<PathBuf>,
     /// First block height to scan for wallet UTXOs.
     pub scan_from_height: Option<u64>,
+    /// Where the expiry sweep may start counting a dropped DIVI lock's absent blocks:
+    /// `"tip"` (the default) or `"mtp"` ([`DiviSection::expiry_start`]).
+    #[serde(default)]
+    pub expiry_start: Option<String>,
 }
 
 fn default_divi_network() -> String {
@@ -81,6 +86,11 @@ impl DiviSection {
             Some(u) => u.clone(),
             None => swap_chain_divi::default_rpc(self.network()?).to_string(),
         })
+    }
+
+    /// `expiry_start`: `"tip"` when absent.
+    pub fn expiry_start(&self) -> Result<ExpiryStart> {
+        Ok(ExpiryStart::Tip)
     }
 
     /// `fallback_rpc_url` when set and non-blank; an identical URL to `rpc_url` is refused
@@ -544,6 +554,14 @@ impl DaemonConfig {
         Ok(Some(t.to_string()))
     }
 
+    /// `[divi].expiry_start`, `"tip"` without a `[divi]` section.
+    pub fn divi_expiry_start(&self) -> Result<ExpiryStart> {
+        Ok(match &self.divi {
+            Some(d) => d.expiry_start()?,
+            None => ExpiryStart::default(),
+        })
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading config {}", path.display()))?;
@@ -863,6 +881,24 @@ key = "credential:btc"
             "[divi]\nkey",
             "[divi]\nnetwork = \"mainnet\"\nallow_mainnet = true\nkey",
         )
+    }
+
+    #[test]
+    fn divi_expiry_start_is_tip_by_default_takes_mtp_and_refuses_anything_else() {
+        let d = DaemonConfig::parse(GOOD).unwrap().divi.unwrap();
+        assert_eq!(d.expiry_start().unwrap(), ExpiryStart::Tip);
+        let with = |value: &str| {
+            DaemonConfig::parse(
+                &GOOD.replace("[divi]\n", &format!("[divi]\nexpiry_start = \"{value}\"\n")),
+            )
+        };
+        let start = |value: &str| with(value).unwrap().divi.unwrap().expiry_start().unwrap();
+        assert_eq!(start("tip"), ExpiryStart::Tip);
+        assert_eq!(start("mtp"), ExpiryStart::Mtp);
+        for bad in ["median", "MTP", ""] {
+            let e = format!("{:#}", with(bad).unwrap_err());
+            assert!(e.contains("[divi].expiry_start"), "{bad:?}: {e}");
+        }
     }
 
     #[test]
