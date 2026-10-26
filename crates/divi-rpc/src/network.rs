@@ -685,6 +685,40 @@ mod tests {
         panic!("no listening port could be bound in 5 tries");
     }
 
+    /// Take the client's messages as the node's message loop does
+    /// (crates/divi-node/src/node.rs): the sporkcount a dialled peer sends goes to a
+    /// spork manager (`NetworkMessage::SporkCount`), and every message is counted as
+    /// taken once handled.
+    /// A peer we dialled is sent no ping until its sporks are in, as Divi Core's
+    /// CNode::CanSendMessagesToPeer (Node.cpp:1025-1034); the server here tells its
+    /// count, 0, as a Core peer does after its verack (main.cpp:417-419)
+    fn handle_sporks(client: &Arc<PeerManager>) {
+        let mut events = client.subscribe();
+        let sporks = divi_network::SporkManager::new(Arc::clone(client));
+        let peers = Arc::clone(client);
+        tokio::spawn(async move {
+            loop {
+                match events.recv().await {
+                    // Each message is handled, then counted as taken, which lets
+                    // the connection's answers to later ones (a pong) go out
+                    Ok(divi_network::PeerEvent::Message {
+                        peer_id,
+                        message,
+                        size,
+                    }) => {
+                        if let divi_network::NetworkMessage::SporkCount(count) = message {
+                            sporks.handle_sporkcount(peer_id, count).await;
+                            peers.release_held(peer_id);
+                        }
+                        peers.message_taken(peer_id, size);
+                    }
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+    }
+
     /// Two nodes on localhost: the per-peer counters and the in/out split must be real.
     /// getpeerinfo used to show pingtime 0 (no ping until 30 s in, then rounded to whole
     /// milliseconds) and getnetworkinfo had no in/out split, so `-getinfo` printed 0/0.
@@ -693,6 +727,7 @@ mod tests {
         use std::time::Duration;
         let (server, listen) = listening_server().await;
         let client = PeerManager::new(quiet_config());
+        handle_sporks(&client);
         let mut connected = false;
         for _ in 0..50 {
             if Arc::clone(&client).connect_to_peer(listen).await.is_ok() {
@@ -752,6 +787,7 @@ mod tests {
         use std::time::Duration;
         let (server, listen) = listening_server().await;
         let client = PeerManager::new(quiet_config());
+        handle_sporks(&client);
         let mut connected = false;
         for _ in 0..50 {
             if Arc::clone(&client).connect_to_peer(listen).await.is_ok() {
