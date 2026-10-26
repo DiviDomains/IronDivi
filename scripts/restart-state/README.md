@@ -64,8 +64,6 @@ Each KNOWN row checks the difference is exactly the one below; any other outcome
 - `file blocks/`, `file db.log`, `file wallet.dat`, `file mncache.dat`, `file sporks/`: irondivid keeps the same data
   in its own stores (blocks and the masternode list and sporks in its chain database, the wallet in `wallet/`), not in
   files of divid's format; divid never reads irondivid's data directory.
-- `file mnpayments.dat`: irondivid keeps no payment votes across a restart; it has them from peers again (divid writes
-  the file, and reads it only with a masternode list, `MasternodeModule.cpp:270-277`).
 - `files only irondivid has`: `wallet/` and `txindex/`, its own stores.
 - `mncache.dat empty|truncated|garbage: start`: divid refuses to start on a `mncache.dat` it cannot read ("Error:
   Failed to load masternode cache from"): `CFlatDB::Load` gives up on anything but a readable header with bad data
