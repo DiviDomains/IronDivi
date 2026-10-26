@@ -137,6 +137,8 @@ episode) and the remaining steps, so every comparison stays exact:
   irondivid's agrees with the same coins. divid keeps each wallet transaction's balance in
   `CachedUtxoBalanceCalculator` (`CachedUtxoBalanceCalculator.cpp:13-30`), recomputed only when a wallet transaction
   spending it is added (`wallet.cpp:1242-1333`). So a spend that the mempool drops still counts as spending the coin.
+  The coins compared are `listunspent 1` and the confirmed locked coins, which `getbalance` counts and `listunspent`
+  leaves out.
 - **maturity window:** only the middle of an `invalidate` differs, by one or two coins of one value, with mempools
   of one size, and the end states agree. The two sides had spent different coins of that value (divid's choice among
   equal coins is by txid order, which shows only in the coins' depths). With the tip lowered, one of those coins sits
@@ -157,8 +159,9 @@ episode) and the remaining steps, so every comparison stays exact:
   it. irondivid stores the key, and copying divid would throw a private key and its coins away. In a twin run both
   divid pairs lose the key alike.
 - **rebroadcast timing:** after a restart, only the restarted node's mempool, unconfirmed balance or unconfirmed coins
-  differ, and each side's restarted node holds only transactions its peer holds too. divid sends some mempool
-  transactions to its peers again at a random time within 30 minutes (`PeriodicallyRebroadcastMempoolTxs`,
+  differ, and each side's restarted node holds only transactions its peer holds too, besides transactions of the same
+  output values on both sides (its own sends, which reach the peer again by the same rebroadcast). divid sends some
+  mempool transactions to its peers again at a random time within 30 minutes (`PeriodicallyRebroadcastMempoolTxs`,
   `main.cpp:1280-1294`; irondivid does the same since `fix/random-sequences`). Whether the restarted node has the
   peer's transactions back by then is chance.
 

@@ -898,10 +898,21 @@ def maturity_explains(n, mid_heights):
 
 
 def confirmed_sum(node):
+    """The confirmed coins getbalance counts: listunspent 1, and the locked
+    coins listunspent leaves out but getbalance counts"""
     coins = node.call("listunspent", 1)
-    if coins[0] != "ok":
+    locked = node.call("listlockunspent")
+    if coins[0] != "ok" or locked[0] != "ok":
         return None
-    return round(sum(float(u["amount"]) for u in coins[1]), 8)
+    total = sum(float(u["amount"]) for u in coins[1])
+    for o in locked[1]:
+        tx = node.call("gettransaction", o["txid"])
+        if tx[0] != "ok" or tx[1].get("confirmations", 0) < 1:
+            continue
+        decoded = node.call("decoderawtransaction", tx[1]["hex"])
+        if decoded[0] == "ok":
+            total += float(decoded[1]["vout"][o["vout"]]["value"])
+    return round(total, 8)
 
 
 def balance_cache_explains():
@@ -957,12 +968,23 @@ def maturity_window_explains(c_mid, i_mid, diff):
 
 def rebroadcast_explains(n):
     """After a restart of node n: on each side node n's mempool holds nothing
-    its peer does not, and the two sides differ only in what node n got back"""
+    its peer does not, but for transactions of the same output values on both
+    sides (node n's own sends, which reach the peer again only by the same
+    rebroadcast), and the two sides differ only in what node n got back"""
+    extras = []
     for pair in PAIRS:
-        mine, theirs = pair.node(n).call("getrawmempool"), pair.other(n).call("getrawmempool")
-        if mine[0] != "ok" or theirs[0] != "ok" or not set(mine[1]) <= set(theirs[1]):
+        node = pair.node(n)
+        mine, theirs = node.call("getrawmempool"), pair.other(n).call("getrawmempool")
+        if mine[0] != "ok" or theirs[0] != "ok":
             return False
-    return True
+        values = []
+        for txid in set(mine[1]) - set(theirs[1]):
+            tx = node.call("getrawtransaction", txid, 1)
+            if tx[0] != "ok":
+                return False
+            values.append(sorted(str(o["value"]) for o in tx[1]["vout"]))
+        extras.append(sorted(values))
+    return extras[0] == extras[1]
 
 
 if REPLAY:
