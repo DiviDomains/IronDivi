@@ -150,3 +150,45 @@ async fn stop_on_a_quiet_node_is_quick() {
     eprintln!("stop on a quiet node took {} ms", took.as_millis());
     assert!(took < Duration::from_secs(5), "stop took {took:?}");
 }
+
+/// A seed lookup still under way at the stop adds nothing when it returns:
+/// stop waits for it, as Divi Core's join_all waits for the dnsseed thread
+/// (divid.cpp:42-53), and what it gives after the stop began is dropped. The
+/// fake resolver answers 240.0.0.77, an address of no host, after 3 s; with
+/// -connect set nothing is dialled either way
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_seed_lookup_that_returns_after_stop_adds_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = NodeConfig::regtest(ChainMode::Divi);
+    config.data_dir = dir.path().to_path_buf();
+    config.p2p.listen_addr = "127.0.0.1".into();
+    config.p2p.port = 53807;
+    config.p2p.listen = Some(true);
+    config.p2p.enable_discovery = false;
+    config.p2p.connect = vec!["127.0.0.1:53817".into()];
+    config.p2p.dns_seed = Some(true);
+    config.p2p.force_dns_seed = true;
+    config.network.dns_seeds = vec!["slow-seed.invalid".into()];
+    let n = Node::new(config).unwrap();
+    let resolver: divi_network::SeedResolver = std::sync::Arc::new(|_name: String| {
+        Box::pin(async {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            Ok(vec!["240.0.0.77:51476".parse().unwrap()])
+        })
+    });
+    n.peer_manager().set_seed_resolver(resolver);
+    let book = n.peer_manager().address_book().clone();
+    assert_eq!(book.len(), 0);
+    n.start().await.unwrap();
+    let _ = connect(53807).await;
+    // The lookup has begun (start dials its -connect peer, refused at once,
+    // then looks the seed up)
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    n.stop().await.unwrap();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        book.len(),
+        0,
+        "the seed's address went into the address book after stop began"
+    );
+}

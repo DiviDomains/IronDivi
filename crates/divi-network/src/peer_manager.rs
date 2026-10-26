@@ -1043,6 +1043,13 @@ impl PeerManager {
                 Some(resolve) => resolve(name).await,
                 None => tokio::net::lookup_host(name).await.map(|a| a.collect()),
             };
+            // A lookup that returns once the node has begun to stop adds
+            // nothing: Divi Core's dnsseed thread is interrupted and joined at
+            // shutdown (divid.cpp:42-53)
+            if self.is_stopping() {
+                debug!("DNS seed {} answered after the stop began; not used", seed);
+                break;
+            }
             match resolved {
                 Ok(addrs) => {
                     // Into the book, as divid adds what a seed gives (net.cpp ThreadDNSAddressSeed)
