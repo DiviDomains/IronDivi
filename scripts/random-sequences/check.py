@@ -360,6 +360,24 @@ def input_values(node, txid):
 
 
 TRACE = os.environ.get("RANDOM_SEQUENCES_TRACE", "") == "1"
+# The middle of an invalidate, for chasing a difference there:
+# RANDOM_SEQUENCES_MID_TRACE=1 logs each side's mempool (txids) with a time,
+# before the invalidate, when it returns, at the read and for 4 s after;
+# RANDOM_SEQUENCES_MID_DELAY=<s> waits that long between the return and the
+# read; RANDOM_SEQUENCES_MID_BARRIER=1 makes the two pairs read together
+MID_TRACE = os.environ.get("RANDOM_SEQUENCES_MID_TRACE", "") == "1"
+MID_DELAY = float(os.environ.get("RANDOM_SEQUENCES_MID_DELAY") or 0)
+MID_BARRIER = threading.Barrier(2) if os.environ.get("RANDOM_SEQUENCES_MID_BARRIER", "") == "1" else None
+T0 = time.monotonic()
+
+
+def mid_trace(pair, node, when):
+    if not MID_TRACE:
+        return
+    pool = node.call("getrawmempool")
+    ids = sorted(t[:8] for t in pool[1]) if pool[0] == "ok" else pool
+    log(f"#   mid {time.monotonic() - T0:9.3f} {pair.name} {node.name} {when}: "
+        f"height {node.call('getblockcount')[1]} pool {ids}")
 
 
 def trace_mempool(pair, node, when):
@@ -459,10 +477,29 @@ def run_step(pair, step):
         for h in range(height - depth + 1, height + 1):
             txs = node.rpc("getblock", node.rpc("getblockhash", h))["tx"]
             block_txs += [t for t in txs[1:] if not is_coinstake(pair, t)]
+        mid_trace(pair, node, "before")
+        mid_trace(pair, other, "before (other)")
+        if MID_TRACE:
+            log(f"#   mid {pair.name} disconnects {[t[:8] for t in block_txs]}")
         first = node.call("invalidateblock", target)
+        mid_trace(pair, node, "returned")
         trace_mempool(pair, node, f"after invalidateblock of {height - depth + 1}")
+        if MID_DELAY:
+            time.sleep(MID_DELAY)
+        if MID_BARRIER:
+            try:
+                MID_BARRIER.wait(60)
+            except threading.BrokenBarrierError:
+                MID_BARRIER.reset()
         mid = snapshot(node)
         mid_pool = node.call("getrawmempool")
+        if MID_TRACE:
+            log(f"#   mid {time.monotonic() - T0:9.3f} {pair.name} {node.name} read: size "
+                f"{mid['mempool size']} pool {sorted(t[:8] for t in mid_pool[1]) if mid_pool[0] == 'ok' else mid_pool}")
+            for d in (0.2, 0.5, 1, 2, 4):
+                time.sleep(d - (0 if d == 0.2 else {0.5: 0.2, 1: 0.5, 2: 1, 4: 2}[d]))
+                mid_trace(pair, node, f"+{d} s")
+            mid_trace(pair, other, "+4 s (other)")
         pair.reorg = {"mid": height - depth, "block_txs": block_txs,
                       "mid_pool": set(mid_pool[1]) if mid_pool[0] == "ok" else None}
         # the coins in full, printed with a FAIL but not compared
@@ -1197,12 +1234,31 @@ if REPLAY:
 else:
     steps = draw_steps(SEED, STEPS)
 
-log(f"# random-sequences: SEED={SEED} STEPS={STEPS}" + (f" REPLAY={REPLAY}" if REPLAY else ""))
+# Fixed rows, run first on nodes of their own in every seeded run: stored
+# episodes of a case the draw reaches only now and then (README, "Fixed rows")
+ROWS = [] if REPLAY or os.environ.get("RANDOM_SEQUENCES_ROWS", "1") == "0" else ["mid-invalidate"]
+row_steps = []
+for row in ROWS:
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "rows", row + ".json")) as f:
+        row_steps += [dict(s, row=row) for s in json.load(f)] + [{"kind": "end of row", "row": row}]
+steps = row_steps + steps
+
+log(f"# random-sequences: SEED={SEED} STEPS={STEPS}" + (f" REPLAY={REPLAY}" if REPLAY else "")
+    + (f" rows first: {', '.join(ROWS)}" if ROWS else ""))
+encrypted_at_start = set(ENCRYPTED)
 new_episode()
 episode_steps = []
 fails = 0
 started = time.time()
 for step in steps:
+    if step["kind"] == "end of row":
+        # the seeded steps start on fresh nodes, as they would without the row
+        log(f"# fixed row {step['row']} done")
+        ENCRYPTED.clear()
+        ENCRYPTED.update(encrypted_at_start)
+        new_episode()
+        episode_steps = []
+        continue
     spec = json.dumps(step, sort_keys=True)
     episode_steps.append(step)
 
@@ -1222,7 +1278,7 @@ for step in steps:
         return result, settled
 
     (c_res, c_settled), (i_res, i_settled) = both(apply)
-    if INJECT and str(step["i"]) == INJECT:
+    if INJECT and str(step["i"]) == INJECT and "row" not in step:
         i_res = ("injected", i_res[1])
     n = step["node"]
     # The two states, read again for a while if they differ: a wallet can
@@ -1292,7 +1348,7 @@ for step in steps:
     if diff:
         fails += 1
         log(f"FAIL   {line}")
-        log(f"#   seed {SEED}, episode {episode}, step {spec}")
+        log(f"#   " + (f"fixed row {step['row']}" if "row" in step else f"seed {SEED}") + f", episode {episode}, step {spec}")
         for k in diff:
             if k == "outcome":
                 log(f"#   outcome: divid {c_res[0]!r} irondivid {i_res[0]!r}")
@@ -1371,6 +1427,6 @@ for step in steps:
     log(f"PASS   {line}")
 
 keep_logs(f"episode{episode}")
-log(f"# {len(steps)} steps planned, {episode} episode(s), ran for {int(time.time() - started)} s")
+log(f"# {len(steps) - len(row_steps)} steps planned" + (" after the fixed rows" if ROWS else "") + f", {episode} episode(s), ran for {int(time.time() - started)} s")
 log(f"FAILS {fails}")
 sys.exit(min(fails, 254))

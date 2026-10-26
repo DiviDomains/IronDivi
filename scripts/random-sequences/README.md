@@ -23,8 +23,9 @@ what does not depend on keys or hashes is compared:
 - the mempool size and the height;
 - for `invalidate`, all of these also between `invalidateblock` and `reconsiderblock`.
 
-Txids and block hashes differ between the pairs, so which coin a send spends or which coin stakes can differ, and with
-it the change values and which stake outputs are still immature. Those fields are still compared exactly. A difference
+Txids and block hashes can differ between the pairs (a block made a second later, a stake kernel found at another
+time), so which coin a send spends or which coin stakes can differ, and with it the change values and which stake
+outputs are still immature. Those fields are still compared exactly. A difference
 that one of divid's accidental choices explains (below) is logged as `KNOWN`, with its reason, and the run goes on
 with four fresh nodes. For the stake outputs, the rules check that each side's balance plus immature balance agree.
 
@@ -55,6 +56,10 @@ SEED=7 scripts/random-sequences/run.sh target/release ~/divi-3.0.0/bin 53850 /va
 | `RANDOM_SEQUENCES_LOGS` | a folder to copy the four logs to, for each episode and on a FAIL |
 | `RANDOM_SEQUENCES_DEBUG` | `1`: irondivid logs at debug level and divid with `debug=mempool` |
 | `RANDOM_SEQUENCES_TWIN` | `1`: the second pair runs divid too, in irondivid's place, to see the differences divid has with itself on the same seed. The twins restore the phrases from `-mnemonic`, a line of their 0600 `divi.conf`. The line is taken out again once the wallet is made, as divid reads it at every start |
+| `RANDOM_SEQUENCES_ROWS` | `0`: leave out the fixed rows (below) that a seeded run starts with |
+| `RANDOM_SEQUENCES_MID_TRACE` | `1`: for each `invalidate`, each side's mempool (txids) with the time, before it, when `invalidateblock` returns, at the read and for 4 s after, and the transactions of the blocks it disconnects |
+| `RANDOM_SEQUENCES_MID_DELAY` | seconds to wait between `invalidateblock` returning and the read of the middle state (0) |
+| `RANDOM_SEQUENCES_MID_BARRIER` | `1`: the two pairs read the middle state of an `invalidate` together, once both calls have returned |
 | `RANDOM_SEQUENCES_TRACE` | `1`: before and after each `invalidateblock`, the node's mempool is printed, each transaction with its inputs (`txid:vout@height/kind`) and its outputs |
 
 A run of 200 steps takes 2 to 10 minutes. However it ends, all nodes are stopped and their directories deleted. It
@@ -76,6 +81,26 @@ Secrets:
    seed. A node whose step has already run in an earlier episode is encrypted at the setup and unlocked for 99999 s.
 3. The nodes run with `staking=0` (blocks come from `setgenerate` and `generateblock`) and `keypool=5`, so a locked
    wallet runs out of keypool keys within a few calls.
+
+## Fixed rows
+
+A seeded run first runs the stored episodes in `rows/`, each on four fresh nodes of its own, then the seeded steps
+on fresh nodes again (with the encryption state they would have had without the rows). Each row is a case the draw
+reaches only now and then, so it is checked on every run. They are left out with `REPLAY` or `RANDOM_SEQUENCES_ROWS=0`.
+
+- `rows/mid-invalidate.json`: seed 14, steps 143-160, ending in a three-block `invalidate` on node 1 with sends of
+  both nodes in the mempool. In about half the runs the two sides' mempools differ in the middle of it. Both nodes
+  put the disconnected blocks' transactions back before `invalidateblock` returns: divid in `disconnectTip`
+  (`ChainTipManager.cpp:176-183`), irondivid in the RPC's reorg hook (`blockchain.rs` `invalidate_block_family`,
+  `node.rs` `update_mempool_after_reorg`). Traced runs, loaded or not, read early or late, never saw a mempool change
+  after the call returned. The middle sizes differ because the two sides had spent different coins of one value
+  before the invalidate (divid's coin choice among equal coins is by txid order), so a different send spends a coin
+  that is immature at the lowered height. That is the **maturity after a reorg** or **maturity in the middle of a
+  reorg** row below, and every other field is still compared. The two sides parted this way far more often than two
+  divid pairs did (26 of 218 middle states against 1 of 66), because irondivid's work blocks wrote a coinbase
+  scriptSig of their own: the height, then the height again as four raw bytes, where divid writes the height, then the
+  extra nonce 1 (`BlockFactory.cpp:38-52`). So no coinbase txid matched divid's, even for a block made in the same
+  second. irondivid now writes divid's.
 
 ## Steps
 
