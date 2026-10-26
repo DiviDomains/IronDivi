@@ -53,7 +53,12 @@ def note(text):
     print(f"# [{time.time() - T0:7.1f}s] {text}", flush=True)
 
 
-KNOWN = {}
+KNOWN = {
+    "SIGTERM during -reindex: getblockcount then below the chain's height":
+        "divid's -reindex connects every block again from its block files, so its height climbs from 0 "
+        "(init.cpp:663-680); irondivid's builds its indexes from the blocks it stored and keeps its chain state "
+        "(crates/divi-node/src/node.rs, ReindexPlan) [by design]",
+}
 # Fields irondivid adds on purpose (KNOWN in scripts/chain-replies): compared without them
 EXTRA = {"getblock": {"mediantime", "nTx"}, "gettxoutsetinfo": {"bogosize"}}
 # gettxoutsetinfo fields made from each node's own files (as scripts/coin-locks, unclean-stop)
@@ -597,9 +602,54 @@ def reindex(n, extra):
                   "gettxoutsetinfo": {k: x for k, x in u.items() if k not in OWN_FILES | EXTRA["gettxoutsetinfo"]}}
 
 
+# A SIGTERM during the reindex. divid reindexes in its import thread, started once the wallet is loaded;
+# RPC answers once init is done (the warm-up ends, init.cpp:1639) while the reindex goes on (init.cpp:663-728,
+# :1580). A stop then exits 0, and the next start goes on with the reindex (BlockIndexLoading.cpp:287-290).
+# irondivid's reindex builds its indexes from the blocks it stored, in about a second here: it is held at its
+# start (IRONDIVI_PAUSE_AT, honoured by a build with --features fault-injection) so the signal comes while it
+# runs. The signal goes a second after RPC answers, once divid's init has returned (as scripts/process-signals).
+REINDEX_HOLD = {"IRONDIVI_PAUSE_AT": "reindex", "IRONDIVI_PAUSE_SECS": "8"}
+
+
+def reindexes_finished(n):
+    """How many times the node logged the end of a -reindex (both log divid's line, init.cpp:681)"""
+    log = os.path.join(n.dir, "regtest", "debug.log") if n.binary == DIVID else os.path.join(n.dir, "debug.log")
+    try:
+        with open(log, errors="replace") as f:
+            return f.read().count("Reindexing finished")
+    except OSError:
+        return 0
+
+
+def reindex_stopped(n, extra):
+    n.stop()
+    before = reindexes_finished(n)
+    n.start(extra, ["-reindex"], env=REINDEX_HOLD if n.binary == IRONDIVID else None)
+    time.sleep(1)
+    out = {"the reindex was still running when signalled": reindexes_finished(n) == before}
+    info, count = n.call("getinfo"), n.call("getblockcount")
+    out["getinfo and getblockcount answered then"] = [info[0], count[0]]
+    out["getblockcount then below the chain's height"] = count[0] == "ok" and count[1] < HEIGHT
+    os.kill(n.proc.pid, signal.SIGTERM)
+    try:
+        out["exit code"] = n.proc.wait(timeout=600)
+    except subprocess.TimeoutExpired:
+        out["exit code"] = "still running"
+        n.kill()
+    n.start(extra)
+    out["the next start: reached the tip"] = on_tip(n)
+    out["the next start finished the reindex"] = wait_for(lambda: reindexes_finished(n) > before, 600, 0.5)
+    u = n.rpc("gettxoutsetinfo")
+    out["the next start: gettxoutsetinfo"] = {k: x for k, x in u.items() if k not in OWN_FILES | EXTRA["gettxoutsetinfo"]}
+    return out
+
+
 I1.stop()
 D2.stop()
 alone = [f"connect={HOST}:{PORT_BASE + 49}", "listen=0", "disablewallet=1"]
+core_s, iron_s = reindex_stopped(D2, alone), reindex_stopped(I1, alone)
+for k in core_s:
+    row(f"SIGTERM during -reindex: {k}", core_s[k], iron_s[k])
 TIMES["-reindex", "divid"], core_r = reindex(D2, alone)
 TIMES["-reindex", "irondivid"], iron_r = reindex(I1, alone)
 for k in core_r:
