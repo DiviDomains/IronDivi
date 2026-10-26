@@ -306,6 +306,62 @@ fn spent_collateral_shows_after_a_check() {
     );
 }
 
+/// The minute timer drops a masternode whose collateral is spent, and one
+/// whose last ping is older than the removal time, from the list
+/// (MasternodeNetworkMessageManager.cpp:36-56)
+#[test]
+fn spent_and_removed_masternodes_leave_the_list_as_divid() {
+    let n = funded();
+    let (spent, vout, _, signed) = set_up(&n, "mn1", 16);
+    n.ok("broadcaststartmasternode", vec![json!(signed)]);
+    let (kept, _, _, signed) = set_up(&n, "mn2", 16);
+    n.ok("broadcaststartmasternode", vec![json!(signed)]);
+    let hex = n.ok("getrawtransaction", vec![json!(spent)]);
+    let prev: Transaction =
+        divi_primitives::serialize::deserialize(&hex::decode(hex.as_str().unwrap()).unwrap())
+            .unwrap();
+    let to = n.wallet.new_receiving_address().unwrap();
+    let (mut tx, prevs) = TransactionBuilder::new()
+        .add_input(
+            OutPoint::new(prev.txid(), vout),
+            prev.vout[vout as usize].script_pubkey.clone(),
+        )
+        .add_output_to_address(Amount::from_sat(99 * COIN), &to)
+        .build();
+    TransactionSigner::new(n.wallet.keystore())
+        .sign_all_inputs(&mut tx, &prevs)
+        .unwrap();
+    n.sent.lock().push(tx);
+    n.mine();
+    n.list.check_collateral(&n.chain);
+    let listed = |n: &Node| -> Vec<(String, String)> {
+        n.ok("listmasternodes", vec![])
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| {
+                (
+                    e["txhash"].as_str().unwrap().to_string(),
+                    e["status"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect()
+    };
+    let mut both = listed(&n);
+    both.sort();
+    let mut want = vec![
+        (spent.clone(), "VIN_SPENT".to_string()),
+        (kept.clone(), "ENABLED".to_string()),
+    ];
+    want.sort();
+    assert_eq!(both, want);
+    n.list.remove_inactive(now());
+    assert_eq!(listed(&n), vec![(kept.clone(), "ENABLED".to_string())]);
+    // 130 minutes without a ping: REMOVE, and dropped
+    n.list.remove_inactive(now() + 131 * 60);
+    assert_eq!(listed(&n), vec![]);
+}
+
 /// A payment vote (mnw) of a ranked masternode for the payee at the top of
 /// the queue is counted and shown by getmasternodewinners; the same vote
 /// again is not new, a second payee from the same masternode for the height

@@ -499,6 +499,35 @@ impl MasternodeList {
         }
     }
 
+    /// Drop the masternodes whose collateral is spent, whose last ping is
+    /// past the removal time, or whose protocol is below the active one, with
+    /// their seen broadcasts and the record of asking for them
+    /// (MasternodeNetworkMessageManager.cpp:36-56, :132-155)
+    pub fn remove_inactive(&self, now: i64) {
+        let removed: Vec<NetworkMasternode> = {
+            let mut entries = self.entries.write();
+            let (gone, kept) = std::mem::take(&mut *entries).into_iter().partition(|e| {
+                matches!(e.status(now), "VIN_SPENT" | "REMOVE")
+                    || e.mnb.protocol_version < ACTIVE_PROTOCOL
+            });
+            *entries = kept;
+            gone
+        };
+        if removed.is_empty() {
+            return;
+        }
+        {
+            let mut seen = self.seen_broadcasts.write();
+            let mut asked = self.asked_entries.lock();
+            for e in &removed {
+                let vin = (e.mnb.vin.prevout_hash, e.mnb.vin.prevout_n);
+                seen.retain(|_, b| (b.vin.prevout_hash, b.vin.prevout_n) != vin);
+                asked.remove(&vin);
+            }
+        }
+        self.save();
+    }
+
     pub fn entries(&self) -> Vec<NetworkMasternode> {
         self.entries.read().clone()
     }
