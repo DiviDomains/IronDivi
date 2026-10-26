@@ -64,14 +64,14 @@ divid, but their masternodes were set up and started by different controllers.
 | silver | the same set-up and start for a second masternode of each controller (300 DIVI), on M3 and M4 |
 | restarts | C and I stopped and started; then M1 and M2 |
 | collateral spent | each controller spends its copper collateral; its status on C and on I 1, 2 and 6 blocks later |
-| payments (`MN_LIFE_PAYMENTS=1`) | C first pays I twelve coins of 200 DIVI to new addresses; 25 minutes after the starts the chain passes height 110, then 20 blocks are mined in turn by C and by I. After each: `getmasternodewinners 20` on both (waiting up to 30 s for the votes to settle), and the block's masternode payments and what it minted. At the end: whether divid's winners carry votes, how many blocks of each miner pay a masternode, and what a block mints |
+| payments (`MN_LIFE_PAYMENTS=1`) | C first pays I twelve coins of 200 DIVI to new addresses; 25 minutes after the starts the chain passes height 110, then 20 blocks are mined in turn by C and by I. After each: `getmasternodewinners 20` on both (waiting up to 30 s for the votes to settle), and the block's masternode payments and what it minted. At the end: whether divid's winners carry votes, how many blocks of each miner pay a masternode, what a block mints, and the masternodes `listmasternodes` keeps and each one's `lastpaid`, once the votes settled, and whether any has a time |
 
 How a row compares:
 - the same outcome; an error with the same code and first line;
 - a result with the same fields, JSON types and values, the members compared as sets; the order of the members
   is compared once, for `setupmasternode`.
 - Left out, because they change from one moment to the next: `lastseen`, `activetime`, `lastpaid`, `sigtime`,
-  `timestamp`.
+  `timestamp`; `lastpaid` is compared once, at the end of the payments phase.
 - `mnsync status` is compared by its fields and by `IsBlockchainSynced` and `currentMasternodeSyncStatus`; its counters
   and times are each node's own.
 - The sync stages of C and I from their start until the network is up (every node finished its sync, 999), and

@@ -577,7 +577,13 @@ if PAYMENTS:
     # I stakes ten blocks below. A stake combines the wallet's coins paying the
     # kernel's script, and a coinstake output needs 20 confirmations before it
     # stakes again (wallet.cpp:1452-1457), so I gets twelve coins of its own,
-    # each to a new address, well before they are needed
+    # each to a new address, well before they are needed. The silver
+    # collaterals are locked, so neither is staked and both masternodes stay
+    # to vote (locked coins are not available, AvailableUtxoCalculator.cpp:91)
+    for alias in ("mnc2", "mni2"):
+        d = mn[alias]
+        need(d["controller"].call("lockunspent", False, [{"txid": d["txhash"], "vout": d["vout"]}]) == ("ok", True),
+             f"{d['controller'].name} could not lock the {alias} collateral")
     for _ in range(12):
         C.rpc("sendtoaddress", I.rpc("getnewaddress"), 200)
     mine(C, 1)
@@ -639,6 +645,22 @@ if PAYMENTS:
     row("payments: blocks that pay a masternode", pays[C.name], pays[I.name], pays[C.name] == pays[I.name])
     minted = {n: sorted({m for _, m in v}) for n, v in views_by.items()}
     row("payments: what a block mints", minted[C.name], minted[I.name], minted[C.name] == minted[I.name])
+
+    # listmasternodes' lastpaid: the time of the newest of the last
+    # (masternodes x 5 / 4) blocks whose payees give the masternode two votes,
+    # plus its DeterministicTimeOffset (RpcMasternodeFeatures.cpp:244-277,
+    # :289; masternode.cpp:219-227). Compared once the votes settled, as the
+    # rows above leave it out
+    def lastpaid(node):
+        out = node.call("listmasternodes")
+        return {e["txhash"]: e["lastpaid"] for e in out[1]} if out[0] == "ok" else show(out)
+    wait_for(lambda: lastpaid(C) == lastpaid(I), 30)
+    paid_c, paid_i = lastpaid(C), lastpaid(I)
+    row("payments: listmasternodes lastpaid", paid_c, paid_i, paid_c == paid_i)
+    # Whether any is paid: only when two masternodes are left to vote, as the
+    # spent ones leave the lists (MasternodeNetworkMessageManager.cpp:36-56)
+    found_c, found_i = (isinstance(p, dict) and any(p.values()) for p in (paid_c, paid_i))
+    row("payments: a masternode has a lastpaid", found_c, found_i, found_c == found_i)
 
 for n in NODES:
     n.stop()
