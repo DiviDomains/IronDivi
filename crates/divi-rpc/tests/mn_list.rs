@@ -809,3 +809,145 @@ fn votes_follow_the_nodes_masternode_sync() {
     assert_eq!(vote(7, payee_script(&mnb), &other).unwrap_err().dos, 20);
     assert!(vote(8, vec![0x51], &mn_key).is_err());
 }
+
+/// regtest's network magic number (chainparams.cpp, the unit-test and
+/// regtest networks)
+const REGTEST_MAGIC: [u8; 4] = [0xa1, 0xcf, 0x7e, 0xac];
+
+/// A node with one masternode and its vote for height 110, as in
+/// payment_votes_are_counted_as_divid_counts_them; the vote's hash
+fn voted() -> (Node, [u8; 32]) {
+    let n = funded();
+    let (_, _, _, signed) = set_up(&n, "mn1", 16);
+    let wif = n_key(&n).lock().clone().unwrap();
+    n.ok("broadcaststartmasternode", vec![json!(signed)]);
+    while n.chain.height() < 100 {
+        n.mine();
+    }
+    let key = divi_crypto::SecretKey::from_bytes(&divi_wallet::decode_wif(&wif).unwrap().key_bytes)
+        .unwrap();
+    let mnb = n.list.entries()[0].mnb.clone();
+    let mut vote = divi_masternode::cpp_wire::CppWinner {
+        vin: mnb.vin.clone(),
+        height: 110,
+        payee: payee_script(&mnb),
+        signature: vec![],
+    };
+    vote.sign(&key).unwrap();
+    assert_eq!(n.votes.accept(&n.chain, &n.list, &vote.encode()), Ok(true));
+    let hash = vote.hash();
+    (n, hash)
+}
+
+/// The payment votes are written at a stop as Divi Core writes mnpayments.dat
+/// (CFlatDB: the magic message, the network's magic number, the votes, their
+/// double SHA-256; flat-database.h, MasternodeModule.cpp:284-297) and read back
+/// at a start: getmasternodewinners shows them again
+#[test]
+fn payment_votes_come_back_from_mnpayments_dat() {
+    use divi_rpc::mn_votes::{PaymentsFile, PAYMENTS_FILE};
+    let (n, hash) = voted();
+    let path = n.dir.path().join(PAYMENTS_FILE);
+    assert!(n.votes.save(&path, REGTEST_MAGIC).unwrap());
+    let bytes = std::fs::read(&path).unwrap();
+    let magic = b"magicMasternodePaymentsCache";
+    assert_eq!(bytes[0] as usize, magic.len());
+    assert_eq!(&bytes[1..1 + magic.len()], magic);
+    assert_eq!(&bytes[1 + magic.len()..5 + magic.len()], &REGTEST_MAGIC);
+    let (data, checksum) = bytes.split_at(bytes.len() - 32);
+    assert_eq!(divi_crypto::double_sha256(data), checksum);
+
+    let before = n.ok("getmasternodewinners", vec![json!("1")]);
+    let again = Arc::new(MasternodeVotes::new());
+    assert_eq!(
+        again.load(&path, REGTEST_MAGIC, n.chain.height() as i64),
+        PaymentsFile::Loaded(1)
+    );
+    assert!(again.is_known(&hash));
+    n.server.set_masternode_votes(again);
+    assert_eq!(n.ok("getmasternodewinners", vec![json!("1")]), before);
+}
+
+/// A file that is not a votes file of this network (a wrong checksum, another
+/// network's magic number) is Invalid: divid then refuses to start and leaves
+/// the file as it is (CFlatDB::Load and ::Dump, flat-database.h). A file whose
+/// checksum is right but whose votes do not parse is taken as empty and
+/// written anew ("will try to recreate")
+#[test]
+fn a_bad_mnpayments_dat_is_handled_as_divid_handles_it() {
+    use divi_rpc::mn_votes::{PaymentsFile, PAYMENTS_FILE};
+    let (n, _) = voted();
+    let path = n.dir.path().join(PAYMENTS_FILE);
+    n.votes.save(&path, REGTEST_MAGIC).unwrap();
+    let good = std::fs::read(&path).unwrap();
+
+    let mut corrupt = good.clone();
+    let middle = corrupt.len() / 2;
+    corrupt[middle] ^= 0xff;
+    std::fs::write(&path, &corrupt).unwrap();
+    let fresh = MasternodeVotes::new();
+    assert!(matches!(
+        fresh.load(&path, REGTEST_MAGIC, 100),
+        PaymentsFile::Invalid(_)
+    ));
+    assert!(!fresh.save(&path, REGTEST_MAGIC).unwrap());
+    assert_eq!(std::fs::read(&path).unwrap(), corrupt, "left as it was");
+
+    std::fs::write(&path, &good).unwrap();
+    assert!(matches!(
+        MasternodeVotes::new().load(&path, [0xdf, 0xa0, 0x8d, 0x8f], 100),
+        PaymentsFile::Invalid(_)
+    ));
+
+    // Right checksum and magic, votes cut short
+    let magic = b"magicMasternodePaymentsCache";
+    let mut short = vec![magic.len() as u8];
+    short.extend_from_slice(magic);
+    short.extend_from_slice(&REGTEST_MAGIC);
+    short.extend_from_slice(&[5, 0xaa]);
+    let checksum = divi_crypto::double_sha256(&short);
+    short.extend_from_slice(&checksum);
+    std::fs::write(&path, &short).unwrap();
+    let fresh = MasternodeVotes::new();
+    assert_eq!(
+        fresh.load(&path, REGTEST_MAGIC, 100),
+        PaymentsFile::BadFormat
+    );
+    assert!(fresh.save(&path, REGTEST_MAGIC).unwrap());
+    assert_ne!(std::fs::read(&path).unwrap(), short, "written anew");
+
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(
+        MasternodeVotes::new().load(&path, REGTEST_MAGIC, 100),
+        PaymentsFile::Missing
+    );
+}
+
+/// Votes for heights more than 1000 below the tip are dropped when the file is
+/// read, with their block's counts, as pruneOutdatedMasternodeWinners drops
+/// them (MasternodePaymentData.cpp:46-61, MasternodeModule.cpp:515-519)
+#[test]
+fn old_payment_votes_are_pruned_on_load() {
+    use divi_rpc::mn_votes::{PaymentsFile, PAYMENTS_FILE};
+    let (n, hash) = voted();
+    let path = n.dir.path().join(PAYMENTS_FILE);
+    n.votes.save(&path, REGTEST_MAGIC).unwrap();
+    let kept = MasternodeVotes::new();
+    assert_eq!(
+        kept.load(&path, REGTEST_MAGIC, 1110),
+        PaymentsFile::Loaded(1)
+    );
+    assert!(kept.is_known(&hash), "1000 below the tip is kept");
+    let pruned = MasternodeVotes::new();
+    assert_eq!(
+        pruned.load(&path, REGTEST_MAGIC, 1111),
+        PaymentsFile::Loaded(1)
+    );
+    assert!(!pruned.is_known(&hash), "1001 below the tip is dropped");
+    // Written again, the pruned votes are gone from the file too
+    pruned.save(&path, REGTEST_MAGIC).unwrap();
+    assert_eq!(
+        MasternodeVotes::new().load(&path, REGTEST_MAGIC, 0),
+        PaymentsFile::Loaded(0)
+    );
+}

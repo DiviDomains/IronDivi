@@ -68,6 +68,7 @@ no earlier than the 15th-confirmation block (masternodeman.cpp:221-227).
 | votes of a masternode younger than 25 minutes, of one not in the list (a `dseg` back), for a height 30 ahead | not taken (masternode-payments.cpp:203-248, :548-620) |
 | after the wait: a good vote; the same again; getdata for it; a second payee from the same masternode; a bad signature (a `dseg` back); a payee not in the queue | taken and announced by inv 7, then as listed (masternode-payments.cpp:203-331) |
 | a newer broadcast after five minutes; getdata for it | updates the entry, announced with its ping; not kept as seen, so `notfound` (masternodeman.cpp:288-307) |
+| a restart of both, on the same data directories | the winners at the voted heights are the same as before the stop: the votes are written to mnpayments.dat at the stop and read back at the start (init.cpp:376, MasternodeModule.cpp:269-297) |
 
 Not in Divi Core 3.0.0, so not checked: a rule on the masternode's port, and a 10000-block rule.
 `CMasternode::IsValidNetAddr` is never called (masternode.cpp:229-235).
