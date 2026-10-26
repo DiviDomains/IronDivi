@@ -97,4 +97,4 @@ nodes are stopped and their directories deleted. RPC passwords are made at rando
 
 | row | divid | irondivid | reason |
 |---|---|---|---|
-| `getaddr after 100 addresses, no routable local address` | 0 | 1 or more | divid keeps no address of a network it has no routable local address in. IPv4 is reachable only once one is known, from `-externalip` or discovery (`NetworkLocalAddressHelpers.cpp:73-106`), and its `addr` handler keeps only reachable addresses (`main.cpp:544-553`). irondivid keeps them: matching it would leave a node without a public address (behind NAT, or `-discover=0`) with an empty address book |
+| `getaddr after 100 addresses, no routable local address` | 0 | 1 or more | divid keeps no address of a network it has no routable local address in. IPv4 is reachable only once one is known, from `-externalip` or discovery (`NetworkLocalAddressHelpers.cpp:73-106`), and its `addr` handler keeps only reachable addresses (`main.cpp:544-553`). irondivid keeps them, a deliberate deviation: matching it would leave a node without a public address (behind NAT, or `-discover=0`) with an empty address book (`docs/divid-differences.md` P3) |

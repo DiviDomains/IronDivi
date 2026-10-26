@@ -58,7 +58,8 @@ NO_LOCAL = ("divid counts IPv4 and IPv6 as reachable only once it knows a routab
             "(vfReachable starts false and only AddLocal sets it, NetworkLocalAddressHelpers.cpp:18, :73-79, "
             ":163-167), and keeps no gossiped address of an unreachable network (main.cpp:544-551): a node with "
             "-discover=0 and no -externalip, or behind NAT with only private interface addresses, never keeps one. "
-            "irondivid keeps them (crates/divi-node/src/node.rs, the addr handler)")
+            "irondivid keeps them, a deliberate deviation so that a node behind NAT still learns peers "
+            "(docs/divid-differences.md P3; crates/divi-network/src/gossip.rs:59-61)")
 KNOWN = {
     "no -externalip: addr of 10 public IPv4 addresses, kept": (
         NO_LOCAL, lambda c, i: c == ("ok", 0) and i[0] == "ok" and i[1] >= 9),

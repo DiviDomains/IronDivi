@@ -61,8 +61,9 @@ KNOWN = {
     "getaddr after 100 addresses, no routable local address: addresses sent": (
         "divid keeps no address of a network it has no routable local address in: IPv4 is reachable only once "
         "one is known (-externalip, discovery; NetworkLocalAddressHelpers.cpp:73-106), and its addr handler keeps "
-        "only reachable addresses (main.cpp:544-553). irondivid keeps them: matching it would leave a node "
-        "without a public address (behind NAT, or -discover=0) with an empty address book",
+        "only reachable addresses (main.cpp:544-553). irondivid keeps them, a deliberate deviation: matching it "
+        "would leave a node without a public address (behind NAT, or -discover=0) with an empty address book "
+        "(docs/divid-differences.md P3)",
         lambda c, i: c == ("ok", 0) and i[0] == "ok" and i[1] > 0),
 }
 
