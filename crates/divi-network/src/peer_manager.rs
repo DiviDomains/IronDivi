@@ -309,6 +309,40 @@ impl PeerManager {
         &self.gossip
     }
 
+    /// Whether a peer we dialled has yet to send its sporks, so that Divi Core sends it
+    /// nothing of its own (CNode::CanSendMessagesToPeer, Node.cpp:1025-1034)
+    pub fn waiting_for_sporks(&self, peer_id: PeerId) -> bool {
+        self.peers
+            .read()
+            .get(&peer_id)
+            .is_some_and(|h| h.stats.sporks_wait.load(Ordering::Acquire))
+    }
+
+    /// The peer's sporks are in: nothing is held back from it from now on, and its
+    /// first ping goes now, before what the node sends it next (Divi Core pings
+    /// before SendMessages, net.cpp:871-893)
+    pub fn sporks_arrived(&self, peer_id: PeerId) {
+        if let Some(handle) = self.peers.read().get(&peer_id) {
+            if handle.stats.sporks_arrived() {
+                let _ = handle.try_send(NetworkMessage::Ping(0));
+            }
+        }
+    }
+
+    /// Send what was held back from a peer while its sporks were out: after the
+    /// sync is started with it, as Divi Core's SendMessages asks for blocks before it
+    /// sends the inventory it kept (main.cpp:1304-1330)
+    pub fn release_held(&self, peer_id: PeerId) {
+        if let Some(handle) = self.peers.read().get(&peer_id) {
+            if handle.stats.sporks_wait.load(Ordering::Acquire) {
+                return;
+            }
+            for msg in handle.stats.take_held() {
+                let _ = handle.try_send(msg);
+            }
+        }
+    }
+
     /// Whether a connected peer is a `-seednode` peer, dropped after its addr
     pub fn is_one_shot(&self, peer_id: PeerId) -> bool {
         self.one_shot_peers.read().contains(&peer_id)

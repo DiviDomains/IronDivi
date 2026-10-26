@@ -349,6 +349,9 @@ impl SporkManager {
             .peer_manager
             .send_to_peer(peer_id, NetworkMessage::GetSporks)
             .await;
+        if count == 0 {
+            self.peer_manager.sporks_arrived(peer_id);
+        }
 
         self.emit_progress();
     }
@@ -434,6 +437,7 @@ impl SporkManager {
                         new_received
                     );
                     states.insert(peer_id, SporkSyncState::Synced);
+                    self.peer_manager.sporks_arrived(peer_id);
                 } else {
                     states.insert(
                         peer_id,

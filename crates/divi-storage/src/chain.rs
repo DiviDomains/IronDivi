@@ -705,6 +705,38 @@ impl Chain {
         Ok(indexed)
     }
 
+    /// Use `tx_index` for lookups and for the blocks connected from now on,
+    /// without filling it in: a -reindex fills it in later with
+    /// `build_tx_index`, while the node runs
+    pub fn attach_tx_index(&mut self, tx_index: Arc<TxIndex>) {
+        self.tx_index = Some(tx_index);
+    }
+
+    /// Fill in the attached `tx_index` for every active block, as
+    /// `rebuild_tx_index` does, stopping between two blocks once `stop` is
+    /// set: the blocks indexed, or None if stopped. Divi Core's import thread
+    /// reindexes so while the node runs (init.cpp:686-690, :1580).
+    pub fn build_tx_index(
+        &self,
+        tx_index: &TxIndex,
+        stop: &std::sync::atomic::AtomicBool,
+    ) -> Result<Option<u32>, StorageError> {
+        pause_point!("reindex");
+        let Some(tip) = self.tip() else {
+            return Ok(Some(0));
+        };
+        let mut indexed = 0;
+        for height in 1..=tip.height {
+            if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                return Ok(None);
+            }
+            indexed += self.index_tx_blocks_between(tx_index, height, height, true)?;
+        }
+        // and the blocks connected meanwhile once more, so the index records
+        // the tip as the newest block it holds
+        Ok(Some(indexed + self.catch_up_tx_index(tx_index)?))
+    }
+
     /// Whether `tx_index` holds the first transaction of `samples` active
     /// blocks spread from block 1 to the tip: an index kept since the chain
     /// began does, one switched on later (or never built) does not
@@ -767,8 +799,19 @@ impl Chain {
         let Some(tip) = self.tip() else {
             return Ok(0);
         };
+        self.index_tx_blocks_between(tx_index, from, tip.height, every_block)
+    }
+
+    /// Index the transactions of the active blocks from `from` to `to`
+    fn index_tx_blocks_between(
+        &self,
+        tx_index: &TxIndex,
+        from: u32,
+        to: u32,
+        every_block: bool,
+    ) -> Result<u32, StorageError> {
         let mut indexed = 0;
-        for height in from.max(1)..=tip.height {
+        for height in from.max(1)..=to {
             let block = match self.db.get_height_mapping(height)? {
                 Some(hash) => self.db.get_block(&hash)?.map(|b| (hash, b)),
                 None => None,
@@ -829,9 +872,40 @@ impl Chain {
     /// since the indexes would miss entries.
     pub fn rebuild_search_index(&mut self, search: Arc<SearchIndex>) -> Result<u32, StorageError> {
         search.clear()?;
-        let tip = self.height();
+        let never = std::sync::atomic::AtomicBool::new(false);
+        let built = self
+            .write_search_entries(&search, self.height(), &never)?
+            .unwrap_or_default();
+        self.search_index = Some(search);
+        Ok(built)
+    }
+
+    /// Write the entries of the active blocks from block 1 to `to` into the
+    /// attached, cleared `search` indexes, as `rebuild_search_index` does,
+    /// stopping between two blocks once `stop` is set: the blocks written, or
+    /// None if stopped. The blocks connected above `to` wrote their own
+    /// entries as they connected. Divi Core's import thread reindexes so
+    /// while the node runs (init.cpp:686-690, :1580).
+    pub fn build_search_index(
+        &self,
+        search: &SearchIndex,
+        to: u32,
+        stop: &std::sync::atomic::AtomicBool,
+    ) -> Result<Option<u32>, StorageError> {
+        self.write_search_entries(search, to, stop)
+    }
+
+    fn write_search_entries(
+        &self,
+        search: &SearchIndex,
+        to: u32,
+        stop: &std::sync::atomic::AtomicBool,
+    ) -> Result<Option<u32>, StorageError> {
         let mut built = 0;
-        for height in 1..=tip {
+        for height in 1..=to {
+            if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                return Ok(None);
+            }
             let missing = |what: &str| {
                 StorageError::ChainState(format!(
                     "{} of block {} is not stored, so the address and spent indexes cannot cover it",
@@ -876,8 +950,7 @@ impl Chain {
             search.apply_connect(&updates)?;
             built += 1;
         }
-        self.search_index = Some(search);
-        Ok(built)
+        Ok(Some(built))
     }
 
     /// The address and spent indexes, when enabled

@@ -31,5 +31,6 @@ futures = "0.3"
 
 [dev-dependencies]
 divi-test-support = { workspace = true }
+libc = "0.2"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tempfile = { workspace = true }

@@ -5,6 +5,7 @@ carrying transactions. Then it compares, with irondivid:
 
 - a sync from scratch both ways: irondivid from divid, then a divid from that irondivid alone;
 - a sync stopped twice on each node (a clean stop, then a kill) and started again;
+- a SIGTERM during a `-reindex` on each node, and what RPC answers then;
 - `-reindex` on each node;
 - a wallet restored from the chain owner's phrase with `-rescan` on each node.
 
@@ -21,7 +22,7 @@ interrupted, or over 3 hours).
 scripts/large-sync/run.sh <irondivid-bin-dir> <core-bin-dir> <port-base> [root]
 
 # for example, with a release build of this tree
-cargo build --release -p irondivid
+cargo build --release -p irondivid --features fault-injection
 scripts/large-sync/run.sh target/release ~/divi-3.0.0/bin 54250 /var/tmp
 ```
 
@@ -69,6 +70,7 @@ chain's tip; a node whose height stops moving for 10 minutes fails the row (or t
 |---|---|
 | sync from scratch | irondivid synced from divid, then a divid synced from that irondivid alone, each against the node it synced from: the tip (height, hash), the hash at every 100th height, `gettxoutsetinfo`, `getchaintips`, `getblock` for about 20 heights (1, 100-102, 250, 400, 1001, the middle, the last two, and ten seeded ones) |
 | sync stopped | a divid and an irondivid each sync from irondivid, are stopped cleanly at one seeded height and killed at another (the same two heights for both), and started again each time (with `-reindex` if a start fails, as `scripts/unclean-stop`): started again, reached the tip, `gettxoutsetinfo`; and irondivid's `gettxoutsetinfo` against the chain's |
+| SIGTERM during `-reindex` | each node alone, started with `-reindex` and sent SIGTERM a second after RPC answers (once divid's init has returned, as `scripts/process-signals`): that the reindex was still running (no new `Reindexing finished` in the log); whether `getinfo` and `getblockcount` answered then, and whether the height was below the chain's; the exit code; at the next start (no `-reindex`), the tip, that it finished the reindex, and `gettxoutsetinfo` |
 | `-reindex` | each node alone (no peers): the tip and `gettxoutsetinfo` |
 | restart | each node stopped and started: the tip |
 | restored wallet | each node restarted with an empty wallet restored from the owner's phrase and `-rescan`: `getbalance`, the `listtransactions` entries, the `listunspent` coins, `getwalletinfo` `txcount` |
@@ -89,6 +91,25 @@ Left out of the comparisons:
   `scripts/coin-locks`, `scripts/unclean-stop`);
 - the fields irondivid adds (`KNOWN` by design in `scripts/chain-replies`): `getblock` `mediantime` and `nTx`,
   `gettxoutsetinfo` `bogosize`; and `getblock` `confirmations`, which moves with each node's tip.
+
+## A stop during `-reindex`
+
+divid reindexes in its import thread, started once the wallet is loaded; RPC answers once init is done (its warm-up
+ends, `init.cpp:1639`) while the reindex goes on (`init.cpp:663-728`, `:1580`). Every RPC then answers from the
+chain as far as it has come: no call is refused during an import, the only gate being the warm-up's -28 with the
+init step (`rpcserver.cpp:965-970`). A stop during the reindex exits 0, and the next start goes on with it
+(`BlockIndexLoading.cpp:287-290`). On this chain divid's reindex takes about a minute.
+
+irondivid's reindex builds its indexes from the blocks it stored (see Timing), in about a second here. In this case
+irondivid is held at the start of its reindex for 8 s (`IRONDIVI_PAUSE_AT=reindex`, which only a build with
+`--features fault-injection` honours), so the signal comes while it runs; without that build its `still running`
+row can fail.
+
+## KNOWN
+
+- `SIGTERM during -reindex: getblockcount then below the chain's height`: divid's `-reindex` connects every block
+  again, so its height climbs from 0 (`init.cpp:663-680`); irondivid's keeps its chain state
+  (`crates/divi-node/src/node.rs`, `ReindexPlan`). By design.
 
 ## Timing
 

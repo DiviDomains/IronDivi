@@ -245,6 +245,7 @@ impl Connection {
 
         let (outbound_tx, outbound_rx) = mpsc::channel(OUTBOUND_BUFFER);
         let stats = Arc::new(LivePeerStats::default());
+        stats.sporks_wait.store(true, Ordering::Release);
 
         let handle = PeerHandle {
             id: peer_id,
@@ -661,24 +662,24 @@ impl Connection {
         // message handler sends it before SendMessages (net.cpp:871-893); then
         // one each PING_INTERVAL after the last ping sent (a `ping` call included)
         let mut ping_timer = tokio::time::interval(PING_CHECK);
-        let first_ping = rand::random();
-        info.ping_nonce = Some(first_ping);
-        info.ping_time = Some(std::time::Instant::now());
-        let mut last_ping_sent = info.ping_time;
-        if let Err(e) = Self::write_message(
-            &mut writer,
-            &mut info,
-            magic,
-            &total_bytes_sent,
-            NetworkMessage::Ping(first_ping),
-        )
-        .await
-        {
-            error!(
-                "Failed to send keepalive ping to {}: {}",
-                crate::peer_log::peer(peer_id, info.addr),
-                e
-            );
+        let mut last_ping_sent = None;
+        // A peer we dialled is sent no ping until its sporks are in (Node.cpp:1032)
+        if !stats.sporks_wait.load(Ordering::Acquire) {
+            if let Err(e) = Self::send_first_ping(
+                &mut writer,
+                &mut info,
+                magic,
+                &total_bytes_sent,
+                &mut last_ping_sent,
+            )
+            .await
+            {
+                error!(
+                    "Failed to send keepalive ping to {}: {}",
+                    crate::peer_log::peer(peer_id, info.addr),
+                    e
+                );
+            }
         }
 
         // What the connection answers itself (pongs, rejects), each behind the
@@ -719,7 +720,10 @@ impl Connection {
                         break;
                     }
                     let now = std::time::Instant::now();
-                    if keepalive_ping_due(info.ping_nonce.is_some(), last_ping_sent, now) {
+                    // none before the first, which waits for a dialled peer's sporks
+                    if last_ping_sent.is_some()
+                        && keepalive_ping_due(info.ping_nonce.is_some(), last_ping_sent, now)
+                    {
                         let nonce = rand::random();
                         info.ping_nonce = Some(nonce);
                         info.ping_time = Some(now);
@@ -937,6 +941,28 @@ impl Connection {
         }
     }
 
+    /// The first keepalive ping, after what the version handler sent and before anything else
+    async fn send_first_ping<W: AsyncWriteExt + Unpin>(
+        writer: &mut W,
+        info: &mut PeerInfo,
+        magic: Magic,
+        total_bytes_sent: &Arc<AtomicU64>,
+        last_ping_sent: &mut Option<std::time::Instant>,
+    ) -> Result<(), NetworkError> {
+        let nonce = rand::random();
+        info.ping_nonce = Some(nonce);
+        info.ping_time = Some(std::time::Instant::now());
+        *last_ping_sent = info.ping_time;
+        Self::write_message(
+            writer,
+            info,
+            magic,
+            total_bytes_sent,
+            NetworkMessage::Ping(nonce),
+        )
+        .await
+    }
+
     /// Write a message the node queued for the peer, counted until written
     /// as Divi Core's nSendSize. A queued ping (the `ping` RPC) gets a fresh
     /// nonce and is timed like the keep-alive, so its pong updates pingtime
@@ -951,6 +977,12 @@ impl Connection {
         msg: NetworkMessage,
     ) -> Result<(), NetworkError> {
         let queued = msg.wire_size();
+        if stats.holds_back(&msg) {
+            // Divi Core keeps these for a peer whose sporks are out
+            stats.send_written(queued);
+            stats.hold(msg);
+            return Ok(());
+        }
         let msg = match msg {
             NetworkMessage::Ping(_) => {
                 let nonce = rand::random();
