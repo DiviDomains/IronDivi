@@ -60,7 +60,8 @@ pub const EXPIRY_ABSENT_BLOCKS: u64 = 6;
 
 /// How far behind the wall clock a backend's tip may be, in target block spacings, for the
 /// expiry sweep to count blocks from it at once. A tip further behind still counts, but only
-/// from its first block newer than the wall clock of the check that found the lock absent.
+/// from the first tip whose median time past reaches the wall clock of the check that found
+/// the lock absent.
 pub const EXPIRY_MAX_TIP_LAG_BLOCKS: u32 = 2;
 
 /// How far behind the wall clock a backend's tip may be, in seconds, for the expiry sweep to
@@ -344,10 +345,15 @@ impl InputReservations {
     /// Only blocks mined after that check count, so a syncing endpoint replaying old blocks
     /// never releases: a record made at a tip more than [`EXPIRY_MAX_TIP_LAG_BLOCKS`] target
     /// spacings behind `now` is pending, keeps that check's `now`, and follows the tip until
-    /// a tip block's time reaches it. If that block is the one right after the record's, the
-    /// record starts counting where it is; otherwise it moves to the tip and counts from
-    /// there. A sparse chain whose blocks come minutes apart therefore releases after the
-    /// usual [`EXPIRY_ABSENT_BLOCKS`] once they are mined.
+    /// the backend's median time past reaches it. A tip block's own time does not end it: a
+    /// miner may stamp a block up to [`EXPIRY_MAX_TIP_LEAD_SECS`] ahead of real time, so an
+    /// endpoint replaying blocks from before the check could show one past it, while MTP
+    /// (monotonic by consensus, the median of the last eleven blocks) cannot run ahead of
+    /// real time like that. If the tip at which MTP reaches it is the block right after the
+    /// record's, the record starts counting where it is; otherwise it moves to the tip and
+    /// counts from there. MTP trails the tip by about six blocks, so a pending record on a
+    /// sparse chain whose blocks come minutes apart releases about
+    /// [`EXPIRY_ABSENT_BLOCKS`] + 5 blocks after the first check, once they are mined.
     /// A lock in the mempool or on chain, or before its deadline, keeps its inputs; so does
     /// every reservation `locks` does not name (`divi-swapd --release-reservation` is the
     /// override for those). Each sweep reads the tip's height, hash and time from one block
@@ -440,8 +446,9 @@ impl InputReservations {
                     self.record_absence(chain, txid, &tip, pending)?;
                     continue;
                 }
-                Some((_, _, Some(after))) if tip.time < after && pending.is_some() => {
-                    // Still at blocks from before the first absent check: follow the tip.
+                Some((_, _, Some(after))) if mtp < after => {
+                    // MTP is still before the first absent check, so the tip may be a
+                    // replayed block from before it, whatever its own time says: follow it.
                     self.record_absence(chain, txid, &tip, Some(after))?;
                     continue;
                 }
