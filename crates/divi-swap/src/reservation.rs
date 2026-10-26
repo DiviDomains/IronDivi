@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS lock_absence (
     lock_txid           TEXT    NOT NULL,
     first_absent_height INTEGER NOT NULL,
     first_absent_hash   TEXT,
+    first_absent_after  INTEGER,
     PRIMARY KEY (chain, lock_txid)
 );
 CREATE TABLE IF NOT EXISTS expiry_tip (
@@ -58,8 +59,13 @@ CREATE TABLE IF NOT EXISTS expiry_tip (
 pub const EXPIRY_ABSENT_BLOCKS: u64 = 6;
 
 /// How far behind the wall clock a backend's tip may be, in target block spacings, for the
-/// expiry sweep to trust it.
+/// expiry sweep to count blocks from it at once. A tip further behind still counts, but only
+/// from its first block newer than the wall clock of the check that found the lock absent.
 pub const EXPIRY_MAX_TIP_LAG_BLOCKS: u32 = 2;
+
+/// How far behind the wall clock a backend's tip may be, in seconds, for the expiry sweep to
+/// check anything at all.
+pub const EXPIRY_MAX_TIP_AGE_SECS: u32 = 24 * 60 * 60;
 
 /// How far ahead of the wall clock a backend's tip time may be, in seconds, for the expiry
 /// sweep to trust it: the consensus future limit (`MAX_FUTURE_BLOCK_TIME` in Bitcoin Core and
@@ -72,11 +78,19 @@ fn tip_is_behind(tip_time: u32, spacing: Option<u32>, now: u32) -> bool {
     !spacing.is_some_and(|s| now.saturating_sub(tip_time) <= EXPIRY_MAX_TIP_LAG_BLOCKS * s)
 }
 
+/// A tip time more than [`EXPIRY_MAX_TIP_AGE_SECS`] behind `now`.
+fn tip_is_dead(tip_time: u32, now: u32) -> bool {
+    now.saturating_sub(tip_time) > EXPIRY_MAX_TIP_AGE_SECS
+}
+
 /// A tip time more than [`EXPIRY_MAX_TIP_LEAD_SECS`] ahead of `now`: no node would have
 /// accepted it, so the backend or the clock is wrong.
 fn tip_is_ahead(tip_time: u32, now: u32) -> bool {
     tip_time.saturating_sub(now) > EXPIRY_MAX_TIP_LEAD_SECS
 }
+
+/// A `lock_absence` row: its block height and hash, and the `now` a pending record waits for.
+type AbsenceRecord = (u64, Option<String>, Option<u32>);
 
 fn storage<E: std::fmt::Display>(e: E) -> SwapError {
     SwapError::Storage(e.to_string())
@@ -171,6 +185,21 @@ impl InputReservations {
             > 0;
         if !has_hash {
             conn.execute_batch("ALTER TABLE lock_absence ADD COLUMN first_absent_hash TEXT")
+                .map_err(storage)?;
+        }
+        // A table from before pending records: add the column. Its old rows were recorded
+        // at a tip within two spacings of the clock, so a NULL (counting) suits them.
+        let has_after: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('lock_absence') \
+                 WHERE name = 'first_absent_after'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map_err(storage)?
+            > 0;
+        if !has_after {
+            conn.execute_batch("ALTER TABLE lock_absence ADD COLUMN first_absent_after INTEGER")
                 .map_err(storage)?;
         }
         Ok(Self {
@@ -312,22 +341,31 @@ impl InputReservations {
     ///
     /// The first absent check past the deadline records its tip block (height and hash) in
     /// `lock_absence` (so a restart keeps it); a check that finds the lock clears the record.
+    /// Only blocks mined after that check count, so a syncing endpoint replaying old blocks
+    /// never releases: a record made at a tip more than [`EXPIRY_MAX_TIP_LAG_BLOCKS`] target
+    /// spacings behind `now` is pending, keeps that check's `now`, and follows the tip until
+    /// a tip block's time reaches it. If that block is the one right after the record's, the
+    /// record starts counting where it is; otherwise it moves to the tip and counts from
+    /// there. A sparse chain whose blocks come minutes apart therefore releases after the
+    /// usual [`EXPIRY_ABSENT_BLOCKS`] once they are mined.
     /// A lock in the mempool or on chain, or before its deadline, keeps its inputs; so does
     /// every reservation `locks` does not name (`divi-swapd --release-reservation` is the
     /// override for those). Each sweep reads the tip's height, hash and time from one block
-    /// ([`ChainBackend::tip_header`]), and checks only while that tip is fresh, in this
+    /// ([`ChainBackend::tip_header`]), and checks only while that tip is plausible, in this
     /// order:
-    /// - a tip time more than [`EXPIRY_MAX_TIP_LAG_BLOCKS`] target spacings behind `now`
-    ///   (unix seconds), or a backend that reports no spacing, is stale; so is a tip time
-    ///   more than [`EXPIRY_MAX_TIP_LEAD_SECS`] ahead of `now`. Nothing is checked, recorded
-    ///   or released, so a lagging endpoint can neither release nor reset a count;
+    /// - a tip time more than [`EXPIRY_MAX_TIP_AGE_SECS`] behind `now` (unix seconds), or a
+    ///   backend that reports no spacing, is stale; so is a tip time more than
+    ///   [`EXPIRY_MAX_TIP_LEAD_SECS`] ahead of `now`. Nothing is checked, recorded or
+    ///   released;
     /// - a tip height below the highest fresh one seen (`expiry_tip`) is a lagging fallback
     ///   endpoint or a reorg to a shorter chain: the records are kept, nothing is released,
     ///   and the high-water mark stays;
     /// - a record whose block is no longer on the backend's main chain
     ///   ([`ChainBackend::in_best_chain`]) was reorged out: it is replaced by one at the
     ///   current tip, so the count starts over. A record from before hashes were stored is
-    ///   re-anchored the same way.
+    ///   re-anchored the same way. A pending record is only ever moved forward, so neither
+    ///   a lagging endpoint (stopped by the high-water mark) nor a stale one can reset a
+    ///   counting record.
     ///
     /// Each case is logged. A backend error stops the sweep with the error and releases
     /// nothing more. Returns how many inputs were released.
@@ -351,7 +389,7 @@ impl InputReservations {
         }
         let tip = backend.tip_header().await?;
         let spacing = backend.target_block_secs();
-        if tip_is_behind(tip.time, spacing, now) {
+        if spacing.is_none() || tip_is_dead(tip.time, now) {
             tracing::warn!(
                 %chain,
                 height = tip.height,
@@ -362,6 +400,8 @@ impl InputReservations {
             );
             return Ok(0);
         }
+        // The `now` a record made at this tip waits for, unless it counts at once.
+        let pending = tip_is_behind(tip.time, spacing, now).then_some(now);
         if tip_is_ahead(tip.time, now) {
             tracing::warn!(
                 %chain,
@@ -395,12 +435,48 @@ impl InputReservations {
                 self.forget_absences(chain, |t| t == txid)?;
                 continue;
             }
-            let (first, hash) = match self.first_absent_block(chain, txid)? {
+            let (first, hash) = match self.absence(chain, txid)? {
                 None => {
-                    self.record_absence(chain, txid, &tip)?;
+                    self.record_absence(chain, txid, &tip, pending)?;
                     continue;
                 }
-                Some((first, None)) => {
+                Some((_, _, Some(after))) if tip.time < after && pending.is_some() => {
+                    // Still at blocks from before the first absent check: follow the tip.
+                    self.record_absence(chain, txid, &tip, Some(after))?;
+                    continue;
+                }
+                Some((first, Some(hash), Some(_))) if tip.height == first + 1 => {
+                    tracing::info!(
+                        %chain,
+                        %txid,
+                        first,
+                        height = tip.height,
+                        "first block after the absent check; the lock's count starts"
+                    );
+                    self.record_absence(
+                        chain,
+                        txid,
+                        &TipHeader {
+                            height: first,
+                            hash: hash.clone(),
+                            time: tip.time,
+                        },
+                        None,
+                    )?;
+                    (first, hash)
+                }
+                Some((first, _, Some(_))) => {
+                    tracing::info!(
+                        %chain,
+                        %txid,
+                        first,
+                        height = tip.height,
+                        "tip is past the absent check; the lock's count starts at the tip"
+                    );
+                    self.record_absence(chain, txid, &tip, None)?;
+                    continue;
+                }
+                Some((first, None, None)) => {
                     tracing::warn!(
                         %chain,
                         %txid,
@@ -408,10 +484,10 @@ impl InputReservations {
                         height = tip.height,
                         "lock absence record has no block hash; re-anchoring it at the tip"
                     );
-                    self.record_absence(chain, txid, &tip)?;
+                    self.record_absence(chain, txid, &tip, pending)?;
                     continue;
                 }
-                Some((first, Some(hash))) => (first, hash),
+                Some((first, Some(hash), None)) => (first, hash),
             };
             if first > tip.height {
                 continue;
@@ -434,7 +510,7 @@ impl InputReservations {
                     height = tip.height,
                     "first absent block was reorged out; restarting the count at the tip"
                 );
-                self.record_absence(chain, txid, &tip)?;
+                self.record_absence(chain, txid, &tip, pending)?;
             } else if tip.height >= first + EXPIRY_ABSENT_BLOCKS {
                 released += self.release_tx(chain, txid)?;
                 self.forget_absences(chain, |t| t == txid)?;
@@ -496,22 +572,56 @@ impl InputReservations {
             .map_err(storage)
     }
 
-    /// Record (or re-anchor) `lock`'s first absent check at `tip`.
-    fn record_absence(&self, chain: Chain, lock: &Txid, tip: &TipHeader) -> Result<()> {
+    /// `lock`'s absence record: its block (height, and hash unless it predates hashes) and,
+    /// while it is pending, the `now` of the check that made it.
+    fn absence(&self, chain: Chain, lock: &Txid) -> Result<Option<AbsenceRecord>> {
+        self.conn
+            .lock()
+            .query_row(
+                "SELECT first_absent_height, first_absent_hash, first_absent_after \
+                 FROM lock_absence WHERE chain = ?1 AND lock_txid = ?2",
+                params![chain.to_string(), lock.to_rpc_hex()],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)? as u64,
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, Option<u32>>(2)?,
+                    ))
+                },
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                e => Err(e),
+            })
+            .map_err(storage)
+    }
+
+    /// Record (or re-anchor) `lock`'s first absent check at `tip`, pending until a tip block
+    /// time reaches `after` if one is given.
+    fn record_absence(
+        &self,
+        chain: Chain,
+        lock: &Txid,
+        tip: &TipHeader,
+        after: Option<u32>,
+    ) -> Result<()> {
         self.conn
             .lock()
             .execute(
                 "INSERT INTO lock_absence \
-                 (chain, lock_txid, first_absent_height, first_absent_hash) \
-                 VALUES (?1, ?2, ?3, ?4) \
+                 (chain, lock_txid, first_absent_height, first_absent_hash, first_absent_after) \
+                 VALUES (?1, ?2, ?3, ?4, ?5) \
                  ON CONFLICT (chain, lock_txid) DO UPDATE SET \
                  first_absent_height = excluded.first_absent_height, \
-                 first_absent_hash = excluded.first_absent_hash",
+                 first_absent_hash = excluded.first_absent_hash, \
+                 first_absent_after = excluded.first_absent_after",
                 params![
                     chain.to_string(),
                     lock.to_rpc_hex(),
                     tip.height as i64,
-                    tip.hash
+                    tip.hash,
+                    after
                 ],
             )
             .map(|_| ())
@@ -830,18 +940,21 @@ mod tests {
         c.forget(&t);
         let locks = [(t, DEADLINE)];
         // The wall clock is three hours past the deadline; the endpoint replays the chain
-        // from an hour before the deadline, one block (60 s of chain time) per sweep, its
-        // tip always more than two spacings behind the clock.
-        let mut now = DEADLINE + 3 * 3_600;
+        // from an hour before the deadline, many blocks (60 s of chain time each) per second
+        // of wall clock, its tip always more than two spacings behind the clock.
+        let now = DEADLINE + 3 * 3_600;
         let mut sweeps = 0;
         while c.mtp() + 180 < now {
             assert_eq!(r.release_expired(&b, &locks, now).await.unwrap(), 0);
             c.mine(1);
-            now += 1;
             sweeps += 1;
         }
         assert!(sweeps > 200);
-        assert_eq!(held_by(&r), HashSet::from([t]), "replayed blocks never count");
+        assert_eq!(
+            held_by(&r),
+            HashSet::from([t]),
+            "replayed blocks never count"
+        );
         // Caught up: the count runs over the blocks mined after the first absent check.
         assert_eq!(r.release_expired(&b, &locks, now).await.unwrap(), 0);
         for i in 1..=EXPIRY_ABSENT_BLOCKS {
@@ -878,7 +991,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_lagging_backend_releases_nothing_and_records_nothing() {
+    async fn a_lagging_backend_releases_nothing_until_its_tip_passes_the_first_checks_clock() {
         let (c, b) = chain();
         let r = InputReservations::in_memory().unwrap();
         let t = lock(&r, &b, 1).await;
@@ -887,25 +1000,63 @@ mod tests {
         let locks = [(t, DEADLINE)];
         let limit = EXPIRY_MAX_TIP_LAG_BLOCKS * 600;
 
-        // Its tip is one second past two target spacings behind the wall clock.
-        let stale = |c: &MockChain| c.mtp() + limit + 1;
-        assert_eq!(r.release_expired(&b, &locks, stale(&c)).await.unwrap(), 0);
-        assert_eq!(r.first_absent_height(Chain::Btc, &t).unwrap(), None);
-        c.mine(EXPIRY_ABSENT_BLOCKS);
-        assert_eq!(r.release_expired(&b, &locks, stale(&c)).await.unwrap(), 0);
+        // A tip one second more than a day behind the wall clock: nothing is recorded.
+        let dead = c.mtp() + EXPIRY_MAX_TIP_AGE_SECS + 1;
+        assert_eq!(r.release_expired(&b, &locks, dead).await.unwrap(), 0);
         assert_eq!(r.first_absent_height(Chain::Btc, &t).unwrap(), None);
 
-        // A fresh view with an absent record in place: a stale one does not release it either.
-        assert_eq!(
-            r.release_expired(&b, &locks, c.mtp() + limit)
-                .await
-                .unwrap(),
-            0
-        );
-        c.mine(EXPIRY_ABSENT_BLOCKS);
+        // The wall clock stops ten blocks and one second past two spacings ahead of the
+        // tip: every block the endpoint catches up on was mined before the first check, so
+        // the record follows the tip and nothing is released, ten blocks on.
+        let now = c.mtp() + 10 * 600 + limit + 1;
+        for _ in 0..10 {
+            assert_eq!(r.release_expired(&b, &locks, now).await.unwrap(), 0);
+            assert_eq!(
+                r.first_absent_height(Chain::Btc, &t).unwrap(),
+                Some(c.height())
+            );
+            c.mine(1);
+        }
+        // Three more blocks, the tip still one second past two spacings behind: a tip newer
+        // than the first check moves the record there and starts the count.
+        c.mine(3);
+        let stale = |c: &MockChain| c.mtp() + limit + 1;
+        assert_eq!(r.release_expired(&b, &locks, stale(&c)).await.unwrap(), 0);
+        let live = c.height();
+        assert_eq!(r.first_absent_height(Chain::Btc, &t).unwrap(), Some(live));
+        c.mine(EXPIRY_ABSENT_BLOCKS - 1);
         assert_eq!(r.release_expired(&b, &locks, stale(&c)).await.unwrap(), 0);
         assert_eq!(held_by(&r), HashSet::from([t]));
-        assert_eq!(sweep(&r, &c, &b, &locks).await, 1);
+        c.mine(1);
+        assert_eq!(r.release_expired(&b, &locks, stale(&c)).await.unwrap(), 1);
+    }
+
+    #[test]
+    fn pending_records_from_older_tables_read_as_counting() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("swap.db");
+        {
+            // The DM table shape: a hash column, no pending column.
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE lock_absence (chain TEXT NOT NULL, lock_txid TEXT NOT NULL, \
+                 first_absent_height INTEGER NOT NULL, first_absent_hash TEXT, \
+                 PRIMARY KEY (chain, lock_txid));",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO lock_absence VALUES (?1, ?2, 7, 'ab')",
+                params![Chain::Btc.to_string(), Txid([1; 32]).to_rpc_hex()],
+            )
+            .unwrap();
+        }
+        let r = InputReservations::open(&db).unwrap();
+        assert_eq!(
+            r.absence(Chain::Btc, &Txid([1; 32])).unwrap(),
+            Some((7, Some("ab".into()), None))
+        );
+        drop(r);
+        InputReservations::open(&db).unwrap(); // a second open does not migrate again
     }
 
     #[tokio::test]
@@ -1212,6 +1363,8 @@ mod tests {
         assert!(!tip_is_behind(100, Some(600), 1_300));
         assert!(tip_is_behind(100, Some(600), 1_301));
         assert!(tip_is_behind(100, None, 100));
+        assert!(!tip_is_dead(100, 100 + 86_400));
+        assert!(tip_is_dead(100, 100 + 86_401), "a day behind the clock");
         assert!(
             !tip_is_behind(100, Some(600), 50) && !tip_is_ahead(100, 50),
             "a tip a little ahead of the clock is not stale"
