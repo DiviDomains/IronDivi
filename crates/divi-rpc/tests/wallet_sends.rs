@@ -696,6 +696,37 @@ fn a_send_keeps_its_change_key_after_logging_the_commit() {
     assert!(reserve < commit && commit < keep, "{log}");
 }
 
+/// A send that fails after it reserved its change key gives the key back
+/// under its number, as Divi Core's ReturnKey does (reservekey.cpp:44-51,
+/// wallet.cpp:2165-2177): the next send reserves the same number
+#[test]
+fn a_failed_send_returns_its_change_key_to_the_pool() {
+    let net = Net::new();
+    unsignable_coin(&net, 10 * COIN);
+    let rpc = net.rpc();
+    let (_, log) = logged(|| {
+        rpc.send_to_address(&p(vec![json!(dest().to_string()), json!(1)]))
+            .unwrap_err()
+    });
+    let reserve = at(&log, "keypool reserve ");
+    let number = log[reserve..]
+        .split_whitespace()
+        .nth(2)
+        .unwrap()
+        .to_string();
+    assert!(
+        at(&log, &format!("keypool return {number}\n")) > reserve,
+        "{log}"
+    );
+    assert!(!log.contains("keypool keep"), "{log}");
+
+    let (_, log) = logged(|| {
+        rpc.send_to_address(&p(vec![json!(dest().to_string()), json!(1)]))
+            .unwrap_err()
+    });
+    at(&log, &format!("keypool reserve {number}\n"));
+}
+
 /// A send the mempool takes logs SendMoney's "<txid's first 10 digits>:
 /// Relaying wtx SendMoney"; one it refuses does not (rpcwallet.cpp:778-788)
 #[test]

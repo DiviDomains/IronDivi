@@ -336,6 +336,14 @@ impl KeyStore {
             return false;
         }
         *index -= 1;
+        // After the counter's lock, which number_pool takes after the pool's
+        drop(index);
+        // Back in the pool under its number, as Divi Core's ReturnKey puts the
+        // index back in its set (wallet.cpp:2165-2177)
+        if let Some((is_change, child, number)) = self.reserved.write().remove(&address.hash) {
+            self.pool_numbers.write().insert((is_change, child), number);
+            tracing::info!("keypool return {}", number);
+        }
         true
     }
 
