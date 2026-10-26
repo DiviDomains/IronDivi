@@ -103,22 +103,16 @@ episode) and the remaining steps, so every comparison stays exact:
   descendants from the mempool with it (`remove(..., true)`, `txmempool.cpp:91-126`). `reconsiderblock` confirms the
   parent again, but the child stays gone.
 - **stake coin choice:** a `mine` step past the last work block, after which only node n's balances and coins differ.
-  On both sides each new block staked the coin divid's rule picks: the first, in outpoint order, of the wallet's
-  coins that are unlocked, have 10 confirmations at that block, and were not spent by an earlier block of the step.
-  divid tries its stake set in `std::set` order (`StakableCoin.h:21-24`), shuffled only with `-vault`
-  (`PoSTransactionCreator.cpp:63-72`, `:99`, `:261`), and on regtest the first coin tried finds its proof. The set
-  holds the coins of `CWallet::SelectStakeCoins` (`wallet.cpp:1433-1465`): depth 10, and no coin age on regtest
-  (`chainparams.cpp:498`). The pairs' txids differ, so the first coin can differ in value. A coinstake's outputs are
-  immature, so the balances part by the difference.
-- **divid balance cache:** divid's `getbalance` disagrees with its own unspent coins (`listunspent 1`), while
-  irondivid's agrees with the same coins. divid keeps each wallet transaction's balance in
-  `CachedUtxoBalanceCalculator` (`CachedUtxoBalanceCalculator.cpp:13-30`), recomputed only when a wallet transaction
-  spending it is added (`wallet.cpp:1242-1333`). So a spend that the mempool drops still counts as spending the coin.
-- **maturity window:** only the middle of an `invalidate` differs, by one or two coins of one value, with mempools
-  of one size, and the end states agree. The two sides had spent different coins of that value (divid's choice among
-  equal coins is by txid order, which shows only in the coins' depths). With the tip lowered, one of those coins sits
-  in the block between the mempool's coinbase maturity (20, `txmempool.cpp:151`) and the wallet's (21,
-  `MerkleTxConfirmationNumberCalculator.cpp:54-59`). The run goes on without a new episode.
+  On both sides each new block staked a coin of divid's stake set (`CWallet::SelectStakeCoins`,
+  `wallet.cpp:1433-1465`): unlocked, 10 confirmations at that block (no coin age on regtest, `chainparams.cpp:498`),
+  not spent by an earlier block of the step. Two more kinds of coin are not listed by `listunspent` when the step
+  begins but count: a vault output the wallet holds, and a coinbase or coinstake output that matures during the step.
+  divid counts a generated coin from 21 confirmations (`MerkleTxConfirmationNumberCalculator.cpp:54-59`).
+  divid tries the set in outpoint order (`StakableCoin.h:21-24`, `PoSTransactionCreator.cpp:261`; shuffled only with
+  `-vault`, `:63-72`, `:99`) and takes the first coin with a kernel hash under the target. That target is weighted
+  by the coin's value (`ProofOfStakeCalculator.cpp:19-24`, `:53-54`), so a small coin is often passed over. Which coin
+  wins depends on the txids, and those differ between the pairs, so the script checks only that each kernel is in the
+  set. A coinstake's outputs are immature, so the balances part by the difference.
 - **maturity in the middle of a reorg:** only the middle of an `invalidate` differs (balances, coins, the mempool's
   size), and the end states agree. While its tip was lowered, one side dropped transactions from the disconnected
   blocks or its mempool, and each spends a coinbase or coinstake output immature at that height, or an output of a
