@@ -1914,7 +1914,22 @@ impl WalletRpc {
             &change_to.template(),
             self.fee_policy(),
         )
-        .map_err(send_error)
+        .map_err(|e| {
+            // Divi Core reserves the change key once the coins are chosen,
+            // before it takes the fee from the payments or sweeps
+            // (wallet.cpp:1786-1800), and the reservation tops the key pool
+            // up (wallet.cpp:2129-2130); the key goes back when these fail
+            if matches!(e, SendError::CannotSubtractFee | SendError::CannotSweep)
+                && matches!(change_to, ChangeTo::NewKey)
+            {
+                if let Ok(wallet) = self.get_wallet() {
+                    if let Err(err) = wallet.top_up_keypool() {
+                        debug!("Keypool not topped up for a failed send: {}", err);
+                    }
+                }
+            }
+            send_error(e)
+        })
     }
 
     /// The wallet's fee rate (Divi Core's wallet pays -minrelaytxfee,

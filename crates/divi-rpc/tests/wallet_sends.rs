@@ -562,3 +562,33 @@ fn a_failed_send_gives_its_change_key_back() {
         "the change key is unused"
     );
 }
+
+/// A send that fails as Divi Core's does once it has reserved the change key,
+/// here the receiver paying a fee that leaves its payment as dust ("Cannot
+/// subtract needed fees from outputs.", wallet.cpp:1786-1793), leaves the key
+/// pool topped up, as the reservation does (wallet.cpp:2129-2130)
+#[test]
+fn a_send_failing_after_coin_selection_tops_the_key_pool_up() {
+    let net = Net::new();
+    net.fund(&[10 * COIN]);
+    net.wallet.top_up_keypool().unwrap();
+    let full = net.wallet.keypool_size();
+    net.wallet.new_receiving_address().unwrap();
+    assert_eq!(net.wallet.keypool_size(), full - 1);
+    let rpc = net.rpc();
+    let err = rpc
+        .send_to_address(&p(vec![
+            json!(dest().to_string()),
+            json!(0.00006),
+            json!("receiver_pays"),
+        ]))
+        .unwrap_err();
+    match err {
+        divi_rpc::Error::Rpc(e) => assert_eq!(
+            (e.code, e.message.as_str()),
+            (-4, "Cannot subtract needed fees from outputs.")
+        ),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(net.wallet.keypool_size(), full, "the key pool is topped up");
+}
