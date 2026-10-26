@@ -51,8 +51,9 @@ pub fn connect_timeout() -> Duration {
     Duration::from_millis(CONNECT_TIMEOUT_MS.load(std::sync::atomic::Ordering::Relaxed))
 }
 
-/// Timeout for handshake completion
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Divi Core CheckForInnactivity: a peer that has sent nothing, or been sent
+/// nothing, this long after the connection opened is dropped (Node.cpp:819-822)
+const FIRST_DATA_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Timeout for reading a message
 const READ_TIMEOUT: Duration = Duration::from_secs(90);
@@ -400,10 +401,9 @@ impl Connection {
             self.info.state = PeerState::VersionSent;
         }
 
-        // Wait for their version (with timeout)
-        let their_version = timeout(HANDSHAKE_TIMEOUT, self.recv_version())
-            .await
-            .map_err(|_| NetworkError::Timeout)??;
+        // Wait for their version, as long as Divi Core keeps a peer that has not
+        // sent one: its inactivity rules apply from the start (Node.cpp:812-834)
+        let their_version = self.recv_version().await?;
 
         debug!(
             "Received version from {}: height={}, user_agent={}",
@@ -539,7 +539,19 @@ impl Connection {
     /// Wait for version message (during handshake - uses blocking read, ok because no select!)
     async fn recv_version(&mut self) -> Result<VersionMessage, NetworkError> {
         loop {
-            match self.read_message_handshake().await? {
+            // A timeout drops the peer, so a message cut off by it is not lost to anyone
+            let deadline = handshake_deadline(&self.info);
+            let read = tokio::time::timeout_at(deadline.into(), self.read_message_handshake());
+            let Ok(read) = read.await else {
+                info!(
+                    "{} sent no version in time ({} bytes in, {} out), disconnecting",
+                    crate::peer_log::peer(self.peer_id, self.info.addr),
+                    self.info.bytes_recv,
+                    self.info.bytes_sent
+                );
+                return Err(NetworkError::Timeout);
+            };
+            match read? {
                 Some(Decoded::Message(NetworkMessage::Version(v))) => return Ok(v),
                 Some(Decoded::Malformed { command, error }) if command == "version" => {
                     self.reject_malformed(&command, &error).await?;
@@ -715,7 +727,7 @@ impl Connection {
 
                 // Proactive keepalive ping
                 _ = ping_timer.tick() => {
-                    if inactivity_exceeded(info.last_recv, info.ping_time, std::time::Instant::now()) {
+                    if inactivity_exceeded(info.last_send, info.last_recv, info.ping_time, std::time::Instant::now()) {
                         info!("{} inactive for {:?}, disconnecting", crate::peer_log::peer(peer_id, info.addr), TIMEOUT_INTERVAL);
                         break;
                     }
@@ -812,7 +824,7 @@ impl Connection {
                         Err(_) => {
                             // A quiet peer gets no extra ping: the keepalive above
                             // runs on its own interval, as in Divi Core
-                            if inactivity_exceeded(info.last_recv, info.ping_time, std::time::Instant::now()) {
+                            if inactivity_exceeded(info.last_send, info.last_recv, info.ping_time, std::time::Instant::now()) {
                                 info!("{} inactive for {:?}, disconnecting", crate::peer_log::peer(peer_id, info.addr), TIMEOUT_INTERVAL);
                                 break;
                             }
@@ -1083,18 +1095,34 @@ fn duplicate_version(peer_id: PeerId) -> PeerEvent {
 }
 
 /// Divi Core `CheckForInnactivity`: disconnect after this long without
-/// receiving anything, or with a ping unanswered
+/// sending anything, without receiving anything, or with a ping unanswered
 const TIMEOUT_INTERVAL: Duration = Duration::from_secs(20 * 60);
 
-/// True once a peer has been silent, or has left a ping unanswered, for
-/// longer than `TIMEOUT_INTERVAL`
+/// True once nothing has been sent to a peer, nothing received from it, or a
+/// ping left unanswered, for longer than `TIMEOUT_INTERVAL` (Node.cpp:823-832;
+/// the sending timeout drops a peer we keep nothing to send, such as a peer we
+/// dialled that never sends its sporks)
 fn inactivity_exceeded(
+    last_send: std::time::Instant,
     last_recv: std::time::Instant,
     ping_sent: Option<std::time::Instant>,
     now: std::time::Instant,
 ) -> bool {
-    now.saturating_duration_since(last_recv) > TIMEOUT_INTERVAL
+    now.saturating_duration_since(last_send) > TIMEOUT_INTERVAL
+        || now.saturating_duration_since(last_recv) > TIMEOUT_INTERVAL
         || ping_sent.is_some_and(|sent| now.saturating_duration_since(sent) > TIMEOUT_INTERVAL)
+}
+
+/// When a peer that has not sent its version is dropped: 60 s after the
+/// connection opened while nothing has come from it or gone to it (an inbound
+/// peer is sent nothing before its version), else 20 minutes after the last
+/// data either way (Divi Core CheckForInnactivity, Node.cpp:819-828)
+fn handshake_deadline(info: &PeerInfo) -> std::time::Instant {
+    if info.bytes_recv == 0 || info.bytes_sent == 0 {
+        info.connected_at + FIRST_DATA_TIMEOUT
+    } else {
+        info.last_send.min(info.last_recv) + TIMEOUT_INTERVAL
+    }
 }
 
 /// Divi Core MaybeSendPing (Node.cpp:1043-1069): a keepalive ping is due when
@@ -1143,9 +1171,25 @@ mod tests {
         assert_eq!(connect_timeout(), Duration::from_millis(5000));
     }
 
+    /// Before its version, Divi Core drops a peer 60 s after the connection
+    /// opened if nothing came from it or nothing went to it (Node.cpp:819-822),
+    /// otherwise 20 minutes after the last data
     #[test]
-    fn test_handshake_timeout() {
-        assert_eq!(HANDSHAKE_TIMEOUT, Duration::from_secs(30));
+    fn a_peer_without_a_version_is_dropped_as_divi_core_does() {
+        let mut info = PeerInfo::new_inbound(1, "127.0.0.1:1".parse().unwrap());
+        let open = info.connected_at;
+        assert_eq!(handshake_deadline(&info), open + Duration::from_secs(60));
+        // something came in, but an inbound peer is sent nothing before its version
+        info.bytes_recv = 24;
+        assert_eq!(handshake_deadline(&info), open + Duration::from_secs(60));
+        // both ways: 20 minutes from the older of the last send and receive
+        info.bytes_sent = 24;
+        info.last_send = open + Duration::from_secs(1);
+        info.last_recv = open + Duration::from_secs(50);
+        assert_eq!(
+            handshake_deadline(&info),
+            open + Duration::from_secs(1) + Duration::from_secs(20 * 60)
+        );
     }
 
     /// Divi Core CheckForInnactivity: 20 minutes without data, or with a ping unanswered
@@ -1153,11 +1197,25 @@ mod tests {
     fn inactive_peers_time_out_after_twenty_minutes() {
         let start = std::time::Instant::now();
         let at = |secs| start + Duration::from_secs(secs);
-        assert!(!inactivity_exceeded(start, None, at(20 * 60)));
-        assert!(inactivity_exceeded(start, None, at(20 * 60 + 1)));
+        assert!(!inactivity_exceeded(at(1200), start, None, at(20 * 60)));
+        assert!(inactivity_exceeded(at(1200), start, None, at(20 * 60 + 1)));
         // Data keeps coming but the ping is never answered
-        assert!(!inactivity_exceeded(at(1199), Some(start), at(1200)));
-        assert!(inactivity_exceeded(at(1200), Some(start), at(1201)));
-        assert!(!inactivity_exceeded(at(1200), None, at(1201)));
+        assert!(!inactivity_exceeded(
+            at(1200),
+            at(1199),
+            Some(start),
+            at(1200)
+        ));
+        assert!(inactivity_exceeded(
+            at(1200),
+            at(1200),
+            Some(start),
+            at(1201)
+        ));
+        assert!(!inactivity_exceeded(at(1200), at(1200), None, at(1201)));
+        // Data keeps coming but nothing is sent: the sending timeout
+        // (Node.cpp:823-825), as for a dialled peer that never sends its sporks
+        assert!(!inactivity_exceeded(start, at(1200), None, at(20 * 60)));
+        assert!(inactivity_exceeded(start, at(1200), None, at(20 * 60 + 1)));
     }
 }
