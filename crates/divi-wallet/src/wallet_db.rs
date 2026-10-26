@@ -1827,6 +1827,7 @@ impl WalletDb {
     ) -> Result<Address, WalletError> {
         let mut store = Vec::new();
         let indices = self.keystore.get_indices();
+        let pool = self.keystore.pool_state();
         let addr = if locked {
             if keep_later {
                 self.keystore.reserve_from_keypool()?
@@ -1866,6 +1867,7 @@ impl WalletDb {
             Err(e) => {
                 self.keystore.remove_keys(&added);
                 self.keystore.set_indices(indices.0, indices.1);
+                self.keystore.restore_pool_state(pool);
                 Err(e)
             }
             Ok(()) => Ok(addr),
@@ -3301,6 +3303,7 @@ impl WalletDb {
 
     /// Top the keypool up to `new_size` and write the new keys
     fn store_new_pool_keys(&self, new_size: Option<u32>) -> Result<u32, WalletError> {
+        let pool = self.keystore.pool_state();
         let added = self.keystore.top_up_keypool(new_size)?;
         if !added.is_empty() {
             self.dirty.write().keys = true;
@@ -3308,6 +3311,7 @@ impl WalletDb {
             // derivation throws before they do (wallet.cpp:2339-2347)
             if let Err(e) = self.persist_keys(&added) {
                 self.keystore.remove_keys(&added);
+                self.keystore.restore_pool_state(pool);
                 return Err(e);
             }
         }

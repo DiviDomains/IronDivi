@@ -452,3 +452,32 @@ fn a_key_that_cannot_be_written_logs_no_keypool_line() {
         assert!(!log.contains("keypool"), "{log}");
     }
 }
+
+/// After a top-up that could not write its keys, the pool's numbers are as
+/// Divi Core leaves them, which never added a key nor took one: the next key
+/// is numbered one past the newest in the pool, and the oldest receiving key
+/// is the one reserved (wallet.cpp:2093-2112, :2154)
+#[test]
+fn a_key_that_cannot_be_written_leaves_the_pool_numbers_as_they_were() {
+    let _limit = LIMIT.lock();
+    let net = Net::new();
+    let rpc = one_key_short(&net);
+    let numbers = net.wallet.keystore().pool_numbers();
+    writes_fail();
+    assert!(rpc.get_new_address(&p(vec![])).is_err());
+    assert!(rpc.keypool_refill(&p(vec![json!(3)])).is_err());
+    writes_work();
+    assert_eq!(net.wallet.keystore().pool_numbers(), numbers);
+
+    let newest = numbers.iter().map(|n| n.2).max().unwrap();
+    let oldest = numbers.iter().filter(|n| !n.0).map(|n| n.2).min().unwrap();
+    let (_, log) = logged(|| rpc.get_new_address(&p(vec![])).unwrap());
+    assert!(
+        log.contains(&format!("keypool added key {}, ", newest + 1)),
+        "{log}"
+    );
+    assert!(
+        log.contains(&format!("keypool reserve {oldest}\n")),
+        "{log}"
+    );
+}

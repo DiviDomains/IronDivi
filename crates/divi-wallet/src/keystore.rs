@@ -744,6 +744,23 @@ impl KeyStore {
         }
     }
 
+    /// The keypool's numbers and the keys reserved from it, to put back with
+    /// [`Self::restore_pool_state`]
+    pub fn pool_state(&self) -> PoolState {
+        PoolState {
+            numbers: self.pool_numbers.read().clone(),
+            reserved: self.reserved.read().clone(),
+        }
+    }
+
+    /// Put the keypool's numbers and reservations back as they were: keys that
+    /// could not be written leave the pool as Divi Core's does, which never
+    /// added them nor took a key from it (wallet.cpp:2104-2112, :2129-2154)
+    pub fn restore_pool_state(&self, state: PoolState) {
+        *self.pool_numbers.write() = state.numbers;
+        *self.reserved.write() = state.reserved;
+    }
+
     /// The keypool's numbers, for persistence: (change chain, child, number)
     pub fn pool_numbers(&self) -> Vec<(bool, u32, u64)> {
         self.pool_numbers
@@ -798,6 +815,12 @@ impl KeyStore {
         self.take_from_pool(is_change, taken, &address.hash, keep_later);
         Ok(address)
     }
+}
+
+/// The keypool's numbers and reservations at one time ([`KeyStore::pool_state`])
+pub struct PoolState {
+    numbers: std::collections::BTreeMap<(bool, u32), u64>,
+    reserved: HashMap<Hash160, (bool, u32, u64)>,
 }
 
 thread_local! {
