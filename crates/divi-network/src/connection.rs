@@ -344,8 +344,18 @@ impl Connection {
 
     /// Run the connection handler
     pub async fn run(mut self) -> Result<(), NetworkError> {
-        // Perform handshake
-        if let Err(e) = self.handshake().await {
+        // Perform handshake, which a stop ends: it reads without the message
+        // loop's watch on the shutdown signal, and Divi Core's net thread,
+        // interrupted at shutdown, takes no more of a peer's version
+        // (divid.cpp:42-53). The receiver subscribed with the connection sees
+        // a stop sent even before this; the message loop takes a new one
+        let fresh = self.shutdown_rx.resubscribe();
+        let mut stop = std::mem::replace(&mut self.shutdown_rx, fresh);
+        let handshake = tokio::select! {
+            result = self.handshake() => result,
+            _ = stop.recv() => Err(NetworkError::Connection("the node is stopping".into())),
+        };
+        if let Err(e) = handshake {
             error!(
                 "Handshake failed with {}: {}",
                 crate::peer_log::peer(self.peer_id, self.info.addr),

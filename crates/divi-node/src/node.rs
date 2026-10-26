@@ -386,6 +386,10 @@ pub struct Node {
 /// How long `Node::stop` waits for the node's loops once told to stop
 const STOP_TASKS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// How long stop waits for the peer tasks: past the connect timeout
+/// (-timeout, 5 s by default), so a dial under way ends on its own
+const PEER_TASKS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Log one shutdown step and how long it took
 pub fn shutdown_stage(what: &str, started: std::time::Instant) {
     tracing::info!("Shutdown: {} in {} ms", what, started.elapsed().as_millis());
@@ -2382,6 +2386,20 @@ impl Node {
         // net threads before anything else (divid.cpp:42-53): no peer is
         // accepted, dialled or looked up once stop has begun
         self.peer_manager.stop_network();
+        // And waits for them, as its join_all returns only when every net
+        // thread has ended: a connection or dial under way is done before the
+        // rest of the stop
+        let started = std::time::Instant::now();
+        let left = self.peer_manager.join_tasks(PEER_TASKS_TIMEOUT).await;
+        if !left.is_empty() {
+            tracing::warn!(
+                "{} peer task(s) had not ended within {} s; not waiting for them: {}",
+                left.len(),
+                PEER_TASKS_TIMEOUT.as_secs(),
+                left.join(", ")
+            );
+        }
+        shutdown_stage("peer tasks ended", started);
 
         // Stop the block import between two records and wait for it, for a
         // minute at most (a read can block where the flag is not seen)
