@@ -30,6 +30,7 @@ bip39 = "2.0"
 futures = "0.3"
 
 [dev-dependencies]
+tracing-subscriber = { workspace = true }
 divi-test-support = { workspace = true }
 libc = "0.2"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

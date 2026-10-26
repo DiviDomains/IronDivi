@@ -773,6 +773,53 @@ fn send_notes(pairs: &[(&str, Option<&str>)]) -> std::collections::BTreeMap<Stri
     notes
 }
 
+/// A transaction as Divi Core's CTransaction::ToString writes it in its log:
+/// the txid's first 10 digits, each input's whole prevout and scriptSig cut at
+/// 24 characters, each output's value and scriptPubKey cut at 30
+/// (primitives/transaction.cpp:51-63, :115-118, :261-280; OutPoint.cpp:29-32)
+pub(crate) fn core_tx_string(tx: &Transaction) -> String {
+    let cut = |text: String, n: usize| text.chars().take(n).collect::<String>();
+    let txid = tx.txid().to_string();
+    let mut out = format!(
+        "CTransaction({}, ver={}, vin.size={}, vout.size={}, nLockTime={})\n",
+        &txid[..10],
+        tx.version,
+        tx.vin.len(),
+        tx.vout.len(),
+        tx.lock_time
+    );
+    for input in &tx.vin {
+        let mut line = format!(
+            "CTxIn(COutPoint({}, {})",
+            input.prevout.txid, input.prevout.vout
+        );
+        if input.prevout.is_null() {
+            line.push_str(&format!(
+                ", coinbase {}",
+                hex::encode(input.script_sig.as_bytes())
+            ));
+        } else {
+            let asm = divi_script::asm::to_asm(input.script_sig.as_bytes());
+            line.push_str(&format!(", scriptSig={}", cut(asm, 24)));
+        }
+        if input.sequence != u32::MAX {
+            line.push_str(&format!(", nSequence={}", input.sequence));
+        }
+        out.push_str(&format!("    {})\n", line));
+    }
+    for output in &tx.vout {
+        let sat = output.value.as_sat();
+        let asm = divi_script::asm::to_asm(output.script_pubkey.as_bytes());
+        out.push_str(&format!(
+            "    CTxOut(nValue={}.{:08}, scriptPubKey={})\n",
+            sat / 100_000_000,
+            sat % 100_000_000,
+            cut(asm, 30)
+        ));
+    }
+    out
+}
+
 /// addvault and removevault without Divi Core's -vault option
 const VAULT_MODE_OFF: &str =
     "Vaults can be added or removed only with the vault option: start irondivid with -vault=1 (or vault=1 in divi.conf)";
@@ -1969,7 +2016,7 @@ impl WalletRpc {
         // returns the key when no change is needed (:1813-1816): so a send
         // without change still leaves the keypool full
         if plan.change.is_none() && matches!(change_to, ChangeTo::NewKey) {
-            match wallet.top_up_keypool() {
+            match wallet.reserve_and_return_change() {
                 // The reservation fails the send when the new keys cannot be
                 // written (wallet.cpp:2339-2347)
                 Err(e @ divi_wallet::WalletError::Storage(_)) => {
@@ -2049,6 +2096,8 @@ impl WalletRpc {
             }
         }
         check_signed(&tx, plan.fee, self.fee_policy()).map_err(|e| give_back(send_error(e)))?;
+        // CommitTransaction logs the transaction it commits (wallet.cpp:1866)
+        info!("CommitTransaction:\n{}", core_tx_string(&tx));
         wallet.note_committed(&tx.txid());
         let callback = self.tx_submit.read();
         let callback = callback.as_ref().ok_or_else(|| {
@@ -2068,6 +2117,9 @@ impl WalletRpc {
             )
             .into());
         }
+        // Once in the mempool, SendMoney relays it and logs so, its format's
+        // arguments the other way round (rpcwallet.cpp:785-788)
+        info!("{}: Relaying wtx SendMoney", &txid.to_string()[..10]);
         Ok(txid)
     }
 

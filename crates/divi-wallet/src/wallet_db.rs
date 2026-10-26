@@ -982,6 +982,7 @@ impl WalletDb {
         // Load HD indices
         let (receiving, change) = db.load_indices()?;
         self.keystore.set_indices(receiving, change);
+        self.keystore.set_pool_numbers(&db.load_keypool_numbers()?);
         debug!(
             "Restored indices: receiving={}, change={}",
             receiving, change
@@ -1200,6 +1201,11 @@ impl WalletDb {
         let (receiving, change) = self.keystore.get_indices();
         batch.put_cf(
             db.cf_metadata(),
+            crate::persistence::KEY_KEYPOOL_NUMBERS,
+            crate::persistence::encode_keypool_numbers(&self.keystore.pool_numbers()),
+        );
+        batch.put_cf(
+            db.cf_metadata(),
             b"receiving_index",
             receiving.to_le_bytes(),
         );
@@ -1348,6 +1354,11 @@ impl WalletDb {
             receiving.to_le_bytes(),
         );
         batch.put_cf(db.cf_metadata(), b"change_index", change.to_le_bytes());
+        batch.put_cf(
+            db.cf_metadata(),
+            crate::persistence::KEY_KEYPOOL_NUMBERS,
+            crate::persistence::encode_keypool_numbers(&self.keystore.pool_numbers()),
+        );
 
         // Save keys
         for (hash, entry) in self.keystore.get_all_keys_with_hashes() {
@@ -1826,6 +1837,30 @@ impl WalletDb {
             }
             Ok(()) => Ok(addr),
         }
+    }
+
+    /// Divi Core's LoadWallet counts (walletdb.cpp:529-537), as (plaintext,
+    /// encrypted, with metadata): imported keys are stored as keys, or as
+    /// encrypted keys once the wallet is encrypted; every key but a watched
+    /// one has metadata, HD keys only that and their public key
+    pub fn load_counts(&self) -> (usize, usize, usize) {
+        let keys = self.keystore.get_all_keys_with_hashes();
+        let owned = keys.iter().filter(|(_, e)| !e.is_watch_only);
+        let imported = owned.clone().filter(|(_, e)| e.hd_path.is_none()).count();
+        let with_metadata = owned.count();
+        if *self.encrypted.read() {
+            (0, imported, with_metadata)
+        } else {
+            (imported, 0, with_metadata)
+        }
+    }
+
+    /// A send that needs no change: Divi Core tops the keypool up, reserves a
+    /// change key and returns it (wallet.cpp:2122-2176), with its log lines.
+    pub fn reserve_and_return_change(&self) -> Result<u32, WalletError> {
+        let added = self.top_up_keypool();
+        self.keystore.reserve_and_return_change();
+        added
     }
 
     /// Derive the missing keypool keys (the seed must be in memory) and store
