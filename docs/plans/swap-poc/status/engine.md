@@ -229,7 +229,7 @@
 ## 2026-10-22 — single-source-q6 (builder BG)
 - done: Q6 answered in place in `engine-review-brief.md`. `single-source-design.md` has the per-chain truth table (source, config key, file:line, cross-check), the attack table (inflated confirmations, hidden spend, shifted MTP, censored broadcast) and the ranking: DIVI, LTC, ZEC, USDC/EVM, BTC, XMR. `single-source-design.FACTS.md` lists the third-party claims with verdict `could not verify` (no network in this lane).
 - proof: design-only commit; no Rust changed, so no test counts moved. Every file:line in the doc was read on base `fb25f36`.
-- left: nothing implemented. Cheapest change across chains is a "disagree is Transient" quorum read on `htlc_output`, `confirmations`, `find_spend`, `median_time_past` when a second endpoint is configured (DIVI first: `[divi].fallback_rpc_url`, `swap-chain-divi/src/rpc.rs`). LTC: make `[ltc].crosscheck` mandatory on mainnet (`bin/divi-swapd/src/config.rs:704`), which changes a mainnet config rule and so needs a decision.
+- left: nothing implemented. Cheapest change across chains is a "disagree is Transient" quorum read on `htlc_output`, `confirmations`, `find_spend`, `median_time_past` when a second endpoint is configured (DIVI first: `[divi].fallback_rpc_url`, `swap-chain-divi/src/rpc.rs`). LTC: make `[ltc].crosscheck` mandatory on mainnet (`bin/divi-swapd/src/config.rs:704`), which changes a mainnet config rule and so needs a decision. (USDC quorum read added by EC in the crate, opt-in; config key still to wire)
 - needs: a decision on whether a mainnet config may start with `[ltc].crosscheck = "off"` and with no second DIVI endpoint.
 - decisions: design only, because every mitigation touches shared client or config files or a mainnet start rule; no confirmation count, timeout, margin, route or opt-in was touched.
 ## 2026-10-22 — accept-gate-bounds (builder BB)
@@ -858,3 +858,21 @@ The Manager's rulings on the DJ2 report. Testnet only, $0, not pushed.
 - left:
   - A lock that was sent, confirmed (its row released), reorged out and left unknown to the node, whose coin another daemon then reserves, would be re-selected by `on_maker_locked` while still short of `maker_leg_confs`. If the old bytes were later mined after all, the maker would hold two locks and track only the new one. This needs a reorg, a vanished lock and a racing daemon at once; F2 covers the same case after `MakerLockConfirmed`.
   - DQ's other limits stand. No live run (no node, no funds).
+
+## 2026-10-26 round: usdc-quorum-reads EC (builder EC, `lane/usdc-quorum-reads`, on 95699a5)
+- why: single-source-design.md section 5, row 4 (USDC/EVM), crate half. `UsdcBackend` read `htlc_output`, `find_spend`, `confirmations` and `median_time_past` from one RPC, so a node that hid the taker's claim, reported a lock that is not there, or reported a latest-block timestamp past the timelock was believed.
+- design: the DIVI second-source shape (`swap-chain-divi/src/second_source.rs`), opt-in, in `crates/swap-chain-evm` only.
+  - `UsdcBackend::with_quorum_rpc(url) -> Result<Self>`: a read-only provider for a second node. `UsdcBackend::new` and every caller are unchanged; without the call nothing changes, not even the request counts.
+  - The four reads moved, unchanged, into per-node helpers (`*_on(provider)`); the trait methods ask the primary, then (quorum on) the second node, and reconcile in `quorum.rs`:
+    - existence (`Some` vs `None`) differs: `SwapError::Transient`, naming both answers. A lock's parties, token, hashlock and timelock are checked by each node against the swap, so a node whose `Locked` log differs answers `None` and the pair disagrees; the amounts must be equal.
+    - `find_spend`: the same spending txid, block height and preimage, else `Transient`.
+    - `confirmations` (and a lock's count): two counts are the smaller one; nodes a block apart are lag, not a disagreement.
+    - `median_time_past`: the smaller of the two latest-block timestamps, never a disagreement, so a refund is never early on one node's word.
+    - a second node that does not answer: `Transient` (fail closed). A primary that fails returns its own error, as before, and the second node is not asked.
+  - No change to `tip_height`, `tip_hash`, sending, nonces, gas, funding, balances, timeouts, margins, confirmation counts, the contract, routes or any other crate.
+- tests (test-first, `crates/swap-chain-evm/src/quorum.rs`, wiremock JSON-RPC nodes, no network or anvil): a claim on one node only, two spending txids (refund vs claim), a lock on one node only or at another amount, a receipt on one node only, the latest block past the timelock on one node, an unreachable second node, and agreement cases (smaller confirmation count, the claim with its preimage, `None` on both). `without_the_quorum_reads_are_unchanged_and_the_second_node_is_never_asked` pins the primary's per-read request counts as on 95699a5 (3, 2, 2, 2, 1) and 0 for the second node; `with_the_quorum_the_second_node_gets_the_same_reads` shows the second node gets the same 8 reads and none from `tip_height`/`tip_hash`. Fail-first on the stub tree 799b7b9: swap-chain-evm 37 passed / 8 failed / 2 ignored (8 of the 10 new tests failed; the off-mode and both-see-the-claim tests pass by design). Final: swap-chain-evm 46 passed / 2 ignored (95699a5: 35 / 2 ignored); the other gate crates unchanged.
+- left:
+  - the `[usdc].fallback_rpc_url` config key in divi-swapd (`bin/divi-swapd/src/config.rs`), its `deploy/divi-swapd/README.md` note and row 4 of `single-source-design.md`: a later lane (they share files with EB). Until then nothing turns the quorum on.
+  - Single-source still: `tip_height`, `tip_hash`, `spendable`/`gas_and_token_balance`, `claim_feerate`, nonces and gas estimates in `build_*`, the allowance read in `build_funding`, and `broadcast`'s receipt check after a nonce conflict.
+  - A transaction sent to the primary and not yet relayed to the second node reads `Transient` in `confirmations` until it propagates or is mined; the engine retries.
+  - No live run (no node, no funds).

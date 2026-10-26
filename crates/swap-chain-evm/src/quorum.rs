@@ -12,6 +12,109 @@
 //! `swap-chain-divi/src/second_source.rs`): two nodes that disagree on a read a claim or
 //! refund rests on are never a decision. The answer is `SwapError::Transient`, which the
 //! engine retries.
+//!
+//! - Existence: `Some` on one node and `None` on the other is a disagreement.
+//! - A lock (`htlc_output`): each node checks the `Locked` log's parties, token, hashlock and
+//!   timelock against the swap itself, so a node whose log differs answers `None` and the
+//!   pair disagrees on existence; the amounts must then be equal. Confirmations: the smaller.
+//! - A spend (`find_spend`): the same spending txid, block height and witness (the preimage).
+//! - `confirmations`: two counts are the smaller one (nodes a block apart are ordinary lag).
+//! - `median_time_past`: the smaller latest-block timestamp, never a disagreement, so a refund
+//!   is never early on one node's word.
+//! - A second node that fails to answer is `Transient` (fail closed: one view is not enough).
+//!   A primary that fails returns its own error, as with no second node; the second node is
+//!   then not asked.
+
+use divi_swap::{LockedOutput, SpendInfo, SwapError};
+
+type Result<T> = std::result::Result<T, SwapError>;
+
+/// The engine logs a `Transient` read and retries it, so the message names both answers.
+fn disagree(op: &str, detail: String) -> SwapError {
+    SwapError::Transient(format!("{op}: USDC nodes disagree: {detail}"))
+}
+
+/// The second node's answer, or `Transient` if it gave none.
+pub(crate) fn second<T>(op: &str, answer: Result<T>) -> Result<T> {
+    answer.map_err(|e| disagree(op, format!("second node failed: {e}")))
+}
+
+pub(crate) fn agree_confirmations(a: Option<u32>, b: Option<u32>) -> Result<Option<u32>> {
+    match (a, b) {
+        (None, None) => Ok(None),
+        (Some(a), Some(b)) => Ok(Some(a.min(b))),
+        (a, b) => Err(disagree(
+            "confirmations",
+            format!("primary {a:?}, second {b:?}"),
+        )),
+    }
+}
+
+pub(crate) fn agree_htlc_output(
+    a: Option<LockedOutput>,
+    b: Option<LockedOutput>,
+) -> Result<Option<LockedOutput>> {
+    match (a, b) {
+        (None, None) => Ok(None),
+        (Some(a), Some(b)) if a.amount == b.amount => Ok(Some(LockedOutput {
+            amount: a.amount,
+            confirmations: a.confirmations.min(b.confirmations),
+        })),
+        (a, b) => Err(disagree(
+            "htlc_output",
+            format!(
+                "primary {}, second {}",
+                describe_lock(a.as_ref()),
+                describe_lock(b.as_ref())
+            ),
+        )),
+    }
+}
+
+fn describe_lock(l: Option<&LockedOutput>) -> String {
+    l.map_or_else(
+        || "no matching lock".into(),
+        |l| format!("a lock of {}", l.amount),
+    )
+}
+
+pub(crate) fn agree_spend(a: Option<SpendInfo>, b: Option<SpendInfo>) -> Result<Option<SpendInfo>> {
+    match (a, b) {
+        (None, None) => Ok(None),
+        (Some(a), Some(b))
+            if a.txid == b.txid && a.height == b.height && a.witness == b.witness =>
+        {
+            Ok(Some(a))
+        }
+        (a, b) => Err(disagree(
+            "find_spend",
+            format!(
+                "primary {}, second {}",
+                describe_spend(a.as_ref()),
+                describe_spend(b.as_ref())
+            ),
+        )),
+    }
+}
+
+fn describe_spend(s: Option<&SpendInfo>) -> String {
+    s.map_or_else(
+        || "no spend".into(),
+        |s| {
+            let kind = if s.witness.is_empty() {
+                "refund"
+            } else {
+                "claim"
+            };
+            format!("{kind} {} at {:?}", s.txid, s.height)
+        },
+    )
+}
+
+/// The smaller of two latest-block timestamps.
+pub(crate) fn agree_mtp(a: u32, b: u32) -> u32 {
+    a.min(b)
+}
 
 #[cfg(test)]
 mod tests {
@@ -312,6 +415,34 @@ mod tests {
             backend.find_spend(&lock_outpoint(), 100).await.unwrap(),
             None
         );
+    }
+
+    /// The primary says the lock was refunded, the second node that it was claimed: two
+    /// spending txids. The message names both answers.
+    #[tokio::test]
+    async fn find_spend_with_two_spending_txids_is_transient_and_names_both() {
+        const REFUND_TX: B256 = B256::repeat_byte(0xd1);
+        let mut refunded = with_lock(110);
+        let data = IErc20Htlc::Refunded {
+            id: swap_id_of(UNITS),
+        }
+        .encode_log_data();
+        refunded.logs.push(rpc_log(&data, REFUND_TX, 106));
+        let (_p, _s, backend) = pair(&refunded, &claimed(with_lock(110))).await;
+        match backend.find_spend(&lock_outpoint(), 100).await {
+            Err(SwapError::Transient(msg)) => {
+                assert!(msg.contains("disagree"), "{msg}");
+                assert!(
+                    msg.contains(&Txid(REFUND_TX.0).to_string()),
+                    "refund txid missing: {msg}"
+                );
+                assert!(
+                    msg.contains(&Txid(CLAIM_TX.0).to_string()),
+                    "claim txid missing: {msg}"
+                );
+            }
+            other => panic!("expected Transient, got {other:?}"),
+        }
     }
 
     /// The primary reports a lock the second node does not have, or has at another amount.
