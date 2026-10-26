@@ -38,23 +38,13 @@ LISTEN_IP = "127.0.0.3"
 
 # --- rows ------------------------------------------------------------------------------
 
-def pair(core, iron):
-    """A KNOWN shape: divid gives exactly `core` and irondivid exactly `iron`"""
-    return lambda c, i: c == core and i == iron
-
-
 # Rows where irondivid differs on purpose: (reason, shape); shape is true only
 # for the difference described, so a KNOWN row that matches divid, or differs in
 # another way, is a FAIL
-NO_BLOOM = ("irondivid offers no bloom filters (crates/divi-node/src/node.rs bloom arm), so it does not set "
-            "NODE_BLOOM (4) and scores a filter message 100, as divid run with -peerbloomfilters=0 does "
-            "(net.cpp:1722, main.cpp:892-898) [by design]")
 PARTIAL = ("divid sets the peer's version and services before it reads the rest (main.cpp:372-373), so a version "
            "that fails to parse after addrMe leaves them set; irondivid keeps nothing from a version that does "
            "not parse. Both send the same reject and keep the connection")
 KNOWN = {
-    "handshake: version: services": (NO_BLOOM, pair(5, 1)),
-    "handshake: version: addr_from": (NO_BLOOM, lambda c, i: c.get("services") == 5 and i == dict(c, services=1)),
     "handshake: version: subver": (
         "each names itself: divid FormatSubVersion (clientversion.cpp:82-86) \"DIVI Core: 3.0.0.0\", irondivid "
         "\"/IronDivi:<version>/\" (crates/divi-network/src/constants.rs USER_AGENT; divid's ban outdated reads it, "
@@ -64,10 +54,6 @@ KNOWN = {
         c["version"] == 70920 and i == dict(c, version=0))),
     "version of 85 bytes (up to the nonce and part of the sub-version): getpeerinfo": (PARTIAL, lambda c, i: (
         c["version"] == 70920 and i == dict(c, version=0))),
-    "filteradd before filterload: connected": (NO_BLOOM, pair(True, False)),
-    "filteradd before filterload: banscore": (NO_BLOOM, pair(0, None)),
-    "filterclear: connected": (NO_BLOOM, pair(True, False)),
-    "filterclear: banscore": (NO_BLOOM, pair(0, None)),
 }
 
 fails = 0
