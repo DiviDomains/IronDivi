@@ -1855,6 +1855,27 @@ impl WalletOptions {
     }
 }
 
+/// The WALLET_MNEMONIC, WALLET_MNEMONIC_PASSPHRASE and WALLET_HDSEED
+/// environment variables, each taken when its option is not set (see
+/// `WalletSeed`)
+#[derive(Default)]
+struct WalletEnv {
+    mnemonic: Option<String>,
+    passphrase: Option<String>,
+    hdseed: Option<String>,
+}
+
+impl WalletEnv {
+    fn from_process() -> Self {
+        let env = |name: &str| std::env::var(name).ok();
+        WalletEnv {
+            mnemonic: env("WALLET_MNEMONIC"),
+            passphrase: env("WALLET_MNEMONIC_PASSPHRASE"),
+            hdseed: env("WALLET_HDSEED"),
+        }
+    }
+}
+
 /// Load or create wallet
 fn load_or_create_wallet(
     wallet_path: &PathBuf,
@@ -1862,6 +1883,26 @@ fn load_or_create_wallet(
     chain_mode: ChainMode,
     seed: WalletSeed,
     options: &WalletOptions,
+) -> Result<Arc<WalletDb>> {
+    load_or_create_wallet_with_env(
+        wallet_path,
+        network,
+        chain_mode,
+        seed,
+        options,
+        WalletEnv::from_process(),
+    )
+}
+
+/// `env` is the WALLET_* variables; passed in so tests never touch the
+/// process environment
+fn load_or_create_wallet_with_env(
+    wallet_path: &PathBuf,
+    network: WalletNetwork,
+    chain_mode: ChainMode,
+    seed: WalletSeed,
+    options: &WalletOptions,
+    env: WalletEnv,
 ) -> Result<Arc<WalletDb>> {
     if seed.restore {
         move_wallet_for_restore(wallet_path)?;
@@ -1873,16 +1914,13 @@ fn load_or_create_wallet(
     {
         info!("PruneHDSeedParameterInteraction: parameter interaction: can't use -hdseed and -mnemonic/-mnemonicpassphrase together, will prefer -seed");
     }
-    let env = |name: &str| std::env::var(name).ok();
     // An empty mnemonic asks for a new one, as in Core
     let mnemonic = seed
         .mnemonic
-        .or_else(|| env("WALLET_MNEMONIC"))
+        .or(env.mnemonic)
         .filter(|m| !m.trim().is_empty());
-    let passphrase = seed
-        .passphrase
-        .or_else(|| env("WALLET_MNEMONIC_PASSPHRASE"));
-    let hdseed = seed.hdseed.or_else(|| env("WALLET_HDSEED"));
+    let passphrase = seed.passphrase.or(env.passphrase);
+    let hdseed = seed.hdseed.or(env.hdseed);
     load_or_restore_wallet_with_seed(
         wallet_path,
         network,
@@ -4263,7 +4301,6 @@ mod wallet_log_tests {
     /// -mnemonic or -hdseed the wallet there is loaded
     #[test]
     fn a_mnemonic_moves_a_wallet_already_there() {
-        let _env = WALLET_ENV.lock().unwrap_or_else(|e| e.into_inner());
         let mnemonic = "abandon abandon abandon abandon abandon abandon \
                         abandon abandon abandon abandon abandon about";
         let mnemonic = mnemonic.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -4273,12 +4310,13 @@ mod wallet_log_tests {
             .unwrap()
             .mnemonic();
         let open = |seed: WalletSeed| {
-            load_or_create_wallet(
+            load_or_create_wallet_with_env(
                 &path,
                 WalletNetwork::Regtest,
                 ChainMode::Divi,
                 seed,
                 &WalletOptions::default(),
+                WalletEnv::default(),
             )
             .unwrap()
             .mnemonic()
@@ -4319,7 +4357,6 @@ mod wallet_log_tests {
     /// moved, and leave no new wallet
     #[test]
     fn invalid_mnemonic_words_stop_the_start() {
-        let _env = WALLET_ENV.lock().unwrap_or_else(|e| e.into_inner());
         // "abandon" twelve times: every word is in the list, the checksum fails
         let words = ["abandon"; 12].join(" ");
         let dir = tempfile::tempdir().unwrap();
@@ -4328,7 +4365,7 @@ mod wallet_log_tests {
             load_or_create_wallet_from(&path, WalletNetwork::Regtest, ChainMode::Divi, None)
                 .unwrap(),
         );
-        let refused = load_or_create_wallet(
+        let refused = load_or_create_wallet_with_env(
             &path,
             WalletNetwork::Regtest,
             ChainMode::Divi,
@@ -4338,6 +4375,7 @@ mod wallet_log_tests {
                 ..WalletSeed::default()
             },
             &WalletOptions::default(),
+            WalletEnv::default(),
         )
         .map(|_| ())
         .unwrap_err();
@@ -4883,12 +4921,6 @@ mod submit_error_tests {
     }
 }
 
-/// Held by the tests that set the WALLET_* environment variables or call
-/// `load_or_create_wallet`, which reads them: tests run in parallel threads
-/// of one process
-#[cfg(test)]
-static WALLET_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 #[cfg(test)]
 mod wallet_move_tests {
     use super::*;
@@ -4898,28 +4930,27 @@ mod wallet_move_tests {
     const CORE_FIRST_ADDRESS: &str = "y7VQ7R3SDRxzNuUsUuFzuq2FT1uVtW8iBz";
 
     /// WALLET_HDSEED restores a wallet from a hex seed, as Core's -hdseed, and
-    /// is taken over WALLET_MNEMONIC (the only test here that sets them; it
-    /// holds `WALLET_ENV`)
+    /// is taken over WALLET_MNEMONIC
     #[test]
     fn hex_seed_restores_cores_first_address() {
-        let _env = WALLET_ENV.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wallet");
-        std::env::set_var("WALLET_HDSEED", "000102030405060708090a0b0c0d0e0f");
-        std::env::set_var(
-            "WALLET_MNEMONIC",
-            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
-        );
-        let wallet = load_or_create_wallet(
+        let wallet = load_or_create_wallet_with_env(
             &path,
             WalletNetwork::Regtest,
             ChainMode::Divi,
             WalletSeed::default(),
             &WalletOptions::default(),
-        );
-        std::env::remove_var("WALLET_HDSEED");
-        std::env::remove_var("WALLET_MNEMONIC");
-        let wallet = wallet.unwrap();
+            WalletEnv {
+                hdseed: Some("000102030405060708090a0b0c0d0e0f".into()),
+                mnemonic: Some(
+                    "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+                        .into(),
+                ),
+                ..WalletEnv::default()
+            },
+        )
+        .unwrap();
         let addresses: Vec<String> = wallet
             .get_addresses()
             .iter()
