@@ -712,6 +712,11 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     let listen_port = config.p2p.port;
     let binds = s.get_multi("bind");
     if let Some(first) = binds.first() {
+        // A node that listens resolves every -bind, this one too, and one
+        // that is no address stops the start (net.cpp:1806-1811)
+        if s.get_bool("listen", true) {
+            bind_address(first, listen_port)?;
+        }
         let (host, p) = host_and_port(first);
         config.p2p.listen_addr = host;
         if let Some(p) = p {
@@ -1711,6 +1716,22 @@ fn move_wallet_for_restore(wallet_path: &Path) -> Result<()> {
     })
 }
 
+/// Divi Core copies the wallet into backups/ (and monthlyBackups/) at every
+/// start, in step 5: after the pid file, before the network and the chain
+/// (BackupWallet, init.cpp:1479, :933-943). A wallet not there yet has none.
+fn backup_wallet_at_start(wallet_path: &Path, options: &WalletOptions) {
+    if !wallet_path.exists() {
+        return;
+    }
+    if let Some(data_dir) = wallet_path.parent() {
+        if let Err(e) =
+            divi_wallet::backup::backup_at_start(wallet_path, data_dir, options.wallet_backups)
+        {
+            warn!("Failed to create backup: {}", e);
+        }
+    }
+}
+
 /// Wallet start options
 #[derive(Debug, Clone)]
 struct WalletOptions {
@@ -1909,9 +1930,6 @@ fn load_or_create_wallet_with_env(
     options: &WalletOptions,
     env: WalletEnv,
 ) -> Result<Arc<WalletDb>> {
-    if seed.restore {
-        move_wallet_for_restore(wallet_path)?;
-    }
     // A hex -hdseed is preferred over -mnemonic and -mnemonicpassphrase,
     // logged at every start, a wallet there or not (init.cpp:945-951)
     if seed.hdseed.as_deref().is_some_and(core_is_hex)
@@ -1986,17 +2004,8 @@ fn load_or_restore_wallet_with_seed(
     options: &WalletOptions,
     env: &WalletEnv,
 ) -> Result<Arc<WalletDb>> {
-    // Try to open existing wallet
+    // Try to open existing wallet (backed up by `backup_wallet_at_start`)
     if wallet_path.exists() {
-        // Divi Core copies the wallet into backups/ (and monthlyBackups/) at
-        // every start, before it opens it (init.cpp:1479)
-        if let Some(data_dir) = wallet_path.parent() {
-            if let Err(e) =
-                divi_wallet::backup::backup_at_start(wallet_path, data_dir, options.wallet_backups)
-            {
-                warn!("Failed to create backup: {}", e);
-            }
-        }
         info!("Loading wallet from {:?}", wallet_path);
         let wallet = match WalletDb::open(wallet_path, network) {
             // A key record that cannot be read: Divi Core's DB_CORRUPT, an
@@ -2275,27 +2284,24 @@ async fn run_daemon(
     // One process per data directory, held until this one exits
     // (TryLockDataDirectory, init.cpp:850-862)
     let _datadir_lock = lock_data_dir(&config.data_dir)?;
+    // With -hdseed or -mnemonic the wallet there is moved out of the way once
+    // the lock is held, before the pid file and before anything is opened, as
+    // Divi Core's CheckWalletFileExists (init.cpp:1460-1467, :864-888)
+    let wallet_dir = core_files::wallet_dir(&config.data_dir, wallet_path.as_deref());
+    if !disable_wallet && wallet_seed.restore {
+        move_wallet_for_restore(&wallet_dir)?;
+    }
     // Divi Core writes its pid file once it holds the lock, with or without
     // -daemon (init.cpp:1470), so a second start leaves a running node's alone
     #[cfg(unix)]
     write_pid_file(&pid_file);
+    if !disable_wallet {
+        backup_wallet_at_start(&wallet_dir, &wallet_options);
+    }
     // The clock warning of the network time offset goes where Divi Core's
     // Warnings::setMiscWarning puts it: getinfo's and getmininginfo's "errors"
     // (timedata.cpp:96-97)
     divi_network::timedata::on_clock_warning(divi_rpc::warnings::set_misc_warning);
-    // divid reads masternode.conf (-mnconf) at every start, makes it when
-    // missing, and with -masternode checks the masternode's settings
-    // (MasternodeModule.cpp:210-240; init.cpp:1594-1597)
-    let mn_entries = mn_options.read_conf().map_err(|e| anyhow::anyhow!(e))?;
-    let mn_network = match config.network.network_type {
-        NetworkType::Mainnet => WalletNetwork::Mainnet,
-        NetworkType::Testnet => WalletNetwork::Testnet,
-        NetworkType::Regtest => WalletNetwork::Regtest,
-    };
-    mn_options
-        .check_start(&mn_entries, config.index.txindex, mn_network)
-        .map_err(|e| anyhow::anyhow!(e))?;
-
     // Divi Core Discover: the interfaces' addresses (net.cpp:1385-1425)
     if config.p2p.discover {
         config.p2p.interface_ips = interfaces::addresses();
@@ -2385,7 +2391,6 @@ async fn run_daemon(
 
         None
     } else {
-        let wallet_dir = core_files::wallet_dir(&config.data_dir, wallet_path.as_deref());
         let wallet_network = match config.network.network_type {
             NetworkType::Mainnet => WalletNetwork::Mainnet,
             NetworkType::Testnet => WalletNetwork::Testnet,
@@ -2410,10 +2415,6 @@ async fn run_daemon(
                 let message = "Make sure to encrypt your wallet and delete all non-encrypted backups after you verified that wallet works!";
                 warn!("Warning: {}", message);
                 eprintln!("Warning: {}", message);
-            }
-            // -mnconflock, default on (MasternodeModule.cpp:454-466)
-            if mn_options.lock {
-                core_files::lock_masternode_collateral(w, &mn_options.conf_path);
             }
             w.set_vault_mode(config.vault);
             // Before the wallet catches up with the chain, as divid loads
@@ -2742,6 +2743,24 @@ async fn run_daemon(
                 tokio::time::sleep(std::time::Duration::from_secs(60)).await;
             }
         });
+    }
+
+    // Divi Core's step 10, once the chain and the wallet are loaded: it reads
+    // masternode.conf (-mnconf), makes it when missing, with -masternode checks
+    // the masternode's settings, then locks the collaterals masternode.conf
+    // names (-mnconflock, default on), all before staking starts in step 11
+    // (init.cpp:1594-1598, MasternodeModule.cpp:210-240, :454-466)
+    let mn_entries = mn_options.read_conf().map_err(|e| anyhow::anyhow!(e))?;
+    let mn_network = match config.network.network_type {
+        NetworkType::Mainnet => WalletNetwork::Mainnet,
+        NetworkType::Testnet => WalletNetwork::Testnet,
+        NetworkType::Regtest => WalletNetwork::Regtest,
+    };
+    mn_options
+        .check_start(&mn_entries, config.index.txindex, mn_network)
+        .map_err(|e| anyhow::anyhow!(e))?;
+    if let (Some(w), true) = (wallet.as_ref(), mn_options.lock) {
+        core_files::lock_masternode_collateral(w, &mn_options.conf_path);
     }
 
     // Start staker if wallet is available
@@ -4308,8 +4327,9 @@ mod wallet_log_tests {
     }
 
     /// As init.cpp:864-888: -mnemonic with a wallet already there moves it to
-    /// `<wallet><time>.moved` and restores a new one from the words; without
-    /// -mnemonic or -hdseed the wallet there is loaded
+    /// `<wallet><time>.moved` (run_daemon's `move_wallet_for_restore`, before
+    /// the load) and restores a new one from the words; without -mnemonic or
+    /// -hdseed the wallet there is loaded
     #[test]
     fn a_mnemonic_moves_a_wallet_already_there() {
         let mnemonic = "abandon abandon abandon abandon abandon abandon \
@@ -4339,6 +4359,7 @@ mod wallet_log_tests {
         );
         assert!(moved_wallets(dir.path()).is_empty());
 
+        move_wallet_for_restore(&path).unwrap();
         let restored = open(WalletSeed {
             mnemonic: Some(mnemonic.clone()),
             restore: true,
@@ -4376,6 +4397,7 @@ mod wallet_log_tests {
             load_or_create_wallet_from(&path, WalletNetwork::Regtest, ChainMode::Divi, None)
                 .unwrap(),
         );
+        move_wallet_for_restore(&path).unwrap();
         let refused = load_or_create_wallet_with_env(
             &path,
             WalletNetwork::Regtest,
@@ -4974,7 +4996,7 @@ mod wallet_move_tests {
         assert!(wallet.mnemonic().is_none());
     }
 
-    /// Opening an existing wallet first copies it into backups/ and
+    /// A start first copies the wallet there into backups/ and
     /// monthlyBackups/ next to it, as Divi Core does at every start
     #[test]
     fn start_makes_wallet_backups() {
@@ -4984,6 +5006,7 @@ mod wallet_move_tests {
             load_or_create_wallet_from(&path, WalletNetwork::Regtest, ChainMode::Divi, None)
                 .unwrap(),
         );
+        backup_wallet_at_start(&path, &WalletOptions::default());
         let wallet =
             load_or_create_wallet_from(&path, WalletNetwork::Regtest, ChainMode::Divi, None)
                 .unwrap();
