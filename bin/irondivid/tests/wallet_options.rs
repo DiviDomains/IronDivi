@@ -381,3 +381,138 @@ fn hdseed_is_logged_as_divid_logs_it() {
     assert!(log(dir.path()).contains(INCORRECT), "{}", log(dir.path()));
     assert!(!log(dir.path()).contains(PREFER), "{}", log(dir.path()));
 }
+
+/// -prunewalletconfs leaves out of memory, at the start, a wallet transaction
+/// whose coins of ours are all spent by a transaction at least max(N, 20)
+/// blocks deep and none of whose inputs comes from one kept, and logs the
+/// counts; the wallet file keeps it, so a start without the option lists it
+/// again (wallet.cpp:900-920, :1162-1240; init.cpp:1574-1577)
+#[test]
+fn prunewalletconfs_leaves_deeply_spent_transactions_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let (rpc, p2p) = (free_port(), free_port());
+    let node = start(dir.path(), rpc, p2p, &[]);
+    ok(rpc, "setgenerate", json!([30]));
+    // The coinbase of block 1, swept alone to an address not ours
+    let hash = ok(rpc, "getblockhash", json!([1]));
+    let coinbase = ok(rpc, "getblock", json!([hash]))["tx"][0].clone();
+    let others: Vec<Value> = ok(rpc, "listunspent", json!([0]))
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|u| u["txid"] != coinbase)
+        .map(|u| json!({"txid": u["txid"], "vout": u["vout"]}))
+        .collect();
+    ok(rpc, "lockunspent", json!([false, others]));
+    let elsewhere = divi_wallet::Address::from_pubkey_hash(
+        divi_primitives::hash::Hash160::from_bytes([0x42; 20]),
+        divi_wallet::Network::Regtest,
+    );
+    let sweep = ok(
+        rpc,
+        "sendtoaddress",
+        json!([elsewhere.to_string(), 1, "sweep_funds"]),
+    );
+    ok(rpc, "setgenerate", json!([25]));
+    stop(node, rpc);
+
+    let known = |txid: &Value| {
+        try_rpc(
+            rpc,
+            "gettransaction",
+            &json!([txid]),
+            Duration::from_secs(60),
+        )
+        .unwrap()["error"]
+            .is_null()
+    };
+    let log = || std::fs::read_to_string(dir.path().join("debug.log")).unwrap_or_default();
+    let node = start(dir.path(), rpc, p2p, &["-prunewalletconfs=5"]);
+    assert!(!known(&coinbase), "the swept coinbase is still listed");
+    assert!(!known(&sweep), "its sweep is still listed");
+    let line = log()
+        .lines()
+        .rev()
+        .find(|l| l.contains("Pruned wallet transactions loaded to memory: Original "))
+        .map(str::to_string);
+    assert!(line.is_some(), "{}", log());
+    stop(node, rpc);
+
+    let node = start(dir.path(), rpc, p2p, &[]);
+    assert!(
+        known(&coinbase) && known(&sweep),
+        "a start without the option lists them again"
+    );
+    stop(node, rpc);
+}
+
+/// Whether `text` is in the node's debug.log within 10 seconds (the log is
+/// written behind the calls)
+fn logged(dir: &Path, text: &str) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let log = std::fs::read_to_string(dir.join("debug.log")).unwrap_or_default();
+        if log.contains(text) {
+            return true;
+        }
+        if Instant::now() > deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// At the end of the start the log has divid's "Key Pool size = <n>" and
+/// "Address Book size = <n>" (init.cpp:1613-1618)
+#[test]
+fn the_start_logs_the_key_pool_and_address_book_sizes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (rpc, p2p) = (free_port(), free_port());
+    let node = start(dir.path(), rpc, p2p, &[]);
+    let pool = ok(rpc, "getwalletinfo", json!([]))["keypoolsize"].clone();
+    assert!(logged(dir.path(), &format!("Key Pool size = {pool}")));
+    assert!(logged(dir.path(), "Address Book size = "));
+    stop(node, rpc);
+}
+
+/// backupwallet logs divid's "copied wallet.dat to <path>" with the path
+/// written (walletdb.cpp:619)
+#[test]
+fn backupwallet_logs_where_it_copied_the_wallet() {
+    let dir = tempfile::tempdir().unwrap();
+    let (rpc, p2p) = (free_port(), free_port());
+    let node = start(dir.path(), rpc, p2p, &[]);
+    let dest = dir.path().join("copy.dat");
+    ok(rpc, "backupwallet", json!([dest.to_str().unwrap()]));
+    assert!(logged(
+        dir.path(),
+        &format!("copied wallet.dat to {}", dest.display())
+    ));
+    stop(node, rpc);
+}
+
+/// encryptwallet and walletpassphrasechange log divid's lines with the key
+/// derivation count (wallet.cpp:949, :836)
+#[test]
+fn encryption_logs_its_derivation_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let (rpc, p2p) = (free_port(), free_port());
+    let node = start(dir.path(), rpc, p2p, &[]);
+    // Throwaway test passphrases, over RPC
+    ok(rpc, "encryptwallet", json!(["first-throwaway"]));
+    ok(rpc, "walletpassphrase", json!(["first-throwaway", 60]));
+    ok(
+        rpc,
+        "walletpassphrasechange",
+        json!(["first-throwaway", "second-throwaway"]),
+    );
+    assert!(logged(
+        dir.path(),
+        "Encrypting Wallet with an nDeriveIterations of "
+    ));
+    assert!(logged(
+        dir.path(),
+        "Wallet passphrase changed to an nDeriveIterations of "
+    ));
+    stop(node, rpc);
+}

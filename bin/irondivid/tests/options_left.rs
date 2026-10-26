@@ -225,7 +225,6 @@ fn divid_s_test_aids_are_named_as_not_supported() {
         "activeversion",
         "manual_fork",
         "override_mnpayee",
-        "prunewalletconfs",
         "stakeupdatetime",
     ];
     let dir = tempfile::tempdir().unwrap();
