@@ -88,9 +88,16 @@ impl DiviSection {
         })
     }
 
-    /// `expiry_start`: `"tip"` when absent.
+    /// `expiry_start`: `"tip"` when absent, `"mtp"` to make every first absent check of a
+    /// dropped DIVI lock wait for the node's median time past
+    /// ([`divi_swap::InputReservations::release_expired_from`]).
     pub fn expiry_start(&self) -> Result<ExpiryStart> {
-        Ok(ExpiryStart::Tip)
+        match self.expiry_start.as_deref() {
+            None => Ok(ExpiryStart::default()),
+            Some(s) => s
+                .parse()
+                .map_err(|e| anyhow::anyhow!("[divi].expiry_start {e}")),
+        }
     }
 
     /// `fallback_rpc_url` when set and non-blank; an identical URL to `rpc_url` is refused
@@ -713,6 +720,7 @@ impl DaemonConfig {
         if self.tick_secs == 0 {
             bail!("tick_secs must be > 0");
         }
+        self.divi_expiry_start()?;
         let mut seen = std::collections::BTreeSet::new();
         for o in self.offer_entries.iter().map(|e| &e.offer) {
             if !seen.insert(&o.id) {

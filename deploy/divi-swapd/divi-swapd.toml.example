@@ -17,6 +17,7 @@ rpc_url = "https://services.divi.domains/api/testnet/rpc/"
 # (confirmations, HTLC output, find-spend, MTP) is made on both endpoints; any disagreement is Transient (retried), never
 # a decision, and a broadcast goes to both. Must differ from rpc_url. Unset = single source, as before.
 # fallback_rpc_url = "http://127.0.0.1:51473"
+# expiry_start = "tip"   # default; "mtp" waits for median time past before counting a dropped lock (~5 more blocks per release)
 key = "credential:maker-divi"   # systemd LoadCredential, see divi-swapd.service
 wallet_path = "/var/lib/divi-swapd/divi-wallet.json"  # known UTXOs (public data only)
 scan_from_height = 339800

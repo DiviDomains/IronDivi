@@ -384,6 +384,9 @@ impl InputReservations {
     /// counts from there. MTP trails the tip by about six blocks, so a pending record on a
     /// sparse chain whose blocks come minutes apart releases about
     /// [`EXPIRY_ABSENT_BLOCKS`] + 5 blocks after the first check, once they are mined.
+    /// A record made at a tip within [`EXPIRY_MAX_TIP_LAG_BLOCKS`] spacings of `now` counts at
+    /// once here; [`Self::release_expired_from`] with [`ExpiryStart::Mtp`] makes it pending
+    /// too (a chain's opt-in, at the cost of about five more blocks before each release).
     /// A lock in the mempool or on chain, or before its deadline, keeps its inputs; so does
     /// every reservation `locks` does not name (`divi-swapd --release-reservation` is the
     /// override for those). Each sweep reads the tip's height, hash and time from one block
@@ -416,13 +419,23 @@ impl InputReservations {
     }
 
     /// [`Self::release_expired`], with `start` saying where a first absent check may start
-    /// its count ([`ExpiryStart`]).
+    /// its count. [`ExpiryStart::Tip`] is exactly [`Self::release_expired`]. With
+    /// [`ExpiryStart::Mtp`], a record made at a tip that looks fresh (within
+    /// [`EXPIRY_MAX_TIP_LAG_BLOCKS`] spacings of `now`) is pending exactly like one made at a
+    /// tip further behind: it keeps that check's `now` in `first_absent_after`, follows the
+    /// tip while the backend's median time past is before it, and then counts as above. So
+    /// does a record restarted after a reorg or re-anchored for want of a hash. A replayed tip
+    /// stamped near the clock then cannot start a count on blocks from before the check;
+    /// the cost is that MTP trails the tip by about six blocks, so every release on that
+    /// chain comes about five blocks later (11 blocks after the first check instead of 6 on a
+    /// chain swept at each block). The stale, ahead, high-water and reorg guards are the
+    /// same for both.
     pub async fn release_expired_from(
         &self,
         backend: &dyn ChainBackend,
         locks: &[(Txid, u32)],
         now: u32,
-        _start: ExpiryStart,
+        start: ExpiryStart,
     ) -> Result<usize> {
         let chain = backend.chain();
         let held: HashSet<Txid> = self
@@ -449,8 +462,10 @@ impl InputReservations {
             );
             return Ok(0);
         }
-        // The `now` a record made at this tip waits for, unless it counts at once.
-        let pending = tip_is_behind(tip.time, spacing, now).then_some(now);
+        // The `now` a record made at this tip waits for, unless it counts at once: with
+        // `ExpiryStart::Mtp` it never does, however fresh the tip looks.
+        let pending =
+            (start == ExpiryStart::Mtp || tip_is_behind(tip.time, spacing, now)).then_some(now);
         if tip_is_ahead(tip.time, now) {
             tracing::warn!(
                 %chain,
@@ -803,7 +818,8 @@ impl InputReservations {
         Ok(released)
     }
 
-    /// [`Self::release_expired_swaps`] on `backend`, then the wallet booking of each lock it
+    /// [`Self::release_expired_swaps`] on `backend` with `start` ([`Self::release_expired_from`]),
+    /// then the wallet booking of each lock it
     /// released: a wallet that tombstoned a lock's inputs when it was broadcast (the DIVI
     /// wallet file) gets them back through [`ChainBackend::release_dead_lock`] once the
     /// backend has its own proof that they are unspent (no proof, nothing given back: the

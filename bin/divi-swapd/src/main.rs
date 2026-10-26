@@ -570,7 +570,10 @@ fn live_divi(
 /// blocks apart gives its inputs back to the wallet ([`InputReservations::release_expired`];
 /// on DIVI the wallet file gets them back too, on the backend's own proof, through
 /// [`InputReservations::release_expired_swaps_and_bookings`]). A DIVI lock of a finished swap
-/// is released first ([`InputReservations::release_finished_swaps`]). A chain that cannot be
+/// is released first ([`InputReservations::release_finished_swaps`]). `divi_start` is
+/// `[divi].expiry_start`: with `"mtp"` every DIVI count waits for the node's median time past
+/// ([`InputReservations::release_expired_from`]); the counter chains always use the default.
+/// A chain that cannot be
 /// asked, or whose backend is stale or went backwards, keeps its reservations this pass
 /// (`--release-reservation` stays the manual override). Returns how many inputs were released.
 async fn expiry_sweep_once(

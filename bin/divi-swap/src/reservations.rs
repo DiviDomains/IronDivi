@@ -54,7 +54,8 @@ pub fn release_finished(store: &Store, res: &InputReservations) -> Result<usize>
 /// [`InputReservations::release_expired_swaps_and_bookings`] on the DIVI backend `divi`: the
 /// expiry sweep, then the wallet booking of each DIVI lock it released (the DIVI wallet file
 /// tombstoned that lock's inputs when it was broadcast, and gets them back only once the node
-/// shows them unspent). Returns how many inputs the table released.
+/// shows them unspent). `start` is `--divi-expiry-start`
+/// ([`InputReservations::release_expired_from`]). Returns how many inputs the table released.
 pub async fn release_expired_divi(
     store: &Store,
     res: &InputReservations,
