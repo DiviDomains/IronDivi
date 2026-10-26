@@ -478,6 +478,8 @@ def load_row(name, args=(), bootstrap=None, stop_after=False, extra_rows=()):
         if c[2] is not None and i[2] is not None:
             for key in c[2]:
                 compare(f"{name}: {key}", ("ok", c[2][key]), ("ok", i[2][key]))
+        # read once both have stopped (see check_row)
+        both(lambda n: n.stop())
         compare(f"{name}: log lines", ("ok", log_lines(C)), ("ok", log_lines(I)))
     for option in extra_rows:
         compare(f"{name}: log lines naming -{option}", ("ok", naming(C, option)), ("ok", naming(I, option)))
@@ -522,11 +524,13 @@ def check_row(name, args, option):
     compare(f"{name}: start", ("ok", outcome(c[0])), ("ok", outcome(i[0])))
     if c[1] is not None and i[1] is not None:
         compare(f"{name}: the chain", ("ok", c[1]), ("ok", i[1]))
+    # the logs are read once both have stopped: irondivid writes debug.log
+    # from a thread of its own, so a running node may still hold a line
+    both(lambda n: n.stop())
     compare(f"{name}: verifying line", ("ok", [x for x in log_lines(C) if x[0] == "verifying"]),
             ("ok", [x for x in log_lines(I) if x[0] == "verifying"]))
     if option != "checklevel":  # the start row has the error line
         compare(f"{name}: log lines naming -{option}", ("ok", naming(C, option)), ("ok", naming(I, option)))
-    both(lambda n: n.stop())
 
 
 check_row("a plain start on the chain", [], "checkblocks")
