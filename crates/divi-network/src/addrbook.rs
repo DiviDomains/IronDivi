@@ -807,8 +807,9 @@ impl AddressBook {
 
     /// Store the addresses of an `addr` message from a peer at `source`, their
     /// times already read as divid reads them (main.cpp:538-553), each two
-    /// hours older than the peer says. An address on port 0, which nothing
-    /// can connect to, is left out (divid keeps it). The number new to the book.
+    /// hours older than the peer says. An address on port 0 is kept too:
+    /// divid checks only the IP (CNetAddr::IsRoutable, netbase.cpp:875-878;
+    /// addrman.cpp:249-250). The number new to the book.
     pub fn add(&self, addrs: &[(u32, NetAddr)], source: IpAddr) -> usize {
         self.add_at(addrs, source, TIME_PENALTY, now())
     }
@@ -818,7 +819,6 @@ impl AddressBook {
         let mut t = self.tables.lock();
         addrs
             .iter()
-            .filter(|(_, net)| net.port != 0)
             .filter(|(time, net)| t.add(net, *time, &source, penalty, now))
             .count()
     }
@@ -923,7 +923,7 @@ mod tests {
     }
 
     #[test]
-    fn only_routable_addresses_with_a_port_are_kept() {
+    fn only_routable_addresses_are_kept() {
         let book = AddressBook::new(MAGIC);
         let now = 1_700_000_000;
         let added = book.add_at(
@@ -940,8 +940,9 @@ mod tests {
             TIME_PENALTY,
             now as i64,
         );
-        assert_eq!(added, 2);
-        assert_eq!(book.len(), 2);
+        // the two public ones, and the one on port 0, as divid keeps it
+        assert_eq!(added, 3);
+        assert_eq!(book.len(), 3);
     }
 
     #[test]
@@ -951,6 +952,18 @@ mod tests {
         let t = book.tables.lock();
         let info = t.info.values().next().unwrap();
         assert_eq!(info.time as i64, (now - 60) as i64 - TIME_PENALTY);
+    }
+
+    /// divid keeps an address on port 0: it checks only the IP
+    /// (netbase.cpp:875-878, addrman.cpp:249-250)
+    #[test]
+    fn an_address_on_port_0_is_kept() {
+        let now = 1_700_000_000u32;
+        let book = AddressBook::new(MAGIC);
+        let mut zero = public(3);
+        zero.port = 0;
+        let added = book.add_at(&[(now, zero)], feeder(), TIME_PENALTY, now as i64);
+        assert_eq!((added, book.len()), (1, 1));
     }
 
     #[test]
