@@ -61,8 +61,6 @@ KNOWN = {
         "keypoololdest, keypoolsize, paytxfee (divid: rpcmisc.cpp:136-157)",
     "getblock tip 1":
         "verbosity 0, 1 or 2 as Bitcoin Core takes it (2: transactions decoded); divid reads a bool (rpcblockchain.cpp:216)",
-    "sendrawtransaction unsigned":
-        "open: divid runs with acceptnonstandard=1 here, which skips its input standardness check, so the script check answers -26 \"16: mandatory-script-verify-flag-failed (...)\" (MempoolConsensus.cpp:274, :362-364); irondivid has no -acceptnonstandard and answers -25 \"\" as divid does without it (scripts/reject-replies, row unsigned)",
 }
 
 # Fields irondivid adds to a reply on purpose: compared without them, and named

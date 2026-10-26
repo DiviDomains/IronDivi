@@ -63,9 +63,10 @@ KNOWN = {
         "(CachedUtxoBalanceCalculator.cpp:11-32), filled before removevault and not cleared by it "
         "(wallet.cpp:707-716), so the staking balance still counts the removed vault's coins until the next "
         "start; irondivid's agrees with listunspent and getcoinavailability, which divid also gives without the vault",
-    "*getstakingstatus mnsync (divid's masternode sync not finished)":
-        "open: true, as irondivid has no masternode sync and counts it finished; divid gives false on a "
-        "regtest node with no masternodes (rpcmisc.cpp:1068; the same gap as mnsync status in scripts/net-replies)",
+    "*getstakingstatus mnsync (the masternode syncs differ)":
+        "the topology, not a difference: divid's owner listens and every other node dials it, so its masternode "
+        "sync can finish (mnsync true, IsSynced, rpcmisc.cpp:1069); irondivid's owner has one peer and stays at "
+        "SPORKS (masternode-sync.cpp:437-440; as in scripts/vault-staking)",
 }
 
 EXTRA = {
@@ -502,7 +503,7 @@ def status(when, pairs=None, stale=False):
                 json.dumps(pick(cs)), json.dumps(pick(is_)), same)
         if cs[0] == is_[0] == "ok":
             a, b = cs[1].get("mnsync"), is_[1].get("mnsync")
-            name = f"{p}{side} getstakingstatus mnsync" + ("" if a == b else " (divid's masternode sync not finished)")
+            name = f"{p}{side} getstakingstatus mnsync" + ("" if a == b else " (the masternode syncs differ)")
             row(name, a, b, a == b)
         order_c = list(c.raw_call("getstakingstatus")["result"])
         order_i = [k for k in i.raw_call("getstakingstatus")["result"] if k in order_c]

@@ -51,7 +51,7 @@ A stop *during* a reorganisation cannot be made on purpose, since both nodes wri
 
 By design:
 - `getcoinavailability`: irondivid adds `total_vaults` and `vaults`; divid has `Vaulted`, `Stakable` and `Spendable` only (`rpcwallet.cpp:818-987`). Compared without them.
-- `getstakingstatus`: irondivid adds `staking status text`; `mnsync` is true on irondivid and false on a divid regtest node with no masternodes (`rpcmisc.cpp:1068`).
+- `getstakingstatus`: irondivid adds `staking status text`; `mnsync` can differ on the owners from the topology alone: divid's owner listens and every other node dials it, so its masternode sync can finish (`rpcmisc.cpp:1069`); irondivid's owner has one peer and stays at SPORKS (`masternode-sync.cpp:437-440`).
 
 ## Proving a difference is caught
 
