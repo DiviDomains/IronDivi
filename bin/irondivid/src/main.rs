@@ -2266,8 +2266,9 @@ async fn run_daemon(
     // once it is done (init.cpp:724-727). divid starts that thread once its
     // chain and wallet are loaded and scanned (init.cpp:1578), so its stop
     // comes after its init has returned, and it exits 0 (divid.cpp:146-180).
-    // irondivid imports from node.start, before the wallet is loaded: the stop
-    // is asked for once the start is done (`start_done`), so that only a
+    // irondivid's import goes on once its wallet is loaded (`release_import`),
+    // still before the end of its start, and a short one can end there: the
+    // stop is asked for once the start is done (`start_done`), so that only a
     // signal or `stop` counts as a stop during the start (exit 1, below)
     let start_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
     if config.stop_after_block_import {
