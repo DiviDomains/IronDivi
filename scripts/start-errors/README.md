@@ -40,7 +40,8 @@ case cannot spoil the next. Both nodes run a case at the same time. A case's out
 - `up`: RPC answers (with the node's credentials) on its RPC port, or on the other port the case names;
 - `running, no RPC`: neither answers nor exits within 10 s of nothing listening;
 - `exit <code> "<line>"`: the exit code (a negative code is the signal that ended it) and the first stderr line that
-  starts with `Error` (else the first line). The node's own data directory path reads `<datadir>` (divid keeps
+  starts with `Error` (else the first that starts with `EXCEPTION`, as divid prints a line of stars before it; else
+  the first line). The node's own data directory path reads `<datadir>` (divid keeps
   regtest data in `<datadir>/regtest`, irondivid in `<datadir>`), so the two lines compare.
 
 A node still running when its outcome is known is killed: the next case starts from the template again. Rows with
@@ -53,6 +54,7 @@ A node still running when its outcome is known is killed: the next case starts f
 | bad values | `-port` abc/0/70000, `-rpcport` abc/0/70000, `-maxconnections` -1/abc, `-dbcache` 0/99999999, `-par` -100/abc, `-keypool=-1`, `-paytxfee=abc`, `-mintxfee=abc` (neither is a divid 3.0.0 option), `-maxtxfee` abc/-1/99999999999, `-bind` garbage/300.1.1.1, `-externalip=garbage`, `-onlynet=bogus`, `-proxy=garbage`, `-timeout` 0/abc, `-banscore=0`, `-bantime=-1`, `-prune=550` (not a divid 3.0.0 option), an unknown option with and without a value, `-rpcbind=garbage` with `-rpcallowip`, `-rpcallowip` garbage and `1.2.3.4/99` |
 | conflicts | `-bind` with `-listen=0`, `-connect` with `-listen=1`, `-rpcbind` without `-rpcallowip` (and its warning), `-txindex=0` on an indexed data directory, `-txindex=1`, `-server=0` |
 | divi.conf | an unknown key, spaces around `=`, a comment after a value, a comment line, a repeated key (which value wins), the command line over the file, `[main]` and `[regtest]` sections, a line with no `=` (before and after the keys), an empty value, a key starting with `-`, `no<key>=1`, CRLF line ends, no `rpcpassword`, no `rpcuser` and no `rpcpassword`, an empty file with the options on the command line, `-conf=<missing>`, `-conf=<another file>`, `-conf=<a name relative to -datadir>`, an unreadable `divi.conf` |
+| a start that fails part way | the chain cannot be opened (divid's `blocks/index`, irondivid's `chainstate`): alone, with `-hdseed` in `divi.conf`, and with no `masternode.conf`; `-masternode=1` without its `masternode.conf` entry and no wallet; `-listen=1 -bind=garbage`. Each has a `: files` row too: what the failed start did to the data directory (a wallet backup, the wallet moved for a restore, a wallet or `masternode.conf` made), by the step of `InitializeDivi` it got to (`init.cpp:1454-1598`) |
 | data directories | `-datadir=<missing>`, `-datadir=<a file>`, `-datadir=<a read-only directory>`, a second instance on the data directory of a running node |
 | help | `-?`, `-help`, `-h`, `--help`, `-version`, `--version`, `-V`: exit code and first line of stdout |
 
@@ -75,6 +77,14 @@ Each KNOWN row checks the difference is exactly the one below; any other outcome
   above; irondivid makes an RPC cookie instead (by design, `crates/divi-rpc/src/auth_cookie.rs`) and refuses later:
   this regtest data directory as another network's, or the unreadable file by name (divid reads an unreadable file as
   none, `Settings.cpp:186-195`).
+- `the chain cannot be opened` (alone, `-hdseed in divi.conf`, `no masternode.conf`): divid dies on the uncaught
+  `leveldb_error` of its unreadable block index ("EXCEPTION: 13leveldb_error", SIGABRT; `init.cpp:1503-1531`);
+  irondivid refuses with exit 1 and "Error: Failed to open chain database: ...". Their `: files` rows are PASS: both
+  have backed the wallet up (step 5, `init.cpp:1479`), or moved it for the restore (step 4, `init.cpp:864-888`), and
+  neither has made `masternode.conf` (step 10, `init.cpp:1595`).
+- `-listen=1 -bind=garbage`: the same error line; divid then aborts as after any early InitError (above).
+  `-listen=1 -bind=garbage: files`: divid resolves `-bind` in step 6 (`net.cpp:1806-1811`), after its wallet backup;
+  irondivid reads `-bind` with the other options, before it takes the lock, so it has made no backup.
 - `-datadir=<a read-only directory>`: divid dies on an uncaught `boost::filesystem_error` creating
   `<datadir>/regtest` ("EXCEPTION: N5boost10filesystem16filesystem_errorE ... Permission denied", SIGABRT);
   irondivid refuses with exit 1 and the error.
