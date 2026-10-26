@@ -132,14 +132,17 @@ episode) and the remaining steps, so every comparison stays exact:
   lacks one with the same output values: a node restarted earlier gets its peer's sends back only by divid's random
   rebroadcast (`main.cpp:1280-1294`), on both sides alike.
 - **stake coin choice:** a `mine` or `generateblock` step past the last work block, after which only node n's balances
-  and coins differ. On both sides each new block staked the coin divid's rule picks: the first, in outpoint order, of
-  the wallet's coins that are unlocked, have 10 confirmations at that block, and were not spent by an earlier block of
-  the step. divid tries its stake set in `std::set` order (`StakableCoin.h:21-24`), shuffled only with `-vault`
-  (`PoSTransactionCreator.cpp:63-72`, `:99`, `:261`), and on regtest the first coin tried finds its proof. The set
-  holds the coins of `CWallet::SelectStakeCoins` (`wallet.cpp:1433-1465`): depth 10, and no coin age on regtest
-  (`chainparams.cpp:498`). The pairs' txids differ, so the first coin can differ in value. A coinstake's outputs are
-  immature, so the balances part by the difference. The rule also checks that node n's balance plus immature balance
-  agree, so the two fields are compared by their total.
+  and coins differ. On both sides each new block staked a coin of divid's stake set (`CWallet::SelectStakeCoins`,
+  `wallet.cpp:1433-1465`): unlocked, 10 confirmations at that block (no coin age on regtest, `chainparams.cpp:498`),
+  not spent by an earlier block of the step. Two more kinds of coin are not listed by `listunspent` when the step
+  begins but count: a vault output the wallet holds, and a coinbase or coinstake output that matures during the step.
+  divid counts a generated coin from 21 confirmations (`MerkleTxConfirmationNumberCalculator.cpp:54-59`). divid tries
+  the set in outpoint order (`StakableCoin.h:21-24`, `PoSTransactionCreator.cpp:261`; shuffled only with `-vault`,
+  `:63-72`, `:99`) and takes the first coin with a kernel hash under the target. That target is weighted by the coin's
+  value (`ProofOfStakeCalculator.cpp:19-24`, `:53-54`), so a small coin is often passed over. Which coin wins depends
+  on the txids, and those differ between the pairs, so the script checks only that each kernel is in the set. A
+  coinstake's outputs are immature, so the balances part by the difference. The rule also checks that node n's balance
+  plus immature balance agree, so the two fields are compared by their total.
 - **divid balance cache:** divid's `getbalance` disagrees with its own unspent coins (`listunspent 1`), while
   irondivid's agrees with the same coins. divid keeps each wallet transaction's balance in
   `CachedUtxoBalanceCalculator` (`CachedUtxoBalanceCalculator.cpp:13-30`), recomputed only when a wallet transaction

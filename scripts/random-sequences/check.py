@@ -742,10 +742,12 @@ EXPLAINED = {
         "(crypter.cpp:295-305), so the next start no longer has it, nor the coins paid to it. irondivid "
         "stores the key"),
     "stake coin choice": (
-        "each side staked, in each new block, the first of its coins in outpoint order with 10 confirmations "
-        "(divid tries its stake set in std::set order, StakableCoin.h:21-24, unshuffled without -vault, "
-        "PoSTransactionCreator.cpp:63-72, :99, :261; the set from CWallet::SelectStakeCoins, wallet.cpp:1433-1465); "
-        "the two pairs' txids differ, so the coins staked differ in value, and a coinstake's outputs are immature"),
+        "each side staked, in each new block, a coin of its stake set (CWallet::SelectStakeCoins, "
+        "wallet.cpp:1433-1465); divid tries the set in outpoint order (StakableCoin.h:21-24, "
+        "PoSTransactionCreator.cpp:261, shuffled only with -vault, :63-72, :99) and takes the first coin with a "
+        "kernel hash under the target, which is weighted by the coin's value (ProofOfStakeCalculator.cpp:19-24, "
+        ":53-54); the two pairs' txids differ, so the coins staked differ in value, and a coinstake's outputs are "
+        "immature"),
     "maturity in the middle of a reorg": (
         "only the middle of the invalidate differs: while its tip was lowered, one side dropped transactions that "
         "spend a coinbase or coinstake output immature at that height, or an output of one that does, which "
@@ -772,26 +774,72 @@ def lost_imported_key():
     return False
 
 
+def vault_output(node, outpoint):
+    """The value of a vault output the wallet holds (listunspent leaves vault
+    coins out, but they are in divid's stake set), or None"""
+    tx = node.call("gettransaction", outpoint[0])
+    if tx[0] != "ok":
+        return None
+    decoded = node.call("decoderawtransaction", tx[1]["hex"])
+    if decoded[0] != "ok" or not 0 <= outpoint[1] < len(decoded[1]["vout"]):
+        return None
+    out = decoded[1]["vout"][outpoint[1]]
+    return str(out["value"]) if out.get("scriptPubKey", {}).get("type") == "vault" else None
+
+
+def matured_in_step(node, outpoint, h, tip):
+    """The value of the wallet's coinbase or coinstake output that was not
+    mature (to be listed) when the step began but is by block h: divid counts
+    a generated coin from MATURITY + 1 confirmations (GetBlocksToMaturity,
+    MerkleTxConfirmationNumberCalculator.cpp:54-59) at the tip block h is
+    made on. Or None"""
+    tx = node.call("gettransaction", outpoint[0])
+    if tx[0] != "ok" or not tx[1].get("generated"):
+        return None
+    depth = tx[1].get("confirmations", 0) - (tip - (h - 1))
+    if depth < MATURITY + 1:
+        return None
+    decoded = node.call("decoderawtransaction", tx[1]["hex"])
+    if decoded[0] != "ok" or not 0 <= outpoint[1] < len(decoded[1]["vout"]):
+        return None
+    return str(decoded[1]["vout"][outpoint[1]]["value"])
+
+
+def coin_detail(node, outpoint):
+    """What the node says of an outpoint: its transaction's confirmations and
+    kind, and the output's value and script type"""
+    tx = node.call("gettransaction", outpoint[0])
+    if tx[0] != "ok":
+        return f"{outpoint[0][:12]}:{outpoint[1]} unknown to the wallet ({tx[1:]})"[:200]
+    decoded = node.call("decoderawtransaction", tx[1]["hex"])
+    out = decoded[1]["vout"][outpoint[1]] if decoded[0] == "ok" and outpoint[1] < len(decoded[1]["vout"]) else {}
+    return (f"{outpoint[0][:12]}:{outpoint[1]} confirmations {tx[1].get('confirmations')} "
+            f"generated {tx[1].get('generated', False)} value {out.get('value')} "
+            f"type {out.get('scriptPubKey', {}).get('type')}")
+
+
 def stake_kernels(node, h0, before, locks):
     """The coin each stake block of a mine or generateblock step staked (its coinstake's first
-    input), and whether each is the one divid's rule picks: the first, in
-    outpoint order, of the wallet's coins that are unlocked, have 10
-    confirmations at that block, and no earlier block of the step spent. divid
-    tries its stake set in std::set order (StakableCoin.h:21-24), unshuffled
-    without -vault (PoSTransactionCreator.cpp:63-72, :99, :261), and on
-    regtest the first coin tried finds its proof. The set is the coins of
-    CWallet::SelectStakeCoins (wallet.cpp:1433-1465): depth 10 (a coinstake
-    output's is already mature to be listed), no coin age on regtest
-    (chainparams.cpp:498). None when no stake block was made"""
+    input), and whether each is a coin of divid's stake set: one of the
+    wallet's coins that is unlocked, has 10 confirmations at that block, and
+    no earlier block of the step spent, or a vault output it holds. The set
+    is the coins of CWallet::SelectStakeCoins (wallet.cpp:1433-1465): depth 10
+    (a coinstake output's is already mature to be listed), no coin age on
+    regtest (chainparams.cpp:498). Which coin of the set is staked is not
+    checked: divid tries the set in outpoint order (StakableCoin.h:21-24,
+    PoSTransactionCreator.cpp:261; shuffled only with -vault, :63-72, :99),
+    and a coin is passed over when no timestamp tried gives it a kernel hash
+    under the target, which is weighted by the coin's value
+    (ProofOfStakeCalculator.cpp:19-24, :53-54). None when no stake block was
+    made"""
     if before[0] != "ok" or locks[0] != "ok":
         return None
     locked = {(o["txid"], o["vout"]) for o in locks[1]}
-    coins = sorted((u for u in before[1] if (u["txid"], u["vout"]) not in locked),
-                   key=lambda u: (u["txid"], u["vout"]))
-    value = {(u["txid"], u["vout"]): str(u["amount"]) for u in before[1]}
+    listed = {(u["txid"], u["vout"]): u for u in before[1]}
     used, kernels, rule, misses = set(), [], True, []
     try:
-        for h in range(h0 + 1, node.rpc("getblockcount") + 1):
+        tip = node.rpc("getblockcount")
+        for h in range(h0 + 1, tip + 1):
             block = node.rpc("getblock", node.rpc("getblockhash", h))
             if len(block["tx"]) < 2:
                 continue  # a work block
@@ -803,18 +851,25 @@ def stake_kernels(node, h0, before, locks):
                 continue  # a work block with transactions: no coinstake
             vin = decoded["vin"]
             kernel = (vin[0].get("txid"), vin[0].get("vout"))
-            # the coin's depth when block h was made on block h - 1
-            first = next((u for u in coins if (u["txid"], u["vout"]) not in used
-                          and u["confirmations"] + (h - 1 - h0) >= 10), None)
-            if first is None or (first["txid"], first["vout"]) != kernel:
+            coin = listed.get(kernel)
+            if coin is not None:
+                # the coin's depth when block h was made on block h - 1
+                depth = coin["confirmations"] + (h - 1 - h0)
+                value = str(coin["amount"])
+                why = ("locked" if kernel in locked else "spent earlier in the step" if kernel in used
+                       else f"at depth {depth}" if depth < 10 else None)
+            else:
+                value = vault_output(node, kernel) or matured_in_step(node, kernel, h, tip)
+                why = "spent earlier in the step" if value is not None and kernel in used else None
+                if value is None:
+                    why = f"not a listed coin or vault output of the wallet: {coin_detail(node, kernel)}"
+                elif kernel in locked:
+                    why = "locked"
+            if why:
                 rule = False
-                staked = next((u for u in before[1] if (u["txid"], u["vout"]) == kernel), None)
-                misses.append(f"block {h}: staked {value.get(kernel, '?')}"
-                              f"{'' if staked is None else ' at ' + str(staked['confirmations'] + h - 1 - h0)}"
-                              f"{' (locked)' if kernel in locked else ''}, rule picks "
-                              f"{'none' if first is None else str(first['amount']) + ' at ' + str(first['confirmations'] + h - 1 - h0)}")
+                misses.append(f"block {h}: staked {value or '?'}, {why}")
             used.update((v.get("txid"), v.get("vout")) for v in vin)
-            kernels.append(value.get(kernel, "?"))
+            kernels.append(value or "?")
     except RuntimeError:
         return None
     return {"rule": rule, "kernels": kernels, "misses": misses, "locked": len(locked)} if kernels else None
@@ -823,8 +878,8 @@ def stake_kernels(node, h0, before, locks):
 def stake_choice_explains(n, diff):
     """A mine or generateblock step after which only node n's balances and
     coins differ, with its balance plus immature balance the same on both
-    sides, where on both sides each stake block staked the coin divid's rule
-    picks (stake_kernels), and the coins staked differ in value"""
+    sides, where on both sides each stake block staked a coin of divid's stake
+    set (stake_kernels), and the coins staked differ in value"""
     stakes = [p.stake for p in PAIRS]
     log(f"#   stake rule: divid {stakes[0]}, irondivid {stakes[1]}"[:1500])
     if None in stakes or not all(s["rule"] for s in stakes):

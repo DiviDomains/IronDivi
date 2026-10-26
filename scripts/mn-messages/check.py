@@ -926,6 +926,19 @@ compare("getdata for the newer broadcast: reply",
                                    Ping(n.coll["mn1"], n.block_hash(2), now - 30, KM), KC, KM).hash(), "mnb")
           for n in NODES))
 
+# The votes outlive a restart: divid writes them to mnpayments.dat at its stop
+# and reads them back at its start, its masternode list being kept too
+# (init.cpp:376, MasternodeModule.cpp:269-297)
+voted_at = {n.name: [winners_at(x)(n) for x in (h, h + 1, h + 2)] for n in NODES}
+for n in NODES:
+    n.stop()
+for n in NODES:
+    n.start()
+again = {n.name: [winners_at(x)(n) for x in (h, h + 1, h + 2)] for n in NODES}
+compare("after a restart: the winners at the voted heights", again["divid"], again["irondivid"])
+compare("after a restart: the same winners as before the stop",
+        again["divid"] == voted_at["divid"], again["irondivid"] == voted_at["irondivid"])
+
 for n in NODES:
     n.stop()
 print(f"# rows: {counts['PASS']} PASS, {counts['KNOWN']} KNOWN, {counts['FAIL']} FAIL", flush=True)
