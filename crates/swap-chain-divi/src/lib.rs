@@ -224,7 +224,7 @@ impl DiviBackend {
     /// Before `tx` is sent: reserve the wallet inputs it spends. Only a transaction whose
     /// every input is this key's P2PKH coin (a lock funding) is reserved; a claim or refund is
     /// left alone, so a store fault cannot hold one up. Inputs another transaction holds are
-    /// `Rejected`, and this transaction's coins go back from the wallet file's own `reserved`
+    /// `InputsHeld` (nothing sent), and this transaction's coins go back from the wallet file's own `reserved`
     /// list (the next selection skips the held one); any other error blocks the broadcast.
     fn reserve_inputs(&self, tx: &Transaction, txid: &Txid) -> Result<()> {
         let Some(res) = &self.reservations else {
@@ -235,7 +235,7 @@ impl DiviBackend {
         }
         let inputs: Vec<Outpoint> = tx.vin.iter().map(prevout).collect();
         match res.reserve(Chain::Divi, txid, &inputs) {
-            Err(e @ SwapError::Rejected(_)) => {
+            Err(e @ SwapError::InputsHeld(_)) => {
                 self.wallet.lock().release(txid)?;
                 Err(e)
             }

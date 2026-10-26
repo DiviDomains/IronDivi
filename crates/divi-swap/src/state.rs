@@ -106,6 +106,7 @@ impl SwapState {
                 | (TakerLockSeen, Aborted)
                 | (TakerLockConfirmed, MakerLocked)
                 | (TakerLockConfirmed, Aborted)
+                | (MakerLocked, TakerLockConfirmed)
                 | (MakerLocked, MakerLockConfirmed)
                 | (MakerLocked, MakerRefundable)
                 | (MakerLockConfirmed, TakerClaimed)

@@ -180,8 +180,8 @@ impl InputReservations {
 
     /// Reserve `inputs` for `txid`, all or none. Idempotent: reserving the same inputs for the
     /// same transaction again is a no-op, so a re-broadcast of the persisted bytes is safe.
-    /// Inputs already reserved by a *different* transaction are an error (`Rejected`): that
-    /// transaction conflicts with a live one.
+    /// Inputs already reserved by a *different* transaction are an error (`InputsHeld`): that
+    /// transaction conflicts with a live one, and the caller must not send it.
     pub fn reserve(&self, chain: Chain, txid: &Txid, inputs: &[Outpoint]) -> Result<()> {
         let mut conn = self.conn.lock();
         let tx = conn.transaction().map_err(storage)?;
@@ -204,7 +204,7 @@ impl InputReservations {
             match owner {
                 Some(o) if o == by => {}
                 Some(o) => {
-                    return Err(SwapError::Rejected(format!(
+                    return Err(SwapError::InputsHeld(format!(
                         "input {}:{} is reserved by {o}",
                         i.txid, i.vout
                     )))
