@@ -570,14 +570,19 @@ both("after X is mined: the coin is listed unspent",
 # transaction with at least max(N, 20) confirmations, and whose inputs come
 # from no transaction kept, is dropped from memory; the log says how many
 # are left (wallet.cpp:900-920, :1162-1240; init.cpp:1574-1577, :1647-1653)
-def sweep_with_order(funding_addr, low):
-    """Fund `funding_addr` from S, then sweep its coin from C in a raw
-    transaction whose txid sorts below the funding's (`low`) or above it,
-    trying payees until it does. divid prunes in txid order when its sort
-    finds no coinbase to start from (wallet.cpp:1092-1133, :1185-1188)"""
+def fund(funding_addr):
+    """Fund `funding_addr` from S in a block of its own: (txid, outpoint)"""
     f_txid = S.rpc("sendtoaddress", funding_addr, 10)
     mine(1)
-    f = outpoint_of(f_txid, funding_addr)
+    return f_txid, outpoint_of(f_txid, funding_addr)
+
+
+def sweep_with_order(funding, low):
+    """Sweep the coin of `funding` (from `fund`) from C in a raw transaction
+    whose txid sorts below the funding's (`low`) or above it, trying payees
+    until it does. divid prunes in txid order when its sort finds no coinbase
+    to start from (wallet.cpp:1092-1133, :1185-1188)"""
+    f_txid, f = funding
     for _ in range(64):
         raw = C.rpc("createrawtransaction", [{"txid": f[0], "vout": f[1]}], {S.rpc("getnewaddress"): 9.999})
         signed = C.rpc("signrawtransaction", raw)
@@ -590,9 +595,12 @@ def sweep_with_order(funding_addr, low):
 
 
 # Pair A: the sweep's txid sorts above its funding's, so divid looks at the
-# funding first; pair B: below it
-p_txid, q_txid = sweep_with_order(shared_address(), low=False)
-pb_txid, qb_txid = sweep_with_order(shared_address(), low=True)
+# funding first; pair B: below it. Both fundings are mined before either sweep
+# is sent, so no sweep can go into the block of pair B's funding
+funding_a = fund(shared_address())
+funding_b = fund(shared_address())
+p_txid, q_txid = sweep_with_order(funding_a, low=False)
+pb_txid, qb_txid = sweep_with_order(funding_b, low=True)
 for t in (q_txid, qb_txid):
     if not seen(t):
         raise RuntimeError("a sweep did not reach the others")
