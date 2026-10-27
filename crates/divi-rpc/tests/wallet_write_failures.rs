@@ -559,3 +559,29 @@ fn a_key_that_cannot_be_written_on_an_encrypted_wallet_names_the_encrypted_chain
         )
     );
 }
+
+/// walletpassphrase unlocks, then tops the keypool up; a key it cannot write
+/// throws there, so the call answers with that write's text, the wallet stays
+/// unlocked and no timer is set (rpcwallet.cpp:2617-2627, wallet.cpp:2359-2360)
+#[test]
+fn walletpassphrase_whose_top_up_cannot_be_written_answers_as_divid() {
+    let _limit = LIMIT.lock();
+    let net = Net::new();
+    let rpc = one_key_short(&net);
+    rpc.encrypt_wallet(&p(vec![json!("throwaway-pass")]))
+        .unwrap();
+    rpc.get_new_address(&p(vec![])).unwrap();
+    writes_fail();
+    let reply = rpc.wallet_passphrase(&p(vec![json!("throwaway-pass"), json!(60)]));
+    writes_work();
+    assert_eq!(
+        rpc_error(reply),
+        (
+            -1,
+            "loadCryptedHDChain: WriteCryptedHDChain failed".to_string()
+        )
+    );
+    let info = rpc.get_wallet_info(&p(vec![])).unwrap();
+    assert_eq!(info["encryption_status"], "unlocked");
+    assert_eq!(info["unlocked_until"], 0);
+}

@@ -1650,6 +1650,9 @@ impl WalletRpc {
                     codes::WALLET_PASSPHRASE_INCORRECT,
                     "Error: The wallet passphrase entered was incorrect.",
                 ),
+                // The top-up after the unlock could not write its keys: the
+                // wallet stays unlocked with no timer (rpcwallet.cpp:2617-2620)
+                e @ divi_wallet::WalletError::Storage(_) => key_write_error(&wallet, e),
                 other => RpcError::new(codes::WALLET_ERROR, other.to_string()),
             })?;
         let timeout = match params.get(1) {
