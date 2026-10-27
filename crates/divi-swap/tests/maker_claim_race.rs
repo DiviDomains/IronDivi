@@ -16,7 +16,7 @@
 //! floor and a mempool floor, and a fee estimate the maker's first claim trusts. BTC and
 //! LTC floors go up to twice the fixed escalation cap, a fifth of the leg, under the
 //! post-leak ceiling (half the leg and more); USDC floors go up to `cap_feerate`, with a
-//! first claim priced down to 1 gwei.
+//! first claim priced down to 1 gwei, or within one price bump of `cap_feerate`.
 //!
 //! Property: with fee escalation on and every floor at or below the ceiling, the maker never
 //! ends `Lost` on BTC (RBF), LTC (CPFP) or USDC (same nonce), and its claim confirms
@@ -73,22 +73,32 @@ fn market() -> impl Strategy<Value = Market> {
         0u16..=1000,
         proptest::collection::vec((0u16..=2000, 0u16..=2000), 1..40),
         2000u64..20_000,
+        prop_oneof![Just(None), (440u64..=USDC_GWEI_CAP).prop_map(Some)],
     )
-        .prop_map(|(chain, estimate, reveal, floors, refund_feerate)| {
+        .prop_map(|(chain, estimate, reveal, floors, refund_feerate, near_cap)| {
             // Drawn per mille of the fixed cap (BTC, LTC: up to twice it) or of
             // `cap_feerate` (USDC: up to it).
             let esc = schedule(chain);
             // USDC: a first claim at 1 to 19 gwei, so the 50x multiple binds (under the
-            // 500 gwei `cap_feerate`) about half the time.
-            let estimate = match chain {
-                Chain::Usdc => 1 + estimate % 19,
+            // 500 gwei `cap_feerate`) about half the time; or, half the time, at 440 to 500
+            // gwei, across the band within one price bump of `cap_feerate` (456 to 499 at
+            // geth's 10%), where a version could never be replaced within the cap.
+            let estimate = match (chain, near_cap) {
+                (Chain::Usdc, Some(near)) => near,
+                (Chain::Usdc, None) => 1 + estimate % 19,
                 _ => estimate,
             };
             let (cap, scale) = match chain {
                 Chain::Usdc => (esc.cap_feerate, 2000),
                 _ => (esc.cap(estimate), 1000),
             };
-            let at = |f: u16| cap * u64::from(f) / scale;
+            // A first claim near the cap: floors between it and `cap_feerate`, the only
+            // ones that hold it out of a block.
+            let low = match (chain, near_cap) {
+                (Chain::Usdc, Some(_)) => estimate.min(cap),
+                _ => 0,
+            };
+            let at = |f: u16| low + (cap - low) * u64::from(f) / scale;
             let floors = floors.into_iter().map(|(b, m)| (at(b), at(m))).collect();
             Market {
                 chain,
@@ -335,6 +345,59 @@ fn a_usdc_maker_claim_reaches_cap_feerate_blocks_before_the_locktime() {
         (SwapState::Done, true, true),
         "{o:?}"
     );
+}
+
+/// The maker's first USDC claim at the 475 gwei estimate: the next version would need 522
+/// (geth's 10% bump), over the 500 gwei `cap_feerate`, so it could never be replaced. The
+/// mempool takes it and the block floor sits at 490, under the cap.
+#[test]
+fn a_usdc_maker_first_claim_within_one_bump_of_the_cap_still_reaches_it() {
+    let o = run(&Market {
+        chain: Chain::Usdc,
+        estimate: 475,
+        reveal: 500,
+        floors: vec![(490, 0)],
+        refund_feerate: 2000,
+    });
+    assert_eq!(
+        (o.maker, o.claimed, o.refunded.is_none()),
+        (SwapState::Done, true, true),
+        "{o:?}"
+    );
+}
+
+/// A first claim at 455 gwei (replaceable once, to 500) refused by a 480 mempool floor is
+/// re-signed one unit higher at a fresh nonce per refusal; taken at 480, inside the band,
+/// it could never be replaced, under a 490 block floor.
+#[test]
+fn a_usdc_maker_claim_re_signed_into_the_band_after_a_refusal_still_reaches_the_cap() {
+    let o = run(&Market {
+        chain: Chain::Usdc,
+        estimate: 455,
+        reveal: 500,
+        floors: vec![(490, 480)],
+        refund_feerate: 2000,
+    });
+    assert_eq!(
+        (o.maker, o.claimed, o.refunded.is_none()),
+        (SwapState::Done, true, true),
+        "{o:?}"
+    );
+}
+
+/// The accepted analogue of residual path 1: a first claim near the cap under a 600 gwei
+/// block floor, above `cap_feerate`, is never mined, and the hostile refund takes the leg.
+#[test]
+fn a_usdc_floor_above_cap_feerate_ends_a_maker_claim_near_the_cap_lost() {
+    let o = run(&Market {
+        chain: Chain::Usdc,
+        estimate: 475,
+        reveal: 500,
+        floors: vec![(USDC_GWEI_CAP + 100, 0)],
+        refund_feerate: 2000,
+    });
+    assert_eq!((o.maker, o.claimed), (SwapState::Lost, false), "{o:?}");
+    assert!(o.refunded.is_some(), "{o:?}");
 }
 
 /// Revealed at the deadline, a first claim at 2, and from the reveal on a block floor of

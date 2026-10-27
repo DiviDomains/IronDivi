@@ -22,7 +22,9 @@
 //! anything is revealed is declined and refunded instead.
 //! USDC (same nonce, gas paid in ETH, so no share-of-leg ceiling) holds the same property
 //! for floors at or below `cap_feerate`, a first claim priced down to 1 gwei included: past
-//! the cap point the multiple of the first feerate gives way to `cap_feerate`.
+//! the cap point the multiple of the first feerate gives way to `cap_feerate`. A first
+//! claim within one price bump of `cap_feerate` is drawn too: it can never be replaced
+//! within the cap, so it must start at the cap.
 //! ZEC (and DIVI) cannot bump at all (no replacement, CPFP inert): the margin is all they
 //! have, so there the test is only that a claim paying the block floor confirms in time.
 //!
@@ -104,10 +106,12 @@ fn schedule(chain: Chain) -> Option<FeeEscalation> {
 
 /// USDC markets: a first claim priced at 1 to 19 gwei (so the 50x multiple binds, under the
 /// 500 gwei `cap_feerate`, about half the time), floors at or below `cap_feerate`, so up to
-/// 500 times the first feerate and far above its fixed cap.
+/// 500 times the first feerate and far above its fixed cap. Or a first claim at 440 to 500
+/// gwei, across the band within one price bump of `cap_feerate` (456 to 499 at geth's
+/// 10%), where a version could never be replaced within the cap.
 fn usdc_market() -> impl Strategy<Value = Market> {
     (
-        1u64..20,
+        prop_oneof![1u64..20, 440u64..=USDC_GWEI_CAP],
         0u32..7200,
         proptest::collection::vec((0u16..=1000, 0u16..=1000), 1..40),
         2000u64..20_000,
@@ -402,6 +406,65 @@ fn a_usdc_claim_reaches_cap_feerate_blocks_before_the_locktime() {
     assert_eq!(
         (o.taker, o.claimed, o.leaked),
         (TakerState::Done, true, true),
+        "{o:?}"
+    );
+}
+
+#[test]
+fn a_usdc_first_claim_within_one_bump_of_the_cap_still_reaches_it() {
+    // A first claim at the 475 gwei estimate: the next version would need 522 (geth's 10%
+    // bump), over the 500 gwei `cap_feerate`, so it could never be replaced. The mempool
+    // takes it (the preimage is out) and the block floor sits at 490, under the cap.
+    let m = Market {
+        chain: Chain::Usdc,
+        estimate: 475,
+        delay_secs: 0,
+        floors: vec![(980, 0)],
+        refund_feerate: 2000,
+    };
+    let o = run(&m, true);
+    assert_eq!(
+        (o.taker, o.claimed, o.leaked),
+        (TakerState::Done, true, true),
+        "{o:?}"
+    );
+}
+
+#[test]
+fn a_usdc_claim_re_signed_into_the_band_after_a_refusal_still_reaches_the_cap() {
+    // A first claim at 455 gwei (one 10% bump short of 500, so replaceable) is refused by
+    // a 480 mempool floor, and each refusal re-signs it one unit higher at a fresh nonce.
+    // Taken at 480, inside the band, it could never be replaced, under a 490 block floor.
+    let m = Market {
+        chain: Chain::Usdc,
+        estimate: 455,
+        delay_secs: 0,
+        floors: vec![(980, 960)],
+        refund_feerate: 2000,
+    };
+    let o = run(&m, true);
+    assert_eq!(
+        (o.taker, o.claimed, o.leaked),
+        (TakerState::Done, true, true),
+        "{o:?}"
+    );
+}
+
+#[test]
+fn a_usdc_floor_above_cap_feerate_loses_a_first_claim_near_the_cap() {
+    // The accepted analogue of residual path 1: a 600 gwei block floor is above the 500
+    // gwei `cap_feerate`, so no version is mined and the hostile refund takes the leg.
+    let m = Market {
+        chain: Chain::Usdc,
+        estimate: 475,
+        delay_secs: 0,
+        floors: vec![(1200, 0)],
+        refund_feerate: 2000,
+    };
+    let o = run(&m, true);
+    assert_eq!(
+        (o.taker, o.claimed, o.leaked),
+        (TakerState::Lost, false, true),
         "{o:?}"
     );
 }
