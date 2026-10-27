@@ -3597,6 +3597,137 @@ mod tests {
         }
     }
 
+    /// A regtest chain of 100 work blocks whose first pays a fresh wallet, the
+    /// staker config the stake tests use, and the blocks, which the wallet is
+    /// not yet told of
+    #[allow(clippy::type_complexity)]
+    fn chain_with_unscanned_coin() -> (
+        tempfile::TempDir,
+        Arc<divi_storage::Chain>,
+        Arc<WalletDb>,
+        Vec<(Hash256, u32, Block)>,
+    ) {
+        use divi_storage::{Chain, ChainDatabase, ChainParams, NetworkType};
+        use divi_wallet::{HdWallet, Network};
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(ChainDatabase::open(temp_dir.path().join("chain")).unwrap());
+        let params =
+            ChainParams::for_network(NetworkType::Regtest, divi_primitives::ChainMode::Divi);
+        let chain = Arc::new(Chain::new(db, params).unwrap());
+        chain.set_ibd_mode(false);
+        let wallet = Arc::new(WalletDb::with_hd_wallet(
+            Network::Regtest,
+            HdWallet::new(divi_primitives::ChainMode::Divi).unwrap(),
+        ));
+        let pay_to = wallet.new_receiving_address().unwrap().script_pubkey();
+        let mut blocks = Vec::new();
+        for height in 1..=100u32 {
+            let tip = chain.tip().unwrap();
+            let payee = if height == 1 {
+                pay_to.clone()
+            } else {
+                Script::new_p2pkh(&[0xee; 20])
+            };
+            let mut sig = divi_storage::bip34_height_script(height);
+            sig.push(0);
+            let mut block = Block::default();
+            block.header.version = 4;
+            block.header.prev_block = tip.hash;
+            block.header.time = tip.time + 60;
+            block.header.bits = 0x207fffff;
+            block.transactions = vec![Transaction {
+                version: 1,
+                vin: vec![TxIn::coinbase(Script::from_bytes(sig))],
+                vout: vec![TxOut::new(Amount::from_divi(1250), payee)],
+                lock_time: 0,
+            }];
+            block.header.merkle_root = compute_merkle_root(&block.transactions);
+            let target = Hash256::from_compact(block.header.bits);
+            while compute_block_hash(&block.header) > target {
+                block.header.nonce += 1;
+            }
+            let hash = chain.accept_block(block.clone()).unwrap().hash;
+            blocks.push((hash, height, block));
+        }
+        (temp_dir, chain, wallet, blocks)
+    }
+
+    fn scan_into(wallet: &WalletDb, blocks: &[(Hash256, u32, Block)]) {
+        for (hash, height, block) in blocks {
+            wallet.scan_block(*hash, *height, block.header.time, &block.transactions);
+            wallet.set_last_scan_height(*height);
+        }
+    }
+
+    fn stake_test_staker(chain: &Arc<divi_storage::Chain>, wallet: &Arc<WalletDb>) -> Staker {
+        use crate::config::MempoolConfig;
+        use divi_network::PeerManagerConfig;
+        Staker::new(
+            wallet.clone(),
+            chain.clone(),
+            Arc::new(Mempool::new(MempoolConfig::default())),
+            PeerManager::new(PeerManagerConfig::default()),
+            StakingConfig {
+                allow_stale_tip: true,
+                min_coin_age: 0,
+                ..StakingConfig::default()
+            },
+        )
+    }
+
+    /// Divi Core records a staking attempt only where it hashes a kernel
+    /// (PoSTransactionCreator.cpp:233-237). A round with nothing to hash
+    /// leaves no record: getstakingstatus's "staking status" stays false
+    /// (init.cpp:155-175) and the rate limit does not start
+    /// (CoinMinter.cpp:84-95). A hashed kernel is recorded at the tip.
+    #[test]
+    fn staking_records_an_attempt_only_when_a_kernel_is_hashed() {
+        let (_dir, chain, wallet, blocks) = chain_with_unscanned_coin();
+
+        // No coin: no kernel hashed, so no attempt recorded
+        let staker = stake_test_staker(&chain, &wallet);
+        let _ = staker.try_stake();
+        assert!(staker.hashed_block_timestamps.read().is_empty());
+        assert!(!staker.get_status().recently_attempted);
+
+        // A kernel hashed: the attempt is recorded at the tip, the status
+        // says so, and the next round at this height waits
+        scan_into(&wallet, &blocks);
+        let staker = stake_test_staker(&chain, &wallet);
+        assert!(matches!(staker.try_stake(), StakeResult::Success { .. }));
+        assert!(staker.hashed_block_timestamps.read().contains_key(&100));
+        assert!(staker.get_status().recently_attempted);
+        assert!(matches!(staker.try_stake(), StakeResult::RateLimited));
+    }
+
+    /// Divi Core's minter stakes only with a staking balance, and only then
+    /// looks for an aged coin, trusting that look for five minutes
+    /// (CanStakeCoins, wallet.cpp:1483-1486; CoinMinter.cpp:49-63, :76-78)
+    #[test]
+    fn staking_looks_for_an_aged_coin_once_there_is_a_balance() {
+        let (_dir, chain, wallet, blocks) = chain_with_unscanned_coin();
+        let staker = stake_test_staker(&chain, &wallet);
+
+        // No balance: no look taken
+        assert!(matches!(staker.try_stake(), StakeResult::RateLimited));
+        assert!(staker.mintable_coins_check.lock().is_none());
+
+        // The coin arrives: the next round looks, finds it and stakes
+        scan_into(&wallet, &blocks);
+        assert!(matches!(staker.try_stake(), StakeResult::Success { .. }));
+        let (checked, have) = staker.mintable_coins_check.lock().unwrap();
+        assert!(have);
+
+        // The look holds five minutes: a coin locked since still counts
+        for coin in wallet.get_spendable_utxos(chain.height(), 1) {
+            wallet.set_coin_locked(coin.outpoint(), true);
+        }
+        assert!(!staker.has_mintable_coins());
+        assert!(staker.has_mintable_coin_for_stake(checked + 300));
+        assert!(!staker.has_mintable_coin_for_stake(checked + 301));
+    }
+
     /// Divi Core stakes only with a peer to announce the block to
     /// (CoinMinter::canMintCoins, CoinMinter.cpp:73-75)
     #[test]
