@@ -32,6 +32,7 @@ network = "signet"         # or "testnet"; "mainnet" needs allow_mainnet = true 
 esplora_url = "https://mempool.space/signet/api"
 fallback_esplora_url = "https://blockstream.info/signet/api"
 # quorum_reads = false      # default; true: spend/HTLC/confirmation reads must agree on both URLs (README)
+# expiry_start = "tip"   # default; "mtp" waits for median time past before counting a dropped lock (~5 more blocks per release)
 key = "credential:maker-btc"
 
 [ltc]
@@ -57,6 +58,7 @@ esplora_url = "https://litecoinspace.org/testnet/api"
 # Testnets reuse the BTC swap key on every secp256k1 chain (docs/plans/swap-poc/funding.md,
 # decision 64ae2a0): no maker-ltc 1Password item or credential file exists or is needed —
 # this is the same maker-btc credential already loaded above.
+# expiry_start = "tip"   # default; "mtp" waits for median time past before counting a dropped lock (~5 more blocks per release)
 key = "credential:maker-btc"
 
 [usdc]
@@ -93,6 +95,7 @@ lightwalletd_url = "https://testnet.zec.rocks:443"
 #                           # registrable domain with lightwalletd_url / the defaults. Required with
 #                           # profile = "mainnet" unless the endpoints already span two operators.
 # allow_single_source = false  # default; true lets a mainnet config start on one operator (logs a warning)
+# expiry_start = "tip"   # default; "mtp" waits for median time past before counting a dropped lock (~5 more blocks per release)
 # Same BTC swap key (funding.md); started only while a zec offer below is enabled.
 key = "credential:maker-btc"
 
