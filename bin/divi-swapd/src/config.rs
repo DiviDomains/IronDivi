@@ -339,6 +339,16 @@ pub struct ZecSection {
     /// Fallback lightwalletd gRPC endpoint, used only when `lightwalletd_url` is set (comes
     /// after it).
     pub fallback_lightwalletd_url: Option<String>,
+    /// A lightwalletd run by a second operator (`https://host:port`), asked for its tip at
+    /// startup and before every ZEC claim and refund (`swap_chain_zec::crosscheck`). Unset
+    /// (the default) is off. Refused at load when its host shares a registrable domain with
+    /// any primary endpoint; required on a mainnet profile unless the endpoints already span
+    /// two operators or `allow_single_source = true`.
+    pub crosscheck_url: Option<String>,
+    /// Let a mainnet profile start without a second lightwalletd operator, trusting one
+    /// operator's tip. Off by default, mirroring `[ltc].allow_single_source`.
+    #[serde(default)]
+    pub allow_single_source: bool,
     /// Reference (`op://…` or `credential:<name>`) to the maker's ZEC key.
     pub key: String,
 }
@@ -1619,7 +1629,7 @@ divi_fund_txids = ["ab"]
         // header, or TOML scopes it into GOOD's last section ([btc]) instead.
         let text = format!(
             "profile = \"mainnet\"\n{}\n[zec]\nnetwork = \"mainnet\"\nallow_mainnet = true\n\
-             key = \"credential:maker-btc\"\n",
+             key = \"credential:maker-btc\"\n{ZEC_SECOND}",
             good_mainnet_btc()
         );
         let c = DaemonConfig::parse(&text).unwrap();
@@ -1688,6 +1698,81 @@ divi_fund_txids = ["ab"]
         }
     }
 
+    /// A second lightwalletd operator for a mainnet `[zec]` section.
+    const ZEC_SECOND: &str = "crosscheck_url = \"https://lwd.other-operator.net:9067\"\n";
+
+    fn mainnet_zec(extra: &str) -> String {
+        format!(
+            "profile = \"mainnet\"\n{}\n[zec]\nnetwork = \"mainnet\"\nallow_mainnet = true\n\
+             key = \"credential:maker-btc\"\n{extra}",
+            good_mainnet_btc()
+        )
+    }
+
+    #[test]
+    fn zec_crosscheck_url_defaults_off_and_parses() {
+        let c = DaemonConfig::parse(&format!("{GOOD}\n[zec]\nkey = \"credential:maker-btc\"\n"))
+            .unwrap();
+        let z = c.zec.unwrap();
+        assert_eq!(z.crosscheck_url, None);
+        assert!(!z.allow_single_source);
+        let c = DaemonConfig::parse(&format!(
+            "{GOOD}\n[zec]\nkey = \"credential:maker-btc\"\n{ZEC_SECOND}"
+        ))
+        .unwrap();
+        assert_eq!(
+            c.zec.unwrap().crosscheck_url.as_deref(),
+            Some("https://lwd.other-operator.net:9067")
+        );
+        DaemonConfig::parse(&mainnet_zec(ZEC_SECOND)).unwrap();
+    }
+
+    #[test]
+    fn zec_crosscheck_url_of_a_primary_operator_is_refused() {
+        // Testnet, explicit primaries; and mainnet on the zec.rocks defaults.
+        let testnet = format!(
+            "{GOOD}\n[zec]\nkey = \"credential:maker-btc\"\n\
+             lightwalletd_url = \"https://na.zec.rocks:443\"\n\
+             crosscheck_url = \"https://eu.zec.rocks:443\"\n"
+        );
+        let mainnet = mainnet_zec("crosscheck_url = \"https://zec.rocks:9067\"\n");
+        for text in [testnet, mainnet] {
+            let e = DaemonConfig::parse(&text).unwrap_err().to_string();
+            assert!(e.contains("[zec].crosscheck_url"), "{e}");
+            assert!(e.contains("zec.rocks"), "{e}");
+        }
+        let bad = format!(
+            "{GOOD}\n[zec]\nkey = \"credential:maker-btc\"\ncrosscheck_url = \"not a url\"\n"
+        );
+        let e = DaemonConfig::parse(&bad).unwrap_err().to_string();
+        assert!(e.contains("[zec].crosscheck_url"), "{e}");
+    }
+
+    #[test]
+    fn zec_mainnet_without_a_second_operator_is_refused_naming_the_key() {
+        for extra in [
+            "",
+            "lightwalletd_url = \"https://zec.rocks:443\"\n\
+             fallback_lightwalletd_url = \"https://na.zec.rocks:443\"\n",
+        ] {
+            let e = DaemonConfig::parse(&mainnet_zec(extra))
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("[zec].crosscheck_url"), "{extra:?}: {e}");
+            assert!(e.contains("allow_single_source"), "{extra:?}: {e}");
+        }
+        // The endpoint list already naming another operator, or the explicit waiver, starts.
+        for extra in [
+            "lightwalletd_url = \"https://zec.rocks:443\"\n\
+             fallback_lightwalletd_url = \"https://lwd.other-operator.net:9067\"\n",
+            "allow_single_source = true\n",
+        ] {
+            DaemonConfig::parse(&mainnet_zec(extra)).unwrap();
+        }
+        // Testnet stays as today: one operator is fine.
+        DaemonConfig::parse(&format!("{GOOD}\n[zec]\nkey = \"credential:maker-btc\"\n")).unwrap();
+    }
+
     #[test]
     fn zec_bad_network_is_rejected() {
         let text =
@@ -1720,7 +1805,7 @@ divi_fund_txids = ["ab"]
     fn zec_absent_lightwalletd_url_resolves_networks_probed_defaults() {
         let text = format!(
             "profile = \"mainnet\"\n{}\n[zec]\nnetwork = \"mainnet\"\nallow_mainnet = true\n\
-             key = \"credential:maker-btc\"\n",
+             key = \"credential:maker-btc\"\n{ZEC_SECOND}",
             good_mainnet_btc()
         );
         let c = DaemonConfig::parse(&text).unwrap();

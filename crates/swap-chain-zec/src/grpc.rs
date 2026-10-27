@@ -333,6 +333,16 @@ impl LightwalletdClient {
         Ok(Self { endpoints, retry })
     }
 
+    /// The endpoints, primary first.
+    pub fn endpoints(&self) -> &[String] {
+        &self.endpoints
+    }
+
+    /// The retry policy every call uses.
+    pub fn retry(&self) -> RetryPolicy {
+        self.retry
+    }
+
     async fn connect(endpoint: String) -> Result<Channel, ClientError> {
         let tls = ClientTlsConfig::new().with_webpki_roots();
         let endpoint = Channel::from_shared(endpoint)
