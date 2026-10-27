@@ -440,12 +440,8 @@ impl Mempool {
         let entry =
             MempoolEntry::new(tx.clone(), fee).with_coin_age(admission.height, admission.coin_age);
 
-        // Check size limits
-        let new_size = *self.total_size.read() + entry.size;
-        if new_size > self.config.max_size {
-            // Need to evict transactions
-            self.evict_for_space(entry.size)?;
-        }
+        // Past the size cap, room is made only from transactions paying less
+        self.make_room_for(&entry)?;
 
         // Add to mempool
         {
@@ -891,40 +887,78 @@ impl Mempool {
         count
     }
 
-    /// Evict transactions to make room for new ones
-    fn evict_for_space(&self, needed: usize) -> Result<(), NodeError> {
-        let mut freed = 0;
-        let mut to_remove = Vec::new();
+    /// Keep the mempool under its size cap when `entry` comes in. Divi Core
+    /// has no cap and keeps every transaction it accepts (MempoolConsensus.cpp
+    /// :415-416, txmempool.cpp:70-89); this one is a memory guard. Past it,
+    /// transactions paying a lower fee rate than `entry` leave, cheapest
+    /// first, each together with its descendants, which cannot be mined
+    /// without it; `entry`'s own ancestors stay. If that frees too little,
+    /// nothing is removed and `entry` is refused.
+    fn make_room_for(&self, entry: &MempoolEntry) -> Result<(), NodeError> {
+        let needed = (*self.total_size.read() + entry.size).saturating_sub(self.config.max_size);
+        if needed == 0 {
+            return Ok(());
+        }
+        let doomed = {
+            let txs = self.txs.read();
+            let spenders = self.spenders.read();
 
-        // Remove lowest fee rate transactions first
-        let txs = self.txs.read();
-        let mut entries: Vec<_> = txs.values().collect();
-        entries.sort_by(|a, b| {
-            a.fee_rate
-                .partial_cmp(&b.fee_rate)
-                .unwrap_or(Ordering::Equal)
-        });
-
-        for entry in entries {
-            if freed >= needed {
-                break;
+            let mut ancestors = HashSet::new();
+            let mut stack: Vec<Hash256> = entry.tx.vin.iter().map(|i| i.prevout.txid).collect();
+            while let Some(id) = stack.pop() {
+                if let Some(parent) = txs.get(&id) {
+                    if ancestors.insert(id) {
+                        stack.extend(parent.tx.vin.iter().map(|i| i.prevout.txid));
+                    }
+                }
             }
-            to_remove.push(entry.txid);
-            freed += entry.size;
+
+            let mut cheaper: Vec<&MempoolEntry> = txs
+                .values()
+                .filter(|e| e.fee_rate < entry.fee_rate && !ancestors.contains(&e.txid))
+                .collect();
+            cheaper.sort_by(|a, b| {
+                a.fee_rate
+                    .partial_cmp(&b.fee_rate)
+                    .unwrap_or(Ordering::Equal)
+                    .then(a.txid.cmp(&b.txid))
+            });
+
+            let mut taken = HashSet::new();
+            let mut doomed = Vec::new();
+            let mut freed = 0;
+            for cheap in cheaper {
+                if freed >= needed {
+                    break;
+                }
+                let mut queue = vec![cheap.txid];
+                while let Some(id) = queue.pop() {
+                    let Some(e) = txs.get(&id) else { continue };
+                    if !taken.insert(id) {
+                        continue;
+                    }
+                    freed += e.size;
+                    doomed.push(id);
+                    for vout in 0..e.tx.vout.len() as u32 {
+                        if let Some(child) = spenders.get(&(id, vout)) {
+                            queue.push(*child);
+                        }
+                    }
+                }
+            }
+            if freed < needed {
+                return Err(NodeError::TransactionValidation(
+                    "Mempool full, cannot accept transaction".into(),
+                ));
+            }
+            doomed
+        };
+
+        for txid in &doomed {
+            if self.remove(txid).is_some() {
+                tracing::info!("Removed tx {} from mempool: mempool full", txid);
+            }
         }
-
-        drop(txs);
-
-        for txid in to_remove {
-            self.remove(&txid);
-        }
-
-        if freed < needed {
-            return Err(NodeError::TransactionValidation(
-                "Mempool full, cannot accept transaction".into(),
-            ));
-        }
-
         Ok(())
     }
 
@@ -1704,6 +1738,84 @@ mod tests {
 
         // Low fee tx should have been evicted
         assert!(!mempool.contains(&txid_low));
+    }
+
+    /// Past the size cap a transaction leaves with its descendants: a child
+    /// left behind would spend an output no longer in the mempool or chain
+    #[test]
+    fn a_full_mempool_evicts_a_parent_with_its_children() {
+        let mut config = test_config();
+        let size = create_test_tx([1u8; 32], 10).size();
+        config.max_size = 3 * size;
+        let mempool = Mempool::new(config);
+
+        let parent = create_test_tx([1u8; 32], 10);
+        let parent_id = mempool.add(parent, Amount::from_sat(100)).unwrap();
+        let child = create_test_tx(parent_id.0, 9);
+        let child_id = mempool.add(child, Amount::from_sat(10_000)).unwrap();
+        let other_id = mempool
+            .add(create_test_tx([2u8; 32], 10), Amount::from_sat(5_000))
+            .unwrap();
+
+        let new_id = mempool
+            .add(create_test_tx([3u8; 32], 10), Amount::from_sat(20_000))
+            .unwrap();
+        assert!(mempool.contains(&new_id));
+        assert!(!mempool.contains(&parent_id));
+        assert!(
+            !mempool.contains(&child_id),
+            "the child outlived its parent"
+        );
+        assert!(mempool.contains(&other_id));
+        assert!(mempool.bytes() <= 3 * size);
+    }
+
+    /// A full mempool never drops a transaction for one paying a lower fee
+    /// rate: the newcomer is refused and everything stays
+    #[test]
+    fn a_full_mempool_refuses_a_cheaper_newcomer() {
+        let mut config = test_config();
+        let size = create_test_tx([1u8; 32], 10).size();
+        config.max_size = 2 * size;
+        let mempool = Mempool::new(config);
+
+        let a = mempool
+            .add(create_test_tx([1u8; 32], 10), Amount::from_sat(5_000))
+            .unwrap();
+        let b = mempool
+            .add(create_test_tx([2u8; 32], 10), Amount::from_sat(6_000))
+            .unwrap();
+        let cheap = create_test_tx([3u8; 32], 10);
+        let cheap_id = cheap.txid();
+        assert!(mempool.add(cheap, Amount::from_sat(1_000)).is_err());
+        assert!(mempool.contains(&a));
+        assert!(mempool.contains(&b));
+        assert!(!mempool.contains(&cheap_id));
+    }
+
+    /// Room is never made by evicting the newcomer's own parent
+    #[test]
+    fn a_full_mempool_keeps_the_newcomers_parent() {
+        let mut config = test_config();
+        let size = create_test_tx([1u8; 32], 10).size();
+        config.max_size = 2 * size;
+        let mempool = Mempool::new(config);
+
+        let parent_id = mempool
+            .add(create_test_tx([1u8; 32], 10), Amount::from_sat(100))
+            .unwrap();
+        let other_id = mempool
+            .add(create_test_tx([2u8; 32], 10), Amount::from_sat(5_000))
+            .unwrap();
+        let child_id = mempool
+            .add(create_test_tx(parent_id.0, 9), Amount::from_sat(20_000))
+            .unwrap();
+        assert!(
+            mempool.contains(&parent_id),
+            "the new child's parent was evicted"
+        );
+        assert!(mempool.contains(&child_id));
+        assert!(!mempool.contains(&other_id));
     }
 
     #[test]
