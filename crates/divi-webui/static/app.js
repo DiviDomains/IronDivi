@@ -131,7 +131,7 @@ const routes = {
   "security": security,
   "settings": settings,
   "console": consoleView,
-  "wallet": () => later("Wallet", "Send and receive."),
+  "wallet": walletView,
   "staking": () => later("Staking", "Staking status, rewards and the split threshold."),
   "vaults": () => later("Vaults", "Vaults that stake for you but cannot spend."),
   "swaps": () => later("Swaps", "Atomic swaps with other chains."),
@@ -386,6 +386,298 @@ async function settings() {
     h("div", { class: "opts" }, opts.filter((o) => o.category === settingsTab).map(row)),
     other,
     h("div", { class: "savebar" }, save, count, msg)));
+}
+
+// --- QR codes ----------------------------------------------------------------
+
+/// A QR code of `text`, dark on white whatever the theme
+function qrCanvas(text) {
+  qrcode.stringToBytes = qrcode.stringToBytesFuncs["UTF-8"];
+  const q = qrcode(0, "M");
+  q.addData(text, "Byte");
+  q.make();
+  const n = q.getModuleCount();
+  const cell = 8;
+  const pad = 4 * cell;
+  const c = h("canvas", { class: "qr", width: n * cell + 2 * pad, height: n * cell + 2 * pad,
+    role: "img", "aria-label": "QR code: " + text });
+  const g = c.getContext("2d");
+  g.fillStyle = "#fff";
+  g.fillRect(0, 0, c.width, c.height);
+  g.fillStyle = "#000";
+  for (let r = 0; r < n; r++) {
+    for (let k = 0; k < n; k++) if (q.isDark(r, k)) g.fillRect(pad + k * cell, pad + r * cell, cell, cell);
+  }
+  return c;
+}
+
+let qrReaderLoad = null;
+
+/// The QR reader, fetched the first time something is scanned
+function qrReader() {
+  qrReaderLoad = qrReaderLoad || new Promise((ok, fail) => {
+    const s = h("script", { src: "/jsqr.js" });
+    s.addEventListener("load", () => ok(window.jsQR));
+    s.addEventListener("error", () => { qrReaderLoad = null; s.remove(); fail(new Error("could not load the QR reader")); });
+    document.head.append(s);
+  });
+  return qrReaderLoad;
+}
+
+/// The text of a QR code in a picture or video frame, or null
+async function readQr(source, width, height) {
+  const jsQR = await qrReader();
+  const scale = Math.min(1, 2000 / Math.max(width, height));
+  const w = Math.max(1, Math.round(width * scale));
+  const ht = Math.max(1, Math.round(height * scale));
+  const c = document.createElement("canvas");
+  c.width = w;
+  c.height = ht;
+  const g = c.getContext("2d", { willReadFrequently: true });
+  g.drawImage(source, 0, 0, w, ht);
+  const hit = jsQR(g.getImageData(0, 0, w, ht).data, w, ht, { inversionAttempts: "attemptBoth" });
+  return hit && hit.data ? hit.data : null;
+}
+
+/// Ways to read a QR code into `onText`: a picture (a phone's camera works
+/// even over plain HTTP), the live camera or the screen (both need HTTPS or
+/// localhost), or a screenshot pasted from the clipboard
+function scanner(onText) {
+  const msg = h("p", { class: "note" });
+  const video = h("video", { class: "scan", playsinline: true, hidden: true });
+  video.muted = true;
+  const box = h("div", { class: "scanner" });
+  const stopButton = h("button", { type: "button", class: "link", hidden: true,
+    onclick: () => { stop(); msg.textContent = ""; } }, "Stop");
+  let stream = null;
+
+  function stop() {
+    if (stream) stream.getTracks().forEach((t) => t.stop());
+    stream = null;
+    video.srcObject = null;
+    video.hidden = stopButton.hidden = true;
+  }
+  function found(text) {
+    stop();
+    note(msg, "Read the QR code.", true);
+    onText(text);
+  }
+
+  async function picture(file) {
+    if (!file) return;
+    note(msg, "Reading the picture…", true);
+    try {
+      const bmp = await createImageBitmap(file);
+      const text = await readQr(bmp, bmp.width, bmp.height);
+      bmp.close();
+      if (text) found(text);
+      else note(msg, "No QR code found in that picture. Try closer, sharper or with more light.", false);
+    } catch (err) {
+      note(msg, "Could not read that picture: " + err.message, false);
+    }
+  }
+
+  async function watch(open, hint) {
+    stop();
+    let mine;
+    try {
+      mine = await open();
+    } catch (err) {
+      note(msg, err.name === "NotAllowedError" ? "Not allowed, so nothing was shared." : err.message, false);
+      return;
+    }
+    stream = mine;
+    video.srcObject = mine;
+    video.hidden = stopButton.hidden = false;
+    await video.play().catch(() => {});
+    note(msg, hint, true);
+    mine.getTracks().forEach((t) => t.addEventListener("ended", () => { if (stream === mine) stop(); }));
+    const tick = async () => {
+      if (stream !== mine) return;
+      if (!box.isConnected) return stop();
+      if (video.videoWidth) {
+        let text = null;
+        try {
+          text = await readQr(video, video.videoWidth, video.videoHeight);
+        } catch (err) {
+          stop();
+          return note(msg, err.message, false);
+        }
+        if (text && stream === mine) return found(text);
+      }
+      setTimeout(tick, 300);
+    };
+    tick();
+  }
+
+  const fileInput = (capture) => {
+    const i = h("input", { type: "file", accept: "image/*", capture: capture ? "environment" : null, hidden: true });
+    i.addEventListener("change", () => { const f = i.files[0]; i.value = ""; picture(f); });
+    return i;
+  };
+  const camera = fileInput(true);
+  const image = fileInput(false);
+  const media = navigator.mediaDevices;
+  const touch = matchMedia("(pointer: coarse)").matches;
+  const buttons = [
+    touch ? h("button", { type: "button", onclick: () => camera.click() }, "Take a picture") : null,
+    h("button", { type: "button", onclick: () => image.click() }, touch ? "Choose a picture" : "Open an image"),
+    media && media.getUserMedia ? h("button", { type: "button", onclick: () => watch(
+      () => media.getUserMedia({ video: { facingMode: "environment" }, audio: false }),
+      "Hold the QR code up to the camera…") }, "Live camera") : null,
+    media && media.getDisplayMedia && !touch ? h("button", { type: "button", onclick: () => watch(
+      () => media.getDisplayMedia({ video: true, audio: false }),
+      "Watching the shared screen or window; bring the QR code into view…") }, "Scan the screen") : null,
+  ];
+
+  const onPaste = (e) => {
+    if (!box.isConnected) return document.removeEventListener("paste", onPaste);
+    const items = [...(e.clipboardData ? e.clipboardData.items : [])];
+    const img = items.find((i) => i.kind === "file" && i.type.startsWith("image/"));
+    if (img) {
+      e.preventDefault();
+      picture(img.getAsFile());
+    }
+  };
+  document.addEventListener("paste", onPaste);
+
+  box.append(h("div", { class: "row wrap" }, buttons, camera, image, stopButton),
+  h("p", { class: "muted small" }, touch ? null : "You can also paste a screenshot of a QR code on this page. ",
+    window.isSecureContext ? null : "The live camera and screen need HTTPS or localhost; a picture works anyway."),
+  video, msg);
+  return box;
+}
+
+/// The request's QR code, its link and ways to hand them over
+function requestCard(uri) {
+  const qr = qrCanvas(uri);
+  const msg = h("p", { class: "note" });
+  const code = h("code", { class: "uri" }, uri);
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(uri);
+      note(msg, "Link copied.", true);
+    } catch (_) {
+      const r = document.createRange();
+      r.selectNodeContents(code);
+      getSelection().removeAllRanges();
+      getSelection().addRange(r);
+      note(msg, "Selected; copy it with Ctrl+C or ⌘C.", true);
+    }
+  };
+  const share = async () => {
+    const data = { title: "Divi payment request", text: uri };
+    const blob = await new Promise((ok) => qr.toBlob(ok, "image/png"));
+    const file = blob && new File([blob], "divi-request.png", { type: "image/png" });
+    if (file && navigator.canShare && navigator.canShare({ files: [file] })) data.files = [file];
+    await navigator.share(data).catch((e) => { if (e.name !== "AbortError") note(msg, e.message, false); });
+  };
+  return h("div", { class: "qrbox" }, qr, code, h("div", { class: "row wrap" },
+    h("button", { type: "button", onclick: copy }, "Copy link"),
+    navigator.share ? h("button", { type: "button", onclick: share }, "Share") : null), msg);
+}
+
+// --- wallet ------------------------------------------------------------------
+
+async function walletView() {
+  await refresh();
+  const w = state.wallet;
+  if (w === null || w === undefined) {
+    return show(h("section", {}, h("h2", {}, "Wallet"), h("p", { class: "muted" }, "The daemon has no wallet loaded.")));
+  }
+  const balance = await rpc("getbalance").catch((e) => e.message);
+
+  const reqBox = h("div");
+  const receive = form("Request a payment", [
+    field("Amount in DIVI (optional)", "amount", "text", { inputmode: "decimal", placeholder: "any amount" }),
+    field("Your name or shop (optional)", "label"),
+    field("What it is for (optional)", "message"),
+    field("Memo for the chain (optional; for wallets that can write one)", "memo", "text", { maxlength: PayUri.MEMO_MAX }),
+  ], "Make QR code", async (f) => {
+    const req = { amount: val(f, "amount"), label: val(f, "label"), message: val(f, "message"), memo: val(f, "memo") };
+    PayUri.build(Object.assign({ address: "1".repeat(34) }, req)); // check the fields before taking a new address
+    const address = await rpc("getnewaddress", req.label.trim());
+    reqBox.replaceChildren(requestCard(PayUri.build(Object.assign({ address }, req))));
+    return "Show the code to the payer, or send them the link. It pays a new address of this wallet.";
+  }, h("p", { class: "muted" }, "Makes a QR code the payer scans with their Divi wallet: your address and the amount fill in for them."));
+  receive.append(reqBox);
+
+  const canSend = w !== "unencrypted";
+  let request = {};
+  const about = h("p", { class: "muted" });
+  const send = form("Pay", [
+    field("Pay to: an address or a divi: link", "to", "text", { spellcheck: "false", placeholder: "D…" }),
+    field("Amount in DIVI", "amount", "text", { inputmode: "decimal" }),
+    field("Note for your records (optional)", "note"),
+    w === "unlocked" ? null : field("Wallet passphrase", "p", "password", { autocomplete: "current-password" }),
+  ], "Send", async (f) => {
+    if (!canSend) throw new Error("encrypt the wallet on the Security page before sending");
+    const address = val(f, "to").trim();
+    const amount = val(f, "amount").trim();
+    if (!amount) throw new Error("enter the amount");
+    PayUri.build({ address, amount });
+    const v = await rpc("validateaddress", address);
+    if (!v.isvalid) throw new Error("that is not a valid address on " + (state.network || "this network"));
+    const before = state.wallet;
+    const p = f.elements.p ? f.elements.p.value : "";
+    if (before !== "unlocked" && !p) throw new Error("enter the wallet passphrase");
+    if (!confirm("Send " + amount + " DIVI to " + address + "?")) return "Not sent.";
+    if (before !== "unlocked") await rpc("walletpassphrase", p, 60, false);
+    let txid;
+    let restore = null;
+    try {
+      const comment = val(f, "note").trim();
+      const to = (request.address === address && request.label) || "";
+      txid = comment || to
+        ? await rpc("sendtoaddress", address, Number(amount), "metadata", comment, to)
+        : await rpc("sendtoaddress", address, Number(amount));
+    } finally {
+      // put the wallet back the way it was: staking only, or locked
+      const back = before === "unlocked-for-staking" ? rpc("walletpassphrase", p, 0, true)
+        : before === "locked" ? rpc("walletlock") : null;
+      if (back) restore = await back.then(() => null, (e) => e.message);
+      await refresh();
+    }
+    f.elements.to.value = f.elements.amount.value = f.elements.note.value = "";
+    request = {};
+    about.textContent = "";
+    return "Sent. Transaction " + txid + (restore
+      ? ". The wallet could not go back to " + walletLabel(before).toLowerCase() + ": " + restore : ".");
+  }, h("div", {},
+    canSend ? null : h("p", { class: "note err" }, "Encrypt the wallet on the Security page before sending."),
+    h("p", { class: "muted" }, "Scan the payee's QR code, or type or paste the address."),
+    scanner((text) => fill(text)), about));
+
+  function fill(text) {
+    let req;
+    try {
+      req = PayUri.parse(text);
+    } catch (err) {
+      about.className = "note err";
+      about.textContent = err.message;
+      return;
+    }
+    request = req;
+    send.elements.to.value = req.address;
+    send.elements.amount.value = req.amount || "";
+    send.elements.note.value = req.memo || req.message || "";
+    const lines = [];
+    if (req.label) lines.push("Request from " + req.label + ".");
+    if (req.message && req.memo) lines.push("For: " + req.message + ".");
+    if (req.memo) lines.push("It asks for a memo on the chain; this wallet keeps it as a note in its own history instead.");
+    lines.push("Check the details, then send.");
+    about.className = "muted";
+    about.textContent = lines.join(" ");
+    send.elements.amount.focus();
+  }
+  send.elements.to.addEventListener("change", () => {
+    if (/^divi:/i.test(send.elements.to.value.trim())) fill(send.elements.to.value);
+  });
+
+  show(h("section", {}, h("h2", {}, "Wallet"),
+    h("div", { class: "card" }, kv([["Balance", typeof balance === "number" ? balance + " DIVI" : balance],
+      ["Encryption", walletLabel(w)]])),
+    h("div", { class: "grid" }, receive, send)));
 }
 
 // --- console -----------------------------------------------------------------

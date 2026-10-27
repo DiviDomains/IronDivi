@@ -206,7 +206,13 @@ fn allowed_hosts(config: &WebUiConfig) -> Vec<String> {
 fn router(shared: Arc<Shared>) -> Router {
     Router::new()
         .route("/", get(index))
-        .route("/app.js", get(app_js))
+        .route("/app.js", get(|| js(include_str!("../static/app.js"))))
+        .route("/pay.js", get(|| js(include_str!("../static/pay.js"))))
+        .route(
+            "/qrcode.js",
+            get(|| js(include_str!("../static/qrcode.js"))),
+        )
+        .route("/jsqr.js", get(|| js(include_str!("../static/jsqr.js"))))
         .route("/app.css", get(app_css))
         .route("/api/state", get(api_state))
         .route("/api/setup", post(api_setup))
@@ -291,10 +297,12 @@ async fn index() -> impl IntoResponse {
     )
 }
 
-async fn app_js() -> impl IntoResponse {
+/// A script compiled in from `static/`: the app, the payment request format,
+/// and the vendored QR encoder and decoder
+async fn js(body: &'static str) -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-        include_str!("../static/app.js"),
+        body,
     )
 }
 

@@ -20,6 +20,7 @@ a { color: var(--accent); }
 nav { display: flex; flex-wrap: wrap; gap: 4px; flex: 1; }
 nav a { padding: 4px 10px; border-radius: 6px; text-decoration: none; color: var(--text); }
 nav a.on, nav a:hover { background: var(--bg); }
+@media (max-width: 600px) { nav { order: 1; flex-basis: 100%; } }
 .banner { padding: 10px 16px; background: var(--warn-bg); color: var(--warn); }
 main { max-width: 1000px; margin: 0 auto; padding: 16px; }
 .narrow { max-width: 460px; margin: 40px auto; }
@@ -59,3 +60,10 @@ button.link { background: none; color: var(--accent); padding: 4px 6px; }
   padding: 12px 0; background: var(--bg); }
 .savebar .note { margin: 0; flex-basis: 100%; }
 .out { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px; overflow: auto; max-height: 60vh; }
+.row.wrap { flex-wrap: wrap; }
+.small { font-size: 13px; }
+.qrbox { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; margin-top: 12px; }
+canvas.qr { width: 100%; max-width: 300px; height: auto; image-rendering: pixelated; border-radius: 8px; }
+.uri { overflow-wrap: anywhere; }
+.scanner { margin-bottom: 12px; }
+video.scan { width: 100%; max-width: 420px; border-radius: 8px; background: #000; margin-top: 8px; }

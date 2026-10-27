@@ -41,10 +41,25 @@ Dashboard · Security (encrypt, unlock for staking, lock, change passphrase,
 change web UI password) · Settings (every option in `src/schema.rs`, grouped
 by category; saves to `divi.conf` preserving comments and order, applies
 `staking`/`stakesplitthreshold` live, flags the rest as needing a restart,
-and shows options overridden on the command line) · Console.
+and shows options overridden on the command line) · Wallet · Console.
 
-Wallet, Staking, Vaults and Swaps are placeholders for the apps built next on
-the same API (`/api/rpc` through the gate, `/api/settings`).
+**Wallet** — balance, and payments by QR code both ways:
+
+- *Request a payment:* amount, name, purpose and memo (all optional) become a
+  `divi:<address>?amount=&label=&message=&memo=` link on a new address, shown
+  as a QR code to hold up to the payer, with Copy and (on phones) Share.
+- *Pay:* scan the payee's code, or type or paste an address or `divi:` link,
+  check, confirm, send. Ways to scan: take a picture (phones; works over plain
+  HTTP), open an image, the live camera, scan the screen (desktop: share a
+  window or screen showing the code), or paste a screenshot. The live camera
+  and the screen need HTTPS or localhost. The wallet is unlocked for 60 s to
+  send and then put back as it was (locked, or staking only). A request's
+  `memo` or `message` is kept as the wallet's own note on the payment: this
+  page cannot write OP_META on the chain (the browser extension can).
+
+The same link format is used by the IronDivi browser extension. Staking,
+Vaults and Swaps are placeholders for the apps built next on the same API
+(`/api/rpc` through the gate, `/api/settings`).
 
 ## Layout
 
@@ -53,4 +68,7 @@ the same API (`/api/rpc` through the gate, `/api/settings`).
 - `src/gate.rs` — which RPC calls the web UI may make
 - `src/schema.rs` — every setting: kind, range, default, help, live RPC
 - `src/conffile.rs` — read/apply changes to `divi.conf` in place
-- `static/` — `index.html`, `app.js`, `app.css` (compiled in)
+- `static/` — `index.html`, `app.js`, `app.css`, `pay.js` (payment links), all
+  compiled in; vendored unmodified: `qrcode.js` (qrcode-generator 1.4.4, MIT)
+  and `jsqr.js` (jsQR 1.4.0, Apache-2.0, `jsqr.LICENSE`; loaded only to scan)
+- `tests/pay_uri.test.js` — `node --test crates/divi-webui/tests/pay_uri.test.js`
