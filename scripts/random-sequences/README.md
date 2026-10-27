@@ -54,6 +54,7 @@ SEED=7 scripts/random-sequences/run.sh target/release ~/divi-3.0.0/bin 53850 /va
 | `RANDOM_SEQUENCES_TIMEOUT` | seconds before the run is stopped (1500) |
 | `RANDOM_SEQUENCES_LOGS` | a folder to copy the four logs to, for each episode and on a FAIL |
 | `RANDOM_SEQUENCES_DEBUG` | `1`: irondivid logs at debug level and divid with `debug=mempool` |
+| `RANDOM_SEQUENCES_PROFILE` | `stake`: steps that reach stake blocks. The first blocks go to height 95 (work blocks end at 100); `mine` weighs 30 and a new step, `addvault`, 6 (node n takes on a vault the other node funded, once it is in a block); `fundvault` funds 100 to 1100; kills, restarts and invalidates are rare; all four nodes run with `vault=1`, which `addvault` needs (`CWallet::AddVault`, `wallet.cpp:693-705`) and which shuffles the stake set. Unset, the steps of every seed are as before |
 | `RANDOM_SEQUENCES_TWIN` | `1`: the second pair runs divid too, in irondivid's place, to see the differences divid has with itself on the same seed. The twins restore the phrases from `-mnemonic`, a line of their 0600 `divi.conf`. The line is taken out again once the wallet is made, as divid reads it at every start |
 | `RANDOM_SEQUENCES_TRACE` | `1`: before and after each `invalidateblock`, the node's mempool is printed, each transaction with its inputs (`txid:vout@height/kind`) and its outputs |
 
@@ -143,6 +144,24 @@ episode) and the remaining steps, so every comparison stays exact:
   on the txids, and those differ between the pairs, so the script checks only that each kernel is in the set. A
   coinstake's outputs are immature, so the balances part by the difference. The rule also checks that node n's balance
   plus immature balance agree, so the two fields are compared by their total.
+
+  A vault kernel is the vault's owner's coin too (the other node's), and the coinstake pays the kernel's own script
+  (`PoSTransactionCreator.cpp:167`), so the reward stays in the vault. The owner's `getbalance` counts owned vault
+  coins (`CWallet::GetBalance`, `wallet.cpp:1395-1402`) and loses the coin until the coinstake matures, and the
+  immature balance counts only the wallet's own coins (`WalletBalanceCalculator.h:44`). So the owner's balances may
+  differ too: node n's total is taken with each vault block's reward added, and the owner's `getbalance` with each
+  staked vault coin added, and both must agree.
+
+  Every stake block is checked, not only those after which the sides differ: a kernel outside the set is a `FAIL`.
+  Each `mine` or `generateblock` step that makes stake blocks logs its kernels as
+  `#   stake kernels: step <i> node <n>: divid [...] irondivid [...]`, with each block's height, case (`listed`,
+  `matured`, `vault`) and value.
+- **stake proof timing:** both sides end a `mine` step with -25 "failed to generate a valid block", after a
+  different number of blocks, and every block either side made staked a coin of its stake set. divid tries one
+  timestamp per attempt, the current time (`PoSTransactionCreator.cpp:335-341`), and the kernel hash includes it. So
+  whether a coin finds its proof (above all a small one, such as a node's only vault coin) depends on the second the
+  attempt runs. `setgenerate` answers -25 at the first attempt that fails (`rpcmining.cpp:104-110`). Seen either way
+  round on a replay of the same steps.
 - **divid balance cache:** divid's `getbalance` disagrees with its own unspent coins (`listunspent 1`), while
   irondivid's agrees with the same coins. divid keeps each wallet transaction's balance in
   `CachedUtxoBalanceCalculator` (`CachedUtxoBalanceCalculator.cpp:13-30`), recomputed only when a wallet transaction
