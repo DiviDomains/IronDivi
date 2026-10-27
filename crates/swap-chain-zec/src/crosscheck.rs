@@ -18,8 +18,13 @@
 //! The lower tip (not the primary's) is used so that the few seconds by which one operator
 //! leads the other cannot cause a false `Disagree`; a lag of more than [`MAX_LAG`] blocks is
 //! `Unavailable` (the second operator is behind), not a comparison.
+//!
+//! It also checks the lock itself (ET): every `htlc_output` (the maker about to fund against
+//! the taker's lock, the taker about to claim the maker's) reads the output from the second
+//! operator too ([`lock_view`]) and needs the agreed script and the same value there
+//! ([`agree_lock`]), failing closed.
 
-use divi_swap::{Outpoint, SwapError};
+use divi_swap::{LockedOutput, Outpoint, SwapError};
 
 use crate::grpc::LightwalletdClient;
 
@@ -227,6 +232,85 @@ pub async fn enforce_before_spend(
     match spend_hold(primary, other, what, at).await {
         None => Ok(()),
         Some(hold) => Err(hold.error),
+    }
+}
+
+/// A lock output as the second operator shows it ([`lock_view`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LockView {
+    script_pubkey: Vec<u8>,
+    value: u64,
+    confirmations: u32,
+}
+
+/// `other`'s view of output `at`, read as the primary's is: `GetTransaction`, then (when
+/// mined) `GetLatestBlock` for its confirmations. An error completes "second operator …".
+pub(crate) async fn lock_view(
+    other: &LightwalletdClient,
+    at: &Outpoint,
+) -> std::result::Result<LockView, String> {
+    let raw = other
+        .get_transaction(&at.txid.0)
+        .await
+        .map_err(|e| format!("could not be read (GetTransaction: {e:?})"))?
+        .ok_or_else(|| "has no such transaction".to_string())?;
+    let parsed = crate::tx::ParsedTx::parse(&raw.data)
+        .map_err(|e| format!("answered a transaction that does not parse ({e})"))?;
+    let out = parsed
+        .vout
+        .get(at.vout as usize)
+        .ok_or_else(|| format!("has no output {} in that transaction", at.vout))?;
+    let confirmations = if raw.height == 0 || raw.height == u64::MAX {
+        0
+    } else {
+        let tip = other
+            .latest_block()
+            .await
+            .map_err(|e| format!("could not be read (GetLatestBlock: {e:?})"))?
+            .height;
+        (tip.saturating_sub(raw.height) + 1) as u32
+    };
+    Ok(LockView {
+        script_pubkey: out.script_pubkey.clone(),
+        value: out.value,
+        confirmations,
+    })
+}
+
+/// Agree the primary's lock read (`mine`, already matched against the agreed script `want`)
+/// with the second operator's (`theirs`), as `swap-chain-ltc`'s `agree_lock` (EL) and
+/// `swap-chain-btc`'s `quorum::agree_htlc_output` do: the agreed script on both, equal
+/// values, the lower confirmation count. Anything else, a second operator that could not be
+/// read included, is [`SwapError::Transient`] naming both operators: the maker about to
+/// fund and the taker about to reveal wait and read again.
+pub(crate) fn agree_lock(
+    at: &Outpoint,
+    want: &[u8],
+    mine: LockedOutput,
+    primary: &LightwalletdClient,
+    theirs: std::result::Result<LockView, String>,
+    other: &LightwalletdClient,
+) -> Result<LockedOutput> {
+    let zat = mine.amount.to_sat();
+    let refuse = |what: String| {
+        SwapError::Transient(format!(
+            "zec lock cross-check FAILED for {at}: primary lightwalletd {} shows the agreed \
+             HTLC script with {zat} zat, second operator {} {what}; not acting on the lock",
+            primary_label(primary),
+            other_label(other)
+        ))
+    };
+    match theirs {
+        Err(what) => Err(refuse(what)),
+        Ok(v) if v.script_pubkey != want => Err(refuse(format!(
+            "shows scriptPubKey {} there",
+            hex::encode(&v.script_pubkey)
+        ))),
+        Ok(v) if v.value != zat => Err(refuse(format!("shows {} zat there", v.value))),
+        Ok(v) => Ok(LockedOutput {
+            amount: mine.amount,
+            confirmations: mine.confirmations.min(v.confirmations),
+        }),
     }
 }
 

@@ -222,8 +222,9 @@ impl ZecBackend {
     }
 
     /// Opt-in (`[zec].crosscheck_url`): a lightwalletd run by a second operator, asked at
-    /// startup ([`ZecBackend::crosscheck`]) and before every claim and refund is built (see
-    /// [`crosscheck`]). `None` (the default) is off: no extra request. The URL is checked by
+    /// startup ([`ZecBackend::crosscheck`]), before every claim and refund is built, and for
+    /// the lock output at every `htlc_output` (see [`crosscheck`]). `None` (the default) is
+    /// off: no extra request. The URL is checked by
     /// the caller against the primaries ([`crosscheck::check_second_operator`]).
     pub fn with_crosscheck(mut self, url: Option<String>) -> Result<Self> {
         self.second = match url {
@@ -260,6 +261,41 @@ impl ZecBackend {
             None => Ok(()),
             Some(h) => Err(h.error),
         }
+    }
+
+    /// The primary's lock read: the output at `at` if its scriptPubKey is `htlc`'s, with its
+    /// value and confirmations ([`ChainBackend::htlc_output`] adds the second operator).
+    async fn htlc_output_primary(
+        &self,
+        htlc: &HtlcParams,
+        at: &Outpoint,
+    ) -> Result<Option<LockedOutput>> {
+        let Some(raw) = self
+            .client
+            .get_transaction(&at.txid.0)
+            .await
+            .map_err(SwapError::from)?
+        else {
+            return Ok(None);
+        };
+        let parsed = tx::ParsedTx::parse(&raw.data)?;
+        let Some(out) = parsed.vout.get(at.vout as usize) else {
+            return Ok(None);
+        };
+        let want = address::htlc_script_pubkey(&htlc.redeem_script());
+        if out.script_pubkey != want {
+            return Ok(None);
+        }
+        let confirmations = if raw.height == 0 || raw.height == u64::MAX {
+            0
+        } else {
+            let tip = self.tip_height().await?;
+            (tip.saturating_sub(raw.height) + 1) as u32
+        };
+        Ok(Some(LockedOutput {
+            amount: Amount::from_sat(out.value),
+            confirmations,
+        }))
     }
 
     /// A spend this backend built: in a primary-only view after a `Disagree`, also sent to
@@ -765,32 +801,16 @@ impl ChainBackend for ZecBackend {
     }
 
     async fn htlc_output(&self, htlc: &HtlcParams, at: &Outpoint) -> Result<Option<LockedOutput>> {
-        let Some(raw) = self
-            .client
-            .get_transaction(&at.txid.0)
-            .await
-            .map_err(SwapError::from)?
-        else {
-            return Ok(None);
-        };
-        let parsed = tx::ParsedTx::parse(&raw.data)?;
-        let Some(out) = parsed.vout.get(at.vout as usize) else {
-            return Ok(None);
-        };
-        let want = address::htlc_script_pubkey(&htlc.redeem_script());
-        if out.script_pubkey != want {
-            return Ok(None);
+        let mine = self.htlc_output_primary(htlc, at).await?;
+        match (&self.second, mine) {
+            // Nothing to agree when the primary shows no matching lock: no side acts on `None`.
+            (Some(second), Some(lo)) => {
+                let want = address::htlc_script_pubkey(&htlc.redeem_script());
+                let theirs = crosscheck::lock_view(second, at).await;
+                crosscheck::agree_lock(at, &want, lo, &self.client, theirs, second).map(Some)
+            }
+            (_, mine) => Ok(mine),
         }
-        let confirmations = if raw.height == 0 || raw.height == u64::MAX {
-            0
-        } else {
-            let tip = self.tip_height().await?;
-            (tip.saturating_sub(raw.height) + 1) as u32
-        };
-        Ok(Some(LockedOutput {
-            amount: Amount::from_sat(out.value),
-            confirmations,
-        }))
     }
 
     async fn find_spend(&self, outpoint: &Outpoint, from_height: u64) -> Result<Option<SpendInfo>> {
