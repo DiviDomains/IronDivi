@@ -34,6 +34,15 @@ fn proxy_error(msg: impl Into<String>) -> NetworkError {
     NetworkError::Connection(format!("SOCKS5 proxy: {}", msg.into()))
 }
 
+/// The start of the error when the proxy cannot be reached at all
+const UNREACHABLE: &str = "SOCKS5 proxy: cannot reach proxy";
+
+/// Whether `e` is the proxy itself not taking the connection (Divi Core's
+/// outProxyConnectionFailed, netbase.cpp:594-601)
+pub fn proxy_unreachable(e: &NetworkError) -> bool {
+    matches!(e, NetworkError::Connection(m) if m.starts_with(UNREACHABLE))
+}
+
 /// Text of a SOCKS5 reply code (RFC 1928 section 6)
 fn reply_text(code: u8) -> &'static str {
     match code {

@@ -446,7 +446,6 @@ impl PeerManager {
                 return;
             };
             debug!("Dialling learnt address {}", addr);
-            self.address_book.attempt(addr);
             let self_clone = Arc::clone(self);
             self.spawn_task(format!("dial of learnt address {addr}"), async move {
                 if let Err(e) = self_clone.connect_to_peer(addr).await {
@@ -1343,7 +1342,15 @@ impl PeerManager {
             self.local_addresses(),
         );
         let result = match self.until_stop(connect).await {
-            Some(result) => result,
+            Some(result) => {
+                // Tried, in the address book, once the connect is made or has
+                // failed, whatever dialled it; not when the proxy itself
+                // could not be reached (ConnectNode, net.cpp:520-538)
+                if !matches!(&result, Err(e) if crate::socks5::proxy_unreachable(e)) {
+                    self.address_book.attempt(addr);
+                }
+                result
+            }
             None => Err(NetworkError::ConnectionRefused(
                 "the node is stopping".to_string(),
             )),
