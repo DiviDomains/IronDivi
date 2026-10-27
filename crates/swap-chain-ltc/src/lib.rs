@@ -230,6 +230,11 @@ impl LtcBackend {
         self
     }
 
+    /// Stub (EO test commit): no behaviour yet; the fix posts to both endpoints.
+    pub fn with_dual_broadcast(self, _on: bool) -> Result<Self> {
+        Ok(self)
+    }
+
     /// The claim-time cross-check for a claim of `at`; `Ok` when off.
     async fn check_before_claim(&self, at: &Outpoint) -> Result<()> {
         let Some(cc) = &self.claim_check else {

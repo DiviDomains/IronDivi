@@ -1795,6 +1795,33 @@ divi_fund_txids = ["ab"]
     }
 
     #[test]
+    fn ltc_dual_broadcast_needs_two_different_endpoints() {
+        let ltc = |extra: &str| {
+            DaemonConfig::parse(&format!(
+                "{GOOD}\n[ltc]\nkey = \"credential:btc\"\n{extra}\n"
+            ))
+        };
+        let two = "esplora_url = \"http://a:1\"\nfallback_esplora_url = \"http://b:2\"";
+        assert!(ltc(&format!("{two}\ndual_broadcast = true")).is_ok());
+        // The network's one default, one endpoint, or the same one twice is refused at load,
+        // naming both keys; off, each is fine (failover only, as before).
+        for one in [
+            "",
+            "esplora_url = \"http://a:1\"",
+            "esplora_url = \"http://a:1\"\nfallback_esplora_url = \"http://a:1/\"",
+        ] {
+            let err = ltc(&format!("{one}\ndual_broadcast = true"))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("[ltc].dual_broadcast") && err.contains("[ltc].fallback_esplora_url"),
+                "{err}"
+            );
+            assert!(ltc(one).is_ok());
+        }
+    }
+
+    #[test]
     fn btc_ltc_network_disagreeing_with_profile_is_rejected() {
         // Default profile is testnet; an allowed mainnet section still disagrees.
         let text = GOOD.replace(

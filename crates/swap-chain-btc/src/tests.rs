@@ -1658,3 +1658,323 @@ async fn quorum_off_tip_reads_are_unchanged() {
     assert_eq!(paths, want);
     assert!(secondary.received_requests().await.unwrap().is_empty());
 }
+
+// ---- quorum broadcast and funding reads (EO): both endpoints get every POST, funding uses
+// only coins both endpoints list. Esplora `POST /tx` answers the txid on success
+// (single-source-design.FACTS.md, Esplora `POST /tx`).
+
+fn quorum_as(primary: &MockServer, secondary: &MockServer, key: [u8; 32]) -> BtcBackend {
+    backend(vec![primary.uri(), secondary.uri()], key)
+        .with_quorum_reads(true)
+        .unwrap()
+}
+
+/// A claim of `outpoint()` signed by the taker key (no request: the fee is fixed).
+async fn a_claim() -> SignedTx {
+    let (pre, hash) = new_preimage();
+    backend(vec![dead_url()], TAKER_KEY)
+        .build_claim(&htlc(hash), &outpoint(), Amount::from_sat(20_000), &pre)
+        .await
+        .unwrap()
+}
+
+async fn mock_post(server: &MockServer, resp: ResponseTemplate) {
+    Mock::given(method("POST"))
+        .and(path("/tx"))
+        .respond_with(resp)
+        .mount(server)
+        .await;
+}
+
+fn accepts(tx: &SignedTx) -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_string(tx.txid.to_rpc_hex())
+}
+
+fn refuses(reason: &str) -> ResponseTemplate {
+    ResponseTemplate::new(400).set_body_string(format!(
+        "sendrawtransaction RPC error: {{\"code\":-26,\"message\":\"{reason}\"}}"
+    ))
+}
+
+/// The raw hex bodies `server` was POSTed at `/tx`.
+async fn posted(server: &MockServer) -> Vec<String> {
+    server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.method.as_str() == "POST" && r.url.path() == "/tx")
+        .map(|r| String::from_utf8(r.body.clone()).unwrap())
+        .collect()
+}
+
+/// A primary that refuses the claim, or accepts it and then drops it, cannot keep it off the
+/// network: the secondary is given the same claim.
+#[tokio::test]
+async fn quorum_broadcast_claim_dropped_by_the_primary_reaches_the_secondary() {
+    let claim = a_claim().await;
+    for primary_says in [refuses("min relay fee not met"), accepts(&claim)] {
+        let (primary, secondary) = (MockServer::start().await, MockServer::start().await);
+        mock_post(&primary, primary_says).await;
+        mock_post(&secondary, accepts(&claim)).await;
+        let b = quorum_as(&primary, &secondary, TAKER_KEY);
+        assert_eq!(b.broadcast(&claim).await.unwrap(), claim.txid);
+        assert_eq!(posted(&secondary).await, [hex::encode(&claim.raw)]);
+        assert_eq!(posted(&primary).await, [hex::encode(&claim.raw)]);
+    }
+}
+
+/// The secondary refusing, or down, while the primary accepts is still a broadcast.
+#[tokio::test]
+async fn quorum_broadcast_one_endpoint_accepting_is_enough() {
+    let claim = a_claim().await;
+    let primary = MockServer::start().await;
+    mock_post(&primary, accepts(&claim)).await;
+    let secondary = MockServer::start().await;
+    mock_post(&secondary, refuses("mempool full")).await;
+    let b = quorum_as(&primary, &secondary, TAKER_KEY);
+    assert_eq!(b.broadcast(&claim).await.unwrap(), claim.txid);
+    let b = backend(vec![primary.uri(), dead_url()], TAKER_KEY)
+        .with_quorum_reads(true)
+        .unwrap();
+    assert_eq!(b.broadcast(&claim).await.unwrap(), claim.txid);
+    // An already-known answer counts as accepted.
+    let (p2, s2) = (MockServer::start().await, MockServer::start().await);
+    mock_post(&p2, refuses("bad-txns-inputs-duplicate")).await;
+    mock_post(
+        &s2,
+        ResponseTemplate::new(400).set_body_string(
+            "sendrawtransaction RPC error: {\"code\":-27,\"message\":\"Transaction already in block chain\"}",
+        ),
+    )
+    .await;
+    assert_eq!(
+        quorum_as(&p2, &s2, TAKER_KEY)
+            .broadcast(&claim)
+            .await
+            .unwrap(),
+        claim.txid
+    );
+}
+
+/// Both accepting: one txid, one POST each.
+#[tokio::test]
+async fn quorum_broadcast_both_accept_once_each() {
+    let claim = a_claim().await;
+    let (primary, secondary) = (MockServer::start().await, MockServer::start().await);
+    mock_post(&primary, accepts(&claim)).await;
+    mock_post(&secondary, accepts(&claim)).await;
+    let b = quorum_as(&primary, &secondary, TAKER_KEY);
+    assert_eq!(b.broadcast(&claim).await.unwrap(), claim.txid);
+    assert_eq!(posted(&primary).await.len(), 1);
+    assert_eq!(posted(&secondary).await.len(), 1);
+}
+
+/// An endpoint that answers 200 with another txid has not taken our transaction: with nothing
+/// else accepting it, the broadcast fails naming that endpoint and both txids.
+#[tokio::test]
+async fn quorum_broadcast_another_txid_is_an_error_naming_the_endpoint() {
+    let claim = a_claim().await;
+    let other = "ab".repeat(32);
+    let (primary, secondary) = (MockServer::start().await, MockServer::start().await);
+    mock_post(&primary, ResponseTemplate::new(200).set_body_string(&other)).await;
+    mock_post(&secondary, refuses("mempool full")).await;
+    let b = quorum_as(&primary, &secondary, TAKER_KEY);
+    let e = b.broadcast(&claim).await.unwrap_err().to_string();
+    assert!(
+        e.contains(&primary.uri()) && e.contains(&other) && e.contains(&claim.txid.to_rpc_hex()),
+        "{e}"
+    );
+}
+
+/// Both refusing is today's error: a refund before its locktime is still `Premature`, also
+/// when the other endpoint cannot be reached.
+#[tokio::test]
+async fn quorum_broadcast_both_refusing_is_todays_error() {
+    let claim = a_claim().await;
+    let (primary, secondary) = (MockServer::start().await, MockServer::start().await);
+    mock_post(&primary, refuses("non-final")).await;
+    mock_post(&secondary, refuses("non-final")).await;
+    let r = quorum_as(&primary, &secondary, TAKER_KEY)
+        .broadcast(&claim)
+        .await;
+    assert!(matches!(r, Err(SwapError::Premature(_))), "{r:?}");
+    for urls in [
+        vec![dead_url(), secondary.uri()],
+        vec![primary.uri(), dead_url()],
+    ] {
+        let b = backend(urls, TAKER_KEY).with_quorum_reads(true).unwrap();
+        let r = b.broadcast(&claim).await;
+        assert!(matches!(r, Err(SwapError::Premature(_))), "{r:?}");
+    }
+}
+
+/// Off (the default): one POST to the primary, its body ignored, nothing to the secondary.
+#[tokio::test]
+async fn quorum_off_broadcast_and_funding_are_unchanged() {
+    let claim = a_claim().await;
+    let (primary, secondary) = (MockServer::start().await, MockServer::start().await);
+    mock_post(
+        &primary,
+        ResponseTemplate::new(200).set_body_string("not a txid"),
+    )
+    .await;
+    Mock::given(wiremock::matchers::any())
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&secondary)
+        .await;
+    let t = |n: u8| hex::encode([n; 32]);
+    for on in [None, Some(false)] {
+        let b = backend(vec![primary.uri(), secondary.uri()], TAKER_KEY);
+        let b = match on {
+            Some(on) => b.with_quorum_reads(on).unwrap(),
+            None => b,
+        };
+        mock_json(
+            &primary,
+            format!("/address/{}/utxo", b.address()),
+            json!([{"txid": t(1), "vout": 0, "value": 900_000, "status": {"confirmed": true}}]),
+        )
+        .await;
+        assert_eq!(b.broadcast(&claim).await.unwrap(), claim.txid);
+        let (_, hash) = new_preimage();
+        b.build_funding(&htlc(hash), Amount::from_sat(20_000))
+            .await
+            .unwrap();
+    }
+    let paths: Vec<String> = primary
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| format!("{} {}", r.method, r.url.path()))
+        .collect();
+    let utxo = format!(
+        "GET /address/{}/utxo",
+        backend(vec![dead_url()], TAKER_KEY).address()
+    );
+    assert_eq!(
+        paths,
+        ["POST /tx", utxo.as_str(), "POST /tx", utxo.as_str()]
+    );
+    assert!(secondary.received_requests().await.unwrap().is_empty());
+}
+
+/// The wallet as each endpoint lists it: `(txid byte, value, confirmed)`.
+async fn mock_wallet(server: &MockServer, b: &BtcBackend, coins: &[(u8, u64, bool)]) {
+    let list: Vec<Value> = coins
+        .iter()
+        .map(|(t, v, c)| {
+            json!({"txid": hex::encode([*t; 32]), "vout": 0, "value": v, "status": {"confirmed": c}})
+        })
+        .collect();
+    mock_json(
+        server,
+        format!("/address/{}/utxo", b.address()),
+        json!(list),
+    )
+    .await;
+}
+
+/// A primary that lists a coin the secondary does not (spent, or never there), or at another
+/// value, cannot get it into a funding transaction or the spendable balance.
+#[tokio::test]
+async fn quorum_funding_uses_only_coins_both_endpoints_list() {
+    let (primary, secondary) = (MockServer::start().await, MockServer::start().await);
+    let b = quorum_as(&primary, &secondary, MAKER_KEY);
+    // 1: phantom on the primary; 2: on both; 3: another value on the primary.
+    mock_wallet(
+        &primary,
+        &b,
+        &[(1, 900_000, true), (2, 30_000, true), (3, 500_000, true)],
+    )
+    .await;
+    mock_wallet(&secondary, &b, &[(2, 30_000, true), (3, 5_000, true)]).await;
+    let (_, hash) = new_preimage();
+    let f = b
+        .build_funding(&htlc(hash), Amount::from_sat(20_000))
+        .await
+        .unwrap();
+    assert_eq!(spent_txids(&f), [[2u8; 32]]);
+    assert_eq!(b.spendable().await.unwrap(), Some(Amount::from_sat(30_000)));
+    let err = b
+        .build_funding(&htlc(hash), Amount::from_sat(100_000))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SwapError::InsufficientFunds(_)), "{err:?}");
+}
+
+/// A coin is confirmed only if both endpoints say so (selection prefers confirmed coins).
+#[tokio::test]
+async fn quorum_funding_a_coin_is_confirmed_only_on_both_words() {
+    let (primary, secondary) = (MockServer::start().await, MockServer::start().await);
+    let b = quorum_as(&primary, &secondary, MAKER_KEY);
+    mock_wallet(&primary, &b, &[(1, 900_000, true), (2, 30_000, true)]).await;
+    mock_wallet(&secondary, &b, &[(1, 900_000, false), (2, 30_000, true)]).await;
+    let (_, hash) = new_preimage();
+    let f = b
+        .build_funding(&htlc(hash), Amount::from_sat(20_000))
+        .await
+        .unwrap();
+    assert_eq!(spent_txids(&f), [[2u8; 32]]);
+}
+
+/// The UTXO list failing on either endpoint is `Transient`, as every quorum read.
+#[tokio::test]
+async fn quorum_funding_with_one_endpoint_down_is_transient() {
+    let primary = MockServer::start().await;
+    let probe = backend(vec![dead_url()], MAKER_KEY);
+    mock_wallet(&primary, &probe, &[(1, 900_000, true)]).await;
+    for urls in [
+        vec![primary.uri(), dead_url()],
+        vec![dead_url(), primary.uri()],
+    ] {
+        let b = backend(urls, MAKER_KEY).with_quorum_reads(true).unwrap();
+        let (_, hash) = new_preimage();
+        transient(b.build_funding(&htlc(hash), Amount::from_sat(20_000)).await);
+        transient(b.spendable().await);
+    }
+}
+
+async fn mock_fees(server: &MockServer, half_hour: u64) {
+    mock_json(
+        server,
+        "/v1/fees/recommended".into(),
+        json!({"fastestFee": half_hour + 1, "halfHourFee": half_hour, "hourFee": 1}),
+    )
+    .await;
+}
+
+fn recommended(urls: Vec<String>, quorum: bool) -> BtcBackend {
+    BtcBackend::new(
+        urls,
+        SecretKey::from_slice(&MAKER_KEY).unwrap(),
+        FeePolicy::Recommended { floor: 2 },
+        fast(),
+    )
+    .unwrap()
+    .with_quorum_reads(quorum)
+    .unwrap()
+}
+
+/// A primary that quotes a low fee cannot leave a lock, claim or refund stuck: the higher of
+/// the two endpoints' rates is used. One endpoint down falls back to the other's rate (a fee
+/// read never stalls a claim); both down is the floor, as today.
+#[tokio::test]
+async fn quorum_fee_rate_is_the_higher_of_the_two() {
+    let (primary, secondary) = (MockServer::start().await, MockServer::start().await);
+    mock_fees(&primary, 3).await;
+    mock_fees(&secondary, 40).await;
+    let b = recommended(vec![primary.uri(), secondary.uri()], true);
+    assert_eq!(b.claim_feerate().await.unwrap(), Some(40));
+    let b = recommended(vec![secondary.uri(), primary.uri()], true);
+    assert_eq!(b.claim_feerate().await.unwrap(), Some(40));
+    let b = recommended(vec![dead_url(), primary.uri()], true);
+    assert_eq!(b.claim_feerate().await.unwrap(), Some(3));
+    let b = recommended(vec![dead_url(), "http://127.0.0.1:2".into()], true);
+    assert_eq!(b.claim_feerate().await.unwrap(), Some(2));
+    // Off: the primary's rate, as today.
+    let b = recommended(vec![primary.uri(), secondary.uri()], false);
+    assert_eq!(b.claim_feerate().await.unwrap(), Some(3));
+}
