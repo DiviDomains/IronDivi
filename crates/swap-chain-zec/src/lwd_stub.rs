@@ -157,6 +157,16 @@ impl Lightwalletd {
         hex::encode(hash)
     }
 
+    /// Give the block at `height` another hash on this stub only (a lying operator).
+    pub(crate) fn tamper(&self, height: u64) {
+        self.chain.lock().unwrap().blocks[height as usize].0[1] ^= 0xff;
+    }
+
+    /// This stub's gRPC base URI.
+    pub(crate) fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
     pub(crate) fn take_calls(&self) -> Vec<&'static str> {
         std::mem::take(&mut self.chain.lock().unwrap().calls)
     }
@@ -424,5 +434,88 @@ mod tests {
             1
         );
         assert!(r.reserved(Chain::Zec).unwrap().is_empty());
+    }
+
+    fn spend_args(b: &ZecBackend) -> (divi_swap::HtlcParams, Outpoint, divi_swap::Amount) {
+        let htlc = divi_swap::HtlcParams {
+            hash: [0x11; 32],
+            claim_pubkey: b.pubkey(),
+            refund_pubkey: b.pubkey(),
+            locktime: 1_900_000_000,
+            script_version: Default::default(),
+        };
+        let at = Outpoint {
+            txid: Txid([0x44; 32]),
+            vout: 0,
+        };
+        (htlc, at, divi_swap::Amount::from_sat(100_000))
+    }
+
+    /// The error of a claim and of a refund built on `b` (the stub has no `GetLightdInfo`,
+    /// so neither can succeed: what matters is whether the cross-check stopped it first).
+    async fn claim_and_refund_errors(b: &ZecBackend) -> [SwapError; 2] {
+        let (htlc, at, amount) = spend_args(b);
+        [
+            b.build_claim(&htlc, &at, amount, &[0x22; 32])
+                .await
+                .unwrap_err(),
+            b.build_refund(&htlc, &at, amount).await.unwrap_err(),
+        ]
+    }
+
+    fn is_crosscheck_hold(e: &SwapError) -> bool {
+        matches!(e, SwapError::Transient(m) if m.contains("cross-check"))
+    }
+
+    #[tokio::test]
+    async fn no_crosscheck_url_makes_no_extra_request() {
+        let lwd = Lightwalletd::start(40);
+        let b = lwd.backend().with_crosscheck(None).unwrap();
+        b.crosscheck().await.unwrap();
+        for e in claim_and_refund_errors(&b).await {
+            assert!(!is_crosscheck_hold(&e), "{e:?}");
+        }
+        assert!(lwd.take_calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_agreeing_second_operator_lets_claim_and_refund_through() {
+        let (lwd, other) = (Lightwalletd::start(40), Lightwalletd::start(40));
+        let b = lwd
+            .backend()
+            .with_crosscheck(Some(other.endpoint().to_string()))
+            .unwrap();
+        b.crosscheck().await.unwrap();
+        for e in claim_and_refund_errors(&b).await {
+            assert!(!is_crosscheck_hold(&e), "{e:?}");
+        }
+        assert!(other.take_calls().contains(&"GetLatestBlock"));
+    }
+
+    #[tokio::test]
+    async fn a_disagreeing_second_operator_holds_claim_and_refund_and_fails_startup() {
+        let (lwd, other) = (Lightwalletd::start(40), Lightwalletd::start(40));
+        other.tamper(40);
+        let b = lwd
+            .backend()
+            .with_crosscheck(Some(other.endpoint().to_string()))
+            .unwrap();
+        assert!(matches!(b.crosscheck().await, Err(SwapError::Transient(_))));
+        for e in claim_and_refund_errors(&b).await {
+            assert!(is_crosscheck_hold(&e), "{e:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_second_operator_holds_claim_and_refund_but_not_startup() {
+        let lwd = Lightwalletd::start(40);
+        let b = lwd
+            .backend()
+            .with_crosscheck(Some("http://127.0.0.1:1".into()))
+            .unwrap();
+        b.crosscheck().await.expect("startup only warns");
+        for e in claim_and_refund_errors(&b).await {
+            assert!(is_crosscheck_hold(&e), "{e:?}");
+        }
     }
 }

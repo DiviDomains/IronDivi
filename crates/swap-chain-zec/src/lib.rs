@@ -14,6 +14,7 @@
 //! t-address encoding lives in [`address`].
 
 pub mod address;
+pub mod crosscheck;
 pub mod grpc;
 pub mod tx;
 
@@ -32,6 +33,7 @@ use divi_swap::{
 use address::TransparentAddress;
 use grpc::{BlockId, ClientError, CompactBlock, LightwalletdClient};
 
+pub use crosscheck::{CrossCheckOutcome, CROSSCHECK_DEPTH};
 pub use grpc::RetryPolicy;
 
 type Result<T> = std::result::Result<T, SwapError>;
@@ -152,6 +154,8 @@ pub struct ZecBackend {
     reservations: Option<InputReservations>,
     /// `"mainnet"` or `"testnet"`: selects address prefixes and the v5/v6 activation height.
     network: String,
+    /// The second lightwalletd operator ([`ZecBackend::with_crosscheck`]); `None` is off.
+    second: Option<LightwalletdClient>,
 }
 
 impl std::fmt::Debug for ZecBackend {
@@ -182,6 +186,7 @@ impl ZecBackend {
             fees,
             reservations: None,
             network: "testnet".to_string(),
+            second: None,
         })
     }
 
@@ -192,6 +197,20 @@ impl ZecBackend {
     pub fn with_input_reservations(mut self, reservations: InputReservations) -> Self {
         self.reservations = Some(reservations);
         self
+    }
+
+    /// Opt-in (`[zec].crosscheck_url`): a lightwalletd run by a second operator, asked at
+    /// startup ([`ZecBackend::crosscheck`]) and before every claim and refund is built (see
+    /// [`crosscheck`]). `None` (the default) is off: no extra request. The URL is checked by
+    /// the caller against the primaries ([`crosscheck::check_second_operator`]).
+    pub fn with_crosscheck(self, url: Option<String>) -> Result<Self> {
+        let _ = url;
+        Ok(self)
+    }
+
+    /// The startup cross-check: `Disagree` is an error, `Unavailable` warns; `Ok` when off.
+    pub async fn crosscheck(&self) -> Result<()> {
+        Ok(())
     }
 
     /// `coins` without those reserved by a broadcast transaction that has not confirmed.

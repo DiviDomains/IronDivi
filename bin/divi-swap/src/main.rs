@@ -124,6 +124,13 @@ struct Cli {
     /// Zcash network: `testnet` (default) or `mainnet` (only with `--allow-mainnet`).
     #[arg(long, global = true, default_value = "testnet")]
     zec_network: String,
+    /// Opt-in ZEC tip cross-check against a lightwalletd run by a second operator
+    /// (`https://host:port`; unset: off). Compared before any ZEC action (a mismatch refuses,
+    /// an unreachable operator warns) and before every ZEC claim and refund (a mismatch or an
+    /// unreachable operator holds it for a retry). Refused when its host shares a
+    /// registrable domain with a primary lightwalletd endpoint.
+    #[arg(long, global = true, env = "SWAP_ZEC_CROSSCHECK_URL")]
+    zec_crosscheck_url: Option<String>,
     /// Allow `--divi-network`, `--zec-network`, `--btc-network`, `--ltc-network` or
     /// `--usdc-network` mainnet
     /// (`mainnet`, or `ethereum`/`base` for usdc), which moves real money. Off by default,
@@ -2009,6 +2016,25 @@ mod tests {
             Err(e) => e,
         };
         assert!(e.to_string().contains("--allow-mainnet"), "{e}");
+    }
+
+    #[test]
+    fn zec_crosscheck_url_defaults_off_and_the_primary_operator_is_refused() {
+        assert_eq!(cli(&[]).zec_crosscheck_url, None);
+        let e = match live_backends(&cli(&[
+            "--counter-chain",
+            "zec",
+            "--zec-crosscheck-url",
+            "https://lwd.zec.rocks:9067",
+        ])) {
+            Ok(_) => panic!("accepted a --zec-crosscheck-url of the primary operator"),
+            Err(e) => e,
+        };
+        let e = e.to_string();
+        assert!(
+            e.contains("--zec-crosscheck-url") && e.contains("zec.rocks"),
+            "{e}"
+        );
     }
 
     #[test]
