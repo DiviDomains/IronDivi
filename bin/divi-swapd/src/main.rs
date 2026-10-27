@@ -395,6 +395,26 @@ async fn live_ltc(
 const MIN_MAKER_ETH_WEI: u128 = 10_000_000_000_000_000; // 0.01 ETH
 const MIN_MAKER_USDC_UNITS: u64 = 10_000_000; // 10 USDC, 6 decimals
 
+/// The live `UsdcBackend` a `[usdc]` section describes, signing with `key`. No network
+/// request is made here.
+fn usdc_backend(
+    cfg: &divi_swapd::UsdcSection,
+    key: swap_chain_evm::PrivateKeySigner,
+) -> Result<swap_chain_evm::UsdcBackend> {
+    let htlc = cfg
+        .htlc
+        .parse()
+        .map_err(|e| anyhow::anyhow!("usdc htlc address: {e}"))?;
+    let token = cfg
+        .token()?
+        .parse()
+        .map_err(|e| anyhow::anyhow!("usdc token address: {e}"))?;
+    Ok(
+        swap_chain_evm::UsdcBackend::new(&cfg.rpc_url()?, key, htlc, token)?
+            .with_min_lock_gas_wei(MIN_MAKER_ETH_WEI),
+    )
+}
+
 /// Builds the live `UsdcBackend` and checks its balance against every enabled usdc offer
 /// in `offers`, returning the ids of any that are enabled but underfunded — the caller
 /// drops those from what it actually serves.
@@ -410,18 +430,9 @@ async fn live_usdc(
         .parse()
         .map_err(|_| anyhow::anyhow!("usdc key is not a valid secp256k1 hex key"))?;
     drop(hex_key);
-    let htlc = cfg
-        .htlc
-        .parse()
-        .map_err(|e| anyhow::anyhow!("usdc htlc address: {e}"))?;
-    let rpc_url = cfg.rpc_url()?;
     let token_str = cfg.token()?;
-    let token = token_str
-        .parse()
-        .map_err(|e| anyhow::anyhow!("usdc token address: {e}"))?;
     let address = key.address();
-    let backend = swap_chain_evm::UsdcBackend::new(&rpc_url, key, htlc, token)?
-        .with_min_lock_gas_wei(MIN_MAKER_ETH_WEI);
+    let backend = usdc_backend(cfg, key)?;
     let (eth_wei, usdc_units) = backend
         .gas_and_token_balance()
         .await
@@ -1123,6 +1134,7 @@ mod tests {
             network: "sepolia".into(),
             allow_mainnet: false,
             rpc_url: Some(endpoint.clone()),
+            fallback_rpc_url: None,
             htlc: format!("{htlc}"),
             token: Some(format!("{token}")),
             key: "credential:test-maker-usdc".into(),
@@ -1137,6 +1149,87 @@ mod tests {
             std::env::remove_var("CREDENTIALS_DIRECTORY");
         }
         assert_eq!(underfunded, vec!["usdc-divi-sepolia".to_string()]);
+    }
+
+    /// An EVM JSON-RPC node that answers `eth_getBlockByNumber` with a latest block at
+    /// `timestamp`, and refuses everything else.
+    async fn evm_node(timestamp: u64) -> wiremock::MockServer {
+        let zero = format!("0x{}", "0".repeat(64));
+        let block = serde_json::json!({
+            "hash": format!("0x{}", "bc".repeat(32)), "parentHash": zero, "sha3Uncles": zero,
+            "miner": format!("0x{}", "0".repeat(40)), "stateRoot": zero,
+            "transactionsRoot": zero, "receiptsRoot": zero,
+            "logsBloom": format!("0x{}", "0".repeat(512)), "difficulty": "0x0",
+            "number": "0x64", "gasLimit": "0x1c9c380", "gasUsed": "0x0",
+            "timestamp": format!("{timestamp:#x}"), "extraData": "0x", "mixHash": zero,
+            "nonce": "0x0000000000000000", "baseFeePerGas": "0x3b9aca00", "uncles": [],
+            "transactions": [],
+        });
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(move |req: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+                let reply = match body["method"].as_str() {
+                    Some("eth_getBlockByNumber") => serde_json::json!({"result": block}),
+                    _ => serde_json::json!({"error": {"code": -32601, "message": "unmocked"}}),
+                };
+                let mut reply = reply;
+                reply["jsonrpc"] = "2.0".into();
+                reply["id"] = body["id"].clone();
+                wiremock::ResponseTemplate::new(200).set_body_json(reply)
+            })
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// A `[usdc]` section on `rpc_url`, with `fallback` as `fallback_rpc_url`.
+    fn usdc_section(rpc_url: &str, fallback: Option<&str>) -> divi_swapd::UsdcSection {
+        divi_swapd::UsdcSection {
+            network: "sepolia".into(),
+            allow_mainnet: false,
+            rpc_url: Some(rpc_url.into()),
+            fallback_rpc_url: fallback.map(Into::into),
+            htlc: format!("0x{}", "11".repeat(20)),
+            token: Some(format!("0x{}", "22".repeat(20))),
+            key: "credential:unused".into(),
+        }
+    }
+
+    async fn requests(node: &wiremock::MockServer) -> usize {
+        node.received_requests().await.unwrap_or_default().len()
+    }
+
+    /// `[usdc].fallback_rpc_url` set: the backend the daemon builds asks the second node too,
+    /// and reads the smaller of the two block times (`quorum.rs`), so a second node behind
+    /// the first holds a refund back.
+    #[tokio::test]
+    async fn usdc_fallback_rpc_url_makes_the_backend_ask_the_second_node() {
+        let (primary, second) = (evm_node(2_000).await, evm_node(1_000).await);
+        let cfg = usdc_section(&primary.uri(), Some(&second.uri()));
+        let backend = usdc_backend(&cfg, swap_chain_evm::PrivateKeySigner::random()).unwrap();
+        assert_eq!(backend.median_time_past().await.unwrap(), 1_000);
+        assert_eq!(requests(&primary).await, 1);
+        assert_eq!(requests(&second).await, 1);
+    }
+
+    /// Unset (or blank), the second node is never asked and the backend reads the one node
+    /// with the one request it always made.
+    #[tokio::test]
+    async fn usdc_without_fallback_rpc_url_reads_one_node_as_before() {
+        for fallback in [None, Some("  ")] {
+            let (primary, second) = (evm_node(2_000).await, evm_node(1_000).await);
+            let mut cfg = usdc_section(&primary.uri(), None);
+            cfg.fallback_rpc_url = fallback.map(Into::into);
+            let backend = usdc_backend(&cfg, swap_chain_evm::PrivateKeySigner::random()).unwrap();
+            assert_eq!(backend.median_time_past().await.unwrap(), 2_000);
+            assert_eq!(requests(&primary).await, 1);
+            assert_eq!(
+                requests(&second).await,
+                0,
+                "the unconfigured node was asked"
+            );
+        }
     }
 
     fn inflight_cfg(db: &std::path::Path, xmr: bool) -> DaemonConfig {
