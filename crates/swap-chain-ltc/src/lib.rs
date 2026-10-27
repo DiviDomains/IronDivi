@@ -15,6 +15,7 @@
 //! `Network` variants.
 
 mod address;
+mod broadcast;
 mod client;
 mod crosscheck;
 mod send;
@@ -123,6 +124,8 @@ pub struct LtcBackend {
     reservations: Option<InputReservations>,
     retry: RetryPolicy,
     claim_check: Option<ClaimCrossCheck>,
+    /// The primary alone and the secondary, when every broadcast goes to both.
+    dual: Option<(EsploraClient, EsploraClient)>,
 }
 
 /// The opt-in claim-time tip cross-check (see [`LtcBackend::with_claim_crosscheck`]).
@@ -230,8 +233,20 @@ impl LtcBackend {
         self
     }
 
-    /// Stub (EO test commit): no behaviour yet; the fix posts to both endpoints.
-    pub fn with_dual_broadcast(self, _on: bool) -> Result<Self> {
+    /// Opt-in (`[ltc].dual_broadcast`): post every broadcast to the primary and the secondary
+    /// Esplora at once, so a primary that refuses or drops a claim cannot keep it off the
+    /// network; either one taking it is a broadcast (see `broadcast.rs`). Off by default (one
+    /// POST, the secondary only a failover); refused with fewer than two endpoints. Reads are
+    /// unchanged.
+    pub fn with_dual_broadcast(mut self, on: bool) -> Result<Self> {
+        self.dual = match on {
+            false => None,
+            true => Some(self.esplora.split_primary().ok_or_else(|| {
+                SwapError::InvalidParams(
+                    "dual broadcast needs a primary and a secondary Esplora endpoint".into(),
+                )
+            })?),
+        };
         Ok(self)
     }
 
@@ -572,6 +587,7 @@ impl LtcBackend {
             reservations: None,
             retry,
             claim_check: None,
+            dual: None,
         })
     }
 
@@ -1053,6 +1069,17 @@ impl ChainBackend for LtcBackend {
 
     async fn broadcast(&self, tx: &SignedTx) -> Result<Txid> {
         self.reserve_inputs(tx)?;
+        if let Some((primary, secondary)) = &self.dual {
+            return match broadcast::post_both(primary, secondary, tx).await {
+                Ok(()) => Ok(tx.txid),
+                Err(f) => {
+                    if f.missing_or_spent && self.confirmations(&tx.txid).await?.is_some() {
+                        return Ok(tx.txid);
+                    }
+                    Err(f.err)
+                }
+            };
+        }
         match self.esplora.post("/tx", hex::encode(&tx.raw)).await {
             Ok(_) => Ok(tx.txid),
             Err(ClientError::Http(f)) => {

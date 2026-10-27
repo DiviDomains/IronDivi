@@ -263,6 +263,13 @@ pub struct LtcSection {
     /// `"tip"` (the default) or `"mtp"` ([`LtcSection::expiry_start`]).
     #[serde(default)]
     pub expiry_start: Option<String>,
+    /// Post every LTC broadcast (lock, claim, CPFP child, refund) to the primary and the
+    /// secondary Esplora at once, so a primary that refuses or drops a claim cannot keep it off
+    /// the network; either one taking it is a broadcast. Off by default: the secondary is then
+    /// only a failover. Needs `esplora_url` and a different `fallback_esplora_url` (the
+    /// network's default list has one endpoint). Reads are unchanged.
+    #[serde(default)]
+    pub dual_broadcast: bool,
 }
 
 impl LtcSection {
@@ -291,6 +298,22 @@ impl LtcSection {
             None => swap_chain_ltc::esplora_endpoints(&self.network)
                 .map_err(|e| anyhow::anyhow!("[ltc].network: {e}"))?,
         })
+    }
+
+    /// With `dual_broadcast` on, the endpoints must be a primary and a different secondary.
+    fn validate_dual_broadcast(&self) -> Result<()> {
+        if !self.dual_broadcast {
+            return Ok(());
+        }
+        let eps = self.endpoints()?;
+        let norm = |u: &String| u.trim().trim_end_matches('/').to_string();
+        if eps.len() < 2 || norm(&eps[0]) == norm(&eps[1]) {
+            bail!(
+                "[ltc].dual_broadcast = true needs a second, different Esplora endpoint: set \
+                 [ltc].fallback_esplora_url next to [ltc].esplora_url"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -956,6 +979,7 @@ impl DaemonConfig {
             if l.crosscheck_source()?.is_some() && l.network != "mainnet" {
                 bail!("[ltc].crosscheck is mainnet-only: no testnet source is verified");
             }
+            l.validate_dual_broadcast()?;
             if l.crosscheck_before_claim && l.crosscheck_source()?.is_none() {
                 bail!(
                     "[ltc].crosscheck_before_claim = true needs a source: set [ltc].crosscheck \
@@ -1801,8 +1825,15 @@ divi_fund_txids = ["ab"]
                 "{GOOD}\n[ltc]\nkey = \"credential:btc\"\n{extra}\n"
             ))
         };
+        assert!(!ltc("").unwrap().ltc.unwrap().dual_broadcast);
         let two = "esplora_url = \"http://a:1\"\nfallback_esplora_url = \"http://b:2\"";
-        assert!(ltc(&format!("{two}\ndual_broadcast = true")).is_ok());
+        assert!(
+            ltc(&format!("{two}\ndual_broadcast = true"))
+                .unwrap()
+                .ltc
+                .unwrap()
+                .dual_broadcast
+        );
         // The network's one default, one endpoint, or the same one twice is refused at load,
         // naming both keys; off, each is fine (failover only, as before).
         for one in [

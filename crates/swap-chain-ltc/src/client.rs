@@ -100,6 +100,21 @@ impl EsploraClient {
         })
     }
 
+    /// The primary alone, and the secondary (with any further endpoints as its own failover),
+    /// as two clients on the same HTTP pool and retry policy. `None` with one endpoint.
+    pub fn split_primary(&self) -> Option<(EsploraClient, EsploraClient)> {
+        let (first, rest) = self.endpoints.split_first()?;
+        if rest.is_empty() {
+            return None;
+        }
+        let on = |endpoints: Vec<String>| EsploraClient {
+            http: self.http.clone(),
+            endpoints,
+            retry: self.retry,
+        };
+        Some((on(vec![first.clone()]), on(rest.to_vec())))
+    }
+
     /// The primary (first) endpoint base URL.
     pub fn primary_url(&self) -> &str {
         &self.endpoints[0]

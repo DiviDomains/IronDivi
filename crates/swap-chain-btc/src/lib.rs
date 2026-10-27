@@ -11,6 +11,7 @@
 //! Lane **btc** (docs/plans/swap-poc/lanes/btc.md) owns this crate. The Wave 0 live
 //! proof (`examples/*_cltv_proof.rs`) shows the transaction shapes that signet accepts.
 
+mod broadcast;
 mod client;
 mod quorum;
 mod tx;
@@ -132,8 +133,10 @@ impl BtcBackend {
 
     /// Read `find_spend`, `htlc_output` and `confirmations` from the primary and the secondary
     /// Esplora and act only on an answer both give (single-source-design.md section 5, BTC).
-    /// A disagreement, or either endpoint failing, is `Transient` (see `quorum.rs`). Off by
-    /// default; refused with fewer than two endpoints.
+    /// A disagreement, or either endpoint failing, is `Transient` (see `quorum.rs`). The same
+    /// switch posts every broadcast to both endpoints (see `broadcast.rs`), funds only from
+    /// coins both list, and takes the higher of their fee rates. Off by default; refused with
+    /// fewer than two endpoints.
     pub fn with_quorum_reads(mut self, on: bool) -> Result<Self> {
         self.quorum = match on {
             false => None,
@@ -164,29 +167,19 @@ impl BtcBackend {
     }
 
     /// This key's coins from the address query, less those [`Self::unreserved`] holds back:
-    /// what funding selects from.
+    /// what funding selects from. With quorum reads, only the coins both endpoints list
+    /// (`quorum::agree_coins`); either endpoint failing is `Transient`.
     async fn my_utxos(&self) -> Result<Vec<Coin>> {
-        let utxos = self
-            .get_json(&format!("/address/{}/utxo", self.address))
-            .await?;
-        let coins = utxos
-            .as_array()
-            .ok_or_else(|| {
-                SwapError::Transient("utxo response is not an array (malformed?)".into())
-            })?
-            .iter()
-            .map(|u| {
-                Ok(Coin {
-                    outpoint: OutPoint::new(
-                        bitcoin::Txid::from_str(u["txid"].as_str().unwrap_or(""))
-                            .map_err(|e| SwapError::Other(format!("utxo txid: {e}")))?,
-                        u["vout"].as_u64().unwrap_or(u64::MAX) as u32,
-                    ),
-                    value: u["value"].as_u64().unwrap_or(0),
-                    confirmed: u["status"]["confirmed"].as_bool().unwrap_or(false),
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let path = format!("/address/{}/utxo", self.address);
+        let coins = match &self.quorum {
+            None => coins_from(&self.get_json(&path).await?)?,
+            Some((primary, secondary)) => {
+                let (a, b) =
+                    tokio::join!(get_json_on(primary, &path), get_json_on(secondary, &path));
+                let (a, b) = quorum::pair("utxos", a, b)?;
+                quorum::agree_coins(coins_from(&a)?, coins_from(&b)?)
+            }
+        };
         self.unreserved(coins)
     }
 
@@ -300,12 +293,24 @@ impl BtcBackend {
         match self.fees {
             FeePolicy::Fixed(r) => r.max(1),
             FeePolicy::Recommended { floor } => {
-                let rate = async {
-                    let body = self.esplora.get("/v1/fees/recommended").await.ok()?;
-                    let v: Value = serde_json::from_str(&body).ok()?;
-                    v["halfHourFee"].as_u64()
-                }
-                .await;
+                // With quorum reads, the higher of the two rates, so a primary quoting low
+                // cannot leave a transaction stuck; one endpoint failing uses the other's
+                // (a fee read never holds up a claim or refund).
+                let rate = match &self.quorum {
+                    None => half_hour_fee_on(&self.esplora).await,
+                    Some((primary, secondary)) => {
+                        let (a, b) =
+                            tokio::join!(half_hour_fee_on(primary), half_hour_fee_on(secondary));
+                        if a.is_none() != b.is_none() {
+                            tracing::warn!(
+                                primary = ?a,
+                                secondary = ?b,
+                                "fee estimate from one Esplora endpoint only"
+                            );
+                        }
+                        a.max(b)
+                    }
+                };
                 if rate.is_none() {
                     tracing::warn!(floor, "fee estimate unavailable, using floor");
                 }
@@ -404,6 +409,34 @@ async fn tip_height_on(es: &EsploraClient) -> Result<u64> {
     trimmed
         .parse()
         .map_err(|_| SwapError::Transient(format!("unparseable tip height {body:?}")))
+}
+
+/// The coins in an Esplora `/address/:address/utxo` answer (`txid`, `vout`, `value`,
+/// `status.confirmed`).
+fn coins_from(utxos: &Value) -> Result<Vec<Coin>> {
+    utxos
+        .as_array()
+        .ok_or_else(|| SwapError::Transient("utxo response is not an array (malformed?)".into()))?
+        .iter()
+        .map(|u| {
+            Ok(Coin {
+                outpoint: OutPoint::new(
+                    bitcoin::Txid::from_str(u["txid"].as_str().unwrap_or(""))
+                        .map_err(|e| SwapError::Other(format!("utxo txid: {e}")))?,
+                    u["vout"].as_u64().unwrap_or(u64::MAX) as u32,
+                ),
+                value: u["value"].as_u64().unwrap_or(0),
+                confirmed: u["status"]["confirmed"].as_bool().unwrap_or(false),
+            })
+        })
+        .collect()
+}
+
+/// `/v1/fees/recommended` `halfHourFee` from one endpoint view; `None` if it cannot be read.
+async fn half_hour_fee_on(es: &EsploraClient) -> Option<u64> {
+    let body = es.get("/v1/fees/recommended").await.ok()?;
+    let v: Value = serde_json::from_str(&body).ok()?;
+    v["halfHourFee"].as_u64()
 }
 
 fn hex_items(v: &Value) -> Result<Vec<Vec<u8>>> {
@@ -652,6 +685,17 @@ impl ChainBackend for BtcBackend {
 
     async fn broadcast(&self, tx: &SignedTx) -> Result<Txid> {
         self.reserve_inputs(tx)?;
+        if let Some((primary, secondary)) = &self.quorum {
+            return match broadcast::post_both(primary, secondary, tx).await {
+                Ok(()) => Ok(tx.txid),
+                Err(f) => {
+                    if f.missing_or_spent && self.confirmations(&tx.txid).await?.is_some() {
+                        return Ok(tx.txid);
+                    }
+                    Err(f.err)
+                }
+            };
+        }
         match self.esplora.post("/tx", hex::encode(&tx.raw)).await {
             Ok(_) => Ok(tx.txid),
             Err(ClientError::Http(f)) => {

@@ -113,6 +113,11 @@ impl EsploraClient {
         Some((on(vec![first.clone()]), on(rest.to_vec())))
     }
 
+    /// The primary (first) endpoint base URL.
+    pub fn primary_url(&self) -> &str {
+        &self.endpoints[0]
+    }
+
     /// GET `path` and return the body.
     pub async fn get(&self, path: &str) -> Result<String, ClientError> {
         self.send(Method::GET, path, None).await

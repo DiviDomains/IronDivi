@@ -381,6 +381,7 @@ async fn live_ltc(
         swap_chain_ltc::FeePolicy::default(),
         swap_chain_ltc::RetryPolicy::default(),
     )?
+    .with_dual_broadcast(cfg.dual_broadcast)?
     .with_input_reservations(reservations.clone())
     // Opt-in (`[ltc].crosscheck_before_claim`, needs `crosscheck`): the same comparison again
     // before every claim; config load refuses it without a source.
@@ -389,7 +390,12 @@ async fn live_ltc(
     } else {
         None
     });
-    tracing::info!(address = %backend.address(), network = %cfg.network, "ltc backend ready");
+    tracing::info!(
+        address = %backend.address(),
+        network = %cfg.network,
+        dual_broadcast = cfg.dual_broadcast,
+        "ltc backend ready"
+    );
     // Opt-in (`[ltc].crosscheck`): a primary that disagrees with the independent source
     // refuses to start; an unreachable source only warns.
     backend.crosscheck(cfg.crosscheck_source()?).await?;

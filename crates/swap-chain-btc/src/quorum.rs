@@ -16,10 +16,12 @@
 //! raise one; endpoints a block apart are ordinary lag, not a disagreement. The tip reads
 //! follow the same rule: the lower tip height and median time, the header of the lower tip
 //! once the other endpoint names the same block at that height, and a block status both
-//! endpoints give.
+//! endpoints give. Funding reads (EO): only the wallet coins both endpoints list.
 
 use divi_swap::backend::TipHeader;
 use divi_swap::{LockedOutput, SpendInfo, SwapError};
+
+use crate::tx::Coin;
 
 type Result<T> = std::result::Result<T, SwapError>;
 
@@ -150,4 +152,40 @@ pub(crate) fn agree_in_best_chain(hash: &str, a: bool, b: bool) -> Result<bool> 
             format!("block {hash}: primary in_best_chain {a}, secondary {b}"),
         ))
     }
+}
+
+/// The coins both endpoints list for the wallet: same outpoint and value, confirmed only if
+/// both say so. A coin one endpoint lists and the other does not (spent, unknown, or at
+/// another value) is left out of funding and the balance, not an error: the wallet funds from
+/// what both agree on, and finds itself short rather than spending a coin that may not exist.
+pub(crate) fn agree_coins(a: Vec<Coin>, b: Vec<Coin>) -> Vec<Coin> {
+    let mut kept = Vec::new();
+    let mut dropped = Vec::new();
+    for x in &a {
+        match b
+            .iter()
+            .find(|y| y.outpoint == x.outpoint && y.value == x.value)
+        {
+            Some(y) => kept.push(Coin {
+                confirmed: x.confirmed && y.confirmed,
+                ..*x
+            }),
+            None => dropped.push(format!("{} ({} sat) primary only", x.outpoint, x.value)),
+        }
+    }
+    for y in &b {
+        if !kept
+            .iter()
+            .any(|k| k.outpoint == y.outpoint && k.value == y.value)
+        {
+            dropped.push(format!("{} ({} sat) secondary only", y.outpoint, y.value));
+        }
+    }
+    if !dropped.is_empty() {
+        tracing::warn!(
+            "Esplora endpoints list different wallet coins, funding without them: {}",
+            dropped.join(", ")
+        );
+    }
+    kept
 }
