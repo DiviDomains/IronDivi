@@ -15,6 +15,7 @@
 use crate::backend::{ChainBackend, FeeBump};
 use crate::config::FeeEscalation;
 use crate::error::{Result, SwapError};
+use crate::hold;
 use crate::htlc::HtlcParams;
 use crate::store::{MakerRecord, Store, TakerRecord};
 use crate::types::{Amount, Chain, Outpoint, SignedTx};
@@ -46,6 +47,8 @@ pub(crate) trait ClaimRecord: Send {
     fn claim_mut(&mut self) -> ClaimMut<'_>;
     /// Write the whole record (write-ahead of every broadcast).
     fn persist(&self, store: &Store) -> Result<()>;
+    /// The record's last error, shown to the operator.
+    fn last_error_mut(&mut self) -> &mut Option<String>;
 }
 
 impl ClaimRecord for TakerRecord {
@@ -65,6 +68,9 @@ impl ClaimRecord for TakerRecord {
     }
     fn persist(&self, store: &Store) -> Result<()> {
         store.put_taker_swap(self)
+    }
+    fn last_error_mut(&mut self) -> &mut Option<String> {
+        &mut self.last_error
     }
 }
 
@@ -86,6 +92,9 @@ impl ClaimRecord for MakerRecord {
     }
     fn persist(&self, store: &Store) -> Result<()> {
         store.put_maker_swap(self)
+    }
+    fn last_error_mut(&mut self) -> &mut Option<String> {
+        &mut self.last_error
     }
 }
 
@@ -145,6 +154,42 @@ impl ClaimCtx<'_> {
         c.children.clear();
         *c.child_replaced = None;
         *c.underpriced = 0;
+        Ok(tx)
+    }
+
+    /// [`ClaimCtx::sign_first`] for a claim whose preimage is already public: a claim the
+    /// backend holds for its second source ([`SwapError::Held`]) is signed on the primary
+    /// alone once less than the claim margin (`window`) is left before the counterparty's
+    /// refund locktime ([`crate::hold`]). Never for a first claim that would reveal the
+    /// preimage: that one is declined at its margin instead (`taker.rs`).
+    pub async fn sign_public<R: ClaimRecord>(&self, r: &mut R) -> Result<SignedTx> {
+        let why = match self.sign_first(r).await {
+            Err(SwapError::Held(why)) => why,
+            other => return other,
+        };
+        let deadline = hold::claim_deadline(self.htlc.locktime, self.window);
+        let view = hold::past_deadline(
+            self.backend,
+            why.clone(),
+            deadline,
+            r.swap_id(),
+            "claim",
+            self.htlc.locktime,
+        )
+        .await?;
+        let primary = ClaimCtx {
+            chain: self.chain,
+            backend: view.as_ref(),
+            escalation: self.escalation,
+            window: self.window,
+            htlc: self.htlc,
+            op: self.op,
+            amount: self.amount,
+            preimage: self.preimage,
+            store: self.store,
+        };
+        let tx = primary.sign_first(r).await?;
+        *r.last_error_mut() = Some(hold::note("claim", &why));
         Ok(tx)
     }
 

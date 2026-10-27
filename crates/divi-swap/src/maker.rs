@@ -31,6 +31,7 @@ use crate::backend::ChainBackend;
 use crate::claim_fee::ClaimCtx;
 use crate::config::{ClaimDeadline, FeeEscalation, SwapConfig};
 use crate::error::{Result, SwapError};
+use crate::hold;
 use crate::htlc::{HtlcParams, ScriptVersion};
 use crate::state::SwapState;
 use crate::store::{MakerRecord, QuoteRecord, Store};
@@ -872,10 +873,18 @@ impl Maker {
         let refund = match r.maker_leg_refund.clone() {
             Some(tx) => tx,
             None => {
-                let tx = self
-                    .mk(r)?
-                    .build_refund(&htlc, &funding.outpoint, funding.amount)
-                    .await?;
+                let mk = self.mk(r)?.clone();
+                let margin = ClaimDeadline::builtin(mk.chain()).margin_secs();
+                let tx = hold::build_refund(
+                    mk.as_ref(),
+                    &htlc,
+                    &funding.outpoint,
+                    funding.amount,
+                    margin,
+                    &r.id,
+                    &mut r.last_error,
+                )
+                .await?;
                 r.maker_leg_refund = Some(tx.clone());
                 self.store.put_maker_swap(r)?; // write-ahead
                 tx
@@ -951,7 +960,8 @@ impl Maker {
         let claim = match r.taker_leg_claim.clone() {
             Some(tx) => tx,
             None => {
-                let tx = ctx.sign_first(r).await?;
+                // The taker's claim revealed the preimage: a hold ends at the margin.
+                let tx = ctx.sign_public(r).await?;
                 self.store.put_maker_swap(r)?; // write-ahead
                 tx
             }
@@ -980,7 +990,7 @@ impl Maker {
             Some(tx) => tx,
             None => {
                 // Forgotten after a refusal: re-sign from the persisted preimage.
-                let tx = ctx.sign_first(r).await?;
+                let tx = ctx.sign_public(r).await?;
                 self.store.put_maker_swap(r)?; // write-ahead
                 tx
             }

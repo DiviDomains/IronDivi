@@ -26,6 +26,7 @@ use crate::config::{
     ClaimDeadline, FeeEscalation, OfferedTerms, Profile,
 };
 use crate::error::{Result, SwapError};
+use crate::hold;
 use crate::htlc::{new_preimage, HtlcParams};
 use crate::store::{Store, TakerRecord};
 use crate::types::{Chain, SignedTx, SpendInfo};
@@ -335,9 +336,10 @@ impl Taker {
         if r.state.is_terminal() {
             return Ok(r.state);
         }
-        let had_error = r.last_error.take().is_some();
+        let prev_error = r.last_error.take();
+        let had_error = prev_error.is_some();
         for _ in 0..16 {
-            match self.advance(&mut r, maker).await {
+            match self.advance(&mut r, maker, prev_error.as_deref()).await {
                 Ok(Flow::Moved) => {}
                 Ok(Flow::Idle | Flow::Halted) => break,
                 Err(e) => {
@@ -449,13 +451,19 @@ impl Taker {
         Ok(Flow::Moved)
     }
 
-    async fn advance(&self, r: &mut TakerRecord, maker: Option<&SwapView>) -> Result<Flow> {
+    /// `prev_error`: the error the previous step ended on, if any.
+    async fn advance(
+        &self,
+        r: &mut TakerRecord,
+        maker: Option<&SwapView>,
+        prev_error: Option<&str>,
+    ) -> Result<Flow> {
         match r.state {
             TakerState::Prepared | TakerState::Accepted | TakerState::Done | TakerState::Lost => {
                 Ok(Flow::Idle)
             }
             TakerState::Locked => self.on_locked(r, maker).await,
-            TakerState::MakerLockConfirmed => self.on_maker_lock_confirmed(r).await,
+            TakerState::MakerLockConfirmed => self.on_maker_lock_confirmed(r, prev_error).await,
             TakerState::Claimed => self.on_claimed(r).await,
             TakerState::Refunded => self.on_refunded(r).await,
         }
@@ -609,7 +617,13 @@ impl Taker {
         self.enter(r, TakerState::MakerLockConfirmed)
     }
 
-    async fn on_maker_lock_confirmed(&self, r: &mut TakerRecord) -> Result<Flow> {
+    /// `prev_error`: what stopped the first claim on the previous step (a hold for the
+    /// second source, say), named when the claim margin runs out because of it.
+    async fn on_maker_lock_confirmed(
+        &self,
+        r: &mut TakerRecord,
+        prev_error: Option<&str>,
+    ) -> Result<Flow> {
         let htlc = r
             .maker_leg_htlc
             .ok_or_else(|| SwapError::Other("no verified maker lock".into()))?;
@@ -619,10 +633,22 @@ impl Taker {
             Some(_) => Ok(()), // decided below on an earlier pass
             None => match self.claim_deadline(chain).check(chain, mtp, htlc.locktime) {
                 Ok(()) => self.claim_fee_check(r, &htlc).await?,
-                late => late,
+                Err(late) => Err(match prev_error {
+                    // The claim was verified with the margin to spare and has not gone out
+                    // since: held for a second source, or failing. Never signed on one
+                    // source here, the preimage is still ours: decline, both legs refund.
+                    Some(prev) => {
+                        tracing::error!(swap = %r.id, %chain, locktime = htlc.locktime, mtp,
+                            last_error = %prev, "the first claim did not go out before the \
+                            claim margin; declining it, both legs refund");
+                        format!("{late}; the first claim did not go out before it: {prev}")
+                    }
+                    None => late,
+                }),
             },
         };
         if r.claim_declined.is_none() && deadline.is_ok() {
+            // Plain `sign_first`, never `sign_public`: a hold here waits for the margin above.
             self.claim_ctx(r)?.sign_first(r).await?;
             // Persist the signed claim (which reveals the preimage) before broadcasting it.
             return self.enter(r, TakerState::Claimed);
@@ -666,7 +692,8 @@ impl Taker {
         let claim = match r.maker_leg_claim.clone() {
             Some(tx) => tx,
             None => {
-                let tx = ctx.sign_first(r).await?;
+                // The preimage went out with the first claim: a hold ends at the margin.
+                let tx = ctx.sign_public(r).await?;
                 self.store.put_taker_swap(r)?; // write-ahead
                 tx
             }
@@ -778,10 +805,19 @@ impl Taker {
                     .taker_leg_funding
                     .clone()
                     .ok_or_else(|| SwapError::Other("Refunded without a funding tx".into()))?;
-                let tx = self
-                    .tk(r)?
-                    .build_refund(&htlc, &f.outpoint, f.amount)
-                    .await?;
+                let chain = r.quote.taker_chain();
+                let margin = self.claim_deadline(chain).margin_secs();
+                let tk = self.tk(r)?.clone();
+                let tx = hold::build_refund(
+                    tk.as_ref(),
+                    &htlc,
+                    &f.outpoint,
+                    f.amount,
+                    margin,
+                    &r.id,
+                    &mut r.last_error,
+                )
+                .await?;
                 r.taker_leg_refund = Some(tx.clone());
                 self.store.put_taker_swap(r)?; // write-ahead
                 tx

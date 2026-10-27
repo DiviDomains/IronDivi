@@ -173,28 +173,60 @@ pub async fn enforce_at_startup(
     }
 }
 
-/// Before a claim or refund (`what`) of `at`: `Disagree` and `Unavailable` are both
-/// [`SwapError::Transient`] (fail closed; the engine retries).
+/// A claim or refund the cross-check holds: the [`SwapError::Held`] to return, naming both
+/// operators, and whether they disagreed (`false`: the second could not vouch).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpendHold {
+    /// The error the build returns.
+    pub error: SwapError,
+    /// The operators reported different blocks (one of them is lying).
+    pub disagree: bool,
+}
+
+/// Before a claim or refund (`what`) of `at`: `None` on agreement; `Disagree` and
+/// `Unavailable` both hold it as [`SwapError::Held`] (fail closed; the engine retries until
+/// its deadline for that spend, then builds it on the primary alone,
+/// [`divi_swap::ChainBackend::primary_only`]).
+pub async fn spend_hold(
+    primary: &LightwalletdClient,
+    other: &LightwalletdClient,
+    what: &str,
+    at: &Outpoint,
+) -> Option<SpendHold> {
+    match tip_crosscheck(primary, other).await {
+        CrossCheckOutcome::Agree { height, hash } => {
+            tracing::debug!(height, %hash, outpoint = %at, "zec {what} cross-check agrees");
+            None
+        }
+        CrossCheckOutcome::Unavailable { reason } => Some(SpendHold {
+            error: SwapError::Held(format!(
+                "zec tip cross-check unavailable ({reason}); primary lightwalletd {}, second \
+                 operator {}: {what} of {at} held until it answers",
+                primary_label(primary),
+                other_label(other)
+            )),
+            disagree: false,
+        }),
+        d @ CrossCheckOutcome::Disagree { .. } => Some(SpendHold {
+            error: SwapError::Held(format!(
+                "{}; {what} of {at} held",
+                d.disagree_message().expect("disagree")
+            )),
+            disagree: true,
+        }),
+    }
+}
+
+/// [`spend_hold`] as a result: `Ok` on agreement, else its [`SwapError::Held`].
 pub async fn enforce_before_spend(
     primary: &LightwalletdClient,
     other: &LightwalletdClient,
     what: &str,
     at: &Outpoint,
 ) -> Result<()> {
-    match tip_crosscheck(primary, other).await {
-        CrossCheckOutcome::Agree { height, hash } => {
-            tracing::debug!(height, %hash, outpoint = %at, "zec {what} cross-check agrees");
-            Ok(())
-        }
-        CrossCheckOutcome::Unavailable { reason } => Err(SwapError::Transient(format!(
-            "zec tip cross-check unavailable ({reason}); second operator {}: {what} of {at} \
-             held until it answers",
-            other_label(other)
-        ))),
-        d @ CrossCheckOutcome::Disagree { .. } => Err(SwapError::Transient(format!(
-            "{}; {what} of {at} held",
-            d.disagree_message().expect("disagree")
-        ))),
+    match spend_hold(primary, other, what, at).await {
+        None => Ok(()),
+        Some(hold) => Err(hold.error),
     }
 }
 
@@ -313,7 +345,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_different_hash_at_the_tip_or_six_below_is_transient_naming_both_endpoints() {
+    async fn a_different_hash_at_the_tip_or_six_below_refuses_naming_both_endpoints() {
         for height in [TIP, TIP - CROSSCHECK_DEPTH] {
             let (p, o) = (Lightwalletd::start(TIP), Lightwalletd::start(TIP));
             o.tamper(height);
@@ -327,17 +359,18 @@ mod tests {
             for needle in [p.endpoint(), o.endpoint()] {
                 assert!(msg.contains(needle), "{msg} lacks {needle}");
             }
-            for err in [
-                enforce_at_startup(&pc, &oc).await.unwrap_err(),
-                enforce_before_spend(&pc, &oc, "refund", &at())
-                    .await
-                    .unwrap_err(),
-            ] {
-                let SwapError::Transient(m) = &err else {
-                    panic!("{height}: not transient: {err:?}");
-                };
-                assert!(m.contains(p.endpoint()) && m.contains(o.endpoint()), "{m}");
-            }
+            // At startup a refusal; before a spend a hold.
+            let startup = enforce_at_startup(&pc, &oc).await.unwrap_err();
+            let SwapError::Transient(m) = &startup else {
+                panic!("{height}: not transient: {startup:?}");
+            };
+            assert!(m.contains(p.endpoint()) && m.contains(o.endpoint()), "{m}");
+            let hold = spend_hold(&pc, &oc, "refund", &at()).await.expect("held");
+            assert!(hold.disagree);
+            let SwapError::Held(m) = &hold.error else {
+                panic!("{height}: not held: {hold:?}");
+            };
+            assert!(m.contains(p.endpoint()) && m.contains(o.endpoint()), "{m}");
         }
     }
 
@@ -357,13 +390,15 @@ mod tests {
             .await
             .expect("startup only warns");
         for what in ["claim", "refund"] {
-            let err = enforce_before_spend(&pc, &oc, what, &at())
-                .await
-                .unwrap_err();
-            let SwapError::Transient(m) = &err else {
-                panic!("{what}: not transient: {err:?}");
+            let hold = spend_hold(&pc, &oc, what, &at()).await.expect("held");
+            assert!(!hold.disagree, "down is not a disagreement");
+            let SwapError::Held(m) = &hold.error else {
+                panic!("{what}: not held: {hold:?}");
             };
-            assert!(m.contains("127.0.0.1:1") && m.contains(what), "{m}");
+            assert!(
+                m.contains("127.0.0.1:1") && m.contains(p.endpoint()) && m.contains(what),
+                "{m}"
+            );
         }
     }
 
@@ -398,7 +433,7 @@ mod tests {
         );
         assert!(matches!(
             enforce_before_spend(&pc, &oc, "claim", &at()).await,
-            Err(SwapError::Transient(_))
+            Err(SwapError::Held(_))
         ));
     }
 
