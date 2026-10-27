@@ -799,12 +799,12 @@ EXPLAINED = {
         "side had spent an older coin of the same value (divid's coin choice among equal coins is by txid order); "
         "reconsiderblock confirms them again, so the end states agree"),
     "divid balance cache in the middle of a reorg": (
-        "only the middle of the invalidate differs, in the immature balance, and the end states agree: both sides "
-        "lost as many transactions while the tip was lowered (spends of coins immature at that height, "
-        "removeCoinbaseSpends, txmempool.cpp:139-157), and divid's immature balance is below irondivid's by just the "
-        "immature coins those spent; divid's wallet still counts a coin spent while its spender is out of the mempool "
-        "but not in conflict (IsSpent with depth 0, UtxoBalanceCalculator.cpp:16-30, cached by "
-        "CachedUtxoBalanceCalculator.cpp:13-30), irondivid's counts it again"),
+        "only the middle of the invalidate differs, in the immature or unconfirmed balance, and the end states agree: "
+        "both sides lost as many transactions while the tip was lowered; divid's wallet still holds a lost one as of "
+        "depth 0, not in conflict, so it counts the coin it spends as spent (IsSpent with depth 0, "
+        "UtxoBalanceCalculator.cpp:16-30, cached by CachedUtxoBalanceCalculator.cpp:13-30) and its outputs as "
+        "unconfirmed (WalletBalanceCalculator.cpp:31-36); irondivid's counts neither and agrees with the coins it "
+        "lists"),
     "maturity after a reorg": (
         "after invalidateblock the dropped mempool transactions all spend a coinbase or coinstake "
         "output that is immature at the new height, which divid's removeCoinbaseSpends drops too "
@@ -1073,33 +1073,56 @@ def mid_maturity_explains(n, diff):
 
 
 def mid_balance_cache_explains(n, c_mid, i_mid, diff):
-    """Only the middle's immature balance differs (the end states agree), each
-    side lost as many transactions while its tip was lowered, and divid's is
-    below irondivid's by just the immature coins of node n's wallet its lost
-    transactions spent: divid's wallet still counts a coin spent while its
-    spender is out of the mempool but not in conflict (IsSpent with depth 0,
-    UtxoBalanceCalculator.cpp:16-30), irondivid's counts it again"""
-    key = "immature balance"
-    if list(diff) != ["after invalidateblock: " + key] or c_mid.get(key) is None or i_mid.get(key) is None:
+    """Only the middle's immature or unconfirmed balance differs (the end
+    states agree, and so do the coins listed), and each side lost as many
+    transactions while its tip was lowered. divid's wallet still holds a lost
+    transaction as one of depth 0, not in conflict: it counts the coin it
+    spends as spent (IsSpent with depth 0, UtxoBalanceCalculator.cpp:16-30)
+    and its outputs to node n as unconfirmed (TxFlag::UNCONFIRMED,
+    WalletBalanceCalculator.cpp:31-36); irondivid's counts neither. So
+    divid's immature balance is below irondivid's by just the immature coins
+    of node n's wallet the lost transactions spent, or irondivid's
+    unconfirmed balance is the sum of the 0-confirmation coins it lists and
+    divid's is not"""
+    if len(diff) != 1:
         return False
-    counts, spent = [], 0
+    key = next(iter(diff)).split("after invalidateblock: ", 1)[-1]
+    if not next(iter(diff)).startswith("after invalidateblock: ") \
+            or key not in ("immature balance", "getunconfirmedbalance"):
+        return False
+    counts = []
     for pair in PAIRS:
-        reorg = pair.reorg
-        if reorg is None or reorg["mid_pool"] is None:
+        if pair.reorg is None or pair.reorg["mid_pool"] is None:
             return False
-        lost = (set(reorg["block_txs"]) | set(pair.pool_before)) - reorg["mid_pool"]
-        counts.append(len(lost))
-        if pair is not PAIRS[0]:
-            continue
-        for txid in lost:
-            inputs = pair.pool_before.get(txid) or wallet_inputs(pair, txid)
-            for prev_txid, vout in inputs or []:
-                if not spends_immature(pair, None, txid, reorg["mid"] + 1, [(prev_txid, vout)]):
-                    continue
-                prev = pair.node(n).call("gettransaction", prev_txid)
-                decoded = pair.node(n).call("decoderawtransaction", prev[1]["hex"]) if prev[0] == "ok" else prev
-                if decoded[0] == "ok":
-                    spent += round(float(decoded[1]["vout"][vout]["value"]) * 1e8)
+        counts.append(len((set(pair.reorg["block_txs"]) | set(pair.pool_before)) - pair.reorg["mid_pool"]))
+    if key == "getunconfirmedbalance":
+        coins = "_coins (amount, confirmations)"
+        if c_mid[key][0] != "ok" or i_mid[key][0] != "ok" or not isinstance(i_mid.get(coins), list):
+            return False
+        listed = round(sum(float(a) for a, confs in i_mid[coins] if confs == 0), 8)
+        log(f"#   mid balance cache rule: lost {counts}, unconfirmed divid {c_mid[key][1]} irondivid "
+            f"{i_mid[key][1]}, irondivid lists {listed} at 0 confirmations")
+        return counts[0] == counts[1] > 0 and round(float(i_mid[key][1]), 8) == listed \
+            and round(float(c_mid[key][1]), 8) != listed
+    if c_mid.get(key) is None or i_mid.get(key) is None:
+        return False
+    spent = 0
+    pair = PAIRS[0]
+    reorg = pair.reorg
+    for txid in (set(reorg["block_txs"]) | set(pair.pool_before)) - reorg["mid_pool"]:
+        inputs = pair.pool_before.get(txid) or wallet_inputs(pair, txid)
+        for prev_txid, vout in inputs or []:
+            if not spends_immature(pair, None, txid, reorg["mid"] + 1, [(prev_txid, vout)]):
+                continue
+            prev = pair.node(n).call("gettransaction", prev_txid)
+            # a coin of a disconnected block is in neither side's
+            # immature balance while the tip is lowered
+            if prev[0] != "ok" or pair.node(n).rpc("getblockcount") - prev[1].get("confirmations", 0) + 1 \
+                    > reorg["mid"]:
+                continue
+            decoded = pair.node(n).call("decoderawtransaction", prev[1]["hex"])
+            if decoded[0] == "ok":
+                spent += round(float(decoded[1]["vout"][vout]["value"]) * 1e8)
     gap = round(float(i_mid[key]) * 1e8) - round(float(c_mid[key]) * 1e8)
     log(f"#   mid balance cache rule: lost {counts}, divid below by {gap / 1e8}, immature coins spent {spent / 1e8}")
     return counts[0] == counts[1] and spent > 0 and gap == spent
