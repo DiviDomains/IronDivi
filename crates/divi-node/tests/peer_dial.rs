@@ -16,8 +16,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
 
-/// The node's maintenance pass that retries added peers runs every 30 s
-const MAINTENANCE: Duration = Duration::from_secs(35);
+/// A node added while the node runs is dialled at the next round of the
+/// added nodes, which comes every two minutes as Divi Core's
+/// (ThreadOpenAddedConnections, net.cpp:1239-1270)
+const ADDED_ROUND: Duration = Duration::from_secs(125);
 
 /// A listener on `ip` that plays Divi Core's inbound side for every
 /// connection it accepts and counts them
@@ -96,9 +98,9 @@ async fn added_node_is_not_dialled_while_a_peer_from_its_ip_is_connected() {
     assert!(pm.add_node(busy));
     assert!(pm.add_node(free));
 
-    // The node dials the added peer on the free IP at its next pass...
+    // The node dials the added peer on the free IP at its next round...
     assert!(
-        wait_until(MAINTENANCE, || free_accepted.load(Ordering::SeqCst) == 1).await,
+        wait_until(ADDED_ROUND, || free_accepted.load(Ordering::SeqCst) == 1).await,
         "the added node on a free IP was not dialled"
     );
     tokio::time::sleep(QUIET).await;
