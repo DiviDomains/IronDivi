@@ -23,7 +23,6 @@ use divi_primitives::amount::Amount;
 use divi_primitives::block::Block;
 use divi_primitives::script::Script;
 use divi_primitives::transaction::{Transaction, TxIn, TxOut};
-use divi_storage::StorageError;
 
 const SEQUENCE_FINAL: u32 = 0xffff_ffff;
 
@@ -90,11 +89,23 @@ fn accepted(t: &TestChain, b: Block) -> bool {
 fn a_height_lock_is_compared_with_the_blocks_height() {
     let (t, coins) = chain();
     // The block is at 26: a lock of 26 is not below it
-    assert!(!accepted(&t, block_with(&t, locked_spend(&t, &coins[..1], 26, &[0]), None)));
-    assert!(!accepted(&t, block_with(&t, locked_spend(&t, &coins[..1], 27, &[0]), None)));
+    assert!(!accepted(
+        &t,
+        block_with(&t, locked_spend(&t, &coins[..1], 26, &[0]), None)
+    ));
+    assert!(!accepted(
+        &t,
+        block_with(&t, locked_spend(&t, &coins[..1], 27, &[0]), None)
+    ));
     // 499,999,999 is still a height
-    assert!(!accepted(&t, block_with(&t, locked_spend(&t, &coins[..1], 499_999_999, &[0]), None)));
-    assert!(accepted(&t, block_with(&t, locked_spend(&t, &coins[..1], 25, &[0]), None)));
+    assert!(!accepted(
+        &t,
+        block_with(&t, locked_spend(&t, &coins[..1], 499_999_999, &[0]), None)
+    ));
+    assert!(accepted(
+        &t,
+        block_with(&t, locked_spend(&t, &coins[..1], 25, &[0]), None)
+    ));
 }
 
 #[test]
@@ -104,13 +115,33 @@ fn a_time_lock_is_compared_with_the_blocks_own_time() {
     let time = tip.time + 60;
     let mtp = t.chain.get_median_time_past(&tip).unwrap();
     assert!(mtp < tip.time);
-    assert!(!accepted(&t, block_with(&t, locked_spend(&t, &coins[..1], time, &[0]), Some(time))));
-    assert!(!accepted(&t, block_with(&t, locked_spend(&t, &coins[..1], time + 1, &[0]), Some(time))));
+    assert!(!accepted(
+        &t,
+        block_with(&t, locked_spend(&t, &coins[..1], time, &[0]), Some(time))
+    ));
+    assert!(!accepted(
+        &t,
+        block_with(
+            &t,
+            locked_spend(&t, &coins[..1], time + 1, &[0]),
+            Some(time)
+        )
+    ));
     // Past the median time past but not past the block's time: final, as
     // Divi Core compares a time lock with the block's time
-    assert!(accepted(&t, block_with(&t, locked_spend(&t, &coins[..1], tip.time, &[0]), Some(time))));
+    assert!(accepted(
+        &t,
+        block_with(
+            &t,
+            locked_spend(&t, &coins[..1], tip.time, &[0]),
+            Some(time)
+        )
+    ));
     // 500,000,000 is a time, long past
-    assert!(accepted(&t, block_with(&t, locked_spend(&t, &coins[1..2], 500_000_000, &[0]), None)));
+    assert!(accepted(
+        &t,
+        block_with(&t, locked_spend(&t, &coins[1..2], 500_000_000, &[0]), None)
+    ));
 }
 
 #[test]
