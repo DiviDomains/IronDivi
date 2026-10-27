@@ -16,12 +16,19 @@ pub type Result<T> = std::result::Result<T, SwapError>;
 /// Errors a backend or the engine can return.
 ///
 /// The variant tells the engine what to do next, so backends must classify carefully:
-/// `Transient` is retried, `Premature` is retried later, everything else is surfaced.
+/// `Transient` and `Held` are retried, `Premature` is retried later, everything else is
+/// surfaced.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum SwapError {
     /// Network failure, timeout, HTTP 429/5xx — safe to retry the same call.
     #[error("transient backend error: {0}")]
     Transient(String),
+    /// The backend refused to build a claim or refund because its second source (an opt-in
+    /// cross-check) is unavailable or disagrees with the primary: retried like `Transient`
+    /// until the engine's deadline for that spend, past which it builds the spend on the
+    /// primary alone ([`crate::ChainBackend::primary_only`]). The message names both sources.
+    #[error("held for a second source: {0}")]
+    Held(String),
     /// The chain refused a transaction because a timelock has not matured yet
     /// (`non-final`, `Locktime requirement not satisfied`). Retry after more blocks.
     #[error("transaction premature: {0}")]
@@ -61,6 +68,9 @@ pub enum SwapError {
 impl SwapError {
     /// True when retrying the identical call later may succeed.
     pub fn is_retryable(&self) -> bool {
-        matches!(self, SwapError::Transient(_) | SwapError::Premature(_))
+        matches!(
+            self,
+            SwapError::Transient(_) | SwapError::Premature(_) | SwapError::Held(_)
+        )
     }
 }

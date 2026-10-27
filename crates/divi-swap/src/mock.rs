@@ -143,6 +143,11 @@ struct ChainState {
     fail: Option<SwapError>,
     /// While set, every `broadcast()` fails with this error; reads still work.
     fail_broadcasts: Option<SwapError>,
+    /// While set, claims and refunds built by a backend that is not a
+    /// [`ChainBackend::primary_only`] view fail with `SwapError::Held(this)`.
+    hold: Option<String>,
+    /// Every claim and refund built through a [`ChainBackend::primary_only`] view, in order.
+    primary_only_builds: Vec<TxKind>,
     /// Every txid this chain ever accepted, kept when the tx later leaves the mempool.
     accepted: HashMap<Txid, TxKind>,
     /// Every `broadcast()` call that reached the node, by kind, whatever its answer
@@ -618,6 +623,19 @@ impl MockChain {
         self.state.lock().fail = err;
     }
 
+    /// While `Some`, every claim and refund built on this chain fails with
+    /// `SwapError::Held(why)`, as a backend whose second source is down or disagrees; a
+    /// [`ChainBackend::primary_only`] view still builds them (and they are recorded,
+    /// [`MockChain::primary_only_builds`]). Reads and broadcasts still answer. `None` heals it.
+    pub fn hold_spends(&self, why: Option<&str>) {
+        self.state.lock().hold = why.map(str::to_string);
+    }
+
+    /// Claims and refunds built through a [`ChainBackend::primary_only`] view, in order.
+    pub fn primary_only_builds(&self) -> Vec<TxKind> {
+        self.state.lock().primary_only_builds.clone()
+    }
+
     /// While `Some`, every `broadcast()` on this chain fails with `err` before touching
     /// any state; reads still answer. `None` heals it.
     pub fn fail_broadcasts_with(&self, err: Option<SwapError>) {
@@ -863,6 +881,7 @@ impl MockChain {
             lag: Arc::new(AtomicU64::new(0)),
             reservations: None,
             coins: Arc::default(),
+            primary_only: false,
         }
     }
 }
@@ -878,6 +897,8 @@ pub struct MockBackend {
     lag: Arc<AtomicU64>,
     reservations: Option<InputReservations>,
     coins: Arc<Vec<Outpoint>>,
+    /// A [`ChainBackend::primary_only`] view: never held by [`MockChain::hold_spends`].
+    primary_only: bool,
 }
 
 impl MockBackend {
@@ -954,6 +975,20 @@ impl MockBackend {
             Err(e.clone())
         } else {
             Ok(())
+        }
+    }
+
+    /// A claim or refund of `kind` about to be built: `Held` while the chain holds spends,
+    /// unless this is a primary-only view, whose builds are recorded.
+    fn check_hold(&self, kind: TxKind) -> Result<()> {
+        let mut s = self.chain.state.lock();
+        if self.primary_only {
+            s.primary_only_builds.push(kind);
+            return Ok(());
+        }
+        match &s.hold {
+            Some(why) => Err(SwapError::Held(why.clone())),
+            None => Ok(()),
         }
     }
 
@@ -1172,6 +1207,7 @@ impl ChainBackend for MockBackend {
         preimage: &[u8; 32],
     ) -> Result<SignedTx> {
         self.check_online()?;
+        self.check_hold(TxKind::Claim)?;
         Ok(Self::sign(&MockTx::Claim {
             to: self.owner(),
             htlc: *htlc,
@@ -1184,6 +1220,13 @@ impl ChainBackend for MockBackend {
 
     fn fee_bump(&self) -> FeeBump {
         self.chain.state.lock().fee_bump
+    }
+
+    fn primary_only(&self) -> Option<Arc<dyn ChainBackend>> {
+        Some(Arc::new(MockBackend {
+            primary_only: true,
+            ..self.clone()
+        }))
     }
 
     async fn claim_feerate(&self) -> Result<Option<u64>> {
@@ -1211,6 +1254,7 @@ impl ChainBackend for MockBackend {
         feerate: u64,
     ) -> Result<SignedTx> {
         self.check_online()?;
+        self.check_hold(TxKind::Claim)?;
         if self.fee_bump() == FeeBump::None {
             return Err(SwapError::Other("mock chain takes no fee bumps".into()));
         }
@@ -1305,6 +1349,7 @@ impl ChainBackend for MockBackend {
         amount: Amount,
     ) -> Result<SignedTx> {
         self.check_online()?;
+        self.check_hold(TxKind::Refund)?;
         let feerate = self
             .chain
             .state

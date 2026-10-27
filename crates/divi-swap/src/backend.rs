@@ -288,6 +288,15 @@ pub trait ChainBackend: Send + Sync {
             self.chain()
         )))
     }
+
+    /// The same key and primary endpoints with the second source off: builds that would
+    /// return [`SwapError::Held`] here are built on the primary alone. The engine asks for it
+    /// only past the deadline of a claim whose preimage is already public, or of a refund
+    /// (`docs/plans/swap-poc/status/engine.md`, EM round); never for a first claim that
+    /// would reveal the preimage. `None` (the default): this backend never holds a spend.
+    fn primary_only(&self) -> Option<std::sync::Arc<dyn ChainBackend>> {
+        None
+    }
 }
 
 #[cfg(test)]

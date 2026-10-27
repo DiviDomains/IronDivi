@@ -552,7 +552,9 @@ impl From<SwapError> for ApiError {
     fn from(e: SwapError) -> Self {
         let status = match &e {
             SwapError::InvalidParams(_) => StatusCode::BAD_REQUEST,
-            SwapError::Transient(_) | SwapError::Premature(_) => StatusCode::SERVICE_UNAVAILABLE,
+            SwapError::Transient(_) | SwapError::Premature(_) | SwapError::Held(_) => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
             SwapError::Rejected(_) | SwapError::InputsHeld(_) | SwapError::InsufficientFunds(_) => {
                 StatusCode::CONFLICT
             }
