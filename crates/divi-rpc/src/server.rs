@@ -79,8 +79,14 @@ impl Default for RpcConfig {
 pub use divi_network::Subnet;
 
 /// Serve `app` on the configured address, refusing (HTTP 403, as Divi Core)
-/// connections from outside the local host and the allowed subnets
-async fn serve(config: &RpcConfig, app: Router) -> Result<(), Error> {
+/// connections from outside the local host and the allowed subnets, until
+/// `stopped`: then no connection is taken, the calls under way are answered
+/// and the server returns once their connections close
+async fn serve(
+    config: &RpcConfig,
+    app: Router,
+    stopped: impl std::future::Future<Output = ()> + Send + 'static,
+) -> Result<(), Error> {
     let mut allowed: Vec<Subnet> = Subnet::loopback().to_vec();
     allowed.extend(config.allowed.iter().copied());
     let app = app.layer(middleware::from_fn(move |req: HttpRequest, next: Next| {
@@ -109,6 +115,7 @@ async fn serve(config: &RpcConfig, app: Router) -> Result<(), Error> {
             slots: Arc::new(tokio::sync::Semaphore::new(slots)),
         },
     )
+    .with_graceful_shutdown(stopped)
     .await?;
     Ok(())
 }
@@ -206,6 +213,9 @@ pub struct RpcServer {
     spork: SporkRpc,
     log_config: RwLock<Option<LogConfigInfo>>,
     shutdown: RwLock<Option<ShutdownCallback>>,
+    /// Set once `stop` has begun the node's stop: the server then takes no
+    /// new connection
+    stopping: tokio::sync::watch::Sender<bool>,
 }
 
 impl RpcServer {
@@ -221,6 +231,7 @@ impl RpcServer {
             spork: SporkRpc::new(),
             log_config: RwLock::new(None),
             shutdown: RwLock::new(None),
+            stopping: tokio::sync::watch::channel(false).0,
         }
     }
 
@@ -236,6 +247,7 @@ impl RpcServer {
             spork: SporkRpc::new(),
             log_config: RwLock::new(None),
             shutdown: RwLock::new(None),
+            stopping: tokio::sync::watch::channel(false).0,
         }
     }
 
@@ -251,6 +263,7 @@ impl RpcServer {
             spork: SporkRpc::new(),
             log_config: RwLock::new(None),
             shutdown: RwLock::new(None),
+            stopping: tokio::sync::watch::channel(false).0,
         }
     }
 
@@ -270,6 +283,7 @@ impl RpcServer {
             spork: SporkRpc::new(),
             log_config: RwLock::new(None),
             shutdown: RwLock::new(None),
+            stopping: tokio::sync::watch::channel(false).0,
         }
     }
 
@@ -366,6 +380,14 @@ impl RpcServer {
     /// Update chain height (for wallet confirmations)
     pub fn set_height(&self, height: u32) {
         self.wallet.set_height(height);
+    }
+
+    /// Resolves once `stop` has begun the node's stop
+    pub fn stopped(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let mut stopping = self.stopping.subscribe();
+        async move {
+            let _ = stopping.wait_for(|s| *s).await;
+        }
     }
 
     /// Set the hook that the `stop` RPC uses to shut the node down
@@ -1186,6 +1208,9 @@ impl RpcServer {
         };
         info!("RPC stop received, shutting down");
         shutdown();
+        // No call is served once the stop has begun, as Divi Core's
+        // connections end at ShutdownRequested (rpcserver.cpp:1003)
+        self.stopping.send_replace(true);
         // rpcserver.cpp:317
         Ok(serde_json::Value::String(
             "DIVI server stopping".to_string(),
@@ -1922,11 +1947,12 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// Start the RPC server
 pub async fn start_server(config: RpcConfig, chain: Arc<Chain>) -> Result<(), Error> {
     let server = Arc::new(RpcServer::new(chain));
+    let stopped = server.stopped();
     let app = create_router_with_auth(server, &config);
 
     info!("Starting RPC server on {}", config.bind_address);
 
-    serve(&config, app).await
+    serve(&config, app, stopped).await
 }
 
 /// Start the RPC server with peer manager
@@ -1951,11 +1977,12 @@ where
 
     setup_callbacks(&server);
 
+    let stopped = server.stopped();
     let app = create_router_with_auth(server, &config);
 
     info!("Starting RPC server on {}", config.bind_address);
 
-    serve(&config, app).await
+    serve(&config, app, stopped).await
 }
 
 /// Start the RPC server with wallet, peer manager, and optional staker
@@ -1978,11 +2005,12 @@ where
     // Allow caller to set up callbacks
     setup_callbacks(&server);
 
+    let stopped = server.stopped();
     let app = create_router_with_auth(server, &config);
 
     info!("Starting RPC server on {}", config.bind_address);
 
-    serve(&config, app).await
+    serve(&config, app, stopped).await
 }
 
 /// Start the RPC server with wallet and peer manager

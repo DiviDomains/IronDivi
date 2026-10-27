@@ -240,6 +240,8 @@ pub struct PeerManager {
     stopping: AtomicBool,
     /// The seed lookup in place of the system resolver, when set
     seed_resolver: RwLock<Option<SeedResolver>>,
+    /// The lookup of a -seednode name in place of the system resolver, when set
+    name_resolver: RwLock<Option<SeedResolver>>,
     /// The tasks this manager spawns (listeners, dials, connections, the seed
     /// lookup), so a stop can wait for them as Divi Core's join_all waits for
     /// its net threads (divid.cpp:42-53); and the names of those running
@@ -310,6 +312,7 @@ impl PeerManager {
             shutdown_tx,
             stopping: AtomicBool::new(false),
             seed_resolver: RwLock::new(None),
+            name_resolver: RwLock::new(None),
             tasks: tokio_util::task::TaskTracker::new(),
             running: Default::default(),
             next_task: AtomicU64::new(0),
@@ -477,10 +480,16 @@ impl PeerManager {
             format!("{}:{}", dest, self.config.default_port)
         };
         // Raced against the stop, as the seed lookup
-        self.until_stop(tokio::net::lookup_host(with_port))
-            .await?
-            .ok()?
-            .next()
+        let resolver = self.name_resolver.read().clone();
+        let lookup = async {
+            match resolver {
+                Some(resolve) => resolve(with_port).await,
+                None => tokio::net::lookup_host(with_port)
+                    .await
+                    .map(|a| a.collect()),
+            }
+        };
+        self.until_stop(lookup).await?.ok()?.into_iter().next()
     }
 
     /// The network magic of this peer manager's network
@@ -1727,6 +1736,12 @@ impl PeerManager {
     /// test controls what a seed gives and when
     pub fn set_seed_resolver(&self, resolver: SeedResolver) {
         *self.seed_resolver.write() = Some(resolver);
+    }
+
+    /// Look -seednode names up with `resolver` instead of the system
+    /// resolver, so a test controls what a name gives and when
+    pub fn set_name_resolver(&self, resolver: SeedResolver) {
+        *self.name_resolver.write() = Some(resolver);
     }
 
     /// Whether the node has begun to stop (see [`Self::stop_network`])
