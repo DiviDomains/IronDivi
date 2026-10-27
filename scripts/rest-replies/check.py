@@ -127,6 +127,10 @@ class Node:
                          headers={"Connection": "close"})
             r = conn.getresponse()
             return (r.status, r.getheader("Content-Type", ""), r.read())
+        except (http.client.RemoteDisconnected, ConnectionResetError, BrokenPipeError):
+            # closed without a reply: divid resets the connection when it closes it
+            # with the request's headers unread, a server that read them does not
+            return (0, "", b"no reply: connection closed")
         except (http.client.HTTPException, OSError) as e:
             return (0, "", f"no reply: {type(e).__name__}".encode())
         finally:
@@ -311,6 +315,12 @@ def rows(p):
     compare(f"{p}block notxdetails genesis .json", f"/rest/block/notxdetails/{genesis}.json")
     compare(f"{p}tx uppercase hash .json", f"/rest/tx/{confirmed.upper()}.json")
     compare(f"{p}tx by POST .json", f"/rest/tx/{confirmed}.json", "POST")
+    # any other method closes the connection without a reply, REST or not
+    # (rpcprotocol.cpp:150-152, rpcserver.cpp:1009-1010)
+    for m in ("PUT", "HEAD", "DELETE", "OPTIONS", "PATCH"):
+        compare(f"{p}tx by {m} .json", f"/rest/tx/{confirmed}.json", m)
+    compare(f"{p}block by PUT .hex", f"/rest/block/{tip}.hex", "PUT")
+    compare(f"{p}tx bad hash by PUT", "/rest/tx/xyz.json", "PUT")
     # errors, in divid's order: hash, then lookup, then format
     compare(f"{p}tx bad hash", "/rest/tx/xyz.json")
     compare(f"{p}tx short hash", f"/rest/tx/{confirmed[:63]}.json")
@@ -354,6 +364,8 @@ compare("rest=0: block tip .hex", f"/rest/block/{tip}.hex")
 compare("rest=0: block notxdetails tip .bin", f"/rest/block/notxdetails/{tip}.bin")
 compare("rest=0: tx unknown txid", f"/rest/tx/{unknown}.json")
 compare("rest=0: not a rest path", "/foo")
+compare("rest=0: tx by PUT .json", f"/rest/tx/{confirmed}.json", "PUT")
+compare("rest=0: tx by HEAD .json", f"/rest/tx/{confirmed}.json", "HEAD")
 
 for n in (C, I):
     n.stop()
