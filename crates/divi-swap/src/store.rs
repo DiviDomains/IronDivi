@@ -92,6 +92,11 @@ pub struct MakerRecord {
     /// the watcher stops re-sending and keeps reporting one error. Absent in older records.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub maker_lock_dropped: bool,
+    /// Set once the maker-leg funding was sent (a broadcast returned Ok) or the node reported
+    /// it: those bytes can still be mined, so a refusal by the reservation table no longer
+    /// re-selects coins. Absent in older records (read as unsent, as before).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub maker_lock_sent: bool,
     /// Fee history of `taker_leg_claim` (keys at the top level, as in [`TakerRecord`]).
     /// Absent in older records.
     #[serde(flatten)]
@@ -222,6 +227,7 @@ impl std::fmt::Debug for MakerRecord {
             taker_leg_claim,
             last_error,
             maker_lock_dropped,
+            maker_lock_sent,
             claim_fees,
         } = self;
         f.debug_struct("MakerRecord")
@@ -243,6 +249,7 @@ impl std::fmt::Debug for MakerRecord {
             .field("taker_leg_claim", taker_leg_claim)
             .field("last_error", last_error)
             .field("maker_lock_dropped", maker_lock_dropped)
+            .field("maker_lock_sent", maker_lock_sent)
             .field("claim_fees", claim_fees)
             .finish()
     }
@@ -733,6 +740,7 @@ mod tests {
             taker_leg_claim: None,
             last_error: None,
             maker_lock_dropped: false,
+            maker_lock_sent: false,
             claim_fees: Default::default(),
         }
     }
