@@ -110,6 +110,12 @@ impl Wallet {
     }
 
     fn persist(&mut self) -> Result<(), SwapError> {
+        self.persist_with(WRITE_TIMEOUT, |tmp, bytes| std::fs::write(tmp, bytes))
+    }
+
+    /// [`Self::persist`] with the temporary file written by `writer` (a test seam) under
+    /// `bound`.
+    fn persist_with(&mut self, _bound: Duration, writer: TempWriter) -> Result<(), SwapError> {
         self.refresh();
         static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let Some(p) = &self.path else { return Ok(()) };
@@ -119,7 +125,7 @@ impl Wallet {
         let tmp = temp_path(p, std::process::id(), n);
         let text = serde_json::to_string_pretty(self)
             .map_err(|e| SwapError::Storage(format!("serialize wallet: {e}")))?;
-        std::fs::write(&tmp, text)
+        writer(&tmp, text.as_bytes())
             .and_then(|_| std::fs::rename(&tmp, p))
             .map_err(|e| {
                 // Ours alone (our pid and counter); it may not exist if the write failed early.
@@ -298,6 +304,12 @@ impl Wallet {
 /// A dead writer's temporary file is removed only once its mtime is at least this old. A
 /// write takes milliseconds; ten minutes leaves room for a slow disk or a paused container.
 const STALE_TEMP_FILE_AGE: Duration = Duration::from_secs(10 * 60);
+
+/// How long the temporary file write of [`Wallet::persist`] may take.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Writes a wallet's temporary file.
+type TempWriter = fn(&Path, &[u8]) -> std::io::Result<()>;
 
 /// Whether a file modified at `mtime` is old enough to be swept at `now`. An mtime in the
 /// future is not.
@@ -693,5 +705,141 @@ mod temp_file_tests {
         assert!(is_stale(ago(600), now));
         assert!(is_stale(ago(86_400), now));
         assert!(!is_stale(now + Duration::from_secs(3600), now));
+    }
+}
+
+#[cfg(test)]
+mod stalled_write_tests {
+    use super::*;
+    use std::sync::{Barrier, LazyLock};
+
+    fn coin(n: u8, value: u64) -> Utxo {
+        Utxo {
+            outpoint: Outpoint {
+                txid: Txid([n; 32]),
+                vout: 0,
+            },
+            value,
+        }
+    }
+
+    fn names(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// Run `f` on its own thread; a call that has not returned within 5 s fails the test
+    /// instead of hanging it.
+    fn within_5s<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("persist did not return within 5 s")
+    }
+
+    /// A write step that writes half the bytes and then never returns.
+    fn hangs(tmp: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        std::fs::write(tmp, &bytes[..bytes.len() / 2])?;
+        loop {
+            std::thread::park();
+        }
+    }
+
+    const TEST_BOUND: Duration = Duration::from_millis(200);
+
+    #[test]
+    fn a_write_that_never_returns_times_out_and_leaves_the_wallet_file_byte_identical() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("w.json");
+        let mut w = Wallet::open(Some(path.clone())).unwrap();
+        w.record_broadcast(&[], &[coin(1, 10)]).unwrap();
+        let before: Vec<u8> = std::fs::read(&path).unwrap();
+        let started = std::time::Instant::now();
+        let res = within_5s(move || {
+            w.add(coin(2, 20));
+            w.persist_with(TEST_BOUND, hangs)
+        });
+        let took = started.elapsed();
+        let Err(SwapError::Storage(msg)) = res else {
+            panic!("expected a Storage error, got {res:?}");
+        };
+        assert!(msg.contains(&path.display().to_string()), "{msg}");
+        assert!(msg.contains("200ms"), "{msg}");
+        assert!(took < Duration::from_secs(2), "{took:?}");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "wallet file unchanged"
+        );
+        // The half-written temporary file is gone: nothing is left to rename over it.
+        assert_eq!(names(dir.path()), vec!["w.json".to_string()]);
+    }
+
+    static RELEASE: LazyLock<Barrier> = LazyLock::new(|| Barrier::new(2));
+
+    /// A write step that waits until the test releases it, then writes its (by then stale)
+    /// bytes in full and returns.
+    fn released_late(tmp: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        RELEASE.wait();
+        std::fs::write(tmp, bytes)
+    }
+
+    #[test]
+    fn a_write_released_after_the_timeout_never_lands_over_a_newer_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("w.json");
+        Wallet::open(Some(path.clone()))
+            .unwrap()
+            .record_broadcast(&[], &[coin(1, 10)])
+            .unwrap();
+        let mut stale = Wallet::open(Some(path.clone())).unwrap();
+        let res = within_5s(move || {
+            stale.add(coin(9, 90));
+            stale.persist_with(TEST_BOUND, released_late)
+        });
+        assert!(matches!(res, Err(SwapError::Storage(_))), "{res:?}");
+        // A newer write succeeds meanwhile.
+        let mut newer = Wallet::open(Some(path.clone())).unwrap();
+        newer.record_broadcast(&[], &[coin(2, 20)]).unwrap();
+        let newer_bytes = std::fs::read(&path).unwrap();
+        // The stalled writer now finishes its temporary file.
+        RELEASE.wait();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while names(dir.path()) != ["w.json"] && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(names(dir.path()), vec!["w.json".to_string()]);
+        assert_eq!(std::fs::read(&path).unwrap(), newer_bytes);
+        assert_eq!(
+            Wallet::open(Some(path)).unwrap().available(),
+            vec![coin(1, 10), coin(2, 20)]
+        );
+    }
+
+    #[test]
+    fn a_fast_write_is_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("w.json");
+        let mut w = Wallet::open(Some(path.clone())).unwrap();
+        w.record_broadcast(&[], &[coin(1, 10)]).unwrap();
+        w.scanned_height = Some(7);
+        w.persist().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            serde_json::to_string_pretty(&w).unwrap()
+        );
+        assert_eq!(names(dir.path()), vec!["w.json".to_string()]);
+    }
+
+    #[test]
+    fn the_write_bound_is_a_minute_well_under_the_sweep_age() {
+        assert_eq!(WRITE_TIMEOUT, Duration::from_secs(60));
+        assert!(WRITE_TIMEOUT * 10 <= STALE_TEMP_FILE_AGE);
     }
 }
