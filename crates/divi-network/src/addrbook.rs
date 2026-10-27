@@ -838,19 +838,21 @@ impl AddressBook {
             .count()
     }
 
-    /// Addresses a DNS seed gave, from 3 to 7 days ago as divid dates them
-    /// (net.cpp ThreadDNSAddressSeed), the seed's first address as their source
+    /// Addresses a DNS seed gave, from 3 to 7 days ago on the node's clock
+    /// (GetTime, not the adjusted one) as divid dates them (net.cpp:1046),
+    /// the seed's first address as their source
     pub fn add_seeds(&self, addrs: &[SocketAddr]) {
         let Some(source) = addrs.first() else {
             return;
         };
         let now = self.now();
+        let today = self.clock.time();
         let mut rng = rand::thread_rng();
         let dated: Vec<(u32, NetAddr)> = addrs
             .iter()
             .map(|a| {
                 let ago = 3 * 24 * 60 * 60 + rng.gen_range(0..4 * 24 * 60 * 60);
-                ((now - ago).max(0) as u32, to_net(a, 1))
+                ((today - ago).max(0) as u32, to_net(a, 1))
             })
             .collect();
         self.add_at(&dated, source.ip(), 0, now);
