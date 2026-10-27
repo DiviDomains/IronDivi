@@ -25,6 +25,15 @@ if conf.get("fail") == "other":
 if conf.get("fail") == "option":
     print("Error: unknown option", file=sys.stderr)
     sys.exit(1)
+if conf.get("rpc") == "partial":
+    # divid with no -rpcbind: the IPv4 RPC port taken, it logs it and runs on
+    r = socket.socket()
+    try:
+        r.bind((conf["bind"], int(conf["rpcport"])))
+        r.listen()
+    except OSError:
+        print("ERROR: Binding RPC on address %s port %s failed: bind: Address already in use"
+              % (conf["bind"], conf["rpcport"]), flush=True)
 s = socket.socket()
 try:
     s.bind((conf["bind"], int(conf["port"])))
@@ -127,6 +136,22 @@ class NodePorts(unittest.TestCase):
         self.assertNotEqual(a.p2p, taken)
         self.assertIn(f"connect={HOST}:{a.p2p}\n", b.conf_text())
         self.assertTrue(os.path.exists(os.path.join(a.dir, "up")))
+
+    def test_a_node_running_on_with_its_rpc_port_taken_is_started_again(self):
+        held = self.hold()
+        a = Fake(self.work, "a", node_ports.free_port(HOST), ["rpc=partial"])
+        a.rpcport = held
+        with open(a.conf, "a") as f:
+            f.write(f"rpcport={held}\n")  # the later line is the one the fake reads
+        proc = a.start(self.work)
+        self.procs.append(proc)
+        end = time.time() + 20
+        while time.time() < end and a.rpcport == held:
+            proc.poll()
+            time.sleep(0.05)
+        self.assertNotEqual(a.rpcport, held)
+        self.assertIsNone(proc.poll())
+        self.assertNotIn(f"rpcport={held}\n", a.conf_text())
 
     def test_a_node_that_ends_for_another_reason_is_not_started_again(self):
         a = Fake(self.work, "a", self.hold(), ["fail=option"])

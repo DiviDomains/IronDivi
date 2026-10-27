@@ -491,7 +491,8 @@ def dedupe(log):
 
 # --- the cases --------------------------------------------------------------------------
 
-need = [PORT_BASE + k for k in (0, 1, 2, 3, 10, 11, 12, 13, 14, 15, 16, 17, 49)]
+# the stand-ins' ports; the nodes' own (PORT_BASE .. +3) move when taken (scripts/lib/node_ports.py)
+need = [PORT_BASE + k for k in (10, 11, 12, 13, 14, 15, 16, 17, 49)]
 busy = [p for p in need if not port_free(p)]
 if busy:
     print(f"FAIL   setup: ports in use on {HOST}: {busy}; choose another port base", flush=True)

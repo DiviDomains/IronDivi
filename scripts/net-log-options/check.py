@@ -102,9 +102,9 @@ class Node:
             f.write("\n".join(lines) + "\n")
         if prepare:
             prepare(self)
-        for p in (self.p2p, self.rpcport):
-            if not wait_for(lambda: port_free(p), 60, 0.5):
-                raise RuntimeError(f"port {p} still taken")
+        # the previous node's ports, a moment after it stopped; one another process holds is node_ports' to move
+        for p in (node_ports.now(self.p2p), node_ports.now(self.rpcport)):
+            wait_for(lambda: port_free(p), 60, 0.5)
         self.out = open(os.path.join(WORK, f"{kind}-{Node.runs}.out"), "ab")
         self.proc = node_ports.popen(self, [self.binary, f"-datadir={self.dir}"] + list(args), cwd=self.dir,
                                      stdout=self.out, stderr=subprocess.STDOUT, start_new_session=True, work=WORK)

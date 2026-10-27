@@ -30,6 +30,7 @@ BIND_RETRIES = 5
 BIND_MESSAGES = ("Address already in use", "Unable to bind")
 
 PEER_WAIT = 90  # seconds a start waits for the node whose port it names to listen
+EARLY = 60  # seconds after a start in which a node still running is looked at for a bind failure (below)
 
 moved = {}  # port a node was moved from -> the port it has now
 _lock = threading.Lock()
@@ -254,6 +255,7 @@ class Proc:
                 kw[key] = open(f.name, "w")
                 reopened.append(kw[key])
         self._offsets = {p: _size(p) for p in self._logs()}
+        self._started = time.time()
         try:
             self._proc = subprocess.Popen(self._argv, **kw)
         finally:
@@ -264,6 +266,23 @@ class Proc:
         return "\n".join(_read_from(p, self._offsets.get(p, 0)) for p in self._logs())
 
     # -- the retry ----------------------------------------------------------------------------------------------
+
+    def _taken_while_running(self):
+        """divid with no -rpcbind binds RPC on ::1 and 127.0.0.1; when only the IPv4 port is taken it logs
+        "Binding RPC on address 127.0.0.1 port <rpcport> failed: bind: Address already in use" and runs on with
+        RPC the scripts cannot reach. Such a node (the message naming its own port, in its first EARLY seconds)
+        is stopped and started again like one that exited"""
+        if not self._left or not self._datadir or time.time() - self._started > EARLY:
+            return False
+        if not bind_failure(self._node, self._ended()):
+            return False
+        self._proc.terminate()
+        try:
+            self._proc.wait(30)
+        except subprocess.TimeoutExpired:
+            self._proc.kill()
+            self._proc.wait()
+        return self._again()
 
     def _again(self):
         """Start the node again on new ports if it ended because one was taken; True when it was"""
@@ -285,7 +304,11 @@ class Proc:
     def poll(self):
         while True:
             code = self._proc.poll()
-            if code is None or not self._again():
+            if code is None:
+                if self._taken_while_running():
+                    continue
+                return None
+            if not self._again():
                 return code
 
     def wait(self, timeout=None):

@@ -28,7 +28,10 @@ sequences with divid's, since each node's sync takes its steps at its own moment
 (in the output files it was given or the datadir's `debug.log`, new lines only) naming the node's own P2P or RPC port,
 the node gets two ports the system picked (`node.p2p` and `node.rpcport` are set, the `port=` and `rpcport=` lines of
 its `divi.conf` follow, a `ports_moved()` method of the node is called if it has one) and is started again, at most
-`BIND_RETRIES` (5) times. Any other exit, a bind failure naming another port (a `-bind` or `-whitebind` the script
+`BIND_RETRIES` (5) times. divid with no `rpcbind` binds RPC on ::1 and 127.0.0.1 and, when only the IPv4
+port is taken, logs `Binding RPC on address 127.0.0.1 port <rpcport> failed: bind: Address already in use` and runs
+on with RPC the scripts cannot reach: a node still running with that line about its own port in its first 60 s
+(`EARLY`) is stopped and started again the same way (seen by `poll()`). Any other exit, a bind failure naming another port (a `-bind` or `-whitebind` the script
 chose) and a failure after the last retry are what an unwrapped start gives, and the process's `poll()` and `wait()`
 report them. A node that names the moved node's port (`connect=127.0.0.2:55500` in its `divi.conf` or arguments,
 whether it is written before or after the move, and again when it is started later) is given the new one when it
