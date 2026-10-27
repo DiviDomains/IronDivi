@@ -1820,9 +1820,24 @@ impl WalletDb {
         // Held until the key is stored, so a concurrent lock() cannot strip it first
         let locked = self.locked.read();
         let _keys = self.key_lock.lock();
+        // Its keypool lines are logged once its keys are written
+        self.keystore.hold_pool_lines();
+        let address = self.take_address(*locked, is_change, keep_later);
+        self.keystore.release_pool_lines(address.is_ok());
+        address
+    }
+
+    /// [`Self::new_address`]'s work, with the wallet's locks held
+    fn take_address(
+        &self,
+        locked: bool,
+        is_change: bool,
+        keep_later: bool,
+    ) -> Result<Address, WalletError> {
         let mut store = Vec::new();
         let indices = self.keystore.get_indices();
-        let addr = if *locked {
+        let pool = self.keystore.pool_state();
+        let addr = if locked {
             if keep_later {
                 self.keystore.reserve_from_keypool()?
             } else {
@@ -1861,6 +1876,7 @@ impl WalletDb {
             Err(e) => {
                 self.keystore.remove_keys(&added);
                 self.keystore.set_indices(indices.0, indices.1);
+                self.keystore.restore_pool_state(pool);
                 Err(e)
             }
             Ok(()) => Ok(addr),
@@ -1885,9 +1901,14 @@ impl WalletDb {
 
     /// A send that needs no change: Divi Core tops the keypool up, reserves a
     /// change key and returns it (wallet.cpp:2122-2176), with its log lines.
+    /// A top-up whose keys cannot be written throws before the reservation
+    /// (wallet.cpp:2104-2106, :2129-2130), so it logs neither line; a locked
+    /// wallet's top-up does nothing and the reservation goes on
     pub fn reserve_and_return_change(&self) -> Result<u32, WalletError> {
         let added = self.top_up_keypool();
-        self.keystore.reserve_and_return_change();
+        if !matches!(added, Err(WalletError::Storage(_))) {
+            self.keystore.reserve_and_return_change();
+        }
         added
     }
 
@@ -2696,6 +2717,18 @@ impl WalletDb {
         timeout_secs: u32,
         staking_only: bool,
     ) -> Result<(), WalletError> {
+        self.unlock_with(passphrase, timeout_secs, staking_only, true)
+    }
+
+    /// [`Self::unlock_for`], topping the keypool up once the keys are in
+    /// when `top_up`; a top-up that cannot be written leaves the wallet unlocked
+    fn unlock_with(
+        &self,
+        passphrase: &str,
+        timeout_secs: u32,
+        staking_only: bool,
+        top_up: bool,
+    ) -> Result<(), WalletError> {
         if !*self.encrypted.read() {
             // Not encrypted, nothing to unlock
             *self.locked.write() = false;
@@ -2820,7 +2853,10 @@ impl WalletDb {
             }
         }
 
-        self.top_up_keypool_after_unlock();
+        if top_up {
+            // Its write error is walletpassphrase's to answer (unlock_keeping_timer)
+            let _ = self.top_up_keypool_after_unlock();
+        }
 
         // Set unlock expiration time
         let expiration = if timeout_secs > 0 {
@@ -2963,8 +2999,7 @@ impl WalletDb {
             self.unlock.write().staking_only = staking_only;
             // walletpassphrase tops the keypool up after any unlock that
             // succeeds, this one too (rpcwallet.cpp:2617-2620)
-            self.top_up_keypool_after_unlock();
-            return Ok(());
+            return self.top_up_keypool_after_unlock();
         }
         let mut before = *self.unlock.read();
         if before.until.is_some_and(|t| Instant::now() >= t) {
@@ -2972,27 +3007,46 @@ impl WalletDb {
             // unlocked_until (revertWalletUnlockStatus, rpcserver.cpp:1160-1174)
             before = UnlockState::default();
         }
-        self.unlock_for(passphrase, 0, staking_only)?;
+        self.unlock_with(passphrase, 0, staking_only, false)?;
         let mut state = self.unlock.write();
         state.until = before.until;
         state.revert_to_staking = before.revert_to_staking;
         state.unlock_time = before.unlock_time;
-        Ok(())
+        drop(state);
+        // walletpassphrase tops the keypool up once the wallet is unlocked; a
+        // key it cannot write throws there, so the call fails with the wallet
+        // unlocked and its timer not set (rpcwallet.cpp:2617-2620)
+        self.top_up_keypool_after_unlock()
     }
 
     /// As Divi Core's walletpassphrase: top the keypool up while the seed is
-    /// here, so getnewaddress keeps working after the wallet is locked again
-    fn top_up_keypool_after_unlock(&self) {
+    /// here, so getnewaddress keeps working after the wallet is locked again.
+    /// Fails only when the new keys cannot be written
+    fn top_up_keypool_after_unlock(&self) -> Result<(), WalletError> {
         let _keys = self.key_lock.lock();
-        match self.keystore.top_up_keypool(None) {
-            Ok(added) if !added.is_empty() => {
-                if let Err(e) = self.persist_keys(&added) {
+        self.keystore.hold_pool_lines();
+        let pool = self.keystore.pool_state();
+        let written = match self.keystore.top_up_keypool(None) {
+            Ok(added) if !added.is_empty() => match self.persist_keys(&added) {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    // Keys that cannot be written do not join the pool, as
+                    // Divi Core's derivation throws before they do
+                    // (wallet.cpp:2357-2360)
                     warn!("Failed to store keypool keys: {}", e);
+                    self.keystore.remove_keys(&added);
+                    self.keystore.restore_pool_state(pool);
+                    Err(e)
                 }
+            },
+            Ok(_) => Ok(()),
+            Err(e) => {
+                debug!("Keypool not topped up on unlock: {}", e);
+                Ok(())
             }
-            Ok(_) => {}
-            Err(e) => debug!("Keypool not topped up on unlock: {}", e),
-        }
+        };
+        self.keystore.release_pool_lines(written.is_ok());
+        written
     }
 
     /// Lock the wallet as a failed walletpassphrasechange does (Lock() before
@@ -3029,6 +3083,16 @@ impl WalletDb {
     /// private key are re-written encrypted under the master key, the plaintext
     /// copies are deleted and compacted away, and the wallet is left locked.
     pub fn encrypt_wallet(&self, passphrase: &str) -> Result<(), WalletError> {
+        // The lines of the keys its top-up adds are logged once they are
+        // written with the rest of the encrypted wallet
+        self.keystore.hold_pool_lines();
+        let encrypted = self.encrypt_and_store(passphrase);
+        self.keystore.release_pool_lines(encrypted.is_ok());
+        encrypted
+    }
+
+    /// [`Self::encrypt_wallet`]'s work
+    fn encrypt_and_store(&self, passphrase: &str) -> Result<(), WalletError> {
         use rand::RngCore;
 
         let mut encrypted = self.encrypted.write();
@@ -3059,9 +3123,11 @@ impl WalletDb {
 
         // Fill the keypool while the seed is still in the clear: the pool keys go
         // into the batch below, and a locked wallet hands out only pool keys
-        if let Err(e) = self.keystore.top_up_keypool(None) {
+        let pool = self.keystore.pool_state();
+        let topped = self.keystore.top_up_keypool(None).unwrap_or_else(|e| {
             debug!("Keypool not topped up before encryption: {}", e);
-        }
+            Vec::new()
+        });
 
         // One atomic batch: either the wallet becomes encrypted or nothing changes.
         let mut batch = db.create_batch();
@@ -3129,7 +3195,14 @@ impl WalletDb {
         batch.put_cf(db.cf_metadata(), b"encryption_salt", &salt);
         batch.put_cf(db.cf_metadata(), b"encrypted_master_key", &sealed_master);
         batch.put_cf(db.cf_metadata(), b"encrypted", [1u8]);
-        db.write_batch(batch)?;
+        if let Err(e) = db.write_batch(batch) {
+            // The pool keys of the top-up were not written: Divi Core's
+            // derivation throws before a key it cannot write joins the pool
+            // (wallet.cpp:1011-1015, :2357-2360)
+            self.keystore.remove_keys(&topped);
+            self.keystore.restore_pool_state(pool);
+            return Err(e);
+        }
         db.flush()?;
         // Overwritten plaintext can survive in old SST files until compaction
         db.compact_secret_cfs();
@@ -3271,6 +3344,15 @@ impl WalletDb {
     pub fn refill_keypool(&self, new_size: Option<u32>) -> Result<u32, WalletError> {
         let _locked = self.locked.read();
         let _keys = self.key_lock.lock();
+        self.keystore.hold_pool_lines();
+        let added = self.store_new_pool_keys(new_size);
+        self.keystore.release_pool_lines(added.is_ok());
+        added
+    }
+
+    /// Top the keypool up to `new_size` and write the new keys
+    fn store_new_pool_keys(&self, new_size: Option<u32>) -> Result<u32, WalletError> {
+        let pool = self.keystore.pool_state();
         let added = self.keystore.top_up_keypool(new_size)?;
         if !added.is_empty() {
             self.dirty.write().keys = true;
@@ -3278,6 +3360,7 @@ impl WalletDb {
             // derivation throws before they do (wallet.cpp:2339-2347)
             if let Err(e) = self.persist_keys(&added) {
                 self.keystore.remove_keys(&added);
+                self.keystore.restore_pool_state(pool);
                 return Err(e);
             }
         }

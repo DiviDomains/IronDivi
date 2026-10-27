@@ -390,3 +390,198 @@ fn a_send_that_cannot_be_signed_while_writes_fail_leaves_the_key_pool_as_it_was(
         "the next keys after a restart"
     );
 }
+
+/// The log lines written while `f` runs on this thread. One global subscriber
+/// writes each thread's lines to that thread's buffer (as wallet_sends.rs)
+fn logged<T>(f: impl FnOnce() -> T) -> (T, String) {
+    thread_local! {
+        static LINES: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    struct ThreadLines;
+    impl std::io::Write for ThreadLines {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            LINES.with(|lines| lines.borrow_mut().extend_from_slice(data));
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(|| ThreadLines)
+            .init();
+    });
+    LINES.with(|lines| lines.borrow_mut().clear());
+    let out = f();
+    let text =
+        LINES.with(|lines| String::from_utf8(std::mem::take(&mut *lines.borrow_mut())).unwrap());
+    (out, text)
+}
+
+/// A wallet with a keypool of 2 a chain, one receiving key short, as each
+/// getnewaddress leaves it: its next top-up must write a key
+fn one_key_short(net: &Net) -> WalletRpc {
+    net.wallet.keystore().set_keypool_target(2);
+    let rpc = net.rpc();
+    rpc.keypool_refill(&p(vec![])).unwrap();
+    rpc.get_new_address(&p(vec![])).unwrap();
+    rpc
+}
+
+/// Divi Core's derivation throws before a key it cannot write joins the pool,
+/// so a getnewaddress, keypoolrefill or send whose top-up cannot write logs no
+/// "keypool added", nor a reservation (wallet.cpp:2104-2112, :2339-2347)
+#[test]
+fn a_key_that_cannot_be_written_logs_no_keypool_line() {
+    let _limit = LIMIT.lock();
+    let net = Net::new();
+    let rpc = one_key_short(&net);
+    // Its key comes from the pool, which its top-up leaves one short again
+    net.fund();
+    writes_fail();
+    let (address, address_log) = logged(|| rpc.get_new_address(&p(vec![])));
+    let (refill, refill_log) = logged(|| rpc.keypool_refill(&p(vec![json!(3)])));
+    let (sent, send_log) =
+        logged(|| rpc.send_to_address(&p(vec![json!(dest().to_string()), json!(1)])));
+    writes_work();
+    assert!(address.is_err() && refill.is_err() && sent.is_err());
+    for log in [address_log, refill_log, send_log] {
+        assert!(!log.contains("keypool"), "{log}");
+    }
+}
+
+/// After a top-up that could not write its keys, the pool's numbers are as
+/// Divi Core leaves them, which never added a key nor took one: the next key
+/// is numbered one past the newest in the pool, and the oldest receiving key
+/// is the one reserved (wallet.cpp:2093-2112, :2154)
+#[test]
+fn a_key_that_cannot_be_written_leaves_the_pool_numbers_as_they_were() {
+    let _limit = LIMIT.lock();
+    let net = Net::new();
+    let rpc = one_key_short(&net);
+    let numbers = net.wallet.keystore().pool_numbers();
+    writes_fail();
+    assert!(rpc.get_new_address(&p(vec![])).is_err());
+    assert!(rpc.keypool_refill(&p(vec![json!(3)])).is_err());
+    writes_work();
+    assert_eq!(net.wallet.keystore().pool_numbers(), numbers);
+
+    let newest = numbers.iter().map(|n| n.2).max().unwrap();
+    let oldest = numbers.iter().filter(|n| !n.0).map(|n| n.2).min().unwrap();
+    let (_, log) = logged(|| rpc.get_new_address(&p(vec![])).unwrap());
+    assert!(
+        log.contains(&format!("keypool added key {}, ", newest + 1)),
+        "{log}"
+    );
+    assert!(
+        log.contains(&format!("keypool reserve {oldest}\n")),
+        "{log}"
+    );
+}
+
+/// A send that needs no change reserves a change key and returns it after its
+/// top-up; a top-up that cannot write throws first (wallet.cpp:2104-2106,
+/// :2129-2130), so the send logs no reservation nor return
+#[test]
+fn a_send_without_change_whose_top_up_cannot_be_written_logs_no_reservation() {
+    let _limit = LIMIT.lock();
+    let net = Net::new();
+    let rpc = one_key_short(&net);
+    // Its key comes from the pool, which its top-up leaves one short again
+    net.fund();
+    writes_fail();
+    let (sent, log) = logged(|| {
+        rpc.send_to_address(&p(vec![
+            json!(dest().to_string()),
+            json!(1),
+            json!("sweep_funds"),
+        ]))
+    });
+    writes_work();
+    assert_eq!(
+        rpc_error(sent),
+        (-1, "loadHDChain: WriteHDChain failed".to_string())
+    );
+    assert!(!log.contains("keypool"), "{log}");
+}
+
+/// encryptwallet and walletpassphrase top the keypool up (wallet.cpp:1011-1015,
+/// rpcwallet.cpp:2617-2620); a key they cannot write throws before it joins the
+/// pool (wallet.cpp:2357-2360), so the pool is as it was
+#[test]
+fn encryption_and_unlock_top_ups_that_cannot_be_written_leave_the_pool_as_it_was() {
+    let _limit = LIMIT.lock();
+    let net = Net::new();
+    let rpc = one_key_short(&net);
+    let pool = net.wallet.keypool_size();
+    writes_fail();
+    assert!(rpc
+        .encrypt_wallet(&p(vec![json!("throwaway-pass")]))
+        .is_err());
+    writes_work();
+    assert_eq!(net.wallet.keypool_size(), pool, "after encryptwallet");
+
+    rpc.encrypt_wallet(&p(vec![json!("throwaway-pass")]))
+        .unwrap();
+    // A locked getnewaddress takes a pool key and does not top up
+    rpc.get_new_address(&p(vec![])).unwrap();
+    let pool = net.wallet.keypool_size();
+    writes_fail();
+    let _ = rpc.wallet_passphrase(&p(vec![json!("throwaway-pass"), json!(60)]));
+    writes_work();
+    assert_eq!(net.wallet.keypool_size(), pool, "after walletpassphrase");
+}
+
+/// On an encrypted wallet Divi Core's derivation writes the encrypted chain,
+/// and a key it cannot write answers with that write's text
+/// (wallet.cpp:503-506, :2359-2360)
+#[test]
+fn a_key_that_cannot_be_written_on_an_encrypted_wallet_names_the_encrypted_chain() {
+    let _limit = LIMIT.lock();
+    let net = Net::new();
+    let rpc = one_key_short(&net);
+    rpc.encrypt_wallet(&p(vec![json!("throwaway-pass")]))
+        .unwrap();
+    rpc.wallet_passphrase(&p(vec![json!("throwaway-pass"), json!(60)]))
+        .unwrap();
+    rpc.get_new_address(&p(vec![])).unwrap();
+    writes_fail();
+    let address = rpc.get_new_address(&p(vec![]));
+    writes_work();
+    assert_eq!(
+        rpc_error(address),
+        (
+            -1,
+            "loadCryptedHDChain: WriteCryptedHDChain failed".to_string()
+        )
+    );
+}
+
+/// walletpassphrase unlocks, then tops the keypool up; a key it cannot write
+/// throws there, so the call answers with that write's text, the wallet stays
+/// unlocked and no timer is set (rpcwallet.cpp:2617-2627, wallet.cpp:2359-2360)
+#[test]
+fn walletpassphrase_whose_top_up_cannot_be_written_answers_as_divid() {
+    let _limit = LIMIT.lock();
+    let net = Net::new();
+    let rpc = one_key_short(&net);
+    rpc.encrypt_wallet(&p(vec![json!("throwaway-pass")]))
+        .unwrap();
+    rpc.get_new_address(&p(vec![])).unwrap();
+    writes_fail();
+    let reply = rpc.wallet_passphrase(&p(vec![json!("throwaway-pass"), json!(60)]));
+    writes_work();
+    assert_eq!(
+        rpc_error(reply),
+        (
+            -1,
+            "loadCryptedHDChain: WriteCryptedHDChain failed".to_string()
+        )
+    );
+    let info = rpc.get_wallet_info(&p(vec![])).unwrap();
+    assert_eq!(info["encryption_status"], "unlocked");
+    assert_eq!(info["unlocked_until"], 0);
+}
