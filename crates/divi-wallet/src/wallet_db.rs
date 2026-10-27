@@ -6418,6 +6418,95 @@ mod tests {
             assert_eq!(wallet.get_balance().as_sat(), CHANGE);
         }
 
+        /// A peer's block moves the chain to a branch that mines `fund` again
+        /// but not `send`. The wallet rolls back first, the mempool takes
+        /// `send` back, and only then is the new branch scanned (sync.rs
+        /// fire_reorg_callbacks, then the block-connected callback), so `send`
+        /// came before the coin it spends was back. Divi Core counts that
+        /// coin spent by `send` in the mempool (SpentOutputTracker::IsSpent),
+        /// so what is left is the change, unconfirmed and trusted.
+        #[test]
+        fn coin_back_after_its_mempool_spend_stays_spent() {
+            let wallet = create_test_wallet();
+            let (fund, send) = fixture(&wallet);
+            scan(&wallet, 2, std::slice::from_ref(&fund));
+            scan(&wallet, 3, std::slice::from_ref(&send));
+
+            wallet.handle_reorg(1);
+            wallet.add_mempool_tx(&send);
+            let new_branch = |h: u32| {
+                let mut block = divi_primitives::block::Block::default();
+                if h == 2 {
+                    block.transactions = vec![fund.clone()];
+                }
+                Some((block_hash(h, 1), block))
+            };
+            wallet.sync_to_tip(3, |h| Some(block_hash(h, 1)), new_branch);
+
+            assert_eq!(
+                outpoints(&wallet),
+                HashSet::from([OutPoint::new(send.txid(), 1)])
+            );
+            assert_eq!(wallet.get_balance().as_sat(), 0);
+            assert_eq!(wallet.get_confirmed_balance(3, 0).as_sat(), CHANGE);
+            assert_eq!(wallet.get_confirmed_balance(3, 1).as_sat(), CHANGE);
+            assert_eq!(wallet.get_unconfirmed_balance().as_sat(), CHANGE);
+            // Divi Core still holds `fund`, so `send` is its send of 30
+            let record = wallet.get_transaction(&send.txid()).unwrap();
+            assert_eq!(record.category, "send");
+            assert_eq!(record.amount, -(30 * COIN + 1_000_000));
+            assert_eq!(record.fee.map(|f| f.as_sat()), Some(1_000_000));
+        }
+
+        /// `invalidateblock` of the block that confirmed `send`: the rollback
+        /// takes `send`'s record out, then puts back the coin it spent. A
+        /// mempool add of `send` that lands between the two (it is not under
+        /// the scan lock) finds the coin in neither place. The coin is still
+        /// spent by `send` once it is back, as in Divi Core.
+        #[test]
+        fn coin_put_back_by_a_rollback_stays_spent_by_its_mempool_spend() {
+            let wallet = create_test_wallet();
+            let (fund, send) = fixture(&wallet);
+            scan(&wallet, 1, std::slice::from_ref(&fund));
+            scan(&wallet, 2, std::slice::from_ref(&send));
+
+            // The first half of the rollback, then the mempool add
+            wallet.transactions.write().remove(&send.txid());
+            wallet.add_mempool_tx(&send);
+            wallet.handle_reorg(1);
+
+            assert_eq!(
+                outpoints(&wallet),
+                HashSet::from([OutPoint::new(send.txid(), 1)])
+            );
+            assert_eq!(wallet.get_balance().as_sat(), 0);
+            assert_eq!(wallet.get_confirmed_balance(2, 1).as_sat(), CHANGE);
+            assert_eq!(wallet.get_unconfirmed_balance().as_sat(), CHANGE);
+            let record = wallet.get_transaction(&send.txid()).unwrap();
+            assert_eq!(record.category, "send");
+            assert_eq!(record.amount, -(30 * COIN + 1_000_000));
+        }
+
+        /// The wallet hears of a mempool spend of `fund`'s coin before `fund`
+        /// itself: once `fund` is in, its coin is spent by `send`
+        #[test]
+        fn mempool_parent_heard_after_its_child_is_spent_by_it() {
+            let wallet = create_test_wallet();
+            let (fund, send) = fixture(&wallet);
+            wallet.add_mempool_tx(&send);
+            wallet.add_mempool_tx(&fund);
+
+            assert_eq!(
+                outpoints(&wallet),
+                HashSet::from([OutPoint::new(send.txid(), 1)])
+            );
+            assert_eq!(wallet.get_unconfirmed_balance().as_sat(), CHANGE);
+            assert_eq!(
+                wallet.get_transaction(&send.txid()).unwrap().amount,
+                -(30 * COIN + 1_000_000)
+            );
+        }
+
         #[test]
         fn reorg_rollback_survives_restart() {
             use tempfile::tempdir;
