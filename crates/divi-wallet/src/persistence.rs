@@ -43,6 +43,22 @@ const CF_SPENT_UTXO_DATA: &str = "spent_utxo_data";
 // Legacy column families - kept for backward compatibility with existing databases
 const CF_WATCH_ONLY_ADDRESSES: &str = "watch_only_addresses";
 const CF_VAULTS_LEGACY: &str = "vaults";
+/// Every column family the wallet database opens
+const ALL_CFS: [&str; 13] = [
+    CF_DEFAULT,
+    CF_METADATA,
+    CF_KEYS,
+    CF_UTXOS,
+    CF_SPENT,
+    CF_TRANSACTIONS,
+    CF_ADDRESSES,
+    CF_ACCOUNTS,
+    CF_SCRIPTS,
+    CF_VAULTS,
+    CF_SPENT_UTXO_DATA,
+    CF_WATCH_ONLY_ADDRESSES,
+    CF_VAULTS_LEGACY,
+];
 
 /// Metadata keys
 const KEY_MNEMONIC: &[u8] = b"mnemonic";
@@ -393,6 +409,18 @@ impl WalletDatabase {
             }
         }
         Ok(out)
+    }
+
+    /// Flush every column family. A write-ahead log is kept until each family
+    /// with data in it is flushed, so flushing only some keeps an old log, and
+    /// whatever it holds, on disk.
+    pub fn flush_all_cfs(&self) -> Result<(), WalletError> {
+        for name in ALL_CFS {
+            if let Some(cf) = self.db.cf_handle(name) {
+                self.db.flush_cf(cf).map_err(|e| self.storage_error(e))?;
+            }
+        }
+        Ok(())
     }
 
     /// Force the metadata and key column families through compaction so that

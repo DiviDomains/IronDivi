@@ -100,6 +100,31 @@ fn encrypt_removes_plaintext_and_locks() {
     assert!(reopened.mnemonic().is_none());
 }
 
+/// As soon as encryptwallet returns, with the wallet still open, no file in its
+/// folder holds the phrase: Divi Core rewrites the wallet file at once
+/// (wallet.cpp:1023-1026), and a start-up backup made next copies the folder as
+/// it is on disk
+#[test]
+fn encrypt_leaves_no_plain_phrase_in_the_open_wallet_folder() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("wallet");
+    let wallet = new_wallet(&path);
+    let addr = wallet.new_receiving_address().unwrap();
+    // A write to a column family of its own, as a running node makes: the
+    // write-ahead log holding the plain phrase then also holds this one
+    wallet.set_label(&addr, "label").unwrap();
+    assert!(
+        dir_contains(&path, MNEMONIC.as_bytes()),
+        "sanity: plaintext before"
+    );
+    wallet.encrypt_wallet("correct horse").unwrap();
+    assert!(
+        !dir_contains(&path, MNEMONIC.as_bytes()),
+        "mnemonic on disk while the wallet is open"
+    );
+    drop(wallet);
+}
+
 #[test]
 fn unlock_restores_secrets_and_wrong_passphrase_fails() {
     let dir = tempdir().unwrap();

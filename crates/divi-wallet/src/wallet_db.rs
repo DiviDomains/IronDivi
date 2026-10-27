@@ -3203,8 +3203,11 @@ impl WalletDb {
             self.keystore.restore_pool_state(pool);
             return Err(e);
         }
-        db.flush()?;
-        // Overwritten plaintext can survive in old SST files until compaction
+        // Divi Core rewrites the whole wallet file after encrypting, so no bit of
+        // the plain keys stays on disk (wallet.cpp:1023-1026): every family is
+        // flushed, so the write-ahead log holding the plain phrase is retired,
+        // and the secret families are compacted, so old SST files go too
+        db.flush_all_cfs()?;
         db.compact_secret_cfs();
 
         *encrypted = true;
