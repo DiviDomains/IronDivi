@@ -47,20 +47,13 @@ MAX_SIZE = 0x02000000
 # Each entry: the reason, and irondivid's reply as the row expects it (the
 # compared parts of it): a KNOWN row whose irondivid reply is anything else
 # is a FAIL too.
-NOT_ALLOWED = {"status": "405 Method Not Allowed", "content-type": "text/plain",
-               "www-authenticate": "(none)", "connection": "close", "body": ("text", "Method Not Allowed")}
 KNOWN = {
-    "401 replies: Connection header": (
-        "divid writes its 401 as an HTTP/1.0 reply with no Connection header and closes the connection "
-        "(rpcprotocol.cpp:85-108); irondivid's HTTP server closes a connection only after a reply that says "
-        "Connection: close, so it says it. Both close (the 'closed after' rows).",
-        {"connection": "close"}),
-    "PUT": (
-        "divid closes the connection without a reply to a method other than GET or POST "
-        "(rpcprotocol.cpp:150-152); irondivid's HTTP server answers every request: 405, then closes",
-        NOT_ALLOWED),
-    "HEAD": ("as for PUT", dict(NOT_ALLOWED, body=("text", ""))),
-    "PUT without credentials": ("as for PUT", NOT_ALLOWED),
+    "request line without a path": (
+        "divid closes the connection without a reply to a request line of fewer than two words "
+        "(rpcprotocol.cpp:143-147); irondivid's HTTP library (hyper) answers a request it cannot parse "
+        "with 400 itself, before the server sees it",
+        {"status": "400 Bad Request", "content-type": "(none)", "www-authenticate": "(none)",
+         "connection": "close", "body": ("text", "")}),
     "path /wallet/w1": (
         "irondivid serves JSON-RPC on /wallet/<name> too (irondivi-cli -rpcwallet, bin/irondivi-cli/src/main.rs); "
         "divid serves / only (rpcserver.cpp:1019-1031)",
@@ -422,13 +415,24 @@ for name, make in (("wrong password: delay before the reply", lambda n: n.auth(p
     sort = lambda s: ">=0.2s" if s >= 0.2 else "<0.2s"
     row(name, f"{sort(c)} ({c * 1000:.0f}ms)", f"{sort(i)} ({i * 1000:.0f}ms)", sort(c) == sort(i))
 
-# HTTP methods and paths (rpcprotocol.cpp:138-160, rpcserver.cpp:1000-1033)
+# HTTP methods and paths (rpcprotocol.cpp:138-160, rpcserver.cpp:1000-1033). divid
+# serves GET and POST, as written; any other method, and a request target that is
+# not a path, closes the connection with no reply, before credentials and paths
 both("GET with a request body", lambda n: request(n, "GET", body=good, headers=close))
 both("PUT", lambda n: request(n, "PUT", body=good, headers=close))
 both("HEAD", lambda n: request(n, "HEAD", body="", headers=close))
+for m in ("DELETE", "OPTIONS", "PATCH", "TRACE", "CONNECT", "PRI", "FOO", "post", "get"):
+    both(m, lambda n, m=m: request(n, m, body=good, headers=close))
+both("HTTP/1.0 PUT", lambda n: request(n, "PUT", body=good, version="HTTP/1.0"))
+both("PUT on path /x", lambda n: request(n, "PUT", path="/x", body=good, headers=close))
+both("OPTIONS *", lambda n: request(n, "OPTIONS", path="*", body="", headers=close))
+both("absolute URI", lambda n: post(n, good, path=f"http://{n.host}:{n.rpcport}/", headers=close))
+both("target *", lambda n: post(n, good, path="*", headers=close))
+both("request line without a path", lambda n: b"POST\r\n\r\n")
 both("path /x", lambda n: post(n, good, path="/x", headers=close))
 both("path /x without credentials", lambda n: post(n, good, path="/x", auth=None, headers=close))
 both("PUT without credentials", lambda n: request(n, "PUT", body=good, auth=None, headers=close))
+both("DELETE without credentials", lambda n: request(n, "DELETE", body=good, auth=None, headers=close))
 both("path /wallet/w1", lambda n: post(n, good, path="/wallet/w1", headers=close))
 both("path with a query /?a=1", lambda n: post(n, good, path="/?a=1", headers=close))
 both("no Content-Type", lambda n: post(n, good, headers=dict(close, **{"Content-Type": None})))
@@ -503,7 +507,11 @@ on_one_connection("Connection: close, then a second request", [lambda n: post(n,
 on_one_connection("an RPC error, then a second request", [lambda n: post(n, rpc_body("getblockhash", [99])),
                                                           lambda n: post(n, good)])
 on_one_connection("wrong password, then a second request", [lambda n: post(n, good, auth=n.auth(password="w")),
-                                                            lambda n: post(n, good)], ("status", "body"))
+                                                            lambda n: post(n, good)])
+on_one_connection("no credentials, then a second request", [lambda n: post(n, good, auth=None),
+                                                            lambda n: post(n, good)])
+on_one_connection("a reply, then a PUT", [lambda n: post(n, good), lambda n: request(n, "PUT", body=good)])
+on_one_connection("a reply, then an OPTIONS", [lambda n: post(n, good), lambda n: request(n, "OPTIONS", body="")])
 on_one_connection("HTTP/1.0 with keep-alive", [lambda n: post(n, good, version="HTTP/1.0",
                                                              headers={"Connection": "keep-alive"}),
                                                 lambda n: post(n, good)])
@@ -547,6 +555,9 @@ if OUTSIDE and not OUTSIDE.startswith("127."):
     both(f"client on {OUTSIDE}, not in -rpcallowip", lambda n: post(n, good, headers=close), source=OUTSIDE)
     both(f"client on {OUTSIDE}, not in -rpcallowip, no credentials",
          lambda n: post(n, good, auth=None, headers=close), source=OUTSIDE)
+    # the address is refused before the request is read (rpcserver.cpp:612-616)
+    both(f"client on {OUTSIDE}, not in -rpcallowip, PUT",
+         lambda n: request(n, "PUT", body=good, headers=close), source=OUTSIDE)
 else:
     print("# no local address outside 127.0.0.0/8: -rpcallowip refusal rows left out", flush=True)
 

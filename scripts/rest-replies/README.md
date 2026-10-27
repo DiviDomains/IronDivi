@@ -59,7 +59,10 @@ How divid answers:
   - `.hex`: `text/plain`, the hex and `\n`;
   - `.json`: `application/json`, compact json_spirit text and `\n`;
   - `404 Not Found`: `text/plain`, body `Not Found` (`rpcprotocol.cpp:85-136`).
-- **Methods:** GET and POST are both served (`rpcprotocol.cpp:149-152`).
+- **Methods:** GET and POST are both served (`rpcprotocol.cpp:149-152`). Any other method closes the connection
+  without a reply, REST on or off, before the path is looked at (`rpcprotocol.cpp:150-152`,
+  `rpcserver.cpp:1009-1010`). divid closes with the request's headers unread, so the client may see a reset; a
+  reset and a plain close both count as `no reply: connection closed`.
 - **Warm-up:** divid answers `503 Service temporarily unavailable: …` while its RPC is warming up
   (`rest.cpp:253-254`). irondivid starts its RPC server only once the node is ready, so it has no warm-up state to
   answer from.
@@ -83,10 +86,11 @@ divid listens; irondivid dials it (`connect=`), so both see one chain. Both run 
 | `block tip`, `block notxdetails tip` | `/rest/block/[notxdetails/]<tip>` in `.json`, `.hex`, `.bin` |
 | `block genesis`, `block notxdetails genesis` | `.json` |
 | `tx uppercase hash`, `tx by POST`, `tx two extensions` | the confirmed tx, `.json` |
+| `tx by PUT`, `by HEAD`, `by DELETE`, `by OPTIONS`, `by PATCH`, `block by PUT`, `tx bad hash by PUT` | other methods: no reply |
 | `tx bad hash`, `tx short hash`, `tx unknown txid`, `tx wrong format`, `tx missing extension`, `tx empty extension`, `tx with a query`, `tx bad hash and wrong format`, `tx unknown txid and wrong format` | the errors, in divid's order |
 | `block bad hash`, `block unknown hash`, `block wrong format`, `block missing extension`, `block notxdetails unknown hash` | the same for blocks |
 | `headers`, `chaininfo`, `mempool info`, `mempool contents`, `getutxos one outpoint`, `getutxos several outpoints`, `getutxos too many outpoints`, `rest root`, `not a rest path` | paths divid does not serve |
-| `rest=0: …` | a tx and both block paths, an unknown txid, a non-REST path, with `-rest=0` |
+| `rest=0: …` | a tx and both block paths, an unknown txid, a non-REST path, a tx by PUT and by HEAD, with `-rest=0` |
 
 How a row compares:
 - the same status and the same `Content-Type`;

@@ -45,14 +45,14 @@ Each request goes on a connection of its own (with `Connection: close`) unless t
 | group | forms |
 |---|---|
 | credentials | no Authorization header, wrong user, wrong password, a scheme other than Basic, `basic` in lower case, `Basic` with nothing after it; the 401's Connection header on a row of its own; whether a reply comes after a delay (divid waits 250 ms before refusing given credentials, `rpcserver.cpp:948-952`, and not when there are none) |
-| methods and paths | GET with a request body, PUT, HEAD, PUT without credentials, `/x`, `/x` without credentials, `/wallet/w1`, `/?a=1`; no Content-Type, `text/plain` |
+| methods and paths | GET with a request body; PUT, HEAD, DELETE, OPTIONS, PATCH, TRACE, CONNECT, PRI, `FOO`, `post` and `get` in lower case, PUT on HTTP/1.0, PUT on `/x`, PUT and DELETE without credentials (divid serves GET and POST as written and closes the connection without a reply to any other method, before it looks at credentials or the path, `rpcprotocol.cpp:150-152`, `rpcserver.cpp:1009-1010`); `OPTIONS *`, an absolute URI and `*` as the target (closed without a reply too: the target must start with `/`, `rpcprotocol.cpp:155-157`); a request line without a path; `/x`, `/x` without credentials, `/wallet/w1`, `/?a=1`; no Content-Type, `text/plain` |
 | bodies | empty, invalid JSON, JSON with trailing text, a number, a string, `null` |
 | batches | two requests, `[]`, a batch with a number, a member without method, a method that is a number, an unknown method and an RPC error, `[[]]` |
 | the request object | `id` missing, null, a string, 1.5, an object; `method` missing, null, a number; `params` missing, null, an object, a string; `jsonrpc` "1.0", "2.0", absent; `method` given twice |
 | RPC errors and their HTTP status | unknown method (404), -8, -1 (help), -3, -5 (500) |
-| one connection | two requests on HTTP/1.1; two on HTTP/1.0; `Connection: close` then a second; an RPC error then a second; wrong password then a second; HTTP/1.0 with `Connection: keep-alive` then a second: each reply, and whether the server closed the connection after |
+| one connection | two requests on HTTP/1.1; two on HTTP/1.0; `Connection: close` then a second; an RPC error then a second; wrong password then a second; no credentials then a second (divid's 401 has no Connection header, and the connection closes after it, `rpcprotocol.cpp:85-105`, `rpcserver.cpp:1020-1022`); a reply then a PUT, a reply then an OPTIONS; HTTP/1.0 with `Connection: keep-alive` then a second: each reply, and whether the server closed the connection after |
 | size | a 3 MiB body (whitespace, then a request), a batch of 60000 requests (2.4 MiB), a Content-Length above divid's 32 MiB (`MAX_SIZE`, `serialize.h:34`) with no body sent |
-| clients | a client on another 127.0.0.0/8 address (allowed, `rpcserver.cpp:634-635`); a client on the outside address with and without credentials (refused, `rpcserver.cpp:612-616`) |
+| clients | a client on another 127.0.0.0/8 address (allowed, `rpcserver.cpp:634-635`); a client on the outside address with and without credentials, and with PUT (refused with 403 before the request is read, `rpcserver.cpp:612-616`) |
 
 How a row compares: the status code and reason phrase; `Content-Type`, `WWW-Authenticate` and `Connection` (absent
 counts as a value); the body as JSON when it is JSON (field names, types and values, items in order), else as text.
@@ -66,12 +66,10 @@ HTTP reading) and `rpcserver.cpp` (`ServiceConnection`, `HTTPReq_JSONRPC`, `JSON
 
 Each KNOWN row checks irondivid's reply is exactly the one below; any other reply is a FAIL.
 
-- `401 replies: Connection header`: divid writes its 401 as an HTTP/1.0 reply with no Connection header and closes
-  the connection (`rpcprotocol.cpp:85-108`); irondivid's HTTP server (hyper) closes a connection only after a reply
-  that says `Connection: close`, so it says it. Both close (the "wrong password, then a second request" rows).
-- `PUT`, `HEAD`, `PUT without credentials`: divid closes the connection without a reply to a method other than GET or
-  POST (`rpcprotocol.cpp:150-152`); irondivid's HTTP server answers every request: `405 Method Not Allowed`,
-  `text/plain`, `Connection: close` (no body for HEAD).
+- `request line without a path`: divid closes the connection without a reply to a request line of fewer than two
+  words (`rpcprotocol.cpp:143-147`); irondivid's HTTP library (hyper) answers a request it cannot parse itself, with
+  `400 Bad Request`, `Connection: close` and no body, before the RPC server sees it. Matching it would mean reading the request line with
+  a parser of irondivid's own instead of hyper's.
 - `path /wallet/w1`: irondivid serves JSON-RPC on `/wallet/<name>` too, which `irondivi-cli -rpcwallet` uses
   (`bin/irondivi-cli/src/main.rs`); divid serves `/` only (`rpcserver.cpp:1019-1031`).
 
