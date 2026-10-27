@@ -83,6 +83,13 @@ class Node:
         self.out_path = os.path.join(WORK, name + ".out")
         self.proc = None
 
+    def ports_moved(self):
+        """node_ports starts the node again on other ports: its text starts after the failed start's (the console
+        file is opened again, empty)"""
+        self.out_mark = 0
+        log = self.debug_log()
+        self.log_mark = os.path.getsize(log) if log else 0
+
     def start(self):
         """Start the node; the console text and log offset it starts from"""
         self.out_mark = os.path.getsize(self.out_path) if os.path.exists(self.out_path) else 0

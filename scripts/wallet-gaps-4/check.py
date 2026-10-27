@@ -208,6 +208,10 @@ class Node:
     def logs(self):
         return [os.path.join(self.dir, "regtest", "debug.log"), os.path.join(self.dir, "debug.log")]
 
+    def ports_moved(self):
+        """node_ports starts the node again on other ports: its log starts after the failed start's"""
+        self.log_from = {p: size(p) for p in self.logs()}
+
     def new_log(self):
         """The log written since the last start"""
         text = ""
