@@ -74,3 +74,50 @@ fn no_wallet_yet_is_logged_for_both_backups() {
     assert!(!dir.path().join("backups").exists());
     assert!(!dir.path().join("monthlyBackups").exists());
 }
+
+/// With a wallet there, Divi Core logs "backing up wallet" once at the start
+/// and again before each of the two backups, each copy followed by its
+/// "Creating backup of" line; the monthly one only when none is there yet
+/// (init.cpp:939, WalletBackupFeatureContainer.cpp:41, WalletBackupCreator.cpp:48)
+#[test]
+fn each_backup_logs_that_it_backs_up() {
+    let dir = tempdir().unwrap();
+    let wallet = dir.path().join("wallet");
+    std::fs::create_dir_all(&wallet).unwrap();
+    std::fs::write(wallet.join("CURRENT"), b"x").unwrap();
+    let (result, log) = logged(|| backup_at_start(&wallet, dir.path(), 20));
+    result.unwrap();
+    let lines = backup_lines(&log);
+    let made = |sub: &str| {
+        lines
+            .iter()
+            .any(|l| l.starts_with("Creating backup of ") && l.contains(sub))
+    };
+    assert_eq!(
+        lines
+            .iter()
+            .map(|l| if l.starts_with("Creating backup of ") {
+                "Creating backup of"
+            } else {
+                l.as_str()
+            })
+            .collect::<Vec<_>>(),
+        vec![
+            "backing up wallet",
+            "backing up wallet",
+            "Creating backup of",
+            "backing up wallet",
+            "Creating backup of",
+        ],
+        "{lines:?}"
+    );
+    assert!(made("/backups/") && made("/monthlyBackups/"), "{lines:?}");
+    // A second start: the monthly backup is not due, so it only logs
+    let (result, log) = logged(|| backup_at_start(&wallet, dir.path(), 20));
+    result.unwrap();
+    let starts: Vec<_> = backup_lines(&log)
+        .into_iter()
+        .filter(|l| l == "backing up wallet")
+        .collect();
+    assert_eq!(starts.len(), 3, "{log}");
+}

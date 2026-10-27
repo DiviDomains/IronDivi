@@ -184,9 +184,13 @@ pub fn backup_at_start(wallet: &Path, data_dir: &Path, keep: usize) -> Result<()
         }
         return Ok(());
     }
+    // Each backup logs it again before it copies or checks the age
+    // (WalletBackupFeatureContainer.cpp:41)
+    info!("backing up wallet");
     backup_closed(wallet, &data_dir.join("backups"), keep, now)?;
     let monthly = data_dir.join("monthlyBackups");
     std::fs::create_dir_all(&monthly).map_err(|e| WalletError::Storage(e.to_string()))?;
+    info!("backing up wallet");
     if monthly_due(&monthly, &wallet_name(wallet), now) {
         backup_closed(wallet, &monthly, keep, now)?;
     }
