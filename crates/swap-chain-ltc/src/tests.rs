@@ -89,8 +89,10 @@ async fn claim_verifies_with_consensus() {
     assert_eq!(tx.input[0].witness.nth(1).unwrap(), pre);
     assert_eq!(signed.txid.0, tx.compute_txid().to_byte_array());
     assert!(tx.output[0].value.to_sat() < 20_000);
-    // The claim cannot be verified against a different amount (sighash commits to it).
+    // The claim cannot be verified against a different amount (BIP 143: the sighash commits
+    // to it), so a primary-only spend cannot be made to pay away more than it was told.
     assert!(verify_htlc_spend(&tx, &h, 19_999).is_err());
+    assert!(verify_htlc_spend(&tx, &h, 20_001).is_err());
 }
 
 #[tokio::test]
@@ -165,6 +167,9 @@ async fn refund_verifies_with_consensus() {
     assert_eq!(tx.input[0].sequence.0, REFUND_SEQUENCE);
     assert_eq!(tx.input[0].witness.len(), 3);
     assert!(tx.input[0].witness.nth(1).unwrap().is_empty());
+    // BIP 143: the refund's signature commits to the spent amount too.
+    assert!(verify_htlc_spend(&tx, &h, 19_999).is_err());
+    assert!(verify_htlc_spend(&tx, &h, 20_001).is_err());
 }
 
 #[tokio::test]
@@ -1373,8 +1378,10 @@ async fn requests_to(s: &MockServer) -> usize {
     s.received_requests().await.map_or(0, |r| r.len())
 }
 
+/// A disagreeing source holds the claim as `Held` (EU), so the engine bounds it: the message
+/// names both hashes and both sources (URLs only, no secret).
 #[tokio::test]
-async fn claim_crosscheck_disagree_refuses_the_claim_as_transient_naming_both_hashes() {
+async fn claim_crosscheck_disagree_holds_the_claim_naming_both_hashes_and_both_sources() {
     let (pre, hash) = new_preimage();
     let h = htlc(hash);
     let p = cc_primary(TIP_A, CC_HASH_A).await;
@@ -1389,10 +1396,12 @@ async fn claim_crosscheck_disagree_refuses_the_claim_as_transient_naming_both_ha
             .await
             .unwrap_err(),
     ] {
-        let SwapError::Transient(msg) = e else {
-            panic!("want Transient, got {e:?}");
+        let SwapError::Held(msg) = e else {
+            panic!("want Held, got {e:?}");
         };
         assert!(msg.contains(CC_HASH_A) && msg.contains(CC_HASH_B), "{msg}");
+        assert!(msg.contains(&p.uri()) && msg.contains(&bb.uri()), "{msg}");
+        assert!(!msg.contains(&hex::encode(pre)), "{msg}");
     }
 }
 
@@ -1621,8 +1630,8 @@ async fn cc_claim(b: &LtcBackend) -> Result<SignedTx> {
 
 fn cc_held(r: Result<SignedTx>) -> String {
     match r {
-        Err(SwapError::Transient(m)) => m,
-        other => panic!("want Transient, got {other:?}"),
+        Err(SwapError::Held(m)) => m,
+        other => panic!("want Held, got {other:?}"),
     }
 }
 
@@ -2149,12 +2158,13 @@ fn fs_backend(p: &MockServer, kind: CrossCheckSource, s: &MockServer) -> LtcBack
     cc_mainnet(p).with_claim_crosscheck_at(kind, s.uri())
 }
 
-/// A `find_spend` the two sources disagree on: `Transient` (the engine retries), naming
+/// A `find_spend` the two sources disagree on: `Held` (the engine retries, and reads on the
+/// primary alone once a refund waiting on it is one margin past its locktime, EU), naming
 /// both sources.
 fn fs_held(r: Result<Option<SpendInfo>>, p: &MockServer, s: &MockServer) -> String {
     let m = match r {
-        Err(SwapError::Transient(m)) => m,
-        other => panic!("want Transient, got {other:?}"),
+        Err(SwapError::Held(m)) => m,
+        other => panic!("want Held, got {other:?}"),
     };
     assert!(m.contains(&p.uri()), "primary named: {m}");
     assert!(m.contains(&s.uri()), "source named: {m}");
@@ -2163,9 +2173,9 @@ fn fs_held(r: Result<Option<SpendInfo>>, p: &MockServer, s: &MockServer) -> Stri
 
 /// Fail-first 1, hidden spend: the source shows the lock spent by a claim, the primary says
 /// unspent. `None` would read as "not spent" (the maker never learns the preimage while the
-/// taker's refund locktime runs out); it must be `Transient`.
+/// taker's refund locktime runs out); it must be held (`Held`, EU; `Transient` before).
 #[tokio::test]
-async fn find_spend_hidden_by_the_primary_is_transient() {
+async fn find_spend_hidden_by_the_primary_is_held() {
     let (pre, hash) = new_preimage();
     let h = htlc(hash);
     let claim = fs_spender(&fs_claim_witness(&h, &pre), 0);
@@ -2182,7 +2192,7 @@ async fn find_spend_hidden_by_the_primary_is_transient() {
 /// Fail-first 2, different spender: both say spent, by different transactions (the primary
 /// shows a refund, the source a claim). Today the primary's answer is returned.
 #[tokio::test]
-async fn find_spend_two_different_spenders_is_transient() {
+async fn find_spend_two_different_spenders_is_held() {
     let (pre, hash) = new_preimage();
     let h = htlc(hash);
     let claim = fs_spender(&fs_claim_witness(&h, &pre), 0);
@@ -2204,7 +2214,7 @@ async fn find_spend_two_different_spenders_is_transient() {
 /// witness, so the primary can show the real spender with another preimage (or a refund's
 /// empty branch). Today the primary's witness is returned.
 #[tokio::test]
-async fn find_spend_same_spender_with_a_different_witness_is_transient() {
+async fn find_spend_same_spender_with_a_different_witness_is_held() {
     let (pre, hash) = new_preimage();
     let (wrong, _) = new_preimage();
     let h = htlc(hash);
@@ -2227,7 +2237,7 @@ async fn find_spend_same_spender_with_a_different_witness_is_transient() {
 /// Fail-first 3, invented spend: the primary shows a spend the source does not know (the
 /// lock unspent there, and no such transaction). Today it is returned.
 #[tokio::test]
-async fn find_spend_invented_by_the_primary_is_transient() {
+async fn find_spend_invented_by_the_primary_is_held() {
     let (pre, hash) = new_preimage();
     let h = htlc(hash);
     let claim = fs_spender(&fs_claim_witness(&h, &pre), 0);
@@ -2509,6 +2519,131 @@ async fn find_spend_crosscheck_off_is_todays_read() {
         assert_eq!(seen, want);
     }
     assert_eq!(requests_to(&s).await, 0);
+}
+
+// ---- the bounded hold (EU): `Held` and the primary-only view ---------------------------
+
+/// Opt-in off: nothing is ever held, so there is no primary-only view.
+#[tokio::test]
+async fn crosscheck_off_has_no_primary_only_view() {
+    let p = MockServer::start().await;
+    assert!(cc_mainnet(&p).primary_only().is_none());
+    assert!(cc_mainnet(&p)
+        .with_claim_crosscheck(None)
+        .primary_only()
+        .is_none());
+    assert!(backend(vec![dead_url()], TAKER_KEY)
+        .primary_only()
+        .is_none());
+    assert_eq!(requests_to(&p).await, 0);
+}
+
+/// The primary-only view of a backend whose source disagrees on the claim: the same key and
+/// primary, the claim cross-check off. It builds the claim the backend would build with the
+/// opt-in off, byte for byte, and asks the source nothing.
+#[tokio::test]
+async fn the_primary_only_view_builds_a_claim_without_asking_the_source() {
+    let (pre, hash) = new_preimage();
+    let h = htlc(hash);
+    let amount = Amount::from_sat(20_000);
+    for kind in BOTH_SOURCES {
+        let p = cc_primary_full(CC_HASH_B, None).await;
+        let s = cc_source(kind, TIP_B, cc_tx(kind, None)).await;
+        let b = cc_mainnet(&p).with_claim_crosscheck_at(kind, s.uri());
+        cc_held(b.build_claim(&h, &outpoint(), amount, &pre).await);
+        let asked = requests_to(&s).await;
+        let view = b.primary_only().expect("a view with the cross-check on");
+        let plain = cc_mainnet(&p);
+        assert_eq!(
+            view.build_claim(&h, &outpoint(), amount, &pre)
+                .await
+                .unwrap(),
+            plain
+                .build_claim(&h, &outpoint(), amount, &pre)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            view.build_claim_at(&h, &outpoint(), amount, &pre, 7)
+                .await
+                .unwrap(),
+            plain
+                .build_claim_at(&h, &outpoint(), amount, &pre, 7)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            requests_to(&s).await,
+            asked,
+            "{kind:?}: the view asked the source"
+        );
+    }
+}
+
+/// The view's refund is the opt-in-off refund, byte for byte, and verifies.
+#[tokio::test]
+async fn the_primary_only_view_builds_the_refund_of_the_same_key() {
+    let (_, hash) = new_preimage();
+    let h = htlc(hash);
+    let amount = Amount::from_sat(20_000);
+    let p = MockServer::start().await;
+    let s = MockServer::start().await;
+    let maker = |c: Option<&MockServer>| {
+        let b = LtcBackend::new_on(
+            "mainnet",
+            vec![p.uri()],
+            SecretKey::from_slice(&MAKER_KEY).unwrap(),
+            FeePolicy::Fixed(1),
+            fast(),
+        )
+        .unwrap();
+        match c {
+            Some(c) => b.with_claim_crosscheck_at(CrossCheckSource::Blockbook, c.uri()),
+            None => b,
+        }
+    };
+    let view = maker(Some(&s)).primary_only().unwrap();
+    let refund = view.build_refund(&h, &outpoint(), amount).await.unwrap();
+    assert_eq!(
+        refund,
+        maker(None)
+            .build_refund(&h, &outpoint(), amount)
+            .await
+            .unwrap()
+    );
+    let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&refund.raw).unwrap();
+    verify_htlc_spend(&tx, &h, 20_000).unwrap();
+    assert_eq!(requests_to(&s).await, 0);
+}
+
+/// The view's `find_spend` is the primary's answer where the source disagrees (EN's
+/// agreement off), asking the source nothing.
+#[tokio::test]
+async fn the_primary_only_view_reads_the_primarys_spend_without_asking_the_source() {
+    let (pre, hash) = new_preimage();
+    let h = htlc(hash);
+    let claim = fs_spender(&fs_claim_witness(&h, &pre), 0);
+    for kind in BOTH_SOURCES {
+        let p = fs_primary(Some((&claim, Some(FS_HEIGHT)))).await;
+        let s = fs_source(kind, None, &[]).await;
+        let b = fs_backend(&p, kind, &s);
+        fs_held(b.find_spend(&outpoint(), 700).await, &p, &s);
+        let asked = requests_to(&s).await;
+        let got = b
+            .primary_only()
+            .unwrap()
+            .find_spend(&outpoint(), 700)
+            .await
+            .unwrap()
+            .expect("the primary's spend");
+        assert_eq!(got.txid.to_rpc_hex(), fs_txid(&claim));
+        assert_eq!(got.extract_preimage(&hash), Some(pre));
+        assert_eq!(
+            requests_to(&s).await,
+            asked,
+            "{kind:?}: the view asked the source"
+        );
+    }
 }
 
 // ---- dual broadcast (EO, `[ltc].dual_broadcast`): every POST goes to the primary and the

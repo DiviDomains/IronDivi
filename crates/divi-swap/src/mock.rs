@@ -148,6 +148,11 @@ struct ChainState {
     hold: Option<String>,
     /// Every claim and refund built through a [`ChainBackend::primary_only`] view, in order.
     primary_only_builds: Vec<TxKind>,
+    /// While set, `find_spend` on a backend that is not a [`ChainBackend::primary_only`]
+    /// view fails with `SwapError::Held(this)`.
+    hold_reads: Option<String>,
+    /// `find_spend` calls answered by a [`ChainBackend::primary_only`] view.
+    primary_only_reads: usize,
     /// Every txid this chain ever accepted, kept when the tx later leaves the mempool.
     accepted: HashMap<Txid, TxKind>,
     /// Every `broadcast()` call that reached the node, by kind, whatever its answer
@@ -636,6 +641,18 @@ impl MockChain {
         self.state.lock().primary_only_builds.clone()
     }
 
+    /// While `Some`, every `find_spend` on this chain fails with `SwapError::Held(why)`, as a
+    /// backend whose second source disagrees on a spend; a [`ChainBackend::primary_only`]
+    /// view still answers (counted, [`MockChain::primary_only_reads`]). `None` heals it.
+    pub fn hold_reads(&self, why: Option<&str>) {
+        self.state.lock().hold_reads = why.map(str::to_string);
+    }
+
+    /// `find_spend` calls answered through a [`ChainBackend::primary_only`] view.
+    pub fn primary_only_reads(&self) -> usize {
+        self.state.lock().primary_only_reads
+    }
+
     /// While `Some`, every `broadcast()` on this chain fails with `err` before touching
     /// any state; reads still answer. `None` heals it.
     pub fn fail_broadcasts_with(&self, err: Option<SwapError>) {
@@ -901,7 +918,8 @@ pub struct MockBackend {
     mtp_lead: Arc<AtomicU32>,
     reservations: Option<InputReservations>,
     coins: Arc<Vec<Outpoint>>,
-    /// A [`ChainBackend::primary_only`] view: never held by [`MockChain::hold_spends`].
+    /// A [`ChainBackend::primary_only`] view: never held by [`MockChain::hold_spends`] or
+    /// [`MockChain::hold_reads`].
     primary_only: bool,
 }
 
@@ -1564,7 +1582,12 @@ impl ChainBackend for MockBackend {
 
     async fn find_spend(&self, outpoint: &Outpoint, from_height: u64) -> Result<Option<SpendInfo>> {
         self.check_online()?;
-        let s = self.chain.state.lock();
+        let mut s = self.chain.state.lock();
+        if self.primary_only {
+            s.primary_only_reads += 1;
+        } else if let Some(why) = &s.hold_reads {
+            return Err(SwapError::Held(why.clone()));
+        }
         let Some(spender) = s.spends.get(outpoint) else {
             return Ok(None);
         };
