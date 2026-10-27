@@ -49,6 +49,12 @@ divid runs with `checkblockindex=0`. Regtest turns that self-check on by default
 off; with it on, divid stops on an assertion (`BlockCheckingHelpers.cpp:231`) after a `reconsiderblock` of a branch
 tip below an invalidated block, so it would not show what a live node does.
 
+`getchaintips` `headers-only` is not compared: on regtest no RPC call leaves a side tip whose blocks are missing. By
+the code both say `headers-only` when a block of the branch lacks its data (divid by the tip's `nChainTx == 0`, which
+counts its parents, `rpcblockchain.cpp:534-536`; irondivid by walking the branch, `crates/divi-storage/src/chain.rs:1952-1953`,
+:1972-1973); they differ only where R20 does, irondivid saying `invalid` first when the branch also holds an invalid
+block (`docs/divid-differences.md` R20).
+
 ## Labels
 
 Hashes are shown as labels so the two nodes compare after each mined its own blocks: `a<height>` for the shared
@@ -72,10 +78,10 @@ chain, `s45` for its stale block, `n<height>` for the blocks each node mines in 
 | rows | divid | irondivid | reason |
 |---|---|---|---|
 | `estimatefee`, `estimatesmartfee`, `estimatepriority` (every step) | -32601 `Method not found` | the relay floor, or the mempool's fee rates; `estimatepriority` `"-1"` | Kept for Bitcoin-family clients (`docs/divid-differences.md` R1). No wallet send uses them: both wallets pay the relay fee for the size (`F: gettransaction w1 fee` is a PASS) |
-| `getblockchaininfo headers` (never counted: PASS or KNOWN) | the best header it ever accepted, kept through `invalidateblock` (46 while `blocks` is 42) and below `blocks` after a restart and a `reconsiderblock` (47 while `blocks` is 48) | the best header on a chain it would take, never below `blocks` | divid's `pindexBestHeader` is set only when a header arrives (`ChainSyncHelpers.cpp:24`). An operator reading divid's reply after `invalidateblock` would think the node is still syncing |
-| `D side invalid: getchaintips` | `a46` valid-fork, while its parent `a45` is invalidated | `a46` invalid | divid reads only the tip's own flags (`rpcblockchain.cpp:531-533`); `invalidateblock` marks only active-chain blocks. irondivid looks down the branch, as the call's help defines `invalid` ("This branch contains at least one invalid block") |
-| `D equal work` (4 rows) | moves to `a46` | stays on `n46` | Equal work after `invalidateblock`: divid takes the branch it received first in this run, and after a restart the one at the lower memory address (`CBlockIndexWorkComparator`, `BlockIndexWork.h:11-28`, blocks loaded from disk all have sequence 0). irondivid keeps its tip, as both nodes do for equal-work blocks that arrive; the next block decides on both |
-| `G` (6 rows) | `invalidateblock` of the genesis block answers null and leaves the chain at height 0 with every other block invalid and a zero balance, until `reconsiderblock` of it | -20 `invalid block: cannot invalidate the genesis block`, nothing changes | divid disconnects every block, then fails to disconnect the genesis block and does not report it (`BlockInvalidationHelpers.cpp:133-143`, `rpcblockchain.cpp:636-646`) |
+| `getblockchaininfo headers` (never counted: PASS or KNOWN) | the best header it ever accepted, kept through `invalidateblock` (46 while `blocks` is 42) and below `blocks` after a restart and a `reconsiderblock` (47 while `blocks` is 48) | the best header on a chain it would take, never below `blocks` | divid's `pindexBestHeader` is set only when a header arrives or the index loads (`ChainSyncHelpers.cpp:17-23`, called from `ChainExtensionService.cpp:257` and `BlockIndexLoading.cpp:75`); irondivid's is its tip plus the headers waiting for their blocks (`crates/divi-network/src/sync.rs:519-521`, `crates/divi-rpc/src/blockchain.rs:409-414`). Not in `docs/divid-differences.md`: these rows are never counted, so nothing pins it. An operator reading divid's reply after `invalidateblock` would think the node is still syncing |
+| `D side invalid: getchaintips` | `a46` valid-fork, while its parent `a45` is invalidated | `a46` invalid | divid reads only the tip's own flags (`rpcblockchain.cpp:531-533`); `invalidateblock` marks only active-chain blocks. irondivid looks down the branch, as the call's help defines `invalid` ("This branch contains at least one invalid block") (`docs/divid-differences.md` R20) |
+| `D equal work` (4 rows) | moves to `a46` | stays on `n46` | Equal work after `invalidateblock`: divid takes the branch it received first in this run, and after a restart the one at the lower memory address (`CBlockIndexWorkComparator`, `BlockIndexWork.h:11-28`, blocks loaded from disk all have sequence 0). irondivid keeps its tip, as both nodes do for equal-work blocks that arrive; the next block decides on both (`docs/divid-differences.md` R21) |
+| `G` (6 rows) | `invalidateblock` of the genesis block answers null and leaves the chain at height 0 with every other block invalid and a zero balance, until `reconsiderblock` of it | -20 `invalid block: cannot invalidate the genesis block`, nothing changes | divid disconnects every block, then fails to disconnect the genesis block and does not report it (`BlockInvalidationHelpers.cpp:133-143`, `rpcblockchain.cpp:636-646`) (`docs/divid-differences.md` R19) |
 
 ## Fixed
 

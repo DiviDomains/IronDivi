@@ -57,7 +57,7 @@ KNOWN = {
 }
 # getblockchaininfo headers: divid keeps its best header (pindexBestHeader) through
 # invalidateblock and reconsiderblock, so it can name an invalid block's height or
-# lag behind blocks after a restart (ChainSyncHelpers.cpp:24); irondivid
+# lag behind blocks after a restart (ChainSyncHelpers.cpp:17-23); irondivid
 # names its best header on a valid chain. Compared in a row of its own that prints
 # KNOWN when they differ and is never counted
 HEADERS_NOTE = "divid's best header is not moved by invalidateblock or reconsiderblock (README.md)"
