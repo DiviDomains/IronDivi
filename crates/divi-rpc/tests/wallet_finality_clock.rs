@@ -88,10 +88,6 @@ impl Node {
         txs[0].clone()
     }
 
-    fn height(&self) -> u32 {
-        self.chain.tip().unwrap().height
-    }
-
     fn address(&self, account: &str) -> Address {
         Address::from_base58(
             self.ok("getnewaddress", vec![json!(account)])
