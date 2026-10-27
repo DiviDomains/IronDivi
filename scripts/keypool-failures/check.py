@@ -31,6 +31,9 @@ import time
 import urllib.error
 import urllib.request
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "lib"))
+import node_ports  # noqa: E402  (scripts/lib: a node whose ports were taken starts again on new ones)
+
 IRONDIVID, DIVID, PORT_BASE, WORK = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
 INJECT = os.environ.get("KEYPOOL_FAILURES_INJECT", "")
 HOST = "127.0.0.150"
@@ -121,7 +124,22 @@ class Node:
         self.auth = base64.b64encode(f"{user}:{password}".encode()).decode()
 
     def start(self):
-        """('up',) once RPC answers, or ('exit', code)"""
+        """('up',) once RPC answers, or ('exit', code). A node that exits because a port is taken is started
+        again on new ports: node_ports.popen does it for a node writing to a file; a wallet's output goes through
+        the pipe, which node_ports does not read, so it is done here"""
+        retries = node_ports.BIND_RETRIES
+        while True:
+            outcome = self.start_once()
+            if outcome[0] == "exit" and self.piped and retries:
+                self.pump.join(5)
+                with open(self.out, errors="replace") as f:
+                    taken = node_ports.bind_failure(self, f.read())
+                if taken and node_ports.move_ports(self, self.dir):
+                    retries -= 1
+                    continue
+            return outcome
+
+    def start_once(self):
         self.starts += 1
         self.out = os.path.join(WORK, f"{self.name}.{self.starts}.out")
         if self.piped:
@@ -142,8 +160,8 @@ class Node:
             self.pump.start()
         else:
             with open(self.out, "w") as o:
-                self.proc = subprocess.Popen([self.binary, f"-datadir={self.dir}"], cwd=self.dir,
-                                             stdout=o, stderr=o, start_new_session=True)
+                self.proc = node_ports.popen(self, [self.binary, f"-datadir={self.dir}"], cwd=self.dir,
+                                             stdout=o, stderr=o, start_new_session=True, work=WORK)
         with open(os.path.join(WORK, "pids"), "a") as f:
             f.write(f"{self.proc.pid}\n")
         deadline = time.time() + START_TIMEOUT
