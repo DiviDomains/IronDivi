@@ -1313,3 +1313,214 @@ async fn in_best_chain_reads_the_block_status() {
         "on the best chain at another height"
     );
 }
+
+// --- Claim-time tip cross-check (opt-in, `with_claim_crosscheck`) ---
+
+const CC_TIP: u64 = 3_199_583;
+const CC_AT: u64 = CC_TIP - CROSSCHECK_DEPTH;
+const CC_HASH_A: &str = "bb06e9077c1907d25a1d986ac281b6d119228b8eae984c21b59fcfdb4af66b11";
+const CC_HASH_B: &str = "ac6f27fa7cfdc204f13f93fcd48ce5f57a4a858b950b4de8ac89979b3b5f0b43";
+
+/// A mainnet primary Esplora whose tip is `tip_hash` at [`CC_TIP`] and whose block at
+/// [`CC_AT`] is `hash_at`.
+async fn cc_primary(tip_hash: &str, hash_at: &str) -> MockServer {
+    let s = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/blocks/tip/hash"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(tip_hash))
+        .mount(&s)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/blocks/tip/height"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(CC_TIP.to_string()))
+        .mount(&s)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/block-height/{CC_AT}")))
+        .respond_with(ResponseTemplate::new(200).set_body_string(hash_at))
+        .mount(&s)
+        .await;
+    s
+}
+
+/// A Blockbook that answers `resp` for the block at [`CC_AT`].
+async fn cc_blockbook(resp: ResponseTemplate) -> MockServer {
+    let s = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/block-index/{CC_AT}")))
+        .respond_with(resp)
+        .mount(&s)
+        .await;
+    s
+}
+
+fn cc_bb(hash: &str) -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_string(format!(r#"{{"blockHash":"{hash}"}}"#))
+}
+
+fn cc_mainnet(primary: &MockServer) -> LtcBackend {
+    LtcBackend::new_on(
+        "mainnet",
+        vec![primary.uri()],
+        SecretKey::from_slice(&TAKER_KEY).unwrap(),
+        FeePolicy::Fixed(1),
+        fast(),
+    )
+    .unwrap()
+}
+
+async fn requests_to(s: &MockServer) -> usize {
+    s.received_requests().await.map_or(0, |r| r.len())
+}
+
+#[tokio::test]
+async fn claim_crosscheck_disagree_refuses_the_claim_as_transient_naming_both_hashes() {
+    let (pre, hash) = new_preimage();
+    let h = htlc(hash);
+    let p = cc_primary(TIP_A, CC_HASH_A).await;
+    let bb = cc_blockbook(cc_bb(CC_HASH_B)).await;
+    let b = cc_mainnet(&p).with_claim_crosscheck_at(CrossCheckSource::Blockbook, bb.uri());
+    let amount = Amount::from_sat(20_000);
+    for e in [
+        b.build_claim(&h, &outpoint(), amount, &pre)
+            .await
+            .unwrap_err(),
+        b.build_claim_at(&h, &outpoint(), amount, &pre, 10)
+            .await
+            .unwrap_err(),
+    ] {
+        let SwapError::Transient(msg) = e else {
+            panic!("want Transient, got {e:?}");
+        };
+        assert!(msg.contains(CC_HASH_A) && msg.contains(CC_HASH_B), "{msg}");
+    }
+}
+
+#[tokio::test]
+async fn claim_crosscheck_agree_builds_the_claim_and_asks_once_per_primary_tip() {
+    let (pre, hash) = new_preimage();
+    let h = htlc(hash);
+    let p = cc_primary(TIP_A, CC_HASH_A).await;
+    let bb = cc_blockbook(cc_bb(CC_HASH_A)).await;
+    let b = cc_mainnet(&p).with_claim_crosscheck_at(CrossCheckSource::Blockbook, bb.uri());
+    let amount = Amount::from_sat(20_000);
+    let signed = b.build_claim(&h, &outpoint(), amount, &pre).await.unwrap();
+    let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&signed.raw).unwrap();
+    verify_htlc_spend(&tx, &h, 20_000).unwrap();
+    b.build_claim_at(&h, &outpoint(), amount, &pre, 10)
+        .await
+        .unwrap();
+    // Same primary tip on the retry: the cached result is reused, the source is asked once.
+    assert_eq!(requests_to(&bb).await, 1);
+}
+
+#[tokio::test]
+async fn claim_crosscheck_asks_again_when_the_primary_tip_moves() {
+    let (pre, hash) = new_preimage();
+    let h = htlc(hash);
+    let p = cc_primary(TIP_A, CC_HASH_A).await;
+    let bb = cc_blockbook(cc_bb(CC_HASH_A)).await;
+    let b = cc_mainnet(&p).with_claim_crosscheck_at(CrossCheckSource::Blockbook, bb.uri());
+    let amount = Amount::from_sat(20_000);
+    b.build_claim(&h, &outpoint(), amount, &pre).await.unwrap();
+    p.reset().await;
+    let p2_tip = Mock::given(method("GET"))
+        .and(path("/blocks/tip/hash"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(TIP_B));
+    p2_tip.mount(&p).await;
+    Mock::given(method("GET"))
+        .and(path("/blocks/tip/height"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(CC_TIP.to_string()))
+        .mount(&p)
+        .await;
+    // The primary now forks off: the block at the compared height differs.
+    Mock::given(method("GET"))
+        .and(path(format!("/block-height/{CC_AT}")))
+        .respond_with(ResponseTemplate::new(200).set_body_string(CC_HASH_B))
+        .mount(&p)
+        .await;
+    let e = b
+        .build_claim(&h, &outpoint(), amount, &pre)
+        .await
+        .unwrap_err();
+    assert!(matches!(e, SwapError::Transient(_)), "{e:?}");
+    assert_eq!(requests_to(&bb).await, 2);
+}
+
+/// Collects formatted `tracing` output for the current thread.
+#[derive(Clone, Default)]
+struct LogBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogBuf {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(b);
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl LogBuf {
+    fn text(&self) -> String {
+        String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+    }
+}
+
+#[tokio::test]
+async fn claim_crosscheck_unavailable_source_warns_and_builds_the_claim() {
+    let buf = LogBuf::default();
+    let w = buf.clone();
+    let sub = tracing_subscriber::fmt()
+        .with_writer(move || w.clone())
+        .with_ansi(false)
+        .finish();
+    let _guard = tracing::subscriber::set_default(sub);
+
+    let (pre, hash) = new_preimage();
+    let h = htlc(hash);
+    let p = cc_primary(TIP_A, CC_HASH_A).await;
+    let bb = cc_blockbook(ResponseTemplate::new(429)).await;
+    let b = cc_mainnet(&p).with_claim_crosscheck_at(CrossCheckSource::Blockbook, bb.uri());
+    let amount = Amount::from_sat(20_000);
+    b.build_claim(&h, &outpoint(), amount, &pre).await.unwrap();
+    b.build_claim_at(&h, &outpoint(), amount, &pre, 10)
+        .await
+        .unwrap();
+    // Rate-limited source: not asked again for the same primary tip.
+    let first = requests_to(&bb).await;
+    assert!(first >= 1);
+    b.build_claim(&h, &outpoint(), amount, &pre).await.unwrap();
+    assert_eq!(requests_to(&bb).await, first);
+
+    // One audit line per claim built without a comparison: source URL, reason, outpoint.
+    let log = buf.text();
+    let lines: Vec<&str> = log
+        .lines()
+        .filter(|l| l.contains("WARN") && l.contains("claim cross-check"))
+        .collect();
+    assert_eq!(lines.len(), 3, "{log}");
+    for l in lines {
+        assert!(l.contains(&bb.uri()), "source URL: {l}");
+        assert!(l.contains("429"), "reason: {l}");
+        assert!(l.contains(&outpoint().to_string()), "outpoint: {l}");
+    }
+}
+
+#[tokio::test]
+async fn claim_crosscheck_off_sends_nothing_to_the_source_or_the_primary() {
+    let (pre, hash) = new_preimage();
+    let h = htlc(hash);
+    let p = cc_primary(TIP_A, CC_HASH_A).await;
+    let bb = cc_blockbook(cc_bb(CC_HASH_B)).await;
+    let amount = Amount::from_sat(20_000);
+    for b in [cc_mainnet(&p), cc_mainnet(&p).with_claim_crosscheck(None)] {
+        b.build_claim(&h, &outpoint(), amount, &pre).await.unwrap();
+        b.build_claim_at(&h, &outpoint(), amount, &pre, 10)
+            .await
+            .unwrap();
+    }
+    assert_eq!(requests_to(&bb).await, 0);
+    // Off is today's request count exactly: a Fixed fee policy claim asks the primary nothing.
+    assert_eq!(requests_to(&p).await, 0);
+}

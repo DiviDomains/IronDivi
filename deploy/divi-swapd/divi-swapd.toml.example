@@ -47,6 +47,12 @@ esplora_url = "https://litecoinspace.org/testnet/api"
 #                           # unless allow_single_source = true below.
 # allow_single_source = false  # default; true lets a mainnet config start with crosscheck "off" and logs a
 #                              # warning at every start. Waives [ltc] only.
+# crosscheck_before_claim = false  # default (opt-in, no mainnet default chosen); needs crosscheck set to a
+#                                  # source, refused with crosscheck "off". Repeats the crosscheck before every
+#                                  # LTC claim: a mismatch holds the claim (retried next tick); an unreachable or
+#                                  # rate-limited source logs one warning per claim and the claim goes ahead. At
+#                                  # most one source request per primary tip block (~150 s); a hanging source
+#                                  # can delay a claim by up to 20 s (HTTP timeout) once per block.
 # Testnets reuse the BTC swap key on every secp256k1 chain (docs/plans/swap-poc/funding.md,
 # decision 64ae2a0): no maker-ltc 1Password item or credential file exists or is needed —
 # this is the same maker-btc credential already loaded above.

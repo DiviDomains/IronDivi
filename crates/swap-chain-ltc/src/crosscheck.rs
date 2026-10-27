@@ -359,9 +359,9 @@ mod tests {
     #[tokio::test]
     async fn source_unreachable_is_unavailable() {
         let (_p, pc) = primary(H_A).await;
-        let dead = MockServer::start().await;
-        let base = dead.uri();
-        drop(dead);
+        // Port 1 on loopback refuses. A dropped `MockServer` is not dead: wiremock returns it
+        // to a pool, and a concurrent test can mount a matching route on it.
+        let base = "http://127.0.0.1:1".to_string();
         let out = tip_crosscheck(&pc, CrossCheckSource::Blockbook, &base, fast()).await;
         assert!(
             matches!(out, CrossCheckOutcome::Unavailable { .. }),
