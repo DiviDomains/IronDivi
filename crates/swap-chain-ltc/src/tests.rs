@@ -1463,7 +1463,7 @@ async fn claim_crosscheck_asks_again_when_the_primary_tip_moves() {
         .build_claim(&h, &outpoint(), amount, &pre)
         .await
         .unwrap_err();
-    assert!(matches!(e, SwapError::Transient(_)), "{e:?}");
+    assert!(matches!(e, SwapError::Held(_)), "{e:?}");
     // Three on the first tip; one on the second, where `tip - 6` already disagrees (EI).
     assert_eq!(requests_to(&bb).await, 4);
 }
