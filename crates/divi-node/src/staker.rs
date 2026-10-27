@@ -1079,13 +1079,10 @@ impl Staker {
             .wallet
             .new_receiving_address()
             .map_err(|e| e.to_string())?;
-        // Height, then the height again so each coinbase txid is unique
-        let mut script_sig = divi_storage::bip34_height_script(height);
-        script_sig.extend_from_slice(&height.to_le_bytes());
         let mut transactions = vec![Transaction {
             version: 1,
             lock_time: 0,
-            vin: vec![TxIn::coinbase(Script::from_bytes(script_sig))],
+            vin: vec![TxIn::coinbase(coinbase_script_sig(height))],
             vout: vec![TxOut::new(
                 self.chain.pow_block_reward(height),
                 pay_to.script_pubkey(),
@@ -2471,14 +2468,21 @@ fn adjusted_timestamp() -> u64 {
     divi_primitives::clock::adjusted_now().max(0) as u64
 }
 
+/// The scriptSig of every coinbase this node makes, work and stake blocks
+/// alike, as Divi Core's CreateEmptyCoinbaseTransaction writes it
+/// (BlockFactory.cpp:38-52): the height (BIP34, CScriptNum) then the extra
+/// nonce 1
+fn coinbase_script_sig(height: u32) -> Script {
+    let mut script_sig = divi_storage::bip34_height_script(height);
+    script_sig.extend_from_slice(&[0x01, 0x01]);
+    Script::from_bytes(script_sig)
+}
+
 /// Create a minimal coinbase marker transaction for PoS blocks
 fn create_coinbase_marker(height: u32) -> Transaction {
-    // Divi Core CreateEmptyCoinbaseTransaction (BlockFactory.cpp:38-52): the
-    // height (BIP34, CScriptNum) then the extra nonce 1, one empty output,
-    // transaction version 1
-    let mut script_sig = encode_bip34_height(height);
-    script_sig.extend_from_slice(&[0x01, 0x01]);
-    let script_sig = Script::from_bytes(script_sig);
+    // Divi Core CreateEmptyCoinbaseTransaction (BlockFactory.cpp:38-52): one
+    // empty output, transaction version 1
+    let script_sig = coinbase_script_sig(height);
 
     Transaction {
         version: 1,
@@ -2493,36 +2497,6 @@ fn create_coinbase_marker(height: u32) -> Transaction {
             script_pubkey: Script::default(),
         }],
     }
-}
-
-/// Encode block height as BIP34 CScriptNum for coinbase scriptSig.
-///
-/// CScriptNum uses little-endian encoding with a sign extension byte when
-/// the most significant byte has bit 7 set (to prevent being interpreted as negative).
-/// C++ equivalent: `CScript() << nHeight`
-fn encode_bip34_height(height: u32) -> Vec<u8> {
-    if height == 0 {
-        // OP_0
-        return vec![0x00];
-    }
-
-    // Serialize height in minimal little-endian bytes
-    let mut num_bytes = Vec::new();
-    let mut val = height;
-    while val > 0 {
-        num_bytes.push((val & 0xFF) as u8);
-        val >>= 8;
-    }
-
-    // CScriptNum sign extension: if MSB has bit 7 set, add 0x00 to keep positive
-    if num_bytes.last().unwrap() & 0x80 != 0 {
-        num_bytes.push(0x00);
-    }
-
-    // Push opcode (length prefix) + data
-    let mut data = vec![num_bytes.len() as u8];
-    data.extend_from_slice(&num_bytes);
-    data
 }
 
 /// Divi Core `MAX_BLOCK_SIZE_CURRENT` (defaultValues.h:43)
@@ -3119,6 +3093,43 @@ mod tests {
             .expect("a work block on a locked wallet");
         assert_eq!(hashes.len(), 1);
         assert_eq!(chain.height(), 1);
+    }
+
+    /// A work block's coinbase carries the height then the extra nonce 1, as
+    /// divid's does (BlockFactory.cpp:38-52), so the same block made at the
+    /// same second by either node has the same coinbase txid
+    #[test]
+    fn work_block_coinbase_is_height_then_extra_nonce() {
+        use crate::config::MempoolConfig;
+        use divi_network::PeerManagerConfig;
+        use divi_storage::{Chain, ChainDatabase, ChainParams, NetworkType};
+        use divi_wallet::{HdWallet, Network};
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(ChainDatabase::open(temp_dir.path().join("chain")).unwrap());
+        let params =
+            ChainParams::for_network(NetworkType::Regtest, divi_primitives::ChainMode::Divi);
+        let chain = Arc::new(Chain::new(db, params).unwrap());
+        let wallet = Arc::new(WalletDb::with_hd_wallet(
+            Network::Regtest,
+            HdWallet::new(divi_primitives::ChainMode::Divi).unwrap(),
+        ));
+        let staker = Staker::new(
+            wallet,
+            chain.clone(),
+            Arc::new(Mempool::new(MempoolConfig::default())),
+            PeerManager::new(PeerManagerConfig::default()),
+            StakingConfig::default(),
+        );
+        staker.generate_blocks(17).unwrap();
+        let script_sig = |h: u32| {
+            let hash = chain.get_block_index_by_height(h).unwrap().unwrap().hash;
+            let block = chain.get_block(&hash).unwrap().unwrap();
+            block.transactions[0].vin[0].script_sig.as_bytes().to_vec()
+        };
+        assert_eq!(script_sig(1), vec![0x51, 0x01, 0x01]);
+        assert_eq!(script_sig(16), vec![0x60, 0x01, 0x01]);
+        assert_eq!(script_sig(17), vec![0x01, 0x11, 0x01, 0x01]);
     }
 
     /// A coin lockunspent locked is neither stake weight nor an aged coin:
@@ -3879,42 +3890,48 @@ mod tests {
 
     #[test]
     fn test_bip34_height_encoding() {
-        // Height 0 → OP_0
-        assert_eq!(encode_bip34_height(0), vec![0x00]);
+        use divi_storage::bip34_height_script;
 
-        // Height 1 → push 1 byte: 0x01
-        assert_eq!(encode_bip34_height(1), vec![0x01, 0x01]);
+        // Height 0 → OP_0
+        assert_eq!(bip34_height_script(0), vec![0x00]);
+
+        // Heights 1 to 16 → OP_1 to OP_16, as CScript() << nHeight writes them
+        assert_eq!(bip34_height_script(1), vec![0x51]);
+        assert_eq!(bip34_height_script(16), vec![0x60]);
+
+        // Height 17 → push 1 byte: 0x11
+        assert_eq!(bip34_height_script(17), vec![0x01, 0x11]);
 
         // Height 127 → push 1 byte: 0x7F (no sign extension)
-        assert_eq!(encode_bip34_height(127), vec![0x01, 0x7F]);
+        assert_eq!(bip34_height_script(127), vec![0x01, 0x7F]);
 
         // Height 128 → push 2 bytes: 0x80 0x00 (sign extension because 0x80 has bit 7)
-        assert_eq!(encode_bip34_height(128), vec![0x02, 0x80, 0x00]);
+        assert_eq!(bip34_height_script(128), vec![0x02, 0x80, 0x00]);
 
         // Height 255 → push 2 bytes: 0xFF 0x00 (sign extension)
-        assert_eq!(encode_bip34_height(255), vec![0x02, 0xFF, 0x00]);
+        assert_eq!(bip34_height_script(255), vec![0x02, 0xFF, 0x00]);
 
         // Height 256 → push 2 bytes: 0x00 0x01 (no sign extension, MSB=0x01)
-        assert_eq!(encode_bip34_height(256), vec![0x02, 0x00, 0x01]);
+        assert_eq!(bip34_height_script(256), vec![0x02, 0x00, 0x01]);
 
         // Height 32767 → push 2 bytes: 0xFF 0x7F (no sign extension, MSB=0x7F)
-        assert_eq!(encode_bip34_height(32767), vec![0x02, 0xFF, 0x7F]);
+        assert_eq!(bip34_height_script(32767), vec![0x02, 0xFF, 0x7F]);
 
         // Height 32768 → push 3 bytes: 0x00 0x80 0x00 (sign extension, MSB=0x80)
-        assert_eq!(encode_bip34_height(32768), vec![0x03, 0x00, 0x80, 0x00]);
+        assert_eq!(bip34_height_script(32768), vec![0x03, 0x00, 0x80, 0x00]);
 
         // Height 48872 (0xBEE8) → push 3 bytes: 0xE8 0xBE 0x00 (sign extension, MSB=0xBE)
-        assert_eq!(encode_bip34_height(48872), vec![0x03, 0xE8, 0xBE, 0x00]);
+        assert_eq!(bip34_height_script(48872), vec![0x03, 0xE8, 0xBE, 0x00]);
 
         // Height 48735 (0xBE5F) → push 3 bytes: 0x5F 0xBE 0x00 (sign extension)
-        assert_eq!(encode_bip34_height(48735), vec![0x03, 0x5F, 0xBE, 0x00]);
+        assert_eq!(bip34_height_script(48735), vec![0x03, 0x5F, 0xBE, 0x00]);
 
         // Height 12345 (0x3039) → push 2 bytes: 0x39 0x30 (no sign extension, MSB=0x30)
-        assert_eq!(encode_bip34_height(12345), vec![0x02, 0x39, 0x30]);
+        assert_eq!(bip34_height_script(12345), vec![0x02, 0x39, 0x30]);
 
         // Height 16777215 (0xFFFFFF) → push 4 bytes: 0xFF 0xFF 0xFF 0x00 (sign extension)
         assert_eq!(
-            encode_bip34_height(16777215),
+            bip34_height_script(16777215),
             vec![0x04, 0xFF, 0xFF, 0xFF, 0x00]
         );
     }
