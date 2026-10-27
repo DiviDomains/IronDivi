@@ -37,6 +37,10 @@ pub struct MempoolEntry {
     /// Time added to mempool
     pub time: Instant,
 
+    /// When it was added on the node's clock, which setmocktime sets (Divi
+    /// Core's entry time, GetTime() at MempoolConsensus.cpp:386)
+    pub entered: i64,
+
     /// Fee in satoshis
     pub fee: Amount,
 
@@ -75,6 +79,7 @@ impl MempoolEntry {
             tx,
             txid,
             time: Instant::now(),
+            entered: divi_primitives::clock::now(),
             fee,
             size,
             fee_rate,
@@ -180,13 +185,6 @@ pub type TipHeightProvider = Arc<dyn Fn() -> u32 + Send + Sync>;
 /// current time.
 pub fn is_final_for_next_block(tx: &Transaction, tip_height: u32, now: u32) -> bool {
     tx.is_final(tip_height.saturating_add(1), now)
-}
-
-fn unix_now() -> u32 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as u32)
-        .unwrap_or(0)
 }
 
 /// Where a transaction entering the mempool comes from, for the checks that
@@ -629,7 +627,8 @@ impl Mempool {
     /// an exponentially decaying ~10-minute window of free bytes, full at
     /// `-limitfreerelay` times 10,000 bytes
     fn free_relay_allows(&self, size: usize) -> bool {
-        let now = unix_now() as i64;
+        // GetTime: the node's clock, which setmocktime sets
+        let now = divi_primitives::clock::now();
         let mut limiter = self.free_limiter.lock();
         let (count, last) = &mut *limiter;
         *count *= (1.0 - 1.0 / 600.0f64).powf((now - *last) as f64);
@@ -1054,10 +1053,6 @@ impl divi_rpc::blockchain::MempoolProvider for Mempool {
     }
 
     fn get_tx_infos(&self) -> Vec<divi_rpc::blockchain::MempoolTxInfo> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
         let tip_height = self.tip_height();
         let txs = self.txs.read();
         txs.values()
@@ -1065,7 +1060,7 @@ impl divi_rpc::blockchain::MempoolProvider for Mempool {
                 txid: e.txid,
                 size: e.size,
                 fee_sat: e.fee.as_sat(),
-                time: now - e.time.elapsed().as_secs() as i64,
+                time: e.entered,
                 // Inputs from pool transactions, each once in hex order, as
                 // Divi Core's std::set<string> (rpcblockchain.cpp:130-136)
                 depends: {
