@@ -1813,6 +1813,12 @@ impl Chain {
         self.params.network_type
     }
 
+    /// Whether the network retargets its difficulty (Divi Core
+    /// fDifficultyRetargeting: not on regtest, chainparams.cpp:249, :517)
+    pub fn retargets_difficulty(&self) -> bool {
+        self.difficulty_params().retarget_difficulty
+    }
+
     /// Compute the next block's difficulty bits given the current tip
     ///
     /// This wraps `get_next_work_required` with the chain's database and
