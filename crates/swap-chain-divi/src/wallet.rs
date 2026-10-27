@@ -838,8 +838,13 @@ mod stalled_write_tests {
     /// bytes in full and returns.
     fn released_late(tmp: &Path, bytes: &[u8]) -> std::io::Result<()> {
         RELEASE.wait();
-        std::fs::write(tmp, bytes)
+        let res = std::fs::write(tmp, bytes);
+        LATE_WRITTEN.store(true, std::sync::atomic::Ordering::SeqCst);
+        res
     }
+
+    /// Set once [`released_late`] has written its file.
+    static LATE_WRITTEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
     #[test]
     fn a_write_released_after_the_timeout_never_lands_over_a_newer_write() {
@@ -862,9 +867,14 @@ mod stalled_write_tests {
         // The stalled writer now finishes its temporary file.
         RELEASE.wait();
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while names(dir.path()) != ["w.json"] && std::time::Instant::now() < deadline {
+        let done = || {
+            LATE_WRITTEN.load(std::sync::atomic::Ordering::SeqCst)
+                && names(dir.path()) == ["w.json"]
+        };
+        while !done() && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
+        assert!(LATE_WRITTEN.load(std::sync::atomic::Ordering::SeqCst));
         assert_eq!(names(dir.path()), vec!["w.json".to_string()]);
         assert_eq!(std::fs::read(&path).unwrap(), newer_bytes);
         assert_eq!(
