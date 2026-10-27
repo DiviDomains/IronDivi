@@ -616,14 +616,13 @@ impl BlockSync {
         if self.chain.is_importing() {
             return;
         }
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        // GetAdjustedTime (main.cpp:1138): the node's clock, which setmocktime
+        // sets, plus the network time offset (and what a test skipped)
+        let now = self.peer_manager.clock().adjusted_time();
         let recent = self
             .chain
             .tip()
-            .is_some_and(|tip| u64::from(tip.time) + 6 * 60 * 60 > now);
+            .is_some_and(|tip| i64::from(tip.time) + 6 * 60 * 60 > now);
         let due: Vec<PeerId> = {
             let peers = self.start_peers.read();
             let have_preferred = peers.values().any(SyncPeer::preferred);
@@ -3653,9 +3652,18 @@ mod tests {
         HashMap<PeerId, tokio::sync::mpsc::Receiver<NetworkMessage>>,
         tempfile::TempDir,
     ) {
+        let (sync, dir) = create_test_sync();
+        let rxs = add_test_peers(&sync, n);
+        (sync, rxs, dir)
+    }
+
+    /// Peers 1 to `n`, dialled, serving every block, on `sync`'s peer manager
+    fn add_test_peers(
+        sync: &BlockSync,
+        n: u64,
+    ) -> HashMap<PeerId, tokio::sync::mpsc::Receiver<NetworkMessage>> {
         use crate::peer::PeerHandle;
 
-        let (sync, dir) = create_test_sync();
         let mut rxs = HashMap::new();
         for id in 1..=n {
             let (tx, rx) = tokio::sync::mpsc::channel(64);
@@ -3673,7 +3681,7 @@ mod tests {
             });
             rxs.insert(id, rx);
         }
-        (sync, rxs, dir)
+        rxs
     }
 
     /// Peers that received a getdata for `hash` since the last drain.
@@ -4322,6 +4330,36 @@ mod tests {
         assert_eq!(getblocks_recipients(&mut rxs), vec![1]);
         sync.begin_syncing_with_peer(2, full_node(true)).await;
         assert!(getblocks_recipients(&mut rxs).is_empty()); // old tip: one sync peer
+    }
+
+    /// Whether the best block is recent enough for every peer to be asked is
+    /// read on the network-adjusted clock (main.cpp:1138), not the system's:
+    /// a block made now is six hours old once the node's clock is seven hours on
+    #[tokio::test]
+    async fn the_tip_s_age_for_a_sync_is_read_on_the_adjusted_clock() {
+        for (skip_hours, asked) in [(0, vec![1, 2]), (7, vec![1])] {
+            let dir = tempdir().unwrap();
+            let db = Arc::new(ChainDatabase::open(dir.path()).unwrap());
+            let params = ChainParams::for_network(
+                divi_storage::NetworkType::Regtest,
+                divi_primitives::ChainMode::Divi,
+            );
+            let chain = Arc::new(Chain::new(db, params).unwrap());
+            let mut block = next_block(&chain);
+            block.header.time = divi_primitives::clock::adjusted_now() as u32;
+            let target = Hash256::from_compact(block.header.bits);
+            while compute_block_hash(&block.header) > target {
+                block.header.nonce += 1;
+            }
+            chain.accept_block(block).unwrap();
+            let clock = crate::peer_clock::PeerClock::skippable(Duration::from_secs(1));
+            clock.skip(Duration::from_secs(skip_hours * 60 * 60));
+            let sync = BlockSync::new(chain, PeerManager::with_clock(Default::default(), clock));
+            let mut rxs = add_test_peers(&sync, 2);
+            sync.begin_syncing_with_peer(1, full_node(false)).await;
+            sync.begin_syncing_with_peer(2, full_node(false)).await;
+            assert_eq!(getblocks_recipients(&mut rxs), asked, "{skip_hours} h on");
+        }
     }
 
     #[tokio::test]
