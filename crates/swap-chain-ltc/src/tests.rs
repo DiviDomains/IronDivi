@@ -2002,3 +2002,511 @@ async fn lock_crosscheck_primary_none_asks_nothing_more() {
     assert_eq!(b.htlc_output(&h, &outpoint()).await.unwrap(), None);
     assert_eq!(requests_to(&s).await, 0);
 }
+
+// --- find_spend from two sources (EN, T32-2) ---
+//
+// With `[ltc].crosscheck_before_claim` on, `find_spend` also asks the cross-check source and
+// agrees the two answers as `swap-chain-btc`'s `quorum::agree_spend` does. The source's
+// shapes (single-source-design.FACTS.md): the lock transaction's output `n` shows its
+// spender (Blockbook `GET /tx/{txid}` `vout[].spent` / `vout[].spentTxId`; BlockCypher
+// `GET /txs/{txid}` `outputs[].spent_by`); the spender itself is read as raw hex (Blockbook
+// `GET /tx/{txid}` `hex` and `blockHeight`, -1 in the mempool, falling back to
+// `GET /tx-specific/{txid}` `hex` when `hex` is absent; BlockCypher
+// `GET /txs/{txid}?includeHex=true` `hex` and `block_height`, -1 when unconfirmed), so the
+// spending input's scriptSig and witness (the preimage) are compared byte for byte.
+
+const FS_HEIGHT: u64 = 777;
+
+/// A claim's witness for `h`: signature, preimage, the claim branch selector, the script.
+fn fs_claim_witness(h: &HtlcParams, pre: &[u8; 32]) -> Vec<Vec<u8>> {
+    vec![vec![0x30; 71], pre.to_vec(), vec![1], h.redeem_script()]
+}
+
+/// A refund's witness for `h`: signature, the empty refund branch selector, the script.
+fn fs_refund_witness(h: &HtlcParams) -> Vec<Vec<u8>> {
+    vec![vec![0x30; 71], vec![], h.redeem_script()]
+}
+
+/// A transaction spending [`outpoint`] at input 1 with `witness`. Its txid commits to
+/// neither witness, so a claim and a refund with the same other fields share a txid.
+fn fs_spender(witness: &[Vec<u8>], fee_tag: u64) -> bitcoin::Transaction {
+    use bitcoin::{ScriptBuf, Sequence, TxIn, TxOut, Witness};
+    bitcoin::Transaction {
+        version: bitcoin::transaction::Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![
+            TxIn {
+                previous_output: OutPoint::new(bitcoin::Txid::from_byte_array([7; 32]), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::from_slice(&[vec![0x02; 33]]),
+            },
+            TxIn {
+                previous_output: ltc_outpoint(&outpoint()),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::from_slice(witness),
+            },
+        ],
+        output: vec![TxOut {
+            value: bitcoin::Amount::from_sat(19_000 - fee_tag),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x00, 0x14, 0x11]),
+        }],
+    }
+}
+
+fn fs_txid(t: &bitcoin::Transaction) -> String {
+    t.compute_txid().to_string()
+}
+
+/// A mainnet primary Esplora that shows [`outpoint`] spent by `spender` at `height` (`None`:
+/// in the mempool), or unspent.
+async fn fs_primary(spender: Option<(&bitcoin::Transaction, Option<u64>)>) -> MockServer {
+    let s = MockServer::start().await;
+    let o = outpoint();
+    let outspend = match spender {
+        None => json!({"spent": false}),
+        Some((t, h)) => {
+            let status = match h {
+                Some(h) => json!({"confirmed": true, "block_height": h}),
+                None => json!({"confirmed": false}),
+            };
+            json!({"spent": true, "txid": fs_txid(t), "vin": 1, "status": status})
+        }
+    };
+    Mock::given(method("GET"))
+        .and(path(format!("/tx/{}/outspend/{}", o.txid, o.vout)))
+        .respond_with(ResponseTemplate::new(200).set_body_json(outspend))
+        .mount(&s)
+        .await;
+    if let Some((t, _)) = spender {
+        let vin: Vec<Value> = t
+            .input
+            .iter()
+            .map(|i| {
+                json!({
+                    "txid": i.previous_output.txid.to_string(),
+                    "vout": i.previous_output.vout,
+                    "scriptsig": hex::encode(i.script_sig.as_bytes()),
+                    "witness": i.witness.iter().map(hex::encode).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        Mock::given(method("GET"))
+            .and(path(format!("/tx/{}", fs_txid(t))))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"txid": fs_txid(t), "vin": vin})),
+            )
+            .mount(&s)
+            .await;
+    }
+    s
+}
+
+/// `kind`'s body for the spending transaction `t` at `height` (`None`: mempool).
+fn fs_source_tx(kind: CrossCheckSource, t: &bitcoin::Transaction, height: Option<u64>) -> Value {
+    let raw = hex::encode(serialize(t));
+    let h = height.map_or(-1, |h| h as i64);
+    match kind {
+        CrossCheckSource::Blockbook => json!({"txid": fs_txid(t), "blockHeight": h,
+            "confirmations": if height.is_some() { 3 } else { 0 }, "hex": raw}),
+        CrossCheckSource::BlockCypher => json!({"hash": fs_txid(t), "block_height": h,
+            "confirmations": if height.is_some() { 3 } else { 0 }, "hex": raw}),
+    }
+}
+
+fn fs_source_tx_path(kind: CrossCheckSource, txid: &str) -> String {
+    match kind {
+        CrossCheckSource::Blockbook => format!("/tx/{txid}"),
+        CrossCheckSource::BlockCypher => format!("/txs/{txid}"),
+    }
+}
+
+/// A cross-check source of `kind` whose lock transaction shows output 1 spent by
+/// `spent_by` (or unspent), and that knows the transactions in `knows` at their heights.
+async fn fs_source(
+    kind: CrossCheckSource,
+    spent_by: Option<&str>,
+    knows: &[(&bitcoin::Transaction, Option<u64>)],
+) -> MockServer {
+    let s = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(lock_tx_path(kind)))
+        .respond_with(cc_tx(kind, spent_by))
+        .mount(&s)
+        .await;
+    for (t, h) in knows {
+        Mock::given(method("GET"))
+            .and(path(fs_source_tx_path(kind, &fs_txid(t))))
+            .respond_with(ResponseTemplate::new(200).set_body_json(fs_source_tx(kind, t, *h)))
+            .mount(&s)
+            .await;
+    }
+    s
+}
+
+fn fs_backend(p: &MockServer, kind: CrossCheckSource, s: &MockServer) -> LtcBackend {
+    cc_mainnet(p).with_claim_crosscheck_at(kind, s.uri())
+}
+
+/// A `find_spend` the two sources disagree on: `Transient` (the engine retries), naming
+/// both sources.
+fn fs_held(r: Result<Option<SpendInfo>>, p: &MockServer, s: &MockServer) -> String {
+    let m = match r {
+        Err(SwapError::Transient(m)) => m,
+        other => panic!("want Transient, got {other:?}"),
+    };
+    assert!(m.contains(&p.uri()), "primary named: {m}");
+    assert!(m.contains(&s.uri()), "source named: {m}");
+    m
+}
+
+/// Fail-first 1, hidden spend: the source shows the lock spent by a claim, the primary says
+/// unspent. `None` would read as "not spent" (the maker never learns the preimage while the
+/// taker's refund locktime runs out); it must be `Transient`.
+#[tokio::test]
+async fn find_spend_hidden_by_the_primary_is_transient() {
+    let (pre, hash) = new_preimage();
+    let h = htlc(hash);
+    let claim = fs_spender(&fs_claim_witness(&h, &pre), 0);
+    for kind in BOTH_SOURCES {
+        let p = fs_primary(None).await;
+        let s = fs_source(kind, Some(&fs_txid(&claim)), &[(&claim, Some(FS_HEIGHT))]).await;
+        let b = fs_backend(&p, kind, &s);
+        let m = fs_held(b.find_spend(&outpoint(), 700).await, &p, &s);
+        assert!(m.contains("unspent"), "{m}");
+        assert!(m.contains(&fs_txid(&claim)), "{m}");
+    }
+}
+
+/// Fail-first 2, different spender: both say spent, by different transactions (the primary
+/// shows a refund, the source a claim). Today the primary's answer is returned.
+#[tokio::test]
+async fn find_spend_two_different_spenders_is_transient() {
+    let (pre, hash) = new_preimage();
+    let h = htlc(hash);
+    let claim = fs_spender(&fs_claim_witness(&h, &pre), 0);
+    let refund = fs_spender(&fs_refund_witness(&h), 1);
+    assert_ne!(fs_txid(&claim), fs_txid(&refund));
+    for kind in BOTH_SOURCES {
+        let p = fs_primary(Some((&refund, Some(FS_HEIGHT)))).await;
+        let s = fs_source(kind, Some(&fs_txid(&claim)), &[(&claim, Some(FS_HEIGHT))]).await;
+        let b = fs_backend(&p, kind, &s);
+        let m = fs_held(b.find_spend(&outpoint(), 700).await, &p, &s);
+        assert!(
+            m.contains(&fs_txid(&claim)) && m.contains(&fs_txid(&refund)),
+            "{m}"
+        );
+    }
+}
+
+/// Fail-first 2b, same txid with a different witness: a txid does not commit to the
+/// witness, so the primary can show the real spender with another preimage (or a refund's
+/// empty branch). Today the primary's witness is returned.
+#[tokio::test]
+async fn find_spend_same_spender_with_a_different_witness_is_transient() {
+    let (pre, hash) = new_preimage();
+    let (wrong, _) = new_preimage();
+    let h = htlc(hash);
+    let real = fs_spender(&fs_claim_witness(&h, &pre), 0);
+    for lie in [
+        fs_spender(&fs_claim_witness(&h, &wrong), 0),
+        fs_spender(&fs_refund_witness(&h), 0),
+    ] {
+        assert_eq!(fs_txid(&lie), fs_txid(&real));
+        for kind in BOTH_SOURCES {
+            let p = fs_primary(Some((&lie, Some(FS_HEIGHT)))).await;
+            let s = fs_source(kind, Some(&fs_txid(&real)), &[(&real, Some(FS_HEIGHT))]).await;
+            let b = fs_backend(&p, kind, &s);
+            let m = fs_held(b.find_spend(&outpoint(), 700).await, &p, &s);
+            assert!(m.contains("witness"), "{m}");
+        }
+    }
+}
+
+/// Fail-first 3, invented spend: the primary shows a spend the source does not know (the
+/// lock unspent there, and no such transaction). Today it is returned.
+#[tokio::test]
+async fn find_spend_invented_by_the_primary_is_transient() {
+    let (pre, hash) = new_preimage();
+    let h = htlc(hash);
+    let claim = fs_spender(&fs_claim_witness(&h, &pre), 0);
+    for kind in BOTH_SOURCES {
+        let p = fs_primary(Some((&claim, Some(FS_HEIGHT)))).await;
+        // No mock for the spender: wiremock answers 404 (Blockbook answers 400 for an
+        // unknown txid; both are a refusal, not an outage).
+        let s = fs_source(kind, None, &[]).await;
+        let b = fs_backend(&p, kind, &s);
+        let m = fs_held(b.find_spend(&outpoint(), 700).await, &p, &s);
+        assert!(m.contains(&fs_txid(&claim)), "{m}");
+    }
+    // Blockbook's own answer for an unknown txid.
+    let p = fs_primary(Some((&claim, Some(FS_HEIGHT)))).await;
+    let s = fs_source(CrossCheckSource::Blockbook, None, &[]).await;
+    Mock::given(method("GET"))
+        .and(path(format!("/tx/{}", fs_txid(&claim))))
+        .respond_with(ResponseTemplate::new(400).set_body_json(
+            json!({"error": format!("Transaction '{}' not found", fs_txid(&claim))}),
+        ))
+        .mount(&s)
+        .await;
+    let b = fs_backend(&p, CrossCheckSource::Blockbook, &s);
+    fs_held(b.find_spend(&outpoint(), 700).await, &p, &s);
+}
+
+/// Both agree: the spend is returned with the preimage. Where the two place it differently
+/// the lower confirmation count wins (the later block; the mempool over a block), so a
+/// lying primary cannot make a spend look deeper than the source has it.
+#[tokio::test]
+async fn find_spend_both_agree_returns_it_with_the_fewer_confirmations() {
+    let (pre, hash) = new_preimage();
+    let h = htlc(hash);
+    let claim = fs_spender(&fs_claim_witness(&h, &pre), 0);
+    let cases = [
+        (Some(FS_HEIGHT), Some(FS_HEIGHT), Some(FS_HEIGHT)),
+        (Some(FS_HEIGHT), Some(FS_HEIGHT + 1), Some(FS_HEIGHT + 1)),
+        (Some(FS_HEIGHT + 1), Some(FS_HEIGHT), Some(FS_HEIGHT + 1)),
+        (Some(FS_HEIGHT), None, None),
+        (None, Some(FS_HEIGHT), None),
+        (None, None, None),
+    ];
+    for kind in BOTH_SOURCES {
+        for (mine, theirs, want) in cases {
+            let p = fs_primary(Some((&claim, mine))).await;
+            let s = fs_source(kind, Some(&fs_txid(&claim)), &[(&claim, theirs)]).await;
+            let b = fs_backend(&p, kind, &s);
+            let spend = b
+                .find_spend(&outpoint(), 700)
+                .await
+                .unwrap()
+                .expect("spent");
+            assert_eq!(spend.txid, Txid::from_rpc_hex(&fs_txid(&claim)).unwrap());
+            assert_eq!(spend.input_index, 1);
+            assert_eq!(
+                spend.height, want,
+                "{kind:?} primary {mine:?} source {theirs:?}"
+            );
+            assert_eq!(spend.extract_preimage(&hash), Some(pre));
+        }
+        // Both unspent.
+        let p = fs_primary(None).await;
+        let s = fs_source(kind, None, &[]).await;
+        assert_eq!(
+            fs_backend(&p, kind, &s)
+                .find_spend(&outpoint(), 700)
+                .await
+                .unwrap(),
+            None
+        );
+    }
+}
+
+/// The source has the spender in its index before its lock view marks the output spent
+/// (or, on Blockbook, marks it spent without naming the spender): the spender is still
+/// read and agreed.
+#[tokio::test]
+async fn find_spend_agrees_when_the_source_names_no_spender_but_knows_it() {
+    let (pre, hash) = new_preimage();
+    let h = htlc(hash);
+    let claim = fs_spender(&fs_claim_witness(&h, &pre), 0);
+    for kind in BOTH_SOURCES {
+        let p = fs_primary(Some((&claim, None))).await;
+        let s = fs_source(kind, None, &[(&claim, None)]).await;
+        let spend = fs_backend(&p, kind, &s)
+            .find_spend(&outpoint(), 700)
+            .await
+            .unwrap()
+            .expect("spent");
+        assert_eq!(spend.extract_preimage(&hash), Some(pre));
+    }
+    let p = fs_primary(Some((&claim, Some(FS_HEIGHT)))).await;
+    let s = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(lock_tx_path(CrossCheckSource::Blockbook)))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"vout": [
+            {"n": 0, "value": "5"}, {"n": 1, "value": "20000", "spent": true}]})))
+        .mount(&s)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/tx/{}", fs_txid(&claim))))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fs_source_tx(
+            CrossCheckSource::Blockbook,
+            &claim,
+            Some(FS_HEIGHT),
+        )))
+        .mount(&s)
+        .await;
+    let spend = fs_backend(&p, CrossCheckSource::Blockbook, &s)
+        .find_spend(&outpoint(), 700)
+        .await
+        .unwrap()
+        .expect("spent");
+    assert_eq!(spend.height, Some(FS_HEIGHT));
+}
+
+/// Blockbook's normalized transaction carries `hex` for confirmed transactions; for a
+/// mempool spender without it, the backend-native `GET /tx-specific/{txid}` `hex` is read.
+#[tokio::test]
+async fn find_spend_blockbook_mempool_spender_without_hex_reads_tx_specific() {
+    let (pre, hash) = new_preimage();
+    let h = htlc(hash);
+    let claim = fs_spender(&fs_claim_witness(&h, &pre), 0);
+    let p = fs_primary(Some((&claim, None))).await;
+    let s = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(lock_tx_path(CrossCheckSource::Blockbook)))
+        .respond_with(cc_tx(CrossCheckSource::Blockbook, Some(&fs_txid(&claim))))
+        .mount(&s)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/tx/{}", fs_txid(&claim))))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(
+                json!({"txid": fs_txid(&claim), "blockHeight": -1, "confirmations": 0}),
+            ),
+        )
+        .mount(&s)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/tx-specific/{}", fs_txid(&claim))))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(
+                json!({"txid": fs_txid(&claim), "hex": hex::encode(serialize(&claim))}),
+            ),
+        )
+        .mount(&s)
+        .await;
+    let spend = fs_backend(&p, CrossCheckSource::Blockbook, &s)
+        .find_spend(&outpoint(), 700)
+        .await
+        .unwrap()
+        .expect("spent");
+    assert_eq!(spend.height, None);
+    assert_eq!(spend.extract_preimage(&hash), Some(pre));
+}
+
+/// Source down (429, 5xx, unreachable, malformed): the LTC claim-time rule, not the lock
+/// rule. One warning naming the source and the outpoint, then the primary's answer, as
+/// today: failing closed here would hold the maker's refund (`on_maker_refundable` reads
+/// `find_spend` first) and its preimage watch behind a rate-limited third-party explorer.
+#[tokio::test]
+async fn find_spend_source_down_warns_and_returns_the_primarys_answer() {
+    let buf = LogBuf::default();
+    let w = buf.clone();
+    let sub = tracing_subscriber::fmt()
+        .with_writer(move || w.clone())
+        .with_ansi(false)
+        .finish();
+    let _guard = tracing::subscriber::set_default(sub);
+
+    let (pre, hash) = new_preimage();
+    let h = htlc(hash);
+    let claim = fs_spender(&fs_claim_witness(&h, &pre), 0);
+    let mut warned = 0;
+    for resp in [
+        ResponseTemplate::new(429),
+        ResponseTemplate::new(503),
+        ResponseTemplate::new(200).set_body_string("<html>"),
+    ] {
+        for mine in [None, Some((&claim, Some(FS_HEIGHT)))] {
+            let p = fs_primary(mine).await;
+            let s = lock_source(CrossCheckSource::Blockbook, resp.clone()).await;
+            let b = fs_backend(&p, CrossCheckSource::Blockbook, &s);
+            let got = b.find_spend(&outpoint(), 700).await.unwrap();
+            assert_eq!(
+                got.map(|s| s.txid),
+                mine.map(|(t, _)| Txid::from_rpc_hex(&fs_txid(t)).unwrap())
+            );
+            warned += 1;
+        }
+    }
+    // A primary spend the source knows nothing reliable about (its spender read is down).
+    let p = fs_primary(Some((&claim, Some(FS_HEIGHT)))).await;
+    let s = fs_source(CrossCheckSource::BlockCypher, None, &[]).await;
+    Mock::given(method("GET"))
+        .and(path(format!("/txs/{}", fs_txid(&claim))))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&s)
+        .await;
+    let b = fs_backend(&p, CrossCheckSource::BlockCypher, &s);
+    assert!(b.find_spend(&outpoint(), 700).await.unwrap().is_some());
+    warned += 1;
+    // Unreachable.
+    let p = fs_primary(None).await;
+    let b = cc_mainnet(&p).with_claim_crosscheck_at(CrossCheckSource::Blockbook, dead_url());
+    assert_eq!(b.find_spend(&outpoint(), 700).await.unwrap(), None);
+    warned += 1;
+
+    let log = buf.text();
+    let lines: Vec<&str> = log
+        .lines()
+        .filter(|l| l.contains("WARN") && l.contains("find_spend cross-check unavailable"))
+        .collect();
+    assert_eq!(lines.len(), warned, "{log}");
+    for l in lines {
+        assert!(l.contains(&outpoint().to_string()), "outpoint: {l}");
+    }
+}
+
+/// The source is asked once per primary answer while that answer stands (within one LTC
+/// block time): the engine polls every 5 s and BlockCypher's keyless quota is 100/hour.
+#[tokio::test]
+async fn find_spend_asks_the_source_once_per_primary_answer() {
+    let (pre, hash) = new_preimage();
+    let h = htlc(hash);
+    let claim = fs_spender(&fs_claim_witness(&h, &pre), 0);
+    for kind in BOTH_SOURCES {
+        let p = fs_primary(Some((&claim, Some(FS_HEIGHT)))).await;
+        let s = fs_source(kind, Some(&fs_txid(&claim)), &[(&claim, Some(FS_HEIGHT))]).await;
+        let b = fs_backend(&p, kind, &s);
+        for _ in 0..3 {
+            assert!(b.find_spend(&outpoint(), 700).await.unwrap().is_some());
+        }
+        assert_eq!(
+            requests_to(&s).await,
+            2,
+            "{kind:?}: lock view and spender, once"
+        );
+        // A disagreement is reused the same way, and stays a disagreement.
+        let p = fs_primary(None).await;
+        let s = fs_source(kind, Some(&fs_txid(&claim)), &[(&claim, Some(FS_HEIGHT))]).await;
+        let b = fs_backend(&p, kind, &s);
+        for _ in 0..3 {
+            fs_held(b.find_spend(&outpoint(), 700).await, &p, &s);
+        }
+        assert_eq!(requests_to(&s).await, 1, "{kind:?}: lock view once");
+    }
+}
+
+/// Opt-in off: today's read exactly, the primary's answer and requests, nothing to the
+/// source, even where the source would disagree.
+#[tokio::test]
+async fn find_spend_crosscheck_off_is_todays_read() {
+    let (pre, hash) = new_preimage();
+    let h = htlc(hash);
+    let claim = fs_spender(&fs_claim_witness(&h, &pre), 0);
+    let s = fs_source(CrossCheckSource::Blockbook, None, &[]).await;
+    for (mine, want_reqs) in [(None, 1), (Some((&claim, Some(FS_HEIGHT))), 2)] {
+        let p = fs_primary(mine).await;
+        for b in [cc_mainnet(&p), cc_mainnet(&p).with_claim_crosscheck(None)] {
+            let got = b.find_spend(&outpoint(), 700).await.unwrap();
+            assert_eq!(got.as_ref().map(|s| s.height), mine.map(|(_, h)| h));
+        }
+        let seen: Vec<String> = p
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| format!("{} {}", r.method, r.url.path()))
+            .collect();
+        let o = outpoint();
+        let mut want = vec![format!("GET /tx/{}/outspend/{}", o.txid, o.vout)];
+        if mine.is_some() {
+            want.push(format!("GET /tx/{}", fs_txid(&claim)));
+        }
+        let want: Vec<String> = want.iter().chain(want.iter()).cloned().collect();
+        assert_eq!(seen.len(), 2 * want_reqs);
+        assert_eq!(seen, want);
+    }
+    assert_eq!(requests_to(&s).await, 0);
+}
