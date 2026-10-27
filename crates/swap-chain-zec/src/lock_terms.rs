@@ -17,17 +17,7 @@
 //! cross-checked [`ZecBackend`] (the stubs serve what the mock chain holds, and the second
 //! operator what the test makes it say).
 
-use std::sync::{Arc, Mutex};
-
-use async_trait::async_trait;
-use divi_swap::api::{Direction, Offer};
-use divi_swap::backend::TipHeader;
-use divi_swap::mock::{MockBackend, MockChain, TxKind};
-use divi_swap::{
-    Amount, Chain, ChainBackend, ClaimSizes, FeeBump, Funding, HtlcParams, LockedOutput, Maker,
-    Outpoint, Profile, Result, SignedTx, SpendInfo, Store, SwapConfig, SwapError, SwapState, Taker,
-    TakerState, Txid,
-};
+use divi_swap::{Amount, ChainBackend, HtlcParams, LockedOutput, Outpoint, SwapError, Txid};
 
 use crate::address::{htlc_script_pubkey, TransparentAddress};
 use crate::lwd_stub::{raw_tx, Lightwalletd};
@@ -214,310 +204,337 @@ async fn no_lock_on_the_primary_asks_nothing_of_the_second() {
 
 // ---- The engine at both acting points -----------------------------------------------------
 
-const T0: u32 = 1_800_000_000;
-const FUNDS: u64 = 2_000_000_000;
-/// The stubs' tip in the engine tests: above any confirmation count a run reaches.
-const STUB_TIP: u64 = 10_000;
+/// `#[cfg(test)]` again (the module is test-only already) so the source scan in
+/// `divi-swap`'s `taker_floor_entry_points` reads the `Taker::new` below as test code.
+#[cfg(test)]
+mod engine {
+    use std::sync::{Arc, Mutex};
 
-/// What the second operator shows of a lock the mock chain (and the primary) holds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Second {
-    Honest,
-    OtherScript,
-    Short,
-    NoTx,
-    NoVout,
-    Down,
-}
+    use async_trait::async_trait;
+    use divi_swap::api::{Direction, Offer};
+    use divi_swap::backend::TipHeader;
+    use divi_swap::mock::{MockBackend, MockChain, TxKind};
+    use divi_swap::{
+        Chain, ClaimSizes, FeeBump, Funding, Maker, Profile, Result, SignedTx, SpendInfo, Store,
+        SwapConfig, SwapState, Taker, TakerState,
+    };
 
-const LIES: [Second; 5] = [
-    Second::OtherScript,
-    Second::Short,
-    Second::NoTx,
-    Second::NoVout,
-    Second::Down,
-];
+    use super::*;
 
-/// A ZEC [`MockBackend`] whose `htlc_output` is a cross-checked [`ZecBackend`]'s, over two
-/// stubs that serve the mock chain's lock (the primary as it is, the second per [`Second`]).
-#[derive(Clone)]
-struct CrossRead {
-    mock: MockBackend,
-    zec: Arc<ZecBackend>,
-    primary: Arc<Lightwalletd>,
-    second: Arc<Lightwalletd>,
-    shows: Arc<Mutex<Second>>,
-}
+    const T0: u32 = 1_800_000_000;
+    const FUNDS: u64 = 2_000_000_000;
+    /// The stubs' tip in the engine tests: above any confirmation count a run reaches.
+    const STUB_TIP: u64 = 10_000;
 
-impl CrossRead {
-    fn new(mock: MockBackend) -> Self {
-        let (primary, second) = (Lightwalletd::start(STUB_TIP), Lightwalletd::start(STUB_TIP));
-        let zec = checked(&primary, &second);
-        CrossRead {
-            mock,
-            zec: Arc::new(zec),
-            primary: Arc::new(primary),
-            second: Arc::new(second),
-            shows: Arc::new(Mutex::new(Second::Honest)),
-        }
+    /// What the second operator shows of a lock the mock chain (and the primary) holds.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Second {
+        Honest,
+        OtherScript,
+        Short,
+        NoTx,
+        NoVout,
+        Down,
     }
 
-    fn shows(&self, s: Second) {
-        *self.shows.lock().unwrap() = s;
-        self.second.set_down(s == Second::Down);
+    const LIES: [Second; 5] = [
+        Second::OtherScript,
+        Second::Short,
+        Second::NoTx,
+        Second::NoVout,
+        Second::Down,
+    ];
+
+    /// A ZEC [`MockBackend`] whose `htlc_output` is a cross-checked [`ZecBackend`]'s, over two
+    /// stubs that serve the mock chain's lock (the primary as it is, the second per [`Second`]).
+    #[derive(Clone)]
+    struct CrossRead {
+        mock: MockBackend,
+        zec: Arc<ZecBackend>,
+        primary: Arc<Lightwalletd>,
+        second: Arc<Lightwalletd>,
+        shows: Arc<Mutex<Second>>,
     }
 
-    /// Serve the mock chain's view of `at` on both stubs.
-    fn serve(&self, htlc: &HtlcParams, at: &Outpoint, real: Option<LockedOutput>) {
-        let Some(lo) = real else {
-            self.primary.drop_tx(at.txid.0);
-            self.second.drop_tx(at.txid.0);
-            return;
-        };
-        let height = match lo.confirmations {
-            0 => 0,
-            c => STUB_TIP + 1 - u64::from(c),
-        };
-        let outputs = |value: u64, spk: Vec<u8>| {
-            let mut v = vec![(FILLER, other_spk()); at.vout as usize];
-            v.push((value, spk));
-            raw_tx(&v)
-        };
-        let (zat, spk) = (lo.amount.to_sat(), agreed_spk(htlc));
-        self.primary
-            .put_tx(at.txid.0, outputs(zat, spk.clone()), height);
-        match *self.shows.lock().unwrap() {
-            Second::Honest | Second::Down => {
-                self.second.put_tx(at.txid.0, outputs(zat, spk), height)
-            }
-            Second::OtherScript => self
-                .second
-                .put_tx(at.txid.0, outputs(zat, other_spk()), height),
-            Second::Short => self.second.put_tx(at.txid.0, outputs(zat - 1, spk), height),
-            Second::NoTx => self.second.drop_tx(at.txid.0),
-            Second::NoVout => {
-                let v = vec![(FILLER, other_spk()); at.vout as usize];
-                self.second.put_tx(at.txid.0, raw_tx(&v), height)
+    impl CrossRead {
+        fn new(mock: MockBackend) -> Self {
+            let (primary, second) = (Lightwalletd::start(STUB_TIP), Lightwalletd::start(STUB_TIP));
+            let zec = checked(&primary, &second);
+            CrossRead {
+                mock,
+                zec: Arc::new(zec),
+                primary: Arc::new(primary),
+                second: Arc::new(second),
+                shows: Arc::new(Mutex::new(Second::Honest)),
             }
         }
-    }
-}
 
-#[async_trait]
-impl ChainBackend for CrossRead {
-    fn chain(&self) -> Chain {
-        self.mock.chain()
-    }
-    fn pubkey(&self) -> [u8; 33] {
-        self.mock.pubkey()
-    }
-    async fn tip_height(&self) -> Result<u64> {
-        self.mock.tip_height().await
-    }
-    async fn tip_hash(&self) -> Result<String> {
-        self.mock.tip_hash().await
-    }
-    async fn median_time_past(&self) -> Result<u32> {
-        self.mock.median_time_past().await
-    }
-    fn refund_final(&self, mtp: u32, locktime: u32) -> bool {
-        self.mock.refund_final(mtp, locktime)
-    }
-    async fn tip_header(&self) -> Result<TipHeader> {
-        self.mock.tip_header().await
-    }
-    async fn in_best_chain(&self, height: u64, hash: &str) -> Result<bool> {
-        self.mock.in_best_chain(height, hash).await
-    }
-    fn target_block_secs(&self) -> Option<u32> {
-        self.mock.target_block_secs()
-    }
-    async fn build_funding(&self, htlc: &HtlcParams, amount: Amount) -> Result<Funding> {
-        self.mock.build_funding(htlc, amount).await
-    }
-    async fn build_claim(
-        &self,
-        htlc: &HtlcParams,
-        at: &Outpoint,
-        amount: Amount,
-        preimage: &[u8; 32],
-    ) -> Result<SignedTx> {
-        self.mock.build_claim(htlc, at, amount, preimage).await
-    }
-    async fn build_refund(
-        &self,
-        htlc: &HtlcParams,
-        at: &Outpoint,
-        amount: Amount,
-    ) -> Result<SignedTx> {
-        self.mock.build_refund(htlc, at, amount).await
-    }
-    async fn broadcast(&self, tx: &SignedTx) -> Result<Txid> {
-        self.mock.broadcast(tx).await
-    }
-    async fn confirmations(&self, txid: &Txid) -> Result<Option<u32>> {
-        self.mock.confirmations(txid).await
-    }
-    async fn htlc_output(&self, htlc: &HtlcParams, at: &Outpoint) -> Result<Option<LockedOutput>> {
-        let real = self.mock.htlc_output(htlc, at).await?;
-        self.serve(htlc, at, real);
-        self.zec.htlc_output(htlc, at).await
-    }
-    async fn find_spend(&self, outpoint: &Outpoint, from_height: u64) -> Result<Option<SpendInfo>> {
-        self.mock.find_spend(outpoint, from_height).await
-    }
-    async fn release_dead_lock(&self, lock: &SignedTx) -> Result<bool> {
-        self.mock.release_dead_lock(lock).await
-    }
-    async fn spendable(&self) -> Result<Option<Amount>> {
-        self.mock.spendable().await
-    }
-    fn fee_bump(&self) -> FeeBump {
-        self.mock.fee_bump()
-    }
-    async fn claim_feerate(&self) -> Result<Option<u64>> {
-        self.mock.claim_feerate().await
-    }
-    fn claim_sizes(&self, htlc: &HtlcParams) -> Option<ClaimSizes> {
-        self.mock.claim_sizes(htlc)
-    }
-    fn primary_only(&self) -> Option<Arc<dyn ChainBackend>> {
-        self.mock.primary_only()
-    }
-}
+        fn shows(&self, s: Second) {
+            *self.shows.lock().unwrap() = s;
+            self.second.set_down(s == Second::Down);
+        }
 
-struct World {
-    divi: MockChain,
-    zec: MockChain,
-    mdivi: MockBackend,
-    mzec: CrossRead,
-    tzec: CrossRead,
-    store: Store,
-    maker: Maker,
-    taker: Taker,
-}
-
-impl World {
-    fn new(dir: Direction) -> World {
-        let divi = MockChain::new(Chain::Divi, T0, 60);
-        let zec = MockChain::new(Chain::Zec, T0, 75);
-        let mdivi = divi.backend(1, Amount(FUNDS));
-        let mzec = CrossRead::new(zec.backend(2, Amount(FUNDS)));
-        let tdivi = divi.backend(3, Amount(FUNDS));
-        let tzec = CrossRead::new(zec.backend(4, Amount(FUNDS)));
-        let store = Store::in_memory().unwrap();
-        let maker = Maker::new(
-            SwapConfig::profile(Profile::Testnet),
-            Arc::new(mdivi.clone()),
-            Arc::new(mzec.clone()),
-            store.clone(),
-            vec![Offer {
-                id: "o".into(),
-                direction: dir,
-                counter_chain: Chain::Zec,
-                divi_sats_per_btc: 50_000_000_000,
-                min_btc_sats: 10_000,
-                max_btc_sats: 5_000_000,
-            }],
-        )
-        .unwrap();
-        let taker = Taker::new(Arc::new(tdivi), Arc::new(tzec.clone()), store.clone());
-        World {
-            divi,
-            zec,
-            mdivi,
-            mzec,
-            tzec,
-            store,
-            maker,
-            taker,
+        /// Serve the mock chain's view of `at` on both stubs.
+        fn serve(&self, htlc: &HtlcParams, at: &Outpoint, real: Option<LockedOutput>) {
+            let Some(lo) = real else {
+                self.primary.drop_tx(at.txid.0);
+                self.second.drop_tx(at.txid.0);
+                return;
+            };
+            let height = match lo.confirmations {
+                0 => 0,
+                c => STUB_TIP + 1 - u64::from(c),
+            };
+            let outputs = |value: u64, spk: Vec<u8>| {
+                let mut v = vec![(FILLER, other_spk()); at.vout as usize];
+                v.push((value, spk));
+                raw_tx(&v)
+            };
+            let (zat, spk) = (lo.amount.to_sat(), agreed_spk(htlc));
+            self.primary
+                .put_tx(at.txid.0, outputs(zat, spk.clone()), height);
+            match *self.shows.lock().unwrap() {
+                Second::Honest | Second::Down => {
+                    self.second.put_tx(at.txid.0, outputs(zat, spk), height)
+                }
+                Second::OtherScript => {
+                    self.second
+                        .put_tx(at.txid.0, outputs(zat, other_spk()), height)
+                }
+                Second::Short => self.second.put_tx(at.txid.0, outputs(zat - 1, spk), height),
+                Second::NoTx => self.second.drop_tx(at.txid.0),
+                Second::NoVout => {
+                    let v = vec![(FILLER, other_spk()); at.vout as usize];
+                    self.second.put_tx(at.txid.0, raw_tx(&v), height)
+                }
+            }
         }
     }
 
-    /// Quote, accept and lock the taker leg; returns (taker swap id, maker swap id).
-    async fn through_taker_lock(&self) -> (String, String) {
-        let q = self.maker.quote("o", 1_000_000).await.unwrap();
-        let (tid, req) = self.taker.prepare(&q).await.unwrap();
-        let v = self.maker.accept(req).await.unwrap();
-        self.taker.accepted(&tid, &v).await.unwrap();
-        let notice = self.taker.lock(&tid).await.unwrap();
-        let mid = self.maker.notify_lock(&v.id, notice).await.unwrap().id;
-        (tid, mid)
-    }
-
-    async fn run(&self, tid: &str, mid: &str, rounds: usize) {
-        for _ in 0..rounds {
-            self.divi.mine(1);
-            self.zec.mine(1);
-            let _ = self.maker.tick().await;
-            let v = self.maker.view(mid).unwrap();
-            let _ = self.taker.step(tid, v.as_ref()).await;
+    #[async_trait]
+    impl ChainBackend for CrossRead {
+        fn chain(&self) -> Chain {
+            self.mock.chain()
+        }
+        fn pubkey(&self) -> [u8; 33] {
+            self.mock.pubkey()
+        }
+        async fn tip_height(&self) -> Result<u64> {
+            self.mock.tip_height().await
+        }
+        async fn tip_hash(&self) -> Result<String> {
+            self.mock.tip_hash().await
+        }
+        async fn median_time_past(&self) -> Result<u32> {
+            self.mock.median_time_past().await
+        }
+        fn refund_final(&self, mtp: u32, locktime: u32) -> bool {
+            self.mock.refund_final(mtp, locktime)
+        }
+        async fn tip_header(&self) -> Result<TipHeader> {
+            self.mock.tip_header().await
+        }
+        async fn in_best_chain(&self, height: u64, hash: &str) -> Result<bool> {
+            self.mock.in_best_chain(height, hash).await
+        }
+        fn target_block_secs(&self) -> Option<u32> {
+            self.mock.target_block_secs()
+        }
+        async fn build_funding(&self, htlc: &HtlcParams, amount: Amount) -> Result<Funding> {
+            self.mock.build_funding(htlc, amount).await
+        }
+        async fn build_claim(
+            &self,
+            htlc: &HtlcParams,
+            at: &Outpoint,
+            amount: Amount,
+            preimage: &[u8; 32],
+        ) -> Result<SignedTx> {
+            self.mock.build_claim(htlc, at, amount, preimage).await
+        }
+        async fn build_refund(
+            &self,
+            htlc: &HtlcParams,
+            at: &Outpoint,
+            amount: Amount,
+        ) -> Result<SignedTx> {
+            self.mock.build_refund(htlc, at, amount).await
+        }
+        async fn broadcast(&self, tx: &SignedTx) -> Result<Txid> {
+            self.mock.broadcast(tx).await
+        }
+        async fn confirmations(&self, txid: &Txid) -> Result<Option<u32>> {
+            self.mock.confirmations(txid).await
+        }
+        async fn htlc_output(
+            &self,
+            htlc: &HtlcParams,
+            at: &Outpoint,
+        ) -> Result<Option<LockedOutput>> {
+            let real = self.mock.htlc_output(htlc, at).await?;
+            self.serve(htlc, at, real);
+            self.zec.htlc_output(htlc, at).await
+        }
+        async fn find_spend(
+            &self,
+            outpoint: &Outpoint,
+            from_height: u64,
+        ) -> Result<Option<SpendInfo>> {
+            self.mock.find_spend(outpoint, from_height).await
+        }
+        async fn release_dead_lock(&self, lock: &SignedTx) -> Result<bool> {
+            self.mock.release_dead_lock(lock).await
+        }
+        async fn spendable(&self) -> Result<Option<Amount>> {
+            self.mock.spendable().await
+        }
+        fn fee_bump(&self) -> FeeBump {
+            self.mock.fee_bump()
+        }
+        async fn claim_feerate(&self) -> Result<Option<u64>> {
+            self.mock.claim_feerate().await
+        }
+        fn claim_sizes(&self, htlc: &HtlcParams) -> Option<ClaimSizes> {
+            self.mock.claim_sizes(htlc)
+        }
+        fn primary_only(&self) -> Option<Arc<dyn ChainBackend>> {
+            self.mock.primary_only()
         }
     }
 
-    fn maker_state(&self, mid: &str) -> (SwapState, Option<String>) {
-        let r = self.store.get_maker_swap(mid).unwrap().unwrap();
-        (r.state, r.last_error)
+    struct World {
+        divi: MockChain,
+        zec: MockChain,
+        mdivi: MockBackend,
+        mzec: CrossRead,
+        tzec: CrossRead,
+        store: Store,
+        maker: Maker,
+        taker: Taker,
     }
-}
 
-/// Control: with the cross-check on and the second operator honest, a swap completes in
-/// both directions (ZEC as the taker leg, then as the maker leg).
-#[tokio::test]
-async fn agreeing_operators_complete_the_swap_both_ways() {
-    for dir in [Direction::TakerPaysBtc, Direction::TakerPaysDivi] {
-        let w = World::new(dir);
-        let (tid, mid) = w.through_taker_lock().await;
-        w.run(&tid, &mid, 80).await;
-        assert_eq!(w.maker_state(&mid).0, SwapState::Done, "{dir:?}");
-        let t = w.store.get_taker_swap(&tid).unwrap().unwrap();
-        assert_eq!(t.state, TakerState::Done, "{dir:?}");
+    impl World {
+        fn new(dir: Direction) -> World {
+            let divi = MockChain::new(Chain::Divi, T0, 60);
+            let zec = MockChain::new(Chain::Zec, T0, 75);
+            let mdivi = divi.backend(1, Amount(FUNDS));
+            let mzec = CrossRead::new(zec.backend(2, Amount(FUNDS)));
+            let tdivi = divi.backend(3, Amount(FUNDS));
+            let tzec = CrossRead::new(zec.backend(4, Amount(FUNDS)));
+            let store = Store::in_memory().unwrap();
+            let maker = Maker::new(
+                SwapConfig::profile(Profile::Testnet),
+                Arc::new(mdivi.clone()),
+                Arc::new(mzec.clone()),
+                store.clone(),
+                vec![Offer {
+                    id: "o".into(),
+                    direction: dir,
+                    counter_chain: Chain::Zec,
+                    divi_sats_per_btc: 50_000_000_000,
+                    min_btc_sats: 10_000,
+                    max_btc_sats: 5_000_000,
+                }],
+            )
+            .unwrap();
+            let taker = Taker::new(Arc::new(tdivi), Arc::new(tzec.clone()), store.clone());
+            World {
+                divi,
+                zec,
+                mdivi,
+                mzec,
+                tzec,
+                store,
+                maker,
+                taker,
+            }
+        }
+
+        /// Quote, accept and lock the taker leg; returns (taker swap id, maker swap id).
+        async fn through_taker_lock(&self) -> (String, String) {
+            let q = self.maker.quote("o", 1_000_000).await.unwrap();
+            let (tid, req) = self.taker.prepare(&q).await.unwrap();
+            let v = self.maker.accept(req).await.unwrap();
+            self.taker.accepted(&tid, &v).await.unwrap();
+            let notice = self.taker.lock(&tid).await.unwrap();
+            let mid = self.maker.notify_lock(&v.id, notice).await.unwrap().id;
+            (tid, mid)
+        }
+
+        async fn run(&self, tid: &str, mid: &str, rounds: usize) {
+            for _ in 0..rounds {
+                self.divi.mine(1);
+                self.zec.mine(1);
+                let _ = self.maker.tick().await;
+                let v = self.maker.view(mid).unwrap();
+                let _ = self.taker.step(tid, v.as_ref()).await;
+            }
+        }
+
+        fn maker_state(&self, mid: &str) -> (SwapState, Option<String>) {
+            let r = self.store.get_maker_swap(mid).unwrap().unwrap();
+            (r.state, r.last_error)
+        }
     }
-}
 
-/// Maker, funding point (ZEC is the taker leg): a taker lock the second operator does not
-/// show as agreed is never funded against; the maker waits, naming the refusal.
-#[tokio::test]
-async fn the_maker_does_not_fund_against_a_lock_the_second_operator_disputes() {
-    for lie in LIES {
-        let w = World::new(Direction::TakerPaysBtc);
-        w.mzec.shows(lie);
-        let (tid, mid) = w.through_taker_lock().await;
-        w.run(&tid, &mid, 30).await;
-        let (state, why) = w.maker_state(&mid);
-        assert_eq!(w.mdivi.funding_calls(), 0, "{lie:?}: the maker funded");
-        assert!(
-            matches!(state, SwapState::Accepted | SwapState::TakerLockSeen),
-            "{lie:?}: {state:?}"
-        );
-        let why = why.unwrap_or_default();
-        assert!(
-            why.contains("zec lock cross-check FAILED"),
-            "{lie:?}: {why}"
-        );
+    /// Control: with the cross-check on and the second operator honest, a swap completes in
+    /// both directions (ZEC as the taker leg, then as the maker leg).
+    #[tokio::test]
+    async fn agreeing_operators_complete_the_swap_both_ways() {
+        for dir in [Direction::TakerPaysBtc, Direction::TakerPaysDivi] {
+            let w = World::new(dir);
+            let (tid, mid) = w.through_taker_lock().await;
+            w.run(&tid, &mid, 80).await;
+            assert_eq!(w.maker_state(&mid).0, SwapState::Done, "{dir:?}");
+            let t = w.store.get_taker_swap(&tid).unwrap().unwrap();
+            assert_eq!(t.state, TakerState::Done, "{dir:?}");
+        }
     }
-}
 
-/// Taker, claim point (ZEC is the maker leg): a maker lock the second operator does not show
-/// as agreed is never claimed, so the preimage stays secret.
-#[tokio::test]
-async fn the_taker_does_not_claim_a_lock_the_second_operator_disputes() {
-    for lie in LIES {
-        let w = World::new(Direction::TakerPaysDivi);
-        w.tzec.shows(lie);
-        let (tid, mid) = w.through_taker_lock().await;
-        w.run(&tid, &mid, 40).await;
-        assert_eq!(
-            w.zec.attempts(TxKind::Claim),
-            0,
-            "{lie:?}: the taker claimed"
-        );
-        let t = w.store.get_taker_swap(&tid).unwrap().unwrap();
-        assert!(t.maker_leg_claim.is_none(), "{lie:?}");
-        let why = t.last_error.unwrap_or_default();
-        assert!(
-            why.contains("zec lock cross-check FAILED"),
-            "{lie:?}: {why}"
-        );
+    /// Maker, funding point (ZEC is the taker leg): a taker lock the second operator does not
+    /// show as agreed is never funded against; the maker waits, naming the refusal.
+    #[tokio::test]
+    async fn the_maker_does_not_fund_against_a_lock_the_second_operator_disputes() {
+        for lie in LIES {
+            let w = World::new(Direction::TakerPaysBtc);
+            w.mzec.shows(lie);
+            let (tid, mid) = w.through_taker_lock().await;
+            w.run(&tid, &mid, 30).await;
+            let (state, why) = w.maker_state(&mid);
+            assert_eq!(w.mdivi.funding_calls(), 0, "{lie:?}: the maker funded");
+            assert!(
+                matches!(state, SwapState::Accepted | SwapState::TakerLockSeen),
+                "{lie:?}: {state:?}"
+            );
+            let why = why.unwrap_or_default();
+            assert!(
+                why.contains("zec lock cross-check FAILED"),
+                "{lie:?}: {why}"
+            );
+        }
+    }
+
+    /// Taker, claim point (ZEC is the maker leg): a maker lock the second operator does not show
+    /// as agreed is never claimed, so the preimage stays secret.
+    #[tokio::test]
+    async fn the_taker_does_not_claim_a_lock_the_second_operator_disputes() {
+        for lie in LIES {
+            let w = World::new(Direction::TakerPaysDivi);
+            w.tzec.shows(lie);
+            let (tid, mid) = w.through_taker_lock().await;
+            w.run(&tid, &mid, 40).await;
+            assert_eq!(
+                w.zec.attempts(TxKind::Claim),
+                0,
+                "{lie:?}: the taker claimed"
+            );
+            let t = w.store.get_taker_swap(&tid).unwrap().unwrap();
+            assert!(t.maker_leg_claim.is_none(), "{lie:?}");
+            let why = t.last_error.unwrap_or_default();
+            assert!(
+                why.contains("zec lock cross-check FAILED"),
+                "{lie:?}: {why}"
+            );
+        }
     }
 }
