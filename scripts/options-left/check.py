@@ -30,6 +30,9 @@ import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "lib"))
+import node_ports  # noqa: E402  (scripts/lib: a node whose ports were taken starts again on new ones)
+
 IRONDIVID, DIVID, PORT_BASE, WORK = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
 HOST = "127.0.0.2"
 DEAD = PORT_BASE + 49  # each node's only -connect peer; nothing listens there
@@ -170,8 +173,9 @@ class Node:
         self.err = base + ".err"
         self.out = base + ".out"
         with open(self.out, "w") as o, open(self.err, "w") as e:
-            self.proc = subprocess.Popen([self.binary, f"-datadir={self.dir}", *args], cwd=WORK,
-                                         stdout=o, stderr=e, stdin=subprocess.DEVNULL, start_new_session=True)
+            self.proc = node_ports.popen(self, [self.binary, f"-datadir={self.dir}", *args], cwd=WORK,
+                                         stdout=o, stderr=e, stdin=subprocess.DEVNULL, start_new_session=True,
+                                         work=WORK)
         note_pid(self.proc.pid)
 
     def answers(self):

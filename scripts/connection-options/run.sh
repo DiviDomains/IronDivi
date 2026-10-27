@@ -25,7 +25,9 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 for b in "$IRD" "$DIVID"; do
   [ -x "$b" ] || { echo "not executable: $b" >&2; exit 255; }
 done
-for p in $(seq "$BASE" $((BASE + 29))); do
+# The nodes' own ports (BASE .. BASE+3) move when taken (scripts/lib/node_ports.py); the -bind, -whitebind and
+# stand-in ports cannot
+for p in $(seq $((BASE + 4)) $((BASE + 29))); do
   # a TIME-WAIT left by an earlier run does not stop a listener (SO_REUSEADDR)
   if ss -Htan exclude time-wait "( sport = :$p or dport = :$p )" 2>/dev/null | grep -q .; then
     echo "port $p is in use" >&2

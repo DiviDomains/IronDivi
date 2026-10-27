@@ -23,6 +23,9 @@ import time
 import urllib.error
 import urllib.request
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "lib"))
+import node_ports  # noqa: E402  (scripts/lib: a node whose ports were taken starts again on new ones)
+
 IRONDIVID, DIVID, PORT_BASE, WORK = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
 HOST = "127.0.0.2"
 RPC_TIMEOUT = 60
@@ -99,12 +102,12 @@ class Node:
             f.write("\n".join(lines) + "\n")
         if prepare:
             prepare(self)
-        for p in (self.p2p, self.rpcport):
-            if not wait_for(lambda: port_free(p), 60, 0.5):
-                raise RuntimeError(f"port {p} still taken")
+        # the previous node's ports, a moment after it stopped; one another process holds is node_ports' to move
+        for p in (node_ports.now(self.p2p), node_ports.now(self.rpcport)):
+            wait_for(lambda: port_free(p), 60, 0.5)
         self.out = open(os.path.join(WORK, f"{kind}-{Node.runs}.out"), "ab")
-        self.proc = subprocess.Popen([self.binary, f"-datadir={self.dir}"] + list(args), cwd=self.dir,
-                                     stdout=self.out, stderr=subprocess.STDOUT, start_new_session=True)
+        self.proc = node_ports.popen(self, [self.binary, f"-datadir={self.dir}"] + list(args), cwd=self.dir,
+                                     stdout=self.out, stderr=subprocess.STDOUT, start_new_session=True, work=WORK)
         with open(os.path.join(WORK, "pids"), "a") as f:
             f.write(f"{self.proc.pid}\n")
 

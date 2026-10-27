@@ -47,6 +47,9 @@ import urllib.error
 import urllib.request
 from decimal import Decimal
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "lib"))
+import node_ports  # noqa: E402  (scripts/lib: a node whose ports were taken starts again on new ones)
+
 IRONDIVID, DIVID, PORT_BASE, WORK = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
 HOST = "127.0.0.2"
 RPC_TIMEOUT = 120
@@ -271,8 +274,8 @@ class Node:
 
     def start(self, args=()):
         self.log = open(os.path.join(WORK, self.name + ".out"), "a")
-        self.proc = subprocess.Popen([self.binary, f"-datadir={self.dir}"] + list(args), cwd=self.dir,
-                                     stdout=self.log, stderr=subprocess.STDOUT, start_new_session=True)
+        self.proc = node_ports.popen(self, [self.binary, f"-datadir={self.dir}"] + list(args), cwd=self.dir,
+                                     stdout=self.log, stderr=subprocess.STDOUT, start_new_session=True, work=WORK)
         with open(os.path.join(WORK, "pids"), "a") as f:
             f.write(f"{self.proc.pid}\n")
 
@@ -785,7 +788,7 @@ if not A.wait_ready():
 FILTERS = {}
 for n_filter, name in enumerate(("irondivid", "divid-B", "divid-plain", "irondivid-plain")):
     FILTERS[name] = PORT_BASE + 20 + n_filter
-    SporkFilter(FILTERS[name], PORT_BASE)
+    SporkFilter(FILTERS[name], A.p2p)  # A has started: its port, moved if PORT_BASE was taken
 I = Node("irondivid", IRONDIVID, 1, ["listen=1", f"connect={HOST}:{FILTERS['irondivid']}"], core=False, seeded=True)
 B = Node("divid-B", DIVID, 2, ["listen=1", f"connect={HOST}:{FILTERS['divid-B']}"], core=True, seeded=True)
 # Two nodes that were given no sporks: they hold the usual rules

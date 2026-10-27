@@ -23,6 +23,9 @@ import time
 import urllib.error
 import urllib.request
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "lib"))
+import node_ports  # noqa: E402  (scripts/lib: a node whose ports were taken starts again on new ones)
+
 IRONDIVID, DIVID, PORT_BASE, WORK = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
 HOST = "127.0.0.2"
 START_TIMEOUT = 120
@@ -136,11 +139,24 @@ class Node:
             os.remove(path)
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w") as f:
-            f.write("\n".join(lines) + "\n")
+            f.write(node_ports.follow("\n".join(lines) + "\n"))
 
     def start(self, extra=(), limit_kb=None, args=()):
         """('up',), ('exit', code) or ('timeout',). The node's output goes
-        through a pipe to a file this script writes, so no limit applies to it."""
+        through a pipe to a file this script writes, so no limit applies to it.
+        A node that exits because a port is taken is started again on new ports."""
+        retries = node_ports.BIND_RETRIES
+        while True:
+            outcome = self.start_once(extra, limit_kb, args)
+            if outcome[0] == "exit" and retries:
+                with open(self.out_path, errors="replace") as f:
+                    taken = node_ports.bind_failure(self, f.read())
+                if taken and node_ports.move_ports(self, self.dir):
+                    retries -= 1
+                    continue
+            return outcome
+
+    def start_once(self, extra, limit_kb, args):
         self.write_conf(extra)
         self.starts += 1
         self.out_path = os.path.join(WORK, f"{self.name}.{self.starts}.out")
@@ -459,7 +475,7 @@ def start_at_limit(n):
     out = n.start(ALONE, limit_kb=limit)
     facts["start under the limit"] = out[0] if out[0] != "exit" else "exit"
     if out == ("up",):
-        n.call("addnode", f"{HOST}:{PORT_BASE}", "onetry")
+        n.call("addnode", f"{HOST}:{node_ports.now(PORT_BASE)}", "onetry")
         with mine_lock:
             mine(M, 5)
         n.wait_exit(60)

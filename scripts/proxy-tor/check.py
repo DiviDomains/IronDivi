@@ -38,6 +38,9 @@ import time
 import urllib.error
 import urllib.request
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "lib"))
+import node_ports  # noqa: E402  (scripts/lib: a node whose ports were taken starts again on new ones)
+
 IRONDIVID, DIVID, PORT_BASE, WORK = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
 # For the proof that a difference is caught: irondivid's reply of the named row
 # is changed before it is compared
@@ -333,8 +336,8 @@ class Node:
         base = os.path.join(WORK, f"{self.name}.{self.runs}")
         self.err = base + ".err"
         with open(base + ".out", "w") as o, open(self.err, "w") as e:
-            self.proc = subprocess.Popen([self.binary, f"-datadir={self.dir}"] + list(args), cwd=WORK, stdout=o,
-                                         stderr=e, stdin=subprocess.DEVNULL, start_new_session=True)
+            self.proc = node_ports.popen(self, [self.binary, f"-datadir={self.dir}"] + list(args), cwd=WORK, stdout=o,
+                                         stderr=e, stdin=subprocess.DEVNULL, start_new_session=True, work=WORK)
         with open(os.path.join(WORK, "pids"), "a") as f:
             f.write(f"{self.proc.pid}\n")
         deadline = time.time() + START_TIMEOUT
@@ -488,7 +491,8 @@ def dedupe(log):
 
 # --- the cases --------------------------------------------------------------------------
 
-need = [PORT_BASE + k for k in (0, 1, 2, 3, 10, 11, 12, 13, 14, 15, 16, 17, 49)]
+# the stand-ins' ports; the nodes' own (PORT_BASE .. +3) move when taken (scripts/lib/node_ports.py)
+need = [PORT_BASE + k for k in (10, 11, 12, 13, 14, 15, 16, 17, 49)]
 busy = [p for p in need if not port_free(p)]
 if busy:
     print(f"FAIL   setup: ports in use on {HOST}: {busy}; choose another port base", flush=True)
