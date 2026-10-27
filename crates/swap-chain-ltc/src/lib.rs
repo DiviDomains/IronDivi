@@ -134,10 +134,12 @@ struct ClaimCrossCheck {
     /// against. A lock polled every engine tick reuses it until the primary's answer changes
     /// (a new confirmation, so about once per LTC block), keeping a rate-limited source's
     /// quota for the reads that matter.
-    locks: parking_lot::Mutex<
-        HashMap<Outpoint, (LockedOutput, std::result::Result<LockView, String>)>,
-    >,
+    locks: parking_lot::Mutex<LockCache>,
 }
+
+/// Per outpoint: the primary's answer and the source's view (or why it could not be read)
+/// taken against it.
+type LockCache = HashMap<Outpoint, (LockedOutput, std::result::Result<LockView, String>)>;
 
 /// Cached lock reads kept before the cache is emptied; far more than the swaps in flight.
 const LOCK_CACHE_MAX: usize = 256;
