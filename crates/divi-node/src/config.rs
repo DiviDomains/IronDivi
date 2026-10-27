@@ -827,6 +827,11 @@ pub struct RpcConfig {
     #[serde(default)]
     pub allowed_ips: Vec<String>,
 
+    /// More addresses to listen on besides `listen_addr`: each -rpcbind
+    /// after the first, or ::1 beside 127.0.0.1 (rpcserver.cpp:683-750)
+    #[serde(default)]
+    pub also_listen: Vec<SocketAddr>,
+
     /// Keep a connection open after a reply when the request asks for it
     /// (Divi Core's -rpckeepalive, default on)
     #[serde(default = "default_rpc_keep_alive")]
@@ -860,6 +865,7 @@ impl Default for RpcConfig {
             max_request_size: 10 * 1024 * 1024, // 10 MB
             timeout: 30,
             allowed_ips: Vec::new(),
+            also_listen: Vec::new(),
             keep_alive: true,
             rest: false,
             threads: 4,

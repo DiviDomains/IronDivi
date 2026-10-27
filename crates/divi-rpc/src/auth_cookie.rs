@@ -8,8 +8,8 @@
 
 //! RPC cookie authentication
 //!
-//! When no `rpcuser`/`rpcpassword` pair is configured the server still
-//! requires authentication: it writes a random secret to `<datadir>/.cookie`
+//! When no `rpcpassword` is configured the server still requires
+//! authentication: it writes a random secret to `<datadir>/.cookie`
 //! (owner-only), and local clients such as `irondivi-cli` read it from there.
 //! The file is removed when the server shuts down cleanly.
 
@@ -88,16 +88,16 @@ impl Drop for AuthCookie {
 }
 
 /// Credentials the RPC server enforces, and the cookie that backs them when
-/// no complete `rpcuser`/`rpcpassword` pair is configured.
+/// no `rpcpassword` is configured. An `rpcpassword` without an `rpcuser` is
+/// the login `:<password>`, as Divi Core takes "-rpcuser" + ":" +
+/// "-rpcpassword" (rpcserver.cpp:655), so divi-cli with only a password logs in.
 pub fn resolve_rpc_auth(
     username: Option<&str>,
     password: Option<&str>,
     data_dir: &Path,
 ) -> io::Result<(String, String, Option<AuthCookie>)> {
     match (username, password) {
-        (Some(u), Some(p)) if !u.is_empty() && !p.is_empty() => {
-            Ok((u.to_string(), p.to_string(), None))
-        }
+        (u, Some(p)) if !p.is_empty() => Ok((u.unwrap_or("").to_string(), p.to_string(), None)),
         _ => {
             let cookie = AuthCookie::generate(data_dir)?;
             Ok((
@@ -149,7 +149,11 @@ mod tests {
         assert!(cookie.is_none());
         assert!(!dir.path().join(COOKIE_FILE_NAME).exists());
 
-        for (user, pass) in [(None, None), (Some("alice"), None), (None, Some("x"))] {
+        for (user, pass) in [
+            (None, None),
+            (Some("alice"), None),
+            (Some("alice"), Some("")),
+        ] {
             let (u, p, cookie) = resolve_rpc_auth(user, pass, dir.path()).unwrap();
             assert_eq!(u, COOKIE_AUTH_USER);
             assert_eq!(p.len(), 64);
