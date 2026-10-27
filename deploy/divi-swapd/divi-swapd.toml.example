@@ -86,6 +86,13 @@ key = "credential:maker-btc"
 # network = "testnet"       # default; "mainnet" needs allow_mainnet = true and profile = "mainnet"
 # allow_mainnet = false      # default; mainnet moves real money — off until a reviewed mainnet cutover
 lightwalletd_url = "https://testnet.zec.rocks:443"
+# crosscheck_url = "https://lwd.example.net:9067"  # unset (default) = off. A lightwalletd run by a SECOND
+#                           # operator: its tip is compared with the primary's at startup (mismatch refuses
+#                           # to start, unreachable warns) and before every ZEC claim and refund (mismatch
+#                           # or unreachable holds it, retried next tick). Refused if its host shares a
+#                           # registrable domain with lightwalletd_url / the defaults. Required with
+#                           # profile = "mainnet" unless the endpoints already span two operators.
+# allow_single_source = false  # default; true lets a mainnet config start on one operator (logs a warning)
 # Same BTC swap key (funding.md); started only while a zec offer below is enabled.
 key = "credential:maker-btc"
 
