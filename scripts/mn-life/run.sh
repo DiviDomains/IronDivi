@@ -42,7 +42,8 @@ cleanup() {
     done
     while read -r pid; do kill -KILL "$pid" 2>/dev/null; done < "$WORK/pids"
   fi
-  rm -rf "$WORK"
+  # MN_LIFE_KEEP=1 keeps the work directory, with each node's debug.log
+  if [ "${MN_LIFE_KEEP:-}" = 1 ]; then echo "# kept $WORK"; else rm -rf "$WORK"; fi
 }
 trap cleanup EXIT
 trap 'exit 255' INT TERM HUP
@@ -50,8 +51,11 @@ trap 'exit 255' INT TERM HUP
 # Ten minutes; with MN_LIFE_PAYMENTS=1 fifty, as a masternode is paid only 25
 # minutes after its start on regtest
 LIMIT=600
+LAST=$((BASE + 11))
 [ "${MN_LIFE_PAYMENTS:-}" = 1 ] && LIMIT=3000
-echo "# mn-life: ports $BASE..$((BASE + 11)), work directory $WORK"
+# MN_LIFE_REWARDS=1 (scripts/mn-reward): the payment phase, then two fresh wallets on two more nodes
+[ "${MN_LIFE_REWARDS:-}" = 1 ] && LIMIT=3600 && LAST=$((BASE + 15))
+echo "# mn-life: ports $BASE..$LAST, work directory $WORK"
 # In the background, so a signal to this script runs the trap at once
 timeout $LIMIT python3 -I "$HERE/check.py" "$IRD" "$DIVID" "$BASE" "$WORK" &
 CHILD=$!

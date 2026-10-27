@@ -37,6 +37,15 @@ INJECT = os.environ.get("MN_LIFE_INJECT", "")
 # can vote and be paid, only 25 minutes after its broadcast was signed
 # (masternode-payments.cpp:558)
 PAYMENTS = os.environ.get("MN_LIFE_PAYMENTS", "") == "1"
+# With 1 (scripts/mn-reward), the payment phase runs with masternode payments on,
+# and the wallet rows of a payment (mn_reward, stake_reward) are compared. divid
+# pays no masternode once DeprecateMasternodes is active, from a median time past
+# of 2023-08-23 (ForkActivation.cpp:31, BlockIncentivesPopulator.cpp:142-152);
+# -manual_fork=<time> moves that fork, and CheckLockTimeVerify, to <time>
+# (ForkActivation.cpp:21, :48-55). The divid nodes get 2100-01-01
+REWARDS = os.environ.get("MN_LIFE_REWARDS", "") == "1"
+PAYMENTS = PAYMENTS or REWARDS
+MANUAL_FORK = "manual_fork=4102444800"
 # Loopback address every node binds to: the ports are inside the host's
 # ephemeral range, where other programs' 127.0.0.1 sockets can hold them
 HOST = "127.0.0.2"
@@ -51,6 +60,10 @@ KNOWN = {
         "copper, silver, gold, platinum, diamond, kept on purpose (divid rpcmasternode.cpp:327-358 has the 8 "
         "counts only; scripts/masternode-replies README)",
 }
+if REWARDS:
+    KNOWN["payments: blocks that pay a masternode"] = (
+        "only divid is given -manual_fork, so only C's blocks pay a masternode; irondivid does not take the option "
+        "and keeps DeprecateMasternodes active, as every network has had it since 2023-08-23 (scripts/mn-reward README)")
 TIERS = {"copper", "silver", "gold", "platinum", "diamond"}
 
 # Fields that change from one moment to the next
@@ -99,7 +112,7 @@ class Node:
             "daemon=0", "printtoconsole=0", "server=1", "discover=0", "listenonion=0",
             f"bind={HOST}", f"externalip={HOST}", "dnsseed=0", "staking=0", "txindex=1",
             "debug=masternode", "keypool=10",
-        ] + list(extra_conf)
+        ] + ([MANUAL_FORK] if REWARDS and binary == DIVID else []) + list(extra_conf)
         self.write_conf()
         self.proc = None
         self.log = None
@@ -190,6 +203,21 @@ def setup_failed(kind, value, tb):
 sys.excepthook = setup_failed
 
 
+def refusals(node):
+    """The payment votes the irondivid node did not take, by reason, from its
+    debug.log (node.rs logs each at debug, which debug=masternode turns on)"""
+    reasons = {}
+    for root, _, files in os.walk(node.dir):
+        for f in files:
+            if f.startswith("debug.log"):
+                with open(os.path.join(root, f), errors="replace") as log:
+                    for line in log:
+                        if "Masternode winner from peer" in line and "not taken:" in line:
+                            why = line.split("not taken:", 1)[1].strip()
+                            reasons[why] = reasons.get(why, 0) + 1
+    info(f"votes {node.name} did not take, by reason: {json.dumps(reasons)}"[:600])
+
+
 def wait_for(fn, secs, step=1.0):
     deadline = time.time() + secs
     while time.time() < deadline:
@@ -249,6 +277,13 @@ def compare(name, c, i, by_shape=False, mask=None):
     a, b = show(c, by_shape), show(i, by_shape)
     canon = lambda o: json.dumps(shape(o[1]) if by_shape else o[1], sort_keys=True) if o[0] == "ok" else show(o)
     row(name, a, b, canon(c) == canon(i))
+    if canon(c) != canon(i) and c[0] == i[0] == "ok" and isinstance(c[1], list) and isinstance(i[1], list):
+        # The row is cut at 600 characters: name the entries that differ
+        for k in range(max(len(c[1]), len(i[1]))):
+            x = c[1][k] if k < len(c[1]) else None
+            y = i[1][k] if k < len(i[1]) else None
+            if x != y:
+                info(f"  entry {k}: divid={json.dumps(x)}  irondivid={json.dumps(y)}"[:600])
     return c, i
 
 
@@ -452,12 +487,24 @@ def enabled_on(node, alias):
     return out[0] == "ok" and any(e.get("status") == "ENABLED" for e in out[1])
 
 
-starts = {}
-compare("broadcaststartmasternode <signed broadcast> from the controller",
-        C.call("broadcaststartmasternode", mn["mnc"]["signed"]),
-        I.call("broadcaststartmasternode", mn["mni"]["signed"]))
-for alias in ("mnc", "mni"):
-    starts[alias] = time.time()
+def start_in_turn(name, c_alias, i_alias):
+    """C's broadcast, then I's once I lists C's masternode. A node lists the
+    masternodes in the order it took them, and a controller takes its own
+    broadcast before relaying it; sent one right after the other, whether C's
+    relay reaches I before I's own call is a race. In turn, both nodes take C's
+    first. Returns when each was sent"""
+    sent = {c_alias: time.time()}
+    c_out = C.call("broadcaststartmasternode", mn[c_alias]["signed"])
+    t0 = time.time()
+    listed = wait_for(lambda: bool(I.rpc("listmasternodes", mn[c_alias]["txhash"])), 60, step=0.5)
+    info(f"{c_alias} listed on {I.name} before {i_alias} was sent: {listed} after {round(time.time() - t0)} s")
+    sent[i_alias] = time.time()
+    i_out = I.call("broadcaststartmasternode", mn[i_alias]["signed"])
+    compare(name, c_out, i_out)
+    return sent
+
+
+starts = start_in_turn("broadcaststartmasternode <signed broadcast> from the controller", "mnc", "mni")
 times = {}
 for alias in ("mnc", "mni"):
     for observer in (C, I):
@@ -473,15 +520,14 @@ row("each controller's own masternode ENABLED on the network (seen on C)", times
 
 
 def views(label):
-    # Each node lists masternodes in the order it took them, its own controller's
-    # first (RelayParsedMasternodeBroadcast takes it before relaying), so the
-    # lists are compared in txhash order and the first entry on its own
+    # Each node lists masternodes in the order it took them, and both took C's
+    # first (start_in_turn), so the lists are compared in txhash order and the
+    # first entry on its own
     lists = [C.call("listmasternodes"), I.call("listmasternodes")]
     compare(f"{label}: listmasternodes (in txhash order)", *lists, mask=sorted_list)
-    own = {C.name: {mn[a]["txhash"] for a in mn if mn[a]["controller"] is C},
-           I.name: {mn[a]["txhash"] for a in mn if mn[a]["controller"] is I}}
-    first = [o[1][0].get("txhash") in own[n.name] if o[0] == "ok" and o[1] else None for o, n in zip(lists, (C, I))]
-    row(f"{label}: the controller's own masternode listed first", first[0], first[1], first[0] == first[1])
+    took_first = {mn[a]["txhash"] for a in mn if mn[a]["controller"] is C}
+    first = [o[1][0].get("txhash") in took_first if o[0] == "ok" and o[1] else None for o in lists]
+    row(f"{label}: the masternode taken first (C's) listed first", first[0], first[1], first[0] == first[1])
     both(f"{label}: getmasternodecount", "getmasternodecount", mask=count_view)
     compare_mnsync(f"{label}: mnsync status", C.call("mnsync", "status"), I.call("mnsync", "status"))
     both(f"{label}: getmasternodestatus (a controller)", "getmasternodestatus")
@@ -491,6 +537,12 @@ def views(label):
     both(f"{label}: getmasternodewinners", "getmasternodewinners", "5")
 
 
+# A masternode node's own status follows the network's ENABLED on its own
+# timer: until then divid answers "Can't detect external address", on M1 and on
+# M2 alike, so both are given the same time to start
+t0 = time.time()
+up = wait_for(lambda: all(n.call("getmasternodestatus")[0] == "ok" for n in (M1, M2)), 120, step=2)
+info(f"masternode nodes' own status started: {up} after {round(time.time() - t0)} s")
 views("started")
 
 # startmasternode <alias> on the masternode node itself (divid only): its reply,
@@ -508,9 +560,7 @@ for alias in ("mnc2", "mni2"):
 mesh()
 need(synced(secs=180), "the second masternode nodes did not reach the tip")
 wait_for(lambda: all(sync_state(n) == 999 for n in (M3, M4)), 240, step=2)
-compare("silver: broadcaststartmasternode from the controller",
-        C.call("broadcaststartmasternode", mn["mnc2"]["signed"]),
-        I.call("broadcaststartmasternode", mn["mni2"]["signed"]))
+start_in_turn("silver: broadcaststartmasternode from the controller", "mnc2", "mni2")
 for alias in ("mnc2", "mni2"):
     wait_for(lambda: enabled_on(C, alias) and enabled_on(I, alias), 120)
 views("four masternodes")
@@ -579,7 +629,13 @@ if PAYMENTS:
     # stakes again (wallet.cpp:1452-1457), so I gets twelve coins of its own,
     # each to a new address, well before they are needed. The silver
     # collaterals are locked, so neither is staked and both masternodes stay
-    # to vote (locked coins are not available, AvailableUtxoCalculator.cpp:91)
+    # to vote (locked coins are not available, AvailableUtxoCalculator.cpp:91).
+    # C and I have no masternode.conf to lock them when they start
+    # (init.cpp:1246-1258), and a collateral would be staked with its
+    # masternode's rewards, which share its script (PoSTransactionCreator.cpp
+    # :172-209); a vote for it within a second of that block is taken or
+    # refused by each node as its last check of the masternode is under 5 s
+    # old or not (masternodeman.cpp:153-180): a race, not a rule
     for alias in ("mnc2", "mni2"):
         d = mn[alias]
         need(d["controller"].call("lockunspent", False, [{"txid": d["txhash"], "vout": d["vout"]}]) == ("ok", True),
@@ -622,9 +678,23 @@ if PAYMENTS:
     # .cpp:142-152), so each block's masternode payments are compared, and what
     # it minted; the votes still flow and are compared after each block
     views_by = {C.name: [], I.name: []}
-    for k in range(20):
+    paid = []  # (height, miner, masternode payments) of each block
+    paid_owners = lambda: {mn[a]["controller"].name for _, _, p in paid for a, _ in p}
+    by_txhash = {mn[a]["txhash"]: a for a in mn}
+    for n in (C, I):
+        info(f"masternodes on {n.name} before the payments: " + json.dumps(
+            {by_txhash.get(e.get("txhash"), e.get("txhash")): e.get("status") for e in n.rpc("listmasternodes")}))
+    # With MN_LIFE_REWARDS, on until a block paid each controller's masternode
+    # (divid picks the payee: in one run it paid one masternode 10 times)
+    for k in range(40 if REWARDS else 20):
+        if k >= 20 and paid_owners() >= {C.name, I.name}:
+            break
         miner = (C, I)[k % 2]
         height = miner.rpc("getblockcount") + 1
+        # Past 20 blocks, short of the treasury block, which mints more
+        # (every 50 blocks on regtest, chainparams.cpp:492-493)
+        if k >= 20 and height % 50 == 0:
+            break
         out = miner.call("setgenerate", 1)
         if out[0] != "ok":
             row(f"payments: setgenerate by {miner.name} at height {height}", "ok", show(out), False)
@@ -632,11 +702,19 @@ if PAYMENTS:
         need(synced(), f"the nodes did not follow {miner.name}'s block")
         payments, minted = coinstake_view(height)
         views_by[miner.name].append((payments, minted))
+        paid.append((height, miner, payments))
         info(f"height {height} mined by {miner.name}: masternode payments {payments}, minted {minted}")
         same = lambda: C.call("getmasternodewinners", "20") == I.call("getmasternodewinners", "20")
         wait_for(same, 30)
+        before = fails
         compare(f"payments: getmasternodewinners 20 after height {height}",
                 C.call("getmasternodewinners", "20"), I.call("getmasternodewinners", "20"))
+        if fails > before:
+            refusals(I)
+    if REWARDS and not paid_owners() >= {C.name, I.name}:
+        info("masternodes on divid-C: " + json.dumps(
+            {by_txhash.get(e.get("txhash"), e.get("txhash")): {k: e.get(k) for k in ("status", "lastpaid", "activetime")}
+             for e in C.rpc("listmasternodes")}))
     voted = C.call("getmasternodewinners", "20")
     row("payments: divid's winners carry votes", any(
         (w["winner"].get("nVotes", 0) if isinstance(w["winner"], dict) else 1) for w in voted[1])
@@ -661,6 +739,126 @@ if PAYMENTS:
     # spent ones leave the lists (MasternodeNetworkMessageManager.cpp:36-56)
     found_c, found_i = (isinstance(p, dict) and any(p.values()) for p in (paid_c, paid_i))
     row("payments: a masternode has a lastpaid", found_c, found_i, found_c == found_i)
+
+# 9. The wallet rows of a masternode payment (MN_LIFE_REWARDS=1, scripts/mn-reward):
+# Divi Core's ParseTransactionDetails (rpcwallet.cpp:2016-2112) gives a coinstake
+# a stake_reward row for the staker's wallet and an mn_reward (or lottery) row
+# for each other output the wallet owns
+if REWARDS:
+    REWARD_DROP = MOMENT | {"time", "timereceived"}
+
+    def coinstake_of(height):
+        block = C.rpc("getblock", C.rpc("getblockhash", height))
+        return block["tx"][1], C.rpc("getrawtransaction", block["tx"][1], 1)
+
+    def rows_of(out, txid):
+        """A list reply's rows of one transaction, times left out, in vout and category order"""
+        if out[0] != "ok":
+            return out
+        rows = out[1]["transactions"] if isinstance(out[1], dict) else out[1]
+        return sorted((strip(r, REWARD_DROP) for r in rows if r.get("txid") == txid),
+                      key=lambda r: (r.get("vout", -1), r.get("category", "")))
+
+    def payment_view(r, height, tip, alias):
+        """A payment row by its fields, its confirmations against its height, and
+        the masternode's alias in its account written as <alias> (C's and I's
+        masternodes have their own aliases)"""
+        v = {k: r.get(k) for k in ("category", "amount", "vout", "account", "involvesWatchonly")}
+        if isinstance(v["account"], str):
+            v["account"] = v["account"].replace(alias, "<alias>")
+        if "confirmations" in r:
+            v["confirmations is tip - height + 1"] = r["confirmations"] == tip - height + 1
+        return v
+
+    # The first block paying each controller's masternode: C's are paid in C's
+    # blocks with C as the staker, I's in C's blocks with C as the staker
+    owner = {a: mn[a]["controller"] for a in mn}
+    first = {}
+    for height, miner, payments in paid:
+        for alias, value in payments:
+            first.setdefault(owner[alias].name, (height, alias, value))
+    info("first payment to each controller's masternode: " + json.dumps(
+        {k: [h, a, v] for k, (h, a, v) in first.items()}))
+    row("rewards: a block paid C's masternode and a block paid I's masternode", C.name in first, I.name in first,
+        C.name in first and I.name in first)
+
+    # Each owner's own wallet: C (divid) on a payment to its masternode, I
+    # (irondivid) on a payment to its own
+    if C.name in first and I.name in first:
+        tip = C.rpc("getblockcount")
+        own = {}
+        for node in (C, I):
+            height, alias, _ = first[node.name]
+            txid, tx = coinstake_of(height)
+            address = mn[alias]["address"]
+            listed = node.call("listtransactions", "*", 1000)
+            got = node.call("gettransaction", txid)
+            since = node.call("listsinceblock", C.rpc("getblockhash", height - 1))
+            pick = lambda rows: [r for r in rows if r.get("address") == address and r.get("category") != "send"] \
+                if isinstance(rows, list) else rows
+            own[node.name] = {
+                "listtransactions": [payment_view(r, height, tip, alias) for r in pick(rows_of(listed, txid))],
+                "gettransaction details": [payment_view(r, height, tip, alias) for r in pick(
+                    got[1].get("details", []) if got[0] == "ok" else got)],
+                "gettransaction confirmations": (got[1].get("confirmations") == tip - height + 1)
+                if got[0] == "ok" else got,
+                "listsinceblock": [payment_view(r, height, tip, alias) for r in pick(rows_of(since, txid))],
+            }
+        for what in own[C.name]:
+            a, b = own[C.name][what], own[I.name][what]
+            row(f"rewards, the owner's own wallet: {what} of the payment", json.dumps(a), json.dumps(b), a == b)
+
+    # Two fresh wallets, a divid and an irondivid, given the keys of the payees
+    # and stakers: both see the same transactions, so every row is compared
+    # whole. divid 3.0.0 has no dumpwallet (rpcserver.cpp:420-464): each key
+    # goes from dumpprivkey into importprivkey, in the RPC bodies only
+    OD = Node("divid-OD", DIVID, 6)
+    OI = Node("irondivid-OI", IRONDIVID, 7)
+    for n in (OD, OI):
+        n.start()
+        NODES.append(n)
+    mesh()
+    need(synced(secs=240), "the fresh wallets did not reach the tip")
+    cases = []
+    for name in (C.name, I.name):
+        if name in first:
+            height, alias, _ = first[name]
+            cases.append((f"C's block paying {name.split('-')[-1]}'s masternode", height, mn[alias]["address"]))
+    i_blocks = [h for h, miner, _ in paid if miner is I]
+    if i_blocks:
+        cases.append(("I's block (no masternode paid)", i_blocks[0], None))
+    addresses = set()
+    for _, height, payee in cases:
+        _, tx = coinstake_of(height)
+        addresses.update(tx["vout"][1]["scriptPubKey"].get("addresses", []))
+        if payee:
+            addresses.add(payee)
+    imported = {OD.name: [], OI.name: []}
+    for address in sorted(addresses):
+        holder = next((n for n in (C, I) if n.rpc("validateaddress", address).get("ismine")), None)
+        need(holder is not None, f"no controller owns {address}")
+        key = holder.rpc("dumpprivkey", address)
+        for n in (OD, OI):
+            out = n.call("importprivkey", key, "", True)
+            imported[n.name].append(out[0])
+        del key
+    row("rewards, fresh wallets: importprivkey with rescan of each payee and staker key",
+        imported[OD.name], imported[OI.name], imported[OD.name] == imported[OI.name])
+    need(synced(secs=60), "the fresh wallets fell behind")
+    for label, height, _ in cases:
+        txid, _ = coinstake_of(height)
+        since_hash = C.rpc("getblockhash", height - 1)
+        a, b = rows_of(OD.call("listtransactions", "*", 1000), txid), rows_of(OI.call("listtransactions", "*", 1000), txid)
+        row(f"rewards, fresh wallets, {label}: listtransactions rows", json.dumps(a), json.dumps(b), a == b)
+        info(f"{label} at height {height}: categories {[r.get('category') for r in a] if isinstance(a, list) else a}")
+        got = [n.call("gettransaction", txid) for n in (OD, OI)]
+        compare(f"rewards, fresh wallets, {label}: gettransaction", *[
+            (g[0], strip(g[1], REWARD_DROP)) if g[0] == "ok" else g for g in got])
+        since = [n.call("listsinceblock", since_hash) for n in (OD, OI)]
+        a, b = rows_of(since[0], txid), rows_of(since[1], txid)
+        row(f"rewards, fresh wallets, {label}: listsinceblock rows", json.dumps(a), json.dumps(b), a == b)
+        last = [x[1].get("lastblock") if x[0] == "ok" else x for x in since]
+        row(f"rewards, fresh wallets, {label}: listsinceblock lastblock", last[0], last[1], last[0] == last[1])
 
 for n in NODES:
     n.stop()
