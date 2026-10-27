@@ -193,7 +193,7 @@ fn account_from_value(account: &str) -> Result<&str, Error> {
 }
 
 /// RPC error for a failed getnewaddress-style key request, as Divi Core
-fn new_key_error(e: divi_wallet::WalletError) -> Error {
+fn new_key_error(wallet: &WalletDb, e: divi_wallet::WalletError) -> Error {
     match e {
         divi_wallet::WalletError::KeypoolRanOut => RpcError::new(
             codes::WALLET_KEYPOOL_RAN_OUT,
@@ -202,18 +202,24 @@ fn new_key_error(e: divi_wallet::WalletError) -> Error {
         divi_wallet::WalletError::WalletLocked => {
             RpcError::new(codes::WALLET_UNLOCK_NEEDED, "Wallet is locked")
         }
-        divi_wallet::WalletError::Storage(_) => key_write_error(e),
+        divi_wallet::WalletError::Storage(_) => key_write_error(wallet, e),
         _ => RpcError::new(codes::WALLET_ERROR, e.to_string()),
     }
     .into()
 }
 
 /// New keys that could not be written: Divi Core's derivation throws
-/// (wallet.cpp:2346-2347), and its RPC server answers with the exception's
-/// text (rpcserver.cpp:1107-1108)
-fn key_write_error(e: divi_wallet::WalletError) -> RpcError {
+/// (wallet.cpp:2346-2347), from the encrypted chain's write on an encrypted
+/// wallet (wallet.cpp:503-506, :2359-2360), and its RPC server answers with
+/// the exception's text (rpcserver.cpp:1107-1108)
+fn key_write_error(wallet: &WalletDb, e: divi_wallet::WalletError) -> RpcError {
     warn!("Failed to store new keys: {}", e);
-    RpcError::new(codes::MISC_ERROR, "loadHDChain: WriteHDChain failed")
+    let text = if wallet.is_encrypted() {
+        "loadCryptedHDChain: WriteCryptedHDChain failed"
+    } else {
+        "loadHDChain: WriteHDChain failed"
+    };
+    RpcError::new(codes::MISC_ERROR, text)
 }
 
 fn amount_from_value(value: &serde_json::Value, allow_zero: bool) -> Result<Amount, Error> {
@@ -1114,7 +1120,9 @@ impl WalletRpc {
 
         let label = account_from_value(params.get_str(0).unwrap_or(""))?;
 
-        let address = wallet.new_receiving_address().map_err(new_key_error)?;
+        let address = wallet
+            .new_receiving_address()
+            .map_err(|e| new_key_error(&wallet, e))?;
         wallet.set_label(&address, label).map_err(|e| {
             RpcError::new(codes::WALLET_ERROR, format!("Failed to store label: {}", e))
         })?;
@@ -1129,7 +1137,9 @@ impl WalletRpc {
         crate::core_help::check_arguments("getrawchangeaddress", params, (0, 1), 0)?;
         let wallet = self.get_wallet()?;
 
-        let address = wallet.new_change_address().map_err(new_key_error)?;
+        let address = wallet
+            .new_change_address()
+            .map_err(|e| new_key_error(&wallet, e))?;
 
         debug!("Generated new change address: {}", address);
         Ok(serde_json::json!(address.to_string()))
@@ -1983,7 +1993,7 @@ impl WalletRpc {
                         // The reservation throws first when the new keys
                         // cannot be written (wallet.cpp:2339-2347)
                         Err(err @ divi_wallet::WalletError::Storage(_)) => {
-                            return key_write_error(err).into();
+                            return key_write_error(&wallet, err).into();
                         }
                         Err(err) => debug!("Keypool not topped up for a failed send: {}", err),
                         Ok(_) => {}
@@ -2020,7 +2030,7 @@ impl WalletRpc {
                 // The reservation fails the send when the new keys cannot be
                 // written (wallet.cpp:2339-2347)
                 Err(e @ divi_wallet::WalletError::Storage(_)) => {
-                    return Err(key_write_error(e).into())
+                    return Err(key_write_error(wallet, e).into())
                 }
                 Err(e) => debug!("Keypool not topped up for a send without change: {}", e),
                 Ok(_) => {}
@@ -2042,7 +2052,7 @@ impl WalletRpc {
             let script = match change_to {
                 ChangeTo::NewKey => {
                     let address = wallet.reserve_change_address().map_err(|e| match e {
-                        divi_wallet::WalletError::Storage(_) => key_write_error(e),
+                        divi_wallet::WalletError::Storage(_) => key_write_error(wallet, e),
                         e => RpcError::new(
                             codes::WALLET_ERROR,
                             format!("Failed to generate change address: {}", e),
@@ -3376,7 +3386,9 @@ impl WalletRpc {
             let (owner_addr, manager_addr) = match vault_encoding.split_once(':') {
                 Some((owner, manager)) => (owner.to_string(), manager.to_string()),
                 None => {
-                    let owner = wallet.new_receiving_address().map_err(new_key_error)?;
+                    let owner = wallet
+                        .new_receiving_address()
+                        .map_err(|e| new_key_error(&wallet, e))?;
                     wallet.set_label(&owner, "").map_err(|e| {
                         RpcError::new(codes::WALLET_ERROR, format!("Failed to store label: {}", e))
                     })?;
@@ -4452,7 +4464,7 @@ impl WalletRpc {
         // A key that cannot be written: Divi Core's derivation throws
         // (wallet.cpp:2104, :2339-2347)
         let generated = wallet.refill_keypool(newsize).map_err(|e| match e {
-            divi_wallet::WalletError::Storage(_) => key_write_error(e),
+            divi_wallet::WalletError::Storage(_) => key_write_error(&wallet, e),
             e => RpcError::internal_error(format!("Failed to refill keypool: {}", e)),
         })?;
         info!("Keypool refilled with {} new keys", generated);
@@ -5092,7 +5104,9 @@ impl WalletRpc {
             }
         }
 
-        let new_addr = wallet.new_receiving_address().map_err(new_key_error)?;
+        let new_addr = wallet
+            .new_receiving_address()
+            .map_err(|e| new_key_error(wallet, e))?;
 
         wallet.set_label(&new_addr, account).map_err(|e| {
             RpcError::new(codes::WALLET_ERROR, format!("Failed to store label: {}", e))

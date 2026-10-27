@@ -534,3 +534,28 @@ fn encryption_and_unlock_top_ups_that_cannot_be_written_leave_the_pool_as_it_was
     writes_work();
     assert_eq!(net.wallet.keypool_size(), pool, "after walletpassphrase");
 }
+
+/// On an encrypted wallet Divi Core's derivation writes the encrypted chain,
+/// and a key it cannot write answers with that write's text
+/// (wallet.cpp:503-506, :2359-2360)
+#[test]
+fn a_key_that_cannot_be_written_on_an_encrypted_wallet_names_the_encrypted_chain() {
+    let _limit = LIMIT.lock();
+    let net = Net::new();
+    let rpc = one_key_short(&net);
+    rpc.encrypt_wallet(&p(vec![json!("throwaway-pass")]))
+        .unwrap();
+    rpc.wallet_passphrase(&p(vec![json!("throwaway-pass"), json!(60)]))
+        .unwrap();
+    rpc.get_new_address(&p(vec![])).unwrap();
+    writes_fail();
+    let address = rpc.get_new_address(&p(vec![]));
+    writes_work();
+    assert_eq!(
+        rpc_error(address),
+        (
+            -1,
+            "loadCryptedHDChain: WriteCryptedHDChain failed".to_string()
+        )
+    );
+}
