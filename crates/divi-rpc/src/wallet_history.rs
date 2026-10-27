@@ -69,6 +69,12 @@ pub(crate) struct History<'a> {
     loaded: RefCell<HashMap<Hash256, Option<Rc<Loaded>>>>,
 }
 
+/// IsFinalTx's time with none given: GetAdjustedTime, the mocked time when one
+/// is set plus the network offset (TransactionFinalityHelpers.cpp:16-17)
+fn adjusted_now() -> u32 {
+    divi_primitives::clock::adjusted_now().max(0) as u32
+}
+
 fn amount(sat: i64) -> Value {
     json!(sat as f64 / 100_000_000.0)
 }
@@ -565,9 +571,7 @@ impl<'a> History<'a> {
     /// counts at `min_depth`; transactions not final, immature or off the
     /// chain are left out. Satoshis.
     pub(crate) fn account_balance(&self, account: &str, min_depth: i64, watch: bool) -> i64 {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs() as u32);
+        let now = adjusted_now();
         let labelled = |script: &Script| self.account_of(&self.destination(script));
         let counts = |script: &Script| {
             let label = labelled(script);
@@ -625,9 +629,7 @@ impl<'a> History<'a> {
     /// not coinbases, final and at least `min_depth` deep, when the wallet owns
     /// the destination spendably (or watches it, with `watch`)
     pub(crate) fn received_tally(&self, min_depth: i64, watch: bool) -> HashMap<String, Tally> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs() as u32);
+        let now = adjusted_now();
         let mut tally: HashMap<String, Tally> = HashMap::new();
         for record in self.records_by_txid() {
             let Some(loaded) = self.load(&record) else {
@@ -690,9 +692,7 @@ impl<'a> History<'a> {
     /// paying exactly `script` in wallet transactions that are not coinbases,
     /// final and at least `min_depth` deep
     pub(crate) fn received_by_script(&self, script: &Script, min_depth: i64) -> i64 {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs() as u32);
+        let now = adjusted_now();
         let mut total = 0;
         for record in self.records_by_txid() {
             let Some(loaded) = self.load(&record) else {

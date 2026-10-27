@@ -1425,8 +1425,9 @@ impl WalletRpc {
         // AvailableUtxoCalculator.cpp:3-30, 60-90): spendable coins only (no
         // vault or watched output), mature, not spent by a wallet transaction,
         // unconfirmed ones only when every input was ours, and not locked by
-        // lockunspent
-        let mut utxos = wallet.get_spendable_utxos(height, 0);
+        // lockunspent, and of a mempool transaction only when the next block
+        // could hold it (AvailableUtxoCalculator.cpp:84)
+        let mut utxos = wallet.get_available_utxos(height);
         // As Divi Core collects them: the confirmed coins, then the unconfirmed
         // ones (AvailableUtxoCollector.cpp:33-41), each in txid order as it
         // walks its wallet map (FilteredTransactionsCalculator.h:67)
