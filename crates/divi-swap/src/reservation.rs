@@ -1580,6 +1580,196 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_mtp_past_the_consensus_future_limit_releases_nothing_and_records_nothing() {
+        // The tip's own time is the wall clock; the MTP read (a separate request, maybe to
+        // another endpoint) is past the 7200 s future limit, as no valid chain's could be.
+        for start in [ExpiryStart::Tip, ExpiryStart::Mtp] {
+            let (c, b) = chain();
+            let r = InputReservations::in_memory().unwrap();
+            let t = lock(&r, &b, 1).await;
+            c.forget(&t);
+            c.advance_time(DEADLINE - T0);
+            let locks = [(t, DEADLINE)];
+            let swept = |now| r.release_expired_from(&b, &locks, now, start);
+
+            b.set_mtp_lead(EXPIRY_MAX_TIP_LEAD_SECS + 1);
+            assert_eq!(swept(c.mtp()).await.unwrap(), 0);
+            assert_eq!(r.absence(Chain::Btc, &t).unwrap(), None, "{start:?}");
+            assert_eq!(r.last_tip(Chain::Btc).unwrap(), None, "{start:?}");
+
+            // Exactly 7200 s ahead is not past the limit: the first check records.
+            b.set_mtp_lead(EXPIRY_MAX_TIP_LEAD_SECS);
+            let now = c.mtp();
+            assert_eq!(swept(now).await.unwrap(), 0);
+            let first = c.height();
+            let pending = (start == ExpiryStart::Mtp).then_some(now);
+            assert_eq!(
+                r.absence(Chain::Btc, &t).unwrap(),
+                Some((first, Some(c.tip_hash()), pending)),
+                "{start:?}"
+            );
+        }
+    }
+
+    /// A DIVI lock past its deadline with a record counting from the first check, made at a
+    /// fresh tip with the default start.
+    async fn counting_divi_lock(
+        r: &InputReservations,
+        c: &MockChain,
+        b: &MockBackend,
+    ) -> ([(Txid, u32); 1], AbsenceRecord) {
+        let t = lock(r, b, 1).await;
+        c.forget(&t);
+        c.advance_time(DEADLINE - T0);
+        let locks = [(t, DEADLINE)];
+        assert_eq!(r.release_expired(b, &locks, c.mtp()).await.unwrap(), 0);
+        let record = (c.height(), Some(c.tip_hash()), None);
+        assert_eq!(r.absence(Chain::Divi, &t).unwrap(), Some(record.clone()));
+        (locks, record)
+    }
+
+    #[tokio::test]
+    async fn a_run_of_blocks_whose_mtp_is_past_the_future_limit_counts_nothing_and_moves_no_record()
+    {
+        for start in [ExpiryStart::Tip, ExpiryStart::Mtp] {
+            let (c, b) = divi_chain();
+            let r = InputReservations::in_memory().unwrap();
+            let (locks, record) = counting_divi_lock(&r, &c, &b).await;
+            let t = locks[0].0;
+            let high_water = r.last_tip(Chain::Divi).unwrap();
+            // Twelve blocks, each stamped at the 2 h future limit, whose MTP read is one
+            // second past it: every sweep is refused, the record and the high-water mark
+            // stay where they were, even twice the usual count on.
+            b.set_tip_lead(EXPIRY_MAX_TIP_LEAD_SECS);
+            b.set_mtp_lead(EXPIRY_MAX_TIP_LEAD_SECS + 1);
+            for _ in 0..2 * EXPIRY_ABSENT_BLOCKS {
+                c.mine(1);
+                let now = c.mtp();
+                assert_eq!(
+                    r.release_expired_from(&b, &locks, now, start)
+                        .await
+                        .unwrap(),
+                    0,
+                    "{start:?} block {}",
+                    c.height()
+                );
+                assert_eq!(r.absence(Chain::Divi, &t).unwrap(), Some(record.clone()));
+                assert_eq!(r.last_tip(Chain::Divi).unwrap(), high_water);
+            }
+            assert_eq!(held_by(&r), HashSet::from([t]));
+            // At the limit the MTP is trusted again, and the count stands from the record.
+            b.set_mtp_lead(EXPIRY_MAX_TIP_LEAD_SECS);
+            assert_eq!(
+                r.release_expired_from(&b, &locks, c.mtp(), start)
+                    .await
+                    .unwrap(),
+                1,
+                "{start:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pending_count_starts_only_once_mtp_is_past_the_check_and_within_the_future_limit() {
+        // A pending record from a stale tip (either start) and one from a fresh tip under
+        // "mtp": a sweep whose MTP is past the check but more than 7200 s ahead of the
+        // clock leaves the record pending where it is; the next sweep at a trusted MTP
+        // starts the count from the record.
+        for (start, stale) in [
+            (ExpiryStart::Tip, true),
+            (ExpiryStart::Mtp, true),
+            (ExpiryStart::Mtp, false),
+        ] {
+            let (c, b) = divi_chain();
+            let r = InputReservations::in_memory().unwrap();
+            let t = lock(&r, &b, 1).await;
+            c.forget(&t);
+            c.advance_time(DEADLINE - T0);
+            let locks = [(t, DEADLINE)];
+            let after = if stale { c.mtp() + 3_600 } else { c.mtp() };
+            let swept = |now| r.release_expired_from(&b, &locks, now, start);
+            assert_eq!(swept(after).await.unwrap(), 0);
+            let record = (c.height(), Some(c.tip_hash()), Some(after));
+            assert_eq!(r.absence(Chain::Divi, &t).unwrap(), Some(record.clone()));
+
+            c.mine(1);
+            let now = after + 60;
+            b.set_mtp_lead(now - c.mtp() + EXPIRY_MAX_TIP_LEAD_SECS + 1);
+            assert_eq!(swept(now).await.unwrap(), 0);
+            assert_eq!(
+                r.absence(Chain::Divi, &t).unwrap(),
+                Some(record.clone()),
+                "{start:?} stale {stale}"
+            );
+
+            b.set_mtp_lead(now - c.mtp() + EXPIRY_MAX_TIP_LEAD_SECS);
+            assert_eq!(swept(now).await.unwrap(), 0);
+            assert_eq!(
+                r.absence(Chain::Divi, &t).unwrap(),
+                Some((record.0, record.1.clone(), None)),
+                "{start:?} stale {stale}"
+            );
+            c.mine(EXPIRY_ABSENT_BLOCKS - 1);
+            assert_eq!(swept(now).await.unwrap(), 1, "{start:?} stale {stale}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_consistent_run_stamped_at_the_future_limit_traces_as_before() {
+        // Regression guard: a run of twelve blocks each stamped at the 2 h future limit
+        // (tip time 7200 s ahead of the clock, MTP 6900 s ahead: the median of eleven
+        // such stamps trails the tip by five blocks) is within every limit, so it counts
+        // as on b4cc18b; one second further and the tip-ahead guard refuses every sweep.
+        for start in [None, Some(ExpiryStart::Tip), Some(ExpiryStart::Mtp)] {
+            for (tip_lead, mtp_lead) in [
+                (EXPIRY_MAX_TIP_LEAD_SECS, EXPIRY_MAX_TIP_LEAD_SECS - 300),
+                (EXPIRY_MAX_TIP_LEAD_SECS + 1, EXPIRY_MAX_TIP_LEAD_SECS - 299),
+            ] {
+                let (c, b) = divi_chain();
+                let r = InputReservations::in_memory().unwrap();
+                let t = lock(&r, &b, 1).await;
+                c.forget(&t);
+                c.advance_time(DEADLINE - T0);
+                b.set_tip_lead(tip_lead);
+                b.set_mtp_lead(mtp_lead);
+                let locks = [(t, DEADLINE)];
+                let (first, after) = (c.height(), c.mtp());
+                let mut steps: Vec<Step> = Vec::new();
+                for i in 0..=2 * EXPIRY_ABSENT_BLOCKS {
+                    if i > 0 {
+                        c.mine(1);
+                    }
+                    let now = c.mtp();
+                    let released = match start {
+                        Some(s) => r.release_expired_from(&b, &locks, now, s).await,
+                        None => r.release_expired(&b, &locks, now).await,
+                    }
+                    .unwrap();
+                    let record = r.absence(Chain::Divi, &t).unwrap();
+                    steps.push((c.height(), released, record.map(|(h, _, a)| (h, a))));
+                }
+                let expected: Vec<Step> = (0..=2 * EXPIRY_ABSENT_BLOCKS)
+                    .map(|i| {
+                        let h = first + i;
+                        if tip_lead > EXPIRY_MAX_TIP_LEAD_SECS {
+                            (h, 0, None)
+                        } else if i == 0 && start == Some(ExpiryStart::Mtp) {
+                            (h, 0, Some((first, Some(after))))
+                        } else if i < EXPIRY_ABSENT_BLOCKS {
+                            (h, 0, Some((first, None)))
+                        } else if i == EXPIRY_ABSENT_BLOCKS {
+                            (h, 1, None)
+                        } else {
+                            (h, 0, None)
+                        }
+                    })
+                    .collect();
+                assert_eq!(steps, expected, "{start:?} tip lead {tip_lead}");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn an_absence_record_from_before_block_hashes_is_read_and_re_anchored() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("swap.db");

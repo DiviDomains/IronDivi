@@ -862,6 +862,7 @@ impl MockChain {
             nonce: Arc::new(AtomicU64::new(0)),
             lag: Arc::new(AtomicU64::new(0)),
             tip_lead: Arc::new(AtomicU32::new(0)),
+            mtp_lead: Arc::new(AtomicU32::new(0)),
             reservations: None,
             coins: Arc::default(),
         }
@@ -878,6 +879,7 @@ pub struct MockBackend {
     released: Arc<Mutex<Vec<Txid>>>,
     lag: Arc<AtomicU64>,
     tip_lead: Arc<AtomicU32>,
+    mtp_lead: Arc<AtomicU32>,
     reservations: Option<InputReservations>,
     coins: Arc<Vec<Outpoint>>,
 }
@@ -928,6 +930,14 @@ impl MockBackend {
     /// included, see the chain as it is. Test-only.
     pub fn set_tip_lead(&self, secs: u32) {
         self.tip_lead.store(secs, Ordering::SeqCst);
+    }
+
+    /// Make this backend (and its clones) report [`ChainBackend::median_time_past`] `secs`
+    /// ahead of the chain's MTP, as a read from another endpoint, or one that a run of
+    /// blocks stamped ahead of real time has moved, does. The tip block's time is
+    /// unchanged (so it may sit behind the MTP reported). Test-only.
+    pub fn set_mtp_lead(&self, secs: u32) {
+        self.mtp_lead.store(secs, Ordering::SeqCst);
     }
 
     /// Fund from `coins` (one per funding) and take part in `reservations`, as the live
@@ -1091,7 +1101,10 @@ impl ChainBackend for MockBackend {
 
     async fn median_time_past(&self) -> Result<u32> {
         self.check_online()?;
-        Ok(self.chain.mtp())
+        Ok(self
+            .chain
+            .mtp()
+            .saturating_add(self.mtp_lead.load(Ordering::SeqCst)))
     }
 
     async fn spendable(&self) -> Result<Option<Amount>> {
