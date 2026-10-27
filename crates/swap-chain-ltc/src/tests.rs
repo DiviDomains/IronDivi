@@ -1740,3 +1740,265 @@ async fn startup_crosscheck_still_compares_tip_minus_six_only() {
     assert_eq!(requests_to(&s).await, 1);
     assert_eq!(requests_to(&p).await, 2);
 }
+
+// --- The lock's script and value, read from the cross-check source too (EL) ---
+//
+// Source shapes: Blockbook `GET /api/v2/tx/{txid}` (`confirmations`, `vout[].n`,
+// `vout[].value` as a decimal string of satoshis, `vout[].hex` the scriptPubKey; trezor/blockbook
+// `api/types.go`) and BlockCypher `GET /txs/{txid}` (`confirmations`, `outputs[].value` in
+// satoshis, `outputs[].script` the scriptPubKey hex; BlockCypher API docs, TX and TXOutput).
+
+const LOCK_SATS: u64 = 20_000;
+
+/// The primary shows the agreed HTLC script and `LOCK_SATS` at `outpoint()`, confirmed at
+/// height 109 under a tip of 110 (two confirmations).
+async fn lock_primary(spk: &str) -> MockServer {
+    let s = MockServer::start().await;
+    mount_lock_primary(&s, spk, 110).await;
+    s
+}
+
+async fn mount_lock_primary(s: &MockServer, spk: &str, tip: u64) {
+    let fund = outpoint();
+    Mock::given(method("GET"))
+        .and(path("/blocks/tip/height"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(tip.to_string()))
+        .mount(s)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/tx/{}", fund.txid)))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "txid": fund.txid.to_rpc_hex(),
+            "vout": [{"scriptpubkey": "00", "value": 5}, {"scriptpubkey": spk, "value": LOCK_SATS}],
+            "status": {"confirmed": true, "block_height": 109}
+        })))
+        .mount(s)
+        .await;
+}
+
+/// `kind`'s transaction body for `outpoint()`: output 1 pays `value` to `spk`.
+fn lock_tx(kind: CrossCheckSource, spk: &str, value: u64, confs: u32) -> ResponseTemplate {
+    let txid = outpoint().txid.to_rpc_hex();
+    let body = match kind {
+        CrossCheckSource::Blockbook => json!({"txid": txid, "confirmations": confs,
+            "blockHeight": 109, "vout": [
+            {"n": 0, "value": "5", "hex": "00"},
+            {"n": 1, "value": value.to_string(), "hex": spk}]}),
+        CrossCheckSource::BlockCypher => json!({"hash": txid, "confirmations": confs,
+            "block_height": 109, "outputs": [
+            {"value": 5, "script": "00"}, {"value": value, "script": spk}]}),
+    };
+    ResponseTemplate::new(200).set_body_json(body)
+}
+
+fn lock_tx_path(kind: CrossCheckSource) -> String {
+    let txid = outpoint().txid.to_rpc_hex();
+    match kind {
+        CrossCheckSource::Blockbook => format!("/tx/{txid}"),
+        CrossCheckSource::BlockCypher => format!("/txs/{txid}"),
+    }
+}
+
+async fn lock_source(kind: CrossCheckSource, resp: ResponseTemplate) -> MockServer {
+    let s = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(lock_tx_path(kind)))
+        .respond_with(resp)
+        .mount(&s)
+        .await;
+    s
+}
+
+fn spk_of(h: &HtlcParams) -> String {
+    hex::encode(htlc_script_pubkey(h).as_bytes())
+}
+
+/// A lock read with the cross-check on that must fail closed: `Transient`, naming both
+/// sources, carrying no key material.
+fn lock_held(r: Result<Option<LockedOutput>>, p: &MockServer, s: &MockServer) -> String {
+    let m = match r {
+        Err(SwapError::Transient(m)) => m,
+        other => panic!("want Transient, got {other:?}"),
+    };
+    assert!(m.contains(&p.uri()), "primary named: {m}");
+    assert!(m.contains(&s.uri()), "source named: {m}");
+    assert!(!m.contains(&hex::encode(TAKER_KEY)), "no key: {m}");
+    m
+}
+
+/// Fail-first 1: the primary shows the agreed script and the full value; the cross-check
+/// source shows another scriptPubKey at that outpoint. Neither side may act on it.
+#[tokio::test]
+async fn lock_crosscheck_wrong_script_on_the_source_is_transient() {
+    for kind in BOTH_SOURCES {
+        let (_, hash) = new_preimage();
+        let h = htlc(hash);
+        let (_, other) = new_preimage();
+        let p = lock_primary(&spk_of(&h)).await;
+        let s = lock_source(kind, lock_tx(kind, &spk_of(&htlc(other)), LOCK_SATS, 2)).await;
+        let b = cc_mainnet(&p).with_claim_crosscheck_at(kind, s.uri());
+        let m = lock_held(b.htlc_output(&h, &outpoint()).await, &p, &s);
+        assert!(m.contains("script"), "{kind:?}: {m}");
+    }
+}
+
+/// Fail-first 2: the source shows the agreed script but a value below the agreed amount
+/// (and below the primary's).
+#[tokio::test]
+async fn lock_crosscheck_short_value_on_the_source_is_transient() {
+    for kind in BOTH_SOURCES {
+        let (_, hash) = new_preimage();
+        let h = htlc(hash);
+        let p = lock_primary(&spk_of(&h)).await;
+        let s = lock_source(kind, lock_tx(kind, &spk_of(&h), LOCK_SATS - 1_000, 2)).await;
+        let b = cc_mainnet(&p).with_claim_crosscheck_at(kind, s.uri());
+        let m = lock_held(b.htlc_output(&h, &outpoint()).await, &p, &s);
+        assert!(
+            m.contains(&(LOCK_SATS - 1_000).to_string()),
+            "{kind:?}: {m}"
+        );
+        assert!(m.contains(&LOCK_SATS.to_string()), "{kind:?}: {m}");
+    }
+}
+
+/// Both sources show the same script and value: the lock is returned with the lower of the
+/// two confirmation counts.
+#[tokio::test]
+async fn lock_crosscheck_agree_returns_the_lock_with_the_lower_confirmations() {
+    for kind in BOTH_SOURCES {
+        for (theirs, want) in [(1, 1), (0, 0), (5, 2)] {
+            let (_, hash) = new_preimage();
+            let h = htlc(hash);
+            let p = lock_primary(&spk_of(&h)).await;
+            let s = lock_source(
+                kind,
+                lock_tx(kind, &spk_of(&h).to_uppercase(), LOCK_SATS, theirs),
+            )
+            .await;
+            let b = cc_mainnet(&p).with_claim_crosscheck_at(kind, s.uri());
+            let lo = b.htlc_output(&h, &outpoint()).await.unwrap();
+            assert_eq!(
+                lo,
+                Some(LockedOutput {
+                    amount: Amount::from_sat(LOCK_SATS),
+                    confirmations: want,
+                }),
+                "{kind:?} source confs {theirs}"
+            );
+        }
+    }
+}
+
+/// The source down, rate-limited, without the transaction or malformed: the lock read fails
+/// closed (nothing is at risk while the maker waits to fund or the taker waits to reveal).
+#[tokio::test]
+async fn lock_crosscheck_source_down_fails_closed() {
+    for kind in BOTH_SOURCES {
+        for resp in [
+            ResponseTemplate::new(404),
+            ResponseTemplate::new(429),
+            ResponseTemplate::new(500),
+            ResponseTemplate::new(200).set_body_string("<html>oops</html>"),
+            ResponseTemplate::new(200).set_body_string("{}"),
+        ] {
+            let (_, hash) = new_preimage();
+            let h = htlc(hash);
+            let p = lock_primary(&spk_of(&h)).await;
+            let s = lock_source(kind, resp).await;
+            let b = cc_mainnet(&p).with_claim_crosscheck_at(kind, s.uri());
+            lock_held(b.htlc_output(&h, &outpoint()).await, &p, &s);
+        }
+        let (_, hash) = new_preimage();
+        let h = htlc(hash);
+        let p = lock_primary(&spk_of(&h)).await;
+        let b = cc_mainnet(&p).with_claim_crosscheck_at(kind, dead_url());
+        match b.htlc_output(&h, &outpoint()).await {
+            Err(SwapError::Transient(m)) => assert!(m.contains(&dead_url()), "{m}"),
+            other => panic!("{kind:?}: want Transient, got {other:?}"),
+        }
+    }
+}
+
+/// The source is asked once per primary answer: a lock polled every engine tick does not
+/// spend a rate-limited source's quota, and a new primary block asks again.
+#[tokio::test]
+async fn lock_crosscheck_asks_the_source_once_per_primary_answer() {
+    let kind = CrossCheckSource::Blockbook;
+    let (_, hash) = new_preimage();
+    let h = htlc(hash);
+    let p = lock_primary(&spk_of(&h)).await;
+    let s = lock_source(kind, lock_tx(kind, &spk_of(&h), LOCK_SATS, 2)).await;
+    let b = cc_mainnet(&p).with_claim_crosscheck_at(kind, s.uri());
+    for _ in 0..3 {
+        assert!(b.htlc_output(&h, &outpoint()).await.unwrap().is_some());
+    }
+    assert_eq!(requests_to(&s).await, 1);
+    p.reset().await;
+    mount_lock_primary(&p, &spk_of(&h), 111).await;
+    let lo = b.htlc_output(&h, &outpoint()).await.unwrap().unwrap();
+    assert_eq!(requests_to(&s).await, 2);
+    // Primary 3, source (as mocked) 2.
+    assert_eq!(lo.confirmations, 2);
+}
+
+/// Off (the default, and `with_claim_crosscheck(None)`): today's request sequence to the
+/// primary exactly, nothing to the source, and today's answer.
+#[tokio::test]
+async fn lock_crosscheck_off_is_todays_lock_read() {
+    let (_, hash) = new_preimage();
+    let h = htlc(hash);
+    let s = lock_source(
+        CrossCheckSource::Blockbook,
+        lock_tx(CrossCheckSource::Blockbook, "00", 1, 0),
+    )
+    .await;
+    for explicit in [false, true] {
+        let p = lock_primary(&spk_of(&h)).await;
+        let b = if explicit {
+            cc_mainnet(&p).with_claim_crosscheck(None)
+        } else {
+            cc_mainnet(&p)
+        };
+        let lo = b.htlc_output(&h, &outpoint()).await.unwrap();
+        assert_eq!(
+            lo,
+            Some(LockedOutput {
+                amount: Amount::from_sat(LOCK_SATS),
+                confirmations: 2,
+            })
+        );
+        let seen: Vec<String> = p
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| format!("{} {}", r.method, r.url.path()))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                format!("GET /tx/{}", outpoint().txid),
+                "GET /blocks/tip/height".to_string()
+            ]
+        );
+    }
+    assert_eq!(requests_to(&s).await, 0);
+}
+
+/// The primary shows no matching lock: nothing to agree, no source request (no side acts on
+/// `None`), as today.
+#[tokio::test]
+async fn lock_crosscheck_primary_none_asks_nothing_more() {
+    let (_, hash) = new_preimage();
+    let h = htlc(hash);
+    let (_, other) = new_preimage();
+    let p = lock_primary(&spk_of(&htlc(other))).await;
+    let s = lock_source(
+        CrossCheckSource::Blockbook,
+        lock_tx(CrossCheckSource::Blockbook, &spk_of(&h), LOCK_SATS, 2),
+    )
+    .await;
+    let b = cc_mainnet(&p).with_claim_crosscheck_at(CrossCheckSource::Blockbook, s.uri());
+    assert_eq!(b.htlc_output(&h, &outpoint()).await.unwrap(), None);
+    assert_eq!(requests_to(&s).await, 0);
+}
