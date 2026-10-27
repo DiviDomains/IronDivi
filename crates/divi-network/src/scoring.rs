@@ -103,7 +103,11 @@ pub struct PeerStats {
 impl PeerStats {
     /// Create new peer stats
     pub fn new(peer_id: PeerId, ip: IpAddr) -> Self {
-        let now = Instant::now();
+        Self::at(peer_id, ip, Instant::now())
+    }
+
+    /// New peer stats for a peer connected at `now`
+    pub fn at(peer_id: PeerId, ip: IpAddr, now: Instant) -> Self {
         PeerStats {
             peer_id,
             ip,
@@ -125,6 +129,11 @@ impl PeerStats {
 
     /// Record a ping response
     pub fn record_pong(&mut self, latency_ms: u64) {
+        self.record_pong_at(latency_ms, Instant::now())
+    }
+
+    /// Record a ping response that came at `now`
+    pub fn record_pong_at(&mut self, latency_ms: u64, now: Instant) {
         self.pongs_received += 1;
         self.last_latency_ms = latency_ms;
         // Rolling average
@@ -133,7 +142,7 @@ impl PeerStats {
         } else {
             self.avg_latency_ms = (self.avg_latency_ms * 7 + latency_ms) / 8;
         }
-        self.last_activity = Instant::now();
+        self.last_activity = now;
     }
 
     /// Record misbehavior
@@ -153,8 +162,12 @@ impl PeerStats {
 
     /// Check if peer is responsive
     pub fn is_responsive(&self) -> bool {
-        // Consider unresponsive if no activity in 5 minutes
-        self.last_activity.elapsed() < Duration::from_secs(300)
+        self.is_responsive_at(Instant::now())
+    }
+
+    /// Whether the peer was active in the 5 minutes before `now`
+    pub fn is_responsive_at(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.last_activity) < Duration::from_secs(300)
     }
 
     /// Get reliability score (0-100, higher is better)
@@ -206,7 +219,11 @@ pub struct BanEntry {
 impl BanEntry {
     /// Create a new ban entry
     pub fn new(ip: IpAddr, duration: Duration, reason: impl Into<String>) -> Self {
-        let created = divi_primitives::clock::now();
+        Self::at(divi_primitives::clock::now(), ip, duration, reason)
+    }
+
+    /// A ban made at `created` (Unix seconds on the node's clock)
+    pub fn at(created: i64, ip: IpAddr, duration: Duration, reason: impl Into<String>) -> Self {
         BanEntry {
             ip,
             created,
@@ -217,16 +234,24 @@ impl BanEntry {
 
     /// Check if the ban has expired
     pub fn is_expired(&self) -> bool {
-        divi_primitives::clock::now() >= self.until
+        self.is_expired_at(divi_primitives::clock::now())
+    }
+
+    /// Whether the ban is over at `now` (Unix seconds on the node's clock):
+    /// Divi Core's IsBanned holds while `currentTime < t`
+    /// (PeerBanningService.cpp:36-48)
+    pub fn is_expired_at(&self, now: i64) -> bool {
+        now >= self.until
     }
 
     /// Get remaining ban time
     pub fn remaining(&self) -> Duration {
-        Duration::from_secs(
-            self.until
-                .saturating_sub(divi_primitives::clock::now())
-                .max(0) as u64,
-        )
+        self.remaining_at(divi_primitives::clock::now())
+    }
+
+    /// The ban time left at `now` (Unix seconds on the node's clock)
+    pub fn remaining_at(&self, now: i64) -> Duration {
+        Duration::from_secs(self.until.saturating_sub(now).max(0) as u64)
     }
 }
 
@@ -248,6 +273,8 @@ pub struct PeerScoring {
     ban_threshold: RwLock<i32>,
     /// How long a misbehaving peer stays banned (Divi Core -bantime)
     ban_duration: RwLock<Duration>,
+    /// The clock bans and activity are read from: the peer manager's
+    clock: crate::peer_clock::PeerClock,
 }
 
 /// What recording misbehaviour did to the peer
@@ -280,20 +307,32 @@ impl Default for PeerScoring {
 impl PeerScoring {
     /// Create a new peer scoring instance
     pub fn new() -> Self {
+        Self::with_clock(crate::peer_clock::PeerClock::system())
+    }
+
+    /// Peer scoring on `clock`: bans end on its `time` (Divi Core's GetTime),
+    /// activity is dated on its `now`
+    pub fn with_clock(clock: crate::peer_clock::PeerClock) -> Self {
         PeerScoring {
             stats: RwLock::new(HashMap::new()),
             bans: RwLock::new(HashMap::new()),
             rate_limits: RwLock::new(HashMap::new()),
             ban_threshold: RwLock::new(100),
             ban_duration: RwLock::new(DEFAULT_BAN_DURATION),
+            clock,
         }
+    }
+
+    /// The clock bans and activity are read from
+    pub fn clock(&self) -> &crate::peer_clock::PeerClock {
+        &self.clock
     }
 
     /// Register a new peer
     pub fn register_peer(&self, peer_id: PeerId, ip: IpAddr) {
         self.stats
             .write()
-            .insert(peer_id, PeerStats::new(peer_id, ip));
+            .insert(peer_id, PeerStats::at(peer_id, ip, self.clock.now()));
         debug!("Registered peer {} ({})", peer_id, ip);
     }
 
@@ -398,7 +437,7 @@ impl PeerScoring {
         let mut stats = self.stats.write();
         if let Some(peer_stats) = stats.get_mut(&peer_id) {
             peer_stats.blocks_received += 1;
-            peer_stats.last_activity = Instant::now();
+            peer_stats.last_activity = self.clock.now();
         }
     }
 
@@ -407,7 +446,7 @@ impl PeerScoring {
         let mut stats = self.stats.write();
         if let Some(peer_stats) = stats.get_mut(&peer_id) {
             peer_stats.txs_received += 1;
-            peer_stats.last_activity = Instant::now();
+            peer_stats.last_activity = self.clock.now();
         }
     }
 
@@ -416,7 +455,7 @@ impl PeerScoring {
         let mut stats = self.stats.write();
         if let Some(peer_stats) = stats.get_mut(&peer_id) {
             peer_stats.messages_received += 1;
-            peer_stats.last_activity = Instant::now();
+            peer_stats.last_activity = self.clock.now();
         }
     }
 
@@ -432,14 +471,14 @@ impl PeerScoring {
     pub fn record_pong(&self, peer_id: PeerId, latency_ms: u64) {
         let mut stats = self.stats.write();
         if let Some(peer_stats) = stats.get_mut(&peer_id) {
-            peer_stats.record_pong(latency_ms);
+            peer_stats.record_pong_at(latency_ms, self.clock.now());
         }
     }
 
     /// Check rate limit for an IP (returns true if limit exceeded)
     pub fn check_rate_limit(&self, ip: IpAddr, max_per_second: u32) -> bool {
         let mut limits = self.rate_limits.write();
-        let now = Instant::now();
+        let now = self.clock.now();
 
         let entry = limits.entry(ip).or_insert(RateLimit {
             count: 0,
@@ -447,7 +486,7 @@ impl PeerScoring {
         });
 
         // Reset window if more than 1 second has passed
-        if entry.window_start.elapsed() >= Duration::from_secs(1) {
+        if now.saturating_duration_since(entry.window_start) >= Duration::from_secs(1) {
             entry.count = 0;
             entry.window_start = now;
         }
@@ -470,7 +509,7 @@ impl PeerScoring {
         let reason = reason.into();
         info!("Banning IP {} for {:?}: {}", ip, duration, reason);
         // A ban is only ever made longer (PeerBanningService.cpp:56-62)
-        let entry = BanEntry::new(ip, duration, reason);
+        let entry = BanEntry::at(self.clock.time(), ip, duration, reason);
         let mut bans = self.bans.write();
         if bans.get(&ip).is_none_or(|old| old.until < entry.until) {
             bans.insert(ip, entry);
@@ -491,7 +530,7 @@ impl PeerScoring {
     pub fn is_banned(&self, ip: &IpAddr) -> bool {
         let bans = self.bans.read();
         if let Some(entry) = bans.get(ip) {
-            if entry.is_expired() {
+            if entry.is_expired_at(self.clock.time()) {
                 drop(bans);
                 self.bans.write().remove(ip);
                 false
@@ -511,7 +550,10 @@ impl PeerScoring {
     /// Get all active bans
     pub fn list_bans(&self) -> Vec<BanEntry> {
         // Clean up expired bans
-        self.bans.write().retain(|_, entry| !entry.is_expired());
+        let now = self.clock.time();
+        self.bans
+            .write()
+            .retain(|_, entry| !entry.is_expired_at(now));
         self.bans.read().values().cloned().collect()
     }
 
@@ -566,7 +608,7 @@ impl PeerScoring {
         for stat in stats.values_mut() {
             if stat.ip == ip {
                 stat.connection_failures += 1;
-                stat.last_connect_attempt = Some(Instant::now());
+                stat.last_connect_attempt = Some(self.clock.now());
                 return;
             }
         }

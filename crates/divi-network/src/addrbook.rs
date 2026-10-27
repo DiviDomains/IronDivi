@@ -73,7 +73,9 @@ const LEGACY_ENTRY_LEN: usize = 16 + 2 + 8 + 4;
 const EMPTY: i32 = -1;
 
 /// The address manager's clock: GetAdjustedTime, the node's clock plus the
-/// network time offset (addrman.h:97-100, :509-560; addrman.cpp:258)
+/// network time offset (addrman.h:97-100, :509-560; addrman.cpp:258); a
+/// book reads it through its [`crate::PeerClock`]
+#[cfg(test)]
 fn now() -> i64 {
     divi_primitives::clock::adjusted_now()
 }
@@ -484,6 +486,17 @@ impl Tables {
         is_new
     }
 
+    /// Connected_ (addrman.cpp:472-490): the entry's time, at most every 20
+    /// minutes, for this exact address and port
+    fn connected(&mut self, ip: &[u8; 16], port: u16, now: i64) {
+        if let Some(id) = self.find(ip) {
+            let info = self.info.get_mut(&id).expect("found");
+            if info.port == port && now - info.time as i64 > 20 * 60 {
+                info.time = now.max(0) as u32;
+            }
+        }
+    }
+
     /// Attempt_ (addrman.cpp:315-332)
     fn attempt(&mut self, ip: &[u8; 16], port: u16, now: i64) {
         if let Some(id) = self.find(ip) {
@@ -716,16 +729,29 @@ pub struct AddressBook {
     tables: Mutex<Tables>,
     path: Mutex<Option<PathBuf>>,
     magic: [u8; 4],
+    /// Its times are read on this clock's `adjusted_time` (GetAdjustedTime)
+    clock: crate::peer_clock::PeerClock,
 }
 
 impl AddressBook {
     /// An empty book for the network with this message start
     pub fn new(magic: [u8; 4]) -> Self {
+        Self::with_clock(magic, crate::peer_clock::PeerClock::system())
+    }
+
+    /// An empty book whose times are read on `clock`
+    pub fn with_clock(magic: [u8; 4], clock: crate::peer_clock::PeerClock) -> Self {
         Self {
             tables: Mutex::new(Tables::fresh()),
             path: Mutex::new(None),
             magic,
+            clock,
         }
+    }
+
+    /// Now on the address manager's clock (GetAdjustedTime)
+    fn now(&self) -> i64 {
+        self.clock.adjusted_time()
     }
 
     /// Keep the book in `dir/peers.dat`, and read what is there. A file that
@@ -780,7 +806,7 @@ impl AddressBook {
             return None;
         }
         let mut t = Tables::fresh();
-        let now = now();
+        let now = self.now();
         for e in data.as_chunks::<LEGACY_ENTRY_LEN>().0 {
             let net = NetAddr {
                 ip: e[..16].try_into().ok()?,
@@ -811,7 +837,7 @@ impl AddressBook {
     /// divid checks only the IP (CNetAddr::IsRoutable, netbase.cpp:875-878;
     /// addrman.cpp:249-250). The number new to the book.
     pub fn add(&self, addrs: &[(u32, NetAddr)], source: IpAddr) -> usize {
-        self.add_at(addrs, source, TIME_PENALTY, now())
+        self.add_at(addrs, source, TIME_PENALTY, self.now())
     }
 
     fn add_at(&self, addrs: &[(u32, NetAddr)], source: IpAddr, penalty: i64, now: i64) -> usize {
@@ -823,19 +849,21 @@ impl AddressBook {
             .count()
     }
 
-    /// Addresses a DNS seed gave, from 3 to 7 days ago as divid dates them
-    /// (net.cpp ThreadDNSAddressSeed), the seed's first address as their source
+    /// Addresses a DNS seed gave, from 3 to 7 days ago on the node's clock
+    /// (GetTime, not the adjusted one) as divid dates them (net.cpp:1046),
+    /// the seed's first address as their source
     pub fn add_seeds(&self, addrs: &[SocketAddr]) {
         let Some(source) = addrs.first() else {
             return;
         };
-        let now = now();
+        let now = self.now();
+        let today = self.clock.time();
         let mut rng = rand::thread_rng();
         let dated: Vec<(u32, NetAddr)> = addrs
             .iter()
             .map(|a| {
                 let ago = 3 * 24 * 60 * 60 + rng.gen_range(0..4 * 24 * 60 * 60);
-                ((now - ago).max(0) as u32, to_net(a, 1))
+                ((today - ago).max(0) as u32, to_net(a, 1))
             })
             .collect();
         self.add_at(&dated, source.ip(), 0, now);
@@ -845,27 +873,44 @@ impl AddressBook {
     pub fn good(&self, addr: SocketAddr) {
         self.tables
             .lock()
-            .good(&ip16(addr.ip()), addr.port(), now());
+            .good(&ip16(addr.ip()), addr.port(), self.now());
     }
 
     /// A connection to `addr` is being made (addrman Attempt, net.cpp:530, :538)
     pub fn attempt(&self, addr: SocketAddr) {
         self.tables
             .lock()
-            .attempt(&ip16(addr.ip()), addr.port(), now());
+            .attempt(&ip16(addr.ip()), addr.port(), self.now());
     }
 
     /// The answer to a getaddr: 23% of the book, at most 2500, at random,
     /// leaving out terrible entries (addrman GetAddr_)
     pub fn sample(&self) -> Vec<(u32, NetAddr)> {
-        self.tables.lock().get_addr(now())
+        self.tables.lock().get_addr(self.now())
+    }
+
+    /// A peer we dialled at `addr`, which sent its verack and no misbehaviour,
+    /// has gone: its time is brought up to now (addrman Connected, called
+    /// from CNodeState::Finalize, NodeState.cpp:38-40)
+    pub fn connected(&self, addr: SocketAddr) {
+        self.tables
+            .lock()
+            .connected(&ip16(addr.ip()), addr.port(), self.now());
+    }
+
+    /// When the book last heard of `addr` (its nTime), if it has it
+    pub fn time_of(&self, addr: SocketAddr) -> Option<u32> {
+        let t = self.tables.lock();
+        let id = t.find(&ip16(addr.ip()))?;
+        let info = &t.info[&id];
+        (info.port == addr.port()).then_some(info.time)
     }
 
     /// An address to dial and when it was last tried (addrman Select)
     pub fn select(&self) -> Option<(SocketAddr, i64)> {
         self.tables
             .lock()
-            .select(now())
+            .select(self.now())
             .map(|i| (i.socket(), i.last_try))
     }
 

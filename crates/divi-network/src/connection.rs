@@ -341,7 +341,18 @@ impl Connection {
     /// Read the connection's times from `clock` (the system clock unless a test
     /// gives one it moves on)
     pub fn with_clock(mut self, clock: crate::peer_clock::PeerClock) -> Self {
-        self.info.clock = clock;
+        // The times the connection was made with move on to the clock's, which
+        // a test may have moved on already (nothing moves on the system clock)
+        let by = clock.skipped();
+        let info = &mut self.info;
+        info.connected_at += by;
+        info.last_recv += by;
+        info.last_send += by;
+        let secs = by.as_secs();
+        info.conn_unix += secs;
+        info.last_recv_unix += secs;
+        info.last_send_unix += secs;
+        info.clock = clock;
         self
     }
 
@@ -461,7 +472,7 @@ impl Connection {
         }
 
         // Store their version info
-        self.info.time_offset = their_version.timestamp - divi_primitives::clock::now();
+        self.info.time_offset = their_version.timestamp - self.info.clock.time();
         let their_time = their_version.timestamp;
         // An inbound peer names the address it reached us at (Divi Core
         // main.cpp:402-404 SeenLocal)
@@ -544,9 +555,9 @@ impl Connection {
             // GetAdjustedTime to an inbound peer, GetTime to one we dialled, both on
             // the clock setmocktime sets (Node.cpp:995-996)
             timestamp: if self.info.direction == PeerDirection::Inbound {
-                divi_primitives::clock::adjusted_now()
+                self.info.clock.adjusted_time()
             } else {
-                divi_primitives::clock::now()
+                self.info.clock.time()
             },
             addr_recv,
             addr_from: self
@@ -634,7 +645,7 @@ impl Connection {
             got += n;
             self.info.bytes_recv += n as u64;
             self.info.last_recv = self.info.clock.now();
-            self.info.last_recv_unix = crate::peer::unix_now();
+            self.info.last_recv_unix = self.info.clock.time().max(0) as u64;
             self.total_bytes_recv.fetch_add(n as u64, Ordering::Relaxed);
         }
         Ok(())
@@ -820,7 +831,7 @@ impl Connection {
                             let bytes_received = framed.decoder_mut().take_bytes_consumed();
                             info.bytes_recv += bytes_received;
                             info.last_recv = info.clock.now();
-                            info.last_recv_unix = crate::peer::unix_now();
+                            info.last_recv_unix = info.clock.time().max(0) as u64;
                             total_bytes_recv.fetch_add(bytes_received, Ordering::Relaxed);
                             debug!("{} from {} does not parse: {}", command, info.addr, error);
                             if command == "pong" {
@@ -845,7 +856,7 @@ impl Connection {
                             // Update stats
                             info.bytes_recv += bytes_received;
                             info.last_recv = info.clock.now();
-                            info.last_recv_unix = crate::peer::unix_now();
+                            info.last_recv_unix = info.clock.time().max(0) as u64;
                             info.last_message_command = Some(msg.command().to_string());
                             total_bytes_recv.fetch_add(bytes_received, Ordering::Relaxed);
 
@@ -901,8 +912,13 @@ impl Connection {
         size: u64,
     ) {
         match &msg {
-            // The peer's verack: nothing waits for it (main.cpp:498-507)
-            NetworkMessage::Verack => {}
+            // The peer's verack: nothing waits for it, but a peer we dialled
+            // is marked currently connected (main.cpp:498-507)
+            NetworkMessage::Verack => {
+                if info.direction == PeerDirection::Outbound {
+                    stats.verack_received.store(true, Ordering::Release);
+                }
+            }
             // Divi Core: one version per connection
             NetworkMessage::Version(_) => {
                 Self::answer_in_turn(stats, waiting, duplicate_version_reject());
@@ -1073,7 +1089,7 @@ impl Connection {
         let bytes_sent = bytes.len() as u64;
         info.bytes_sent += bytes_sent;
         info.last_send = info.clock.now();
-        info.last_send_unix = crate::peer::unix_now();
+        info.last_send_unix = info.clock.time().max(0) as u64;
         total_bytes_sent.fetch_add(bytes_sent, Ordering::Relaxed);
 
         // Log outgoing messages for debugging
@@ -1091,7 +1107,7 @@ impl Connection {
         let bytes_sent = bytes.len() as u64;
         self.info.bytes_sent += bytes_sent;
         self.info.last_send = self.info.clock.now();
-        self.info.last_send_unix = crate::peer::unix_now();
+        self.info.last_send_unix = self.info.clock.time().max(0) as u64;
         self.total_bytes_sent
             .fetch_add(bytes_sent, Ordering::Relaxed);
 

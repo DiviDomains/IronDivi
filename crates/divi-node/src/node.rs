@@ -2048,8 +2048,9 @@ impl Node {
                                     // Addresses are dated on the network-adjusted
                                     // clock (main.cpp:536), the day's peers picked
                                     // on the node's own (net.cpp:1508)
-                                    let now = divi_primitives::clock::adjusted_now().max(0) as u32;
-                                    let day_now = divi_primitives::clock::now().max(0) as u32;
+                                    let clock = peer_manager.clock();
+                                    let now = clock.adjusted_time().max(0) as u32;
+                                    let day_now = clock.time().max(0) as u32;
                                     let got = peer_manager.gossip().received(
                                         peer_id,
                                         &addrs,

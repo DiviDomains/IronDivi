@@ -345,10 +345,9 @@ impl NetworkRpc {
                 let absolute = params.get_bool(3).unwrap_or(false);
                 let duration = match params.get_u64(2) {
                     Some(until) if until > 0 && absolute => {
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0);
+                        // Counted from the clock the ban's end is read on,
+                        // the node's (setmocktime moves it)
+                        let now = peer_manager.clock().time().max(0) as u64;
                         Duration::from_secs(until.saturating_sub(now))
                     }
                     Some(secs) if secs > 0 => Duration::from_secs(secs),
@@ -521,7 +520,7 @@ impl NetworkRpc {
                     "blocks_received": s.blocks_received,
                     "txs_received": s.txs_received,
                     "avg_latency_ms": s.avg_latency_ms,
-                    "is_responsive": s.is_responsive(),
+                    "is_responsive": s.is_responsive_at(peer_manager.clock().now()),
                 })
             })
             .collect();
