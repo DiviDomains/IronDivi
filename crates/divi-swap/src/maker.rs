@@ -34,7 +34,7 @@ use crate::error::{Result, SwapError};
 use crate::htlc::{HtlcParams, ScriptVersion};
 use crate::state::SwapState;
 use crate::store::{MakerRecord, QuoteRecord, Store};
-use crate::types::{Amount, Chain, Outpoint, SignedTx, SpendInfo};
+use crate::types::{Amount, Chain, Funding, Outpoint, SignedTx, SpendInfo};
 
 /// Default wall-clock time the maker waits for the taker's lock after `accept`.
 pub const DEFAULT_LOCK_WAIT_SECS: u64 = 1800;
@@ -733,7 +733,11 @@ impl Maker {
             .clone()
             .ok_or_else(|| SwapError::Other("MakerLocked without a funding tx".into()))?;
         // Idempotent: a tx the chain already has is Ok.
-        self.mk(r)?.broadcast(&funding.tx).await?;
+        match self.mk(r)?.broadcast(&funding.tx).await {
+            Ok(_) => {}
+            Err(SwapError::InputsHeld(why)) => return self.lost_coin_race(r, &funding, &why).await,
+            Err(e) => return Err(e),
+        }
         let confs = self
             .mk(r)?
             .confirmations(&funding.tx.txid)
@@ -747,6 +751,27 @@ impl Maker {
             return self.enter(r, SwapState::MakerRefundable);
         }
         Ok(Flow::Idle)
+    }
+
+    /// The reservation table refused the persisted funding before it was sent: another lock
+    /// (a second daemon on the same database) took one of its coins first. Unless the chain
+    /// knows these bytes (sent earlier, before their row went), drop the funding and go back
+    /// to `TakerLockConfirmed`, whose checks build a new one from other coins or, past the
+    /// lock window, abort. The backend has already given the coins back to its wallet.
+    async fn lost_coin_race(
+        &self,
+        r: &mut MakerRecord,
+        funding: &Funding,
+        why: &str,
+    ) -> Result<Flow> {
+        if self.mk(r)?.confirmations(&funding.tx.txid).await?.is_some() {
+            return Err(SwapError::InputsHeld(why.into()));
+        }
+        tracing::warn!(swap = %r.id, txid = %funding.tx.txid, "maker lock lost the coin race, unsent: {why}");
+        r.maker_leg_htlc = None;
+        r.maker_leg_funding = None;
+        r.maker_mtp_at_lock = None;
+        self.enter(r, SwapState::TakerLockConfirmed)
     }
 
     async fn on_maker_lock_confirmed(&self, r: &mut MakerRecord) -> Result<Flow> {
@@ -789,7 +814,7 @@ impl Maker {
         }
         match mk.broadcast(&funding.tx).await {
             Ok(_) => {}
-            Err(SwapError::Rejected(why)) => {
+            Err(SwapError::Rejected(why) | SwapError::InputsHeld(why)) => {
                 r.maker_lock_dropped = true;
                 r.last_error = Some(format!("{MAKER_LOCK_DROPPED}: {why}"));
                 self.store.put_maker_swap(r)?;
