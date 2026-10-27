@@ -20,6 +20,8 @@
 # Environment and secrets
 .env*
 *.pem
+# test-only TLS certificates for tests/electrum.rs
+!bin/irondivid/tests/fixtures/electrum/*.pem
 *.key
 wallet/
 wallet.dat
