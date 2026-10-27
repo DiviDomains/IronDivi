@@ -33,6 +33,9 @@ import time
 import urllib.error
 import urllib.request
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "lib"))
+import node_ports  # noqa: E402  (scripts/lib: a node whose ports were taken starts again on new ones)
+
 IRONDIVID, DIVID, PORT_BASE, WORK, OUT = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4], sys.argv[5]
 SEED = int(os.environ.get("SEED", "1"))
 HOURS = float(os.environ.get("HOURS", "1"))
@@ -105,8 +108,8 @@ class Node:
     def start(self, connect_to, extra=()):
         self.write_conf(connect_to, extra)
         log = open(os.path.join(self.dir, "stdout.log"), "a")
-        self.proc = subprocess.Popen([self.binary, f"-datadir={self.dir}"], cwd=self.dir, stdout=log, stderr=log,
-                                     start_new_session=True)
+        self.proc = node_ports.popen(self, [self.binary, f"-datadir={self.dir}"], cwd=self.dir, stdout=log, stderr=log,
+                                     start_new_session=True, work=WORK)
         with open(os.path.join(WORK, "pids"), "a") as f:
             f.write(f"{self.proc.pid}\n")
         deadline = time.time() + START_TIMEOUT

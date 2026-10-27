@@ -12,7 +12,7 @@ done. Each step runs on both in the same order, and the log lines it writes are 
 - `KNOWN`: differs, in the way listed below with the reason;
 - `FAIL`: differs and should not, or a `KNOWN` row that now matches divid, or differs in another way.
 
-The run ends with `FAILS <n>`; the exit code is the number of FAILs (255: usage error, a port in use, interrupted, or
+The run ends with `FAILS <n>`; the exit code is the number of FAILs (255: usage error, interrupted, or
 over 15 minutes).
 
 ```sh

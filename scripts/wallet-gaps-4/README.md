@@ -12,7 +12,7 @@ Each case below runs on both twins, and its outcome is compared (never its timin
 - `FAIL`: differs and should not, or a `KNOWN` row that now matches divid, or differs in another way (the list below
   is out of date).
 
-The run ends with `FAILS <n>`; the exit code is the number of FAILs (255: usage error, a port in use, interrupted, or
+The run ends with `FAILS <n>`; the exit code is the number of FAILs (255: usage error, interrupted, or
 over 15 minutes).
 
 ```sh

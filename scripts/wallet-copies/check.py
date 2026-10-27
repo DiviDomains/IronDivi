@@ -25,6 +25,9 @@ import time
 import urllib.error
 import urllib.request
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "lib"))
+import node_ports  # noqa: E402  (scripts/lib: a node whose ports were taken starts again on new ones)
+
 IRONDIVID, DIVID, PORT_BASE, WORK = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
 # For the proof that a difference is caught: irondivid's value of the named row is
 # changed before it is compared
@@ -80,14 +83,21 @@ class Node:
         self.out_path = os.path.join(WORK, name + ".out")
         self.proc = None
 
+    def ports_moved(self):
+        """node_ports starts the node again on other ports: its text starts after the failed start's (the console
+        file is opened again, empty)"""
+        self.out_mark = 0
+        log = self.debug_log()
+        self.log_mark = os.path.getsize(log) if log else 0
+
     def start(self):
         """Start the node; the console text and log offset it starts from"""
         self.out_mark = os.path.getsize(self.out_path) if os.path.exists(self.out_path) else 0
         log = self.debug_log()
         self.log_mark = os.path.getsize(log) if log else 0
         out = open(self.out_path, "a")
-        self.proc = subprocess.Popen([self.binary, f"-datadir={self.dir}"], cwd=self.dir,
-                                     stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
+        self.proc = node_ports.popen(self, [self.binary, f"-datadir={self.dir}"], cwd=self.dir,
+                                     stdout=out, stderr=subprocess.STDOUT, start_new_session=True, work=WORK)
         out.close()
         with open(os.path.join(WORK, "pids"), "a") as f:
             f.write(f"{self.proc.pid}\n")

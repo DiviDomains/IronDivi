@@ -17,12 +17,14 @@ import base64
 import json
 import os
 import secrets
-import socket
 import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "lib"))
+import node_ports  # noqa: E402  (scripts/lib: a node whose ports were taken starts again on new ones)
 
 IRONDIVID, DIVID, PORT_BASE, WORK = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
 # For the proof that a difference is caught: irondivid's reply of the named row
@@ -31,7 +33,6 @@ INJECT = os.environ.get("FORK_WARNING_INJECT", "")
 RPC_TIMEOUT = 120
 START_TIMEOUT = 120
 SYNC_TIMEOUT = 120
-BIND_RETRIES = 5
 WARNING = ("Warning: We do not appear to fully agree with our peers! You may need to upgrade, "
            "or other nodes may need to upgrade.")
 LOG_LINE = "CheckForkWarningConditions: Warning: Found invalid chain at least ~6 blocks longer than our best chain."
@@ -65,17 +66,6 @@ def row(name, core, iron):
         fails += 1
     show = lambda v: json.dumps(v, sort_keys=True)[:200]
     print(f"{word:<5}  {name}  divid={show(core)}  irondivid={show(iron)}{note}", flush=True)
-
-
-def info(text):
-    print(f"#      {text}", flush=True)
-
-
-def free_port():
-    """A port nothing listens on now (the system picks it)"""
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.2", 0))
-        return sock.getsockname()[1]
 
 
 class Node:
@@ -115,8 +105,8 @@ class Node:
         self.write_conf()
         self.err = os.path.join(WORK, f"{self.name}.{self.starts}.err")
         with open(os.path.join(WORK, f"{self.name}.{self.starts}.out"), "w") as o, open(self.err, "w") as e:
-            self.proc = subprocess.Popen([self.binary, f"-datadir={self.dir}"], cwd=self.dir,
-                                         stdout=o, stderr=e, start_new_session=True)
+            self.proc = node_ports.popen(self, [self.binary, f"-datadir={self.dir}"], cwd=self.dir,
+                                         stdout=o, stderr=e, start_new_session=True, work=WORK)
         with open(os.path.join(WORK, "pids"), "a") as f:
             f.write(f"{self.proc.pid}\n")
 
@@ -140,20 +130,12 @@ class Node:
 
     def start(self):
         """True once RPC answers; a node whose ports are taken is started again
-        on new ones; otherwise `why` says how it ended"""
-        retries = BIND_RETRIES
+        on new ones (node_ports); otherwise `why` says how it ended"""
         self.launch()
         deadline = time.time() + START_TIMEOUT
         while time.time() < deadline:
             code = self.proc.poll()
             if code is not None:
-                text = "\n".join(self.log_tail())
-                if retries and ("Address already in use" in text or "Unable to bind" in text):
-                    retries -= 1
-                    self.p2p, self.rpcport = free_port(), free_port()
-                    info(f"{self.name}: ports in use, starting again on {self.p2p}/{self.rpcport}")
-                    self.launch()
-                    continue
                 self.why = f"exited with code {code}; last lines of its log:\n" + "\n".join(
                     "#     " + line for line in self.log_tail())
                 return False

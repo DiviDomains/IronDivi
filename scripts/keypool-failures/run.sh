@@ -25,13 +25,7 @@ for b in "$IRD" "$DIVID"; do
   [ -x "$b" ] || { echo "not executable: $b" >&2; exit 255; }
 done
 command -v prlimit >/dev/null || { echo "needs util-linux's prlimit" >&2; exit 255; }
-for p in $(seq "$BASE" $((BASE + 5))); do
-  # a TIME-WAIT left by an earlier run does not stop a listener (SO_REUSEADDR)
-  if ss -Htan exclude time-wait "( sport = :$p or dport = :$p )" 2>/dev/null | grep -q .; then
-    echo "port $p is in use" >&2
-    exit 255
-  fi
-done
+# All six ports are the nodes' own: one that is taken moves (scripts/lib/node_ports.py)
 mkdir -p "$ROOT"
 WORK=$(mktemp -d "$ROOT/keypool-failures.XXXXXX") || exit 255
 chmod 700 "$WORK"

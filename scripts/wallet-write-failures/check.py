@@ -26,6 +26,9 @@ import time
 import urllib.error
 import urllib.request
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "lib"))
+import node_ports  # noqa: E402  (scripts/lib: a node whose ports were taken starts again on new ones)
+
 IRONDIVID, DIVID, PORT_BASE, WORK = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
 HOST = "127.0.0.2"
 START_TIMEOUT = 120
@@ -114,8 +117,9 @@ sys.excepthook = setup_failed
 class Node:
     def __init__(self, name, binary, index, case):
         self.name, self.binary = name, binary
-        self.p2p = PORT_BASE + 2 * index
-        self.rpcport = PORT_BASE + 2 * index + 1
+        # each case's nodes have the same ports: the ones a node of an earlier case was moved to
+        self.p2p = node_ports.now(PORT_BASE + 2 * index)
+        self.rpcport = node_ports.now(PORT_BASE + 2 * index + 1)
         self.password = secrets.token_hex(16)
         self.user = f"u{index}"
         self.auth = base64.b64encode(f"{self.user}:{self.password}".encode()).decode()
@@ -136,11 +140,24 @@ class Node:
             os.remove(path)
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w") as f:
-            f.write("\n".join(lines) + "\n")
+            f.write(node_ports.follow("\n".join(lines) + "\n"))
 
     def start(self):
         """('up',), ('exit', code) or ('timeout',). The node's output goes
-        through a pipe to a file this script writes, so no limit applies to it."""
+        through a pipe to a file this script writes, so no limit applies to it.
+        A node that exits because a port is taken is started again on new ports."""
+        retries = node_ports.BIND_RETRIES
+        while True:
+            outcome = self.start_once()
+            if outcome[0] == "exit" and retries:
+                with open(self.out_path, errors="replace") as f:
+                    taken = node_ports.bind_failure(self, f.read())
+                if taken and node_ports.move_ports(self, self.dir):
+                    retries -= 1
+                    continue
+            return outcome
+
+    def start_once(self):
         self.write_conf()
         self.starts += 1
         self.out_path = os.path.join(WORK, f"{self.case}.{self.name}.{self.starts}.out")
