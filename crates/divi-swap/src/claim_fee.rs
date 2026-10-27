@@ -47,8 +47,6 @@ pub(crate) trait ClaimRecord: Send {
     fn claim_mut(&mut self) -> ClaimMut<'_>;
     /// Write the whole record (write-ahead of every broadcast).
     fn persist(&self, store: &Store) -> Result<()>;
-    /// The record's last error, shown to the operator.
-    fn last_error_mut(&mut self) -> &mut Option<String>;
 }
 
 impl ClaimRecord for TakerRecord {
@@ -68,9 +66,6 @@ impl ClaimRecord for TakerRecord {
     }
     fn persist(&self, store: &Store) -> Result<()> {
         store.put_taker_swap(self)
-    }
-    fn last_error_mut(&mut self) -> &mut Option<String> {
-        &mut self.last_error
     }
 }
 
@@ -92,9 +87,6 @@ impl ClaimRecord for MakerRecord {
     }
     fn persist(&self, store: &Store) -> Result<()> {
         store.put_maker_swap(self)
-    }
-    fn last_error_mut(&mut self) -> &mut Option<String> {
-        &mut self.last_error
     }
 }
 
@@ -157,40 +149,26 @@ impl ClaimCtx<'_> {
         Ok(tx)
     }
 
-    /// [`ClaimCtx::sign_first`] for a claim whose preimage is already public: a claim the
-    /// backend holds for its second source ([`SwapError::Held`]) is signed on the primary
-    /// alone once less than the claim margin (`window`) is left before the counterparty's
-    /// refund locktime ([`crate::hold`]). Never for a first claim that would reveal the
-    /// preimage: that one is declined at its margin instead (`taker.rs`).
+    /// [`ClaimCtx::sign_first`] for a claim whose preimage is already public. A claim the
+    /// backend holds for its second source ([`SwapError::Held`]) has no refund path left, so
+    /// it keeps holding and is never signed on the primary alone (Manager ruling 2026-10-27
+    /// 19:40Z); once less than the claim margin (`window`) is left before the counterparty's
+    /// refund locktime the hold says it needs a human ([`hold::keep_holding`]).
     pub async fn sign_public<R: ClaimRecord>(&self, r: &mut R) -> Result<SignedTx> {
-        let why = match self.sign_first(r).await {
-            Err(SwapError::Held(why)) => why,
-            other => return other,
-        };
-        let deadline = hold::claim_deadline(self.htlc.locktime, self.window);
-        let view = hold::past_deadline(
-            self.backend,
-            why.clone(),
-            deadline,
-            r.swap_id(),
-            "claim",
-            self.htlc.locktime,
-        )
-        .await?;
-        let primary = ClaimCtx {
-            chain: self.chain,
-            backend: view.as_ref(),
-            escalation: self.escalation,
-            window: self.window,
-            htlc: self.htlc,
-            op: self.op,
-            amount: self.amount,
-            preimage: self.preimage,
-            store: self.store,
-        };
-        let tx = primary.sign_first(r).await?;
-        *r.last_error_mut() = Some(hold::note("claim", &why));
-        Ok(tx)
+        match self.sign_first(r).await {
+            Err(SwapError::Held(why)) => {
+                let deadline = hold::claim_deadline(self.htlc.locktime, self.window);
+                Err(hold::keep_holding(
+                    self.backend,
+                    why,
+                    deadline,
+                    r.swap_id(),
+                    self.htlc.locktime,
+                )
+                .await)
+            }
+            other => other,
+        }
     }
 
     /// Whether a version a replacement superseded is the one that got mined.

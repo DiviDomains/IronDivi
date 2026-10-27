@@ -1117,13 +1117,23 @@ impl Maker {
         Ok(mk.refund_final(mk.median_time_past().await?, htlc.locktime))
     }
 
-    /// The preimage, if a transaction other than our own refund spent the maker-leg lock.
-    async fn revealed_preimage(&self, r: &MakerRecord) -> Result<Option<[u8; 32]>> {
-        let (_, funding) = self.maker_leg(r)?;
-        let Some(spend) = self
-            .mk(r)?
-            .find_spend(&funding.outpoint, r.maker_leg_scan_from)
-            .await?
+    /// The preimage, if a transaction other than our own refund spent the maker-leg lock. Our
+    /// refund waits on this read, so a read held by the second source is read on the primary
+    /// alone one claim margin after the locktime ([`hold::find_spend`]).
+    async fn revealed_preimage(&self, r: &mut MakerRecord) -> Result<Option<[u8; 32]>> {
+        let (htlc, funding) = self.maker_leg(r)?;
+        let mk = self.mk(r)?.clone();
+        let margin = ClaimDeadline::builtin(mk.chain()).margin_secs();
+        let Some(spend) = hold::find_spend(
+            mk.as_ref(),
+            &funding.outpoint,
+            r.maker_leg_scan_from,
+            htlc.locktime,
+            margin,
+            &r.id,
+            &mut r.last_error,
+        )
+        .await?
         else {
             return Ok(None);
         };

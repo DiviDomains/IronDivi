@@ -192,20 +192,22 @@ impl LtcBackend {
     /// primary's hash at `tip - CROSSCHECK_DEPTH` with `source` at its default mainnet base,
     /// as the startup [`LtcBackend::crosscheck`] does, then its hash at
     /// `tip - CLAIM_NEAR_DEPTH` and its spend of the claimed output. `Disagree` refuses the claim as
-    /// [`SwapError::Transient`] (the engine retries); `Unavailable` logs one warning per claim
-    /// and builds it anyway. The result is reused until the primary's tip hash changes.
+    /// [`SwapError::Held`] naming both sources (the engine retries; a public-preimage claim
+    /// keeps holding, `divi_swap::hold`); `Unavailable` logs one warning per claim and builds
+    /// it anyway. The result is reused until the primary's tip hash changes.
     /// It also cross-checks every lock read (`htlc_output`, EL): the source must show the
     /// agreed script and the primary's value at the outpoint, and the lower confirmation
     /// count is used; a disagreeing or unreadable source is `Transient` (fail closed, since
     /// neither caller has revealed or paid anything yet).
     /// And it cross-checks every `find_spend` (EN): the source's spender, input, scriptSig and
-    /// witness must match the primary's, else `Transient`; the fewer confirmations are used; a
+    /// witness must match the primary's, else `Held` (a refund waiting on the read reads the
+    /// primary alone one claim margin after its locktime); the fewer confirmations are used; a
     /// source that cannot be read logs a warning and leaves the primary's answer (as today), so
     /// a down explorer never holds the maker's refund or preimage watch. One more request per
     /// read while unspent, two once spent, reused for one LTC block time while the primary's
     /// answer stands.
-    /// `None` (the default) is off: no extra request. Mainnet only; the daemon's config
-    /// enforces that.
+    /// `None` (the default) is off: no extra request and no [`ChainBackend::primary_only`]
+    /// view. Mainnet only; the daemon's config enforces that.
     pub fn with_claim_crosscheck(self, source: Option<CrossCheckSource>) -> Self {
         match source {
             Some(s) => self.with_claim_crosscheck_at(s, s.default_base()),
@@ -303,9 +305,11 @@ impl LtcBackend {
                 );
                 Ok(())
             }
-            ClaimCheck::Disagree(m) => {
-                Err(SwapError::Transient(format!("{m}; claim of {at} held")))
-            }
+            ClaimCheck::Disagree(m) => Err(SwapError::Held(format!(
+                "{m}; claim of {at} held (primary {}, {source} {})",
+                self.esplora.primary_url(),
+                cc.base
+            ))),
         }
     }
 
@@ -389,7 +393,8 @@ impl LtcBackend {
 
     /// With `[ltc].crosscheck_before_claim` on: `mine` (the primary's `find_spend`) agreed with
     /// the cross-check source's view of the spend of `at` ([`agree_find_spend`]). One attempt,
-    /// no backoff. `Disagree` is `Transient` (the engine reads again); `Unavailable` warns once
+    /// no backoff. `Disagree` is `Held` (the engine reads again, and on the primary alone once
+    /// a refund waiting on it is one claim margin past its locktime); `Unavailable` warns once
     /// per fresh read and returns `mine`, the LTC claim-time rule: failing closed would hold
     /// the maker's refund, which reads `find_spend` first, behind a third-party explorer.
     async fn agree_spend_with_source(
@@ -436,7 +441,7 @@ impl LtcBackend {
                 if fresh {
                     tracing::warn!(source, outpoint = %at, "{m}");
                 }
-                Err(SwapError::Transient(m))
+                Err(SwapError::Held(m))
             }
             Err(SpendCheck::Unavailable(reason)) => {
                 if fresh {
@@ -1097,6 +1102,27 @@ impl ChainBackend for LtcBackend {
             }
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// With the cross-check on: the same key, primary Esplora, reservations and broadcast
+    /// setting (dual broadcast stays as configured), the claim and `find_spend` cross-checks
+    /// off. The engine builds held refunds and reads held spends through it at their deadline
+    /// (`divi_swap::hold`); a public-preimage claim is never built through it.
+    fn primary_only(&self) -> Option<std::sync::Arc<dyn ChainBackend>> {
+        self.claim_check.as_ref()?;
+        Some(std::sync::Arc::new(LtcBackend {
+            esplora: self.esplora.clone(),
+            secp: self.secp.clone(),
+            key: self.key,
+            pubkey: self.pubkey,
+            address: self.address.clone(),
+            hrp: self.hrp,
+            fees: self.fees,
+            reservations: self.reservations.clone(),
+            retry: self.retry,
+            claim_check: None,
+            dual: self.dual.clone(),
+        }))
     }
 
     async fn confirmations(&self, txid: &Txid) -> Result<Option<u32>> {

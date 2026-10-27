@@ -492,12 +492,15 @@ impl Taker {
     /// The maker's claim of the taker leg, if one that carries our preimage is buried at
     /// least as deep as the quote asks on that chain. Our refund can then never confirm: the
     /// preimage went out with a maker-leg claim of ours that never confirmed, and the maker
-    /// spent both legs.
-    async fn taker_leg_lost(&self, r: &TakerRecord) -> Result<Option<SpendInfo>> {
-        let Some(f) = &r.taker_leg_funding else {
+    /// spent both legs. Our refund waits on this read, so a read held by the second source is
+    /// read on the primary alone one claim margin after the locktime ([`hold::find_spend`]).
+    async fn taker_leg_lost(&self, r: &mut TakerRecord) -> Result<Option<SpendInfo>> {
+        let Some(f) = r.taker_leg_funding.clone() else {
             return Ok(None);
         };
-        let tb = self.tk(r)?;
+        let tb = self.tk(r)?.clone();
+        let locktime = self.taker_leg_htlc(r)?.locktime;
+        let margin = self.claim_deadline(r.quote.taker_chain()).margin_secs();
         let Some(confs) = tb
             .confirmations(&f.outpoint.txid)
             .await?
@@ -506,9 +509,16 @@ impl Taker {
             return Ok(None);
         };
         let tip = tb.tip_height().await?;
-        let Some(spend) = tb
-            .find_spend(&f.outpoint, (tip + 1).saturating_sub(confs as u64))
-            .await?
+        let Some(spend) = hold::find_spend(
+            tb.as_ref(),
+            &f.outpoint,
+            (tip + 1).saturating_sub(confs as u64),
+            locktime,
+            margin,
+            &r.id,
+            &mut r.last_error,
+        )
+        .await?
         else {
             return Ok(None);
         };

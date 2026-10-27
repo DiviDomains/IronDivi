@@ -8,31 +8,40 @@
 
 //! The bound on a spend a backend holds for its second source ([`SwapError::Held`]).
 //!
-//! A backend with an opt-in cross-check refuses to build a claim or refund while its second
-//! source is down or disagrees. Held past the locktime it races, that turns a possible false
-//! alarm into a certain loss, so the hold ends at a deadline in the chain's own time (MTP):
+//! A backend with an opt-in cross-check refuses to build a claim or refund, or to answer a
+//! spend read, while its second source is down or disagrees. Refunds have a deadline in the
+//! chain's own time (MTP); a claim whose preimage is public does not (Manager ruling
+//! 2026-10-27 19:40Z, EU):
 //!
+//! - a refund: one claim margin after its locktime, it is built on the primary alone; and the
+//!   spend read a refund waits on (`find_spend`: was the lock claimed, with which preimage?)
+//!   is read on the primary alone from the same deadline;
 //! - a claim whose preimage is already public (the taker's in `Claimed`, the maker's of the
-//!   taker leg): once less than the chain's claim margin is left before the counterparty's
-//!   refund locktime — the moment the taker stops starting a first claim
-//!   ([`crate::ClaimDeadline::check`]) — it is built on the primary alone;
-//! - a refund: one claim margin after its locktime, it is built on the primary alone.
+//!   taker leg) has no refund path left: it keeps holding, never built on the primary alone.
+//!   Once less than the chain's claim margin is left before the counterparty's refund
+//!   locktime (its old deadline, where [`crate::ClaimDeadline::check`] fails) the hold is
+//!   logged once at error level and `last_error` says it needs a human
+//!   ([`NO_REFUND_PATH`]); the two-source build is still retried every tick.
 //!
-//! Past either deadline the cross-check protects nothing: the preimage is out, or the coins
-//! go back to our own key, and the signature commits to the amount and the chain's branch
-//! (ZIP 244, BIP 143), so a lying primary can only make the spend fail to land, which is what
-//! holding gives too. The taker's **first** claim, which would reveal the preimage, never comes
-//! here: it is declined at its margin and both legs refund (`taker.rs`). Only if the chain's
-//! MTP cannot be read (a two-source MTP whose second source is down) is the wall clock used,
-//! which runs ahead of MTP and so can only bring a deadline earlier.
+//! Past a refund deadline the cross-check protects nothing: the coins go back to our own key
+//! and the signature commits to the amount and the chain's branch (ZIP 244, BIP 143), so a
+//! lying primary can only make the refund fail to land, which is what holding gives too. A
+//! preimage read on the primary alone is checked against the hash. The taker's **first**
+//! claim, which would reveal the preimage, is declined at its margin and both legs refund
+//! (`taker.rs`). Only if the chain's MTP cannot be read (a two-source MTP whose second source
+//! is down) is the wall clock used, which runs ahead of MTP and so can only bring a deadline
+//! earlier.
 
 use crate::backend::ChainBackend;
 use crate::error::{Result, SwapError};
 use crate::htlc::HtlcParams;
-use crate::types::{Amount, Outpoint, SignedTx};
+use crate::types::{Amount, Outpoint, SignedTx, SpendInfo};
 
-/// First chain time at which a held claim of an HTLC with `locktime` is built on the primary
-/// alone: less than `margin` seconds are left (where [`crate::ClaimDeadline::check`] fails).
+/// What `last_error` says of a public-preimage claim held past its old deadline.
+pub(crate) const NO_REFUND_PATH: &str = "held claim, no refund path: needs a human";
+
+/// The old deadline of a held claim of an HTLC with `locktime`: less than `margin` seconds are
+/// left (where [`crate::ClaimDeadline::check`] fails). From it on the hold needs a human.
 pub(crate) fn claim_deadline(locktime: u32, margin: u32) -> i64 {
     i64::from(locktime) - i64::from(margin) + 1
 }
@@ -91,6 +100,47 @@ pub(crate) async fn past_deadline(
     Ok(view)
 }
 
+/// Whether this is the first time (in this process) that `swap`'s held claim passed its old
+/// deadline: the error line is written once, not every tick.
+fn first_report(swap: &str) -> bool {
+    static SEEN: std::sync::OnceLock<parking_lot::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    SEEN.get_or_init(Default::default)
+        .lock()
+        .insert(swap.to_owned())
+}
+
+/// A public-preimage claim the backend holds (`why`): it keeps holding (no refund path, so
+/// nothing moves without a human). From its old `deadline` on, the hold is logged once at
+/// error level and the returned `Held` says it needs a human ([`NO_REFUND_PATH`]).
+pub(crate) async fn keep_holding(
+    backend: &dyn ChainBackend,
+    why: String,
+    deadline: i64,
+    swap: &str,
+    locktime: u32,
+) -> SwapError {
+    let (now, clock) = judge_time(backend.median_time_past().await, unix_now());
+    if now < deadline {
+        return SwapError::Held(why);
+    }
+    if first_report(swap) {
+        tracing::error!(
+            swap,
+            chain = %backend.chain(),
+            what = "claim",
+            locktime,
+            deadline,
+            now,
+            clock,
+            held = %why,
+            "{NO_REFUND_PATH}: a claim with a public preimage is held by the second source \
+             past its deadline; it is never built on the primary alone"
+        );
+    }
+    SwapError::Held(format!("{NO_REFUND_PATH}: {why}"))
+}
+
 /// What a record says once a spend was built on the primary alone.
 pub(crate) fn note(what: &str, why: &str) -> String {
     format!("{what} built on the primary source alone at its hold deadline (held: {why})")
@@ -127,6 +177,32 @@ pub(crate) async fn build_refund(
     Ok(tx)
 }
 
+/// [`ChainBackend::find_spend`] for a read a refund of the HTLC with `locktime` waits on:
+/// held reads are read on the primary alone from the refund deadline ([`refund_deadline`]
+/// with the chain's claim `margin`); `last_error` then names it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn find_spend(
+    backend: &dyn ChainBackend,
+    at: &Outpoint,
+    from_height: u64,
+    locktime: u32,
+    margin: u32,
+    swap: &str,
+    last_error: &mut Option<String>,
+) -> Result<Option<SpendInfo>> {
+    let why = match backend.find_spend(at, from_height).await {
+        Err(SwapError::Held(why)) => why,
+        other => return other,
+    };
+    let deadline = refund_deadline(locktime, margin);
+    let view = past_deadline(backend, why.clone(), deadline, swap, "spend read", locktime).await?;
+    let spend = view.find_spend(at, from_height).await?;
+    *last_error = Some(format!(
+        "spend read on the primary source alone at its hold deadline (held: {why})"
+    ));
+    Ok(spend)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,6 +216,13 @@ mod tests {
         assert!(d.check(crate::Chain::Btc, (c - 1) as u32, l).is_ok());
         assert!(d.check(crate::Chain::Btc, c as u32, l).is_err());
         assert_eq!(refund_deadline(l, m), i64::from(l) + 3600);
+    }
+
+    #[test]
+    fn a_held_claim_past_its_deadline_is_reported_once_per_swap() {
+        assert!(first_report("eu-once-a"));
+        assert!(!first_report("eu-once-a"));
+        assert!(first_report("eu-once-b"));
     }
 
     #[test]
