@@ -23,8 +23,9 @@ what does not depend on keys or hashes is compared:
 - the mempool size and the height;
 - for `invalidate`, all of these also between `invalidateblock` and `reconsiderblock`.
 
-Txids and block hashes differ between the pairs, so which coin a send spends or which coin stakes can differ, and with
-it the change values and which stake outputs are still immature. Those fields are still compared exactly. A difference
+Txids and block hashes can differ between the pairs (a block made a second later, a stake kernel found at another
+time), so which coin a send spends or which coin stakes can differ, and with it the change values and which stake
+outputs are still immature. Those fields are still compared exactly. A difference
 that one of divid's accidental choices explains (below) is logged as `KNOWN`, with its reason, and the run goes on
 with four fresh nodes. For the stake outputs, the rules check that each side's balance plus immature balance agree.
 
@@ -56,6 +57,10 @@ SEED=7 scripts/random-sequences/run.sh target/release ~/divi-3.0.0/bin 53850 /va
 | `RANDOM_SEQUENCES_DEBUG` | `1`: irondivid logs at debug level and divid with `debug=mempool` |
 | `RANDOM_SEQUENCES_PROFILE` | `stake`: steps that reach stake blocks. The first blocks go to height 95 (work blocks end at 100); `mine` weighs 30 and a new step, `addvault`, 6 (node n takes on a vault the other node funded, once it is in a block); `fundvault` funds 100 to 1100; kills, restarts and invalidates are rare; all four nodes run with `vault=1`, which `addvault` needs (`CWallet::AddVault`, `wallet.cpp:693-705`) and which shuffles the stake set. Unset, the steps of every seed are as before |
 | `RANDOM_SEQUENCES_TWIN` | `1`: the second pair runs divid too, in irondivid's place, to see the differences divid has with itself on the same seed. The twins restore the phrases from `-mnemonic`, a line of their 0600 `divi.conf`. The line is taken out again once the wallet is made, as divid reads it at every start |
+| `RANDOM_SEQUENCES_ROWS` | `0`: leave out the fixed rows (below) that a seeded run starts with |
+| `RANDOM_SEQUENCES_MID_TRACE` | `1`: for each `invalidate`, each side's mempool (txids) with the time, before it, when `invalidateblock` returns, at the read and for 4 s after, and the transactions of the blocks it disconnects |
+| `RANDOM_SEQUENCES_MID_DELAY` | seconds to wait between `invalidateblock` returning and the read of the middle state (0) |
+| `RANDOM_SEQUENCES_MID_BARRIER` | `1`: the two pairs read the middle state of an `invalidate` together, once both calls have returned |
 | `RANDOM_SEQUENCES_TRACE` | `1`: before and after each `invalidateblock`, the node's mempool is printed, each transaction with its inputs (`txid:vout@height/kind`) and its outputs |
 
 A run of 200 steps takes 2 to 10 minutes. However it ends, all nodes are stopped and their directories deleted. It
@@ -78,6 +83,35 @@ Secrets:
 3. The nodes run with `staking=0` (blocks come from `setgenerate` and `generateblock`) and `keypool=5`, so a locked
    wallet runs out of keypool keys within a few calls.
 
+## Fixed rows
+
+A seeded run first runs the stored episodes in `rows/`, each on four fresh nodes of its own, then the seeded steps
+on fresh nodes again (with the encryption state they would have had without the rows). Each row is a case the draw
+reaches only now and then, so it is checked on every run. They are left out with `REPLAY` or `RANDOM_SEQUENCES_ROWS=0`.
+
+- `rows/mid-invalidate.json`: seed 14, steps 143-160, ending in a three-block `invalidate` on node 1 with sends of
+  both nodes in the mempool. In about half the runs the two sides' mempools differ in the middle of it. Both nodes
+  put the disconnected blocks' transactions back before `invalidateblock` returns: divid in `disconnectTip`
+  (`ChainTipManager.cpp:176-183`), irondivid in the RPC's reorg hook (`blockchain.rs` `invalidate_block_family`,
+  `node.rs` `update_mempool_after_reorg`). Traced runs, loaded or not, read early or late, never saw a mempool change
+  after the call returned. The middle sizes differ because the two sides had spent different coins of one value
+  before the invalidate (divid's coin choice among equal coins is by txid order), so a different send spends a coin
+  that is immature at the lowered height. That is the **maturity after a reorg** or **maturity in the middle of a
+  reorg** row below, and every other field is still compared. The two sides parted this way far more often than two
+  divid pairs did (26 of 218 middle states against 1 of 66), because irondivid's work blocks wrote a coinbase
+  scriptSig of their own: the height, then the height again as four raw bytes, where divid writes the height, then the
+  extra nonce 1 (`BlockFactory.cpp:38-52`). So no coinbase txid matched divid's, even for a block made in the same
+  second. irondivid now writes divid's.
+
+  With the coinbases the same, the row's sends often have the same txids on both sides. That showed a second,
+  rarer difference, at the end of the step (5 of 140 runs, in both directions). Node 1 is restarted by its
+  `encryptwallet` (step 156), so it lacks node 2's earlier sends, and in the middle it drops its own send that spends
+  an immature coin. Each comes back only by node 2's random mempool rebroadcast (divid `main.cpp:1280-1294`,
+  irondivid `rebroadcast.rs`). In the logs, that rebroadcast came 19 s after `reconsiderblock` on one side and later
+  than the end read on the other. So after `reconsiderblock` the script offers each node of the pair the transactions
+  of its peer's mempool that it lacks (`sendrawtransaction`, parents first), as that rebroadcast would. It does this
+  on both sides alike and compares every field after it. A node that refuses one still shows as a difference.
+
 ## Steps
 
 Each step names a node (1 or 2) and a random number `draw`, which picks amounts, coins and depths.
@@ -92,7 +126,7 @@ Each step names a node (1 or 2) and a random number `draw`, which picks amounts,
 | `fundvault` | `fundvault "<own address>:<other node's address>" <1 to 50>` |
 | `reclaim` | `reclaimvaultfunds <own address> <0.5 to 20>` |
 | `mine` | `setgenerate 1` to `3`: work blocks, and stake blocks past the last work block |
-| `invalidate` | `invalidateblock` of the block 1 to 3 below the tip, the state compared, then `reconsiderblock` |
+| `invalidate` | `invalidateblock` of the block 1 to 3 below the tip, the state compared, then `reconsiderblock`, and each node offered its peer's mempool transactions it lacks |
 | `restart` | `stop`, then a start on the same datadir |
 | `kill` | `kill -9`, then a start (see below for divid) |
 | `walletlock`, `walletpassphrase` | lock the wallet, or unlock it for 99999 s |
@@ -177,8 +211,27 @@ episode) and the remaining steps, so every comparison stays exact:
   size), and the end states agree. While its tip was lowered, one side dropped transactions from the disconnected
   blocks or its mempool, and each spends a coinbase or coinstake output immature at that height, or an output of a
   disconnected transaction that does. divid drops these with their descendants (`txmempool.cpp:139-157`, `:91-126`),
-  and `reconsiderblock` confirms them again. The other side had spent an older coin of the same value. The run goes
-  on without a new episode.
+  and `reconsiderblock` confirms them again. The other side had spent an older coin of the same value, so the two
+  sides lost transactions of different output values. The run goes on without a new episode.
+- **divid balance cache in the middle of a reorg:** only the middle of an `invalidate` differs, in node n's
+  balances alone (immature, `getbalance`, unconfirmed), and the end states agree. Both sides lost as many
+  transactions while the tip was lowered: spends of coins immature at that height (`removeCoinbaseSpends`), and the
+  transactions of the disconnected blocks it refuses. divid's wallet keeps the balances it cached for a mempool
+  transaction the reorg dropped (`CachedUtxoBalanceCalculator.cpp:13-30`, recomputed only when a wallet transaction
+  spending it is added, `wallet.cpp:1242-1333`). So the coins that transaction spends stay spent, and its outputs to
+  node n stay unconfirmed, although the transaction is now at -1 confirmations
+  (`MerkleTxConfirmationNumberCalculator.cpp:51`). A transaction of a disconnected block reaches the wallet again
+  through the disconnect (`ChainTipManager.cpp:189`), which recomputes the cache of each transaction it spends
+  (`wallet.cpp:1318-1334`), so the coins of those transactions leave no gap.
+  irondivid's wallet counts neither, so its balances agree with the coins it lists, as with **divid balance cache**.
+
+  The rule does the accounting exactly. It takes the coins of node n's wallet (`validateaddress`) that the lost
+  mempool transactions spent and that exist at the lowered height. It leaves out those of a transaction that one of
+  node n's transactions in the disconnected blocks (a coinstake too) also spends. divid's immature balance must be below irondivid's
+  by just those immature for the wallet there (under 21 confirmations), and both `getbalance` fields by just the
+  others. irondivid's unconfirmed balance must be the sum of the 0-confirmation coins it lists. This showed once
+  irondivid's coinbases matched divid's (see "Fixed rows"), because the two sides then drop the same sends. The run
+  goes on without a new episode.
 - **divid reindex after a kill:** see below. divid's reindex runs on a thread of its own (`init.cpp:1580`), while
   its wallet's unconfirmed transactions are offered to the mempool at the end of the start (`init.cpp:1646`), before
   the chain is rebuilt. So they are refused, and divid's wallet counts their inputs unspent.
@@ -203,6 +256,8 @@ episode) and the remaining steps, so every comparison stays exact:
 **Settling.** After each step, each pair waits until its two nodes are connected again (after a restart, the
 `-connect` node dials again within seconds) and on one tip, and until both mempools are equal or still for 8 s. A
 transaction made while the two are apart would reach the other node only through the random mempool rebroadcast.
+An `invalidate` first offers each node the transactions of its peer's mempool that it lacks, as that rebroadcast
+would (see "Fixed rows").
 
 **divid after `kill -9`:** divid refuses to start (or aborts while loading its block index) ("Block database corruption detected! Failed to find best block in
 block index", `BlockIndexLoading.cpp:275`, `init.cpp:1082`) until it is started with `-reindex`. That is the recovery

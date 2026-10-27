@@ -367,6 +367,24 @@ def input_values(node, txid):
 
 
 TRACE = os.environ.get("RANDOM_SEQUENCES_TRACE", "") == "1"
+# The middle of an invalidate, for chasing a difference there:
+# RANDOM_SEQUENCES_MID_TRACE=1 logs each side's mempool (txids) with a time,
+# before the invalidate, when it returns, at the read and for 4 s after;
+# RANDOM_SEQUENCES_MID_DELAY=<s> waits that long between the return and the
+# read; RANDOM_SEQUENCES_MID_BARRIER=1 makes the two pairs read together
+MID_TRACE = os.environ.get("RANDOM_SEQUENCES_MID_TRACE", "") == "1"
+MID_DELAY = float(os.environ.get("RANDOM_SEQUENCES_MID_DELAY") or 0)
+MID_BARRIER = threading.Barrier(2) if os.environ.get("RANDOM_SEQUENCES_MID_BARRIER", "") == "1" else None
+T0 = time.monotonic()
+
+
+def mid_trace(pair, node, when):
+    if not MID_TRACE:
+        return
+    pool = node.call("getrawmempool")
+    ids = sorted(t[:8] for t in pool[1]) if pool[0] == "ok" else pool
+    log(f"#   mid {time.monotonic() - T0:9.3f} {pair.name} {node.name} {when}: "
+        f"height {node.call('getblockcount')[1]} pool {ids}")
 
 
 def trace_mempool(pair, node, when):
@@ -480,21 +498,48 @@ def run_step(pair, step):
         pair.pool_before = pool_inputs(node)
         # the transactions of the blocks about to be disconnected, but their
         # coinbases and coinstakes, which no node puts back in its mempool
-        block_txs = []
+        block_txs, disconnected = [], []
         for h in range(height - depth + 1, height + 1):
             txs = node.rpc("getblock", node.rpc("getblockhash", h))["tx"]
             block_txs += [t for t in txs[1:] if not is_coinstake(pair, t)]
+            disconnected += txs[1:]
+        mid_trace(pair, node, "before")
+        mid_trace(pair, other, "before (other)")
+        if MID_TRACE:
+            log(f"#   mid {pair.name} disconnects {[t[:8] for t in block_txs]}")
         first = node.call("invalidateblock", target)
+        mid_trace(pair, node, "returned")
         trace_mempool(pair, node, f"after invalidateblock of {height - depth + 1}")
+        if MID_DELAY:
+            time.sleep(MID_DELAY)
+        if MID_BARRIER:
+            try:
+                MID_BARRIER.wait(60)
+            except threading.BrokenBarrierError:
+                MID_BARRIER.reset()
         mid = snapshot(node)
         mid_pool = node.call("getrawmempool")
-        pair.reorg = {"mid": height - depth, "block_txs": block_txs,
+        if MID_TRACE:
+            log(f"#   mid {time.monotonic() - T0:9.3f} {pair.name} {node.name} read: size "
+                f"{mid['mempool size']} pool {sorted(t[:8] for t in mid_pool[1]) if mid_pool[0] == 'ok' else mid_pool}")
+            for d in (0.2, 0.5, 1, 2, 4):
+                time.sleep(d - (0 if d == 0.2 else {0.5: 0.2, 1: 0.5, 2: 1, 4: 2}[d]))
+                mid_trace(pair, node, f"+{d} s")
+            mid_trace(pair, other, "+4 s (other)")
+        pair.reorg = {"mid": height - depth, "block_txs": block_txs, "disconnected": disconnected,
                       "mid_pool": set(mid_pool[1]) if mid_pool[0] == "ok" else None}
         # the coins in full, printed with a FAIL but not compared
         coins = node.call("listunspent", 0)
         mid["_coins (amount, confirmations)"] = sorted(
             (str(u["amount"]), u["confirmations"]) for u in coins[1]) if coins[0] == "ok" else coins
         second = node.call("reconsiderblock", target)
+        # node n dropped its peer's spends of coins immature in the middle,
+        # and a node restarted in the episode lacks its peer's sends: each
+        # comes back only by the peer's random mempool rebroadcast (divid
+        # main.cpp:1280-1294, irondivid rebroadcast.rs), which lands before
+        # the end read on one side and after it on the other. Offer them now,
+        # as that rebroadcast would (README, "Fixed rows")
+        offer_missing(pair)
         return f"{outcome(first)}/{outcome(second)}", mid
     if kind in ("restart", "kill"):
         pair.restarted.add(n)
@@ -799,6 +844,14 @@ EXPLAINED = {
         "divid's removeCoinbaseSpends drops with their descendants (txmempool.cpp:139-157, :91-126); the other "
         "side had spent an older coin of the same value (divid's coin choice among equal coins is by txid order); "
         "reconsiderblock confirms them again, so the end states agree"),
+    "divid balance cache in the middle of a reorg": (
+        "only the middle of the invalidate differs, in node n's balances, and the end states agree: both sides lost "
+        "as many transactions while the tip was lowered; divid's wallet keeps the balances it cached for a mempool "
+        "transaction the reorg dropped (CachedUtxoBalanceCalculator.cpp:13-30, recomputed only when a wallet "
+        "transaction spending it is added, wallet.cpp:1242-1333), so the coins it spends stay spent and its outputs "
+        "stay unconfirmed, though it is at -1 confirmations (MerkleTxConfirmationNumberCalculator.cpp:51); divid's "
+        "immature balance and getbalance are below irondivid's by just those coins, and irondivid's balances agree "
+        "with the coins it lists"),
     "maturity after a reorg": (
         "after invalidateblock the dropped mempool transactions all spend a coinbase or coinstake "
         "output that is immature at the new height, which divid's removeCoinbaseSpends drops too "
@@ -1039,6 +1092,37 @@ def spends_immature(pair, holder, txid, next_height, inputs=None):
     return False
 
 
+def offer_missing(pair):
+    """Each node of the pair is sent the transactions of its peer's mempool
+    it lacks, parents first, as the peer's mempool rebroadcast does"""
+    for node, peer in (pair.nodes, pair.nodes[::-1]):
+        mine, theirs = node.call("getrawmempool"), peer.call("getrawmempool")
+        if mine[0] != "ok" or theirs[0] != "ok":
+            continue
+        todo = [t for t in theirs[1] if t not in mine[1]]
+        # a child is refused until its parent is in: pass again while one gets in
+        while todo:
+            left = []
+            for txid in todo:
+                raw = peer.call("getrawtransaction", txid)
+                if raw[0] != "ok" or node.call("sendrawtransaction", raw[1])[0] != "ok":
+                    left.append(txid)
+            if len(left) == len(todo):
+                break
+            todo = left
+
+
+def output_values(pair, txid):
+    """The output values of a transaction of one of the pair's wallets, sorted"""
+    for wallet in pair.nodes:
+        tx = wallet.call("gettransaction", txid)
+        if tx[0] == "ok":
+            decoded = wallet.call("decoderawtransaction", tx[1]["hex"])
+            if decoded[0] == "ok":
+                return sorted(str(o["value"]) for o in decoded[1]["vout"])
+    return None
+
+
 def wallet_inputs(pair, txid):
     """The outpoints a transaction of one of the pair's wallets spends, or None"""
     for wallet in pair.nodes:
@@ -1092,10 +1176,108 @@ def mid_maturity_explains(n, diff):
                     or parent_spends_immature(pair, holder, txid, reorg["mid"], next_height, inputs)):
                 log(f"#   mid maturity rule: {pair.name} lost {txid[:8]}, not immature at {next_height}")
                 return False
-            values.append(txid)
-        lost_values.append(len(values))
-    log(f"#   mid maturity rule: lost {lost_values}")
+            values.append(output_values(pair, txid) or [])
+        lost_values.append(sorted(values))
+    log(f"#   mid maturity rule: lost transactions of output values {lost_values}")
     return lost_values[0] != lost_values[1]
+
+
+def mid_balance_cache_explains(n, c_mid, i_mid, diff):
+    """Only the middle's balances differ (the end states agree, and so do the
+    coins listed), and each side lost as many transactions while its tip was
+    lowered. divid's wallet keeps the balances it cached for a mempool
+    transaction the reorg dropped (CachedUtxoBalanceCalculator.cpp:13-30,
+    recomputed only when a wallet transaction spending it is added,
+    wallet.cpp:1242-1333): the coins it spends stay spent and its outputs to
+    node n stay unconfirmed, though it is now at -1 confirmations
+    (MerkleTxConfirmationNumberCalculator.cpp:51); irondivid's counts
+    neither. A transaction of a disconnected block reaches the wallet again
+    by the disconnect (SyncTransactions, ChainTipManager.cpp:189), which
+    recomputes the cache of the transactions it spends
+    (wallet.cpp:1318-1334): their coins leave no gap. So divid's immature balance
+    is below irondivid's by just the coins of node n's wallet, immature for
+    the wallet at the lowered height, that the lost mempool transactions
+    spent, and its getbalance by just the mature ones; and irondivid's
+    unconfirmed balance is the sum of the 0-confirmation coins it lists"""
+    fields = ("immature balance", "getbalance * 0", "getbalance * 1", "getunconfirmedbalance")
+    prefix = "after invalidateblock: "
+    if not diff or any(not k.startswith(prefix) or k[len(prefix):] not in fields for k in diff):
+        return False
+    counts = []
+    for pair in PAIRS:
+        if pair.reorg is None or pair.reorg["mid_pool"] is None:
+            return False
+        counts.append(len((set(pair.reorg["block_txs"]) | set(pair.pool_before)) - pair.reorg["mid_pool"]))
+    if counts[0] != counts[1] or not counts[0]:
+        return False
+    pair = PAIRS[0]
+    node, mid = pair.node(n), pair.reorg["mid"]
+    tip = node.rpc("getblockcount")
+    # the disconnect syncs node n's transactions of the disconnected blocks
+    # (coinstakes too) to its wallet again, which drops the cache of each
+    # transaction they spend (wallet.cpp:1318-1334): its coins count unspent
+    recomputed = set()
+    for txid in pair.reorg["disconnected"]:
+        tx = node.call("gettransaction", txid)
+        decoded = node.call("decoderawtransaction", tx[1]["hex"]) if tx[0] == "ok" else tx
+        if decoded[0] == "ok":
+            recomputed |= {i.get("txid") for i in decoded[1]["vin"]}
+    immature = mature = 0
+    for txid in set(pair.pool_before) - pair.reorg["mid_pool"]:
+        for prev_txid, vout in pair.pool_before[txid]:
+            if prev_txid in recomputed:
+                continue
+            prev = node.call("gettransaction", prev_txid)
+            if prev[0] != "ok":
+                continue
+            decoded = node.call("decoderawtransaction", prev[1]["hex"])
+            if decoded[0] != "ok":
+                return False
+            output = decoded[1]["vout"][vout]
+            addresses = output.get("scriptPubKey", {}).get("addresses", [])
+            owner = node.call("validateaddress", addresses[0]) if addresses else ("none", None)
+            if owner[0] != "ok" or not owner[1].get("ismine"):
+                continue
+            confirmations = prev[1].get("confirmations", 0)
+            if confirmations <= 0:
+                log(f"#   mid balance cache rule: {txid[:8]} spends a coin of node {n} at 0 confirmations")
+                return False
+            height = tip - confirmations + 1
+            # a coin of a disconnected block is in neither side's balances
+            # while the tip is lowered
+            if height > mid:
+                continue
+            value = round(float(output["value"]) * 1e8)
+            # the wallet's maturity: 21 confirmations
+            # (MerkleTxConfirmationNumberCalculator.cpp:54-59)
+            if prev[1].get("generated") and mid - height + 1 < MATURITY + 1:
+                immature += value
+            else:
+                mature += value
+
+    def amount(mid_state, field):
+        v = mid_state.get(field)
+        if isinstance(v, (list, tuple)):
+            v = v[1] if v[0] == "ok" else None
+        return None if v is None else round(float(v) * 1e8)
+
+    log(f"#   mid balance cache rule: lost {counts}, node {n}'s coins the lost mempool transactions spent: "
+        f"immature {immature / 1e8}, mature {mature / 1e8}")
+    for field, expected in (("immature balance", immature), ("getbalance * 0", mature), ("getbalance * 1", mature)):
+        c, i = amount(c_mid, field), amount(i_mid, field)
+        if c is None or i is None or i - c != expected:
+            log(f"#   mid balance cache rule: {field}: divid below by {None if None in (c, i) else (i - c) / 1e8}")
+            return False
+    field = "getunconfirmedbalance"
+    if prefix + field in diff:
+        coins = "_coins (amount, confirmations)"
+        if not isinstance(i_mid.get(coins), list) or amount(i_mid, field) is None:
+            return False
+        listed = round(sum(float(a) for a, confs in i_mid[coins] if confs == 0) * 1e8)
+        if amount(i_mid, field) != listed:
+            log(f"#   mid balance cache rule: irondivid's unconfirmed balance is not the {listed / 1e8} it lists")
+            return False
+    return True
 
 
 def parent_spends_immature(pair, holder, txid, mid, next_height, inputs=None):
@@ -1294,13 +1476,32 @@ if REPLAY:
 else:
     steps = draw_steps(SEED, STEPS)
 
+# Fixed rows, run first on nodes of their own in every seeded run: stored
+# episodes of a case the draw reaches only now and then (README, "Fixed rows")
+ROWS = [] if REPLAY or os.environ.get("RANDOM_SEQUENCES_ROWS", "1") == "0" else ["mid-invalidate"]
+row_steps = []
+for row in ROWS:
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "rows", row + ".json")) as f:
+        row_steps += [dict(s, row=row) for s in json.load(f)] + [{"kind": "end of row", "row": row}]
+steps = row_steps + steps
+
 log(f"# random-sequences: SEED={SEED} STEPS={STEPS}" + (f" REPLAY={REPLAY}" if REPLAY else "")
-    + (f" PROFILE={PROFILE}" if PROFILE else ""))
+    + (f" PROFILE={PROFILE}" if PROFILE else "")
+    + (f" rows first: {', '.join(ROWS)}" if ROWS else ""))
+encrypted_at_start = set(ENCRYPTED)
 new_episode()
 episode_steps = []
 fails = 0
 started = time.time()
 for step in steps:
+    if step["kind"] == "end of row":
+        # the seeded steps start on fresh nodes, as they would without the row
+        log(f"# fixed row {step['row']} done")
+        ENCRYPTED.clear()
+        ENCRYPTED.update(encrypted_at_start)
+        new_episode()
+        episode_steps = []
+        continue
     spec = json.dumps(step, sort_keys=True)
     episode_steps.append(step)
 
@@ -1320,7 +1521,7 @@ for step in steps:
         return result, settled
 
     (c_res, c_settled), (i_res, i_settled) = both(apply)
-    if INJECT and str(step["i"]) == INJECT:
+    if INJECT and str(step["i"]) == INJECT and "row" not in step:
         i_res = ("injected", i_res[1])
     n = step["node"]
     # The two states, read again for a while if they differ: a wallet can
@@ -1371,6 +1572,9 @@ for step in steps:
             explained = "maturity window"
         elif step["kind"] == "invalidate" and mid_maturity_explains(n, diff):
             explained = "maturity in the middle of a reorg"
+        elif step["kind"] == "invalidate" and c_res[1] and i_res[1] \
+                and mid_balance_cache_explains(n, c_res[1], i_res[1], diff):
+            explained = "divid balance cache in the middle of a reorg"
         elif step["kind"] == "kill" and PAIRS[0].note:
             explained = "divid reindex after a kill"
         elif step["kind"] == "kill" and (
@@ -1393,14 +1597,15 @@ for step in steps:
     if diff and (explained or known):
         log(f"KNOWN  {line}  {explained or ''}  [{EXPLAINED[explained] if explained else known}]")
         # the end states agree after a maturity window: the run goes on
-        if explained not in ("maturity window", "maturity in the middle of a reorg"):
+        if explained not in ("maturity window", "maturity in the middle of a reorg",
+                             "divid balance cache in the middle of a reorg"):
             new_episode()
             episode_steps = []
         continue
     if diff:
         fails += 1
         log(f"FAIL   {line}")
-        log(f"#   seed {SEED}, episode {episode}, step {spec}")
+        log(f"#   " + (f"fixed row {step['row']}" if "row" in step else f"seed {SEED}") + f", episode {episode}, step {spec}")
         for k in diff:
             if k == "outcome":
                 log(f"#   outcome: divid {c_res[0]!r} irondivid {i_res[0]!r}")
@@ -1482,6 +1687,6 @@ for step in steps:
     log(f"PASS   {line}")
 
 keep_logs(f"episode{episode}")
-log(f"# {len(steps)} steps planned, {episode} episode(s), ran for {int(time.time() - started)} s")
+log(f"# {len(steps) - len(row_steps)} steps planned" + (" after the fixed rows" if ROWS else "") + f", {episode} episode(s), ran for {int(time.time() - started)} s")
 log(f"FAILS {fails}")
 sys.exit(min(fails, 254))
