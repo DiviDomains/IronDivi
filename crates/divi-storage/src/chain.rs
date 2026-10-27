@@ -2382,7 +2382,7 @@ impl Chain {
         if let Some(ref parent) = parent_index {
             if parent.failed() {
                 return Err(StorageError::InvalidBlock(format!(
-                    "prev block {} at height {} is invalid, unable to add block {}",
+                    "bad-prevblk: prev block {} at height {} is invalid, unable to add block {}",
                     parent.hash, parent.height, hash
                 )));
             }
@@ -2425,7 +2425,15 @@ impl Chain {
             // for a block of a side chain, as in Divi Core's ConnectTip.
             self.check_block_context(&block, parent)?;
             self.check_checkpoint(&hash, parent.height + 1)?;
-            Self::check_block_version_final_and_height(&block, parent.height + 1)?;
+            Self::check_block_version(&block)?;
+            if let Err(e) = Self::check_block_final_and_height(&block, parent.height + 1) {
+                // Divi Core has added the header to its block index by now
+                // (AcceptBlockHeader) and marks it failed (:493-499): the block
+                // sent again is refused as known to be invalid, a block on it
+                // as bad-prevblk.
+                self.store_failed_header(&block, &hash, parent)?;
+                return Err(e);
+            }
         }
 
         // 7. Create block index
@@ -3743,6 +3751,24 @@ impl Chain {
         Ok(())
     }
 
+    /// Keep the header of a block ContextualCheckBlock refused, marked failed
+    /// and without its data, as Divi Core's block index does
+    /// (ChainExtensionService.cpp:429, :493-499)
+    fn store_failed_header(
+        &self,
+        block: &Block,
+        hash: &Hash256,
+        parent: &BlockIndex,
+    ) -> Result<(), StorageError> {
+        let mut index = BlockIndex::from_header(&block.header, parent.height + 1, Some(parent));
+        index.hash = *hash;
+        index.n_tx = block.transactions.len() as u32;
+        index.status.insert(BlockStatus::VALID_HEADER);
+        index.status.insert(BlockStatus::FAILED);
+        index.set_proof_of_stake(block.is_proof_of_stake());
+        self.db.store_block_index_entry(&index)
+    }
+
     /// Check basic block header validity
     fn check_block_header(&self, block: &Block) -> Result<(), StorageError> {
         // Check version
@@ -3781,14 +3807,10 @@ impl Chain {
         Ok(())
     }
 
-    /// Divi Core ContextualCheckBlockHeader's version rule, then
-    /// ContextualCheckBlock's finality and BIP34 rules
-    /// (ChainExtensionService.cpp:350-353, :362-368, :375-382), for every block
-    /// after the genesis block
-    fn check_block_version_final_and_height(
-        block: &Block,
-        height: u32,
-    ) -> Result<(), StorageError> {
+    /// Divi Core ContextualCheckBlockHeader's version rule
+    /// (ChainExtensionService.cpp:350-353), for every block after the genesis
+    /// block
+    fn check_block_version(block: &Block) -> Result<(), StorageError> {
         if block.header.version < 3 {
             return Err(StorageError::invalid_block_scored(
                 0,
@@ -3798,6 +3820,13 @@ impl Chain {
                 ),
             ));
         }
+        Ok(())
+    }
+
+    /// Divi Core ContextualCheckBlock: every transaction final, then BIP34
+    /// (ChainExtensionService.cpp:357-385), for every block after the genesis
+    /// block
+    fn check_block_final_and_height(block: &Block, height: u32) -> Result<(), StorageError> {
         check_block_txs_final(block, height)?;
         let expect = bip34_height_script(height);
         let script_sig = block.transactions[0].vin[0].script_sig.as_bytes();

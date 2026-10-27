@@ -135,6 +135,7 @@ impl StorageError {
             "bad-txns-inputs-duplicate",
             "bad-txns-nonfinal",
             "bad-cb-height",
+            "bad-prevblk",
             "time-too-new",
             "time-too-old",
         ];
