@@ -73,6 +73,36 @@ pub const EXPIRY_MAX_TIP_AGE_SECS: u32 = 24 * 60 * 60;
 /// Litecoin Core, `MAX_FUTURE_BLOCK_TIME_LOCAL` in zcashd), used for every chain.
 pub const EXPIRY_MAX_TIP_LEAD_SECS: u32 = 2 * 60 * 60;
 
+/// Where the expiry sweep may start counting a lock's absent blocks: a per-chain setting
+/// (`[divi].expiry_start` in divi-swapd, `--divi-expiry-start` in the CLI), passed to
+/// [`InputReservations::release_expired_from`] for the chain it sweeps.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ExpiryStart {
+    /// `"tip"` (the default): a first absent check at a tip whose own time is within
+    /// [`EXPIRY_MAX_TIP_LAG_BLOCKS`] target spacings of the wall clock counts at once; one at
+    /// a tip further behind is pending until the backend's median time past reaches that
+    /// check's clock.
+    #[default]
+    Tip,
+    /// `"mtp"`: every first absent check is pending until the backend's median time past
+    /// reaches that check's clock, however fresh the tip looks, so a replayed tip stamped
+    /// near the clock cannot start the count. Every release on the chain comes about five
+    /// blocks later.
+    Mtp,
+}
+
+impl std::str::FromStr for ExpiryStart {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "tip" => Ok(Self::Tip),
+            "mtp" => Ok(Self::Mtp),
+            other => Err(format!("must be \"tip\" or \"mtp\", got {other:?}")),
+        }
+    }
+}
+
 /// A tip time more than [`EXPIRY_MAX_TIP_LAG_BLOCKS`] target spacings behind `now`, or from
 /// a backend that does not say its spacing.
 fn tip_is_behind(tip_time: u32, spacing: Option<u32>, now: u32) -> bool {
@@ -354,6 +384,9 @@ impl InputReservations {
     /// counts from there. MTP trails the tip by about six blocks, so a pending record on a
     /// sparse chain whose blocks come minutes apart releases about
     /// [`EXPIRY_ABSENT_BLOCKS`] + 5 blocks after the first check, once they are mined.
+    /// A record made at a tip within [`EXPIRY_MAX_TIP_LAG_BLOCKS`] spacings of `now` counts at
+    /// once here; [`Self::release_expired_from`] with [`ExpiryStart::Mtp`] makes it pending
+    /// too (a chain's opt-in, at the cost of about five more blocks before each release).
     /// A lock in the mempool or on chain, or before its deadline, keeps its inputs; so does
     /// every reservation `locks` does not name (`divi-swapd --release-reservation` is the
     /// override for those). Each sweep reads the tip's height, hash and time from one block
@@ -381,6 +414,29 @@ impl InputReservations {
         locks: &[(Txid, u32)],
         now: u32,
     ) -> Result<usize> {
+        self.release_expired_from(backend, locks, now, ExpiryStart::Tip)
+            .await
+    }
+
+    /// [`Self::release_expired`], with `start` saying where a first absent check may start
+    /// its count. [`ExpiryStart::Tip`] is exactly [`Self::release_expired`]. With
+    /// [`ExpiryStart::Mtp`], a record made at a tip that looks fresh (within
+    /// [`EXPIRY_MAX_TIP_LAG_BLOCKS`] spacings of `now`) is pending exactly like one made at a
+    /// tip further behind: it keeps that check's `now` in `first_absent_after`, follows the
+    /// tip while the backend's median time past is before it, and then counts as above. So
+    /// does a record restarted after a reorg or re-anchored for want of a hash. A replayed tip
+    /// stamped near the clock then cannot start a count on blocks from before the check;
+    /// the cost is that MTP trails the tip by about six blocks, so every release on that
+    /// chain comes about five blocks later (11 blocks after the first check instead of 6 on a
+    /// chain swept at each block). The stale, ahead, high-water and reorg guards are the
+    /// same for both.
+    pub async fn release_expired_from(
+        &self,
+        backend: &dyn ChainBackend,
+        locks: &[(Txid, u32)],
+        now: u32,
+        start: ExpiryStart,
+    ) -> Result<usize> {
         let chain = backend.chain();
         let held: HashSet<Txid> = self
             .list_all()?
@@ -406,8 +462,10 @@ impl InputReservations {
             );
             return Ok(0);
         }
-        // The `now` a record made at this tip waits for, unless it counts at once.
-        let pending = tip_is_behind(tip.time, spacing, now).then_some(now);
+        // The `now` a record made at this tip waits for, unless it counts at once: with
+        // `ExpiryStart::Mtp` it never does, however fresh the tip looks.
+        let pending =
+            (start == ExpiryStart::Mtp || tip_is_behind(tip.time, spacing, now)).then_some(now);
         if tip_is_ahead(tip.time, now) {
             tracing::warn!(
                 %chain,
@@ -760,7 +818,8 @@ impl InputReservations {
         Ok(released)
     }
 
-    /// [`Self::release_expired_swaps`] on `backend`, then the wallet booking of each lock it
+    /// [`Self::release_expired_swaps`] on `backend` with `start` ([`Self::release_expired_from`]),
+    /// then the wallet booking of each lock it
     /// released: a wallet that tombstoned a lock's inputs when it was broadcast (the DIVI
     /// wallet file) gets them back through [`ChainBackend::release_dead_lock`] once the
     /// backend has its own proof that they are unspent (no proof, nothing given back: the
@@ -771,13 +830,16 @@ impl InputReservations {
         store: &Store,
         backend: &dyn ChainBackend,
         now: u32,
+        start: ExpiryStart,
     ) -> Result<usize> {
         let chain = backend.chain();
         let before = self.holders(chain)?;
         if before.is_empty() {
             return Ok(0);
         }
-        let released = self.release_expired_swaps(store, backend, now).await?;
+        let released = self
+            .release_expired_from(backend, &swap_locks(store, chain)?, now, start)
+            .await?;
         if released == 0 {
             return Ok(0);
         }
@@ -1103,6 +1165,161 @@ mod tests {
         assert_eq!(held_by(&r), HashSet::from([t]));
         c.mine(1);
         assert_eq!(r.release_expired(&b, &locks, now).await.unwrap(), 1);
+    }
+
+    /// One sweep of a DIVI chain: the tip height, the inputs released, and the lock's record
+    /// (its height and, while pending, the clock it waits for) after the sweep.
+    type Step = (u64, usize, Option<(u64, Option<u32>)>);
+
+    /// A DIVI lock past its deadline, swept once at its first absent check and then once
+    /// after each of `blocks` blocks mined `gap` seconds apart. Every tip is stamped `lead`
+    /// seconds ahead of the chain's MTP, and each sweep runs `lag` seconds after the tip's
+    /// time. `start` is the setting passed to [`InputReservations::release_expired_from`];
+    /// `None` calls [`InputReservations::release_expired`], the API every chain used before
+    /// the setting. Returns the first check's height and clock, and one [`Step`] per sweep.
+    async fn divi_trace(
+        start: Option<ExpiryStart>,
+        lead: u32,
+        lag: u32,
+        gap: u32,
+        blocks: u64,
+    ) -> (u64, u32, Vec<Step>) {
+        let (c, b) = divi_chain();
+        let r = InputReservations::in_memory().unwrap();
+        let t = lock(&r, &b, 1).await;
+        c.forget(&t);
+        c.advance_time(DEADLINE - T0);
+        b.set_tip_lead(lead);
+        let locks = [(t, DEADLINE)];
+        let first = c.height();
+        let clock = |c: &MockChain| c.mtp() + lead + lag;
+        let after = clock(&c);
+        let mut steps = Vec::new();
+        for i in 0..=blocks {
+            if i > 0 {
+                mine_after(&c, gap);
+            }
+            let now = clock(&c);
+            let released = match start {
+                Some(s) => r.release_expired_from(&b, &locks, now, s).await,
+                None => r.release_expired(&b, &locks, now).await,
+            }
+            .unwrap();
+            let record = r.absence(Chain::Divi, &t).unwrap();
+            if let Some((h, hash, _)) = &record {
+                assert_eq!(hash.as_deref(), Some(c.block_hash(*h).as_str()));
+            }
+            steps.push((c.height(), released, record.map(|(h, _, a)| (h, a))));
+        }
+        (first, after, steps)
+    }
+
+    /// A dense DIVI chain (one block a minute) whose tips each look fresh (swept at the tip's
+    /// own time) while MTP trails them by five blocks, as a real median of eleven does.
+    async fn fresh_divi_trace(start: Option<ExpiryStart>) -> (u64, u32, Vec<Step>) {
+        divi_trace(start, 5 * 60, 0, 60, 2 * EXPIRY_ABSENT_BLOCKS).await
+    }
+
+    #[tokio::test]
+    async fn with_expiry_start_mtp_a_record_at_a_fresh_tip_is_pending_and_follows_the_tip() {
+        let (first, after, steps) = fresh_divi_trace(Some(ExpiryStart::Mtp)).await;
+        // The first check's tip looks fresh, but its MTP is five blocks before the check's
+        // clock: the record is pending on that clock, and follows the tip while MTP is
+        // before it, releasing nothing.
+        assert_eq!(steps[0], (first, 0, Some((first, Some(after)))));
+        for (i, step) in steps.iter().enumerate().take(5).skip(1) {
+            let h = first + i as u64;
+            assert_eq!(*step, (h, 0, Some((h, Some(after)))), "block {h}");
+        }
+    }
+
+    #[tokio::test]
+    async fn with_expiry_start_mtp_the_count_starts_once_mtp_passes_the_check_and_runs_six_blocks()
+    {
+        let (first, _, steps) = fresh_divi_trace(Some(ExpiryStart::Mtp)).await;
+        // Five blocks on, MTP reaches the check's clock at the block right after the
+        // record's: by EE's rule the count starts at the record, and the lock is released
+        // the usual six blocks after it.
+        let start = first + 4;
+        assert_eq!(steps[5], (first + 5, 0, Some((start, None))));
+        for step in &steps[6..10] {
+            assert_eq!(*step, (step.0, 0, Some((start, None))), "block {}", step.0);
+        }
+        assert_eq!(steps[10], (start + EXPIRY_ABSENT_BLOCKS, 1, None));
+        assert!(steps[11..].iter().all(|s| s.1 == 0 && s.2.is_none()));
+    }
+
+    #[tokio::test]
+    async fn with_expiry_start_mtp_a_stale_tip_record_is_as_with_the_default() {
+        // EE's sparse chain (blocks ten minutes apart, MTP five blocks behind the tip,
+        // sweeps three minutes after each block) and EA's (MTP at the tip's time): the
+        // first check is made at a tip more than two spacings behind the clock, so it is
+        // pending with either setting, and every sweep is the same.
+        for lead in [5 * 600, 0] {
+            let tip = divi_trace(Some(ExpiryStart::Tip), lead, 180, 600, 12).await;
+            let mtp = divi_trace(Some(ExpiryStart::Mtp), lead, 180, 600, 12).await;
+            assert_eq!(mtp, tip, "lead {lead}");
+            let (first, after, steps) = mtp;
+            assert_eq!(steps[0], (first, 0, Some((first, Some(after)))));
+            let at = if lead == 0 { 6 } else { 11 };
+            assert_eq!(steps.iter().position(|s| s.1 == 1), Some(at), "lead {lead}");
+        }
+        // EE's replayed tip stamped ahead of the first check: the record follows the tip
+        // until MTP passes the check with either setting.
+        for start in [ExpiryStart::Tip, ExpiryStart::Mtp] {
+            let (c, b) = divi_chain();
+            let r = InputReservations::in_memory().unwrap();
+            let (locks, after) = pending_divi_lock(&r, &c, &b).await;
+            b.set_tip_lead(3_600 + 600);
+            let mut now = after;
+            while c.mtp() < after {
+                c.mine(1);
+                now += 1;
+                assert_eq!(
+                    r.release_expired_from(&b, &locks, now, start)
+                        .await
+                        .unwrap(),
+                    0
+                );
+            }
+            let first = c.height() - 1;
+            assert_eq!(
+                r.absence(Chain::Divi, &locks[0].0).unwrap(),
+                Some((first, Some(c.block_hash(first)), None)),
+                "{start:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_default_expiry_start_is_todays_rule_and_a_fresh_tip_counts_at_once() {
+        assert_eq!(ExpiryStart::default(), ExpiryStart::Tip);
+        let today = fresh_divi_trace(None).await;
+        let default = fresh_divi_trace(Some(ExpiryStart::default())).await;
+        assert_eq!(default, today);
+        // Today's rule: the fresh tip's record counts at once, and the lock is released six
+        // blocks after the first check, four blocks before "mtp" releases it.
+        let (first, _, steps) = today;
+        assert_eq!(steps[0], (first, 0, Some((first, None))));
+        assert_eq!(
+            steps.iter().position(|s| s.1 == 1),
+            Some(EXPIRY_ABSENT_BLOCKS as usize)
+        );
+        let (_, _, mtp) = fresh_divi_trace(Some(ExpiryStart::Mtp)).await;
+        assert_ne!(mtp, steps);
+        assert_eq!(
+            mtp.iter().position(|s| s.1 == 1),
+            Some(EXPIRY_ABSENT_BLOCKS as usize + 4)
+        );
+    }
+
+    #[test]
+    fn expiry_start_parses_tip_and_mtp_only() {
+        assert_eq!("tip".parse(), Ok(ExpiryStart::Tip));
+        assert_eq!("mtp".parse(), Ok(ExpiryStart::Mtp));
+        for bad in ["", "MTP", "median", "tip "] {
+            assert!(bad.parse::<ExpiryStart>().is_err(), "{bad:?}");
+        }
     }
 
     #[tokio::test]

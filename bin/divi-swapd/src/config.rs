@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use divi_swap::api::{Direction, Offer};
+use divi_swap::reservation::ExpiryStart;
 use divi_swap::{Chain, Profile};
 use serde::Deserialize;
 
@@ -65,6 +66,10 @@ pub struct DiviSection {
     pub wallet_path: Option<PathBuf>,
     /// First block height to scan for wallet UTXOs.
     pub scan_from_height: Option<u64>,
+    /// Where the expiry sweep may start counting a dropped DIVI lock's absent blocks:
+    /// `"tip"` (the default) or `"mtp"` ([`DiviSection::expiry_start`]).
+    #[serde(default)]
+    pub expiry_start: Option<String>,
 }
 
 fn default_divi_network() -> String {
@@ -87,6 +92,18 @@ impl DiviSection {
             Some(u) => u.clone(),
             None => swap_chain_divi::default_rpc(self.network()?).to_string(),
         })
+    }
+
+    /// `expiry_start`: `"tip"` when absent, `"mtp"` to make every first absent check of a
+    /// dropped DIVI lock wait for the node's median time past
+    /// ([`divi_swap::InputReservations::release_expired_from`]).
+    pub fn expiry_start(&self) -> Result<ExpiryStart> {
+        match self.expiry_start.as_deref() {
+            None => Ok(ExpiryStart::default()),
+            Some(s) => s
+                .parse()
+                .map_err(|e| anyhow::anyhow!("[divi].expiry_start {e}")),
+        }
     }
 
     /// `fallback_rpc_url` when set and non-blank; an identical URL to `rpc_url` is refused
@@ -624,6 +641,14 @@ impl DaemonConfig {
         }
     }
 
+    /// `[divi].expiry_start`, `"tip"` without a `[divi]` section.
+    pub fn divi_expiry_start(&self) -> Result<ExpiryStart> {
+        Ok(match &self.divi {
+            Some(d) => d.expiry_start()?,
+            None => ExpiryStart::default(),
+        })
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading config {}", path.display()))?;
@@ -781,6 +806,7 @@ impl DaemonConfig {
                  would be believed; list the proxy's address (default [\"127.0.0.1/32\", \"::1/128\"])"
             );
         }
+        self.divi_expiry_start()?;
         let mut seen = std::collections::BTreeSet::new();
         for o in self.offer_entries.iter().map(|e| &e.offer) {
             if !seen.insert(&o.id) {
@@ -1019,6 +1045,24 @@ key = "credential:btc"
             );
             // Off, the same single endpoint is fine (failover only, as before).
             assert!(with(one).is_ok());
+        }
+    }
+
+    #[test]
+    fn divi_expiry_start_is_tip_by_default_takes_mtp_and_refuses_anything_else() {
+        let d = DaemonConfig::parse(GOOD).unwrap().divi.unwrap();
+        assert_eq!(d.expiry_start().unwrap(), ExpiryStart::Tip);
+        let with = |value: &str| {
+            DaemonConfig::parse(
+                &GOOD.replace("[divi]\n", &format!("[divi]\nexpiry_start = \"{value}\"\n")),
+            )
+        };
+        let start = |value: &str| with(value).unwrap().divi.unwrap().expiry_start().unwrap();
+        assert_eq!(start("tip"), ExpiryStart::Tip);
+        assert_eq!(start("mtp"), ExpiryStart::Mtp);
+        for bad in ["median", "MTP", ""] {
+            let e = format!("{:#}", with(bad).unwrap_err());
+            assert!(e.contains("[divi].expiry_start"), "{bad:?}: {e}");
         }
     }
 
