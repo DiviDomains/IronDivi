@@ -113,11 +113,18 @@ pub(crate) struct ClaimCtx<'a> {
 
 impl ClaimCtx<'_> {
     /// Sign the first claim. Where the backend can bump it and escalation is on, at the
-    /// feerate it reports now, recorded as the base the escalation climbs from.
+    /// feerate it reports now, recorded as the base the escalation climbs from. A same-nonce
+    /// claim whose estimate is within one price bump of the cap is signed at the cap
+    /// ([`FeeEscalation::reach_cap`]): no replacement of it could stay within the cap, so it
+    /// would stay at the estimate under a floor the cap clears.
     pub async fn sign_first<R: ClaimRecord>(&self, r: &mut R) -> Result<SignedTx> {
         let b = self.backend;
         let feerate = match (b.fee_bump(), self.escalation) {
             (FeeBump::None, _) | (_, None) => None,
+            (FeeBump::SameNonce, Some(esc)) => b
+                .claim_feerate()
+                .await?
+                .map(|f| esc.reach_cap(f, esc.cap(f))),
             _ => b.claim_feerate().await?,
         };
         let tx = match feerate {
@@ -294,6 +301,12 @@ impl ClaimCtx<'_> {
                 .max(estimate)
                 .max(current.saturating_add(step))
                 .min(cap);
+            // A fresh same-nonce claim within one price bump of the cap could never be
+            // replaced within it, as in `sign_first`.
+            let feerate = match b.fee_bump() {
+                FeeBump::SameNonce => esc.reach_cap(feerate, cap),
+                _ => feerate,
+            };
             if feerate <= current {
                 tracing::warn!(swap = %r.swap_id(), txid = %claim.txid, feerate = current,
                     error = %e, "claim refused at the fee cap; resending it unchanged");
