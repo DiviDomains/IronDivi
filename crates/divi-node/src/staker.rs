@@ -258,15 +258,9 @@ pub fn kernel_search_start(adjusted: i64, mtp: u32, retarget: bool, floor: u32) 
     u32::try_from(adjusted.max(minimum).min(maximum)).ok()
 }
 
-/// Divi Core's hashproofTimestampMinimumValue_ and the height of
-/// hashedBlockTimestamps_ (PoSTransactionCreator.cpp:233-237, :277, :331-334)
-#[derive(Default)]
-struct KernelSearchFloor {
-    /// The height whose kernels were last hashed
-    hashed_height: Option<u32>,
-    /// The start of the last round that found no kernel
-    floor: u32,
-}
+/// How long Divi Core's minter trusts its last look for an aged coin
+/// (CoinMinter.h:31, CoinMinter.cpp:49-63)
+const MINTABLE_COINS_RECHECK_SECS: u64 = 5 * 60;
 
 /// Default maximum tip age for staking: 24 hours (C++ `nMaxTipAge`).
 pub const DEFAULT_MAX_TIP_AGE_SECS: u32 = 24 * 60 * 60;
@@ -379,8 +373,13 @@ pub struct Staker {
     /// Track last staking attempt time per height (height -> timestamp)
     /// This matches C++ mapHashedBlocks / hashedBlockTimestamps
     hashed_block_timestamps: RwLock<HashMap<u32, u64>>,
-    /// Where the next kernel search may start at the earliest
-    kernel_search_floor: parking_lot::Mutex<KernelSearchFloor>,
+    /// Where the next kernel search may start at the earliest: the start of
+    /// the last round that found no kernel (Divi Core
+    /// hashproofTimestampMinimumValue_, PoSTransactionCreator.cpp:277)
+    kernel_search_floor: parking_lot::Mutex<u32>,
+    /// When the staking loop last looked for an aged coin, and whether it
+    /// found one (Divi Core lastTimeCheckedMintable_, haveMintableCoins_)
+    mintable_coins_check: parking_lot::Mutex<Option<(u64, bool)>>,
     /// Block connected callback (same one used by BlockSync for wallet/mempool/fees)
     /// Set from main.rs after construction so the staker can fire it on self-accepted blocks.
     block_connected_callback: RwLock<Option<BlockConnectedCallback>>,
@@ -446,7 +445,8 @@ impl Staker {
             last_stake_time: RwLock::new(0),
             stake_weight: RwLock::new(0),
             hashed_block_timestamps: RwLock::new(HashMap::new()),
-            kernel_search_floor: parking_lot::Mutex::new(KernelSearchFloor::default()),
+            kernel_search_floor: parking_lot::Mutex::new(0),
+            mintable_coins_check: parking_lot::Mutex::new(None),
             block_connected_callback: RwLock::new(None),
             cache: RwLock::new(StakerCache::new()),
             producing: parking_lot::Mutex::new(()),
@@ -1240,7 +1240,10 @@ impl Staker {
         false
     }
 
-    /// Record that we attempted staking at this height
+    /// Record that a kernel was hashed at this height, as Divi Core does in
+    /// FindHashproof only (PoSTransactionCreator.cpp:233-237), never for a
+    /// round that hashed nothing. The rate limit, the kernel search floor and
+    /// getstakingstatus's "staking status" read it.
     ///
     /// This matches C++ PoSTransactionCreator line 235-236:
     /// hashedBlockTimestamps_.clear();
@@ -1340,17 +1343,62 @@ impl Staker {
             }
         }
 
+        // Divi Core's minter waits for a staking balance (CanStakeCoins,
+        // wallet.cpp:1483-1486), then for an aged coin, which it looks for
+        // again at most every five minutes (CoinMinter.cpp:49-63, :76-78);
+        // without a balance it takes no look
+        if !self.has_staking_balance() || !self.has_mintable_coin_for_stake(local_time) {
+            debug!("Skipping stake: no staking balance or no aged coin");
+            return StakeResult::RateLimited;
+        }
+
         // CRITICAL: Rate limiting check (matches C++ limitStakingSpeed)
-        // Check if we tried at this height recently (before updating the timestamp)
+        // Check if a kernel was hashed at this height recently. The record is
+        // made where a kernel is hashed (build_stake_block), not here
         if self.limit_staking_speed(current_height, local_time) {
             return StakeResult::RateLimited;
         }
 
-        // Record this staking attempt (matches C++ PoSTransactionCreator)
-        // Only record if we pass rate limiting
-        self.record_staking_attempt(current_height, local_time);
-
         self.build_stake_block(&tip, current_time)
+    }
+
+    /// Divi Core `GetStakingBalance() > 0` (wallet.cpp:1377-1385): the wallet
+    /// holds a confirmed, mature coin of its own or of a vault it manages
+    /// that `lockunspent` has not locked
+    fn has_staking_balance(&self) -> bool {
+        let height = self.chain.height();
+        let maturity = self.coinbase_maturity();
+        let counts = |u: &divi_wallet::WalletUtxo| {
+            u.value.as_sat() > 0
+                && u.is_mature(height, maturity)
+                && !self.wallet.is_coin_locked(&u.outpoint())
+        };
+        self.wallet
+            .get_spendable_utxos(height, 1)
+            .iter()
+            .any(counts)
+            || self
+                .wallet
+                .get_stakeable_vault_utxos(height, 1)
+                .iter()
+                .any(|(u, _)| counts(u))
+    }
+
+    /// Divi Core CoinMinter::hasMintableCoinForProofOfStake
+    /// (CoinMinter.cpp:49-63): whether the wallet has an aged coin, as last
+    /// looked at; looked at again once five minutes have passed
+    fn has_mintable_coin_for_stake(&self, now: u64) -> bool {
+        let mut check = self.mintable_coins_check.lock();
+        match *check {
+            Some((checked, have)) if now.saturating_sub(checked) <= MINTABLE_COINS_RECHECK_SECS => {
+                have
+            }
+            _ => {
+                let have = self.has_mintable_coins();
+                *check = Some((now, have));
+                have
+            }
+        }
     }
 
     /// A proof-of-stake block on `tip`, its time at the kernel search's start
@@ -1528,18 +1576,22 @@ impl Staker {
             (cache.stake_modifier, cache.median_time_past)
         };
         // Where the kernel search starts: the floor a round that found no
-        // kernel left holds until a kernel is hashed at another height
+        // kernel left holds while the last kernel hashed was at this height
         // (PoSTransactionCreator.cpp:331-341)
         let search_start = {
             let mut floor = self.kernel_search_floor.lock();
-            if floor.hashed_height != Some(current_height) {
-                floor.floor = 0;
+            if !self
+                .hashed_block_timestamps
+                .read()
+                .contains_key(&current_height)
+            {
+                *floor = 0;
             }
             kernel_search_start(
                 i64::from(current_time),
                 mtp,
                 self.chain.retargets_difficulty(),
-                floor.floor,
+                *floor,
             )
         };
         let Some(search_start) = search_start else {
@@ -1619,7 +1671,6 @@ impl Staker {
             // staking loop and from setgenerate alike (PoSTransactionCreator.cpp:233-237)
             if !matches!(result, HashproofResult::FailedSetup) {
                 self.record_staking_attempt(current_height, current_timestamp());
-                self.kernel_search_floor.lock().hashed_height = Some(current_height);
             }
 
             match &result {
@@ -1715,7 +1766,7 @@ impl Staker {
         }
         // The next round at this height starts no earlier
         // (PoSTransactionCreator.cpp:277)
-        self.kernel_search_floor.lock().floor = search_start;
+        *self.kernel_search_floor.lock() = search_start;
 
         StakeResult::NoProofFound
     }
