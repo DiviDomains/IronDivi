@@ -39,7 +39,7 @@ use bitcoin::consensus::encode::serialize;
 use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::{All, Secp256k1, SecretKey};
 use bitcoin::{CompressedPublicKey, OutPoint};
-use crosscheck::enforce;
+use crosscheck::{claim_crosscheck, enforce, ClaimCheck};
 use divi_swap::{
     Amount, Chain, ChainBackend, ClaimSizes, FeeBump, Funding, HtlcParams, InputReservations,
     LockedOutput, Outpoint, SignedTx, SpendInfo, SwapError, Txid,
@@ -125,10 +125,10 @@ pub struct LtcBackend {
 struct ClaimCrossCheck {
     source: CrossCheckSource,
     base: String,
-    /// The last outcome and the primary tip hash it was taken at. A claim retried every
-    /// engine tick reuses it until the primary's tip moves, so the (rate-limited) source is
-    /// asked at most once per primary block.
-    last: parking_lot::Mutex<Option<(String, CrossCheckOutcome)>>,
+    /// The last outcome, the primary tip hash it was taken at and the outpoint it checked. A
+    /// claim retried every engine tick reuses it until the primary's tip moves, so the
+    /// (rate-limited) source is asked at most once per primary block per comparison.
+    last: parking_lot::Mutex<Option<(String, Outpoint, ClaimCheck)>>,
 }
 
 impl std::fmt::Debug for LtcBackend {
@@ -151,7 +151,8 @@ impl LtcBackend {
 
     /// Opt-in (`[ltc].crosscheck_before_claim`): before every claim is built, compare the
     /// primary's hash at `tip - CROSSCHECK_DEPTH` with `source` at its default mainnet base,
-    /// as the startup [`LtcBackend::crosscheck`] does. `Disagree` refuses the claim as
+    /// as the startup [`LtcBackend::crosscheck`] does, then its hash at
+    /// `tip - CLAIM_NEAR_DEPTH` and its spend of the claimed output. `Disagree` refuses the claim as
     /// [`SwapError::Transient`] (the engine retries); `Unavailable` logs one warning per claim
     /// and builds it anyway. The result is reused until the primary's tip hash changes.
     /// `None` (the default) is off: no extra request. Mainnet only; the daemon's config
@@ -188,19 +189,19 @@ impl LtcBackend {
         };
         let source = cc.source.as_str();
         let outcome = match self.tip_hash_raw().await {
-            Err(e) => CrossCheckOutcome::Unavailable {
-                reason: format!("{}: tip hash: {e}", self.esplora.primary_url()),
-            },
+            Err(e) => {
+                ClaimCheck::Unavailable(format!("{}: tip hash: {e}", self.esplora.primary_url()))
+            }
             Ok(tip) => {
                 let tip = tip.trim().to_ascii_lowercase();
                 let cached = cc
                     .last
                     .lock()
                     .as_ref()
-                    .filter(|(t, _)| *t == tip)
-                    .map(|(_, o)| o.clone());
+                    .filter(|(t, o, _)| *t == tip && o == at)
+                    .map(|(_, _, c)| c.clone());
                 match cached {
-                    Some(o) => o,
+                    Some(c) => c,
                     None => {
                         // One attempt: a rate-limited source must not hold the claim up in
                         // backoff; the next primary block asks again.
@@ -208,19 +209,20 @@ impl LtcBackend {
                             attempts: 1,
                             ..self.retry
                         };
-                        let o = tip_crosscheck(&self.esplora, cc.source, &cc.base, once).await;
-                        *cc.last.lock() = Some((tip, o.clone()));
-                        o
+                        let c =
+                            claim_crosscheck(&self.esplora, cc.source, &cc.base, once, at).await;
+                        *cc.last.lock() = Some((tip, *at, c.clone()));
+                        c
                     }
                 }
             }
         };
         match outcome {
-            CrossCheckOutcome::Agree { height, hash } => {
-                tracing::debug!(height, %hash, source, outpoint = %at, "ltc claim cross-check agrees");
+            ClaimCheck::Agree => {
+                tracing::debug!(source, outpoint = %at, "ltc claim cross-check agrees");
                 Ok(())
             }
-            CrossCheckOutcome::Unavailable { reason } => {
+            ClaimCheck::Unavailable(reason) => {
                 // Warn and continue: the claim must not stall past the counterparty's refund
                 // timeout because a second explorer is down. One line per claim built
                 // unchecked, for audit.
@@ -233,10 +235,9 @@ impl LtcBackend {
                 );
                 Ok(())
             }
-            d @ CrossCheckOutcome::Disagree { .. } => Err(SwapError::Transient(format!(
-                "{}; claim of {at} held",
-                d.disagree_message().expect("disagree")
-            ))),
+            ClaimCheck::Disagree(m) => {
+                Err(SwapError::Transient(format!("{m}; claim of {at} held")))
+            }
         }
     }
 

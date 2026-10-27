@@ -13,13 +13,17 @@
 //! `second_source`): two endpoints that disagree on a read are never a decision. The answer is
 //! `SwapError::Transient`, which the engine retries. Where the two agree on what exists, a
 //! confirmation count is the lower of the two, so a single liar can lower a count but never
-//! raise one; endpoints a block apart are ordinary lag, not a disagreement.
+//! raise one; endpoints a block apart are ordinary lag, not a disagreement. The tip reads
+//! follow the same rule: the lower tip height and median time, the header of the lower tip
+//! once the other endpoint names the same block at that height, and a block status both
+//! endpoints give.
 
+use divi_swap::backend::TipHeader;
 use divi_swap::{LockedOutput, SpendInfo, SwapError};
 
 type Result<T> = std::result::Result<T, SwapError>;
 
-fn disagree(op: &str, detail: String) -> SwapError {
+pub(crate) fn disagree(op: &str, detail: String) -> SwapError {
     tracing::warn!(
         op,
         "Esplora endpoints disagree, treating the read as transient: {detail}"
@@ -118,5 +122,32 @@ pub(crate) fn agree_spend(a: Option<SpendInfo>, b: Option<SpendInfo>) -> Result<
                 describe_spend(&b)
             ),
         )),
+    }
+}
+
+/// `low` is the lower endpoint's tip; `ahead_hash` is the other endpoint's block at that
+/// height (its own tip when both are at one height). Two blocks at one height are `Transient`.
+pub(crate) fn agree_block_at(low: TipHeader, ahead_hash: String) -> Result<TipHeader> {
+    if ahead_hash == low.hash {
+        Ok(low)
+    } else {
+        Err(disagree(
+            "tip_header",
+            format!(
+                "two blocks at height {}: {} and {ahead_hash}",
+                low.height, low.hash
+            ),
+        ))
+    }
+}
+
+pub(crate) fn agree_in_best_chain(hash: &str, a: bool, b: bool) -> Result<bool> {
+    if a == b {
+        Ok(a)
+    } else {
+        Err(disagree(
+            "in_best_chain",
+            format!("block {hash}: primary in_best_chain {a}, secondary {b}"),
+        ))
     }
 }

@@ -232,9 +232,9 @@ impl BtcBackend {
         }
     }
 
-    /// The raw `/blocks/tip/hash` body, shared by `tip_hash` and `median_time_past`.
+    /// The raw `/blocks/tip/hash` body, for `tip_hash` without quorum reads.
     async fn tip_hash_raw(&self) -> Result<String> {
-        Ok(self.esplora.get("/blocks/tip/hash").await?)
+        tip_hash_raw_on(&self.esplora).await
     }
 
     /// Signet backend on explicit `endpoints`: Esplora base URLs, primary first. `key` is
@@ -389,6 +389,10 @@ async fn get_json_opt_on(es: &EsploraClient, path: &str) -> Result<Option<Value>
     }
 }
 
+async fn tip_hash_raw_on(es: &EsploraClient) -> Result<String> {
+    Ok(es.get("/blocks/tip/hash").await?)
+}
+
 async fn tip_height_on(es: &EsploraClient) -> Result<u64> {
     let body = es.get("/blocks/tip/height").await?;
     let trimmed = body.trim();
@@ -479,10 +483,18 @@ impl ChainBackend for BtcBackend {
     }
 
     async fn tip_height(&self) -> Result<u64> {
-        tip_height_on(&self.esplora).await
+        let Some((primary, secondary)) = &self.quorum else {
+            return tip_height_on(&self.esplora).await;
+        };
+        let (a, b) = tokio::join!(tip_height_on(primary), tip_height_on(secondary));
+        let (a, b) = quorum::pair("tip_height", a, b)?;
+        Ok(a.min(b))
     }
 
     async fn tip_hash(&self) -> Result<String> {
+        if self.quorum.is_some() {
+            return Ok(self.tip_header().await?.hash);
+        }
         divi_swap::backend::normalize_block_hash(&self.tip_hash_raw().await?)
     }
 
@@ -490,49 +502,31 @@ impl ChainBackend for BtcBackend {
     /// for that block's `height`, `timestamp` and `id` (Blockstream esplora `API.md`). Height
     /// and time come from the one block whose hash was read, so a tip that moves between
     /// the two requests cannot mix two blocks; a block whose `id` is not the hash asked for
-    /// is a transient error.
+    /// is a transient error. With quorum reads, the lower of the two endpoints' tips, once
+    /// the other names the same block at that height (see [`Self::quorum_tip_header`]).
     async fn tip_header(&self) -> Result<divi_swap::backend::TipHeader> {
-        let hash = divi_swap::backend::normalize_block_hash(&self.tip_hash_raw().await?)?;
-        let block = self.get_json(&format!("/block/{hash}")).await?;
-        let id = block["id"]
-            .as_str()
-            .ok_or_else(|| SwapError::Transient("block JSON lacks id (still indexing?)".into()))
-            .and_then(divi_swap::backend::normalize_block_hash)?;
-        if id != hash {
-            return Err(SwapError::Transient(format!(
-                "asked for block {hash}, got {id}"
-            )));
+        match &self.quorum {
+            None => Self::tip_header_on(&self.esplora).await,
+            Some((primary, secondary)) => Self::quorum_tip_header(primary, secondary).await,
         }
-        let field = |name: &str| {
-            block[name].as_u64().ok_or_else(|| {
-                SwapError::Transient(format!("block JSON lacks {name} (still indexing?)"))
-            })
-        };
-        Ok(divi_swap::backend::TipHeader {
-            height: field("height")?,
-            hash,
-            time: field("timestamp")? as u32,
-        })
     }
 
     /// Esplora `GET /block/:hash/status`: `in_best_chain` is "false for orphaned blocks"
     /// (Blockstream esplora `API.md`). A status whose `height` is not `height` is a transient
     /// error, as is one without `in_best_chain`. Esplora may also answer `false` (or 404, an
     /// error here) for a hash it never saw; the expiry sweep only asks about a block at or
-    /// below a tip it has already accepted from this chain.
+    /// below a tip it has already accepted from this chain. With quorum reads both endpoints
+    /// must give the same answer.
     async fn in_best_chain(&self, height: u64, hash: &str) -> Result<bool> {
-        let hash = divi_swap::backend::normalize_block_hash(hash)?;
-        let status = self.get_json(&format!("/block/{hash}/status")).await?;
-        let best = status["in_best_chain"]
-            .as_bool()
-            .ok_or_else(|| SwapError::Transient("block status JSON lacks in_best_chain".into()))?;
-        if best && status["height"].as_u64() != Some(height) {
-            return Err(SwapError::Transient(format!(
-                "block {hash} is in the best chain at {}, not {height}",
-                status["height"]
-            )));
-        }
-        Ok(best)
+        let Some((primary, secondary)) = &self.quorum else {
+            return Self::in_best_chain_on(&self.esplora, height, hash).await;
+        };
+        let (a, b) = tokio::join!(
+            Self::in_best_chain_on(primary, height, hash),
+            Self::in_best_chain_on(secondary, height, hash)
+        );
+        let (a, b) = quorum::pair("in_best_chain", a, b)?;
+        quorum::agree_in_best_chain(hash, a, b)
     }
 
     /// `pow_target_spacing` of rust-bitcoin's consensus parameters for this network
@@ -543,16 +537,15 @@ impl ChainBackend for BtcBackend {
     }
 
     async fn median_time_past(&self) -> Result<u32> {
-        let hash = self.tip_hash_raw().await?;
-        let block = self.get_json(&format!("/block/{}", hash.trim())).await?;
-        block["mediantime"]
-            .as_u64()
-            .map(|t| t as u32)
-            .ok_or_else(|| {
-                // Esplora always sets mediantime on a real block; its absence means we read a
-                // block from a backend that has not finished indexing it yet.
-                SwapError::Transient("block JSON lacks mediantime (still indexing?)".into())
-            })
+        let Some((primary, secondary)) = &self.quorum else {
+            return Self::median_time_past_on(&self.esplora).await;
+        };
+        let (a, b) = tokio::join!(
+            Self::median_time_past_on(primary),
+            Self::median_time_past_on(secondary)
+        );
+        let (a, b) = quorum::pair("median_time_past", a, b)?;
+        Ok(a.min(b))
     }
 
     async fn spendable(&self) -> Result<Option<Amount>> {
@@ -799,6 +792,105 @@ impl BtcBackend {
         };
         let height = outspend["status"]["block_height"].as_u64();
         spend_from_tx(&t, &prev, outpoint.vout, height)
+    }
+}
+
+/// The tip, header, block-status and median-time reads as one endpoint view answers them,
+/// and the header's quorum join (`[btc].quorum_reads`). Without quorum reads the view is the
+/// failover client and these are the reads as they were.
+impl BtcBackend {
+    /// `tip_header` as one endpoint view `es` answers it.
+    async fn tip_header_on(es: &EsploraClient) -> Result<divi_swap::backend::TipHeader> {
+        let hash = divi_swap::backend::normalize_block_hash(&tip_hash_raw_on(es).await?)?;
+        let block = get_json_on(es, &format!("/block/{hash}")).await?;
+        let id = block["id"]
+            .as_str()
+            .ok_or_else(|| SwapError::Transient("block JSON lacks id (still indexing?)".into()))
+            .and_then(divi_swap::backend::normalize_block_hash)?;
+        if id != hash {
+            return Err(SwapError::Transient(format!(
+                "asked for block {hash}, got {id}"
+            )));
+        }
+        let field = |name: &str| {
+            block[name].as_u64().ok_or_else(|| {
+                SwapError::Transient(format!("block JSON lacks {name} (still indexing?)"))
+            })
+        };
+        Ok(divi_swap::backend::TipHeader {
+            height: field("height")?,
+            hash,
+            time: field("timestamp")? as u32,
+        })
+    }
+
+    /// Both endpoints' tip headers; the lower one, after the endpoint that is ahead names the
+    /// same block at that height (Esplora `GET /block-height/:height`). Endpoints a block (or
+    /// more) apart are lag; two different blocks at one height are `Transient`, as is either
+    /// endpoint failing.
+    async fn quorum_tip_header(
+        primary: &EsploraClient,
+        secondary: &EsploraClient,
+    ) -> Result<divi_swap::backend::TipHeader> {
+        let (a, b) = tokio::join!(Self::tip_header_on(primary), Self::tip_header_on(secondary));
+        let (a, b) = quorum::pair("tip_header", a, b)?;
+        let (low, ahead, ahead_es) = if a.height <= b.height {
+            (a, b, secondary)
+        } else {
+            (b, a, primary)
+        };
+        let ahead_hash = if ahead.height == low.height {
+            ahead.hash
+        } else {
+            let body = ahead_es
+                .get(&format!("/block-height/{}", low.height))
+                .await
+                .map_err(SwapError::from)
+                .and_then(|b| divi_swap::backend::normalize_block_hash(&b));
+            match body {
+                Ok(h) => h,
+                Err(e) => {
+                    return Err(quorum::disagree(
+                        "tip_header",
+                        format!(
+                            "the endpoint at {} has no block at {}: {e}",
+                            ahead.height, low.height
+                        ),
+                    ))
+                }
+            }
+        };
+        quorum::agree_block_at(low, ahead_hash)
+    }
+
+    /// `in_best_chain` as one endpoint view `es` answers it.
+    async fn in_best_chain_on(es: &EsploraClient, height: u64, hash: &str) -> Result<bool> {
+        let hash = divi_swap::backend::normalize_block_hash(hash)?;
+        let status = get_json_on(es, &format!("/block/{hash}/status")).await?;
+        let best = status["in_best_chain"]
+            .as_bool()
+            .ok_or_else(|| SwapError::Transient("block status JSON lacks in_best_chain".into()))?;
+        if best && status["height"].as_u64() != Some(height) {
+            return Err(SwapError::Transient(format!(
+                "block {hash} is in the best chain at {}, not {height}",
+                status["height"]
+            )));
+        }
+        Ok(best)
+    }
+
+    /// `median_time_past` as one endpoint view `es` answers it.
+    async fn median_time_past_on(es: &EsploraClient) -> Result<u32> {
+        let hash = tip_hash_raw_on(es).await?;
+        let block = get_json_on(es, &format!("/block/{}", hash.trim())).await?;
+        block["mediantime"]
+            .as_u64()
+            .map(|t| t as u32)
+            .ok_or_else(|| {
+                // Esplora always sets mediantime on a real block; its absence means we read a
+                // block from a backend that has not finished indexing it yet.
+                SwapError::Transient("block JSON lacks mediantime (still indexing?)".into())
+            })
     }
 }
 

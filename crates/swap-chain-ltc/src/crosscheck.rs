@@ -16,9 +16,14 @@
 //!
 //! `H - 6` (not the tip) is used so that ordinary one-to-few-block reorgs and the few
 //! seconds by which one explorer leads another cannot cause a false `Disagree`.
+//!
+//! The claim-time check (`[ltc].crosscheck_before_claim`, [`claim_crosscheck`]) also compares
+//! the block at `H - 1` ([`CLAIM_NEAR_DEPTH`]: a source one block behind or ahead still has
+//! it, so one block of lag is not a disagreement) and the spend of the output being claimed.
 
 use std::str::FromStr;
 
+use divi_swap::Outpoint;
 use serde_json::Value;
 
 use crate::client::{EsploraClient, RetryPolicy};
@@ -26,6 +31,10 @@ use crate::client::{EsploraClient, RetryPolicy};
 /// How far below the primary's tip the compared block sits. A comparison depth only — it is
 /// **not** a confirmation count and nothing else reads it.
 pub const CROSSCHECK_DEPTH: u64 = 6;
+
+/// The claim-time check's second comparison sits this far below the primary's tip. Like
+/// [`CROSSCHECK_DEPTH`], a comparison depth only.
+pub const CLAIM_NEAR_DEPTH: u64 = 1;
 
 /// Blockbook mainnet API base (keyless).
 pub const BLOCKBOOK_MAINNET: &str = "https://litecoinblockexplorer.net/api/v2";
@@ -74,6 +83,49 @@ impl CrossCheckSource {
         }
     }
 
+    /// The transaction whose outputs carry their spenders: Blockbook `GET /api/v2/tx/{txid}`
+    /// (`vout[].spent`, `vout[].spentTxId`; trezor/blockbook `api/types.go`), BlockCypher
+    /// `GET /txs/{txid}` (`outputs[].spent_by`, "only returned for outputs that have been
+    /// spent"; BlockCypher API docs, TXOutput).
+    fn tx_path(self, txid: &str) -> String {
+        match self {
+            Self::Blockbook => format!("/tx/{txid}"),
+            Self::BlockCypher => format!("/txs/{txid}"),
+        }
+    }
+
+    /// How this source's transaction body shows output `vout` spent.
+    fn spend_from(self, body: &str, vout: u32) -> Result<SpendView, String> {
+        let v: Value = serde_json::from_str(body).map_err(|e| format!("not JSON: {e}"))?;
+        match self {
+            Self::Blockbook => {
+                let out = v["vout"]
+                    .as_array()
+                    .and_then(|a| a.iter().find(|o| o["n"].as_u64() == Some(vout as u64)))
+                    .ok_or_else(|| format!("no output {vout} in response"))?;
+                // `spent` and `spentTxId` are omitted when empty (`omitempty`).
+                if out["spent"].as_bool() != Some(true) {
+                    return Ok(SpendView::Unspent);
+                }
+                Ok(match out["spentTxId"].as_str().filter(|t| !t.is_empty()) {
+                    Some(t) => SpendView::SpentBy(normalize_txid(t)?),
+                    None => SpendView::SpentUnnamed,
+                })
+            }
+            Self::BlockCypher => {
+                // BlockCypher lists 20 outputs by default; an HTLC output is never that far in.
+                let out = v["outputs"]
+                    .as_array()
+                    .and_then(|a| a.get(vout as usize))
+                    .ok_or_else(|| format!("no output {vout} in response"))?;
+                Ok(match out["spent_by"].as_str().filter(|t| !t.is_empty()) {
+                    Some(t) => SpendView::SpentBy(normalize_txid(t)?),
+                    None => SpendView::Unspent,
+                })
+            }
+        }
+    }
+
     /// Pull the block hash out of this source's response body.
     fn hash_from(self, body: &str) -> Result<String, String> {
         let v: Value = serde_json::from_str(body).map_err(|e| format!("not JSON: {e}"))?;
@@ -111,6 +163,29 @@ fn normalize_hash(h: &str) -> Result<String, String> {
         Ok(h)
     } else {
         Err(format!("not a 64-hex block hash: {h:?}"))
+    }
+}
+
+fn normalize_txid(t: &str) -> Result<String, String> {
+    normalize_hash(t).map_err(|_| format!("not a 64-hex txid: {t:?}"))
+}
+
+/// An output's spend as one source shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SpendView {
+    Unspent,
+    SpentBy(String),
+    /// Spent, but the source did not name the spender (Blockbook without `spentTxId`).
+    SpentUnnamed,
+}
+
+impl std::fmt::Display for SpendView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unspent => f.write_str("unspent"),
+            Self::SpentBy(t) => write!(f, "spent by {t}"),
+            Self::SpentUnnamed => f.write_str("spent (spender not named)"),
+        }
     }
 }
 
@@ -177,7 +252,20 @@ pub async fn tip_crosscheck(
         Some(h) => h,
         None => return unavailable(format!("{primary_base}: tip {tip} below depth")),
     };
+    compare_at(primary, &other, source, source_base, height).await
+}
 
+/// Compare `primary`'s hash at `height` with `source`'s (asked through `other`, at
+/// `source_base`).
+async fn compare_at(
+    primary: &EsploraClient,
+    other: &EsploraClient,
+    source: CrossCheckSource,
+    source_base: &str,
+    height: u64,
+) -> CrossCheckOutcome {
+    let unavailable = |reason: String| CrossCheckOutcome::Unavailable { reason };
+    let primary_base = primary.primary_url().to_string();
     let primary_hash = match primary.get(&format!("/block-height/{height}")).await {
         Ok(b) => match normalize_hash(&b) {
             Ok(h) => h,
@@ -210,6 +298,129 @@ pub async fn tip_crosscheck(
             other_url,
         }
     }
+}
+
+/// Result of the claim-time check ([`claim_crosscheck`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ClaimCheck {
+    /// Every comparison was made and agrees.
+    Agree,
+    /// A comparison disagrees: the refusal text, naming both answers and both URLs.
+    Disagree(String),
+    /// Nothing disagrees, but at least one comparison could not be made: why.
+    Unavailable(String),
+}
+
+/// The claim-time check of a claim of `at`: `primary`'s hashes at `tip - CROSSCHECK_DEPTH`
+/// and `tip - CLAIM_NEAR_DEPTH` and its spend of `at` (Esplora `GET /tx/:txid/outspend/:vout`,
+/// as `find_spend` reads it), each against `source`. The first disagreement ends the check;
+/// a comparison that cannot be made is noted and the others still run.
+pub(crate) async fn claim_crosscheck(
+    primary: &EsploraClient,
+    source: CrossCheckSource,
+    source_base: &str,
+    retry: RetryPolicy,
+    at: &Outpoint,
+) -> ClaimCheck {
+    let other = match EsploraClient::new(vec![source_base.to_string()], retry) {
+        Ok(c) => c,
+        Err(e) => return ClaimCheck::Unavailable(format!("{} client: {e}", source.as_str())),
+    };
+    let primary_base = primary.primary_url().to_string();
+    let tip: u64 = match primary.get("/blocks/tip/height").await {
+        Ok(b) => match b.trim().parse() {
+            Ok(h) => h,
+            Err(_) => {
+                return ClaimCheck::Unavailable(format!("{primary_base}: tip height not a number"))
+            }
+        },
+        Err(e) => return ClaimCheck::Unavailable(format!("{primary_base}: tip height: {e:?}")),
+    };
+    let mut unavailable = Vec::new();
+    for depth in [CROSSCHECK_DEPTH, CLAIM_NEAR_DEPTH] {
+        let Some(height) = tip.checked_sub(depth) else {
+            unavailable.push(format!("{primary_base}: tip {tip} below depth {depth}"));
+            continue;
+        };
+        match compare_at(primary, &other, source, source_base, height).await {
+            CrossCheckOutcome::Agree { .. } => {}
+            CrossCheckOutcome::Unavailable { reason } => unavailable.push(reason),
+            d @ CrossCheckOutcome::Disagree { .. } => {
+                return ClaimCheck::Disagree(d.disagree_message().expect("disagree"))
+            }
+        }
+    }
+    match compare_spend(primary, &other, source, source_base, at).await {
+        Ok(()) => {}
+        Err(SpendCheck::Unavailable(r)) => unavailable.push(r),
+        Err(SpendCheck::Disagree(m)) => return ClaimCheck::Disagree(m),
+    }
+    if unavailable.is_empty() {
+        ClaimCheck::Agree
+    } else {
+        ClaimCheck::Unavailable(unavailable.join("; "))
+    }
+}
+
+enum SpendCheck {
+    Unavailable(String),
+    Disagree(String),
+}
+
+/// `primary`'s and `source`'s view of the spend of `at`. Both unspent, or spent by the same
+/// transaction, agree; so does a spend the source shows without naming its spender. A spend
+/// one shows and the other does not, or two different spenders, disagree.
+async fn compare_spend(
+    primary: &EsploraClient,
+    other: &EsploraClient,
+    source: CrossCheckSource,
+    source_base: &str,
+    at: &Outpoint,
+) -> Result<(), SpendCheck> {
+    let txid = at.txid.to_rpc_hex();
+    let primary_path = format!("/tx/{txid}/outspend/{}", at.vout);
+    let primary_url = format!("{}{primary_path}", primary.primary_url());
+    let mine = match primary.get_opt(&primary_path).await {
+        // Not found reads as unspent, as `find_spend` reads it.
+        Ok(None) => SpendView::Unspent,
+        Ok(Some(b)) => {
+            let v: Value = serde_json::from_str(&b)
+                .map_err(|e| SpendCheck::Unavailable(format!("{primary_url}: not JSON: {e}")))?;
+            if v["spent"].as_bool() == Some(true) {
+                let t = v["txid"].as_str().ok_or_else(|| {
+                    SpendCheck::Unavailable(format!("{primary_url}: outspend lacks txid"))
+                })?;
+                SpendView::SpentBy(
+                    normalize_txid(t)
+                        .map_err(|e| SpendCheck::Unavailable(format!("{primary_url}: {e}")))?,
+                )
+            } else {
+                SpendView::Unspent
+            }
+        }
+        Err(e) => return Err(SpendCheck::Unavailable(format!("{primary_url}: {e:?}"))),
+    };
+    let other_path = source.tx_path(&txid);
+    let other_url = format!("{}{other_path}", source_base.trim_end_matches('/'));
+    let theirs = match other.get(&other_path).await {
+        Ok(body) => source
+            .spend_from(&body, at.vout)
+            .map_err(|e| SpendCheck::Unavailable(format!("{other_url}: {e}")))?,
+        Err(e) => return Err(SpendCheck::Unavailable(format!("{other_url}: {e:?}"))),
+    };
+    let agree = match (&mine, &theirs) {
+        (SpendView::Unspent, SpendView::Unspent) => true,
+        (SpendView::SpentBy(a), SpendView::SpentBy(b)) => a == b,
+        (SpendView::SpentBy(_), SpendView::SpentUnnamed) => true,
+        _ => false,
+    };
+    if agree {
+        return Ok(());
+    }
+    Err(SpendCheck::Disagree(format!(
+        "ltc claim cross-check FAILED on the spend of {at}: primary {primary_url} says {mine}, \
+         independent source {other_url} says {theirs}; refusing"
+    )))
 }
 
 /// Run the check for a mainnet backend and apply the policy: `Disagree` is an error naming
