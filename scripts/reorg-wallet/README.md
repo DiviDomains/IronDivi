@@ -24,7 +24,7 @@ scripts/reorg-wallet/run.sh target/release ~/divi-3.0.0/bin 55500 /var/tmp
 - `<port-base>`: ten ports on 127.0.0.2, the p2p and RPC port of each node in turn. The divid owner listens; the others dial it.
 - `[root]`: a fresh directory is made under it (default `$TMPDIR`, else `/tmp`) and deleted at the end.
 
-A run takes about 12 minutes. Needs bash and python3 (standard library only). Keys and phrases are never printed or put on a command line.
+A run takes about 14 minutes. Needs bash and python3 (standard library only). Keys and phrases are never printed or put on a command line.
 
 ## Rounds
 
@@ -41,7 +41,11 @@ transaction a view finds at depth < 0 on divid.
 2. **A chain of three:** a spends a coin, b spends a's change, c spends b's change, each in its own block; the second branch double-spends the coin a spent, so a is dropped and b and c lose their input.
 3. **Orphaned stakes:** three blocks staked by the owner replaced by four of the second miner's.
 4. **A vault:** the owner funds a registered vault; the manager stakes a block of its vault coins; the second miner double-spends the funding's inputs and mines five blocks. The manager's coinstake is orphaned and the funding dropped.
-5. **A kill:** four payments with a block each, then `kill -9` of both managers and a start. divid stops with a block index error and is started with `-reindex`.
+5. **A coin back after its spend:** the owner pays itself a coin (p) and spends it (s), a block each; the second miner mines p
+   again, not s. The mempool takes s back before the new branch's p is scanned, so s comes before the coin it spends is back in
+   the wallet. divid's wallet still holds p and counts the coin spent by s in the mempool (`SpentOutputTracker.cpp:22-34`): only
+   s's change is left, unconfirmed.
+6. **A kill:** four payments with a block each, then `kill -9` of both managers and a start. divid stops with a block index error and is started with `-reindex`.
 
 ## What Divi Core does
 
