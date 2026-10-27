@@ -2134,7 +2134,12 @@ impl Chain {
 
     /// IsInitialBlockDownload (ChainSyncHelpers.cpp:33-50): while block files
     /// are imported, or while the tip is more than 144 blocks below the best
-    /// header or that header is more than 6 hours old; once out, out for good
+    /// header or that header is more than 6 hours old on the node's clock;
+    /// once out, out for good
+    pub fn is_initial_block_download(&self) -> bool {
+        self.in_initial_download()
+    }
+
     fn in_initial_download(&self) -> bool {
         use std::sync::atomic::Ordering::SeqCst;
         if self.is_importing() {
@@ -2146,9 +2151,8 @@ impl Chain {
         let Some(best) = self.best_known_block.read().clone().or_else(|| self.tip()) else {
             return true;
         };
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs() as i64);
+        // GetTime: the node's clock, which setmocktime sets
+        let now = divi_primitives::clock::now();
         let behind = i64::from(self.height()) < i64::from(best.height) - 24 * 6
             || i64::from(best.time) < now - 6 * 60 * 60;
         if !behind {
@@ -5126,18 +5130,17 @@ impl Chain {
     }
 
     /// The time of the block at `height` as sporks read it: that of the block in
-    /// the active chain, else the time now (Divi Core `GetBlockTime`,
-    /// spork.cpp:84-88; a block being connected is not in the active chain yet)
+    /// the active chain, else now on the network-adjusted clock (Divi Core
+    /// `GetBlockTime`, spork.cpp:84-88: GetAdjustedTime, the node's clock, which
+    /// setmocktime sets, plus the network time offset; a block being connected
+    /// is not in the active chain yet)
     fn spork_block_time(&self, height: u32) -> i64 {
         if height <= self.height() {
             if let Ok(Some(index)) = self.db.get_block_index_by_height(height) {
                 return index.time as i64;
             }
         }
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0)
+        divi_primitives::clock::adjusted_now()
     }
 
     /// Run `f` with the sporks consensus reads
