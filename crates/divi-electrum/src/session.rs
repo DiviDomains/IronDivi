@@ -6,18 +6,19 @@
 // it under the terms of the GNU Affero General Public License as published
 // by the Free Software Foundation, version 3.
 
-//! One client connection: newline-delimited JSON-RPC requests in, replies
-//! and subscription notifications out.
+//! One client connection: JSON-RPC requests in, replies and subscription
+//! notifications out. Over TCP and TLS a message is a line; over WebSocket it
+//! is a text frame. The session logic is the same for both.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use divi_primitives::hash::Hash256;
-use futures::StreamExt;
+use futures::{Sink, SinkExt, Stream, StreamExt};
 use serde_json::{json, Value};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use tokio_util::codec::{FramedRead, LinesCodec};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec};
 
 use crate::backend::{parse_scripthash, Backend, ElectrumError, HistoryEntry, Result};
 
@@ -335,20 +336,32 @@ fn notification(method: &str, params: Value) -> Value {
     json!({ "jsonrpc": "2.0", "method": method, "params": params })
 }
 
-async fn send<W: AsyncWrite + Unpin>(writer: &mut W, value: &Value) -> std::io::Result<()> {
-    let mut line = value.to_string();
-    line.push('\n');
-    writer.write_all(line.as_bytes()).await?;
-    writer.flush().await
-}
+/// Longest request accepted, over any transport
+pub const MAX_MESSAGE: usize = MAX_LINE;
 
-/// Serves one connection until the client leaves or it errors
+/// Serves one newline-delimited connection until the client leaves or it errors
 pub async fn run<S>(stream: S, backend: Arc<Backend>, banner: Arc<String>)
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    let (reader, mut writer) = tokio::io::split(stream);
-    let mut lines = FramedRead::new(reader, LinesCodec::new_with_max_length(MAX_LINE));
+    let (reader, writer) = tokio::io::split(stream);
+    let lines = FramedRead::new(reader, LinesCodec::new_with_max_length(MAX_LINE));
+    let out = FramedWrite::new(writer, LinesCodec::new());
+    run_messages(lines, out, backend, banner).await
+}
+
+/// Serves one connection whose requests arrive as `incoming` messages and
+/// whose replies go to `outgoing`, until either side ends or errors
+pub async fn run_messages<I, E, O>(
+    mut incoming: I,
+    mut outgoing: O,
+    backend: Arc<Backend>,
+    banner: Arc<String>,
+) where
+    I: Stream<Item = std::result::Result<String, E>> + Unpin,
+    E: std::fmt::Display,
+    O: Sink<String> + Unpin,
+{
     let mut session = Session {
         backend,
         banner,
@@ -360,7 +373,7 @@ where
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
-            line = lines.next() => {
+            line = incoming.next() => {
                 let line = match line {
                     Some(Ok(line)) => line,
                     Some(Err(e)) => {
@@ -373,7 +386,7 @@ where
                     continue;
                 }
                 if let Some(reply) = session.handle_line(&line).await {
-                    if send(&mut writer, &reply).await.is_err() {
+                    if outgoing.send(reply.to_string()).await.is_err() {
                         return;
                     }
                 }
@@ -382,7 +395,7 @@ where
                 match session.tick().await {
                     Ok(notifications) => {
                         for n in notifications {
-                            if send(&mut writer, &n).await.is_err() {
+                            if outgoing.send(n.to_string()).await.is_err() {
                                 return;
                             }
                         }

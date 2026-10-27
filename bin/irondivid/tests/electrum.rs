@@ -23,6 +23,8 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tungstenite::client::IntoClientRequest;
+use tungstenite::{Message, WebSocket};
 
 /// One JSON-RPC call; None while the server is not up.
 /// "dGVzdDp0ZXN0" is base64 of test:test
@@ -55,15 +57,18 @@ struct Node {
     port: u16,
     electrum: u16,
     electrum_tls: u16,
+    electrum_ws: u16,
+    electrum_wss: u16,
 }
 
 impl Node {
     fn start(datadir: &std::path::Path) -> Node {
-        let (mut electrum, mut electrum_tls) = (0, 0);
+        let (mut electrum, mut electrum_tls, mut electrum_ws, mut electrum_wss) = (0, 0, 0, 0);
         let (child, port, _) = start_node(
             datadir,
             |rpc_port, p2p_port| {
-                (electrum, electrum_tls) = (free_port(), free_port());
+                (electrum, electrum_tls, electrum_ws, electrum_wss) =
+                    (free_port(), free_port(), free_port(), free_port());
                 let mut cmd = Command::new(env!("CARGO_BIN_EXE_irondivid"));
                 cmd.arg("--regtest")
                     .arg("--datadir")
@@ -76,6 +81,8 @@ impl Node {
                     .args(["--txindex", "--addressindex"])
                     .arg(format!("--electrum=127.0.0.1:{electrum}"))
                     .arg(format!("--electrumtls=127.0.0.1:{electrum_tls}"))
+                    .arg(format!("--electrumws=127.0.0.1:{electrum_ws}"))
+                    .arg(format!("--electrumwss=127.0.0.1:{electrum_wss}"))
                     .arg(format!("--electrumcert={}", fixture("cert.pem").display()))
                     .arg(format!("--electrumkey={}", fixture("key.pem").display()))
                     .stdout(Stdio::null())
@@ -89,6 +96,8 @@ impl Node {
             port,
             electrum,
             electrum_tls,
+            electrum_ws,
+            electrum_wss,
         }
     }
 
@@ -100,15 +109,107 @@ impl Node {
     }
 
     /// A connection to the plain TCP port, once the server listens
-    fn connect(&self) -> Client<TcpStream> {
+    fn connect(&self) -> Client<Lines<TcpStream>> {
+        Client::new(self.open(self.electrum))
+    }
+
+    /// A plain WebSocket connection, once the server listens
+    fn connect_ws(&self) -> Client<WebSocket<TcpStream>> {
+        let stream = self.open(self.electrum_ws);
+        // A browser sends its page's Origin; the server must accept any
+        let mut request = "ws://127.0.0.1/".into_client_request().unwrap();
+        request
+            .headers_mut()
+            .insert("Origin", "https://wallet.example".parse().unwrap());
+        let (socket, _) = tungstenite::client(request, stream).unwrap();
+        Client::with(socket)
+    }
+
+    /// A WebSocket-over-TLS connection
+    fn connect_wss(
+        &self,
+    ) -> Client<WebSocket<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>> {
+        let tls = tls_stream(self.open(self.electrum_wss));
+        let (socket, _) = tungstenite::client("wss://localhost/", tls).unwrap();
+        Client::with(socket)
+    }
+
+    fn open(&self, port: u16) -> TcpStream {
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
-            if let Ok(stream) = TcpStream::connect(("127.0.0.1", self.electrum)) {
-                return Client::new(stream);
+            if let Ok(stream) = TcpStream::connect(("127.0.0.1", port)) {
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(30)))
+                    .unwrap();
+                return stream;
             }
             assert!(Instant::now() < deadline, "the electrum port never opened");
             std::thread::sleep(Duration::from_millis(100));
         }
+    }
+}
+
+/// The TLS client side over `tcp`, trusting the test CA
+fn tls_stream(tcp: TcpStream) -> rustls::StreamOwned<rustls::ClientConnection, TcpStream> {
+    let mut roots = rustls::RootCertStore::empty();
+    let ca = std::fs::read(fixture("ca.pem")).unwrap();
+    use rustls::pki_types::pem::PemObject;
+    for cert in rustls::pki_types::CertificateDer::pem_slice_iter(&ca) {
+        roots.add(cert.unwrap()).unwrap();
+    }
+    let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    let connection =
+        rustls::ClientConnection::new(Arc::new(config), "localhost".try_into().unwrap()).unwrap();
+    rustls::StreamOwned::new(connection, tcp)
+}
+
+/// How a client reads and writes whole JSON-RPC messages: a line over TCP,
+/// a text frame over WebSocket
+trait Transport {
+    fn read_text(&mut self) -> String;
+    fn write_text(&mut self, message: &str);
+}
+
+struct Lines<S: Read + Write>(BufReader<S>);
+
+impl<S: Read + Write> Transport for Lines<S> {
+    fn read_text(&mut self) -> String {
+        let mut line = String::new();
+        let n = self.0.read_line(&mut line).unwrap();
+        assert!(n > 0, "the server closed the connection");
+        line
+    }
+
+    fn write_text(&mut self, message: &str) {
+        let stream = self.0.get_mut();
+        stream.write_all(format!("{message}\n").as_bytes()).unwrap();
+        stream.flush().unwrap();
+    }
+}
+
+impl<S: Read + Write> Transport for WebSocket<S> {
+    fn read_text(&mut self) -> String {
+        loop {
+            match self.read().expect("the server closed the connection") {
+                Message::Text(text) => {
+                    // One message per frame, no line framing
+                    assert!(!text.ends_with('\n'), "{text:?}");
+                    return text;
+                }
+                Message::Ping(_) | Message::Pong(_) => {}
+                other => panic!("unexpected frame {other:?}"),
+            }
+        }
+    }
+
+    fn write_text(&mut self, message: &str) {
+        self.send(Message::Text(message.to_string())).unwrap();
     }
 }
 
@@ -125,26 +226,29 @@ impl Drop for Node {
 }
 
 /// An Electrum client: one JSON line per request, notifications kept aside
-struct Client<S: Read + Write> {
-    reader: BufReader<S>,
+struct Client<T: Transport> {
+    transport: T,
     next_id: u64,
     notifications: Vec<Value>,
 }
 
-impl<S: Read + Write> Client<S> {
+impl<S: Read + Write> Client<Lines<S>> {
     fn new(stream: S) -> Self {
+        Client::with(Lines(BufReader::new(stream)))
+    }
+}
+
+impl<T: Transport> Client<T> {
+    fn with(transport: T) -> Self {
         Client {
-            reader: BufReader::new(stream),
+            transport,
             next_id: 0,
             notifications: Vec::new(),
         }
     }
 
     fn read(&mut self) -> Value {
-        let mut line = String::new();
-        let n = self.reader.read_line(&mut line).unwrap();
-        assert!(n > 0, "the server closed the connection");
-        serde_json::from_str(&line).unwrap()
+        serde_json::from_str(&self.transport.read_text()).unwrap()
     }
 
     /// The whole reply to a request
@@ -152,9 +256,7 @@ impl<S: Read + Write> Client<S> {
         self.next_id += 1;
         let id = self.next_id;
         let line = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
-        let stream = self.reader.get_mut();
-        stream.write_all(format!("{line}\n").as_bytes()).unwrap();
-        stream.flush().unwrap();
+        self.transport.write_text(&line.to_string());
         loop {
             let message = self.read();
             if message["id"] == json!(id) {
@@ -218,8 +320,69 @@ fn electrum_serves_a_regtest_node() {
     let dir = tempfile::tempdir().unwrap();
     let node = Node::start(dir.path());
     node.rpc("setgenerate", json!([110]));
-
     let mut c = node.connect();
+    session_suite(&node, &mut c);
+
+    // TLS: the same server behind the test certificate
+    let mut tls = Client::new(tls_stream(node.open(node.electrum_tls)));
+    assert_eq!(tls.call("server.version", json!(["test", "1.4"]))[1], "1.4");
+    assert_eq!(
+        tls.call("blockchain.headers.subscribe", json!([]))["height"],
+        111
+    );
+}
+
+/// The same session tests over WebSocket: a text frame per message, a header
+/// push and a scripthash push, from a page on another Origin
+#[test]
+fn electrum_serves_a_regtest_node_over_websocket() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::start(dir.path());
+    node.rpc("setgenerate", json!([110]));
+    let mut c = node.connect_ws();
+    session_suite(&node, &mut c);
+
+    // Secure WebSocket: the same server behind the test certificate
+    let mut wss = node.connect_wss();
+    assert_eq!(wss.call("server.version", json!(["test", "1.4"]))[1], "1.4");
+    assert_eq!(
+        wss.call("blockchain.headers.subscribe", json!([]))["height"],
+        111
+    );
+    // A frame with several requests is a JSON-RPC batch
+    wss.transport.write_text(
+        &json!([
+            {"jsonrpc": "2.0", "id": 1, "method": "server.ping", "params": []},
+            {"jsonrpc": "2.0", "id": 2, "method": "blockchain.relayfee", "params": []},
+        ])
+        .to_string(),
+    );
+    assert_eq!(wss.read().as_array().unwrap().len(), 2);
+}
+
+/// A client that
+/// talks plain TCP at a WebSocket port is dropped, and the port keeps serving
+#[test]
+fn electrum_websocket_port_rejects_non_websocket_clients() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::start(dir.path());
+    let mut stream = node.open(node.electrum_ws);
+    stream
+        .write_all(b"{\"id\":1,\"method\":\"server.ping\",\"params\":[]}\n\r\n\r\n")
+        .unwrap();
+    let mut reply = String::new();
+    let _ = stream.read_to_string(&mut reply);
+    assert!(!reply.contains("result"), "{reply}");
+    // And the node still serves a real one
+    assert_eq!(
+        node.connect_ws().call("server.ping", json!([])),
+        Value::Null
+    );
+}
+
+/// The whole conversation, over whichever transport `c` speaks; expects a
+/// fresh regtest node at height 110
+fn session_suite<T: Transport>(node: &Node, c: &mut Client<T>) {
     c.notifications.clear();
     let version = c.call("server.version", json!(["test", "1.4"]));
     assert_eq!(version[1], "1.4");
@@ -358,31 +521,6 @@ fn electrum_serves_a_regtest_node() {
     assert_eq!(
         c.reply("no.such.method", json!([]))["error"]["code"],
         -32601
-    );
-
-    // TLS: the same server behind the test certificate
-    let mut roots = rustls::RootCertStore::empty();
-    let ca = std::fs::read(fixture("ca.pem")).unwrap();
-    use rustls::pki_types::pem::PemObject;
-    for cert in rustls::pki_types::CertificateDer::pem_slice_iter(&ca) {
-        roots.add(cert.unwrap()).unwrap();
-    }
-    let config = rustls::ClientConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()
-    .unwrap()
-    .with_root_certificates(roots)
-    .with_no_client_auth();
-    let connection =
-        rustls::ClientConnection::new(Arc::new(config), "localhost".try_into().unwrap()).unwrap();
-    let tcp = TcpStream::connect(("127.0.0.1", node.electrum_tls)).unwrap();
-    tcp.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
-    let mut tls = Client::new(rustls::StreamOwned::new(connection, tcp));
-    assert_eq!(tls.call("server.version", json!(["test", "1.4"]))[1], "1.4");
-    assert_eq!(
-        tls.call("blockchain.headers.subscribe", json!([]))["height"],
-        111
     );
 }
 

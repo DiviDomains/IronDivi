@@ -99,8 +99,23 @@ verbose), `blockchain.transaction.broadcast`,
 |---|---|
 | `-electrum=<ip:port>` | Serve plain TCP on this address. |
 | `-electrumtls=<ip:port>` | Serve TLS on this address. |
-| `-electrumcert=<file.pem>` | TLS certificate chain, PEM. Needed with `-electrumtls`. |
-| `-electrumkey=<file.pem>` | TLS private key, PEM. Needed with `-electrumtls`. |
+| `-electrumcert=<file.pem>` | TLS certificate chain, PEM. Needed with `-electrumtls` or `-electrumwss`. |
+| `-electrumkey=<file.pem>` | TLS private key, PEM. Needed with `-electrumtls` or `-electrumwss`. |
+| `-electrumws=<ip:port>` | Serve Electrum over plain WebSocket on this address. Conventional port 50003 (testnet 51003). Meant for `127.0.0.1` behind a TLS front such as nginx, `tailscale serve` or a Cloudflare Tunnel. |
+| `-electrumwss=<ip:port>` | Serve Electrum over WebSocket with TLS on this address, using `-electrumcert` and `-electrumkey`. Conventional port 50004 (testnet 51004). |
+
+The WebSocket listeners are for wallets that run in a browser engine (a web
+page, a Telegram webview, an extension service worker) and cannot open a raw
+socket. The methods, subscriptions and push notifications are the same as over
+TCP. Only the framing differs: each JSON-RPC message (or batch) is one
+WebSocket text frame, with no trailing newline. Any `Origin` is accepted,
+because everything served is public chain data. All four listeners share the
+1000-connection cap. A client must open the socket with a WebSocket handshake;
+plain TCP or HTTP sent to these ports is dropped.
+
+```
+irondivid -txindex=1 -addressindex=1 -electrumws=127.0.0.1:50003
+```
 
 Relative cert and key paths are taken from the data directory. Either
 listener, or both, can be on. The node also needs `-txindex=1`,

@@ -7,9 +7,10 @@
 // by the Free Software Foundation, version 3.
 
 //! IronDivi's optional Electrum protocol server, on with `-electrum` (plain
-//! TCP) and `-electrumtls` (TLS). Light wallets such as BasicSwap's
-//! `--light` mode use it in place of a local node. The design is in
-//! docs/electrum-server.md.
+//! TCP), `-electrumtls` (TLS), `-electrumws` (WebSocket) and `-electrumwss`
+//! (WebSocket over TLS). Light wallets such as BasicSwap's `--light` mode use
+//! it in place of a local node; browser wallets use the WebSocket ports. The
+//! design is in docs/electrum-server.md.
 
 pub mod backend;
 pub mod session;
@@ -22,14 +23,17 @@ use anyhow::Context;
 use divi_rpc::blockchain::MempoolProvider;
 use divi_rpc::RpcServer;
 use divi_storage::Chain;
+use futures::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, Semaphore};
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+use tokio_tungstenite::tungstenite::Message;
 
 pub use backend::Backend;
 
-/// Most connections served at once, over TCP and TLS together
+/// Most connections served at once, over every listener together
 const MAX_CONNECTIONS: usize = 1000;
 
 /// The TLS listener: where it binds and its PEM certificate chain and key
@@ -44,6 +48,10 @@ pub struct TlsConfig {
 pub struct ElectrumConfig {
     pub tcp: Option<SocketAddr>,
     pub tls: Option<TlsConfig>,
+    /// WebSocket, no TLS: meant for a TLS-terminating proxy in front
+    pub ws: Option<SocketAddr>,
+    /// WebSocket over TLS, with the same kind of certificate as `tls`
+    pub wss: Option<TlsConfig>,
     pub banner: String,
 }
 
@@ -52,6 +60,8 @@ pub struct ElectrumConfig {
 pub struct Prepared {
     tcp: Option<std::net::TcpListener>,
     tls: Option<(std::net::TcpListener, TlsAcceptor)>,
+    ws: Option<std::net::TcpListener>,
+    wss: Option<(std::net::TcpListener, TlsAcceptor)>,
     banner: Arc<String>,
 }
 
@@ -92,9 +102,16 @@ pub fn prepare(config: ElectrumConfig) -> anyhow::Result<Prepared> {
         Some(tls) => Some((bind(tls.bind)?, tls_acceptor(tls)?)),
         None => None,
     };
+    let ws = config.ws.map(bind).transpose()?;
+    let wss = match &config.wss {
+        Some(wss) => Some((bind(wss.bind)?, tls_acceptor(wss)?)),
+        None => None,
+    };
     Ok(Prepared {
         tcp,
         tls,
+        ws,
+        wss,
         banner: Arc::new(config.banner),
     })
 }
@@ -108,6 +125,16 @@ impl Prepared {
     /// The bound TLS address, if any
     pub fn tls_addr(&self) -> Option<SocketAddr> {
         self.tls.as_ref().and_then(|(l, _)| l.local_addr().ok())
+    }
+
+    /// The bound WebSocket address, if any
+    pub fn ws_addr(&self) -> Option<SocketAddr> {
+        self.ws.as_ref().and_then(|l| l.local_addr().ok())
+    }
+
+    /// The bound secure WebSocket address, if any
+    pub fn wss_addr(&self) -> Option<SocketAddr> {
+        self.wss.as_ref().and_then(|(l, _)| l.local_addr().ok())
     }
 
     /// Fills the scripthash index if needed, then serves until `shutdown`
@@ -130,44 +157,36 @@ impl Prepared {
             let backend = Arc::new(Backend::new(chain, mempool, rpc));
             let limit = Arc::new(Semaphore::new(MAX_CONNECTIONS));
             let mut tasks = Vec::new();
-            if let Some(listener) = self.tcp {
+            let mut listen = |name: &str,
+                              listener: Option<std::net::TcpListener>,
+                              tls: Option<TlsAcceptor>,
+                              framing: Framing| {
+                let Some(listener) = listener else { return };
                 match TcpListener::from_std(listener) {
                     Ok(listener) => {
                         tracing::info!(
-                            "electrum: listening on {:?} (tcp)",
+                            "electrum: listening on {:?} ({name})",
                             listener.local_addr().ok()
                         );
                         tasks.push(tokio::spawn(accept_loop(
                             listener,
-                            None,
+                            tls,
+                            framing,
                             backend.clone(),
                             self.banner.clone(),
                             limit.clone(),
                             shutdown.resubscribe(),
                         )));
                     }
-                    Err(e) => tracing::error!("electrum: tcp listener failed: {e}"),
+                    Err(e) => tracing::error!("electrum: {name} listener failed: {e}"),
                 }
-            }
-            if let Some((listener, acceptor)) = self.tls {
-                match TcpListener::from_std(listener) {
-                    Ok(listener) => {
-                        tracing::info!(
-                            "electrum: listening on {:?} (tls)",
-                            listener.local_addr().ok()
-                        );
-                        tasks.push(tokio::spawn(accept_loop(
-                            listener,
-                            Some(acceptor),
-                            backend.clone(),
-                            self.banner.clone(),
-                            limit.clone(),
-                            shutdown.resubscribe(),
-                        )));
-                    }
-                    Err(e) => tracing::error!("electrum: tls listener failed: {e}"),
-                }
-            }
+            };
+            listen("tcp", self.tcp, None, Framing::Lines);
+            let (tls, tls_acceptor) = self.tls.unzip();
+            listen("tls", tls, tls_acceptor, Framing::Lines);
+            listen("ws", self.ws, None, Framing::WebSocket);
+            let (wss, wss_acceptor) = self.wss.unzip();
+            listen("wss", wss, wss_acceptor, Framing::WebSocket);
             for task in tasks {
                 let _ = task.await;
             }
@@ -175,9 +194,65 @@ impl Prepared {
     }
 }
 
+/// How a connection's messages are framed
+#[derive(Clone, Copy)]
+enum Framing {
+    /// One JSON-RPC message per line
+    Lines,
+    /// One JSON-RPC message per WebSocket text frame; any Origin is accepted,
+    /// since everything served is public chain data
+    WebSocket,
+}
+
+async fn serve<S>(stream: S, framing: Framing, backend: Arc<Backend>, banner: Arc<String>)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+{
+    match framing {
+        Framing::Lines => session::run(stream, backend, banner).await,
+        Framing::WebSocket => {
+            let config = WebSocketConfig {
+                max_message_size: Some(session::MAX_MESSAGE),
+                max_frame_size: Some(session::MAX_MESSAGE),
+                ..Default::default()
+            };
+            let handshake = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                tokio_tungstenite::accept_async_with_config(stream, Some(config)),
+            )
+            .await;
+            let socket = match handshake {
+                Ok(Ok(socket)) => socket,
+                Ok(Err(e)) => return tracing::debug!("electrum: websocket handshake: {e}"),
+                Err(_) => return tracing::debug!("electrum: websocket handshake timed out"),
+            };
+            let (sink, stream) = socket.split();
+            // Text frames are requests; the library answers pings and close
+            let incoming = stream.filter_map(|message| async move {
+                match message {
+                    Ok(Message::Text(text)) => Some(Ok(text)),
+                    Ok(Message::Binary(bytes)) => Some(
+                        String::from_utf8(bytes)
+                            .map_err(|_| tokio_tungstenite::tungstenite::Error::Utf8),
+                    ),
+                    Ok(Message::Close(_)) => None,
+                    Ok(_) => Some(Ok(String::new())),
+                    Err(e) => Some(Err(e)),
+                }
+            });
+            let incoming = Box::pin(incoming);
+            let outgoing = sink.with(|text: String| async move {
+                Ok::<_, tokio_tungstenite::tungstenite::Error>(Message::Text(text))
+            });
+            session::run_messages(incoming, Box::pin(outgoing), backend, banner).await
+        }
+    }
+}
+
 async fn accept_loop(
     listener: TcpListener,
     tls: Option<TlsAcceptor>,
+    framing: Framing,
     backend: Arc<Backend>,
     banner: Arc<String>,
     limit: Arc<Semaphore>,
@@ -207,7 +282,7 @@ async fn accept_loop(
         tokio::spawn(async move {
             let _permit = permit;
             match tls {
-                None => session::run(stream, backend, banner).await,
+                None => serve(stream, framing, backend, banner).await,
                 Some(acceptor) => {
                     let handshake = tokio::time::timeout(
                         std::time::Duration::from_secs(10),
@@ -215,7 +290,7 @@ async fn accept_loop(
                     )
                     .await;
                     match handshake {
-                        Ok(Ok(stream)) => session::run(stream, backend, banner).await,
+                        Ok(Ok(stream)) => serve(stream, framing, backend, banner).await,
                         Ok(Err(e)) => tracing::debug!("electrum: tls handshake with {peer}: {e}"),
                         Err(_) => tracing::debug!("electrum: tls handshake with {peer} timed out"),
                     }

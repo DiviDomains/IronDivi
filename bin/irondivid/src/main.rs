@@ -107,7 +107,8 @@ IronDivi's own: -fullnode=<ip> -stakeonstaletip -stakesplitthreshold=<n>\n  \
 -webui -webuiport=<port> -webuibind=<addr> -webuiallowhost=<host>\n  \
 -webuiallowremote (the web interface, off unless -webui is given)\n  \
 -electrum=<addr:port> -electrumtls=<addr:port> -electrumcert=<pem>\n  \
--electrumkey=<pem> (an Electrum server; needs -txindex -addressindex)\n  \
+-electrumkey=<pem> -electrumws=<addr:port> -electrumwss=<addr:port>\n  \
+(an Electrum server, TCP/TLS/WebSocket; needs -txindex -addressindex)\n  \
 --export-chain --export-start N --export-end N --export-output DIR\n  \
 --export-snapshot DIR --import-snapshot DIR [--snapshot-root HEX]\n  \
 --sign-snapshot DIR --verify-snapshot DIR --snapshot-signer ADDRESS\n";
@@ -352,6 +353,8 @@ const READ_ELSEWHERE: &[&str] = &[
     "webuiallowhost",
     "electrum",
     "electrumtls",
+    "electrumws",
+    "electrumwss",
     "electrumcert",
     "electrumkey",
     "conf",
@@ -2448,7 +2451,7 @@ async fn run_daemon(
     }
 }
 
-/// `-electrum` and `-electrumtls`: the Electrum server's settings; None when
+/// `-electrum`, `-electrumtls`, `-electrumws` and `-electrumwss`: the Electrum server's settings; None when
 /// it is off
 fn electrum_config(
     args: &Args,
@@ -2465,23 +2468,27 @@ fn electrum_config(
         }
     };
     let tcp = addr("electrum")?;
-    let tls = match addr("electrumtls")? {
-        None => None,
-        Some(bind) => {
-            let file = |name: &str| -> Result<PathBuf> {
-                match s.get(name).map(str::trim) {
-                    Some(p) if !p.is_empty() => Ok(config.data_dir.join(p)),
-                    _ => anyhow::bail!("-electrumtls needs -{name}=<file.pem>"),
-                }
-            };
-            Some(divi_electrum::TlsConfig {
-                bind,
-                cert: file("electrumcert")?,
-                key: file("electrumkey")?,
-            })
-        }
+    let ws = addr("electrumws")?;
+    // -electrumtls and -electrumwss share -electrumcert and -electrumkey
+    let tls_for = |flag: &str| -> Result<Option<divi_electrum::TlsConfig>> {
+        let Some(bind) = addr(flag)? else {
+            return Ok(None);
+        };
+        let file = |name: &str| -> Result<PathBuf> {
+            match s.get(name).map(str::trim) {
+                Some(p) if !p.is_empty() => Ok(config.data_dir.join(p)),
+                _ => anyhow::bail!("-{flag} needs -{name}=<file.pem>"),
+            }
+        };
+        Ok(Some(divi_electrum::TlsConfig {
+            bind,
+            cert: file("electrumcert")?,
+            key: file("electrumkey")?,
+        }))
     };
-    if tcp.is_none() && tls.is_none() {
+    let tls = tls_for("electrumtls")?;
+    let wss = tls_for("electrumwss")?;
+    if tcp.is_none() && tls.is_none() && ws.is_none() && wss.is_none() {
         return Ok(None);
     }
     if !config.index.txindex || !config.index.addressindex {
@@ -2495,6 +2502,8 @@ fn electrum_config(
     Ok(Some(divi_electrum::ElectrumConfig {
         tcp,
         tls,
+        ws,
+        wss,
         banner: format!("IronDivi {} Electrum server", env!("CARGO_PKG_VERSION")),
     }))
 }

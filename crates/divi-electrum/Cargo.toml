@@ -18,6 +18,8 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 hex = { workspace = true }
 anyhow = { workspace = true }
+# WebSocket framing for -electrumws / -electrumwss; the version axum already pulls in
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
 # TLS for -electrumtls; ring keeps the build free of a C/cmake toolchain
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }

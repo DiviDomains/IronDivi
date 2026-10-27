@@ -2823,6 +2823,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-rustls",
+ "tokio-tungstenite 0.24.0",
  "tokio-util",
  "tracing",
 ]
@@ -4402,6 +4403,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "tungstenite 0.24.0",
 ]
 
 [[package]]
