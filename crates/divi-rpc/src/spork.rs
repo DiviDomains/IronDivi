@@ -74,7 +74,9 @@ impl SporkRpc {
             .unwrap_or_default()
     }
 
-    /// C++ `IsSporkActive`.
+    /// C++ `IsSporkActive`: a time spork is active once its time is past
+    /// GetAdjustedTime, the node's clock (setmocktime sets it) plus the
+    /// network time offset (spork.cpp:379)
     fn is_active(&self, id: i32, default: Option<&str>) -> bool {
         if is_multi_value(id) {
             return self.received_value(id).is_some();
@@ -83,10 +85,7 @@ impl SporkRpc {
             .received_value(id)
             .or_else(|| default.map(str::to_string))
             .unwrap_or_else(|| "4070908800".to_string());
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
+        let now = divi_primitives::clock::adjusted_now();
         v.parse::<i64>().map(|t| t < now).unwrap_or(false)
     }
 
