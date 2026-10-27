@@ -25,7 +25,9 @@
 //! removed by the next [`Wallet::open`], once no running process has that pid and the file
 //! is older than [`STALE_TEMP_FILE_AGE`]. The age matters for a writer in another pid
 //! namespace (a container sharing the wallet volume): it looks dead from here, but its
-//! in-flight file is only milliseconds old.
+//! in-flight file is only milliseconds old. The temporary file write may take at most
+//! [`WRITE_TIMEOUT`] (a tenth of that age); one that takes longer is abandoned, its file
+//! removed and never renamed, and the write is an error.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -114,8 +116,10 @@ impl Wallet {
     }
 
     /// [`Self::persist`] with the temporary file written by `writer` (a test seam) under
-    /// `bound`.
-    fn persist_with(&mut self, _bound: Duration, writer: TempWriter) -> Result<(), SwapError> {
+    /// `bound`. A write that has not answered within `bound` is a `Storage` error; the
+    /// wallet file is left as it was, and the in-memory state keeps the caller's change,
+    /// as after any other failed write.
+    fn persist_with(&mut self, bound: Duration, writer: TempWriter) -> Result<(), SwapError> {
         self.refresh();
         static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let Some(p) = &self.path else { return Ok(()) };
@@ -125,7 +129,7 @@ impl Wallet {
         let tmp = temp_path(p, std::process::id(), n);
         let text = serde_json::to_string_pretty(self)
             .map_err(|e| SwapError::Storage(format!("serialize wallet: {e}")))?;
-        writer(&tmp, text.as_bytes())
+        write_temp_file(&tmp, text.into_bytes(), bound, writer)
             .and_then(|_| std::fs::rename(&tmp, p))
             .map_err(|e| {
                 // Ours alone (our pid and counter); it may not exist if the write failed early.
@@ -310,6 +314,53 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Writes a wallet's temporary file.
 type TempWriter = fn(&Path, &[u8]) -> std::io::Result<()>;
+
+/// Write `tmp` with `writer` on its own thread, waiting at most `bound`; only an answer in
+/// time lets the caller rename `tmp`. `bound` is far below [`STALE_TEMP_FILE_AGE`], so a
+/// file we rename is never old enough for another process's sweep. Past it the write is
+/// abandoned: the caller removes `tmp`, and the thread, should its write ever return, finds
+/// nobody waiting and removes `tmp` itself, so a late write is never renamed over anything.
+fn write_temp_file(
+    tmp: &Path,
+    bytes: Vec<u8>,
+    bound: Duration,
+    writer: TempWriter,
+) -> std::io::Result<()> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let path = tmp.to_path_buf();
+    let thread = std::thread::Builder::new()
+        .name("wallet-write".into())
+        .spawn(move || {
+            let res = writer(&path, &bytes);
+            if tx.send(res).is_err() {
+                let _ = std::fs::remove_file(&path);
+            }
+        })?;
+    match rx.recv_timeout(bound) {
+        Ok(res) => {
+            let _ = thread.join();
+            res
+        }
+        Err(e) => {
+            // Dropped before the caller removes `tmp`: whichever runs last removes it.
+            drop(rx);
+            let (kind, why) = match e {
+                std::sync::mpsc::RecvTimeoutError::Timeout => (
+                    std::io::ErrorKind::TimedOut,
+                    format!("the temporary file write did not finish within {bound:?}"),
+                ),
+                std::sync::mpsc::RecvTimeoutError::Disconnected => (
+                    std::io::ErrorKind::Other,
+                    "the temporary file writer stopped".to_string(),
+                ),
+            };
+            Err(std::io::Error::new(
+                kind,
+                format!("{why}; the wallet file is unchanged"),
+            ))
+        }
+    }
+}
 
 /// Whether a file modified at `mtime` is old enough to be swept at `now`. An mtime in the
 /// future is not.
