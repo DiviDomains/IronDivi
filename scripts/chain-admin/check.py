@@ -367,13 +367,17 @@ for h, amount in ((41, 10), (42, 5), (43, 3)):
     sends[C.rpc("sendtoaddress", X, amount)] = f"t{h}"
     C.rpc("setgenerate", 1)
 C.rpc("setgenerate", 2)
+# irondivid must hold block 45 before divid replaces it, or it never sees the stale block
+if not synced():
+    print("FAIL   setup: irondivid did not follow divid's chain", flush=True)
+    sys.exit(1)
 # The stale block: 45 is replaced by a longer branch, then reconsidered
 old45 = C.rpc("getblockhash", 45)
 C.rpc("invalidateblock", old45)
 C.rpc("setgenerate", 2)
 C.rpc("reconsiderblock", old45)
-if not synced():
-    print("FAIL   setup: irondivid did not follow divid's chain", flush=True)
+if not synced() or I.call("getblockheader", old45)[0] != "ok":
+    print("FAIL   setup: irondivid did not follow divid's chain and its stale block", flush=True)
     sys.exit(1)
 for h in range(0, C.rpc("getblockcount") + 1):
     label_all(f"a{h}", C.rpc("getblockhash", h))
