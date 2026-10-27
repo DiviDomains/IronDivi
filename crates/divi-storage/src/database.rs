@@ -201,6 +201,7 @@ impl ChainDatabase {
                 crate::search_index::CF_ADDRESS_UNSPENT,
                 Options::default(),
             ),
+            ColumnFamilyDescriptor::new(crate::search_index::CF_SCRIPTHASH, Options::default()),
         ];
 
         tracing::info!(

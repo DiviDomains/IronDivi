@@ -2827,6 +2827,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "divi-electrum"
+version = "0.2.7"
+dependencies = [
+ "anyhow",
+ "divi-crypto",
+ "divi-primitives",
+ "divi-rpc",
+ "divi-storage",
+ "futures",
+ "hex",
+ "rustls",
+ "serde_json",
+ "tokio",
+ "tokio-rustls",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "divi-masternode"
 version = "0.2.7"
 dependencies = [
@@ -4379,6 +4398,7 @@ dependencies = [
  "clap",
  "dirs",
  "divi-crypto",
+ "divi-electrum",
  "divi-masternode",
  "divi-network",
  "divi-node",
@@ -4390,8 +4410,10 @@ dependencies = [
  "divi-webui",
  "hex",
  "libc",
+ "rustls",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "tokio",
  "toml",

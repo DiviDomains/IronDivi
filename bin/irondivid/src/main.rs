@@ -106,6 +106,8 @@ IronDivi's own: -fullnode=<ip> -stakeonstaletip -stakesplitthreshold=<n>\n  \
 -utxocachesize=<n> -expire=<age> -maxlogsize=<MB> -maxlogfiles=<n>\n  \
 -webui -webuiport=<port> -webuibind=<addr> -webuiallowhost=<host>\n  \
 -webuiallowremote (the web interface, off unless -webui is given)\n  \
+-electrum=<addr:port> -electrumtls=<addr:port> -electrumcert=<pem>\n  \
+-electrumkey=<pem> (an Electrum server; needs -txindex -addressindex)\n  \
 --export-chain --export-start N --export-end N --export-output DIR\n  \
 --export-snapshot DIR --import-snapshot DIR [--snapshot-root HEX]\n  \
 --sign-snapshot DIR --verify-snapshot DIR --snapshot-signer ADDRESS\n";
@@ -348,6 +350,10 @@ const READ_ELSEWHERE: &[&str] = &[
     "webuibind",
     "webuiallowremote",
     "webuiallowhost",
+    "electrum",
+    "electrumtls",
+    "electrumcert",
+    "electrumkey",
     "conf",
     "hdseed",
     "mnemonic",
@@ -1663,6 +1669,7 @@ fn lock_data_dir(dir: &std::path::Path) -> Result<std::fs::File> {
 }
 
 /// Run the daemon
+#[allow(clippy::too_many_arguments)]
 async fn run_daemon(
     mut config: NodeConfig,
     wallet_path: Option<PathBuf>,
@@ -1672,6 +1679,7 @@ async fn run_daemon(
     shutdown_tx: broadcast::Sender<()>,
     shutdown_rx: broadcast::Receiver<()>,
     webui: Option<divi_webui::WebUiConfig>,
+    electrum: Option<divi_electrum::ElectrumConfig>,
 ) -> Result<()> {
     // Create data directory if it doesn't exist
     private_files::ensure_private_dir(&config.data_dir, false)
@@ -1685,6 +1693,9 @@ async fn run_daemon(
     // -webui: take its port now, so a port in use stops the start at once
     let webui = webui.map(divi_webui::prepare).transpose()?;
     let webui_shutdown = shutdown_tx.subscribe();
+    // -electrum: the same, for the Electrum server's ports and certificate
+    let electrum = electrum.map(divi_electrum::prepare).transpose()?;
+    let electrum_shutdown = shutdown_tx.subscribe();
 
     // Divi Core Discover: the interfaces' addresses (net.cpp:1385-1425)
     if config.p2p.discover {
@@ -2169,6 +2180,8 @@ async fn run_daemon(
         let peers_for_staking_status = Arc::clone(&peer_manager);
         let split_threshold_divi = config.staking.split_threshold as f64 / 100_000_000.0;
         let mempool_for_rpc = node.mempool().clone();
+        let mempool_for_electrum = node.mempool().clone();
+        let chain_for_electrum = Arc::clone(&chain);
         let reorg_hook_for_rpc = mempool_reorg_hook(&node, Some(Arc::clone(&wallet)));
         let spork_for_rpc = node.spork_manager().clone();
         let history_for_rpc = node.history_fetcher();
@@ -2196,6 +2209,14 @@ async fn run_daemon(
                 move |rpc_server| {
                     if let Some(webui) = webui {
                         webui.spawn(Arc::clone(rpc_server), webui_shutdown);
+                    }
+                    if let Some(electrum) = electrum {
+                        electrum.spawn(
+                            chain_for_electrum,
+                            mempool_for_electrum,
+                            Arc::clone(rpc_server),
+                            electrum_shutdown,
+                        );
                     }
                     rpc_server.set_shutdown_callback(rpc_stop);
                     rpc_server.set_mempool(mempool_for_rpc);
@@ -2330,6 +2351,8 @@ async fn run_daemon(
         }
     } else {
         let mempool_for_rpc = node.mempool().clone();
+        let mempool_for_electrum = node.mempool().clone();
+        let chain_for_electrum = Arc::clone(&chain);
         let reorg_hook_for_rpc = mempool_reorg_hook(&node, None);
         let spork_for_rpc = node.spork_manager().clone();
         let history_for_rpc = node.history_fetcher();
@@ -2354,6 +2377,14 @@ async fn run_daemon(
                 move |rpc_server| {
                     if let Some(webui) = webui {
                         webui.spawn(Arc::clone(rpc_server), webui_shutdown);
+                    }
+                    if let Some(electrum) = electrum {
+                        electrum.spawn(
+                            chain_for_electrum,
+                            mempool_for_electrum,
+                            Arc::clone(rpc_server),
+                            electrum_shutdown,
+                        );
                     }
                     rpc_server.set_shutdown_callback(rpc_stop);
                     rpc_server.set_mempool(mempool_for_rpc);
@@ -2415,6 +2446,57 @@ async fn run_daemon(
         Some(e) => Err(anyhow::anyhow!("RPC server error: {}", e)),
         None => Ok(()),
     }
+}
+
+/// `-electrum` and `-electrumtls`: the Electrum server's settings; None when
+/// it is off
+fn electrum_config(
+    args: &Args,
+    config: &NodeConfig,
+) -> Result<Option<divi_electrum::ElectrumConfig>> {
+    let s = &args.settings;
+    let addr = |name: &str| -> Result<Option<SocketAddr>> {
+        match s.get(name).map(str::trim) {
+            None | Some("") => Ok(None),
+            Some(a) => a
+                .parse()
+                .map(Some)
+                .with_context(|| format!("Invalid -{name}: '{a}' (an address:port)")),
+        }
+    };
+    let tcp = addr("electrum")?;
+    let tls = match addr("electrumtls")? {
+        None => None,
+        Some(bind) => {
+            let file = |name: &str| -> Result<PathBuf> {
+                match s.get(name).map(str::trim) {
+                    Some(p) if !p.is_empty() => Ok(config.data_dir.join(p)),
+                    _ => anyhow::bail!("-electrumtls needs -{name}=<file.pem>"),
+                }
+            };
+            Some(divi_electrum::TlsConfig {
+                bind,
+                cert: file("electrumcert")?,
+                key: file("electrumkey")?,
+            })
+        }
+    };
+    if tcp.is_none() && tls.is_none() {
+        return Ok(None);
+    }
+    if !config.index.txindex || !config.index.addressindex {
+        anyhow::bail!("-electrum needs -txindex=1 and -addressindex=1");
+    }
+    if !config.rpc.enabled {
+        anyhow::bail!(
+            "-electrum calls the daemon through its RPC server; it cannot run with -server=0"
+        );
+    }
+    Ok(Some(divi_electrum::ElectrumConfig {
+        tcp,
+        tls,
+        banner: format!("IronDivi {} Electrum server", env!("CARGO_PKG_VERSION")),
+    }))
 }
 
 /// `-webui`: the web interface's settings; None when it is off
@@ -3109,6 +3191,7 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
     let wallet_seed = WalletSeed::from_settings(&args.settings);
     let wallet_options = WalletOptions::from_settings(&args.settings);
     let webui = webui_config(&args, &config)?;
+    let electrum = electrum_config(&args, &config)?;
 
     // Run the daemon
     if let Err(e) = run_daemon(
@@ -3120,6 +3203,7 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
         shutdown_tx,
         shutdown_rx,
         webui,
+        electrum,
     )
     .await
     {

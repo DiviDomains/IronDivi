@@ -20,6 +20,7 @@ divi-wallet = { workspace = true }
 divi-crypto = { workspace = true }
 divi-masternode = { workspace = true }
 divi-webui = { workspace = true }
+divi-electrum = { workspace = true }
 
 # CLI
 clap = { version = "4.4", features = ["derive"] }
@@ -52,3 +53,6 @@ fault-injection = ["divi-storage/fault-injection"]
 [dev-dependencies]
 divi-test-support = { workspace = true }
 tempfile = { workspace = true }
+# tests/electrum.rs: a TLS client and Electrum's script hash
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+sha2 = { workspace = true }

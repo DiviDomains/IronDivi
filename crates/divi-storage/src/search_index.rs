@@ -30,6 +30,9 @@ use std::sync::Arc;
 pub const CF_ADDRESS_DELTA: &str = "address_delta";
 /// Column family of the unspent outputs per address (Core's DB_ADDRESSUNSPENTINDEX)
 pub const CF_ADDRESS_UNSPENT: &str = "address_unspent";
+/// Column family mapping an Electrum script hash (sha256 of the output
+/// script) to the address type and hash the address index files it under
+pub const CF_SCRIPTHASH: &str = "scripthash";
 /// Column family of the spent index (shared with `SpentIndex`)
 const CF_SPENT: &str = crate::spent_index::CF_SPENT_INDEX;
 
@@ -48,6 +51,39 @@ pub fn address_of_script(script: &[u8]) -> Option<(u8, [u8; 20])> {
         Some((1, hash(3..23)))
     } else {
         None
+    }
+}
+
+/// The Electrum script hash of an output script: its sha256, in the byte
+/// order it is hashed (Electrum shows it reversed)
+pub fn script_hash(script: &[u8]) -> [u8; 32] {
+    divi_crypto::hash::sha256(script)
+}
+
+fn address_key(address_type: u8, hash: &[u8; 20]) -> [u8; 21] {
+    let mut key = [0u8; 21];
+    key[0] = address_type;
+    key[1..].copy_from_slice(hash);
+    key
+}
+
+/// The output script of an address the index files under `address_type` 1
+/// (P2PKH) or 2 (P2SH); vault scripts (type 3) cannot be rebuilt from a hash
+pub fn script_of_address(address_type: u8, hash: &[u8; 20]) -> Option<Vec<u8>> {
+    match address_type {
+        1 => {
+            let mut s = vec![0x76, 0xa9, 0x14];
+            s.extend_from_slice(hash);
+            s.extend_from_slice(&[0x88, 0xac]);
+            Some(s)
+        }
+        2 => {
+            let mut s = vec![0xa9, 0x14];
+            s.extend_from_slice(hash);
+            s.push(0x87);
+            Some(s)
+        }
+        _ => None,
     }
 }
 
@@ -389,7 +425,12 @@ impl SearchIndex {
     /// built again
     pub fn clear(&self) -> Result<(), StorageError> {
         let db = self.db.inner_db();
-        for name in [CF_ADDRESS_DELTA, CF_ADDRESS_UNSPENT, CF_SPENT] {
+        for name in [
+            CF_ADDRESS_DELTA,
+            CF_ADDRESS_UNSPENT,
+            CF_SPENT,
+            CF_SCRIPTHASH,
+        ] {
             let cf = self.cf(name)?;
             loop {
                 let keys: Vec<Box<[u8]>> = db
@@ -452,9 +493,21 @@ impl SearchIndex {
                 }
             }
             let unspent = self.cf(CF_ADDRESS_UNSPENT)?;
+            let scripthash = self.cf(CF_SCRIPTHASH)?;
             for (key, value) in &updates.unspent {
                 match value {
-                    Some(value) => batch.put_cf(unspent, key.to_bytes(), value.to_bytes()),
+                    Some(value) => {
+                        batch.put_cf(unspent, key.to_bytes(), value.to_bytes());
+                        // The mapping does not depend on the chain, so a
+                        // disconnect leaves it in place
+                        if !disconnect {
+                            batch.put_cf(
+                                scripthash,
+                                script_hash(value.script.as_bytes()),
+                                address_key(key.address_type, &key.hash),
+                            );
+                        }
+                    }
                     None => batch.delete_cf(unspent, key.to_bytes()),
                 }
             }
@@ -470,6 +523,79 @@ impl SearchIndex {
             }
         }
         Ok(())
+    }
+
+    /// The address type and hash an Electrum script hash is filed under, if
+    /// any output with that script was ever indexed
+    pub fn lookup_script_hash(
+        &self,
+        script_hash: &[u8; 32],
+    ) -> Result<Option<(u8, [u8; 20])>, StorageError> {
+        let cf = self.cf(CF_SCRIPTHASH)?;
+        let value = self
+            .db
+            .inner_db()
+            .get_cf(cf, script_hash)
+            .map_err(StorageError::Database)?;
+        Ok(value.and_then(|v| {
+            if v.len() != 21 {
+                return None;
+            }
+            Some((v[0], v[1..].try_into().ok()?))
+        }))
+    }
+
+    /// Fill the script hash column family from the address index when it is
+    /// empty but the address index is not, as on a node that built its
+    /// address index before the column family existed. P2PKH and P2SH
+    /// scripts are rebuilt from every address in the index; vault scripts
+    /// come from the unspent outputs, so a vault that has no unspent output
+    /// left is not found until the index is rebuilt. Returns how many
+    /// entries it wrote.
+    pub fn backfill_script_hashes(&self) -> Result<usize, StorageError> {
+        let db = self.db.inner_db();
+        let scripthash = self.cf(CF_SCRIPTHASH)?;
+        if db
+            .iterator_cf(scripthash, rocksdb::IteratorMode::Start)
+            .next()
+            .is_some()
+        {
+            return Ok(0);
+        }
+        let mut written = 0usize;
+        let mut batch = rocksdb::WriteBatch::default();
+        let mut last: Option<[u8; 21]> = None;
+        let deltas = self.cf(CF_ADDRESS_DELTA)?;
+        for item in db.iterator_cf(deltas, rocksdb::IteratorMode::Start) {
+            let (key, _) = item.map_err(StorageError::Database)?;
+            if key.len() < 21 {
+                continue;
+            }
+            let prefix: [u8; 21] = key[..21].try_into().expect("21 bytes");
+            if last == Some(prefix) {
+                continue;
+            }
+            last = Some(prefix);
+            let hash: [u8; 20] = prefix[1..].try_into().expect("20 bytes");
+            if let Some(script) = script_of_address(prefix[0], &hash) {
+                batch.put_cf(scripthash, script_hash(&script), prefix);
+                written += 1;
+            }
+        }
+        let unspent = self.cf(CF_ADDRESS_UNSPENT)?;
+        for item in db.iterator_cf(unspent, rocksdb::IteratorMode::Start) {
+            let (key, value) = item.map_err(StorageError::Database)?;
+            if key.len() < 21 || key[0] != 3 {
+                continue;
+            }
+            if let Some(value) = AddressUnspentValue::from_bytes(&value) {
+                let prefix: [u8; 21] = key[..21].try_into().expect("21 bytes");
+                batch.put_cf(scripthash, script_hash(value.script.as_bytes()), prefix);
+                written += 1;
+            }
+        }
+        db.write(batch).map_err(StorageError::Database)?;
+        Ok(written)
     }
 
     /// An address's deltas in key order (Core `ReadAddressIndex`,
@@ -719,5 +845,96 @@ mod tests {
         p2pk.push(0xac);
         assert_eq!(address_of_script(&p2pk), None);
         assert_eq!(address_of_script(&[0x6a, 0x01, 0x07]), None);
+    }
+
+    fn unspent(
+        address_type: u8,
+        hash: [u8; 20],
+        script: Script,
+    ) -> (AddressUnspentKey, Option<AddressUnspentValue>) {
+        (
+            AddressUnspentKey {
+                address_type,
+                hash,
+                txid: Hash256::from_bytes([9; 32]),
+                index: 0,
+            },
+            Some(AddressUnspentValue {
+                satoshis: 5,
+                script,
+                height: 1,
+            }),
+        )
+    }
+
+    #[test]
+    fn rebuilt_scripts_match_cores() {
+        assert_eq!(
+            script_of_address(1, &[4; 20]).unwrap(),
+            Script::new_p2pkh(&[4; 20]).as_bytes()
+        );
+        assert_eq!(
+            script_of_address(2, &[3; 20]).unwrap(),
+            Script::new_p2sh(&[3; 20]).as_bytes()
+        );
+        assert_eq!(script_of_address(3, &[1; 20]), None);
+    }
+
+    /// A connected output files its script hash under its address, and a
+    /// disconnect leaves it
+    #[test]
+    fn script_hashes_follow_connected_outputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(ChainDatabase::open(dir.path()).unwrap());
+        let index = SearchIndex::new(db, true, true);
+        let script = Script::new_p2pkh(&[4; 20]);
+        let mut updates = IndexUpdates::default();
+        updates.unspent.push(unspent(1, [4; 20], script.clone()));
+        index.apply_connect(&updates).unwrap();
+        let sh = script_hash(script.as_bytes());
+        assert_eq!(index.lookup_script_hash(&sh).unwrap(), Some((1, [4; 20])));
+        index.apply_disconnect(&updates).unwrap();
+        assert_eq!(index.lookup_script_hash(&sh).unwrap(), Some((1, [4; 20])));
+        assert_eq!(index.lookup_script_hash(&[0; 32]).unwrap(), None);
+        // Already filled, so a backfill writes nothing
+        assert_eq!(index.backfill_script_hashes().unwrap(), 0);
+    }
+
+    /// An address index built without script hashes gets them from its
+    /// deltas (P2PKH, P2SH) and its unspent outputs (vaults)
+    #[test]
+    fn backfill_fills_an_old_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(ChainDatabase::open(dir.path()).unwrap());
+        let index = SearchIndex::new(db.clone(), true, true);
+        let vault = divi_script::StakingVaultScript::new([1; 20], [2; 20]).to_script();
+        let mut updates = IndexUpdates::default();
+        updates.deltas.push(delta(1, 0, false));
+        updates.deltas.push(delta(2, 0, true));
+        updates.unspent.push(unspent(3, [1; 20], vault.clone()));
+        index.apply_connect(&updates).unwrap();
+        // Forget the script hashes, as an index from before they existed
+        let cf = db.inner_db().cf_handle(CF_SCRIPTHASH).unwrap();
+        let keys: Vec<Box<[u8]>> = db
+            .inner_db()
+            .iterator_cf(cf, rocksdb::IteratorMode::Start)
+            .map(|i| i.unwrap().0)
+            .collect();
+        for k in keys {
+            db.inner_db().delete_cf(cf, k).unwrap();
+        }
+        let p2pkh = script_hash(Script::new_p2pkh(&[7; 20]).as_bytes());
+        assert_eq!(index.lookup_script_hash(&p2pkh).unwrap(), None);
+        assert_eq!(index.backfill_script_hashes().unwrap(), 2);
+        assert_eq!(
+            index.lookup_script_hash(&p2pkh).unwrap(),
+            Some((1, [7; 20]))
+        );
+        assert_eq!(
+            index
+                .lookup_script_hash(&script_hash(vault.as_bytes()))
+                .unwrap(),
+            Some((3, [1; 20]))
+        );
     }
 }
