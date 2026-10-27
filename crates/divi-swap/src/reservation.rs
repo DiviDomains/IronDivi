@@ -74,8 +74,10 @@ pub const EXPIRY_MAX_TIP_AGE_SECS: u32 = 24 * 60 * 60;
 pub const EXPIRY_MAX_TIP_LEAD_SECS: u32 = 2 * 60 * 60;
 
 /// Where the expiry sweep may start counting a lock's absent blocks: a per-chain setting
-/// (`[divi].expiry_start` in divi-swapd, `--divi-expiry-start` in the CLI), passed to
-/// [`InputReservations::release_expired_from`] for the chain it sweeps.
+/// (`expiry_start` in divi-swapd's `[divi]`, `[btc]`, `[ltc]` and `[zec]`;
+/// `--divi-expiry-start`, `--btc-expiry-start`, `--ltc-expiry-start` and
+/// `--zec-expiry-start` in the CLI), passed to [`InputReservations::release_expired_from`]
+/// for the chain it sweeps.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ExpiryStart {
     /// `"tip"` (the default): a first absent check at a tip whose own time is within
@@ -610,7 +612,20 @@ impl InputReservations {
         backend: &dyn ChainBackend,
         now: u32,
     ) -> Result<usize> {
-        self.release_expired(backend, &swap_locks(store, backend.chain())?, now)
+        self.release_expired_swaps_from(store, backend, now, ExpiryStart::Tip)
+            .await
+    }
+
+    /// [`Self::release_expired_swaps`] with `start` ([`Self::release_expired_from`]): a
+    /// chain's `expiry_start` setting.
+    pub async fn release_expired_swaps_from(
+        &self,
+        store: &Store,
+        backend: &dyn ChainBackend,
+        now: u32,
+        start: ExpiryStart,
+    ) -> Result<usize> {
+        self.release_expired_from(backend, &swap_locks(store, backend.chain())?, now, start)
             .await
     }
 

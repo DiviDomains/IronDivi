@@ -625,7 +625,10 @@ async fn expiry_sweep_once(
 ) -> usize {
     let mut expired = 0;
     for b in counters {
-        match res.release_expired_swaps(store, b.as_ref(), now).await {
+        match res
+            .release_expired_swaps_from(store, b.as_ref(), now, starts.of(b.chain()))
+            .await
+        {
             Ok(n) => expired += n,
             Err(e) => {
                 tracing::warn!(chain = %b.chain(), error = %e, "could not check locks for expiry")

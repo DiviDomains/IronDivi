@@ -814,7 +814,9 @@ fn unix_now() -> u32 {
 /// ([`InputReservations::release_expired_swaps`]; the first check's block is kept in
 /// `--db`, so the second can come from a later command). A released DIVI lock's inputs also
 /// go back to the DIVI wallet file ([`divi_swap_cli::reservations::release_expired_divi`],
-/// counting as `--divi-expiry-start` says). Run before each taker command (a
+/// counting as `--divi-expiry-start` says; a BTC, LTC or ZEC lock counts as
+/// `--btc-expiry-start`, `--ltc-expiry-start` or `--zec-expiry-start` says,
+/// [`InputReservations::release_expired_swaps_from`]). Run before each taker command (a
 /// swap that finished, or a lock that expired, since the last one) and after each command
 /// that can finish a swap, whether or not that command succeeded. A failure only warns: an
 /// unreleased input stays out of coin selection, never spent twice.
@@ -834,8 +836,17 @@ async fn sweep_locks(cli: &Cli, divi: &dyn ChainBackend, counter: &dyn ChainBack
         Ok(n) => tracing::info!(n, "released the lock inputs of finished taker swaps"),
         Err(e) => tracing::warn!(error = %e, "could not release finished taker lock inputs"),
     }
-    if matches!(cli.counter_chain, Chain::Btc | Chain::Ltc | Chain::Zec) {
-        match res.release_expired_swaps(&store, counter, now).await {
+    let counter_start = match cli.counter_chain {
+        Chain::Btc => Some(cli.btc_expiry_start),
+        Chain::Ltc => Some(cli.ltc_expiry_start),
+        Chain::Zec => Some(cli.zec_expiry_start),
+        _ => None,
+    };
+    if let Some(start) = counter_start {
+        match res
+            .release_expired_swaps_from(&store, counter, now, start)
+            .await
+        {
             Ok(0) => {}
             Ok(n) => tracing::info!(
                 n,

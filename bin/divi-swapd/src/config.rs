@@ -185,8 +185,7 @@ impl BtcSection {
     /// dropped lock wait for the backend's median time past
     /// ([`divi_swap::InputReservations::release_expired_from`]).
     pub fn expiry_start(&self) -> Result<ExpiryStart> {
-        let _ = &self.expiry_start; // EK stub: ignores the key
-        Ok(ExpiryStart::default())
+        expiry_start("btc", self.expiry_start.as_deref())
     }
 
     /// Esplora endpoints, primary first: `esplora_url` (then `fallback_esplora_url`) when
@@ -265,8 +264,7 @@ impl LtcSection {
     /// dropped lock wait for the backend's median time past
     /// ([`divi_swap::InputReservations::release_expired_from`]).
     pub fn expiry_start(&self) -> Result<ExpiryStart> {
-        let _ = &self.expiry_start; // EK stub: ignores the key
-        Ok(ExpiryStart::default())
+        expiry_start("ltc", self.expiry_start.as_deref())
     }
 
     /// Parsed `crosscheck`; `None` is `off`.
@@ -461,8 +459,7 @@ impl ZecSection {
     /// dropped lock wait for the backend's median time past
     /// ([`divi_swap::InputReservations::release_expired_from`]).
     pub fn expiry_start(&self) -> Result<ExpiryStart> {
-        let _ = &self.expiry_start; // EK stub: ignores the key
-        Ok(ExpiryStart::default())
+        expiry_start("zec", self.expiry_start.as_deref())
     }
 
     /// Lightwalletd endpoints, primary first: `lightwalletd_url` (then
@@ -728,9 +725,12 @@ impl DaemonConfig {
     /// `expiry_start` of `[divi]`, `[btc]`, `[ltc]` and `[zec]`, each `"tip"` without its
     /// section or key.
     pub fn expiry_starts(&self) -> Result<ExpiryStarts> {
+        let of = |s: Option<Result<ExpiryStart>>| s.unwrap_or(Ok(ExpiryStart::default()));
         Ok(ExpiryStarts {
             divi: self.divi_expiry_start()?,
-            ..ExpiryStarts::default()
+            btc: of(self.btc.as_ref().map(BtcSection::expiry_start))?,
+            ltc: of(self.ltc.as_ref().map(LtcSection::expiry_start))?,
+            zec: of(self.zec.as_ref().map(ZecSection::expiry_start))?,
         })
     }
 
@@ -891,7 +891,7 @@ impl DaemonConfig {
                  would be believed; list the proxy's address (default [\"127.0.0.1/32\", \"::1/128\"])"
             );
         }
-        self.divi_expiry_start()?;
+        self.expiry_starts()?;
         let mut seen = std::collections::BTreeSet::new();
         for o in self.offer_entries.iter().map(|e| &e.offer) {
             if !seen.insert(&o.id) {
