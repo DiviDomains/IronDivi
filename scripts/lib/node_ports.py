@@ -192,8 +192,10 @@ class Proc:
         # a node made again for a later row has the ports of the first, which its conf maps to the new ones
         node.p2p, node.rpcport = now(node.p2p), now(node.rpcport)
         self._ports0 = (node.p2p, node.rpcport)
+        self._plock = threading.RLock()
         self._wait_for_peers()
         self._launch()
+        threading.Thread(target=self._watch, daemon=True).start()
         with _lock:
             _procs.append(self)
 
@@ -324,22 +326,36 @@ class Proc:
         return True
 
     def poll(self):
-        while True:
-            code = self._proc.poll()
-            if code is None:
-                if self._taken_while_running():
-                    continue
-                return None
-            if not self._again():
-                return code
+        with self._plock:
+            while True:
+                code = self._proc.poll()
+                if code is None:
+                    if self._taken_while_running():
+                        continue
+                    return None
+                if not self._again():
+                    return code
 
     def wait(self, timeout=None):
         end = None if timeout is None else time.time() + timeout
         while True:
             left = None if end is None else max(0.0, end - time.time())
-            code = self._proc.wait(left)
-            if not self._again():
-                return code
+            proc = self._proc
+            code = proc.wait(left)
+            with self._plock:
+                if self._proc is not proc:
+                    continue  # the watch started it again meanwhile
+                if not self._again():
+                    return code
+
+    def _watch(self):
+        """Some scripts wait for a node by its RPC answer alone and never poll it: in each start's first EARLY
+        seconds (and one look after), the node is polled here, so a node that ended for a taken port, or runs on
+        with its RPC port taken, is started again for them too"""
+        while True:
+            time.sleep(0.25)
+            if self.poll() is not None or time.time() - self._started > EARLY + 1:
+                return
 
 
 def popen(node, argv, work=None, datadir=None, **kw):

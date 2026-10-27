@@ -181,6 +181,17 @@ class NodePorts(unittest.TestCase):
         with open(os.path.join(self.work, "a.err")) as f:
             self.assertEqual(f.read(), f"Error: Unable to bind to {HOST}:{port} on this computer.\n")
 
+    def test_a_node_nobody_polls_is_started_again_all_the_same(self):
+        taken = self.hold()
+        a = Fake(self.work, "a", taken)
+        self.procs.append(a.start(self.work))
+        end = time.time() + 20
+        while time.time() < end and not os.path.exists(os.path.join(a.dir, "up")):
+            time.sleep(0.05)  # the script waits for an answer only
+        self.assertNotEqual(a.p2p, taken)
+        with open(os.path.join(a.dir, "up")) as f:
+            self.assertEqual(f.read(), str(a.p2p))
+
     def test_a_node_that_ends_for_another_reason_is_not_started_again(self):
         a = Fake(self.work, "a", self.hold(), ["fail=option"])
         proc = a.start(self.work)
