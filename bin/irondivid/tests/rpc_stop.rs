@@ -93,12 +93,14 @@ fn rpc_stop_exits_the_daemon() {
 
 /// A taken RPC port stops irondivid with a failing exit status, as divid's
 /// "Unable to bind any endpoint for RPC server" InitError does: a service
-/// manager or script must not take it for a clean stop
+/// manager or script must not take it for a clean stop. Both loopback
+/// addresses are taken: divid and irondivid run on either alone.
 #[test]
 fn rpc_port_in_use_exits_with_failure() {
     let dir = tempfile::tempdir().unwrap();
     let taken = TcpListener::bind("127.0.0.1:0").unwrap();
     let rpc_port = taken.local_addr().unwrap().port();
+    let taken_v6 = TcpListener::bind(("::1", rpc_port)).unwrap();
     let p2p_port = free_port();
 
     let child = Command::new(env!("CARGO_BIN_EXE_irondivid"))
@@ -131,4 +133,5 @@ fn rpc_port_in_use_exits_with_failure() {
         "irondivid exit status with its RPC port taken: {status}"
     );
     drop(taken);
+    drop(taken_v6);
 }
