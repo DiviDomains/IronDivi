@@ -16,7 +16,7 @@
 
 use crate::mempool::Mempool;
 use divi_consensus::{
-    HashproofResult, ProofOfStakeGenerator, SimpleStakeModifierService, StakingData,
+    HashproofResult, ProofOfStakeGenerator, SimpleStakeModifierService, StakingData, N_HASH_DRIFT,
 };
 use divi_crypto::compute_block_hash;
 use divi_network::{BlockConnectedCallback, PeerManager};
@@ -233,6 +233,41 @@ pub fn is_stake_set_coin(
     depth >= min_depth && now.saturating_sub(block_time) >= min_coin_age
 }
 
+/// Divi Core MaxFutureBlockDrift: how far past the network-adjusted time a
+/// proof-of-stake block's time may be (Settings.cpp:215-218)
+const MAX_FUTURE_BLOCK_DRIFT: i64 = 180;
+
+/// Where Divi Core starts a coinstake's kernel search on a tip whose median
+/// time past is `mtp` (PoSTransactionCreator.cpp:335-341): at the
+/// network-adjusted time `adjusted`, but past the median time, by the hash
+/// drift more on a network that retargets its difficulty (not regtest), not
+/// before `floor`, the start of the last round at this height that found no
+/// kernel, and never past the future drift. None when that leaves no time
+/// (PoSTransactionCreator.cpp:340). The search then counts down from the
+/// start (ProofOfStakeGenerator.cpp:37-56).
+pub fn kernel_search_start(adjusted: i64, mtp: u32, retarget: bool, floor: u32) -> Option<u32> {
+    let maximum = adjusted + MAX_FUTURE_BLOCK_DRIFT - 1;
+    let mut minimum = i64::from(mtp) + 1;
+    if retarget {
+        minimum += i64::from(N_HASH_DRIFT);
+    }
+    let minimum = minimum.max(i64::from(floor));
+    if maximum <= minimum {
+        return None;
+    }
+    u32::try_from(adjusted.max(minimum).min(maximum)).ok()
+}
+
+/// Divi Core's hashproofTimestampMinimumValue_ and the height of
+/// hashedBlockTimestamps_ (PoSTransactionCreator.cpp:233-237, :277, :331-334)
+#[derive(Default)]
+struct KernelSearchFloor {
+    /// The height whose kernels were last hashed
+    hashed_height: Option<u32>,
+    /// The start of the last round that found no kernel
+    floor: u32,
+}
+
 /// Default maximum tip age for staking: 24 hours (C++ `nMaxTipAge`).
 pub const DEFAULT_MAX_TIP_AGE_SECS: u32 = 24 * 60 * 60;
 
@@ -344,6 +379,8 @@ pub struct Staker {
     /// Track last staking attempt time per height (height -> timestamp)
     /// This matches C++ mapHashedBlocks / hashedBlockTimestamps
     hashed_block_timestamps: RwLock<HashMap<u32, u64>>,
+    /// Where the next kernel search may start at the earliest
+    kernel_search_floor: parking_lot::Mutex<KernelSearchFloor>,
     /// Block connected callback (same one used by BlockSync for wallet/mempool/fees)
     /// Set from main.rs after construction so the staker can fire it on self-accepted blocks.
     block_connected_callback: RwLock<Option<BlockConnectedCallback>>,
@@ -409,6 +446,7 @@ impl Staker {
             last_stake_time: RwLock::new(0),
             stake_weight: RwLock::new(0),
             hashed_block_timestamps: RwLock::new(HashMap::new()),
+            kernel_search_floor: parking_lot::Mutex::new(KernelSearchFloor::default()),
             block_connected_callback: RwLock::new(None),
             cache: RwLock::new(StakerCache::new()),
             producing: parking_lot::Mutex::new(()),
@@ -1025,7 +1063,7 @@ impl Staker {
         Err("Sign failed: the coinstake output is not a key hash, key or vault".to_string())
     }
 
-    /// Earliest time a block on `tip` may carry: now on the network-adjusted
+    /// A proof-of-work block's time on `tip`: now on the network-adjusted
     /// clock, but past the median time (BlockFactory.cpp:77,
     /// BlockProofProver.cpp:36)
     fn next_block_time(&self, tip: &divi_storage::BlockIndex) -> u32 {
@@ -1077,14 +1115,14 @@ impl Staker {
         })
     }
 
-    /// A proof-of-stake block on `tip`, its search starting past the median
-    /// time so blocks made back to back stay valid
+    /// A proof-of-stake block on `tip`, its kernel searched for from where
+    /// the staking loop starts it (see `kernel_search_start`)
     fn build_generated_stake_block(
         &self,
         tip: &divi_storage::BlockIndex,
     ) -> Result<Block, GenerateBlockError> {
         use GenerateBlockError::{Failed, Refused};
-        match self.build_stake_block(tip, self.next_block_time(tip)) {
+        match self.build_stake_block(tip, adjusted_timestamp() as u32) {
             StakeResult::Success { block, .. } => Ok(block),
             StakeResult::NoStakeableUtxos => Err(Failed("no coins to stake".to_string())),
             StakeResult::LockedHdKey => Err(Refused(LOCKED_HD_KEY.to_string())),
@@ -1315,10 +1353,11 @@ impl Staker {
         self.build_stake_block(&tip, current_time)
     }
 
-    /// A proof-of-stake block on `tip` at `current_time` or up to the hash
-    /// drift before it, staked with the first coin of the stake set that finds
-    /// a proof (Divi Core BlockFactory::CreateNewPoSBlock). The staking loop's
-    /// pacing guards are the caller's.
+    /// A proof-of-stake block on `tip`, its time at the kernel search's start
+    /// (`kernel_search_start` from the network-adjusted `current_time`) or up
+    /// to the hash drift before it, staked with the first coin of the stake
+    /// set that finds a proof (Divi Core BlockFactory::CreateNewPoSBlock). The
+    /// staking loop's pacing guards are the caller's.
     fn build_stake_block(&self, tip: &divi_storage::BlockIndex, current_time: u32) -> StakeResult {
         let current_height = tip.height;
         let next_height = current_height + 1;
@@ -1488,6 +1527,29 @@ impl Staker {
             }
             (cache.stake_modifier, cache.median_time_past)
         };
+        // Where the kernel search starts: the floor a round that found no
+        // kernel left holds until a kernel is hashed at another height
+        // (PoSTransactionCreator.cpp:331-341)
+        let search_start = {
+            let mut floor = self.kernel_search_floor.lock();
+            if floor.hashed_height != Some(current_height) {
+                floor.floor = 0;
+            }
+            kernel_search_start(
+                i64::from(current_time),
+                mtp,
+                self.chain.retargets_difficulty(),
+                floor.floor,
+            )
+        };
+        let Some(search_start) = search_start else {
+            debug!(
+                "No time left to stake on tip {}: median time {} is past {} plus the future drift",
+                current_height, mtp, current_time
+            );
+            return StakeResult::NoProofFound;
+        };
+
         let modifier_service = SimpleStakeModifierService::new(move |_| Ok(stake_modifier));
 
         // 3. PoS generator - same config for all UTXOs
@@ -1537,7 +1599,7 @@ impl Staker {
             }
 
             // Skip UTXOs that haven't reached minimum coin age
-            let coin_age = current_time.saturating_sub(block_time_of_first_confirmation);
+            let coin_age = search_start.saturating_sub(block_time_of_first_confirmation);
             if coin_age < self.config.read().min_coin_age {
                 continue;
             }
@@ -1552,11 +1614,12 @@ impl Staker {
             );
 
             // Try to find a valid hashproof
-            let result = generator.create_hashproof_timestamp(&staking_data, current_time);
+            let result = generator.create_hashproof_timestamp(&staking_data, search_start);
             // Divi Core records the attempt once a kernel passes setup, from the
             // staking loop and from setgenerate alike (PoSTransactionCreator.cpp:233-237)
             if !matches!(result, HashproofResult::FailedSetup) {
                 self.record_staking_attempt(current_height, current_timestamp());
+                self.kernel_search_floor.lock().hashed_height = Some(current_height);
             }
 
             match &result {
@@ -1573,7 +1636,7 @@ impl Staker {
                     generation_failed_count += 1;
                     // Diagnostic: log the first UTXO's details every 60 attempts
                     if generation_failed_count == 1 && count.is_multiple_of(60) {
-                        let age = current_time.saturating_sub(block_time_of_first_confirmation);
+                        let age = search_start.saturating_sub(block_time_of_first_confirmation);
                         info!(
                             "Sample UTXO {}:{} value={} age={}s ({:.1}h) block_time={}",
                             utxo.txid,
@@ -1607,8 +1670,8 @@ impl Staker {
                 }
 
                 info!(
-                    "Found valid stake for UTXO {}:{} at timestamp {} (MTP={}, current_time={})",
-                    utxo.txid, utxo.vout, timestamp, mtp, current_time
+                    "Found valid stake for UTXO {}:{} at timestamp {} (MTP={}, search start={})",
+                    utxo.txid, utxo.vout, timestamp, mtp, search_start
                 );
                 // Only setgenerate gets here locked (the staking loop waits
                 // for an unlock, as CanStakeCoins does): the search needs no
@@ -1650,6 +1713,9 @@ impl Staker {
                 setup_failed_count
             );
         }
+        // The next round at this height starts no earlier
+        // (PoSTransactionCreator.cpp:277)
+        self.kernel_search_floor.lock().floor = search_start;
 
         StakeResult::NoProofFound
     }
