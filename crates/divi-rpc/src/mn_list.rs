@@ -61,16 +61,21 @@ impl NetworkMasternode {
         OutPoint::new(Hash256(self.mnb.vin.prevout_hash), self.mnb.vin.prevout_n)
     }
 
-    /// CMasternode::Status for the state CMasternodeMan::Check gives it
-    /// (masternodeman.cpp:152-180, masternode.cpp:134-145)
+    /// CMasternode::Status for the state CMasternodeMan::Check gives it at
+    /// `now` on the network-adjusted clock (masternodeman.cpp:152-180,
+    /// masternode.cpp:134-145): a spent collateral stays VIN_SPENT; a last
+    /// ping at least 130 minutes old (or none) is REMOVE, at least 120
+    /// minutes old EXPIRED (TimeSinceLastPingIsWithin, MasternodeHelpers.cpp
+    /// :172-181). The collateral is looked at only for a masternode that is
+    /// neither (check_collateral)
     pub fn status(&self, now: i64) -> &'static str {
         if self.vin_spent {
             return "VIN_SPENT";
         }
         let since_ping = now - self.mnb.last_ping.sig_time;
-        if since_ping > REMOVAL_SECONDS {
+        if ping_is_empty(&self.mnb.last_ping) || since_ping >= REMOVAL_SECONDS {
             "REMOVE"
-        } else if since_ping > EXPIRATION_SECONDS {
+        } else if since_ping >= EXPIRATION_SECONDS {
             "EXPIRED"
         } else {
             "ENABLED"
@@ -263,11 +268,16 @@ pub struct MasternodeList {
     relays: Mutex<Vec<(u32, [u8; 32])>>,
 }
 
+/// GetTime: the node's clock, which setmocktime sets
 fn now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+    divi_primitives::clock::now()
+}
+
+/// GetAdjustedTime: the node's clock plus the network time offset, which
+/// divid's masternode checks use (masternodeman.cpp:57, :235, :311-318;
+/// MasternodeHelpers.cpp:175; masternode-payments.cpp:461, :557)
+fn adjusted_now() -> i64 {
+    divi_primitives::clock::adjusted_now()
 }
 
 impl MasternodeList {
@@ -288,7 +298,11 @@ impl MasternodeList {
         if let Err(Header::Invalid(_)) = flat_file::read(path, MNCACHE_MAGIC, network_magic) {
             return Ok(false);
         }
-        let bytes = flat_file::bytes(MNCACHE_MAGIC, network_magic, &self.file_data(now()));
+        let bytes = flat_file::bytes(
+            MNCACHE_MAGIC,
+            network_magic,
+            &self.file_data(adjusted_now()),
+        );
         let tmp = path.with_extension("dat.new");
         std::fs::write(&tmp, bytes)?;
         std::fs::rename(&tmp, path)?;
@@ -396,7 +410,7 @@ impl MasternodeList {
     /// broadcast of the same collateral. Ok(true) when the list changed.
     pub fn accept_broadcast(&self, chain: &Chain, payload: &[u8]) -> Result<bool, Refusal> {
         let mnb = CppBroadcast::decode(payload).map_err(|e| format!("{e:?}"))?;
-        self.accept_decoded(chain, mnb, now())
+        self.accept_decoded(chain, mnb, adjusted_now())
     }
 
     fn accept_decoded(&self, chain: &Chain, mnb: CppBroadcast, now: i64) -> Result<bool, Refusal> {
@@ -615,7 +629,7 @@ impl MasternodeList {
         if self.seen_pings.read().contains_key(&ping.hash()) {
             return Ok(false);
         }
-        let now = now();
+        let now = adjusted_now();
         {
             let mut entries = self.entries.write();
             let Some(e) = entries.iter_mut().find(|e| {
@@ -624,7 +638,7 @@ impl MasternodeList {
             }) else {
                 // An unknown masternode is asked for (masternodeman.cpp:529-533)
                 return Err(Refusal {
-                    ask: self.ask_entry(&ping.vin, now),
+                    ask: self.ask_entry(&ping.vin, self::now()),
                     ..Refusal::from("unknown masternode")
                 });
             };
@@ -636,7 +650,7 @@ impl MasternodeList {
             check_ping(chain, &e.mnb, Some(&e.mnb.last_ping), &ping, now).map_err(|r| Refusal {
                 cause: PING_FAILED,
                 ask: (r.dos > 0)
-                    .then(|| self.ask_entry(&ping.vin, now))
+                    .then(|| self.ask_entry(&ping.vin, self::now()))
                     .flatten(),
                 ..r
             })?;
@@ -648,20 +662,25 @@ impl MasternodeList {
     }
 
     /// Mark the masternodes whose collateral the active chain has spent
-    /// (CMasternodeMan::Check's IsCoinSpent)
+    /// (CMasternodeMan::Check's IsCoinSpent). Check looks at the collateral
+    /// only after the ping times, so a masternode that is EXPIRED or REMOVE
+    /// stays so though its collateral is spent (masternodeman.cpp:160-178)
     pub fn check_collateral(&self, chain: &Chain) {
+        let now = adjusted_now();
         let mut entries = self.entries.write();
-        for e in entries.iter_mut().filter(|e| !e.vin_spent) {
+        for e in entries.iter_mut().filter(|e| e.status(now) == "ENABLED") {
             if matches!(chain.get_utxo(&e.outpoint()), Ok(None)) {
                 e.vin_spent = true;
             }
         }
     }
 
-    /// Drop the masternodes whose collateral is spent, whose last ping is
-    /// past the removal time, or whose protocol is below the active one, with
-    /// their seen broadcasts and the record of asking for them
-    /// (MasternodeNetworkMessageManager.cpp:36-56, :132-155)
+    /// clearTimedOutAndExpiredRequests at `now` (MasternodeNetworkMessageManager
+    /// .cpp:36-131): drop the masternodes whose collateral is spent, whose
+    /// last ping is past the removal time, or whose protocol is below the
+    /// active one, with their seen broadcasts and the record of asking for
+    /// them; then the asks whose time is past, and the broadcasts and pings
+    /// seen whose ping is more than twice the removal time old
     pub fn remove_inactive(&self, now: i64) {
         let removed: Vec<NetworkMasternode> = {
             let mut entries = self.entries.write();
@@ -672,18 +691,20 @@ impl MasternodeList {
             *entries = kept;
             gone
         };
-        if removed.is_empty() {
-            return;
+        let mut seen = self.seen_broadcasts.write();
+        let mut asked = self.asked_entries.lock();
+        for e in &removed {
+            let vin = (e.mnb.vin.prevout_hash, e.mnb.vin.prevout_n);
+            seen.retain(|_, b| (b.vin.prevout_hash, b.vin.prevout_n) != vin);
+            asked.remove(&vin);
         }
-        {
-            let mut seen = self.seen_broadcasts.write();
-            let mut asked = self.asked_entries.lock();
-            for e in &removed {
-                let vin = (e.mnb.vin.prevout_hash, e.mnb.vin.prevout_n);
-                seen.retain(|_, b| (b.vin.prevout_hash, b.vin.prevout_n) != vin);
-                asked.remove(&vin);
-            }
+        if let Some(sync) = self.sync.read().as_ref() {
+            sync.lock().sync.prune_list_asks(now);
         }
+        asked.retain(|_, until| *until >= now);
+        let oldest = now - 2 * REMOVAL_SECONDS;
+        seen.retain(|_, b| b.last_ping.sig_time >= oldest);
+        self.seen_pings.write().retain(|_, p| p.sig_time >= oldest);
     }
 
     pub fn entries(&self) -> Vec<NetworkMasternode> {
@@ -701,7 +722,7 @@ impl MasternodeList {
         filter: Option<&str>,
         votes: Option<&crate::mn_votes::MasternodeVotes>,
     ) -> serde_json::Value {
-        let now = now();
+        let now = adjusted_now();
         let network = address_network(chain);
         let filter = filter.unwrap_or("");
         let mut out = Vec::new();
@@ -737,10 +758,17 @@ impl MasternodeList {
 
     /// `getmasternodecount`'s eight counts as Divi Core gives them
     /// (rpcmasternode.cpp:327-358, RpcMasternodeFeatures.cpp:326-422); it
-    /// checks every masternode first, as Core's counts call Check()
-    pub fn counts(&self, chain: &Chain) -> MasternodeCounts {
+    /// checks every masternode first, as Core's counts call Check(). The
+    /// queue is the one for the tip (GetMasternodePaymentQueue(chainTip, 0),
+    /// RpcMasternodeFeatures.cpp:404), which leaves out the masternodes
+    /// `votes` has scheduled
+    pub fn counts(
+        &self,
+        chain: &Chain,
+        votes: Option<&crate::mn_votes::MasternodeVotes>,
+    ) -> MasternodeCounts {
         self.check_collateral(chain);
-        let now = now();
+        let now = adjusted_now();
         let entries = self.entries();
         let enabled: Vec<&NetworkMasternode> = entries
             .iter()
@@ -751,7 +779,9 @@ impl MasternodeList {
         // No queue before there is a block to score with, 101 below the tip
         // (GetBlockHashForScoring, MasternodeHelpers.cpp:75-86)
         let queue = match scoring_hash(chain, tip as i64) {
-            Some(hash) => self.queue_from(chain, &entries, &hash, now).len(),
+            Some(hash) => self
+                .queue_from(chain, &entries, &hash, tip as i64, now, votes)
+                .len(),
             None => 0,
         };
         let (mut ipv4, mut ipv6, mut onion) = (0, 0, 0);
@@ -784,10 +814,25 @@ impl MasternodeList {
     /// under a third of them, a second pass without that filter whose entries
     /// are added to the first's; then by score, highest first
     /// (masternode-payments.cpp:435-545). Each entry is the masternode's
-    /// payee script (P2PKH of its collateral key).
-    pub fn payment_queue(&self, chain: &Chain, scoring: &Hash256) -> Vec<Vec<u8>> {
+    /// payee script (P2PKH of its collateral key). Off regtest a masternode
+    /// `votes` has scheduled for another of the next blocks than `height` is
+    /// left out (IsScheduled, masternode-payments.cpp:451-458).
+    pub fn payment_queue(
+        &self,
+        chain: &Chain,
+        scoring: &Hash256,
+        height: i64,
+        votes: Option<&crate::mn_votes::MasternodeVotes>,
+    ) -> Vec<Vec<u8>> {
         self.check_collateral(chain);
-        self.queue_from(chain, &self.entries(), scoring, now())
+        self.queue_from(
+            chain,
+            &self.entries(),
+            scoring,
+            height,
+            adjusted_now(),
+            votes,
+        )
     }
 
     fn queue_from(
@@ -795,8 +840,14 @@ impl MasternodeList {
         chain: &Chain,
         entries: &[NetworkMasternode],
         scoring: &Hash256,
+        height: i64,
         now: i64,
+        votes: Option<&crate::mn_votes::MasternodeVotes>,
     ) -> Vec<Vec<u8>> {
+        let scheduled = |e: &NetworkMasternode| {
+            chain.network_type() != NetworkType::Regtest
+                && votes.is_some_and(|v| v.is_scheduled(chain, &payee_script(&e.mnb), height))
+        };
         let enabled: Vec<&NetworkMasternode> = entries
             .iter()
             .filter(|e| e.mnb.protocol_version >= ACTIVE_PROTOCOL && e.is_enabled(now))
@@ -806,6 +857,7 @@ impl MasternodeList {
         let pass = |filter_sig_time: bool| -> Vec<&NetworkMasternode> {
             enabled
                 .iter()
+                .filter(|e| !scheduled(e))
                 .filter(|e| {
                     !(filter_sig_time
                         && e.mnb.sig_time + (mn_count as f64 * 2.6 * 60.0) as i64 > now)
@@ -844,7 +896,7 @@ impl MasternodeList {
         scoring: &Hash256,
         check_num: usize,
     ) -> Option<usize> {
-        let now = now();
+        let now = adjusted_now();
         let min_age = if chain.network_type() == NetworkType::Regtest {
             25 * 60
         } else {

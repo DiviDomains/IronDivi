@@ -328,7 +328,8 @@ pub fn parse_list_request(payload: &[u8]) -> Option<ListRequest> {
 }
 
 /// NotifyPeerOfMasternode (masternode-sync.cpp:127-137): an enabled
-/// masternode not on an RFC1918 address is announced
+/// masternode not on an RFC1918 address is announced. `now` is the
+/// network-adjusted clock its state is checked on (MasternodeHelpers.cpp:175)
 fn announced(mn: &NetworkMasternode, now: i64) -> bool {
     let ip = std::net::Ipv6Addr::from(mn.mnb.ip);
     let ip = ip
@@ -339,7 +340,8 @@ fn announced(mn: &NetworkMasternode, now: i64) -> bool {
 }
 
 /// The broadcasts an answer to the whole-list `dseg` announces, in the list's
-/// order (SyncMasternodeListWithPeer, masternode-sync.cpp:138-152)
+/// order (SyncMasternodeListWithPeer, masternode-sync.cpp:138-152), `now`
+/// on the network-adjusted clock
 pub fn list_inventory(entries: &[NetworkMasternode], now: i64) -> Vec<[u8; 32]> {
     entries
         .iter()
@@ -406,6 +408,8 @@ pub async fn answer_list_request(
     let (Some(addr), Some(request)) = (peers.peer_addr(peer), parse_list_request(payload)) else {
         return;
     };
+    // The asks are timed on GetTime, a masternode's state on GetAdjustedTime
+    let adjusted = now + divi_primitives::clock::time_offset();
     match request {
         ListRequest::Whole => {
             if !is_local(addr.ip())
@@ -417,12 +421,14 @@ pub async fn answer_list_request(
                 peers.report_misbehavior_score(peer, 34, "Asked mn peer list too often");
                 return;
             }
-            let items = list_inventory(&list.entries(), now);
+            let items = list_inventory(&list.entries(), adjusted);
             send_answer(peers, peer, SYNC_LIST, InvType::MasternodeAnnounce, items).await;
         }
         ListRequest::One(hash, n) => {
             let found = list.entries().into_iter().find(|mn| {
-                mn.mnb.vin.prevout_hash == hash && mn.mnb.vin.prevout_n == n && announced(mn, now)
+                mn.mnb.vin.prevout_hash == hash
+                    && mn.mnb.vin.prevout_n == n
+                    && announced(mn, adjusted)
             });
             if let Some(mn) = found {
                 let inv = vec![InvItem::new(

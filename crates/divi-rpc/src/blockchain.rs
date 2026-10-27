@@ -380,6 +380,11 @@ impl BlockchainRpc {
         *self.mempool.write() = Some(mempool);
     }
 
+    /// The mempool provider, once set
+    pub fn mempool(&self) -> Option<Arc<dyn MempoolProvider>> {
+        self.mempool.read().clone()
+    }
+
     /// Set what invalidateblock, reconsiderblock and reverseblocktransactions
     /// do to the mempool
     pub fn set_reorg_hook(&self, hook: ReorgHook) {

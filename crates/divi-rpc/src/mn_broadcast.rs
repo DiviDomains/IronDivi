@@ -37,10 +37,20 @@ const FUTURE_SIGTIME_SECS: i64 = 45 * 60;
 /// Relay hook: hands raw broadcast bytes to the P2P layer (as an `mnb` message)
 pub type BroadcastRelay = Arc<dyn Fn(Vec<u8>) + Send + Sync>;
 
+/// Whether the node's masternode list takes a broadcast, and why not
+pub type BroadcastCheck<'a> = &'a dyn Fn(&CppBroadcast) -> Result<(), String>;
+
+/// The wallet's address of an account, as getaccountaddress gives it
+pub type AccountAddress<'a> = &'a dyn Fn(&str) -> Result<String, Error>;
+
 /// What a handler needs from the node
 pub struct MnContext<'a> {
     pub chain: &'a Arc<Chain>,
     pub wallet: Option<Arc<WalletDb>>,
+    /// Where setupmasternode finds a collateral not yet in a block
+    pub mempool: Option<Arc<dyn crate::blockchain::MempoolProvider>>,
+    /// The wallet's address for an account, as getaccountaddress gives it
+    pub account_address: Option<AccountAddress<'a>>,
 }
 
 /// The masternode calls' errors are RPC_INVALID_PARAMS (rpcmasternode.cpp:177, :236)
@@ -48,11 +58,10 @@ fn invalid_param(msg: impl Into<String>) -> Error {
     RpcError::new(codes::INVALID_PARAMS, msg.into()).into()
 }
 
+/// GetAdjustedTime, which divid signs broadcasts and pings with
+/// (MasternodeBroadcastFactory.cpp:224, MasternodeHelpers.cpp:207)
 fn now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+    divi_primitives::clock::adjusted_now()
 }
 
 /// `COutPoint::ToString`
@@ -119,8 +128,11 @@ pub(crate) struct Collateral {
     pub(crate) script: Vec<u8>,
 }
 
+/// The collateral on the active chain, found as Divi Core's GetTransaction
+/// finds it: through the transaction index, or without one through the
+/// collateral's unspent output (TransactionDiskAccessor.cpp:63-110)
 pub(crate) fn find_collateral(chain: &Chain, hash: &Hash256, n: u32) -> Option<Collateral> {
-    let (tx, loc) = chain.get_transaction_with_location(hash).ok()??;
+    let (tx, loc) = chain.locate_transaction(hash).ok()??;
     let out = tx.vout.get(n as usize)?;
     let bi = chain.get_block_index(&loc.block_hash).ok()??;
     let active = chain.get_block_index_by_height(bi.height).ok()??;
@@ -144,7 +156,7 @@ fn blockchain_synced(chain: &Chain) -> bool {
     }
     chain
         .tip()
-        .map(|t| now() - (t.time as i64) < 2 * 3600)
+        .map(|t| divi_primitives::clock::now() - (t.time as i64) < 2 * 3600)
         .unwrap_or(false)
 }
 
@@ -198,11 +210,15 @@ impl BroadcastStore {
             .and_then(|b| CppBroadcast::decode(b).ok())
     }
 
+    /// The broadcasts in Divi Core's order, std::map's by COutPoint: the hash
+    /// as a 256-bit number, then the index (StoredMasternodeBroadcasts.h:19,
+    /// OutPoint.cpp, uint256.cpp:139-147)
     pub fn list(&self) -> Vec<CppBroadcast> {
-        self.entries
-            .lock()
-            .values()
-            .filter_map(|b| CppBroadcast::decode(b).ok())
+        let map = self.entries.lock();
+        let mut keys: Vec<&([u8; 32], u32)> = map.keys().collect();
+        keys.sort_by(|a, b| crate::flat_file::cmp_u256(&a.0, &b.0).then(a.1.cmp(&b.1)));
+        keys.into_iter()
+            .filter_map(|k| CppBroadcast::decode(&map[k]).ok())
             .collect()
     }
 
@@ -298,10 +314,20 @@ pub fn setup_masternode(
         .into());
     }
 
-    // Fresh wallet key to act as the masternode key (printed as WIF in the config line)
-    let addr = wallet
-        .new_receiving_address()
-        .map_err(|e| RpcError::new(codes::WALLET_ERROR, e.to_string()))?;
+    // The masternode key (printed as WIF in the config line): the address of
+    // the account "reserved-><alias>", which stays the alias's key while
+    // nothing pays it (GetAccountAddress, rpcmasternode.cpp:207,
+    // rpcwallet.cpp:334-375)
+    let addr = match ctx.account_address {
+        Some(account_address) => {
+            let addr = account_address(&format!("reserved->{alias}"))?;
+            divi_wallet::address::Address::from_base58(&addr)
+                .map_err(|e| RpcError::new(codes::WALLET_ERROR, e.to_string()))?
+        }
+        None => wallet
+            .new_receiving_address()
+            .map_err(|e| RpcError::new(codes::WALLET_ERROR, e.to_string()))?,
+    };
     let entry = wallet
         .keystore()
         .get_key_by_address(&addr)
@@ -334,17 +360,29 @@ pub fn setup_masternode(
 
     let chain = ctx.chain;
     let outpoint = outpoint_string(&hash, n);
-    let coll = find_collateral(chain, &hash, n)
+    // GetTransaction looks in the mempool first: a collateral not yet in a
+    // block has no height, so its ping names the tip and its broadcast is
+    // signed 45 minutes ahead (MasternodeBroadcastFactory.cpp:78-85, :212-224;
+    // ComputeMasternodeInputAge, MasternodeHelpers.cpp:142-156)
+    let pooled = ctx.mempool.as_ref().and_then(|m| {
+        m.get_transaction(&hash)
+            .or_else(|| m.get_transaction_by_bare_txid(&hash))
+    });
+    let coll = match pooled {
+        Some(tx) => tx.vout.get(n as usize).map(|out| (out.value.0, None)),
+        None => find_collateral(chain, &hash, n).map(|c| (c.amount, Some(c.height))),
+    };
+    let (amount, coll_height) = coll
         .ok_or_else(|| invalid_param(format!("Could not find txin {} for masternode", outpoint)))?;
     if !blockchain_synced(chain) {
         return Err(invalid_param(
             "Sync in progress. Must wait until sync is complete to start Masternode",
         ));
     }
-    let tier = tier_for_collateral(chain, coll.amount).ok_or_else(|| {
+    let tier = tier_for_collateral(chain, amount).ok_or_else(|| {
         invalid_param(format!(
             "Invalid tier selected for masternode {}, collateral value is: {}",
-            ip_and_port, coll.amount
+            ip_and_port, amount
         ))
     })?;
 
@@ -352,7 +390,9 @@ pub fn setup_masternode(
     let tip = chain
         .tip()
         .ok_or_else(|| invalid_param("Chain has no tip"))?;
-    let age = (tip.height + 1).saturating_sub(coll.height).min(12);
+    let age = coll_height
+        .map_or(0, |h| (tip.height + 1).saturating_sub(h))
+        .min(12);
     let ping_block = block_at(chain, tip.height - age.min(tip.height))
         .ok_or_else(|| invalid_param("Failed to sign ping, no ping block"))?;
     let vin = CppTxIn::new(hash.0, n);
@@ -366,10 +406,13 @@ pub fn setup_masternode(
         .map_err(|_| invalid_param(format!("Failed to sign ping, masternode={}", hash.to_hex())))?;
 
     // sigTime must be after the collateral has MASTERNODE_MIN_CONFIRMATIONS confirmations
-    let conf_height = coll.height + MASTERNODE_MIN_CONFIRMATIONS - 1;
-    let sig_time = match block_at(chain, conf_height) {
-        Some(b) if conf_height <= tip.height => b.time as i64,
-        _ => now() + FUTURE_SIGTIME_SECS,
+    let conf = coll_height.and_then(|h| {
+        let conf_height = h + MASTERNODE_MIN_CONFIRMATIONS - 1;
+        block_at(chain, conf_height).filter(|_| conf_height <= tip.height)
+    });
+    let sig_time = match conf {
+        Some(b) => b.time as i64,
+        None => now() + FUTURE_SIGTIME_SECS,
     };
 
     let mut mnb = CppBroadcast {
@@ -435,10 +478,14 @@ pub(crate) fn ping_signature_valid(mnb: &CppBroadcast, ping: &CppPing) -> bool {
     )
 }
 
-/// `broadcaststartmasternode`: validate and relay a signed broadcast
+/// `broadcaststartmasternode`: validate and relay a signed broadcast. With
+/// `accept`, the node's masternode list, the reply is whether the list took
+/// it, as divid answers from ProcessBroadcast (RpcMasternodeFeatures.cpp:104-121);
+/// without one, the broadcast's own checks decide
 pub fn relay_broadcast(
     ctx: &MnContext,
     relay: Option<&BroadcastRelay>,
+    accept: Option<BroadcastCheck<'_>>,
     hex_in: &str,
     signature_hex: Option<&str>,
 ) -> Result<serde_json::Value, Error> {
@@ -448,7 +495,11 @@ pub fn relay_broadcast(
             .map_err(|_| RpcError::new(codes::DESERIALIZATION_ERROR, "Signature must be hex"))?;
     }
     // `update_ping` only matters for a node running as this masternode; this node never is.
-    match check_broadcast(ctx, &mnb) {
+    let checked = match accept {
+        Some(accept) => accept(&mnb),
+        None => check_broadcast(ctx, &mnb),
+    };
+    match checked {
         Ok(()) => {
             if let Some(relay) = relay {
                 relay(mnb.encode());

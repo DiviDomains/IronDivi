@@ -14,6 +14,7 @@ use crate::mn_broadcast::{self, BroadcastRelay, BroadcastStore, MnContext};
 use crate::mn_list::MasternodeList;
 use crate::mn_votes::MasternodeVotes;
 use crate::protocol::Params;
+use divi_masternode::cpp_wire::CppBroadcast;
 use divi_masternode::mnsync::SharedMasternodeSync;
 use divi_masternode::{MasternodeManager, MasternodeRpc as MasternodeRpcImpl, PaymentVoteTracker};
 use divi_storage::Chain;
@@ -158,7 +159,8 @@ impl MasternodeRpc {
             return Err(Self::usage(GETMASTERNODECOUNT_USAGE));
         }
         if let Some(list) = self.network_list.read().clone() {
-            let c = list.counts(chain);
+            let votes = self.votes.read().clone();
+            let c = list.counts(chain, votes.as_deref());
             let mut value = json!({
                 "total": c.total,
                 "stable": c.stable,
@@ -374,22 +376,23 @@ impl MasternodeRpc {
             Some("update_ping") | None => None,
             Some(s) => Some(s),
         };
-        // Divi Core takes the broadcast into its own list, then relays it
-        // (RelayParsedMasternodeBroadcast, RpcMasternodeFeatures.cpp:80-121)
+        // Divi Core takes the broadcast into its own list, then relays it; its
+        // reply is whether the list took it (RelayParsedMasternodeBroadcast,
+        // RpcMasternodeFeatures.cpp:80-121)
         let relay = self.relay.read().clone();
         let list = self.network_list.read().clone();
         let chain = Arc::clone(ctx.chain);
-        let relay: BroadcastRelay = Arc::new(move |bytes: Vec<u8>| {
-            if let Some(list) = &list {
-                if let Err(e) = list.accept_broadcast(&chain, &bytes) {
-                    tracing::debug!("own masternode broadcast not listed: {}", e);
-                }
-            }
-            if let Some(relay) = &relay {
-                relay(bytes);
+        let accept = list.map(|list| {
+            move |mnb: &CppBroadcast| {
+                list.accept_broadcast(&chain, &mnb.encode())
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
             }
         });
-        mn_broadcast::relay_broadcast(ctx, Some(&relay), hex_in, sig)
+        let accept = accept
+            .as_ref()
+            .map(|f| f as mn_broadcast::BroadcastCheck<'_>);
+        mn_broadcast::relay_broadcast(ctx, relay.as_ref(), accept, hex_in, sig)
     }
 
     /// `signmnbroadcast mnhex`
@@ -691,6 +694,8 @@ mod tests {
         let ctx = MnContext {
             chain: &chain,
             wallet: None,
+            mempool: None,
+            account_address: None,
         };
         assert_eq!(
             rpc_err(rpc.start_masternode(&args(&[json!("mn1"), json!("yes")]), &ctx)),

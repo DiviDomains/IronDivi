@@ -145,10 +145,11 @@ impl MasternodeVotes {
         }
         let scoring = scoring_hash(chain, height).ok_or("no scoring block for the height")?;
         list.check_collateral(chain);
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
+        // Asks are timed on GetTime, the masternode's state on
+        // GetAdjustedTime (MasternodeNetworkMessageManager.cpp:203,
+        // MasternodeHelpers.cpp:175)
+        let now = divi_primitives::clock::now();
+        let adjusted = divi_primitives::clock::adjusted_now();
         // An unknown masternode is asked for (masternode-payments.cpp:223-228)
         let voter = list
             .entries()
@@ -164,7 +165,7 @@ impl MasternodeVotes {
         if voter.mnb.protocol_version < ACTIVE_PROTOCOL {
             return Err("masternode protocol too old".into());
         }
-        if !voter.is_enabled(now) {
+        if !voter.is_enabled(adjusted) {
             return Err("masternode is not active".into());
         }
         match list.rank(
@@ -180,7 +181,7 @@ impl MasternodeVotes {
         // the top of its own queue
         if self.sync_finished()
             && !list
-                .payment_queue(chain, &scoring)
+                .payment_queue(chain, &scoring, height, Some(self))
                 .iter()
                 .take(2 * SIGNATURES_TOTAL)
                 .any(|p| *p == winner.payee)
@@ -374,6 +375,25 @@ impl MasternodeVotes {
         serde_json::Value::Array(out)
     }
 
+    /// PruneOldMasternodeWinnerData, which divid's masternode thread runs once
+    /// a minute: the votes for heights more than 1000 below the tip go
+    /// (MasternodeModule.cpp:515-519, masternode-payments.cpp:412-417)
+    pub fn prune_old(&self, tip: i64) {
+        if tip > 0 {
+            prune(&mut self.winners.write(), &mut self.blocks.write(), tip);
+        }
+    }
+
+    /// CMasternodePayments::IsScheduled (masternode-payments.cpp:332-352):
+    /// whether `payee` has the most votes (GetPayee) for one of the heights
+    /// from the tip to 8 above it, other than `not_height`
+    pub fn is_scheduled(&self, chain: &Chain, payee: &[u8], not_height: i64) -> bool {
+        let tip = chain.height() as i64;
+        (0..=8)
+            .filter(|h| tip + h != not_height)
+            .any(|h| top_payee(&self.votes_for_height(chain, tip + h)).is_some_and(|p| p == payee))
+    }
+
     /// CMasternodeBlockPayees::HasPayeeWithVotes (MasternodePayeeData.cpp:82-91)
     /// for the block scored at `height`
     pub fn has_payee_with_votes(
@@ -437,6 +457,18 @@ fn atoi(v: &str) -> i64 {
     } else {
         n
     }
+}
+
+/// CMasternodeBlockPayees::GetPayee: the payee with the most votes, the
+/// first of a tie (MasternodePayeeData.cpp:67-80)
+fn top_payee(payees: &[(Vec<u8>, u32)]) -> Option<&[u8]> {
+    let mut best: Option<(&[u8], u32)> = None;
+    for (script, votes) in payees {
+        if best.is_none_or(|(_, n)| *votes > n) {
+            best = Some((script, *votes));
+        }
+    }
+    best.map(|(script, _)| script)
 }
 
 /// pruneOutdatedMasternodeWinners: the votes for heights more than 1000

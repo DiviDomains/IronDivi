@@ -19,18 +19,11 @@ use divi_primitives::{
 };
 use std::time::Duration;
 
-/// A block at the present time, so the chain is synced (IsBlockchainSynced)
-fn mine_now(t: &TestNode) {
-    let chain = t.node.chain();
-    let tip = chain.tip().unwrap();
-    let mut tag = divi_storage::bip34_height_script(tip.height + 1);
-    tag.extend_from_slice(&(tip.height + 1).to_le_bytes());
-    let mut block = Block::default();
-    block.header.version = 4;
-    block.header.prev_block = tip.hash;
-    block.header.time = divi_primitives::clock::now() as u32;
-    block.header.bits = 0x207fffff;
-    block.transactions = vec![Transaction {
+/// The coinbase of the block at `height`
+fn coinbase(height: u32) -> Transaction {
+    let mut tag = divi_storage::bip34_height_script(height);
+    tag.extend_from_slice(&height.to_le_bytes());
+    Transaction {
         version: 1,
         vin: vec![TxIn::coinbase(Script::from_bytes(tag))],
         vout: vec![TxOut::new(
@@ -38,7 +31,19 @@ fn mine_now(t: &TestNode) {
             Script::new_p2pkh(&[0xee; 20]),
         )],
         lock_time: 0,
-    }];
+    }
+}
+
+/// A block at the present time, so the chain is synced (IsBlockchainSynced)
+fn mine_now(t: &TestNode) {
+    let chain = t.node.chain();
+    let tip = chain.tip().unwrap();
+    let mut block = Block::default();
+    block.header.version = 4;
+    block.header.prev_block = tip.hash;
+    block.header.time = divi_primitives::clock::now() as u32;
+    block.header.bits = 0x207fffff;
+    block.transactions = vec![coinbase(tip.height + 1)];
     block.header.merkle_root = divi_crypto::compute_merkle_root(&block.transactions);
     let target = Hash256::from_compact(block.header.bits);
     while divi_crypto::compute_block_hash(&block.header) > target {
@@ -47,9 +52,12 @@ fn mine_now(t: &TestNode) {
     chain.accept_block(block).unwrap();
 }
 
-/// A broadcast as the list keeps it, on a public address, pinged now
+/// A broadcast as the list keeps it, on a public address, pinged now. Its
+/// collateral is the coinbase of the block the test mines, so the minute's
+/// pass, which runs once the chain is synced, does not find it spent and
+/// drop it (masternodeman.cpp:160-178, MasternodeModule.cpp:502-519)
 fn broadcast() -> CppBroadcast {
-    let vin = CppTxIn::new([0x11; 32], 1);
+    let vin = CppTxIn::new(coinbase(1).txid().0, 0);
     let mut ip = [0u8; 16];
     ip[10] = 0xff;
     ip[11] = 0xff;
