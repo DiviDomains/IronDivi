@@ -114,8 +114,8 @@ fn tip_is_dead(tip_time: u32, now: u32) -> bool {
     now.saturating_sub(tip_time) > EXPIRY_MAX_TIP_AGE_SECS
 }
 
-/// A tip time more than [`EXPIRY_MAX_TIP_LEAD_SECS`] ahead of `now`: no node would have
-/// accepted it, so the backend or the clock is wrong.
+/// A tip time, or a median time past, more than [`EXPIRY_MAX_TIP_LEAD_SECS`] ahead of
+/// `now`: no node would have accepted it, so the backend or the clock is wrong.
 fn tip_is_ahead(tip_time: u32, now: u32) -> bool {
     tip_time.saturating_sub(now) > EXPIRY_MAX_TIP_LEAD_SECS
 }
@@ -399,6 +399,12 @@ impl InputReservations {
     /// - a tip height below the highest fresh one seen (`expiry_tip`) is a lagging fallback
     ///   endpoint or a reorg to a shorter chain: the records are kept, nothing is released,
     ///   and the high-water mark stays;
+    /// - a median time past ([`ChainBackend::median_time_past`]) more than
+    ///   [`EXPIRY_MAX_TIP_LEAD_SECS`] ahead of `now` is treated as a tip past that limit:
+    ///   nothing is checked, recorded or released, no record moves and the high-water mark
+    ///   stays. A valid chain's MTP is below its tip's time, but the two are separate reads
+    ///   (maybe from separate endpoints), and a pending record must not start its count on an
+    ///   MTP the clock cannot vouch for;
     /// - a record whose block is no longer on the backend's main chain
     ///   ([`ChainBackend::in_best_chain`]) was reorged out: it is replaced by one at the
     ///   current tip, so the count starts over. A record from before hashes were stored is
@@ -487,8 +493,20 @@ impl InputReservations {
             );
             return Ok(0);
         }
-        self.record_tip(chain, tip.height)?;
         let mtp = backend.median_time_past().await?;
+        if tip_is_ahead(mtp, now) {
+            tracing::warn!(
+                %chain,
+                height = tip.height,
+                mtp,
+                now,
+                limit = EXPIRY_MAX_TIP_LEAD_SECS,
+                "backend median time past is past the consensus future limit; \
+                 not releasing expired locks"
+            );
+            return Ok(0);
+        }
+        self.record_tip(chain, tip.height)?;
         let mut on_chain: HashMap<(u64, String), bool> = HashMap::new();
         let mut released = 0;
         for (txid, deadline) in due {
@@ -1710,6 +1728,7 @@ mod tests {
                 "{start:?} stale {stale}"
             );
             c.mine(EXPIRY_ABSENT_BLOCKS - 1);
+            b.set_mtp_lead(0);
             assert_eq!(swept(now).await.unwrap(), 1, "{start:?} stale {stale}");
         }
     }
