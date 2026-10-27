@@ -73,6 +73,7 @@ Core paths are under `divi/src/` of the Divi Core source at v3.0.0.
 - `getmempoolinfo keys`: irondivid adds `usage`, `maxmempool` and `mempoolminfee` (`docs/divid-differences.md`
   R13; also KNOWN in `scripts/net-counters`). divid gives `size` and `bytes` only (`rpcblockchain.cpp:569-574`).
 - Not run: irondivid keeps its mempool under 300 MB (`crates/divi-node/src/config.rs` `MempoolConfig::max_size`,
-  no option sets it). Past it, it removes the transactions of the lowest fee rate (`crates/divi-node/src/mempool.rs`
-  `evict_for_space`); divid has no cap and grows until memory runs out. It is kept as a memory guard and cannot be
-  reached on regtest in a run of minutes.
+  no option sets it). Past it, a transaction is taken only if the ones paying a lower fee rate, each with its
+  descendants, free enough room (`crates/divi-node/src/mempool.rs` `make_room_for`; `docs/divid-differences.md` M1);
+  divid has no cap and grows until memory runs out. It is kept as a memory guard and cannot be reached on regtest in
+  a run of minutes.
