@@ -9,7 +9,9 @@
 //! An in-process lightwalletd for tests: a tonic server on 127.0.0.1 (ephemeral port)
 //! answering `GetLatestBlock`, `GetBlock`, `GetBlockRange` and `GetTransaction` of
 //! `cash.z.wallet.sdk.rpc.CompactTxStreamer` from a scripted chain, with the crate's own
-//! [`grpc`](crate::grpc) wire messages. [`ZecBackend`]'s `tip_header`, `in_best_chain` and
+//! [`grpc`](crate::grpc) wire messages; `GetLightdInfo` (NU5's branch id) and `SendTransaction`
+//! (accepting and recording every transaction) answer too, so a claim or refund can be built
+//! and sent. [`ZecBackend`]'s `tip_header`, `in_best_chain` and
 //! the expiry sweep run over real gRPC against it.
 
 use std::convert::Infallible;
@@ -26,7 +28,10 @@ use tonic::transport::server::TcpIncoming;
 use tonic::Status;
 use tonic_prost::ProstCodec;
 
-use crate::grpc::{BlockId, BlockRange, ChainSpec, CompactBlock, RawTransaction, TxFilter};
+use crate::grpc::{
+    BlockId, BlockRange, ChainSpec, CompactBlock, Empty, LightdInfo, RawTransaction, SendResponse,
+    TxFilter,
+};
 use crate::{FeePolicy, RetryPolicy, ZecBackend};
 
 /// Block time of height 0; each later block is [`SPACING`] s after the one before.
@@ -52,6 +57,8 @@ struct Chain {
     after_latest: Option<Move>,
     /// Method names in call order.
     calls: Vec<&'static str>,
+    /// Raw transactions received by `SendTransaction`, in order.
+    sent: Vec<Vec<u8>>,
 }
 
 impl Chain {
@@ -170,6 +177,11 @@ impl Lightwalletd {
     pub(crate) fn take_calls(&self) -> Vec<&'static str> {
         std::mem::take(&mut self.chain.lock().unwrap().calls)
     }
+
+    /// Raw transactions received by `SendTransaction` since the last call.
+    pub(crate) fn take_sent(&self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.chain.lock().unwrap().sent)
+    }
 }
 
 #[derive(Clone)]
@@ -204,6 +216,14 @@ impl Service<http::Request<Body>> for Stub {
                 "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetTransaction" => {
                     let mut grpc = Grpc::new(ProstCodec::default());
                     grpc.unary(Unary(chain, get_transaction), req).await
+                }
+                "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLightdInfo" => {
+                    let mut grpc = Grpc::new(ProstCodec::default());
+                    grpc.unary(Unary(chain, get_lightd_info), req).await
+                }
+                "/cash.z.wallet.sdk.rpc.CompactTxStreamer/SendTransaction" => {
+                    let mut grpc = Grpc::new(ProstCodec::default());
+                    grpc.unary(Unary(chain, send_transaction), req).await
                 }
                 "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetBlockRange" => {
                     let mut grpc = Grpc::new(ProstCodec::default());
@@ -266,6 +286,27 @@ fn get_transaction(c: &mut Chain, _: TxFilter) -> Result<RawTransaction, Status>
     ))
 }
 
+/// NU5's consensus branch id (the ZIP-244 test vectors' too).
+fn get_lightd_info(c: &mut Chain, _: Empty) -> Result<LightdInfo, Status> {
+    c.calls.push("GetLightdInfo");
+    Ok(LightdInfo {
+        version: "stub".into(),
+        chain_name: "test".into(),
+        consensus_branch_id: "c2d6d0b4".into(),
+        block_height: c.tip(),
+    })
+}
+
+/// Accepts and records every transaction.
+fn send_transaction(c: &mut Chain, tx: RawTransaction) -> Result<SendResponse, Status> {
+    c.calls.push("SendTransaction");
+    c.sent.push(tx.data);
+    Ok(SendResponse {
+        error_code: 0,
+        error_message: String::new(),
+    })
+}
+
 struct BlockRangeSvc(Arc<Mutex<Chain>>);
 
 impl ServerStreamingService<BlockRange> for BlockRangeSvc {
@@ -288,6 +329,7 @@ mod tests {
     use divi_swap::backend::TipHeader;
     use divi_swap::reservation::EXPIRY_MAX_TIP_LEAD_SECS;
     use divi_swap::{Chain, ChainBackend, InputReservations, Outpoint, SwapError, Txid};
+    use sha2::Digest;
 
     use super::*;
 
@@ -436,11 +478,11 @@ mod tests {
         assert!(r.reserved(Chain::Zec).unwrap().is_empty());
     }
 
-    fn spend_args(b: &ZecBackend) -> (divi_swap::HtlcParams, Outpoint, divi_swap::Amount) {
+    fn spend_args(pubkey: [u8; 33]) -> (divi_swap::HtlcParams, Outpoint, divi_swap::Amount) {
         let htlc = divi_swap::HtlcParams {
-            hash: [0x11; 32],
-            claim_pubkey: b.pubkey(),
-            refund_pubkey: b.pubkey(),
+            hash: sha2::Sha256::digest(PREIMAGE).into(),
+            claim_pubkey: pubkey,
+            refund_pubkey: pubkey,
             locktime: 1_900_000_000,
             script_version: Default::default(),
         };
@@ -451,71 +493,161 @@ mod tests {
         (htlc, at, divi_swap::Amount::from_sat(100_000))
     }
 
-    /// The error of a claim and of a refund built on `b` (the stub has no `GetLightdInfo`,
-    /// so neither can succeed: what matters is whether the cross-check stopped it first).
-    async fn claim_and_refund_errors(b: &ZecBackend) -> [SwapError; 2] {
-        let (htlc, at, amount) = spend_args(b);
+    const PREIMAGE: [u8; 32] = [0x22; 32];
+
+    /// A claim and a refund built on `b`.
+    async fn claim_and_refund(b: &dyn ChainBackend) -> [divi_swap::Result<divi_swap::SignedTx>; 2] {
+        let (htlc, at, amount) = spend_args(b.pubkey());
         [
-            b.build_claim(&htlc, &at, amount, &[0x22; 32])
-                .await
-                .unwrap_err(),
-            b.build_refund(&htlc, &at, amount).await.unwrap_err(),
+            b.build_claim(&htlc, &at, amount, &PREIMAGE).await,
+            b.build_refund(&htlc, &at, amount).await,
         ]
     }
 
-    fn is_crosscheck_hold(e: &SwapError) -> bool {
-        matches!(e, SwapError::Transient(m) if m.contains("cross-check"))
+    /// A backend on `lwd` cross-checked against `second`.
+    fn checked(lwd: &Lightwalletd, second: &str) -> ZecBackend {
+        lwd.backend()
+            .with_crosscheck(Some(second.to_string()))
+            .unwrap()
+    }
+
+    /// A second operator that answers but cannot vouch: too far behind (`Unavailable`).
+    fn lagging() -> Lightwalletd {
+        Lightwalletd::start(40 - crate::crosscheck::MAX_LAG - 1)
+    }
+
+    /// A second operator with another hash at the tip (`Disagree`).
+    fn lying() -> Lightwalletd {
+        let other = Lightwalletd::start(40);
+        other.tamper(40);
+        other
+    }
+
+    /// The hold, naming the primary and the second operator.
+    fn assert_held(r: &divi_swap::Result<divi_swap::SignedTx>, primary: &str, second: &str) {
+        match r {
+            Err(SwapError::Held(m)) => {
+                assert!(m.contains(primary) && m.contains(second), "{m}");
+            }
+            other => panic!("expected the hold, got {other:?}"),
+        }
     }
 
     #[tokio::test]
-    async fn no_crosscheck_url_makes_no_extra_request() {
+    async fn no_crosscheck_url_makes_no_extra_request_and_has_no_primary_only_view() {
         let lwd = Lightwalletd::start(40);
         let b = lwd.backend().with_crosscheck(None).unwrap();
         b.crosscheck().await.unwrap();
-        for e in claim_and_refund_errors(&b).await {
-            assert!(!is_crosscheck_hold(&e), "{e:?}");
+        for r in claim_and_refund(&b).await {
+            r.unwrap();
         }
-        assert!(lwd.take_calls().is_empty());
+        assert_eq!(
+            lwd.take_calls(),
+            [
+                "GetLightdInfo",
+                "GetLatestBlock",
+                "GetLightdInfo",
+                "GetLatestBlock"
+            ],
+            "only the build's own reads"
+        );
+        assert!(b.primary_only().is_none(), "nothing is ever held");
     }
 
     #[tokio::test]
     async fn an_agreeing_second_operator_lets_claim_and_refund_through() {
         let (lwd, other) = (Lightwalletd::start(40), Lightwalletd::start(40));
-        let b = lwd
-            .backend()
-            .with_crosscheck(Some(other.endpoint().to_string()))
-            .unwrap();
+        let b = checked(&lwd, other.endpoint());
         b.crosscheck().await.unwrap();
-        for e in claim_and_refund_errors(&b).await {
-            assert!(!is_crosscheck_hold(&e), "{e:?}");
+        for r in claim_and_refund(&b).await {
+            r.unwrap();
         }
         assert!(other.take_calls().contains(&"GetLatestBlock"));
     }
 
     #[tokio::test]
     async fn a_disagreeing_second_operator_holds_claim_and_refund_and_fails_startup() {
-        let (lwd, other) = (Lightwalletd::start(40), Lightwalletd::start(40));
-        other.tamper(40);
-        let b = lwd
-            .backend()
-            .with_crosscheck(Some(other.endpoint().to_string()))
-            .unwrap();
+        let (lwd, other) = (Lightwalletd::start(40), lying());
+        let b = checked(&lwd, other.endpoint());
         assert!(matches!(b.crosscheck().await, Err(SwapError::Transient(_))));
-        for e in claim_and_refund_errors(&b).await {
-            assert!(is_crosscheck_hold(&e), "{e:?}");
+        for r in claim_and_refund(&b).await {
+            assert_held(&r, lwd.endpoint(), other.endpoint());
         }
     }
 
     #[tokio::test]
     async fn an_unreachable_second_operator_holds_claim_and_refund_but_not_startup() {
         let lwd = Lightwalletd::start(40);
-        let b = lwd
-            .backend()
-            .with_crosscheck(Some("http://127.0.0.1:1".into()))
-            .unwrap();
+        let b = checked(&lwd, "http://127.0.0.1:1");
         b.crosscheck().await.expect("startup only warns");
-        for e in claim_and_refund_errors(&b).await {
-            assert!(is_crosscheck_hold(&e), "{e:?}");
+        for r in claim_and_refund(&b).await {
+            assert_held(&r, lwd.endpoint(), "127.0.0.1:1");
         }
+    }
+
+    /// Past the engine's deadline: the primary-only view builds the same spends without
+    /// asking the second operator, whether it is down, lagging or disagreeing.
+    #[tokio::test]
+    async fn the_primary_only_view_builds_without_asking_the_second_operator() {
+        for (name, other) in [("lagging", lagging()), ("lying", lying())] {
+            let lwd = Lightwalletd::start(40);
+            let b = checked(&lwd, other.endpoint());
+            let held = claim_and_refund(&b).await;
+            let view = b
+                .primary_only()
+                .expect("a cross-checked backend has a view");
+            other.take_calls();
+            let built = claim_and_refund(view.as_ref()).await;
+            assert!(
+                other.take_calls().is_empty(),
+                "{name}: the view asked the second operator"
+            );
+            for (h, r) in held.iter().zip(&built) {
+                assert_held(h, lwd.endpoint(), other.endpoint());
+                let tx = r.as_ref().unwrap_or_else(|e| panic!("{name}: {e:?}"));
+                assert!(!tx.raw.is_empty());
+            }
+            assert_eq!(view.pubkey(), b.pubkey(), "same key");
+        }
+        let down = checked(&Lightwalletd::start(40), "http://127.0.0.1:1");
+        for r in claim_and_refund(down.primary_only().unwrap().as_ref()).await {
+            r.unwrap();
+        }
+    }
+
+    /// On `Disagree` a spend built on the primary alone is also sent to the second operator
+    /// (best effort: the primary may be the liar); on `Unavailable`, and for anything not
+    /// built on the primary alone, the second operator gets nothing.
+    #[tokio::test]
+    async fn a_primary_only_spend_reaches_the_second_operator_only_on_disagree() {
+        for (name, other, relayed) in [("lying", lying(), true), ("lagging", lagging(), false)] {
+            let lwd = Lightwalletd::start(40);
+            let b = checked(&lwd, other.endpoint());
+            let _ = claim_and_refund(&b).await;
+            let view = b.primary_only().unwrap();
+            for tx in claim_and_refund(view.as_ref()).await {
+                let tx = tx.unwrap();
+                assert_eq!(b.broadcast(&tx).await.unwrap(), tx.txid, "{name}");
+                assert_eq!(
+                    lwd.take_sent(),
+                    std::slice::from_ref(&tx.raw),
+                    "{name}: primary"
+                );
+                let want: Vec<Vec<u8>> = if relayed {
+                    vec![tx.raw.clone()]
+                } else {
+                    vec![]
+                };
+                assert_eq!(other.take_sent(), want, "{name}: second operator");
+            }
+        }
+        // Agreeing sources: a normal claim goes to the primary only.
+        let (lwd, other) = (Lightwalletd::start(40), Lightwalletd::start(40));
+        let b = checked(&lwd, other.endpoint());
+        let [claim, _] = claim_and_refund(&b).await;
+        let claim = claim.unwrap();
+        b.broadcast(&claim).await.unwrap();
+        assert_eq!(lwd.take_sent().len(), 1);
+        assert!(other.take_sent().is_empty());
     }
 }

@@ -1674,6 +1674,58 @@ mod tests {
         );
     }
 
+    /// A claim or refund built on one lightwalletd's word (past the engine's hold deadline,
+    /// `ChainBackend::primary_only`) cannot be turned into a fee siphon by that server: the
+    /// ZIP 244 signature digest commits to the spent amount and to the consensus branch id,
+    /// so the signature verifies only for the amount the engine recorded and the branch the
+    /// chain really runs. A lie about either gives a transaction the network refuses, never a
+    /// valid one paying more fee than the engine chose.
+    #[test]
+    fn a_spend_signature_commits_to_the_input_amount_and_the_branch_id() {
+        let (pre, hash) = new_preimage();
+        let h = htlc(hash);
+        let secp = Secp256k1::new();
+        let script_pubkey = htlc_script_pubkey(&h.redeem_script());
+        let amount = 60_000;
+        for (key, spend) in [(TAKER_KEY, Spend::Claim(&pre)), (MAKER_KEY, Spend::Refund)] {
+            for version in [5, 6] {
+                let sk = SecretKey::from_slice(&key).unwrap();
+                let tx = build_spend_tx(
+                    &secp,
+                    &sk,
+                    &pubkey_of(&key),
+                    &h,
+                    outpoint(),
+                    amount,
+                    spend,
+                    version,
+                    BRANCH_ID,
+                    2,
+                )
+                .unwrap();
+                let at = |value: u64| {
+                    [SigInput {
+                        value,
+                        script_pubkey: script_pubkey.clone(),
+                    }]
+                };
+                verify_htlc_spend(&tx, 0, &at(amount), &h.redeem_script()).unwrap();
+                for other in [amount - 1, amount + 1, 10 * amount] {
+                    assert!(
+                        verify_htlc_spend(&tx, 0, &at(other), &h.redeem_script()).is_err(),
+                        "v{version}: signature also valid for {other} zats"
+                    );
+                }
+                let mut forked = tx.clone();
+                forked.consensus_branch_id ^= 1;
+                assert!(
+                    verify_htlc_spend(&forked, 0, &at(amount), &h.redeem_script()).is_err(),
+                    "v{version}: signature valid under another branch id"
+                );
+            }
+        }
+    }
+
     #[test]
     fn claim_script_executes() {
         let (pre, hash) = new_preimage();
