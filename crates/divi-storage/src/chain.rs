@@ -2382,7 +2382,7 @@ impl Chain {
         if let Some(ref parent) = parent_index {
             if parent.failed() {
                 return Err(StorageError::InvalidBlock(format!(
-                    "prev block {} at height {} is invalid, unable to add block {}",
+                    "bad-prevblk: prev block {} at height {} is invalid, unable to add block {}",
                     parent.hash, parent.height, hash
                 )));
             }
@@ -2416,60 +2416,28 @@ impl Chain {
                 other => other?,
             }
             self.check_reorg_depth(parent.height + 1)?;
-            Self::check_block_version_and_height(&block, parent.height + 1)?;
-        }
-
-        // 6. Check contextual validity (skip for genesis)
-        // The proof of stake and the signature were checked above for every block.
-        // What is left of the full validation (the coins, scripts and amounts) is done
-        // when the block is connected: on arrival for a block on the tip, during a reorg
-        // for a block of a side chain, as in C++ Divi's AcceptBlock vs ConnectTip.
-        if let Some(ref parent) = parent_index {
-            if extends_tip {
-                debug!("  ├─ Full context validation (extends tip)");
-                self.check_block_context(&block, parent)?;
-                debug!("  ├─ Context validation: ✅ PASS");
-            } else {
-                debug!("  ├─ Header-only context validation (side chain)");
-                // Minimal validation: timestamp and parent linkage only
-                if block.header.prev_block != parent.hash {
-                    return Err(StorageError::invalid_block_scored(0, "wrong parent".into()));
-                }
-                let mtp = self.get_median_time_past(parent)?;
-                if block.header.time <= mtp {
-                    return Err(StorageError::invalid_block_scored(
-                        0,
-                        format!(
-                            "time-too-old: block's timestamp {} is not greater than the median time past {}",
-                            block.header.time, mtp
-                        ),
-                    ));
-                }
-                debug!("  ├─ Header validation: ✅ PASS (full validation deferred to reorg)");
+            // 6. The rest of ContextualCheckBlockHeader (time, checkpoint,
+            // version), then ContextualCheckBlock (every transaction final,
+            // then BIP34), in Divi Core's order, for a block of a side chain as
+            // for one on the tip (AcceptBlock, ChainExtensionService.cpp:429,
+            // :493). The coins, scripts and amounts are checked when the block
+            // is connected: on arrival for a block on the tip, during a reorg
+            // for a block of a side chain, as in Divi Core's ConnectTip.
+            self.check_block_context(&block, parent)?;
+            self.check_checkpoint(&hash, parent.height + 1)?;
+            Self::check_block_version(&block)?;
+            if let Err(e) = Self::check_block_final_and_height(&block, parent.height + 1) {
+                // Divi Core has added the header to its block index by now
+                // (AcceptBlockHeader) and marks it failed (:493-499): the block
+                // sent again is refused as known to be invalid, a block on it
+                // as bad-prevblk.
+                self.store_failed_header(&block, &hash, parent)?;
+                return Err(e);
             }
         }
 
         // 7. Create block index
         let height = parent_index.as_ref().map(|p| p.height + 1).unwrap_or(0);
-
-        // 7a. Checkpoint validation — reject blocks at known heights with wrong hash.
-        // This prevents following minority forks during IBD.
-        if let Some(expected_hash) = self.get_checkpoint_hash(height) {
-            if hash != expected_hash {
-                warn!(
-                    "CHECKPOINT REJECT: Block {} at height {} fails checkpoint (expected {})",
-                    hash, height, expected_hash
-                );
-                return Err(StorageError::InvalidBlock(format!(
-                    "checkpoint mismatch: rejected by checkpoint lock-in at {} (block {}, expected {})",
-                    height, hash, expected_hash
-                )));
-            }
-            warn!(
-                "CHECKPOINT PASS: Block {} at height {} matches checkpoint",
-                hash, height
-            );
-        }
 
         let mut index = BlockIndex::from_header(&block.header, height, parent_index.as_ref());
         index.hash = hash;
@@ -3759,6 +3727,48 @@ impl Chain {
             .map(|(_, hash)| *hash)
     }
 
+    /// Divi Core ContextualCheckBlockHeader's checkpoint rule
+    /// (ChainExtensionService.cpp:320-328): a block at a checkpoint height must
+    /// be the checkpoint's block
+    fn check_checkpoint(&self, hash: &Hash256, height: u32) -> Result<(), StorageError> {
+        let Some(expected_hash) = self.get_checkpoint_hash(height) else {
+            return Ok(());
+        };
+        if *hash != expected_hash {
+            warn!(
+                "CHECKPOINT REJECT: Block {} at height {} fails checkpoint (expected {})",
+                hash, height, expected_hash
+            );
+            return Err(StorageError::InvalidBlock(format!(
+                "checkpoint mismatch: rejected by checkpoint lock-in at {} (block {}, expected {})",
+                height, hash, expected_hash
+            )));
+        }
+        warn!(
+            "CHECKPOINT PASS: Block {} at height {} matches checkpoint",
+            hash, height
+        );
+        Ok(())
+    }
+
+    /// Keep the header of a block ContextualCheckBlock refused, marked failed
+    /// and without its data, as Divi Core's block index does
+    /// (ChainExtensionService.cpp:429, :493-499)
+    fn store_failed_header(
+        &self,
+        block: &Block,
+        hash: &Hash256,
+        parent: &BlockIndex,
+    ) -> Result<(), StorageError> {
+        let mut index = BlockIndex::from_header(&block.header, parent.height + 1, Some(parent));
+        index.hash = *hash;
+        index.n_tx = block.transactions.len() as u32;
+        index.status.insert(BlockStatus::VALID_HEADER);
+        index.status.insert(BlockStatus::FAILED);
+        index.set_proof_of_stake(block.is_proof_of_stake());
+        self.db.store_block_index_entry(&index)
+    }
+
     /// Check basic block header validity
     fn check_block_header(&self, block: &Block) -> Result<(), StorageError> {
         // Check version
@@ -3797,10 +3807,10 @@ impl Chain {
         Ok(())
     }
 
-    /// Divi Core ContextualCheckBlockHeader's version rule and ContextualCheckBlock's
-    /// BIP34 rule (ChainExtensionService.cpp:350-353, :375-382), for every block
-    /// after the genesis block
-    fn check_block_version_and_height(block: &Block, height: u32) -> Result<(), StorageError> {
+    /// Divi Core ContextualCheckBlockHeader's version rule
+    /// (ChainExtensionService.cpp:350-353), for every block after the genesis
+    /// block
+    fn check_block_version(block: &Block) -> Result<(), StorageError> {
         if block.header.version < 3 {
             return Err(StorageError::invalid_block_scored(
                 0,
@@ -3810,6 +3820,14 @@ impl Chain {
                 ),
             ));
         }
+        Ok(())
+    }
+
+    /// Divi Core ContextualCheckBlock: every transaction final, then BIP34
+    /// (ChainExtensionService.cpp:357-385), for every block after the genesis
+    /// block
+    fn check_block_final_and_height(block: &Block, height: u32) -> Result<(), StorageError> {
+        check_block_txs_final(block, height)?;
         let expect = bip34_height_script(height);
         let script_sig = block.transactions[0].vin[0].script_sig.as_bytes();
         if !script_sig.starts_with(&expect) {
@@ -4640,7 +4658,9 @@ impl Chain {
         );
 
         // Divi Core ContextualCheckBlock: every transaction must be final at
-        // this block's height and time ("bad-txns-nonfinal").
+        // this block's height and time ("bad-txns-nonfinal"). accept_block
+        // checks it on arrival; this catches a side-chain block an earlier
+        // version stored without that check.
         check_block_txs_final(block, height)?;
 
         // Divi Core ConnectBlock checks the block again in case an earlier
