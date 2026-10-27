@@ -62,8 +62,8 @@ pub const LIGHTWALLETD_EXTRA_ENV: &str = "SWAP_ZEC_LIGHTWALLETD_EXTRA";
 /// from hp2); `lwd1.zcash-infra.com:9067`, `mainnet.lightwalletd.com:9067` and
 /// `lightwalletd.electriccoin.co:9067` gave no handshake and are deliberately left out. See
 /// `- decisions:` in `docs/plans/swap-poc/status/zec.md`. Reachability is not a statement
-/// about operator trust: check the endpoint's chain tip against a second source before
-/// moving real funds.
+/// about operator trust: all three are one operator's, so a mainnet daemon compares their tip
+/// with a second operator's lightwalletd ([`crosscheck`], `[zec].crosscheck_url`).
 pub const MAINNET_LIGHTWALLETD: [&str; 3] = [
     "https://zec.rocks:443",
     "https://na.zec.rocks:443",
@@ -203,14 +203,29 @@ impl ZecBackend {
     /// startup ([`ZecBackend::crosscheck`]) and before every claim and refund is built (see
     /// [`crosscheck`]). `None` (the default) is off: no extra request. The URL is checked by
     /// the caller against the primaries ([`crosscheck::check_second_operator`]).
-    pub fn with_crosscheck(self, url: Option<String>) -> Result<Self> {
-        let _ = url;
+    pub fn with_crosscheck(mut self, url: Option<String>) -> Result<Self> {
+        self.second = match url {
+            Some(url) => Some(LightwalletdClient::new(vec![url], self.client.retry())?),
+            None => None,
+        };
         Ok(self)
     }
 
     /// The startup cross-check: `Disagree` is an error, `Unavailable` warns; `Ok` when off.
     pub async fn crosscheck(&self) -> Result<()> {
-        Ok(())
+        match &self.second {
+            Some(second) => crosscheck::enforce_at_startup(&self.client, second).await,
+            None => Ok(()),
+        }
+    }
+
+    /// Before a claim or refund (`what`) of `at` is built: fail closed on anything but
+    /// agreement ([`crosscheck::enforce_before_spend`]); `Ok` when off.
+    async fn check_before_spend(&self, what: &str, at: &Outpoint) -> Result<()> {
+        match &self.second {
+            Some(second) => crosscheck::enforce_before_spend(&self.client, second, what, at).await,
+            None => Ok(()),
+        }
     }
 
     /// `coins` without those reserved by a broadcast transaction that has not confirmed.
@@ -558,6 +573,7 @@ impl ChainBackend for ZecBackend {
         amount: Amount,
         preimage: &[u8; 32],
     ) -> Result<SignedTx> {
+        self.check_before_spend("claim", at).await?;
         let branch_id = self.consensus_branch_id().await?;
         let version = self.tx_version().await?;
         let outpoint = tx::OutPoint {
@@ -585,6 +601,7 @@ impl ChainBackend for ZecBackend {
         at: &Outpoint,
         amount: Amount,
     ) -> Result<SignedTx> {
+        self.check_before_spend("refund", at).await?;
         let branch_id = self.consensus_branch_id().await?;
         let version = self.tx_version().await?;
         let outpoint = tx::OutPoint {
