@@ -121,3 +121,36 @@ fn each_backup_logs_that_it_backs_up() {
         .collect();
     assert_eq!(starts.len(), 3, "{log}");
 }
+
+/// A backup of that minute already there: Divi Core's copy fails, it logs
+/// "Failed to create backup" and keeps the one there (WalletBackupCreator.cpp:44-55)
+#[test]
+fn a_backup_name_already_there_is_a_failed_backup() {
+    let dir = tempdir().unwrap();
+    let wallet = dir.path().join("wallet");
+    std::fs::create_dir_all(&wallet).unwrap();
+    std::fs::write(wallet.join("CURRENT"), b"new").unwrap();
+    // This minute's name and the next one's, so the test does not race the clock
+    let now = std::time::SystemTime::now();
+    for at in [now, now + std::time::Duration::from_secs(60)] {
+        let taken = dir
+            .path()
+            .join("backups")
+            .join(format!("wallet{}", divi_wallet::backup::time_suffix(at)));
+        std::fs::create_dir_all(&taken).unwrap();
+        std::fs::write(taken.join("CURRENT"), b"old").unwrap();
+    }
+    let (result, log) = logged(|| backup_at_start(&wallet, dir.path(), 20));
+    result.unwrap();
+    let lines = backup_lines(&log);
+    assert_eq!(
+        lines.get(2).map(String::as_str),
+        Some("Failed to create backup"),
+        "{lines:?}"
+    );
+    assert!(!log.contains("already exists"), "{log}");
+    for entry in std::fs::read_dir(dir.path().join("backups")).unwrap() {
+        let copy = entry.unwrap().path();
+        assert_eq!(std::fs::read(copy.join("CURRENT")).unwrap(), b"old");
+    }
+}

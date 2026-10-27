@@ -136,7 +136,8 @@ fn backup_closed(
     let made = if !wallet.is_dir() {
         None
     } else if target.exists() {
-        warn!("Backup {} already exists; not made again", target.display());
+        // Core's copy_file refuses a name already there (WalletBackupCreator.cpp:44-55)
+        info!("Failed to create backup");
         None
     } else {
         copy_dir(wallet, &target).map_err(|e| {
@@ -217,7 +218,7 @@ pub fn monthly_backup(
     }
     let target = backup_path(&dir, &path, now);
     if target.exists() {
-        warn!("Backup {} already exists; not made again", target.display());
+        info!("Failed to create backup");
         return Ok(None);
     }
     wallet.backup_to(&target)?;
