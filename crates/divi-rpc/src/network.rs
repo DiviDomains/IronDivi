@@ -521,7 +521,7 @@ impl NetworkRpc {
                     "blocks_received": s.blocks_received,
                     "txs_received": s.txs_received,
                     "avg_latency_ms": s.avg_latency_ms,
-                    "is_responsive": s.is_responsive(),
+                    "is_responsive": s.is_responsive_at(peer_manager.clock().now()),
                 })
             })
             .collect();

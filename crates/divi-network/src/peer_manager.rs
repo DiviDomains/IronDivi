@@ -292,11 +292,21 @@ pub struct PeerManager {
     one_shots: parking_lot::Mutex<std::collections::VecDeque<String>>,
     /// Connected peers that go after their addr (Divi Core fOneShot)
     one_shot_peers: RwLock<HashSet<PeerId>>,
+    /// The clock the manager, its connections, bans and address book read
+    /// (the system clock unless a test gives one it moves on)
+    clock: crate::peer_clock::PeerClock,
 }
 
 impl PeerManager {
     /// Create a new peer manager
     pub fn new(config: PeerManagerConfig) -> Arc<Self> {
+        Self::with_clock(config, crate::peer_clock::PeerClock::system())
+    }
+
+    /// A peer manager on `clock`: its waits between dials, the static peers'
+    /// back-off and its connections' timeouts on the clock's `now`, bans on
+    /// its `time` and the address book on its `adjusted_time`
+    pub fn with_clock(config: PeerManagerConfig, clock: crate::peer_clock::PeerClock) -> Arc<Self> {
         let config_magic = config.magic;
         let seed_nodes = config.seed_nodes.clone();
         let tor = (config.tor_proxy, config.tor_reachable);
@@ -316,7 +326,7 @@ impl PeerManager {
             tasks: tokio_util::task::TaskTracker::new(),
             running: Default::default(),
             next_task: AtomicU64::new(0),
-            scoring: PeerScoring::new(),
+            scoring: PeerScoring::with_clock(clock.clone()),
             local_nonces: Default::default(),
             local_addresses: RwLock::new(Arc::new(Default::default())),
             tor: RwLock::new(tor),
@@ -331,11 +341,20 @@ impl PeerManager {
             spork_count_source: RwLock::new(None),
             prebound: parking_lot::Mutex::new(None),
             inbound_handshaking: AtomicUsize::new(0),
-            address_book: Arc::new(crate::addrbook::AddressBook::new(config_magic)),
+            address_book: Arc::new(crate::addrbook::AddressBook::with_clock(
+                config_magic,
+                clock.clone(),
+            )),
             gossip: crate::gossip::Gossip::new(),
             one_shots: parking_lot::Mutex::new(seed_nodes.into()),
             one_shot_peers: RwLock::new(HashSet::new()),
+            clock,
         })
+    }
+
+    /// The clock the manager reads
+    pub fn clock(&self) -> &crate::peer_clock::PeerClock {
+        &self.clock
     }
 
     /// The addresses learnt from peers
@@ -397,7 +416,7 @@ impl PeerManager {
             return;
         }
         // GetAdjustedTime (net.cpp:1147)
-        let now = divi_primitives::clock::adjusted_now();
+        let now = self.clock.adjusted_time();
         let local = self.local_addresses();
         let mut slots = self.config.max_outbound;
         while slots > 0 && self.can_connect_outbound() {
@@ -1035,7 +1054,7 @@ impl PeerManager {
                 return;
             }
             tokio::select! {
-                _ = tokio::time::sleep(DNS_SEED_DELAY) => {}
+                _ = self.clock.sleep(DNS_SEED_DELAY) => {}
                 _ = shutdown.recv() => return,
             }
             if self.is_stopping() {
@@ -1256,6 +1275,11 @@ impl PeerManager {
         true
     }
 
+    /// Whether a dial to `addr` is under way
+    pub fn is_dialling(&self, addr: &SocketAddr) -> bool {
+        self.connecting_addrs.read().contains(addr)
+    }
+
     /// Dial `addr` once, now (RPC `addnode … onetry`)
     pub fn connect_once(self: &Arc<Self>, addr: SocketAddr) {
         if self.is_banned(&addr.ip()) || !self.claim_dial(addr, DialRule::ByName) {
@@ -1327,7 +1351,8 @@ impl PeerManager {
 
         let (conn, handle) = match result {
             Ok((conn, handle)) => (
-                conn.with_spork_count(self.spork_count_source.read().clone()),
+                conn.with_spork_count(self.spork_count_source.read().clone())
+                    .with_clock(self.clock.clone()),
                 handle,
             ),
             Err(e) => {
@@ -1426,6 +1451,7 @@ impl PeerManager {
             .until_stop(connect)
             .await
             .ok_or_else(|| NetworkError::ConnectionRefused("the node is stopping".to_string()))??;
+        let conn = conn.with_clock(self.clock.clone());
         let peer_id = handle.id;
         let addr = handle.addr;
         self.scoring.register_peer(peer_id, addr.ip());
@@ -1492,7 +1518,9 @@ impl PeerManager {
             self.local_addresses(),
         )
         .await?;
-        let conn = conn.with_spork_count(self.spork_count_source.read().clone());
+        let conn = conn
+            .with_spork_count(self.spork_count_source.read().clone())
+            .with_clock(self.clock.clone());
 
         let peer_id = handle.id;
         let addr = handle.addr;
@@ -1802,7 +1830,8 @@ impl PeerManager {
                 if *failures == 0 {
                     return true;
                 }
-                last_attempt.elapsed() >= Self::backoff_duration(*failures)
+                self.clock.now().saturating_duration_since(*last_attempt)
+                    >= Self::backoff_duration(*failures)
             }
         }
     }
@@ -1810,9 +1839,10 @@ impl PeerManager {
     /// Record a static-peer connection failure, incrementing its backoff counter.
     fn record_static_peer_failure(&self, addr: SocketAddr) {
         let mut backoff = self.static_peer_backoff.write();
-        let entry = backoff.entry(addr).or_insert((0, Instant::now()));
+        let now = self.clock.now();
+        let entry = backoff.entry(addr).or_insert((0, now));
         entry.0 += 1;
-        entry.1 = Instant::now();
+        entry.1 = now;
         let delay = Self::backoff_duration(entry.0);
         debug!(
             "Static peer {} failure #{} — next retry in {:.0}s",
@@ -1853,10 +1883,10 @@ impl PeerManager {
                     });
                 }
                 for _ in 0..round {
-                    tokio::time::sleep(pause).await;
+                    self.clock.sleep(pause).await;
                 }
             }
-            tokio::time::sleep(pause).await;
+            self.clock.sleep(pause).await;
             round = (round + 1).min(10);
         }
     }
@@ -1876,7 +1906,7 @@ impl PeerManager {
     ///   6 failures → 16 min
     ///   7+ failures → 30 min (cap)
     pub async fn run_maintenance(self: Arc<Self>) {
-        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        let mut interval = self.clock.interval(Duration::from_secs(30));
         loop {
             interval.tick().await;
 
