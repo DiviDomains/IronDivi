@@ -1473,3 +1473,188 @@ fn quorum_reads_need_two_endpoints() {
     let one = backend(vec![dead_url()], MAKER_KEY);
     assert!(one.with_quorum_reads(false).is_ok());
 }
+
+// ---- quorum tip reads (EI): tip, header, median time and block status ----
+
+const TIP_C: &str = "00000000000000000001cccccccccccccccccccccccccccccccccccccccccccc";
+
+/// `server`'s tip is block `hash` at `height`, with time `1_790_000_000 + height` and median
+/// time `mtp`; `prev` is its parent, served at `/block-height/{height - 1}`.
+async fn mock_chain_tip(server: &MockServer, height: u64, hash: &str, prev: &str, mtp: u64) {
+    mock_tip(server, height).await;
+    Mock::given(method("GET"))
+        .and(path("/blocks/tip/hash"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(hash))
+        .mount(server)
+        .await;
+    mock_json(
+        server,
+        format!("/block/{hash}"),
+        json!({"id": hash, "height": height, "timestamp": 1_790_000_000 + height,
+               "mediantime": mtp, "previousblockhash": prev}),
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/block-height/{height}")))
+        .respond_with(ResponseTemplate::new(200).set_body_string(hash))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/block-height/{}", height - 1)))
+        .respond_with(ResponseTemplate::new(200).set_body_string(prev))
+        .mount(server)
+        .await;
+}
+
+async fn mock_best(server: &MockServer, hash: &str, height: u64, best: bool) {
+    mock_json(
+        server,
+        format!("/block/{hash}/status"),
+        json!({"in_best_chain": best, "height": height}),
+    )
+    .await;
+}
+
+/// Agreement, a block apart: the lower tip, its hash and header, and the lower median time.
+/// The endpoint a block ahead names the lower tip as its block at that height.
+#[tokio::test]
+async fn quorum_tip_reads_agree_on_the_lower_tip() {
+    for primary_ahead in [true, false] {
+        let (primary, secondary) = (MockServer::start().await, MockServer::start().await);
+        let (ahead, behind) = match primary_ahead {
+            true => (&primary, &secondary),
+            false => (&secondary, &primary),
+        };
+        mock_chain_tip(ahead, 101, TIP_B, TIP_A, 1_789_998_600).await;
+        mock_chain_tip(behind, 100, TIP_A, TIP_C, 1_789_998_000).await;
+        let b = quorum(&primary, &secondary);
+        assert_eq!(b.tip_height().await.unwrap(), 100, "ahead={primary_ahead}");
+        assert_eq!(b.tip_hash().await.unwrap(), TIP_A);
+        assert_eq!(
+            b.tip_header().await.unwrap(),
+            divi_swap::backend::TipHeader {
+                height: 100,
+                hash: TIP_A.into(),
+                time: 1_790_000_100,
+            }
+        );
+        assert_eq!(b.median_time_past().await.unwrap(), 1_789_998_000);
+    }
+    // Same height, same block.
+    let (primary, secondary) = (MockServer::start().await, MockServer::start().await);
+    for s in [&primary, &secondary] {
+        mock_chain_tip(s, 100, TIP_A, TIP_C, 1_789_998_000).await;
+    }
+    let b = quorum(&primary, &secondary);
+    assert_eq!(b.tip_hash().await.unwrap(), TIP_A);
+    assert_eq!(b.tip_header().await.unwrap().height, 100);
+}
+
+/// Two different blocks at one height are a disagreement: at the shared tip height, and at
+/// the lower tip's height when one endpoint is a block ahead on another branch.
+#[tokio::test]
+async fn quorum_tip_hash_two_blocks_at_one_height_is_transient() {
+    let (primary, secondary) = (MockServer::start().await, MockServer::start().await);
+    mock_chain_tip(&primary, 100, TIP_A, TIP_C, 1_789_998_000).await;
+    mock_chain_tip(&secondary, 100, TIP_B, TIP_C, 1_789_998_000).await;
+    let b = quorum(&primary, &secondary);
+    let m = transient(b.tip_hash().await);
+    assert!(m.contains(TIP_A) && m.contains(TIP_B), "{m}");
+    transient(b.tip_header().await);
+
+    let (primary, secondary) = (MockServer::start().await, MockServer::start().await);
+    // The primary is a block ahead, but its block 100 is TIP_C, not the secondary's TIP_A.
+    mock_chain_tip(&primary, 101, TIP_B, TIP_C, 1_789_998_600).await;
+    mock_chain_tip(&secondary, 100, TIP_A, TIP_C, 1_789_998_000).await;
+    let b = quorum(&primary, &secondary);
+    let m = transient(b.tip_hash().await);
+    assert!(m.contains(TIP_A) && m.contains(TIP_C), "{m}");
+    transient(b.tip_header().await);
+}
+
+#[tokio::test]
+async fn quorum_in_best_chain_needs_both_endpoints() {
+    let (primary, secondary) = (MockServer::start().await, MockServer::start().await);
+    for s in [&primary, &secondary] {
+        mock_best(s, TIP_A, 100, true).await;
+        mock_best(s, TIP_C, 100, false).await;
+    }
+    mock_best(&primary, TIP_B, 101, true).await;
+    mock_best(&secondary, TIP_B, 101, false).await;
+    let b = quorum(&primary, &secondary);
+    assert!(b.in_best_chain(100, TIP_A).await.unwrap());
+    assert!(
+        !b.in_best_chain(100, TIP_C).await.unwrap(),
+        "orphaned on both"
+    );
+    let m = transient(b.in_best_chain(101, TIP_B).await);
+    assert!(m.contains(TIP_B), "{m}");
+}
+
+/// Fail closed on the tip reads too: with either endpoint unreachable, all five are
+/// `Transient`, however healthy the other's answer looks.
+#[tokio::test]
+async fn quorum_tip_reads_with_one_endpoint_down_are_transient() {
+    let up = MockServer::start().await;
+    mock_chain_tip(&up, 100, TIP_A, TIP_C, 1_789_998_000).await;
+    mock_best(&up, TIP_A, 100, true).await;
+    for urls in [vec![up.uri(), dead_url()], vec![dead_url(), up.uri()]] {
+        let b = backend(urls, MAKER_KEY).with_quorum_reads(true).unwrap();
+        transient(b.tip_height().await);
+        transient(b.tip_hash().await);
+        transient(b.tip_header().await);
+        transient(b.median_time_past().await);
+        transient(b.in_best_chain(100, TIP_A).await);
+    }
+}
+
+/// Off (the default): the five tip reads go to the primary alone, with today's requests
+/// (height 1, hash 1, header 2, median time 2, block status 1); the secondary is not asked.
+#[tokio::test]
+async fn quorum_off_tip_reads_are_unchanged() {
+    let (primary, secondary) = (MockServer::start().await, MockServer::start().await);
+    mock_chain_tip(&primary, 101, TIP_B, TIP_A, 1_789_998_600).await;
+    mock_best(&primary, TIP_B, 101, true).await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .expect(0)
+        .mount(&secondary)
+        .await;
+    for on in [None, Some(false)] {
+        let b = backend(vec![primary.uri(), secondary.uri()], MAKER_KEY);
+        let b = match on {
+            Some(on) => b.with_quorum_reads(on).unwrap(),
+            None => b,
+        };
+        assert_eq!(b.tip_height().await.unwrap(), 101);
+        assert_eq!(b.tip_hash().await.unwrap(), TIP_B);
+        assert_eq!(b.tip_header().await.unwrap().height, 101);
+        assert_eq!(b.median_time_past().await.unwrap(), 1_789_998_600);
+        assert!(b.in_best_chain(101, TIP_B).await.unwrap());
+    }
+    let paths: Vec<String> = primary
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.url.path().to_string())
+        .collect();
+    let block = format!("/block/{TIP_B}");
+    let status = format!("/block/{TIP_B}/status");
+    let once = [
+        "/blocks/tip/height",
+        "/blocks/tip/hash",
+        "/blocks/tip/hash",
+        &block,
+        "/blocks/tip/hash",
+        &block,
+        &status,
+    ];
+    let want: Vec<String> = once
+        .iter()
+        .chain(once.iter())
+        .map(|s| s.to_string())
+        .collect();
+    assert_eq!(paths, want);
+    assert!(secondary.received_requests().await.unwrap().is_empty());
+}

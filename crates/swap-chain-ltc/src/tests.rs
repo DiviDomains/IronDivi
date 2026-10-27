@@ -1400,8 +1400,13 @@ async fn claim_crosscheck_disagree_refuses_the_claim_as_transient_naming_both_ha
 async fn claim_crosscheck_agree_builds_the_claim_and_asks_once_per_primary_tip() {
     let (pre, hash) = new_preimage();
     let h = htlc(hash);
-    let p = cc_primary(TIP_A, CC_HASH_A).await;
-    let bb = cc_blockbook(cc_bb(CC_HASH_A)).await;
+    let p = cc_primary_full(CC_HASH_B, None).await;
+    let bb = cc_source(
+        CrossCheckSource::Blockbook,
+        CC_HASH_B,
+        cc_tx(CrossCheckSource::Blockbook, None),
+    )
+    .await;
     let b = cc_mainnet(&p).with_claim_crosscheck_at(CrossCheckSource::Blockbook, bb.uri());
     let amount = Amount::from_sat(20_000);
     let signed = b.build_claim(&h, &outpoint(), amount, &pre).await.unwrap();
@@ -1410,16 +1415,22 @@ async fn claim_crosscheck_agree_builds_the_claim_and_asks_once_per_primary_tip()
     b.build_claim_at(&h, &outpoint(), amount, &pre, 10)
         .await
         .unwrap();
-    // Same primary tip on the retry: the cached result is reused, the source is asked once.
-    assert_eq!(requests_to(&bb).await, 1);
+    // Same primary tip on the retry: the cached result is reused, the source is asked once
+    // per comparison (`tip - 6`, `tip - 1`, the spend; EI).
+    assert_eq!(requests_to(&bb).await, 3);
 }
 
 #[tokio::test]
 async fn claim_crosscheck_asks_again_when_the_primary_tip_moves() {
     let (pre, hash) = new_preimage();
     let h = htlc(hash);
-    let p = cc_primary(TIP_A, CC_HASH_A).await;
-    let bb = cc_blockbook(cc_bb(CC_HASH_A)).await;
+    let p = cc_primary_full(CC_HASH_B, None).await;
+    let bb = cc_source(
+        CrossCheckSource::Blockbook,
+        CC_HASH_B,
+        cc_tx(CrossCheckSource::Blockbook, None),
+    )
+    .await;
     let b = cc_mainnet(&p).with_claim_crosscheck_at(CrossCheckSource::Blockbook, bb.uri());
     let amount = Amount::from_sat(20_000);
     b.build_claim(&h, &outpoint(), amount, &pre).await.unwrap();
@@ -1444,7 +1455,8 @@ async fn claim_crosscheck_asks_again_when_the_primary_tip_moves() {
         .await
         .unwrap_err();
     assert!(matches!(e, SwapError::Transient(_)), "{e:?}");
-    assert_eq!(requests_to(&bb).await, 2);
+    // Three on the first tip; one on the second, where `tip - 6` already disagrees (EI).
+    assert_eq!(requests_to(&bb).await, 4);
 }
 
 /// Collects formatted `tracing` output for the current thread.
@@ -1523,4 +1535,208 @@ async fn claim_crosscheck_off_sends_nothing_to_the_source_or_the_primary() {
     assert_eq!(requests_to(&bb).await, 0);
     // Off is today's request count exactly: a Fixed fee policy claim asks the primary nothing.
     assert_eq!(requests_to(&p).await, 0);
+}
+
+// --- Claim-time cross-check at `tip - 1` and of the claimed output's spend (EI) ---
+
+const CC_AT1: u64 = CC_TIP - 1;
+const SPENDER_X: &str = "abababababababababababababababababababababababababababababababab";
+const SPENDER_Y: &str = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
+
+/// [`cc_primary`] plus its block at `tip - 1` (`hash_at1`) and the outspend of
+/// [`outpoint`]: `spender` or unspent.
+async fn cc_primary_full(hash_at1: &str, spender: Option<&str>) -> MockServer {
+    let s = cc_primary(TIP_A, CC_HASH_A).await;
+    Mock::given(method("GET"))
+        .and(path(format!("/block-height/{CC_AT1}")))
+        .respond_with(ResponseTemplate::new(200).set_body_string(hash_at1))
+        .mount(&s)
+        .await;
+    let o = outpoint();
+    let body = match spender {
+        Some(t) => json!({"spent": true, "txid": t, "vin": 0, "status": {"confirmed": false}}),
+        None => json!({"spent": false}),
+    };
+    Mock::given(method("GET"))
+        .and(path(format!("/tx/{}/outspend/{}", o.txid, o.vout)))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .mount(&s)
+        .await;
+    s
+}
+
+/// A source of `kind` that has [`CC_HASH_A`] at [`CC_AT`], `hash_at1` at [`CC_AT1`] and
+/// answers `tx` for the funding transaction of [`outpoint`].
+async fn cc_source(kind: CrossCheckSource, hash_at1: &str, tx: ResponseTemplate) -> MockServer {
+    let s = MockServer::start().await;
+    let (block, txp) = match kind {
+        CrossCheckSource::Blockbook => ("/block-index", "/tx"),
+        CrossCheckSource::BlockCypher => ("/blocks", "/txs"),
+    };
+    for (h, hash) in [(CC_AT, CC_HASH_A), (CC_AT1, hash_at1)] {
+        let body = match kind {
+            CrossCheckSource::Blockbook => json!({"blockHash": hash}),
+            CrossCheckSource::BlockCypher => json!({"height": h, "hash": hash}),
+        };
+        Mock::given(method("GET"))
+            .and(path(format!("{block}/{h}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&s)
+            .await;
+    }
+    Mock::given(method("GET"))
+        .and(path(format!("{txp}/{}", outpoint().txid)))
+        .respond_with(tx)
+        .mount(&s)
+        .await;
+    s
+}
+
+/// The funding transaction as `kind` shows it: output 0 unspent, output 1 (the HTLC of
+/// [`outpoint`]) spent by `spender` or unspent.
+fn cc_tx(kind: CrossCheckSource, spender: Option<&str>) -> ResponseTemplate {
+    let txid = outpoint().txid.to_string();
+    let body = match (kind, spender) {
+        (CrossCheckSource::Blockbook, Some(t)) => json!({"txid": txid, "vout": [
+            {"n": 0, "value": "5"},
+            {"n": 1, "value": "20000", "spent": true, "spentTxId": t, "spentIndex": 0}]}),
+        (CrossCheckSource::Blockbook, None) => json!({"txid": txid, "vout": [
+            {"n": 0, "value": "5"}, {"n": 1, "value": "20000"}]}),
+        (CrossCheckSource::BlockCypher, Some(t)) => json!({"hash": txid, "outputs": [
+            {"value": 5}, {"value": 20000, "spent_by": t}]}),
+        (CrossCheckSource::BlockCypher, None) => json!({"hash": txid, "outputs": [
+            {"value": 5}, {"value": 20000}]}),
+    };
+    ResponseTemplate::new(200).set_body_json(body)
+}
+
+const BOTH_SOURCES: [CrossCheckSource; 2] =
+    [CrossCheckSource::Blockbook, CrossCheckSource::BlockCypher];
+
+async fn cc_claim(b: &LtcBackend) -> Result<SignedTx> {
+    let (pre, hash) = new_preimage();
+    b.build_claim(&htlc(hash), &outpoint(), Amount::from_sat(20_000), &pre)
+        .await
+}
+
+fn cc_held(r: Result<SignedTx>) -> String {
+    match r {
+        Err(SwapError::Transient(m)) => m,
+        other => panic!("want Transient, got {other:?}"),
+    }
+}
+
+/// Agreement at `tip - 6`, at `tip - 1` and on the spend (unspent, or the same spender):
+/// the claim is built, and the source is asked once per comparison per primary tip.
+#[tokio::test]
+async fn claim_crosscheck_agrees_at_tip_minus_one_and_on_the_spend() {
+    for kind in BOTH_SOURCES {
+        for spender in [None, Some(SPENDER_X)] {
+            let p = cc_primary_full(CC_HASH_B, spender).await;
+            let s = cc_source(kind, CC_HASH_B, cc_tx(kind, spender)).await;
+            let b = cc_mainnet(&p).with_claim_crosscheck_at(kind, s.uri());
+            cc_claim(&b).await.unwrap();
+            cc_claim(&b).await.unwrap();
+            assert_eq!(requests_to(&s).await, 3, "{kind:?} {spender:?}");
+        }
+    }
+}
+
+/// `tip - 6` agrees, `tip - 1` does not: the claim is held, naming both hashes.
+#[tokio::test]
+async fn claim_crosscheck_tip_minus_one_disagree_holds_the_claim() {
+    for kind in BOTH_SOURCES {
+        let p = cc_primary_full(CC_HASH_B, None).await;
+        let s = cc_source(kind, TIP_B, cc_tx(kind, None)).await;
+        let b = cc_mainnet(&p).with_claim_crosscheck_at(kind, s.uri());
+        let m = cc_held(cc_claim(&b).await);
+        assert!(m.contains(CC_HASH_B) && m.contains(TIP_B), "{kind:?}: {m}");
+        assert!(m.contains(&CC_AT1.to_string()), "{m}");
+    }
+}
+
+/// A spend of the claimed output that only the source shows (the primary hides it), or only
+/// the primary shows, holds the claim.
+#[tokio::test]
+async fn claim_crosscheck_spend_one_source_shows_holds_the_claim() {
+    for kind in BOTH_SOURCES {
+        for (primary, other) in [(None, Some(SPENDER_X)), (Some(SPENDER_X), None)] {
+            let p = cc_primary_full(CC_HASH_B, primary).await;
+            let s = cc_source(kind, CC_HASH_B, cc_tx(kind, other)).await;
+            let b = cc_mainnet(&p).with_claim_crosscheck_at(kind, s.uri());
+            let m = cc_held(cc_claim(&b).await);
+            assert!(
+                m.contains(SPENDER_X) && m.contains("unspent"),
+                "{kind:?}: {m}"
+            );
+            assert!(m.contains(&outpoint().to_string()), "{m}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn claim_crosscheck_two_different_spenders_holds_the_claim() {
+    for kind in BOTH_SOURCES {
+        let p = cc_primary_full(CC_HASH_B, Some(SPENDER_X)).await;
+        let s = cc_source(kind, CC_HASH_B, cc_tx(kind, Some(SPENDER_Y))).await;
+        let b = cc_mainnet(&p).with_claim_crosscheck_at(kind, s.uri());
+        let m = cc_held(cc_claim(&b).await);
+        assert!(
+            m.contains(SPENDER_X) && m.contains(SPENDER_Y),
+            "{kind:?}: {m}"
+        );
+    }
+}
+
+/// ED's rule for an unreachable source holds for the new comparisons: the source failing on
+/// the spend read (or not having `tip - 1`) warns, naming the source URL, and the claim
+/// goes ahead.
+#[tokio::test]
+async fn claim_crosscheck_source_down_on_the_new_reads_warns_and_builds_the_claim() {
+    let buf = LogBuf::default();
+    let w = buf.clone();
+    let sub = tracing_subscriber::fmt()
+        .with_writer(move || w.clone())
+        .with_ansi(false)
+        .finish();
+    let _guard = tracing::subscriber::set_default(sub);
+    for kind in BOTH_SOURCES {
+        let p = cc_primary_full(CC_HASH_B, None).await;
+        let s = cc_source(kind, CC_HASH_B, ResponseTemplate::new(500)).await;
+        let b = cc_mainnet(&p).with_claim_crosscheck_at(kind, s.uri());
+        cc_claim(&b).await.unwrap();
+        // A source that has not indexed `tip - 1` yet (Blockbook: an empty hash).
+        let p = cc_primary_full(CC_HASH_B, None).await;
+        let s = cc_source(kind, "", cc_tx(kind, None)).await;
+        let b = cc_mainnet(&p).with_claim_crosscheck_at(kind, s.uri());
+        cc_claim(&b).await.unwrap();
+    }
+    let log = buf.text();
+    let lines: Vec<&str> = log
+        .lines()
+        .filter(|l| l.contains("WARN") && l.contains("claim cross-check"))
+        .collect();
+    assert_eq!(lines.len(), 4, "{log}");
+    assert!(lines[0].contains("500"), "{}", lines[0]);
+}
+
+/// The startup check (`[ltc].crosscheck`) is unchanged: one comparison at `tip - 6`, no
+/// `tip - 1` and no spend read.
+#[tokio::test]
+async fn startup_crosscheck_still_compares_tip_minus_six_only() {
+    let p = cc_primary_full(CC_HASH_B, None).await;
+    let s = cc_source(
+        CrossCheckSource::Blockbook,
+        CC_HASH_B,
+        cc_tx(CrossCheckSource::Blockbook, None),
+    )
+    .await;
+    let pc = EsploraClient::new(vec![p.uri()], fast()).unwrap();
+    let out = tip_crosscheck(&pc, CrossCheckSource::Blockbook, &s.uri(), fast()).await;
+    assert!(
+        matches!(out, CrossCheckOutcome::Agree { height: CC_AT, .. }),
+        "{out:?}"
+    );
+    assert_eq!(requests_to(&s).await, 1);
+    assert_eq!(requests_to(&p).await, 2);
 }
