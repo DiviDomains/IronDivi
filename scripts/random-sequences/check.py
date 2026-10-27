@@ -473,10 +473,11 @@ def run_step(pair, step):
         pair.pool_before = pool_inputs(node)
         # the transactions of the blocks about to be disconnected, but their
         # coinbases and coinstakes, which no node puts back in its mempool
-        block_txs = []
+        block_txs, disconnected = [], []
         for h in range(height - depth + 1, height + 1):
             txs = node.rpc("getblock", node.rpc("getblockhash", h))["tx"]
             block_txs += [t for t in txs[1:] if not is_coinstake(pair, t)]
+            disconnected += txs[1:]
         mid_trace(pair, node, "before")
         mid_trace(pair, other, "before (other)")
         if MID_TRACE:
@@ -500,7 +501,7 @@ def run_step(pair, step):
                 time.sleep(d - (0 if d == 0.2 else {0.5: 0.2, 1: 0.5, 2: 1, 4: 2}[d]))
                 mid_trace(pair, node, f"+{d} s")
             mid_trace(pair, other, "+4 s (other)")
-        pair.reorg = {"mid": height - depth, "block_txs": block_txs,
+        pair.reorg = {"mid": height - depth, "block_txs": block_txs, "disconnected": disconnected,
                       "mid_pool": set(mid_pool[1]) if mid_pool[0] == "ok" else None}
         # the coins in full, printed with a FAIL but not compared
         coins = node.call("listunspent", 0)
@@ -1095,7 +1096,8 @@ def mid_balance_cache_explains(n, c_mid, i_mid, diff):
     (MerkleTxConfirmationNumberCalculator.cpp:51); irondivid's counts
     neither. A transaction of a disconnected block reaches the wallet again
     by the disconnect (SyncTransactions, ChainTipManager.cpp:189), which
-    recomputes the cache, so it leaves no gap. So divid's immature balance
+    recomputes the cache of the transactions it spends
+    (wallet.cpp:1318-1334): their coins leave no gap. So divid's immature balance
     is below irondivid's by just the coins of node n's wallet, immature for
     the wallet at the lowered height, that the lost mempool transactions
     spent, and its getbalance by just the mature ones; and irondivid's
@@ -1114,9 +1116,20 @@ def mid_balance_cache_explains(n, c_mid, i_mid, diff):
     pair = PAIRS[0]
     node, mid = pair.node(n), pair.reorg["mid"]
     tip = node.rpc("getblockcount")
+    # the disconnect syncs node n's transactions of the disconnected blocks
+    # (coinstakes too) to its wallet again, which drops the cache of each
+    # transaction they spend (wallet.cpp:1318-1334): its coins count unspent
+    recomputed = set()
+    for txid in pair.reorg["disconnected"]:
+        tx = node.call("gettransaction", txid)
+        decoded = node.call("decoderawtransaction", tx[1]["hex"]) if tx[0] == "ok" else tx
+        if decoded[0] == "ok":
+            recomputed |= {i.get("txid") for i in decoded[1]["vin"]}
     immature = mature = 0
     for txid in set(pair.pool_before) - pair.reorg["mid_pool"]:
         for prev_txid, vout in pair.pool_before[txid]:
+            if prev_txid in recomputed:
+                continue
             prev = node.call("gettransaction", prev_txid)
             if prev[0] != "ok":
                 continue

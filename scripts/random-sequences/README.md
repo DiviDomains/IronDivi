@@ -202,11 +202,13 @@ episode) and the remaining steps, so every comparison stays exact:
   spending it is added, `wallet.cpp:1242-1333`). So the coins that transaction spends stay spent, and its outputs to
   node n stay unconfirmed, although the transaction is now at -1 confirmations
   (`MerkleTxConfirmationNumberCalculator.cpp:51`). A transaction of a disconnected block reaches the wallet again
-  through the disconnect (`ChainTipManager.cpp:189`), which recomputes its cache entries, so it leaves no gap.
+  through the disconnect (`ChainTipManager.cpp:189`), which recomputes the cache of each transaction it spends
+  (`wallet.cpp:1318-1334`), so the coins of those transactions leave no gap.
   irondivid's wallet counts neither, so its balances agree with the coins it lists, as with **divid balance cache**.
 
   The rule does the accounting exactly. It takes the coins of node n's wallet (`validateaddress`) that the lost
-  mempool transactions spent and that exist at the lowered height. divid's immature balance must be below irondivid's
+  mempool transactions spent and that exist at the lowered height. It leaves out those of a transaction that one of
+  node n's transactions in the disconnected blocks (a coinstake too) also spends. divid's immature balance must be below irondivid's
   by just those immature for the wallet there (under 21 confirmations), and both `getbalance` fields by just the
   others. irondivid's unconfirmed balance must be the sum of the 0-confirmation coins it lists. This showed once
   irondivid's coinbases matched divid's (see "Fixed rows"), because the two sides then drop the same sends. The run
