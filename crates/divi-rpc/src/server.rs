@@ -105,84 +105,198 @@ async fn serve(
         }
     }));
     let listener = tokio::net::TcpListener::bind(config.bind_address).await?;
-    let slots = config
-        .threads
-        .clamp(0, tokio::sync::Semaphore::MAX_PERMITS as i64) as usize;
-    axum::serve(
-        listener,
-        ConnectionSlots {
-            inner: app.into_make_service_with_connect_info::<SocketAddr>(),
-            slots: Arc::new(tokio::sync::Semaphore::new(slots)),
-        },
-    )
-    .with_graceful_shutdown(stopped)
-    .await?;
+    serve_listener(listener, app, config.threads, stopped).await;
     Ok(())
 }
 
+/// Serve `app` on `listener`, each connection with hyper's HTTP/1 as Divi
+/// Core's ServiceConnection serves it (rpcserver.cpp:1000-1033), on one of
+/// `threads` slots, until `stopped`.
+///
 /// Divi Core serves each RPC connection to its end on one of its -rpcthreads
 /// threads, idle keep-alive waits included (rpcserver.cpp:755-757, :1000-1010):
 /// a connection past them waits, accepted but unread, until one closes. Each
 /// connection here takes a slot before it is served and gives it back when it
 /// closes; the accept loop waits for the slot, as Divi Core's threads do.
-#[derive(Clone)]
-struct ConnectionSlots {
-    inner: axum::extract::connect_info::IntoMakeServiceWithConnectInfo<Router, SocketAddr>,
-    slots: Arc<tokio::sync::Semaphore>,
+///
+/// Once `stopped` resolves no connection is taken (one waiting for a slot is
+/// closed unread), each connection under way ends after the call it is
+/// answering (hyper's graceful shutdown), and this returns once they have
+/// closed, as axum's graceful shutdown did.
+pub(crate) async fn serve_listener(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    threads: i64,
+    stopped: impl std::future::Future<Output = ()> + Send + 'static,
+) {
+    let slots = Arc::new(tokio::sync::Semaphore::new(
+        threads.clamp(0, tokio::sync::Semaphore::MAX_PERMITS as i64) as usize,
+    ));
+    // `stop` is closed once `stopped` resolves; each connection holds an
+    // `open` receiver until it has closed
+    let (stop, stop_rx) = tokio::sync::watch::channel(());
+    let stop = Arc::new(stop);
+    tokio::spawn(async move {
+        stopped.await;
+        drop(stop_rx);
+    });
+    let (open, open_rx) = tokio::sync::watch::channel(());
+    loop {
+        let accepted = tokio::select! {
+            accepted = listener.accept() => accepted,
+            _ = stop.closed() => break,
+        };
+        let (stream, peer) = match accepted {
+            Ok(conn) => conn,
+            Err(e) => {
+                // As axum's own loop: a connection that went away is no
+                // error; any other (such as no file left) waits a second
+                if !matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionRefused
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::ConnectionReset
+                ) {
+                    error!("RPC accept error: {e}");
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+                continue;
+            }
+        };
+        // The semaphore is never closed
+        let slot = tokio::select! {
+            slot = slots.clone().acquire_owned() => slot.ok(),
+            _ = stop.closed() => break,
+        };
+        let app = app.clone();
+        let stop = stop.clone();
+        let open = open_rx.clone();
+        tokio::spawn(async move {
+            serve_connection(stream, peer, app, stop, open).await;
+            drop(slot);
+        });
+    }
+    drop(open_rx);
+    drop(listener);
+    open.closed().await;
 }
 
-type SlotFuture<T> = std::pin::Pin<
-    Box<dyn std::future::Future<Output = Result<T, std::convert::Infallible>> + Send>,
->;
+/// One connection. A reply the router marks [`crate::http::RawReply`] is not
+/// hyper's to write: the service fails, so hyper writes nothing and lets the
+/// socket go, and [`Socket`] then writes the raw bytes, if any, and closes.
+/// Once `stop` is closed the connection ends after the call under way.
+async fn serve_connection(
+    stream: tokio::net::TcpStream,
+    peer: SocketAddr,
+    app: Router,
+    stop: Arc<tokio::sync::watch::Sender<()>>,
+    open: tokio::sync::watch::Receiver<()>,
+) {
+    let raw: Arc<parking_lot::Mutex<Option<Vec<u8>>>> = Arc::default();
+    let socket = Socket {
+        stream: Some(stream),
+        raw: raw.clone(),
+        open,
+    };
+    let service = hyper::service::service_fn(move |req: HttpRequest<hyper::body::Incoming>| {
+        let mut app = app.clone();
+        let raw = raw.clone();
+        async move {
+            let mut req = req.map(axum::body::Body::new);
+            req.extensions_mut()
+                .insert(axum::extract::ConnectInfo(peer));
+            // A Router is always ready (axum's poll_ready never waits)
+            let res = tower::Service::call(&mut app, req)
+                .await
+                .unwrap_or_else(|e| match e {});
+            match res.extensions().get::<crate::http::RawReply>() {
+                Some(reply) => {
+                    *raw.lock() = reply.0.clone();
+                    Err(std::io::Error::other(
+                        "a reply written as Divi Core writes it",
+                    ))
+                }
+                None => Ok(res),
+            }
+        }
+    });
+    let conn = hyper::server::conn::http1::Builder::new()
+        .serve_connection(hyper_util::rt::TokioIo::new(socket), service);
+    tokio::pin!(conn);
+    let mut stopping = std::pin::pin!(stop.closed());
+    let mut stop_asked = false;
+    loop {
+        tokio::select! {
+            _ = conn.as_mut() => break,
+            // once: the shutdown is asked for, then the connection runs out
+            _ = &mut stopping, if !stop_asked => {
+                stop_asked = true;
+                conn.as_mut().graceful_shutdown();
+            }
+        }
+    }
+}
 
-impl<'a> tower::Service<axum::serve::IncomingStream<'a>> for ConnectionSlots {
-    type Response =
-        Slotted<axum::middleware::AddExtension<Router, axum::extract::ConnectInfo<SocketAddr>>>;
-    type Error = std::convert::Infallible;
-    type Future = SlotFuture<Self::Response>;
+/// A connection's socket as hyper uses it. Once hyper lets it go, a reply
+/// left for it ([`crate::http::RawReply`]) is written, and the socket closed.
+struct Socket {
+    stream: Option<tokio::net::TcpStream>,
+    raw: Arc<parking_lot::Mutex<Option<Vec<u8>>>>,
+    /// Held until the socket is closed, a reply left for it written
+    open: tokio::sync::watch::Receiver<()>,
+}
 
-    fn poll_ready(
-        &mut self,
+impl Socket {
+    fn stream(&mut self) -> std::pin::Pin<&mut tokio::net::TcpStream> {
+        std::pin::Pin::new(self.stream.as_mut().expect("taken only on drop"))
+    }
+}
+
+impl Drop for Socket {
+    fn drop(&mut self) {
+        if let (Some(mut stream), Some(raw)) = (self.stream.take(), self.raw.lock().take()) {
+            let open = self.open.clone();
+            tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt;
+                let _ = stream.write_all(&raw).await;
+                let _ = stream.shutdown().await;
+                drop(open);
+            });
+        }
+    }
+}
+
+impl tokio::io::AsyncRead for Socket {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), Self::Error>> {
-        tower::Service::<axum::serve::IncomingStream<'a>>::poll_ready(&mut self.inner, cx)
-    }
-
-    fn call(&mut self, stream: axum::serve::IncomingStream<'a>) -> Self::Future {
-        let made = self.inner.call(stream);
-        let slots = self.slots.clone();
-        Box::pin(async move {
-            // The semaphore is never closed
-            let slot = slots.acquire_owned().await.ok();
-            Ok(Slotted {
-                service: made.await?,
-                _slot: Arc::new(slot),
-            })
-        })
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        self.stream().poll_read(cx, buf)
     }
 }
 
-/// A connection's service, holding its slot until the connection closes
-#[derive(Clone)]
-struct Slotted<S> {
-    service: S,
-    _slot: Arc<Option<tokio::sync::OwnedSemaphorePermit>>,
-}
-
-impl<S: tower::Service<R>, R> tower::Service<R> for Slotted<S> {
-    type Response = S::Response;
-    type Error = S::Error;
-    type Future = S::Future;
-
-    fn poll_ready(
-        &mut self,
+impl tokio::io::AsyncWrite for Socket {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), Self::Error>> {
-        self.service.poll_ready(cx)
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        self.stream().poll_write(cx, buf)
     }
 
-    fn call(&mut self, request: R) -> Self::Future {
-        self.service.call(request)
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        self.stream().poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        self.stream().poll_shutdown(cx)
     }
 }
 
@@ -1888,9 +2002,14 @@ fn build_router(
     let router = router.layer(middleware::from_fn(
         move |req: HttpRequest, next: Next| async move {
             if !crate::http::method_served(req.method()) {
-                return crate::http::error_page(StatusCode::METHOD_NOT_ALLOWED);
+                return crate::http::no_reply();
             }
             let uri = req.uri();
+            // The target must be a path: an absolute URI, an authority or
+            // "*" closes the connection unanswered too (rpcprotocol.cpp:155-157)
+            if uri.scheme().is_some() || uri.authority().is_some() || !uri.path().starts_with('/') {
+                return crate::http::no_reply();
+            }
             let path = uri.path();
             let rpc_path = path == "/"
                 || path
@@ -2029,6 +2148,52 @@ mod tests {
     use crate::protocol::RequestId;
     use divi_storage::{ChainDatabase, ChainParams};
     use tempfile::tempdir;
+
+    /// Once stop has begun no connection is taken, the call under way is
+    /// answered, and the server returns when its connection has closed
+    #[tokio::test]
+    async fn after_stop_no_connection_is_taken_and_the_call_under_way_is_answered() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let app = Router::new().route(
+            "/",
+            post(|| async {
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                "done"
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let served = tokio::spawn(serve_listener(listener, app, 4, async move {
+            let _ = stopped.await;
+        }));
+        let request = format!("POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Length: 0\r\n\r\n");
+
+        let mut under_way = tokio::net::TcpStream::connect(addr).await.unwrap();
+        under_way.write_all(request.as_bytes()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        stop.send(()).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // a new connection is refused, or closed with no reply
+        if let Ok(mut late) = tokio::net::TcpStream::connect(addr).await {
+            let _ = late.write_all(request.as_bytes()).await;
+            let mut buf = Vec::new();
+            let _ = late.read_to_end(&mut buf).await;
+            assert!(buf.is_empty(), "{}", String::from_utf8_lossy(&buf));
+        }
+
+        // the call under way is answered, and its connection then closed
+        let mut reply = Vec::new();
+        under_way.read_to_end(&mut reply).await.unwrap();
+        let reply = String::from_utf8_lossy(&reply);
+        assert!(reply.starts_with("HTTP/1.1 200 OK"), "{reply}");
+        assert!(reply.ends_with("done"), "{reply}");
+        tokio::time::timeout(std::time::Duration::from_secs(5), served)
+            .await
+            .expect("the server returns once its connections have closed")
+            .unwrap();
+    }
 
     /// A JSON null where Divi Core reads an account name, an address or a
     /// message with get_str is refused as its getter refuses it; a null
