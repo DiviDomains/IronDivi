@@ -860,6 +860,48 @@ if REWARDS:
         last = [x[1].get("lastblock") if x[0] == "ok" else x for x in since]
         row(f"rewards, fresh wallets, {label}: listsinceblock lastblock", last[0], last[1], last[0] == last[1])
 
+# 10. A reorg across a paying block (MN_LIFE_PAYMENTS=1): C and I invalidate
+# the last block that paid a masternode (the last block, when none did), I
+# mines the block in its place, then both reconsider it and go back to the
+# longer chain. The votes are kept by the block a height is scored with, 101
+# below it (MasternodePaymentData.cpp:23-43), and lastpaid comes from them
+# (RpcMasternodeFeatures.cpp:244-277), so neither follows who a block paid
+if PAYMENTS:
+    paying = [h for h, _, p in paid if p]
+    target = paying[-1] if paying else paid[-1][0]
+    old_hash = C.rpc("getblockhash", target)
+    old_tip = C.rpc("getbestblockhash")
+    pair = [C, I]
+
+    def at(hash_):
+        return wait_for(lambda: all(n.rpc("getbestblockhash") == hash_ for n in pair), 60)
+
+    def reorg_views(label):
+        compare(f"reorg, {label}: getblockcount", C.call("getblockcount"), I.call("getblockcount"))
+        wait_for(lambda: C.call("getmasternodewinners", "20") == I.call("getmasternodewinners", "20"), 30)
+        compare(f"reorg, {label}: getmasternodewinners 20", C.call("getmasternodewinners", "20"),
+                I.call("getmasternodewinners", "20"))
+        wait_for(lambda: lastpaid(C) == lastpaid(I), 30)
+        a, b = lastpaid(C), lastpaid(I)
+        row(f"reorg, {label}: listmasternodes lastpaid", a, b, a == b)
+        both(f"reorg, {label}: getmasternodecount", "getmasternodecount", mask=count_view)
+
+    info(f"reorg: invalidating height {target} (paid {[p for h, _, p in paid if h == target]})")
+    for n in pair:
+        n.rpc("invalidateblock", old_hash)
+    need(at(C.rpc("getblockhash", target - 1)), "C and I did not both go back below the paying block")
+    reorg_views("the paying block invalidated")
+    out = I.call("setgenerate", 1)
+    need(out[0] == "ok", f"{I.name} could not mine in the paying block's place: {out}")
+    need(at(I.rpc("getbestblockhash")), "C did not follow I's block")
+    payments, minted = coinstake_view(target)
+    info(f"reorg: height {target} mined by {I.name} in its place: masternode payments {payments}, minted {minted}")
+    reorg_views("a block of I's in its place")
+    for n in pair:
+        n.rpc("reconsiderblock", old_hash)
+    need(at(old_tip), "C and I did not go back to the longer chain")
+    reorg_views("back on the longer chain")
+
 for n in NODES:
     n.stop()
 print(f"# {counts['PASS']} PASS, {counts['KNOWN']} KNOWN, {counts['FAIL']} FAIL", flush=True)
