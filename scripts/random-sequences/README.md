@@ -102,6 +102,15 @@ reaches only now and then, so it is checked on every run. They are left out with
   extra nonce 1 (`BlockFactory.cpp:38-52`). So no coinbase txid matched divid's, even for a block made in the same
   second. irondivid now writes divid's.
 
+  With the coinbases the same, the row's sends often have the same txids on both sides. That showed a second,
+  rarer difference, at the end of the step (5 of 140 runs, in both directions). Node 1 is restarted by its
+  `encryptwallet` (step 156), so it lacks node 2's earlier sends, and in the middle it drops its own send that spends
+  an immature coin. Each comes back only by node 2's random mempool rebroadcast (divid `main.cpp:1280-1294`,
+  irondivid `rebroadcast.rs`). In the logs, that rebroadcast came 19 s after `reconsiderblock` on one side and later
+  than the end read on the other. So after `reconsiderblock` the script offers each node of the pair the transactions
+  of its peer's mempool that it lacks (`sendrawtransaction`, parents first), as that rebroadcast would. It does this
+  on both sides alike and compares every field after it. A node that refuses one still shows as a difference.
+
 ## Steps
 
 Each step names a node (1 or 2) and a random number `draw`, which picks amounts, coins and depths.
@@ -116,7 +125,7 @@ Each step names a node (1 or 2) and a random number `draw`, which picks amounts,
 | `fundvault` | `fundvault "<own address>:<other node's address>" <1 to 50>` |
 | `reclaim` | `reclaimvaultfunds <own address> <0.5 to 20>` |
 | `mine` | `setgenerate 1` to `3`: work blocks, and stake blocks past the last work block |
-| `invalidate` | `invalidateblock` of the block 1 to 3 below the tip, the state compared, then `reconsiderblock` |
+| `invalidate` | `invalidateblock` of the block 1 to 3 below the tip, the state compared, then `reconsiderblock`, and each node offered its peer's mempool transactions it lacks |
 | `restart` | `stop`, then a start on the same datadir |
 | `kill` | `kill -9`, then a start (see below for divid) |
 | `walletlock`, `walletpassphrase` | lock the wallet, or unlock it for 99999 s |
@@ -209,6 +218,8 @@ episode) and the remaining steps, so every comparison stays exact:
 **Settling.** After each step, each pair waits until its two nodes are connected again (after a restart, the
 `-connect` node dials again within seconds) and on one tip, and until both mempools are equal or still for 8 s. A
 transaction made while the two are apart would reach the other node only through the random mempool rebroadcast.
+An `invalidate` first offers each node the transactions of its peer's mempool that it lacks, as that rebroadcast
+would (see "Fixed rows").
 
 **divid after `kill -9`:** divid refuses to start (or aborts while loading its block index) ("Block database corruption detected! Failed to find best block in
 block index", `BlockIndexLoading.cpp:275`, `init.cpp:1082`) until it is started with `-reindex`. That is the recovery

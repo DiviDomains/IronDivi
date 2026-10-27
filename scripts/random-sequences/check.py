@@ -507,6 +507,13 @@ def run_step(pair, step):
         mid["_coins (amount, confirmations)"] = sorted(
             (str(u["amount"]), u["confirmations"]) for u in coins[1]) if coins[0] == "ok" else coins
         second = node.call("reconsiderblock", target)
+        # node n dropped its peer's spends of coins immature in the middle,
+        # and a node restarted in the episode lacks its peer's sends: each
+        # comes back only by the peer's random mempool rebroadcast (divid
+        # main.cpp:1280-1294, irondivid rebroadcast.rs), which lands before
+        # the end read on one side and after it on the other. Offer them now,
+        # as that rebroadcast would (README, "Fixed rows")
+        offer_missing(pair)
         return f"{outcome(first)}/{outcome(second)}", mid
     if kind in ("restart", "kill"):
         pair.restarted.add(n)
@@ -977,6 +984,26 @@ def spends_immature(pair, holder, txid, next_height, inputs=None):
                     return True
                 break
     return False
+
+
+def offer_missing(pair):
+    """Each node of the pair is sent the transactions of its peer's mempool
+    it lacks, parents first, as the peer's mempool rebroadcast does"""
+    for node, peer in (pair.nodes, pair.nodes[::-1]):
+        mine, theirs = node.call("getrawmempool"), peer.call("getrawmempool")
+        if mine[0] != "ok" or theirs[0] != "ok":
+            continue
+        todo = [t for t in theirs[1] if t not in mine[1]]
+        # a child is refused until its parent is in: pass again while one gets in
+        while todo:
+            left = []
+            for txid in todo:
+                raw = peer.call("getrawtransaction", txid)
+                if raw[0] != "ok" or node.call("sendrawtransaction", raw[1])[0] != "ok":
+                    left.append(txid)
+            if len(left) == len(todo):
+                break
+            todo = left
 
 
 def wallet_inputs(pair, txid):
