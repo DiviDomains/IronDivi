@@ -3000,7 +3000,11 @@ mod tests {
             );
         }
         c.mine(divi_swap::reservation::EXPIRY_ABSENT_BLOCKS);
-        assert!(refund_at(c.mtp() + 2 * 600 + 1).await.is_err());
+        assert!(
+            refund_at(c.mtp() + divi_swap::reservation::EXPIRY_MAX_TIP_AGE_SECS + 1)
+                .await
+                .is_err()
+        );
         assert_eq!(
             held(&db),
             vec![(Chain::Btc, lock_of(&s))],
@@ -3190,7 +3194,11 @@ mod tests {
             );
         }
         c.mine(divi_swap::reservation::EXPIRY_ABSENT_BLOCKS);
-        assert!(refund_at(c.mtp() + 2 * 60 + 1).await.is_err());
+        assert!(
+            refund_at(c.mtp() + divi_swap::reservation::EXPIRY_MAX_TIP_AGE_SECS + 1)
+                .await
+                .is_err()
+        );
         assert_eq!(
             held(&db),
             vec![(Chain::Divi, lock_of(&s))],

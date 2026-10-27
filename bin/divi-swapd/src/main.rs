@@ -1519,7 +1519,7 @@ mod tests {
         );
         chain.mine(divi_swap::reservation::EXPIRY_ABSENT_BLOCKS);
         assert_eq!(
-            sweep(chain.mtp() + 2 * 600 + 1).await,
+            sweep(chain.mtp() + divi_swap::reservation::EXPIRY_MAX_TIP_AGE_SECS + 1).await,
             0,
             "a stale backend releases nothing"
         );
@@ -2343,7 +2343,13 @@ mod tests {
         );
         chain.mine(1);
         assert_eq!(
-            divi_sweep(&res, &store, &divi, chain.mtp() + 2 * 60 + 1).await,
+            divi_sweep(
+                &res,
+                &store,
+                &divi,
+                chain.mtp() + divi_swap::reservation::EXPIRY_MAX_TIP_AGE_SECS + 1
+            )
+            .await,
             0,
             "a stale backend releases nothing"
         );
