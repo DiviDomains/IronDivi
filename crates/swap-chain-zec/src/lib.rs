@@ -19,6 +19,8 @@ pub mod grpc;
 pub mod tx;
 
 #[cfg(test)]
+mod lock_terms;
+#[cfg(test)]
 mod lwd_stub;
 
 use std::collections::HashSet;

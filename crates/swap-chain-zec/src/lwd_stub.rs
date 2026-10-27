@@ -12,8 +12,11 @@
 //! [`grpc`](crate::grpc) wire messages; `GetLightdInfo` (NU5's branch id) and `SendTransaction`
 //! (accepting and recording every transaction) answer too, so a claim or refund can be built
 //! and sent. [`ZecBackend`]'s `tip_header`, `in_best_chain` and
-//! the expiry sweep run over real gRPC against it.
+//! the expiry sweep run over real gRPC against it. `GetTransaction` answers the transactions
+//! put with [`Lightwalletd::put_tx`] (none by default), and [`Lightwalletd::set_down`] makes
+//! every method fail as an unreachable operator would.
 
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::future::{ready, Ready};
 use std::sync::{Arc, Mutex};
@@ -59,6 +62,10 @@ struct Chain {
     calls: Vec<&'static str>,
     /// Raw transactions received by `SendTransaction`, in order.
     sent: Vec<Vec<u8>>,
+    /// What `GetTransaction` answers, by the requested hash: (raw, height; 0 = mempool).
+    txs: HashMap<[u8; 32], (Vec<u8>, u64)>,
+    /// Every method fails `Unavailable`.
+    down: bool,
 }
 
 impl Chain {
@@ -182,6 +189,49 @@ impl Lightwalletd {
     pub(crate) fn take_sent(&self) -> Vec<Vec<u8>> {
         std::mem::take(&mut self.chain.lock().unwrap().sent)
     }
+
+    /// `GetTransaction(txid)` answers `raw` at `height` (0: in the mempool) from now on. The
+    /// stub does not check that `raw` hashes to `txid` (a lying operator need not).
+    pub(crate) fn put_tx(&self, txid: [u8; 32], raw: Vec<u8>, height: u64) {
+        self.chain.lock().unwrap().txs.insert(txid, (raw, height));
+    }
+
+    /// `GetTransaction(txid)` is not found again.
+    pub(crate) fn drop_tx(&self, txid: [u8; 32]) {
+        self.chain.lock().unwrap().txs.remove(&txid);
+    }
+
+    /// While `down`, every method fails `Unavailable` (and is not recorded).
+    pub(crate) fn set_down(&self, down: bool) {
+        self.chain.lock().unwrap().down = down;
+    }
+}
+
+/// A v5 transparent transaction with one placeholder input and `vout` as its outputs
+/// (value, scriptPubKey), as `GetTransaction` would carry a lock.
+pub(crate) fn raw_tx(vout: &[(u64, Vec<u8>)]) -> Vec<u8> {
+    crate::tx::ZecTx {
+        version: 5,
+        consensus_branch_id: 0xc2d6_d0b4,
+        lock_time: 0,
+        expiry_height: 0,
+        vin: vec![crate::tx::TxIn {
+            prevout: crate::tx::OutPoint {
+                txid: [0x11; 32],
+                n: 0,
+            },
+            script_sig: vec![0x51],
+            sequence: u32::MAX,
+        }],
+        vout: vout
+            .iter()
+            .map(|(value, script_pubkey)| crate::tx::TxOut {
+                value: *value,
+                script_pubkey: script_pubkey.clone(),
+            })
+            .collect(),
+    }
+    .serialize()
 }
 
 #[derive(Clone)]
@@ -203,6 +253,9 @@ impl Service<http::Request<Body>> for Stub {
     fn call(&mut self, req: http::Request<Body>) -> Self::Future {
         let chain = self.0.clone();
         Box::pin(async move {
+            if chain.lock().unwrap().down {
+                return Ok(Status::unavailable("stub operator is down").into_http());
+            }
             let path = req.uri().path().to_string();
             Ok(match path.as_str() {
                 "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLatestBlock" => {
@@ -278,12 +331,22 @@ fn get_block(c: &mut Chain, id: BlockId) -> Result<CompactBlock, Status> {
         .ok_or_else(|| Status::invalid_argument(format!("no block at height {}", id.height)))
 }
 
-/// Every transaction is unknown: the locks under test have dropped out.
-fn get_transaction(c: &mut Chain, _: TxFilter) -> Result<RawTransaction, Status> {
+/// A transaction put with [`Lightwalletd::put_tx`]; any other is unknown (the locks under
+/// the older tests have dropped out).
+fn get_transaction(c: &mut Chain, f: TxFilter) -> Result<RawTransaction, Status> {
     c.calls.push("GetTransaction");
-    Err(Status::not_found(
-        "No such mempool or blockchain transaction",
-    ))
+    let found = <[u8; 32]>::try_from(f.hash.as_slice())
+        .ok()
+        .and_then(|h| c.txs.get(&h));
+    match found {
+        Some((data, height)) => Ok(RawTransaction {
+            data: data.clone(),
+            height: *height,
+        }),
+        None => Err(Status::not_found(
+            "No such mempool or blockchain transaction",
+        )),
+    }
 }
 
 /// NU5's consensus branch id (the ZIP-244 test vectors' too).
