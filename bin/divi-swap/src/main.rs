@@ -148,6 +148,12 @@ struct Cli {
     /// ERC-20 (USDC) token address. Defaults to Circle's test USDC for `--usdc-network`.
     #[arg(long, global = true)]
     usdc_token: Option<String>,
+    /// A second, independent EVM JSON-RPC node. When set, the USDC reads a claim or refund rests
+    /// on (HTLC output, find-spend, confirmations, latest block time) are made on both nodes
+    /// and a disagreement, or this node not answering, is retried, never acted on. Must differ
+    /// from the `--usdc-rpc-url` in use; unset = one node.
+    #[arg(long, global = true)]
+    usdc_fallback_rpc_url: Option<String>,
     /// `monerod` RPC URL (when `--counter-chain xmr`, live).
     #[arg(long, global = true, env = "SWAP_XMR_MONEROD_URL")]
     xmr_monerod_url: Option<String>,
@@ -464,9 +470,30 @@ fn live_usdc_backend(cli: &Cli) -> Result<Arc<swap_chain_evm::UsdcBackend>> {
     let token = token
         .parse()
         .map_err(|e| anyhow::anyhow!("--usdc-token: {e}"))?;
-    Ok(Arc::new(swap_chain_evm::UsdcBackend::new(
-        &rpc_url, key, htlc, token,
-    )?))
+    let backend = swap_chain_evm::UsdcBackend::new(&rpc_url, key, htlc, token)?;
+    Ok(Arc::new(with_usdc_fallback(cli, &rpc_url, backend)?))
+}
+
+/// Apply `--usdc-fallback-rpc-url` to a USDC backend on `rpc_url`. Unset or blank leaves it
+/// untouched; the same URL as `rpc_url` is refused (one node asked twice is not a second
+/// source).
+fn with_usdc_fallback(
+    cli: &Cli,
+    rpc_url: &str,
+    backend: swap_chain_evm::UsdcBackend,
+) -> Result<swap_chain_evm::UsdcBackend> {
+    let Some(url) = cli
+        .usdc_fallback_rpc_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+    else {
+        return Ok(backend);
+    };
+    if url.trim_end_matches('/') == rpc_url.trim().trim_end_matches('/') {
+        bail!("--usdc-fallback-rpc-url must differ from --usdc-rpc-url");
+    }
+    Ok(backend.with_quorum_rpc(url)?)
 }
 
 /// Refuse `mainnet` for the btc/ltc arms without `--allow-mainnet`, and an unknown network
@@ -2325,6 +2352,95 @@ mod tests {
             .unwrap();
             assert_eq!(backend.chain(), Chain::Usdc);
         }
+    }
+
+    /// An EVM JSON-RPC node that answers `eth_getBlockByNumber` with a latest block at
+    /// `timestamp`, and refuses everything else.
+    async fn evm_node(timestamp: u64) -> wiremock::MockServer {
+        let zero = format!("0x{}", "0".repeat(64));
+        let block = serde_json::json!({
+            "hash": format!("0x{}", "bc".repeat(32)), "parentHash": zero, "sha3Uncles": zero,
+            "miner": format!("0x{}", "0".repeat(40)), "stateRoot": zero,
+            "transactionsRoot": zero, "receiptsRoot": zero,
+            "logsBloom": format!("0x{}", "0".repeat(512)), "difficulty": "0x0",
+            "number": "0x64", "gasLimit": "0x1c9c380", "gasUsed": "0x0",
+            "timestamp": format!("{timestamp:#x}"), "extraData": "0x", "mixHash": zero,
+            "nonce": "0x0000000000000000", "baseFeePerGas": "0x3b9aca00", "uncles": [],
+            "transactions": [],
+        });
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(move |req: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+                let mut reply = match body["method"].as_str() {
+                    Some("eth_getBlockByNumber") => serde_json::json!({"result": block}),
+                    _ => serde_json::json!({"error": {"code": -32601, "message": "unmocked"}}),
+                };
+                reply["jsonrpc"] = "2.0".into();
+                reply["id"] = body["id"].clone();
+                wiremock::ResponseTemplate::new(200).set_body_json(reply)
+            })
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn usdc_on(rpc_url: &str) -> swap_chain_evm::UsdcBackend {
+        swap_chain_evm::UsdcBackend::new(
+            rpc_url,
+            swap_chain_evm::PrivateKeySigner::random(),
+            "0x1111111111111111111111111111111111111111"
+                .parse()
+                .unwrap(),
+            swap_chain_evm::SEPOLIA_USDC.parse().unwrap(),
+        )
+        .unwrap()
+    }
+
+    async fn requests(node: &wiremock::MockServer) -> usize {
+        node.received_requests().await.unwrap_or_default().len()
+    }
+
+    #[tokio::test]
+    async fn usdc_fallback_flag_makes_the_backend_ask_the_second_node() {
+        let (primary, second) = (evm_node(2_000).await, evm_node(1_000).await);
+        let c = cli(&["--usdc-fallback-rpc-url", &second.uri()]);
+        assert_eq!(
+            c.usdc_fallback_rpc_url.as_deref(),
+            Some(second.uri().as_str())
+        );
+        let b = with_usdc_fallback(&c, &primary.uri(), usdc_on(&primary.uri())).unwrap();
+        // The smaller of the two latest-block times (`quorum.rs`).
+        assert_eq!(b.median_time_past().await.unwrap(), 1_000);
+        assert_eq!(requests(&second).await, 1);
+    }
+
+    #[tokio::test]
+    async fn usdc_fallback_unset_or_blank_reads_one_node() {
+        for flags in [&[][..], &["--usdc-fallback-rpc-url", "  "][..]] {
+            let (primary, second) = (evm_node(2_000).await, evm_node(1_000).await);
+            let c = cli(flags);
+            let b = with_usdc_fallback(&c, &primary.uri(), usdc_on(&primary.uri())).unwrap();
+            assert_eq!(b.median_time_past().await.unwrap(), 2_000);
+            assert_eq!(requests(&primary).await, 1);
+            assert_eq!(requests(&second).await, 0);
+        }
+    }
+
+    #[test]
+    fn usdc_fallback_equal_to_the_rpc_url_is_refused() {
+        let c = cli(&["--usdc-fallback-rpc-url", " http://127.0.0.1:8545/ "]);
+        let err = with_usdc_fallback(
+            &c,
+            "http://127.0.0.1:8545",
+            usdc_on("http://127.0.0.1:8545"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("--usdc-fallback-rpc-url") && err.contains("--usdc-rpc-url"),
+            "{err}"
+        );
     }
 
     // ---- lock-input reservations: two takers on one wallet and one --db ----

@@ -67,6 +67,11 @@ key = "credential:maker-btc"
 network = "sepolia"
 # allow_mainnet = false      # default; mainnet moves real money — off until a reviewed mainnet cutover
 rpc_url = "https://ethereum-sepolia-rpc.publicnode.com"
+# Second, independent EVM JSON-RPC node (ideally your own; must differ from rpc_url). When
+# set, the HTLC lock, spend, confirmation and block-time reads ask both nodes and a
+# disagreement is retried, never acted on; while it is down or behind, claims and refunds
+# wait. Off by default.
+# fallback_rpc_url = "http://127.0.0.1:8545"
 # Placeholder until Erc20Htlc is deployed to Sepolia (orchestrator, funded key) — fill in
 # the real address before enabling a usdc offer.
 htlc = "0x0000000000000000000000000000000000000000"

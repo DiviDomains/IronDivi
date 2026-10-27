@@ -38,6 +38,8 @@ and with `esplora_url` unset the mainnet endpoints come from the crate defaults.
 `[usdc].network` defaults to `sepolia`; the mainnets `ethereum` and `base` likewise need
 `allow_mainnet = true` and a matching top-level `profile = "mainnet"`.
 
+`[usdc].fallback_rpc_url` (unset by default) names a second, independent EVM JSON-RPC node, ideally your own. When set, the reads a claim or refund rests on (the HTLC lock, the spend of it, confirmations and the latest block time) are asked of both nodes: a lock or spend only one node reports, two different spends, or a lock at another amount is `Transient` (the engine retries; nothing is decided on a split view), and of two confirmation counts or block times the smaller is used. It must differ from `[usdc].rpc_url` (or the network's default when that is unset), or the config is refused at load. The cost: it fails closed, so while the second node is down, rate-limited or behind, those reads stay `Transient` and a claim or refund waits until it answers and catches up. Tip, sending, nonces, gas and balances stay on `rpc_url`. Not required on a mainnet profile. The taker CLI's matching flag is `divi-swap --usdc-fallback-rpc-url`.
+
 ## Secrets
 
 Keys never touch disk locally or argv. `provision-secrets` runs `op read` and pipes the value

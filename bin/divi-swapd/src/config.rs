@@ -236,6 +236,14 @@ pub struct UsdcSection {
     pub allow_mainnet: bool,
     /// EVM JSON-RPC URL. Defaults to a free public endpoint for `network`.
     pub rpc_url: Option<String>,
+    /// Second, independent EVM JSON-RPC node (ideally the operator's own). When set, the
+    /// reads a claim or refund rests on (`htlc_output`, `find_spend`, `confirmations`,
+    /// `median_time_past`) are asked of both nodes and a disagreement, or this node not
+    /// answering, is `Transient` (retried later), never a decision
+    /// (`swap_chain_evm::UsdcBackend::with_quorum_rpc`). Off by default; optional on every
+    /// profile.
+    #[serde(default)]
+    pub fallback_rpc_url: Option<String>,
     /// Deployed `Erc20Htlc` contract address.
     pub htlc: String,
     /// ERC-20 (USDC) token address. Defaults to Circle's test USDC for `network`.
@@ -262,6 +270,22 @@ impl UsdcSection {
             Some(u) => u.clone(),
             None => self.network()?.default_rpc_url().to_string(),
         })
+    }
+
+    /// `fallback_rpc_url` when set and non-blank; an identical URL to `rpc_url` is refused
+    /// because it would make the "second" node a copy of the first.
+    pub fn fallback_rpc_url(&self) -> Result<Option<String>> {
+        let Some(f) = self.fallback_rpc_url.as_deref().map(str::trim) else {
+            return Ok(None);
+        };
+        if f.is_empty() {
+            return Ok(None);
+        }
+        let norm = |u: &str| u.trim().trim_end_matches('/').to_string();
+        if norm(f) == norm(&self.rpc_url()?) {
+            bail!("[usdc].fallback_rpc_url must differ from [usdc].rpc_url");
+        }
+        Ok(Some(f.to_string()))
     }
 
     /// `token`, or `network`'s USDC token address if unset.
@@ -789,6 +813,7 @@ impl DaemonConfig {
         }
         if let Some(u) = &self.usdc {
             let network = u.network()?;
+            u.fallback_rpc_url()?;
             if network.is_mainnet() && !u.allow_mainnet {
                 bail!(
                     "[usdc].network = {:?}: usdc mainnet moves real money: no mainnet \
@@ -1013,6 +1038,38 @@ key = "credential:btc"
         assert_eq!(d.fallback_rpc_url().unwrap(), None);
         let d = with("rpc_url = \"http://a:1\"\nfallback_rpc_url = \"http://a:1\"");
         assert!(d.fallback_rpc_url().is_err());
+    }
+
+    #[test]
+    fn usdc_fallback_rpc_url_is_off_by_default_and_must_differ_from_the_primary() {
+        let usdc = |extra: &str| {
+            DaemonConfig::parse(&format!(
+                "{GOOD}\n[usdc]\n{extra}\nhtlc = \"0x00\"\nkey = \"credential:usdc\"\n"
+            ))
+        };
+        let u = usdc("").unwrap().usdc.unwrap();
+        assert_eq!(u.fallback_rpc_url, None);
+        assert_eq!(u.fallback_rpc_url().unwrap(), None);
+        let u = usdc("fallback_rpc_url = \"  \"").unwrap().usdc.unwrap();
+        assert_eq!(u.fallback_rpc_url().unwrap(), None);
+        let u = usdc("rpc_url = \"http://a:1\"\nfallback_rpc_url = \" http://b:2 \"")
+            .unwrap()
+            .usdc
+            .unwrap();
+        assert_eq!(u.fallback_rpc_url().unwrap().as_deref(), Some("http://b:2"));
+        // The same node twice is refused at load, naming both keys: an explicit primary, and
+        // the network's default primary when `rpc_url` is unset.
+        let default = swap_chain_evm::UsdcNetwork::Sepolia.default_rpc_url();
+        for same in [
+            "rpc_url = \"http://a:1\"\nfallback_rpc_url = \" http://a:1/ \"".to_string(),
+            format!("fallback_rpc_url = \"{default}\""),
+        ] {
+            let err = usdc(&same).unwrap_err().to_string();
+            assert!(
+                err.contains("[usdc].fallback_rpc_url") && err.contains("[usdc].rpc_url"),
+                "{err}"
+            );
+        }
     }
 
     #[test]
