@@ -2287,6 +2287,29 @@ impl WalletDb {
             .collect()
     }
 
+    /// Core's AvailableCoins with fOnlyConfirmed false, as listunspent reads
+    /// it: the spendable coins of [`get_spendable_utxos`](Self::get_spendable_utxos)
+    /// without the coins of a mempool transaction that the next block could
+    /// not hold, IsFinalTx at the next height and the adjusted time
+    /// (AvailableUtxoCalculator.cpp:84). A block disconnected below a lock
+    /// height gives such a transaction back to the mempool; the unconfirmed
+    /// balance still counts it, as Core's does.
+    pub fn get_available_utxos(&self, current_height: u32) -> Vec<WalletUtxo> {
+        let next = current_height.saturating_add(1);
+        let now = divi_primitives::clock::adjusted_now().max(0) as u32;
+        let not_final: HashSet<Hash256> = self
+            .mempool_txs
+            .read()
+            .iter()
+            .filter(|(_, entry)| !entry.tx.is_final(next, now))
+            .map(|(txid, _)| *txid)
+            .collect();
+        self.get_spendable_utxos(current_height, 0)
+            .into_iter()
+            .filter(|utxo| utxo.height.is_some() || !not_final.contains(&utxo.txid))
+            .collect()
+    }
+
     /// Reconcile wallet UTXOs against the chain's UTXO set.
     /// Removes wallet UTXOs that the chain does not have (phantom UTXOs).
     ///
@@ -2386,7 +2409,8 @@ impl WalletDb {
     /// outputs are added only with `-spendzeroconfchange`, which is off by
     /// default: those of wallet transactions whose inputs are all ours
     /// (wallet.cpp:1848, AvailableUtxoCollector.cpp:33-43,
-    /// AvailableUtxoCalculator.cpp:84-85). The send's coin selection orders them.
+    /// AvailableUtxoCalculator.cpp:84-85), and only when the next block could
+    /// hold their transaction. The send's coin selection orders them.
     pub fn get_send_candidates(
         &self,
         current_height: u32,
@@ -2395,7 +2419,7 @@ impl WalletDb {
         let zero_conf = self
             .spend_zero_conf_change
             .load(std::sync::atomic::Ordering::Relaxed);
-        self.get_spendable_utxos(current_height, 0)
+        self.get_available_utxos(current_height)
             .into_iter()
             .filter(|utxo| {
                 let confirmations = utxo.confirmations(current_height);
