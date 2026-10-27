@@ -331,6 +331,8 @@ fn chain_datadir_of_another_network_is_refused() {
     // Without a wallet nothing else notices the network
     for extra in [&[][..], &["--disablewallet"][..]] {
         let mut cmd = irondivid(datadir, "--testnet", free_port());
+        // off regtest the user name must not be the password (rpcserver.cpp:656)
+        cmd.args(["--rpcpassword", "testnet"]);
         cmd.args(extra);
         let out = run_to_exit(cmd, 60).unwrap_or_else(|| {
             panic!("{extra:?}: testnet irondivid kept running on a regtest datadir")
