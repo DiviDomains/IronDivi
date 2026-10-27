@@ -248,10 +248,20 @@ pub struct DetachedTx {
 
 #[derive(Debug, Clone)]
 struct MempoolWalletTx {
-    /// Every outpoint the transaction spends (ours or not), for conflict checks
+    /// Every outpoint the transaction spends (ours or not): each is spent
+    /// while the transaction is in the mempool, whenever the wallet learns of
+    /// the coin (see `mempool_spent_in`)
     inputs: Vec<OutPoint>,
-    /// The subset of `inputs` that belong to this wallet
+    /// The inputs that are coins of this wallet, as far as it knows: those it
+    /// held when the transaction came, and those it got back since
+    /// (`claim_mempool_inputs`)
     spends: Vec<OutPoint>,
+    /// Whether one of `spends` is a vault coin
+    spends_vault: bool,
+    /// The sum of `spends` (Divi Core's debit)
+    sent: Amount,
+    /// The sum of `outputs` (Divi Core's credit)
+    received: Amount,
     /// Outputs paying this wallet (height None)
     outputs: Vec<WalletUtxo>,
     /// Core's IsTrusted for a 0-conf transaction: every input is ours
@@ -260,6 +270,40 @@ struct MempoolWalletTx {
     record: WalletTx,
     /// The transaction itself, to store and to resubmit after a restart
     tx: divi_primitives::transaction::Transaction,
+}
+
+impl MempoolWalletTx {
+    /// Count `coin`, the input at `outpoint`, as the wallet's own
+    fn count_input(&mut self, outpoint: OutPoint, coin: &WalletUtxo) {
+        self.spends.push(outpoint);
+        self.sent += coin.value;
+        self.spends_vault |= divi_script::is_staking_vault_script(&coin.script_pubkey);
+        self.settle();
+    }
+
+    /// The history entry's amount, fee and category, and the trust, from the
+    /// inputs and outputs counted as the wallet's
+    fn settle(&mut self) {
+        let net_amount = self.received.as_sat() - self.sent.as_sat();
+        self.record.amount = net_amount;
+        self.record.fee = if self.sent > Amount::ZERO {
+            let total_outputs = self
+                .tx
+                .vout
+                .iter()
+                .filter(|o| !o.is_empty())
+                .map(|o| o.value)
+                .fold(Amount::ZERO, |a, b| a + b);
+            (self.sent > total_outputs).then(|| self.sent - total_outputs)
+        } else {
+            None
+        };
+        self.record.category = if net_amount > 0 { "receive" } else { "send" }.to_string();
+        // Core trusts an unconfirmed transaction whose every input is a
+        // spendable coin of ours (AvailableUtxoCalculator.cpp:43-53); a vault
+        // coin is not spendable in that sense
+        self.trusted = self.spends.len() == self.inputs.len() && !self.spends_vault;
+    }
 }
 
 /// Wallet database
@@ -2175,10 +2219,7 @@ impl WalletDb {
     /// transactions that spend only our coins (our own change).
     fn effective_utxos(&self) -> Vec<(WalletUtxo, CoinSource)> {
         let overlay = self.mempool_txs.read();
-        let spent: HashSet<OutPoint> = overlay
-            .values()
-            .flat_map(|e| e.spends.iter().copied())
-            .collect();
+        let spent = Self::mempool_spent_in(&overlay);
 
         let utxos = self.utxos.read();
         let mut result: Vec<(WalletUtxo, CoinSource)> = utxos
@@ -2203,6 +2244,83 @@ impl WalletDb {
             }
         }
         result
+    }
+
+    /// Every outpoint a wallet transaction in the mempool spends. Divi Core
+    /// records each input of a wallet transaction, its own coin or not
+    /// (SpentOutputTracker::AddToSpends, SpentOutputTracker.cpp:60-68), and
+    /// asks at each call whether a spender is in the chain or the mempool
+    /// (IsSpent, :22-34). So a coin the wallet holds only after its spender
+    /// came (one a disconnected block had spent, put back by the rollback; a
+    /// coin of an imported key; a block scanned after the mempool took the
+    /// spend) is spent all the same, and its spender's change is not counted
+    /// on top of it.
+    fn mempool_spent_in(overlay: &HashMap<Hash256, MempoolWalletTx>) -> HashSet<OutPoint> {
+        overlay
+            .values()
+            .flat_map(|e| e.inputs.iter().copied())
+            .collect()
+    }
+
+    /// The coin of the wallet's at `outpoint`: a confirmed one, or an output
+    /// of one of its mempool transactions
+    fn wallet_coin(
+        outpoint: &OutPoint,
+        utxos: &HashMap<OutPoint, WalletUtxo>,
+        overlay: &HashMap<Hash256, MempoolWalletTx>,
+    ) -> Option<WalletUtxo> {
+        utxos.get(outpoint).cloned().or_else(|| {
+            overlay
+                .get(&outpoint.txid)
+                .and_then(|e| e.outputs.iter().find(|u| u.vout == outpoint.vout).cloned())
+        })
+    }
+
+    /// Count, for each wallet transaction in the mempool, the inputs that
+    /// have become coins of the wallet since it came: a coin a rollback put
+    /// back, one of a block scanned after the mempool took the spend, an
+    /// output of a mempool transaction the wallet heard of after its child.
+    /// Divi Core's wallet keeps every transaction it has seen, a disconnected
+    /// one too, so it knows such a coin as its own from the start and counts
+    /// it in the spend's debit, fee and trust.
+    fn claim_mempool_inputs(&self) {
+        let mut overlay = self.mempool_txs.write();
+        if overlay.is_empty() {
+            return;
+        }
+        let utxos = self.utxos.read();
+        Self::claim_inputs_in(&mut overlay, &utxos);
+    }
+
+    fn claim_inputs_in(
+        overlay: &mut HashMap<Hash256, MempoolWalletTx>,
+        utxos: &HashMap<OutPoint, WalletUtxo>,
+    ) {
+        let found: Vec<(Hash256, OutPoint, WalletUtxo)> = overlay
+            .iter()
+            .flat_map(|(txid, e)| {
+                e.inputs
+                    .iter()
+                    .filter(|op| !e.spends.contains(op))
+                    .filter_map(|op| {
+                        Self::wallet_coin(op, utxos, overlay).map(|coin| (*txid, *op, coin))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        for (txid, outpoint, coin) in found {
+            if let Some(entry) = overlay.get_mut(&txid) {
+                entry.count_input(outpoint, &coin);
+                info!(
+                    "Mempool wallet tx {} spends {}:{}, back in the wallet ({} {} sats)",
+                    txid,
+                    outpoint.txid,
+                    outpoint.vout,
+                    entry.record.category,
+                    entry.record.amount.abs()
+                );
+            }
+        }
     }
 
     /// Every output the wallet has received, spent or not: confirmed coins
@@ -2254,11 +2372,7 @@ impl WalletDb {
 
     /// Outpoints spent by wallet transactions in the mempool
     fn mempool_spent(&self) -> HashSet<OutPoint> {
-        self.mempool_txs
-            .read()
-            .values()
-            .flat_map(|e| e.spends.iter().copied())
-            .collect()
+        Self::mempool_spent_in(&self.mempool_txs.read())
     }
 
     /// Get spendable UTXOs (mature and confirmed)
@@ -3422,6 +3536,7 @@ impl WalletDb {
         let mut received = Amount::ZERO;
         let mut sent = Amount::ZERO;
         let mut is_relevant = false;
+        let mut added_coin = false;
 
         // Check outputs for coins we receive
         for (vout, output) in tx.vout.iter().enumerate() {
@@ -3450,6 +3565,7 @@ impl WalletDb {
                 // bring back a coin already seen spent
                 if !self.spent.read().contains(&utxo.outpoint()) {
                     self.add_utxo(utxo);
+                    added_coin = true;
                 }
                 if !address.is_empty() {
                     self.mark_address_used(&address);
@@ -3555,6 +3671,9 @@ impl WalletDb {
         if block_hash.is_some() {
             self.drop_confirmed_from_mempool(tx);
         }
+        if added_coin {
+            self.claim_mempool_inputs();
+        }
     }
 
     /// Label for an output we own: its address as Divi Core's
@@ -3655,88 +3774,66 @@ impl WalletDb {
             return false;
         }
 
+        let inputs: Vec<OutPoint> = tx
+            .vin
+            .iter()
+            .filter(|i| !i.prevout.is_null())
+            .map(|i| OutPoint::new(i.prevout.txid, i.prevout.vout))
+            .collect();
+        let mut entry = MempoolWalletTx {
+            inputs,
+            spends: Vec::new(),
+            spends_vault: false,
+            sent: Amount::ZERO,
+            received,
+            outputs,
+            trusted: false,
+            record: WalletTx {
+                txid,
+                block_hash: None,
+                block_height: None,
+                timestamp: restored_time.unwrap_or_else(|| {
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs()
+                }),
+                amount: 0,
+                fee: None,
+                category: String::new(),
+                confirmations: 0,
+            },
+            tx: tx.clone(),
+        };
         // Inputs we own: confirmed coins, or outputs of our other mempool txs
-        let mut inputs = Vec::new();
-        let mut spends = Vec::new();
-        let mut sent = Amount::ZERO;
-        let mut spends_vault = false;
-        {
-            let utxos = self.utxos.read();
-            for input in &tx.vin {
-                if input.prevout.is_null() {
-                    continue;
-                }
-                let outpoint = OutPoint::new(input.prevout.txid, input.prevout.vout);
-                inputs.push(outpoint);
-                let coin = utxos.get(&outpoint).cloned().or_else(|| {
-                    overlay
-                        .get(&outpoint.txid)
-                        .and_then(|e| e.outputs.iter().find(|u| u.vout == outpoint.vout).cloned())
-                });
-                if let Some(coin) = coin {
-                    spends.push(outpoint);
-                    sent += coin.value;
-                    spends_vault |= divi_script::is_staking_vault_script(&coin.script_pubkey);
-                }
+        let utxos = self.utxos.read();
+        for outpoint in entry.inputs.clone() {
+            if let Some(coin) = Self::wallet_coin(&outpoint, &utxos, &overlay) {
+                entry.count_input(outpoint, &coin);
             }
         }
+        entry.settle();
 
-        if spends.is_empty() && outputs.is_empty() {
+        if entry.spends.is_empty() && entry.outputs.is_empty() {
             return false;
         }
 
-        let net_amount = received.as_sat() - sent.as_sat();
-        let fee = if sent > Amount::ZERO {
-            let total_outputs = tx
-                .vout
-                .iter()
-                .filter(|o| !o.is_empty())
-                .map(|o| o.value)
-                .fold(Amount::ZERO, |a, b| a + b);
-            (sent > total_outputs).then(|| sent - total_outputs)
-        } else {
-            None
-        };
-        let category = if net_amount > 0 { "receive" } else { "send" };
-        let record = WalletTx {
-            txid,
-            block_hash: None,
-            block_height: None,
-            timestamp: restored_time.unwrap_or_else(|| {
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs()
-            }),
-            amount: net_amount,
-            fee,
-            category: category.to_string(),
-            confirmations: 0,
-        };
-
-        // Core trusts an unconfirmed transaction whose every input is a
-        // spendable coin of ours (AvailableUtxoCalculator.cpp:33-43); a vault
-        // coin is not spendable in that sense
-        let trusted = spends.len() == inputs.len() && !spends_vault;
         info!(
             "Mempool wallet tx {} {} {} sats ({})",
-            category,
+            entry.record.category,
             txid,
-            net_amount.abs(),
-            if trusted { "trusted" } else { "untrusted" }
+            entry.record.amount.abs(),
+            if entry.trusted {
+                "trusted"
+            } else {
+                "untrusted"
+            }
         );
-        let timestamp = record.timestamp;
-        overlay.insert(
-            txid,
-            MempoolWalletTx {
-                trusted,
-                inputs,
-                spends,
-                outputs,
-                record,
-                tx: tx.clone(),
-            },
-        );
+        let timestamp = entry.record.timestamp;
+        overlay.insert(txid, entry);
+        // A transaction already here that spends one of this one's outputs
+        Self::claim_inputs_in(&mut overlay, &utxos);
+        drop(utxos);
         drop(overlay);
 
         if restored_time.is_none() {
@@ -4063,6 +4160,9 @@ impl WalletDb {
             dirty.spent = true;
         }
         drop(pending);
+        if restored > 0 {
+            self.claim_mempool_inputs();
+        }
         // Kept, at depth -1, until a block or the mempool has them again;
         // Divi Core updates each one as its block is disconnected
         for (txid, timestamp, moves_to_mempool) in disconnected {
