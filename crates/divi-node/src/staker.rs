@@ -2780,6 +2780,32 @@ fn compute_merkle_root(transactions: &[Transaction]) -> Hash256 {
 mod tests {
     use super::*;
 
+    /// The kernel search starts where divid's attachBlockProof starts it
+    /// (PoSTransactionCreator.cpp:335-341)
+    #[test]
+    fn kernel_search_start_is_divids() {
+        let now = 1_750_000_000i64;
+        let t = now as u32;
+        // Regtest: the adjusted time, or the median time plus one past it
+        assert_eq!(kernel_search_start(now, t - 300, false, 0), Some(t));
+        assert_eq!(kernel_search_start(now, t, false, 0), Some(t + 1));
+        assert_eq!(kernel_search_start(now, t + 100, false, 0), Some(t + 101));
+        // A network that retargets: the hash drift past the median time too
+        assert_eq!(kernel_search_start(now, t - 300, true, 0), Some(t));
+        assert_eq!(kernel_search_start(now, t - 45, true, 0), Some(t + 1));
+        assert_eq!(kernel_search_start(now, t - 10, true, 0), Some(t + 36));
+        // Not before the start of a round at this height that found nothing
+        assert_eq!(kernel_search_start(now, t - 300, false, t + 7), Some(t + 7));
+        assert_eq!(kernel_search_start(now, t - 300, true, t - 1), Some(t));
+        // Never past the adjusted time plus 179, and nothing when that is
+        // not past the floor
+        assert_eq!(kernel_search_start(now, t + 177, false, 0), Some(t + 178));
+        assert_eq!(kernel_search_start(now, t + 178, false, 0), None);
+        assert_eq!(kernel_search_start(now, t + 133, true, 0), None);
+        assert_eq!(kernel_search_start(now, t + 132, true, 0), Some(t + 178));
+        assert_eq!(kernel_search_start(now, t - 300, false, t + 179), None);
+    }
+
     /// Where the regtest lottery and treasury cycles coincide before the
     /// superblock transition, the staker pays the treasury only, as Divi Core's
     /// FillBlockPayee does; paying both made the coinstake mint too much.
