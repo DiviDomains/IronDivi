@@ -41,9 +41,20 @@ const UNAUTHORIZED_BODY: &str =
 <BODY><H1>401 Unauthorized.</H1></BODY>\r\n\
 </HTML>\r\n";
 
-/// Divi Core's HTTPError for 401: "401 Authorization Required", a Basic
-/// challenge and an HTML page. Divi Core writes it as HTTP/1.0 and closes the
-/// connection; here the close is said with "Connection: close".
+/// A reply hyper does not write: the RPC server's connection (server.rs,
+/// `serve_listener`) writes these bytes as they are, or nothing at all when
+/// there are none, and closes. Divi Core writes some replies its own way,
+/// which hyper's rules would change: a 401 with no Connection header
+/// followed by the close.
+#[derive(Clone, Debug)]
+pub struct RawReply(pub Option<Vec<u8>>);
+
+/// Divi Core's HTTPError for 401: "401 Authorization Required" as HTTP/1.0, a
+/// Basic challenge and an HTML page, with no Connection header, and the
+/// connection closed after it (rpcprotocol.cpp:85-105, rpcserver.cpp:1020-1022).
+/// hyper would add "connection: close" to a reply on a connection it means to
+/// close, so the bytes go out as a [`RawReply`]; the response itself is what
+/// a caller of the router sees. No Server line: irondivid sends none.
 pub fn unauthorized() -> Response<Body> {
     let mut res = Response::new(Body::from(UNAUTHORIZED_BODY));
     *res.status_mut() = StatusCode::UNAUTHORIZED;
@@ -52,13 +63,25 @@ pub fn unauthorized() -> Response<Body> {
         .insert(hyper::ext::ReasonPhrase::from_static(
             b"Authorization Required",
         ));
+    let date = chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S +0000");
+    let raw = format!(
+        "HTTP/1.0 401 Authorization Required\r\n\
+         Date: {date}\r\n\
+         WWW-Authenticate: Basic realm=\"jsonrpc\"\r\n\
+         Content-Type: text/html\r\n\
+         Content-Length: {}\r\n\
+         \r\n\
+         {UNAUTHORIZED_BODY}",
+        UNAUTHORIZED_BODY.len()
+    );
+    res.extensions_mut()
+        .insert(RawReply(Some(raw.into_bytes())));
     let h = res.headers_mut();
     h.insert(
         header::WWW_AUTHENTICATE,
         HeaderValue::from_static("Basic realm=\"jsonrpc\""),
     );
     h.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/html"));
-    h.insert(header::CONNECTION, HeaderValue::from_static("close"));
     res
 }
 
