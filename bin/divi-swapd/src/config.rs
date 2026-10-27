@@ -254,6 +254,9 @@ pub struct LtcSection {
     /// It also checks every LTC lock read (before the maker funds, before the taker claims)
     /// against the source's script and value at the outpoint; there a disagreeing or
     /// unreachable source holds the swap (fail closed), since nothing is revealed or paid yet.
+    /// And every LTC `find_spend` (the maker's preimage watch, the refund checks): a spend
+    /// only one side shows, two spenders, or one spender with another witness is `Transient`;
+    /// an unreachable source warns and the primary's answer stands, as for the claim.
     #[serde(default)]
     pub crosscheck_before_claim: bool,
     /// Where the expiry sweep may start counting a dropped LTC lock's absent blocks:

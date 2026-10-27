@@ -22,14 +22,17 @@
 //! it, so one block of lag is not a disagreement) and the spend of the output being claimed.
 //! With it on, every lock read (`htlc_output`: the maker about to fund against the taker's
 //! lock, the taker about to claim the maker's) also compares the output's script and value
-//! with the source ([`lock_view`], [`agree_lock`]) and fails closed.
+//! with the source ([`lock_view`], [`agree_lock`]) and fails closed. Every `find_spend` (EN)
+//! is agreed with the source's view of the spend ([`agree_find_spend`]): two answers that
+//! differ are `Transient`, a source that cannot be read leaves the primary's answer.
 
 use std::str::FromStr;
 
-use divi_swap::{LockedOutput, Outpoint};
+use bitcoin::hashes::Hash;
+use divi_swap::{LockedOutput, Outpoint, SpendInfo, Txid};
 use serde_json::Value;
 
-use crate::client::{EsploraClient, RetryPolicy};
+use crate::client::{ClientError, EsploraClient, RetryPolicy};
 
 /// How far below the primary's tip the compared block sits. A comparison depth only — it is
 /// **not** a confirmation count and nothing else reads it.
@@ -365,7 +368,8 @@ pub(crate) async fn claim_crosscheck(
     }
 }
 
-enum SpendCheck {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SpendCheck {
     Unavailable(String),
     Disagree(String),
 }
@@ -424,6 +428,165 @@ async fn compare_spend(
         "ltc claim cross-check FAILED on the spend of {at}: primary {primary_url} says {mine}, \
          independent source {other_url} says {theirs}; refusing"
     )))
+}
+
+/// `find_spend` with the cross-check on (EN): the primary's answer `mine` agreed with
+/// `source`'s, as `swap-chain-btc`'s `quorum::agree_spend` agrees two Esplora endpoints.
+/// The source's lock transaction names the spender ([`CrossCheckSource::tx_path`]); the
+/// spender itself is read as raw hex ([`source_spender`]) so the spending input, its scriptSig
+/// and its witness (the preimage) are compared byte for byte. Both unspent agree; a spend one
+/// shows and the other does not, two spenders, or one spender with another input or witness
+/// are `Disagree`. On agreement the spend is returned with the fewer confirmations: the later
+/// block, or the mempool if either has it there. A source that cannot be read (transport,
+/// 5xx, 429, a body that does not parse) is `Unavailable`.
+pub(crate) async fn agree_find_spend(
+    primary_base: &str,
+    source: CrossCheckSource,
+    source_base: &str,
+    retry: RetryPolicy,
+    at: &Outpoint,
+    mine: &Option<SpendInfo>,
+) -> Result<Option<SpendInfo>, SpendCheck> {
+    let other = EsploraClient::new(vec![source_base.to_string()], retry)
+        .map_err(|e| SpendCheck::Unavailable(format!("{} client: {e}", source.as_str())))?;
+    let base = source_base.trim_end_matches('/');
+    let lock_txid = at.txid.to_rpc_hex();
+    let primary_url = format!("{primary_base}/tx/{lock_txid}/outspend/{}", at.vout);
+    let view_url = format!("{base}{}", source.tx_path(&lock_txid));
+    let view = match other.get(&source.tx_path(&lock_txid)).await {
+        Ok(body) => source
+            .spend_from(&body, at.vout)
+            .map_err(|e| SpendCheck::Unavailable(format!("{view_url}: {e}")))?,
+        Err(e) => return Err(SpendCheck::Unavailable(format!("{view_url}: {e:?}"))),
+    };
+    let refuse = |mine: String, theirs: String| {
+        SpendCheck::Disagree(format!(
+            "ltc find_spend cross-check FAILED on the spend of {at}: primary {primary_url} \
+             says {mine}, independent source {theirs}; not acting on it"
+        ))
+    };
+    let Some(x) = mine else {
+        return match view {
+            SpendView::Unspent => Ok(None),
+            v => Err(refuse("unspent".into(), format!("{view_url} says {v}"))),
+        };
+    };
+    let x_txid = x.txid.to_rpc_hex();
+    let says_x = format!("spent by {x_txid} input {}", x.input_index);
+    if let SpendView::SpentBy(y) = &view {
+        if *y != x_txid {
+            return Err(refuse(says_x, format!("{view_url} says spent by {y}")));
+        }
+    }
+    let spender_url = format!("{base}{}", source.tx_path(&x_txid));
+    let Some((tx, height)) = source_spender(&other, source, base, &x_txid).await? else {
+        return Err(refuse(
+            says_x,
+            format!("{view_url} says {view} and {spender_url} does not know {x_txid}"),
+        ));
+    };
+    let want = bitcoin::OutPoint::new(bitcoin::Txid::from_byte_array(at.txid.0), at.vout);
+    let Some((i, input)) = tx
+        .input
+        .iter()
+        .enumerate()
+        .find(|(_, i)| i.previous_output == want)
+    else {
+        return Err(refuse(
+            says_x,
+            format!("{spender_url} shows {x_txid} spending no such output"),
+        ));
+    };
+    let theirs = SpendInfo {
+        txid: x.txid,
+        input_index: i as u32,
+        height,
+        script_sig: input.script_sig.to_bytes(),
+        witness: input.witness.to_vec(),
+    };
+    if theirs.input_index != x.input_index
+        || theirs.script_sig != x.script_sig
+        || theirs.witness != x.witness
+    {
+        return Err(refuse(
+            says_x,
+            format!(
+                "{spender_url} shows the same spender with input {}, but the input, scriptSig \
+                 or witness differs",
+                theirs.input_index
+            ),
+        ));
+    }
+    // The fewer confirmations: a single liar can lower a spend's depth, never raise it.
+    let height = match (x.height, height) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        _ => None,
+    };
+    Ok(Some(SpendInfo {
+        height,
+        ..x.clone()
+    }))
+}
+
+/// `source`'s copy of transaction `txid` and its block height (`None` in the mempool), from
+/// raw hex: Blockbook `GET /tx/{txid}` (`hex`, `blockHeight`, -1 for unconfirmed; `hex` is
+/// documented for confirmed transactions, so without it `GET /tx-specific/{txid}`, the
+/// backend's own JSON, gives `hex`), BlockCypher `GET /txs/{txid}?includeHex=true` (`hex`,
+/// `block_height`, -1 when unconfirmed). `Ok(None)`: the source refused the txid (a 4xx
+/// other than 429; Blockbook answers 400 for an unknown txid), so it does not know it.
+async fn source_spender(
+    other: &EsploraClient,
+    source: CrossCheckSource,
+    base: &str,
+    txid: &str,
+) -> Result<Option<(bitcoin::Transaction, Option<u64>)>, SpendCheck> {
+    let (path, height_key) = match source {
+        CrossCheckSource::Blockbook => (source.tx_path(txid), "blockHeight"),
+        CrossCheckSource::BlockCypher => (
+            format!("{}?includeHex=true", source.tx_path(txid)),
+            "block_height",
+        ),
+    };
+    let url = format!("{base}{path}");
+    let unavailable = |e: String| SpendCheck::Unavailable(format!("{url}: {e}"));
+    let body = match other.get(&path).await {
+        Ok(b) => b,
+        Err(ClientError::Http(_)) => return Ok(None),
+        Err(e) => return Err(unavailable(format!("{e:?}"))),
+    };
+    let v: Value =
+        serde_json::from_str(&body).map_err(|e| unavailable(format!("not JSON: {e}")))?;
+    let height = v[height_key]
+        .as_i64()
+        .ok_or_else(|| unavailable(format!("no {height_key:?} in response")))?;
+    let height = u64::try_from(height).ok();
+    let hex = match (v["hex"].as_str().filter(|h| !h.is_empty()), source) {
+        (Some(h), _) => h.to_string(),
+        (None, CrossCheckSource::Blockbook) => {
+            let path = format!("/tx-specific/{txid}");
+            let url = format!("{base}{path}");
+            let body = other
+                .get(&path)
+                .await
+                .map_err(|e| SpendCheck::Unavailable(format!("{url}: {e:?}")))?;
+            let v: Value = serde_json::from_str(&body)
+                .map_err(|e| SpendCheck::Unavailable(format!("{url}: not JSON: {e}")))?;
+            v["hex"]
+                .as_str()
+                .ok_or_else(|| SpendCheck::Unavailable(format!("{url}: no \"hex\" in response")))?
+                .to_string()
+        }
+        (None, CrossCheckSource::BlockCypher) => {
+            return Err(unavailable("no \"hex\" in response".into()))
+        }
+    };
+    let raw = hex::decode(hex.trim()).map_err(|e| unavailable(format!("bad hex: {e}")))?;
+    let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&raw)
+        .map_err(|e| unavailable(format!("not a transaction: {e}")))?;
+    if Txid(tx.compute_txid().to_byte_array()).to_rpc_hex() != txid {
+        return Err(unavailable(format!("hex is not transaction {txid}")));
+    }
+    Ok(Some((tx, height)))
 }
 
 /// A lock output as the cross-check source shows it (EL).

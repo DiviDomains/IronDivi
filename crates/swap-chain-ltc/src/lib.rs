@@ -40,7 +40,10 @@ use bitcoin::consensus::encode::serialize;
 use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::{All, Secp256k1, SecretKey};
 use bitcoin::{CompressedPublicKey, OutPoint};
-use crosscheck::{agree_lock, claim_crosscheck, enforce, lock_view, ClaimCheck, LockView};
+use crosscheck::{
+    agree_find_spend, agree_lock, claim_crosscheck, enforce, lock_view, ClaimCheck, LockView,
+    SpendCheck,
+};
 use divi_swap::{
     Amount, Chain, ChainBackend, ClaimSizes, FeeBump, Funding, HtlcParams, InputReservations,
     LockedOutput, Outpoint, SignedTx, SpendInfo, SwapError, Txid,
@@ -135,11 +138,31 @@ struct ClaimCrossCheck {
     /// (a new confirmation, so about once per LTC block), keeping a rate-limited source's
     /// quota for the reads that matter.
     locks: parking_lot::Mutex<LockCache>,
+    /// The agreed view of each `find_spend` (EN), with the primary's answer it was taken
+    /// against and when. A spend polled every engine tick (5 s) reuses it while the primary's
+    /// answer is unchanged, for at most [`SPEND_RECHECK`], so a rate-limited source (BlockCypher
+    /// keyless: 100 requests an hour) is asked about once per LTC block per watched lock.
+    spends: parking_lot::Mutex<SpendCache>,
 }
 
 /// Per outpoint: the primary's answer and the source's view (or why it could not be read)
 /// taken against it.
 type LockCache = HashMap<Outpoint, (LockedOutput, std::result::Result<LockView, String>)>;
+
+/// Spend reads cached by [`ClaimCrossCheck::spends`]: the primary's answer, when it was
+/// agreed, and the outcome.
+type SpendCache = HashMap<
+    Outpoint,
+    (
+        Option<SpendInfo>,
+        std::time::Instant,
+        std::result::Result<Option<SpendInfo>, SpendCheck>,
+    ),
+>;
+
+/// How long an agreed `find_spend` is reused while the primary's answer stands: one LTC
+/// block time. A reuse window only; no timeout, margin or confirmation count reads it.
+const SPEND_RECHECK: std::time::Duration = std::time::Duration::from_secs(TARGET_BLOCK_SECS as u64);
 
 /// Cached lock reads kept before the cache is emptied; far more than the swaps in flight.
 const LOCK_CACHE_MAX: usize = 256;
@@ -172,6 +195,12 @@ impl LtcBackend {
     /// agreed script and the primary's value at the outpoint, and the lower confirmation
     /// count is used; a disagreeing or unreadable source is `Transient` (fail closed, since
     /// neither caller has revealed or paid anything yet).
+    /// And it cross-checks every `find_spend` (EN): the source's spender, input, scriptSig and
+    /// witness must match the primary's, else `Transient`; the fewer confirmations are used; a
+    /// source that cannot be read logs a warning and leaves the primary's answer (as today), so
+    /// a down explorer never holds the maker's refund or preimage watch. One more request per
+    /// read while unspent, two once spent, reused for one LTC block time while the primary's
+    /// answer stands.
     /// `None` (the default) is off: no extra request. Mainnet only; the daemon's config
     /// enforces that.
     pub fn with_claim_crosscheck(self, source: Option<CrossCheckSource>) -> Self {
@@ -196,6 +225,7 @@ impl LtcBackend {
             base: base.into(),
             last: parking_lot::Mutex::new(None),
             locks: parking_lot::Mutex::new(HashMap::new()),
+            spends: parking_lot::Mutex::new(HashMap::new()),
         });
         self
     }
@@ -335,6 +365,106 @@ impl LtcBackend {
             cc.source.tx_path(&txid)
         );
         agree_lock(at, &want, mine, &primary_url, &theirs, &source_url)
+    }
+
+    /// With `[ltc].crosscheck_before_claim` on: `mine` (the primary's `find_spend`) agreed with
+    /// the cross-check source's view of the spend of `at` ([`agree_find_spend`]). One attempt,
+    /// no backoff. `Disagree` is `Transient` (the engine reads again); `Unavailable` warns once
+    /// per fresh read and returns `mine`, the LTC claim-time rule: failing closed would hold
+    /// the maker's refund, which reads `find_spend` first, behind a third-party explorer.
+    async fn agree_spend_with_source(
+        &self,
+        cc: &ClaimCrossCheck,
+        at: &Outpoint,
+        mine: Option<SpendInfo>,
+    ) -> Result<Option<SpendInfo>> {
+        let cached = cc
+            .spends
+            .lock()
+            .get(at)
+            .filter(|(p, when, _)| *p == mine && when.elapsed() < SPEND_RECHECK)
+            .map(|(_, _, v)| v.clone());
+        let fresh = cached.is_none();
+        let outcome = match cached {
+            Some(v) => v,
+            None => {
+                let once = RetryPolicy {
+                    attempts: 1,
+                    ..self.retry
+                };
+                let v = agree_find_spend(
+                    self.esplora.primary_url(),
+                    cc.source,
+                    &cc.base,
+                    once,
+                    at,
+                    &mine,
+                )
+                .await;
+                let mut m = cc.spends.lock();
+                if m.len() >= LOCK_CACHE_MAX {
+                    m.clear();
+                }
+                m.insert(*at, (mine.clone(), std::time::Instant::now(), v.clone()));
+                v
+            }
+        };
+        let source = cc.source.as_str();
+        match outcome {
+            Ok(agreed) => Ok(agreed),
+            Err(SpendCheck::Disagree(m)) => {
+                if fresh {
+                    tracing::warn!(source, outpoint = %at, "{m}");
+                }
+                Err(SwapError::Transient(m))
+            }
+            Err(SpendCheck::Unavailable(reason)) => {
+                if fresh {
+                    tracing::warn!(
+                        source,
+                        source_url = %cc.base,
+                        %reason,
+                        outpoint = %at,
+                        "ltc find_spend cross-check unavailable; using the primary's answer"
+                    );
+                }
+                Ok(mine)
+            }
+        }
+    }
+
+    /// The primary's `find_spend`: outspend then the spender, or a block scan where the
+    /// endpoint has no outspend.
+    async fn find_spend_primary(
+        &self,
+        outpoint: &Outpoint,
+        from_height: u64,
+    ) -> Result<Option<SpendInfo>> {
+        let prev = outpoint.txid.to_rpc_hex();
+        let path = format!("/tx/{prev}/outspend/{}", outpoint.vout);
+        let outspend = match self.esplora.get_opt(&path).await {
+            Ok(Some(b)) => parse_json(&b)?,
+            Ok(None) => return Ok(None),
+            // Endpoint without outspend support: fall back to scanning blocks.
+            Err(ClientError::Http(f)) if f.status == 400 || f.status == 501 => {
+                return self.scan_blocks(outpoint, from_height).await;
+            }
+            Err(e) => return Err(e.into()),
+        };
+        if outspend["spent"].as_bool() != Some(true) {
+            return Ok(None);
+        }
+        let spender = outspend["txid"]
+            .as_str()
+            .ok_or_else(|| SwapError::Other("outspend lacks txid".into()))?;
+        // A load-balanced backend can report the outspend before another replica has
+        // indexed the spending tx itself; treat that race as "not found yet" (the caller
+        // polls find_spend again), not a permanent error.
+        let Some(t) = self.get_json_opt(&format!("/tx/{spender}")).await? else {
+            return Ok(None);
+        };
+        let height = outspend["status"]["block_height"].as_u64();
+        spend_from_tx(&t, &prev, outpoint.vout, height)
     }
 
     /// `coins` without those reserved by a broadcast transaction that has not confirmed.
@@ -966,31 +1096,11 @@ impl ChainBackend for LtcBackend {
     }
 
     async fn find_spend(&self, outpoint: &Outpoint, from_height: u64) -> Result<Option<SpendInfo>> {
-        let prev = outpoint.txid.to_rpc_hex();
-        let path = format!("/tx/{prev}/outspend/{}", outpoint.vout);
-        let outspend = match self.esplora.get_opt(&path).await {
-            Ok(Some(b)) => parse_json(&b)?,
-            Ok(None) => return Ok(None),
-            // Endpoint without outspend support: fall back to scanning blocks.
-            Err(ClientError::Http(f)) if f.status == 400 || f.status == 501 => {
-                return self.scan_blocks(outpoint, from_height).await;
-            }
-            Err(e) => return Err(e.into()),
-        };
-        if outspend["spent"].as_bool() != Some(true) {
-            return Ok(None);
+        let mine = self.find_spend_primary(outpoint, from_height).await?;
+        match &self.claim_check {
+            Some(cc) => self.agree_spend_with_source(cc, outpoint, mine).await,
+            None => Ok(mine),
         }
-        let spender = outspend["txid"]
-            .as_str()
-            .ok_or_else(|| SwapError::Other("outspend lacks txid".into()))?;
-        // A load-balanced backend can report the outspend before another replica has
-        // indexed the spending tx itself; treat that race as "not found yet" (the caller
-        // polls find_spend again), not a permanent error.
-        let Some(t) = self.get_json_opt(&format!("/tx/{spender}")).await? else {
-            return Ok(None);
-        };
-        let height = outspend["status"]["block_height"].as_u64();
-        spend_from_tx(&t, &prev, outpoint.vout, height)
     }
 }
 
