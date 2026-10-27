@@ -158,7 +158,8 @@ impl MasternodeRpc {
             return Err(Self::usage(GETMASTERNODECOUNT_USAGE));
         }
         if let Some(list) = self.network_list.read().clone() {
-            let c = list.counts(chain);
+            let votes = self.votes.read().clone();
+            let c = list.counts(chain, votes.as_deref());
             let mut value = json!({
                 "total": c.total,
                 "stable": c.stable,

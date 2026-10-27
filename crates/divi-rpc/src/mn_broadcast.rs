@@ -48,11 +48,10 @@ fn invalid_param(msg: impl Into<String>) -> Error {
     RpcError::new(codes::INVALID_PARAMS, msg.into()).into()
 }
 
+/// GetAdjustedTime, which divid signs broadcasts and pings with
+/// (MasternodeBroadcastFactory.cpp:224, MasternodeHelpers.cpp:207)
 fn now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+    divi_primitives::clock::adjusted_now()
 }
 
 /// `COutPoint::ToString`
@@ -144,7 +143,7 @@ fn blockchain_synced(chain: &Chain) -> bool {
     }
     chain
         .tip()
-        .map(|t| now() - (t.time as i64) < 2 * 3600)
+        .map(|t| divi_primitives::clock::now() - (t.time as i64) < 2 * 3600)
         .unwrap_or(false)
 }
 

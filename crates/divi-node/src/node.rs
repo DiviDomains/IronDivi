@@ -1419,25 +1419,30 @@ impl Node {
         let masternode_votes = Arc::clone(&self.masternode_votes);
         let peer_manager = Arc::clone(&self.peer_manager);
         let mut peer_events = self.peer_manager.subscribe();
-        // Divi Core checks every masternode once a minute, and once the chain
-        // is synced drops the spent and removed ones (MasternodeModule.cpp:502-529)
+        // Divi Core's masternode thread wakes every second and, while the
+        // chain is synced, once a minute on the node's clock (setmocktime
+        // sets it) checks every masternode, drops the spent and removed ones
+        // with what is timed out, and prunes the old payment votes
+        // (MasternodeModule.cpp:471-531)
         {
             let list = Arc::clone(&self.masternode_list);
+            let votes = Arc::clone(&self.masternode_votes);
             let chain = Arc::clone(&self.chain);
             let mut shutdown = self.shutdown_tx.subscribe();
             self.keep(tokio::spawn(async move {
-                let mut every = tokio::time::interval(std::time::Duration::from_secs(60));
+                let mut every = tokio::time::interval(std::time::Duration::from_secs(1));
+                let mut last = 0i64;
                 loop {
                     tokio::select! {
                         _ = every.tick() => {
-                            list.check_collateral(&chain);
-                            if list.blockchain_synced(&chain) {
-                                let now = std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .map(|d| d.as_secs() as i64)
-                                    .unwrap_or(0);
-                                list.remove_inactive(now);
+                            let now = divi_primitives::clock::now();
+                            if !list.blockchain_synced(&chain) || now < last + 60 {
+                                continue;
                             }
+                            last = now;
+                            list.check_collateral(&chain);
+                            list.remove_inactive(divi_primitives::clock::adjusted_now());
+                            votes.prune_old(chain.height() as i64);
                         }
                         _ = shutdown.recv() => break,
                     }

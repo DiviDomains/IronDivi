@@ -467,6 +467,14 @@ impl MasternodeSync {
         (&self.asked_us_for_list, &self.asked_for_list)
     }
 
+    /// Drop the asks whose time is past (clearTimedOutMasternodeListRequestsFromPeers,
+    /// clearTimedOutMasternodeListRequestsToPeers,
+    /// MasternodeNetworkMessageManager.cpp:66-92)
+    pub fn prune_list_asks(&mut self, now: i64) {
+        self.asked_us_for_list.retain(|_, until| *until >= now);
+        self.asked_for_list.retain(|_, until| *until >= now);
+    }
+
     /// Put back the asks read from mncache.dat
     pub fn set_list_asks(
         &mut self,
