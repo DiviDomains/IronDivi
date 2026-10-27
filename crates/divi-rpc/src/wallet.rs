@@ -4213,6 +4213,7 @@ impl WalletRpc {
         // is a new one, so lockunspent's locks are gone, the masternode
         // collateral's too: LoadAndSelectWallet does not lock it again
         // (init.cpp:282-292, :1291-1318)
+        wallet.read_names_back();
         for outpoint in wallet.locked_coins() {
             wallet.set_coin_locked(outpoint, false);
         }
@@ -4283,11 +4284,12 @@ impl WalletRpc {
                 let hash = divi_primitives::hash::Hash160::from_bytes(hash_bytes);
                 Address::p2sh(hash, wallet.network())
             } else {
-                return Err(RpcError::new(
-                    codes::WALLET_ERROR,
-                    "Only P2PKH and P2SH scripts are supported for watch-only import",
-                )
-                .into());
+                // Divi Core watches any script and answers null
+                // (rpcdump.cpp:122-166), but a watched script of another kind
+                // never brings a transaction into its wallet, which records
+                // only what pays or spends a spendable output
+                // (wallet.cpp:1292-1311): nothing more to keep
+                return Ok(serde_json::Value::Null);
             }
         };
         let label = if params.len() > 1 {
@@ -5080,8 +5082,10 @@ impl WalletRpc {
         account: &str,
         force_new: bool,
     ) -> Result<String, Error> {
-        let addresses = wallet.get_addresses_by_account(account);
-        if let (Some(last), false) = (addresses.last(), force_new) {
+        // The last address given the name, even one since moved to another
+        // name (GetAccountAddress, rpcwallet.cpp:341-343)
+        let last = wallet.last_address_of_label(account);
+        if let (Some(last), false) = (last.as_ref(), force_new) {
             // Any wallet transaction paying its script, a watched address's too
             // (AccountShouldUseNewKey, rpcwallet.cpp:314-332)
             let paid = Address::from_base58(last)

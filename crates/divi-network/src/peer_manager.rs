@@ -210,6 +210,8 @@ impl Default for PeerManagerConfig {
 /// Added node entry (manually added via RPC)
 #[derive(Debug, Clone)]
 pub struct AddedNode {
+    /// The node as it was given (divid keeps and matches the text, net.cpp:1183-1206)
+    pub name: String,
     /// Address of the node
     pub addr: SocketAddr,
     /// Whether we're currently connected to this node
@@ -258,7 +260,7 @@ pub struct PeerManager {
     named_dialling: RwLock<HashSet<String>>,
     /// Added nodes, in the order they were added: -addnode, then the addnode
     /// RPC (Divi Core's vAddedNodes list, net.cpp:1218)
-    added_nodes: RwLock<Vec<SocketAddr>>,
+    added_nodes: RwLock<Vec<(String, SocketAddr)>>,
     /// Addresses currently being connected to (connection attempt in progress)
     connecting_addrs: RwLock<HashSet<SocketAddr>>,
     /// Total bytes sent across all peers (cumulative since node start)
@@ -770,13 +772,34 @@ impl PeerManager {
     ///
     /// This adds the node to the list of nodes we should try to stay connected to.
     pub fn add_node(&self, addr: SocketAddr) -> bool {
+        self.add_node_as(addr.to_string(), addr)
+    }
+
+    /// Add a node by the text it was given as: divid keeps the text and
+    /// refuses only the same text again (net.cpp:1183-1206), so two texts of
+    /// one address are two entries, dialled once
+    pub fn add_node_as(&self, name: String, addr: SocketAddr) -> bool {
         let mut added = self.added_nodes.write();
-        if added.contains(&addr) {
+        if added.iter().any(|(n, _)| *n == name) {
             return false; // Already added
         }
-        added.push(addr);
-        info!("Added node: {}", addr);
+        info!("Added node: {}", name);
+        added.push((name, addr));
         true
+    }
+
+    /// Remove the added node given as `name` (divid compares the text)
+    pub fn remove_added_node_as(&self, name: &str) -> bool {
+        let removed = {
+            let mut added = self.added_nodes.write();
+            let before = added.len();
+            added.retain(|(n, _)| n != name);
+            added.len() != before
+        };
+        if removed {
+            info!("Removed node: {}", name);
+        }
+        removed
     }
 
     /// Remove a manually added node
@@ -784,7 +807,7 @@ impl PeerManager {
         let removed = {
             let mut added = self.added_nodes.write();
             let before = added.len();
-            added.retain(|a| a != addr);
+            added.retain(|(_, a)| a != addr);
             added.len() != before
         };
         if removed {
@@ -804,7 +827,8 @@ impl PeerManager {
 
         added
             .iter()
-            .map(|addr| AddedNode {
+            .map(|(name, addr)| AddedNode {
+                name: name.clone(),
                 addr: *addr,
                 connected: connected_addrs.contains(addr),
                 connecting: connecting.contains(addr),
@@ -814,7 +838,7 @@ impl PeerManager {
 
     /// Check if an address is a manually added node
     pub fn is_added_node(&self, addr: &SocketAddr) -> bool {
-        self.added_nodes.read().contains(addr)
+        self.added_nodes.read().iter().any(|(_, a)| a == addr)
     }
 
     /// The addresses to listen on, each with whether its peers are
@@ -1848,7 +1872,12 @@ impl PeerManager {
             // thread runs beside the -connect loop and counts no outbound
             // slot since Divi Core f8c0d2e67 took its semaphore grant out; it skips a
             // banned address (net.cpp:1214-1271, :1275-1285)
-            let added: Vec<SocketAddr> = self.added_nodes.read().iter().copied().collect();
+            let mut added: Vec<SocketAddr> = Vec::new();
+            for (_, addr) in self.added_nodes.read().iter() {
+                if !added.contains(addr) {
+                    added.push(*addr);
+                }
+            }
             for addr in added {
                 if self.is_banned(&addr.ip()) {
                     continue;

@@ -83,7 +83,7 @@ fn unknown_and_unsupported_options_start_with_a_log_line() {
         |rpc_port, p2p_port| {
             let mut a = args(dir.path(), rpc_port, p2p_port);
             a.push("-bogusflag=1".into());
-            a.push("-par=2".into());
+            a.push("-accountlabels=1".into());
             // Applied (-dbcache) or only in divid's help (-mining): no line
             a.push("-dbcache=100".into());
             a.push("-mining=1".into());
@@ -100,13 +100,55 @@ fn unknown_and_unsupported_options_start_with_a_log_line() {
         "no line for the unknown option"
     );
     assert!(
-        log.contains("Option -par is not supported by irondivid; ignored"),
+        log.contains("Option -accountlabels is not supported by irondivid; ignored"),
         "no line for the unsupported option"
     );
     assert!(!log.contains("-dbcache"), "a line for -dbcache: {log}");
     assert!(!log.contains("-mining"), "a line for -mining: {log}");
     // -alertnotify is taken: irondivid runs it for its own warning
     // (start_rpc_options.rs), so it is not named as unsupported
+}
+
+/// -par sets the script check threads as divid works them out and logs the
+/// count (init.cpp:801, :965, TransactionInputChecker.cpp:16-26): 2 is two,
+/// 1 is none. With threads a block's script checks run after its other
+/// checks; a block that spends a coin still connects.
+#[test]
+fn par_sets_the_script_check_threads() {
+    for (par, threads) in [("2", 2), ("1", 0), ("17", 16)] {
+        let dir = tempfile::tempdir().unwrap();
+        let (child, rpc_port, _) = start_node(
+            dir.path(),
+            |rpc_port, p2p_port| {
+                let mut a = args(dir.path(), rpc_port, p2p_port);
+                a.push(format!("-par={par}"));
+                let mut cmd = Command::new(env!("CARGO_BIN_EXE_irondivid"));
+                cmd.args(&a).stdout(Stdio::null()).stderr(Stdio::null());
+                cmd
+            },
+            |rpc_port| rpc(rpc_port, "getblockcount", json!([])).is_some(),
+        );
+        let _node = Node(child);
+        let log = debug_log(dir.path());
+        assert!(
+            log.contains(&format!("Using {threads} threads for script verification")),
+            "-par={par}: no line for {threads} threads"
+        );
+        assert!(!log.contains("Option -par"), "-par={par} named: {log}");
+        if par == "2" {
+            // Mature coins, a payment, and the block that spends them
+            rpc(rpc_port, "setgenerate", json!([25])).unwrap();
+            let address = rpc(rpc_port, "getnewaddress", json!([])).unwrap()["result"].clone();
+            let sent =
+                rpc(rpc_port, "sendtoaddress", json!([address, 1])).unwrap()["result"].clone();
+            assert!(sent.is_string(), "sendtoaddress: {sent}");
+            rpc(rpc_port, "setgenerate", json!([1])).unwrap();
+            let count = rpc(rpc_port, "getblockcount", json!([])).unwrap()["result"].clone();
+            assert_eq!(count, json!(26));
+            let tx = rpc(rpc_port, "gettransaction", json!([sent])).unwrap()["result"].clone();
+            assert_eq!(tx["confirmations"], json!(1), "{tx}");
+        }
+    }
 }
 
 /// Start irondivid with `extra` and masternode.conf `conf`; its exit status

@@ -64,6 +64,11 @@ pub struct NodeConfig {
     #[serde(default = "default_check_blocks")]
     pub check_blocks: u32,
 
+    /// Script check threads (`-par`, worked out as Divi Core does): 0 checks
+    /// each input's script as its block connects
+    #[serde(default)]
+    pub script_check_threads: usize,
+
     /// Refuse a block this many blocks or more below the tip (C++ `-maxreorg`;
     /// unset = the network's depth, 100 on Divi)
     #[serde(default)]
@@ -176,6 +181,7 @@ impl Default for NodeConfig {
             expire: divi_storage::prune::Expire::Never,
             check_blocks: DEFAULT_CHECK_BLOCKS,
             max_reorg: None,
+            script_check_threads: 0,
             resync: false,
             load_block: Vec::new(),
             bootstrap_dir: None,

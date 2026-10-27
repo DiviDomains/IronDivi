@@ -277,7 +277,9 @@ fn resolve_args(mut args: Args) -> Result<Args> {
         return Ok(args);
     }
     let path = config_path(&args);
-    if path.exists() {
+    // divid opens a directory as a stream that is good() and yields no line,
+    // so it runs without a config file (Settings.cpp:186-205)
+    if path.exists() && !path.is_dir() {
         let content = std::fs::read_to_string(&path)
             .with_context(|| format!("Error reading configuration file: {:?}", path))?;
         // Only irondivid's own file may be TOML: a divi.conf that happens to
@@ -312,7 +314,6 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "override_mnpayee",
     "stakeupdatetime",
     "checklevel",
-    "par",
 ];
 
 /// Options divid takes and does nothing with, only naming them in its help:
@@ -465,6 +466,7 @@ const APPLIED: &[&str] = &[
     "reindex",
     "utxocachesize",
     "dbcache",
+    "par",
     "forcednsseed",
     "expire",
     "blocknotify",
@@ -601,11 +603,6 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
             "InitializeDivi : parameter interaction: -proxy set -> setting -discover=0",
         );
     }
-    // -salvagewallet rewrites nothing in Divi Core 3.0.0: it sets -rescan
-    // (EnableWalletFeatures, init.cpp:763-766)
-    if s.get_bool("salvagewallet", false) && s.soft_set_bool("rescan", true) {
-        info!("InitializeDivi : parameter interaction: -salvagewallet=1 -> setting -rescan=1");
-    }
     // -listen=0 turns -upnp, -discover and -listenonion off unless given
     if !s.get_bool("listen", true) {
         let set = s.soft_set_bool("upnp", false);
@@ -631,6 +628,12 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
             set,
             "InitializeDivi : parameter interaction: -externalip set -> setting -discover=0",
         );
+    }
+    // -salvagewallet rewrites nothing in Divi Core 3.0.0: it sets -rescan
+    // (EnableWalletFeatures, init.cpp:763-766), after the network ones
+    // (init.cpp:1416-1418)
+    if s.get_bool("salvagewallet", false) && s.soft_set_bool("rescan", true) {
+        info!("InitializeDivi : parameter interaction: -salvagewallet=1 -> setting -rescan=1");
     }
     // Regtest does not stake unless asked (init.cpp:242); no wallet, no staking
     if regtest && !s.is_set("staking") {
@@ -969,6 +972,11 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         config.block_cache_size = Some(sizes.block_tree + sizes.coin_db);
         config.utxo_cache_size = sizes.coin_cache_entries;
     }
+    // -par, read as divid reads a number (atoi: 0 for a word), against the
+    // machine's cores (init.cpp:801, TransactionInputChecker.cpp:16-26)
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get() as i64);
+    config.script_check_threads =
+        divi_storage::script_check::threads_for(settings::atoi(s.get("par").unwrap_or("0")), cores);
     if let Some(n) = number_option(&s, "utxocachesize", 0..=i64::MAX) {
         config.utxo_cache_size = n as u64;
     }
@@ -1653,6 +1661,11 @@ fn print_banner(config: &NodeConfig) {
     info!("Data dir: {:?}", config.data_dir);
     info!("RPC: {}:{}", config.rpc.listen_addr, config.rpc.port);
     info!("P2P: {}:{}", config.p2p.listen_addr, config.p2p.port);
+    // divid's line (init.cpp:965)
+    info!(
+        "Using {} threads for script verification",
+        config.script_check_threads
+    );
     info!("========================================");
 }
 
@@ -5051,6 +5064,21 @@ mod divid_option_tests {
         cfg_in("irondivi.conf", conf, &[]).unwrap()
     }
 
+    /// -conf naming a directory: divid reads no line from it and runs with
+    /// no config file (Settings.cpp:186-205)
+    #[test]
+    fn a_conf_that_is_a_directory_is_read_as_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("conf.d")).unwrap();
+        let argv = [
+            "irondivid".to_string(),
+            format!("--datadir={}", dir.path().display()),
+            "-conf=conf.d".to_string(),
+        ];
+        let c = build_config(&Args::parse_from(argv)).unwrap();
+        assert_eq!(c.rpc.port, NodeConfig::default().rpc.port);
+    }
+
     /// divid reads divi.conf in its data directory
     #[test]
     fn divi_conf_in_the_data_directory_is_read() {
@@ -5414,7 +5442,11 @@ mod divid_option_tests {
         assert_eq!(option_warning(&s, "masternode"), None);
         // applied as divid applies it
         assert_eq!(option_warning(&s, "dbcache"), None);
-        assert!(option_warning(&s, "par").unwrap().contains("not supported"));
+        assert_eq!(option_warning(&s, "par"), None);
+        assert_eq!(option_warning(&s, "peerbloomfilters"), None);
+        assert!(option_warning(&s, "accountlabels")
+            .unwrap()
+            .contains("not supported"));
         assert!(option_warning(&s, "nosuchoption")
             .unwrap()
             .starts_with("Unknown option"));

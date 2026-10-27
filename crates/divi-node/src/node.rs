@@ -550,6 +550,7 @@ impl Node {
                 e
             ))
         };
+        divi_storage::script_check::set_threads(config.script_check_threads);
         let mut chain = Chain::new(db.clone(), chain_params.clone()).map_err(damaged)?;
 
         // C++ checks the newest blocks at every start (-checkblocks); a damaged
@@ -989,7 +990,7 @@ impl Node {
                 });
             match addr {
                 Some(addr) => {
-                    peer_manager.add_node(addr);
+                    peer_manager.add_node_as(node.clone(), addr);
                 }
                 None => {
                     tracing::debug!("-addnode {} is not an address; dialled by name only", node)

@@ -4721,6 +4721,11 @@ impl Chain {
             flags
         };
 
+        // -par: with script check threads, the block's script checks wait
+        // until its other checks are done (crate::script_check)
+        let script_threads = crate::script_check::threads();
+        let mut deferred: Vec<crate::script_check::ScriptCheck> = Vec::new();
+
         for (tx_idx, tx) in block.transactions.iter().enumerate() {
             let txid = txids[tx_idx];
 
@@ -4846,35 +4851,28 @@ impl Chain {
                     // block's flags, during initial sync too. A failure rejects the
                     // block (BlockTransactionChecker::Check, ConnectBlock).
                     if let Some(ref utxo) = prev_utxo {
-                        verify_input_with_flags(
-                            tx,
-                            input_index,
-                            &utxo.script_pubkey,
-                            utxo.value,
-                            block_flags,
-                        )
-                        .map_err(|e| {
-                            warn!(
-                                "Script verification failed: tx {} input {} ({}:{}) at height {}: {}",
-                                txid,
+                        if script_threads > 0 {
+                            deferred.push(crate::script_check::ScriptCheck {
+                                tx_index: tx_idx,
                                 input_index,
-                                input.prevout.txid,
-                                input.prevout.vout,
-                                height,
-                                e.core_message()
+                                script_pubkey: utxo.script_pubkey.clone(),
+                                value: utxo.value,
+                            });
+                        } else {
+                            verify_input_with_flags(
+                                tx,
+                                input_index,
+                                &utxo.script_pubkey,
+                                utxo.value,
+                                block_flags,
+                            )
+                            .map_err(|e| script_failure(tx, &txid, input_index, height, &e))?;
+                            self.script_stats.record(
+                                utxo.script_pubkey.as_bytes(),
+                                input.script_sig.as_bytes(),
+                                is_coinstake,
                             );
-                            StorageError::InvalidBlock(format!(
-                                "mandatory-script-verify-flag-failed ({}) in tx {} input {}",
-                                e.core_message(),
-                                txid,
-                                input_index
-                            ))
-                        })?;
-                        self.script_stats.record(
-                            utxo.script_pubkey.as_bytes(),
-                            input.script_sig.as_bytes(),
-                            is_coinstake,
-                        );
+                        }
                         // CheckProofOfStake also verifies the stake kernel (input 0)
                         // under POS_SCRIPT_VERIFY_FLAGS
                         if is_coinstake && input_index == 0 {
@@ -4964,6 +4962,25 @@ impl Chain {
         debug!("  ├─ Block value + lottery validation check");
         self.validate_block_value(block, index, mint, fees)?;
         debug!("  ├─ Block value validation: ✅ PASS");
+
+        // Divi Core waits for its script check queue after the block's value
+        // and payee checks (BlockConnectionService.cpp:331-343)
+        if !deferred.is_empty() {
+            crate::script_check::run(&block.transactions, &deferred, block_flags, script_threads)
+                .map_err(|(n, e)| {
+                let c = &deferred[n];
+                let tx = &block.transactions[c.tx_index];
+                script_failure(tx, &txids[c.tx_index], c.input_index, height, &e)
+            })?;
+            for c in &deferred {
+                let tx = &block.transactions[c.tx_index];
+                self.script_stats.record(
+                    c.script_pubkey.as_bytes(),
+                    tx.vin[c.input_index].script_sig.as_bytes(),
+                    tx.is_coinstake(),
+                );
+            }
+        }
 
         // Money supply: previous supply plus everything created minus everything consumed
         // (coinbase/coinstake rewards raise it, fees burned by plain transactions lower it)
@@ -6087,6 +6104,31 @@ pub fn check_depth(depth: i64, height: u32) -> u32 {
     }
 }
 
+/// A failed input script: logged, and the block refused (Divi Core CheckInputs)
+fn script_failure(
+    tx: &Transaction,
+    txid: &Hash256,
+    input_index: usize,
+    height: u32,
+    e: &divi_script::ScriptError,
+) -> StorageError {
+    let prevout = &tx.vin[input_index].prevout;
+    warn!(
+        "Script verification failed: tx {} input {} ({}:{}) at height {}: {}",
+        txid,
+        input_index,
+        prevout.txid,
+        prevout.vout,
+        height,
+        e.core_message()
+    );
+    StorageError::InvalidBlock(format!(
+        "mandatory-script-verify-flag-failed ({}) in tx {} input {}",
+        e.core_message(),
+        txid,
+        input_index
+    ))
+}
 #[cfg(test)]
 mod tests {
     mod crash;
