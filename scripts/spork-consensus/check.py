@@ -788,7 +788,7 @@ if not A.wait_ready():
 FILTERS = {}
 for n_filter, name in enumerate(("irondivid", "divid-B", "divid-plain", "irondivid-plain")):
     FILTERS[name] = PORT_BASE + 20 + n_filter
-    SporkFilter(FILTERS[name], PORT_BASE)
+    SporkFilter(FILTERS[name], A.p2p)  # A has started: its port, moved if PORT_BASE was taken
 I = Node("irondivid", IRONDIVID, 1, ["listen=1", f"connect={HOST}:{FILTERS['irondivid']}"], core=False, seeded=True)
 B = Node("divid-B", DIVID, 2, ["listen=1", f"connect={HOST}:{FILTERS['divid-B']}"], core=True, seeded=True)
 # Two nodes that were given no sporks: they hold the usual rules

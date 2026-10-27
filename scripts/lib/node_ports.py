@@ -44,6 +44,15 @@ def free_port(host):
         return sock.getsockname()[1]
 
 
+def _far_port(host, near):
+    """A free port at least 64 from `near`: the system picks from a range that can hold the script's own
+    <port-base> range, whose other ports its other nodes and stand-ins will use"""
+    while True:
+        port = free_port(host)
+        if abs(port - near) >= 64:
+            return port
+
+
 def now(port):
     """`port`, or the port its node has since been moved to"""
     with _lock:
@@ -142,9 +151,9 @@ def move_ports(node, datadir):
         return None
     host = _own_conf_host(conf)
     old = (node.p2p, node.rpcport)
-    new = (free_port(host), free_port(host))
+    new = (_far_port(host, old[0]), _far_port(host, old[0]))
     while new[1] == new[0]:
-        new = (new[0], free_port(host))
+        new = (new[0], _far_port(host, old[0]))
     with _lock:
         before = dict(moved)
         moved[old[0]], moved[old[1]] = new
