@@ -307,6 +307,10 @@ pub struct ChainTip {
 /// A listener for a new chain tip (see `Chain::add_tip_listener`)
 pub type TipListener = Arc<dyn Fn(&BlockIndex) + Send + Sync>;
 
+/// Called with Divi Core's fLargeWorkInvalidChainFound each time the fork
+/// warning check changes it
+pub type ForkWarningListener = Arc<dyn Fn(bool) + Send + Sync>;
+
 /// A block the active chain took or gave up (see `Chain::add_block_listener`)
 #[derive(Debug, Clone)]
 pub enum ChainEvent {
@@ -540,6 +544,16 @@ pub struct Chain {
     script_stats: ScriptStats,
     /// Sporks 13 to 16, which set block values, payments and the lottery ticket
     consensus_sporks: SharedSporks,
+    /// The invalid block with the most chain work (Divi Core's
+    /// mostWorkInvalidBlockIndex, BlockCheckingHelpers.cpp:364-381); None
+    /// until the stored blocks are first looked through
+    most_work_invalid: RwLock<Option<Option<BlockIndex>>>,
+    /// Divi Core's fLargeWorkInvalidChainFound (Warnings.cpp:7)
+    invalid_chain_found: std::sync::atomic::AtomicBool,
+    /// IsInitialBlockDownload's latch: once out, never in again
+    /// (ChainSyncHelpers.cpp:40-49)
+    left_initial_download: std::sync::atomic::AtomicBool,
+    fork_warning_listeners: RwLock<Vec<ForkWarningListener>>,
 }
 
 /// The entries of sporks 13 to 16, shared between the spork manager that holds
@@ -624,6 +638,10 @@ impl Chain {
             importing: std::sync::atomic::AtomicBool::new(false),
             script_stats: ScriptStats::default(),
             consensus_sporks: Arc::new(RwLock::new(ConsensusSporks::default())),
+            most_work_invalid: RwLock::new(None),
+            invalid_chain_found: std::sync::atomic::AtomicBool::new(false),
+            left_initial_download: std::sync::atomic::AtomicBool::new(false),
+            fork_warning_listeners: RwLock::new(Vec::new()),
         };
 
         crate::datadir::check_network(&chain.db, &chain.params)?;
@@ -2088,6 +2106,151 @@ impl Chain {
         self.block_listeners.write().push(listener);
     }
 
+    /// Call `listener` with Divi Core's fLargeWorkInvalidChainFound each time
+    /// the fork warning check changes it
+    pub fn add_fork_warning_listener(&self, listener: ForkWarningListener) {
+        self.fork_warning_listeners.write().push(listener);
+    }
+
+    /// Whether the last fork warning check found an invalid chain with more
+    /// than six blocks of work over the best one (fLargeWorkInvalidChainFound)
+    pub fn large_work_invalid_chain_found(&self) -> bool {
+        self.invalid_chain_found
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// IsInitialBlockDownload (ChainSyncHelpers.cpp:33-50): while block files
+    /// are imported, or while the tip is more than 144 blocks below the best
+    /// header or that header is more than 6 hours old; once out, out for good
+    fn in_initial_download(&self) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        if self.is_importing() {
+            return true;
+        }
+        if self.left_initial_download.load(SeqCst) {
+            return false;
+        }
+        let Some(best) = self.best_known_block.read().clone().or_else(|| self.tip()) else {
+            return true;
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64);
+        let behind = i64::from(self.height()) < i64::from(best.height) - 24 * 6
+            || i64::from(best.time) < now - 6 * 60 * 60;
+        if !behind {
+            self.left_initial_download.store(true, SeqCst);
+        }
+        behind
+    }
+
+    /// The invalid block with the most chain work. The stored blocks are
+    /// looked through the first time it is needed, as Divi Core's block index
+    /// load takes it from every block marked failed (BlockIndexLoading.cpp:67-68)
+    fn most_work_invalid(&self) -> Result<Option<BlockIndex>, StorageError> {
+        if let Some(mark) = self.most_work_invalid.read().clone() {
+            return Ok(mark);
+        }
+        let mut best: Option<BlockIndex> = None;
+        for index in self.db.iter_all_block_indexes()? {
+            if index.failed()
+                && best.as_ref().is_none_or(|b| {
+                    Self::compare_chain_work(&index.chain_work, &b.chain_work)
+                        == std::cmp::Ordering::Greater
+                })
+            {
+                best = Some(index);
+            }
+        }
+        *self.most_work_invalid.write() = Some(best.clone());
+        Ok(best)
+    }
+
+    /// updateMostWorkInvalidBlockIndex: `index` if it has more work than the
+    /// invalid block kept (BlockCheckingHelpers.cpp:368-381)
+    fn update_most_work_invalid(&self, index: &BlockIndex) {
+        let kept = match self.most_work_invalid() {
+            Ok(kept) => kept,
+            Err(e) => {
+                warn!("The invalid block with the most work is unknown: {}", e);
+                return;
+            }
+        };
+        if kept.is_none_or(|k| {
+            Self::compare_chain_work(&index.chain_work, &k.chain_work)
+                == std::cmp::Ordering::Greater
+        }) {
+            *self.most_work_invalid.write() = Some(Some(index.clone()));
+        }
+    }
+
+    /// CheckForkWarningConditions with `tip` as the active tip
+    /// (ForkWarningHelpers.cpp:20-58). Only its invalid-chain half can fire
+    /// in Divi Core 3.0: CheckForkWarningConditionsOnNewFork is given the
+    /// first block of the batch being connected (MostWorkChainTransitionMediator.cpp:21-25,
+    /// :155), which is on the active chain or just above it, never 7 blocks
+    /// of work past the fork, so a large valid fork is never kept.
+    fn check_fork_warning_at(&self, tip: &BlockIndex) {
+        if self.in_initial_download() {
+            return;
+        }
+        let kept = match self.most_work_invalid() {
+            Ok(kept) => kept,
+            Err(e) => {
+                warn!("The invalid block with the most work is unknown: {}", e);
+                return;
+            }
+        };
+        let found = kept.is_some_and(|k| {
+            crate::fork_warning::invalid_work_is_large(&k.chain_work, &tip.chain_work, tip.bits)
+        });
+        if found {
+            warn!("{}", crate::fork_warning::INVALID_CHAIN_LOG);
+        }
+        let was = self
+            .invalid_chain_found
+            .swap(found, std::sync::atomic::Ordering::SeqCst);
+        if was != found {
+            let listeners = self.fork_warning_listeners.read().clone();
+            for listener in &listeners {
+                listener(found);
+            }
+        }
+    }
+
+    /// InvalidChainFound for `invalid`, with `best` the active tip at that
+    /// moment (BlockInvalidationHelpers.cpp:91-110)
+    fn note_invalid_chain(&self, invalid: &BlockIndex, best: &BlockIndex) {
+        use crate::fork_warning::{date, format_g8, log2_work};
+        self.update_most_work_invalid(invalid);
+        info!(
+            "InvalidChainFound: invalid block={}  height={}  log2_work={}  date={}",
+            invalid.hash,
+            invalid.height,
+            format_g8(log2_work(&invalid.chain_work)),
+            date(invalid.time)
+        );
+        info!(
+            "InvalidChainFound:  current best={}  height={}  log2_work={}  date={}",
+            best.hash,
+            best.height,
+            format_g8(log2_work(&best.chain_work)),
+            date(best.time)
+        );
+        self.check_fork_warning_at(best);
+    }
+
+    /// What Divi Core does when `failed` does not connect on `best`: the
+    /// InvalidChainFound of InvalidBlockFound for it (ChainTipManager.cpp:121-127),
+    /// one for `first`, the lowest block of the batch it was in
+    /// (MostWorkChainTransitionMediator.cpp:47-58, :77), then the check of
+    /// CheckForkWarningConditionsOnNewFork (:153-155)
+    fn note_failed_connect(&self, failed: &BlockIndex, first: &BlockIndex, best: &BlockIndex) {
+        self.note_invalid_chain(failed, best);
+        self.note_invalid_chain(first, best);
+        self.check_fork_warning_at(best);
+    }
+
     /// Whether this start wrote the genesis block, as on a new data directory
     pub fn created_genesis(&self) -> bool {
         self.created_genesis
@@ -2418,6 +2581,7 @@ impl Chain {
                             // again when another block arrives
                             if Self::is_consensus_invalid(&e) {
                                 self.mark_block_failed(&hash)?;
+                                self.note_failed_connect(&index, &index, current_tip);
                             }
                             return Err(e);
                         }
@@ -2430,6 +2594,9 @@ impl Chain {
 
                     // Keep best_known_block in sync with the new tip
                     self.update_best_known_block(&index);
+                    // A new best chain is checked for a fork to warn of
+                    // (MostWorkChainTransitionMediator.cpp:156-157)
+                    self.check_fork_warning_at(&index);
 
                     // Periodically flush UTXO cache to disk (every 100 blocks)
                     if self.db.has_utxo_cache() && accepted_height.is_multiple_of(100) {
@@ -2800,10 +2967,22 @@ impl Chain {
                 // descendants BLOCK_FAILED_CHILD, so the chain is never
                 // selected again. Here the descendants on the path to the
                 // reorg target are exactly the rest of blocks_to_connect.
-                if Self::is_consensus_invalid(&e) {
+                let invalid = Self::is_consensus_invalid(&e);
+                if invalid {
                     for (_, failed) in &blocks_to_connect[i..] {
                         self.mark_block_failed(&failed.hash)?;
                     }
+                    // Divi Core connects 32 heights at a time; the batch's
+                    // lowest block and the tip reached are what it reports
+                    let reached = if i == 0 {
+                        &common_ancestor
+                    } else {
+                        &blocks_to_connect[i - 1].1
+                    };
+                    self.note_failed_connect(index, &blocks_to_connect[i / 32 * 32].1, reached);
+                    // FindMostWorkChain then finds the target on a failed
+                    // chain (BlockCheckingHelpers.cpp:340-341)
+                    self.update_most_work_invalid(new_index);
                     warn!(
                         "reorganize_chain: marked block {} at height {} and {} descendant(s) invalid",
                         index.hash,
@@ -2817,6 +2996,12 @@ impl Chain {
                     old_tip,
                 )?;
                 self.db.delete_metadata(REORG_TARGET_KEY)?;
+                // and checks again on the chain it goes back to
+                if invalid {
+                    if let Some(tip) = self.tip() {
+                        self.check_fork_warning_at(&tip);
+                    }
+                }
                 return Err(e);
             }
         }
@@ -2835,6 +3020,7 @@ impl Chain {
             "Chain reorganization complete. New tip: {} at height {}",
             new_index.hash, new_index.height
         );
+        self.check_fork_warning_at(new_index);
 
         Ok((common_ancestor.height, orphaned_txs))
     }
@@ -3025,6 +3211,10 @@ impl Chain {
                 }
             }
         }
+        // InvalidChainFound for the block (BlockInvalidationHelpers.cpp:153)
+        if let Some(tip) = self.tip() {
+            self.note_invalid_chain(&target, &tip);
+        }
         if activate {
             self.activate_best_valid_chain()?;
         }
@@ -3151,6 +3341,20 @@ impl Chain {
         let all = self.db.iter_all_block_indexes()?;
         let by_hash: std::collections::HashMap<Hash256, BlockIndex> =
             all.iter().map(|i| (i.hash, i.clone())).collect();
+
+        // reconsiderBlock forgets the invalid block kept when it is this
+        // block or one above it (ChainExtensionService.cpp:667-678)
+        let kept = self.most_work_invalid.read().clone().flatten();
+        if let Some(kept) = kept {
+            let mut walk = Some(kept);
+            while let Some(w) = walk.filter(|w| w.height >= target.height) {
+                if w.hash == target.hash {
+                    *self.most_work_invalid.write() = Some(None);
+                    break;
+                }
+                walk = by_hash.get(&w.prev_hash).cloned();
+            }
+        }
 
         let mut to_clear: std::collections::HashSet<Hash256> = std::collections::HashSet::new();
         // Ancestors of the target
@@ -4358,6 +4562,9 @@ impl Chain {
                 "activate_best_chain: block {} at height {} is on an invalid chain - not reorganizing",
                 best_block.hash, best_block.height
             );
+            // which makes it the invalid block with the most work if none
+            // has more (BlockCheckingHelpers.cpp:340-341)
+            self.update_most_work_invalid(&best_block);
             *self.best_known_block.write() = Some(current_tip);
             return Ok(None);
         }
@@ -5488,6 +5695,7 @@ impl Chain {
         // Never activate a block that is, or descends from, an invalid block.
         if self.has_failed_ancestor(&existing_index)? {
             debug!("try_activate_block: Block {} is on an invalid chain", hash);
+            self.update_most_work_invalid(&existing_index);
             return Ok(None);
         }
 
@@ -6585,6 +6793,73 @@ mod tests {
                 "coinbase of active block {height} not indexed"
             );
         }
+    }
+
+    /// Divi Core's fork warning (ForkWarningHelpers.cpp:20-58): a branch the
+    /// chain moved to and then invalidated is one block past the tip while it
+    /// runs, so nothing is found. After a restart the invalid block kept is the
+    /// branch's tip, the most work of the blocks marked failed
+    /// (BlockIndexLoading.cpp:67-68), and each block connected is checked
+    /// against it until the tip is six blocks of work below it.
+    #[test]
+    fn an_invalidated_branch_far_past_the_tip_is_found_after_a_restart() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(ChainDatabase::open(dir.path().join("chain")).unwrap());
+        let params = ChainParams {
+            check_block_work: false,
+            checkpoints: Vec::new(),
+            ..ChainParams::for_network(NetworkType::Mainnet, ChainMode::Divi)
+        };
+        let extend = |chain: &Chain, from: (Hash256, u32), n: usize, key: u8| {
+            let (mut prev_hash, mut prev_time) = from;
+            for _ in 0..n {
+                let mut block = create_child_block_with_pubkey(prev_hash, prev_time, [key; 20]);
+                block.transactions[0].vout[0].value = Amount::from_divi(1);
+                seal(&mut block);
+                prev_time = block.header.time;
+                prev_hash = chain.accept_block(block).unwrap().hash;
+            }
+            (prev_hash, prev_time)
+        };
+        // Recent blocks, so the chain is out of initial download
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as u32;
+        let own = {
+            let chain = Chain::new(db.clone(), params.clone()).unwrap();
+            let fork = extend(&chain, (get_genesis_info(&chain).0, now - 3600), 20, 1);
+            let own = extend(&chain, fork, 2, 2);
+            extend(&chain, fork, 20, 3);
+            assert_eq!(chain.height(), 40);
+            let first = chain.get_block_index_by_height(21).unwrap().unwrap().hash;
+            chain.invalidate_block(&first).unwrap();
+            assert_eq!(chain.tip().unwrap().hash, own.0);
+            assert!(!chain.large_work_invalid_chain_found());
+            own
+        };
+        let chain = Chain::new(db, params).unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        chain.add_fork_warning_listener(Arc::new(move |found| sink.lock().push(found)));
+        // Nothing is checked before a block connects
+        assert!(!chain.large_work_invalid_chain_found());
+        let own = extend(&chain, own, 1, 2);
+        assert!(
+            chain.large_work_invalid_chain_found(),
+            "tip 23, branch tip 40"
+        );
+        let own = extend(&chain, own, 10, 2);
+        assert!(
+            chain.large_work_invalid_chain_found(),
+            "tip 33: seven blocks below"
+        );
+        extend(&chain, own, 1, 2);
+        assert!(
+            !chain.large_work_invalid_chain_found(),
+            "tip 34: six blocks below"
+        );
+        assert_eq!(*seen.lock(), vec![true, false]);
     }
 
     #[test]

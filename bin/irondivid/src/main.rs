@@ -2322,6 +2322,15 @@ async fn run_daemon(
         spawn_block_notify(node.chain().clone(), cmd);
     }
     spawn_version_warning(node.chain().clone(), config.alertnotify.clone());
+    // The chain's fork warning check sets what Divi Core's
+    // Warnings::setLargeWorkInvalidChainFound does: getinfo's and
+    // getmininginfo's "errors", and safe mode (Warnings.cpp:41-47)
+    node.chain().add_fork_warning_listener(Arc::new(
+        divi_rpc::warnings::set_large_work_invalid_chain_found,
+    ));
+    divi_rpc::warnings::set_large_work_invalid_chain_found(
+        node.chain().large_work_invalid_chain_found(),
+    );
 
     // The ZMQ notifiers, before the chain takes blocks (init.cpp:1495-1500).
     // Kept for the life of the node; none if an address cannot be bound.

@@ -59,6 +59,7 @@ pub mod export;
 #[cfg(test)]
 mod fault;
 pub mod fork_activation;
+pub mod fork_warning;
 pub mod lottery;
 pub mod masternode;
 pub mod pos_validation;
