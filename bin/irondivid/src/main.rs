@@ -4218,6 +4218,30 @@ mod config_format_tests {
         assert_eq!(a.chain_mode(), ChainMode::Divi);
     }
 
+    /// Off regtest divid stops at start when rpcuser is rpcpassword
+    /// (rpcserver.cpp:655-678); irondivid served that login
+    #[test]
+    fn rpcuser_equal_to_rpcpassword_is_refused_off_regtest() {
+        for net in ["", "testnet=1\n"] {
+            let err = cfg(&format!("{net}rpcuser=same\nrpcpassword=same\n"), &[])
+                .err()
+                .unwrap_or_else(|| panic!("{net:?}: started"));
+            assert!(
+                err.to_string().contains("MUST NOT be the same"),
+                "{net:?}: {err}"
+            );
+            // without the RPC server there is no login to refuse
+            assert!(cfg(
+                &format!("{net}server=0\nrpcuser=same\nrpcpassword=same\n"),
+                &[]
+            )
+            .is_ok());
+            assert!(cfg(&format!("{net}rpcuser=a\nrpcpassword=b\n"), &[]).is_ok());
+        }
+        // regtest does not need the password (chainparams.cpp:513)
+        assert!(cfg("regtest=1\nrpcuser=same\nrpcpassword=same\n", &[]).is_ok());
+    }
+
     /// -rpckeepalive is read, on by default (rpcserver.cpp:1014-1017)
     #[test]
     fn rpckeepalive_is_read() {
@@ -5459,6 +5483,33 @@ mod divid_option_tests {
         assert_eq!(
             cfg("rpcuser=x\nrpcbind=0.0.0.0\n").rpc.listen_addr,
             "127.0.0.1"
+        );
+    }
+
+    /// divid listens on ::1 and 127.0.0.1 by default, and on every -rpcbind
+    /// (one without a port on -rpcport) when -rpcallowip is given
+    /// (rpcserver.cpp:683-750); irondivid took 127.0.0.1 or the first -rpcbind
+    #[test]
+    fn rpc_listens_on_every_address_divid_binds() {
+        let addrs = |c: NodeConfig| {
+            let mut all = vec![c.rpc.socket_addr()];
+            all.extend(c.rpc.also_listen);
+            all.iter().map(|a| a.to_string()).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            addrs(cfg("rpcuser=x\nrpcport=4000\n")),
+            ["127.0.0.1:4000", "[::1]:4000"]
+        );
+        assert_eq!(
+            addrs(cfg(
+                "rpcuser=x\nrpcport=4000\nrpcallowip=10.0.0.0/8\n\
+                 rpcbind=127.0.0.2:4001\nrpcbind=127.0.0.3\nrpcbind=[::1]:4002\n"
+            )),
+            ["127.0.0.2:4001", "127.0.0.3:4000", "[::1]:4002"]
+        );
+        assert_eq!(
+            addrs(cfg("rpcuser=x\nrpcport=4000\nrpcallowip=10.0.0.0/8\n")),
+            ["[::]:4000"]
         );
     }
 

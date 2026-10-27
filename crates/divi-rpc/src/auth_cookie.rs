@@ -161,4 +161,17 @@ mod tests {
             assert!(dir.path().join(COOKIE_FILE_NAME).exists());
         }
     }
+
+    /// divid logs in "-rpcuser:-rpcpassword", so a password alone is the
+    /// login with an empty user, not a reason for a cookie
+    #[test]
+    fn password_alone_is_a_login_with_an_empty_user() {
+        let dir = tempfile::tempdir().unwrap();
+        for user in [None, Some("")] {
+            let (u, p, cookie) = resolve_rpc_auth(user, Some("s3cret"), dir.path()).unwrap();
+            assert_eq!((u.as_str(), p.as_str()), ("", "s3cret"));
+            assert!(cookie.is_none());
+            assert!(!dir.path().join(COOKIE_FILE_NAME).exists());
+        }
+    }
 }
