@@ -2744,13 +2744,42 @@ mod tests {
     }
 
     #[test]
-    fn credentials_need_both_user_and_password() {
+    fn credentials_need_a_password() {
         let mut config = RpcConfig::default();
         assert!(rpc_credentials(&config).is_none());
         config.username = Some("alice".into());
         assert!(rpc_credentials(&config).is_none());
+        config.password = Some("".into());
+        assert!(rpc_credentials(&config).is_none());
         config.password = Some("s3cret".into());
         assert!(rpc_credentials(&config).is_some());
+    }
+
+    /// divid with rpcpassword and no rpcuser takes the login ":<password>"
+    /// (rpcserver.cpp:655), which divi-cli sends with only a password set
+    #[tokio::test]
+    async fn password_without_user_logs_in_with_an_empty_user() {
+        for user in [None, Some("")] {
+            let (server, _dir) = create_test_server();
+            let config = RpcConfig {
+                username: user.map(String::from),
+                password: Some("s3cret".into()),
+                ..RpcConfig::default()
+            };
+            let router = create_router_with_auth(server, &config);
+            assert_eq!(
+                status_of(router.clone(), Some(basic("", "s3cret"))).await,
+                StatusCode::OK
+            );
+            assert_eq!(
+                status_of(router.clone(), Some(basic("alice", "s3cret"))).await,
+                StatusCode::UNAUTHORIZED
+            );
+            assert_eq!(
+                status_of(router, Some(basic("", ""))).await,
+                StatusCode::UNAUTHORIZED
+            );
+        }
     }
 
     /// Serve `router` on a loopback port and POST one getblockcount to it.
@@ -2810,6 +2839,68 @@ mod tests {
                 StatusCode::UNAUTHORIZED
             );
         }
+    }
+
+    /// The status line irondivid's server gives a request without credentials
+    /// at `addr`, waiting for it to listen
+    async fn status_line_at(addr: SocketAddr) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut stream = loop {
+            match tokio::net::TcpStream::connect(addr).await {
+                Ok(s) => break s,
+                Err(e) if std::time::Instant::now() > deadline => panic!("{addr}: {e}"),
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
+            }
+        };
+        let body = r#"{"method":"getblockcount","params":[],"id":1}"#;
+        let request = format!(
+            "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        response.lines().next().unwrap_or_default().to_string()
+    }
+
+    /// Divi Core listens on every -rpcbind (and on ::1 and 127.0.0.1), goes
+    /// on without an address it cannot bind and fails only with none
+    /// (rpcserver.cpp:683-753); irondivid listened on one address
+    #[tokio::test]
+    async fn every_bind_address_is_served_and_one_taken_is_skipped() {
+        let taken = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let free = || {
+            std::net::TcpListener::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+        };
+        let (a, b) = (free(), free());
+        let (server, _dir) = create_test_server();
+        let config = RpcConfig {
+            bind_address: taken.local_addr().unwrap(),
+            also_bind: vec![a, b],
+            username: Some("alice".into()),
+            password: Some("s3cret".into()),
+            ..RpcConfig::default()
+        };
+        let app = create_router_with_auth(server.clone(), &config);
+        tokio::spawn(async move { serve(&config, app, std::future::pending()).await });
+        for addr in [a, b] {
+            assert_eq!(
+                status_line_at(addr).await,
+                "HTTP/1.0 401 Authorization Required",
+                "{addr}"
+            );
+        }
+
+        let config = RpcConfig {
+            bind_address: taken.local_addr().unwrap(),
+            ..RpcConfig::default()
+        };
+        let app = create_router_with_auth(server, &config);
+        assert!(serve(&config, app, std::future::pending()).await.is_err());
     }
 
     /// Serve `router` on a loopback port, send `request` as is and return the

@@ -1228,6 +1228,46 @@ mod endpoint_tests {
         assert_eq!(base, Path::new("/h/.irondivi"));
     }
 
+    /// divi-cli with only rpcpassword logs in as ":<password>", which
+    /// irondivid takes as divid does; a cookie must not replace it
+    #[test]
+    fn password_alone_logs_in_with_an_empty_user() {
+        let home = tempfile::tempdir().unwrap();
+        let datadir = home.path().join("node");
+        fs::create_dir_all(&datadir).unwrap();
+        fs::write(datadir.join("irondivi.conf"), "rpcpassword=p\n").unwrap();
+        fs::write(datadir.join(".cookie"), "__cookie__:feedbeef").unwrap();
+        let dd = datadir.to_str().unwrap();
+        for argv in [
+            vec![
+                "irondivi-cli",
+                "--regtest",
+                "--datadir",
+                dd,
+                "getblockcount",
+            ],
+            vec![
+                "irondivi-cli",
+                "--regtest",
+                "--rpcpassword=p",
+                "getblockcount",
+            ],
+        ] {
+            let ep = resolve_endpoint(&parse_args(&argv), home.path()).unwrap();
+            assert_eq!(ep.rpc_user.as_deref(), Some(""), "{argv:?}");
+            assert_eq!(ep.rpc_password.as_deref(), Some("p"), "{argv:?}");
+        }
+        let client = |u: Option<&str>, p: Option<&str>| RpcClient {
+            url: String::new(),
+            username: u.map(String::from),
+            password: p.map(String::from),
+        };
+        assert_eq!(client(None, Some("p")).login(), Some(("", "p")));
+        assert_eq!(client(Some("u"), None).login(), Some(("u", "")));
+        assert_eq!(client(Some("u"), Some("p")).login(), Some(("u", "p")));
+        assert_eq!(client(None, None).login(), None);
+    }
+
     #[test]
     fn cookie_in_irondivid_datadir_is_used() {
         // irondivid writes <datadir>/.cookie; the CLI must find it with
