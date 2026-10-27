@@ -659,3 +659,76 @@ fn every_tier_is_set_up_and_listed() {
         assert_eq!(listed[0]["tier"], json!(name), "{listed}");
     }
 }
+
+/// The peers' time offset set until dropped (Core's nTimeOffset, which
+/// GetAdjustedTime adds, timedata.cpp:35-38)
+struct PeerOffset;
+
+impl PeerOffset {
+    fn of(seconds: i64) -> Self {
+        clock::set_time_offset(seconds);
+        PeerOffset
+    }
+}
+
+impl Drop for PeerOffset {
+    fn drop(&mut self) {
+        clock::set_time_offset(0);
+    }
+}
+
+/// A masternode's state is checked on the network-adjusted clock
+/// (TimeSinceLastPingIsWithin on GetAdjustedTime, MasternodeHelpers.cpp
+/// :172-181): with the node's own clock unmoved, a peer offset that puts the
+/// adjusted time two hours past the last ping makes it EXPIRED
+#[test]
+fn a_peer_offset_moves_a_masternode_across_its_expiry() {
+    let _serial = SERIAL.lock();
+    let n = regtest();
+    let s = n.start("mn1", "copper");
+    let since = clock::system_now() - n.last_ping_time();
+    {
+        let _offset = PeerOffset::of(7200 - since + 30);
+        assert_eq!(n.status(&s), json!("EXPIRED"));
+        let count = n.ok("getmasternodecount", vec![]);
+        assert_eq!(count["enabled"], json!(0), "{count}");
+    }
+    assert_eq!(n.status(&s), json!("ENABLED"));
+}
+
+/// A broadcast is refused when signed more than an hour past the
+/// network-adjusted clock (CheckMasternodeBroadcastContext,
+/// masternodeman.cpp:235): a peer offset of ten minutes takes one signed 65
+/// minutes ahead
+#[test]
+fn a_peer_offset_moves_the_broadcast_future_limit() {
+    let _serial = SERIAL.lock();
+    let n = regtest();
+    let s = n.set_up("mn1", "copper");
+    let mut mnb = CppBroadcast::decode(&hex::decode(&s.signed).unwrap()).unwrap();
+    let hash = Hash256::from_hex(&s.txhash).unwrap();
+    let (tx, _) = n.chain.locate_transaction(&hash).unwrap().unwrap();
+    let script = tx.vout[s.vout as usize].script_pubkey.as_bytes().to_vec();
+    let mut id = [0u8; 20];
+    id.copy_from_slice(&script[3..23]);
+    let address =
+        divi_wallet::address::Address::from_pubkey_hash(id.into(), n.wallet.network()).to_base58();
+    let wif = n.ok("dumpprivkey", vec![json!(address)]);
+    let collateral = divi_crypto::SecretKey::from_bytes(
+        &divi_wallet::decode_wif(wif.as_str().unwrap())
+            .unwrap()
+            .key_bytes,
+    )
+    .unwrap();
+    mnb.sig_time = clock::system_now() + 65 * 60;
+    mnb.sign(&collateral).unwrap();
+    let refusal = MasternodeList::new()
+        .accept_broadcast(&n.chain, &mnb.encode())
+        .unwrap_err();
+    assert_eq!(refusal.dos, 1, "{refusal}");
+    let _offset = PeerOffset::of(10 * 60);
+    assert_eq!(
+        MasternodeList::new().accept_broadcast(&n.chain, &mnb.encode()),
+        Ok(true)
+    );
+}
