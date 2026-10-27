@@ -136,7 +136,8 @@ fn backup_closed(
     let made = if !wallet.is_dir() {
         None
     } else if target.exists() {
-        warn!("Backup {} already exists; not made again", target.display());
+        // Core's copy_file refuses a name already there (WalletBackupCreator.cpp:44-55)
+        info!("Failed to create backup");
         None
     } else {
         copy_dir(wallet, &target).map_err(|e| {
@@ -172,9 +173,25 @@ fn monthly_due(dir: &Path, wallet: &str, now: SystemTime) -> bool {
 pub fn backup_at_start(wallet: &Path, data_dir: &Path, keep: usize) -> Result<(), WalletError> {
     let now = SystemTime::now();
     info!("backing up wallet");
+    // No wallet yet (a first start): each of the two backups says so and
+    // makes nothing, not even its folder (WalletBackupFeatureContainer.cpp:24-33,
+    // :57-70)
+    if !wallet.exists() {
+        for _ in 0..2 {
+            info!(
+                "Wallet file not found at {}. Skipping backup...",
+                wallet.display()
+            );
+        }
+        return Ok(());
+    }
+    // Each backup logs it again before it copies or checks the age
+    // (WalletBackupFeatureContainer.cpp:41)
+    info!("backing up wallet");
     backup_closed(wallet, &data_dir.join("backups"), keep, now)?;
     let monthly = data_dir.join("monthlyBackups");
     std::fs::create_dir_all(&monthly).map_err(|e| WalletError::Storage(e.to_string()))?;
+    info!("backing up wallet");
     if monthly_due(&monthly, &wallet_name(wallet), now) {
         backup_closed(wallet, &monthly, keep, now)?;
     }
@@ -201,7 +218,7 @@ pub fn monthly_backup(
     }
     let target = backup_path(&dir, &path, now);
     if target.exists() {
-        warn!("Backup {} already exists; not made again", target.display());
+        info!("Failed to create backup");
         return Ok(None);
     }
     wallet.backup_to(&target)?;

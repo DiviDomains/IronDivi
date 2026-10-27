@@ -1731,11 +1731,9 @@ fn move_wallet_for_restore(wallet_path: &Path) -> Result<()> {
 
 /// Divi Core copies the wallet into backups/ (and monthlyBackups/) at every
 /// start, in step 5: after the pid file, before the network and the chain
-/// (BackupWallet, init.cpp:1479, :933-943). A wallet not there yet has none.
+/// (BackupWallet, init.cpp:1479, :933-943). A wallet not there yet has none,
+/// and the log says so.
 fn backup_wallet_at_start(wallet_path: &Path, options: &WalletOptions) {
-    if !wallet_path.exists() {
-        return;
-    }
     if let Some(data_dir) = wallet_path.parent() {
         if let Err(e) =
             divi_wallet::backup::backup_at_start(wallet_path, data_dir, options.wallet_backups)
