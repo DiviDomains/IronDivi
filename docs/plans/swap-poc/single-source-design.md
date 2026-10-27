@@ -6,6 +6,8 @@ is changed by this document. Answers `engine-review-brief.md` §7 question 6.
 Third-party facts (who operates an endpoint, what an explorer returns) are in
 `single-source-design.FACTS.md`; this file only states what the code does.
 
+Two sources that collude (one operator, one upstream, the host's DNS) are covered in `colluding-endpoints.md`.
+
 ## 1. What each side asks a single source
 
 The engine (`crates/divi-swap/src/backend.rs:41`, `ChainBackend`) calls five things on a backend.
