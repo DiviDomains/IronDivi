@@ -473,12 +473,22 @@ fn live_usdc_backend(cli: &Cli) -> Result<Arc<swap_chain_evm::UsdcBackend>> {
 /// untouched; the same URL as `rpc_url` is refused (one node asked twice is not a second
 /// source).
 fn with_usdc_fallback(
-    _cli: &Cli,
-    _rpc_url: &str,
+    cli: &Cli,
+    rpc_url: &str,
     backend: swap_chain_evm::UsdcBackend,
 ) -> Result<swap_chain_evm::UsdcBackend> {
-    // Stub until the wiring lands: the flag parses but turns nothing on.
-    Ok(backend)
+    let Some(url) = cli
+        .usdc_fallback_rpc_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+    else {
+        return Ok(backend);
+    };
+    if url.trim_end_matches('/') == rpc_url.trim().trim_end_matches('/') {
+        bail!("--usdc-fallback-rpc-url must differ from --usdc-rpc-url");
+    }
+    Ok(backend.with_quorum_rpc(url)?)
 }
 
 /// Refuse `mainnet` for the btc/ltc arms without `--allow-mainnet`, and an unknown network

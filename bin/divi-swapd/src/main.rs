@@ -395,8 +395,8 @@ async fn live_ltc(
 const MIN_MAKER_ETH_WEI: u128 = 10_000_000_000_000_000; // 0.01 ETH
 const MIN_MAKER_USDC_UNITS: u64 = 10_000_000; // 10 USDC, 6 decimals
 
-/// The live `UsdcBackend` a `[usdc]` section describes, signing with `key`. No network
-/// request is made here.
+/// The live `UsdcBackend` a `[usdc]` section describes, signing with `key`, with the second
+/// node of `fallback_rpc_url` when set. No network request is made here.
 fn usdc_backend(
     cfg: &divi_swapd::UsdcSection,
     key: swap_chain_evm::PrivateKeySigner,
@@ -409,10 +409,14 @@ fn usdc_backend(
         .token()?
         .parse()
         .map_err(|e| anyhow::anyhow!("usdc token address: {e}"))?;
-    Ok(
-        swap_chain_evm::UsdcBackend::new(&cfg.rpc_url()?, key, htlc, token)?
-            .with_min_lock_gas_wei(MIN_MAKER_ETH_WEI),
-    )
+    let mut backend = swap_chain_evm::UsdcBackend::new(&cfg.rpc_url()?, key, htlc, token)?
+        .with_min_lock_gas_wei(MIN_MAKER_ETH_WEI);
+    // Opt-in (`[usdc].fallback_rpc_url`): the reads a claim or refund rests on are asked of
+    // both nodes. Unset, the backend is built as before.
+    if let Some(second) = cfg.fallback_rpc_url()? {
+        backend = backend.with_quorum_rpc(&second)?;
+    }
+    Ok(backend)
 }
 
 /// Builds the live `UsdcBackend` and checks its balance against every enabled usdc offer
@@ -439,7 +443,7 @@ async fn live_usdc(
         .map_err(|e| anyhow::anyhow!("usdc balance check: {e}"))?;
     tracing::info!(
         %address, network = %cfg.network, mainnet = cfg.network()?.is_mainnet(), htlc = %cfg.htlc, token = %token_str,
-        %eth_wei, %usdc_units, "usdc backend ready"
+        %eth_wei, %usdc_units, quorum_reads = cfg.fallback_rpc_url()?.is_some(), "usdc backend ready"
     );
     let mut underfunded = Vec::new();
     for o in offers.iter().filter(|o| o.counter_chain == Chain::Usdc) {

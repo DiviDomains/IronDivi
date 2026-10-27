@@ -269,8 +269,17 @@ impl UsdcSection {
     /// `fallback_rpc_url` when set and non-blank; an identical URL to `rpc_url` is refused
     /// because it would make the "second" node a copy of the first.
     pub fn fallback_rpc_url(&self) -> Result<Option<String>> {
-        // Stub until the wiring lands: the key parses but turns nothing on.
-        Ok(None)
+        let Some(f) = self.fallback_rpc_url.as_deref().map(str::trim) else {
+            return Ok(None);
+        };
+        if f.is_empty() {
+            return Ok(None);
+        }
+        let norm = |u: &str| u.trim().trim_end_matches('/').to_string();
+        if norm(f) == norm(&self.rpc_url()?) {
+            bail!("[usdc].fallback_rpc_url must differ from [usdc].rpc_url");
+        }
+        Ok(Some(f.to_string()))
     }
 
     /// `token`, or `network`'s USDC token address if unset.
@@ -798,6 +807,7 @@ impl DaemonConfig {
         }
         if let Some(u) = &self.usdc {
             let network = u.network()?;
+            u.fallback_rpc_url()?;
             if network.is_mainnet() && !u.allow_mainnet {
                 bail!(
                     "[usdc].network = {:?}: usdc mainnet moves real money: no mainnet \
