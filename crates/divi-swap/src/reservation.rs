@@ -404,9 +404,10 @@ impl InputReservations {
     /// - a median time past ([`ChainBackend::median_time_past`]) more than
     ///   [`EXPIRY_MAX_TIP_LEAD_SECS`] ahead of `now` is treated as a tip past that limit:
     ///   nothing is checked, recorded or released, no record moves and the high-water mark
-    ///   stays. A valid chain's MTP is below its tip's time, but the two are separate reads
-    ///   (maybe from separate endpoints), and a pending record must not start its count on an
-    ///   MTP the clock cannot vouch for;
+    ///   stays. A valid chain's MTP is a median of block times each accepted within that
+    ///   limit, so it cannot be past it either; one that is comes from a wrong backend or
+    ///   clock (the tip and MTP are separate reads, maybe from separate endpoints), and a
+    ///   pending record must not start its count on an MTP the clock cannot vouch for;
     /// - a record whose block is no longer on the backend's main chain
     ///   ([`ChainBackend::in_best_chain`]) was reorged out: it is replaced by one at the
     ///   current tip, so the count starts over. A record from before hashes were stored is
