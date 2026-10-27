@@ -696,10 +696,8 @@ impl WalletDb {
     /// is offered to the mempool again at the next start (wallet.cpp:1866-1878,
     /// rpcwallet.cpp:774-782, init.cpp:1262-1275)
     pub fn keep_refused_send(&self, tx: &divi_primitives::transaction::Transaction) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        // nTimeReceived = GetAdjustedTime() (SpentOutputTracker.cpp:47)
+        let now = divi_primitives::clock::adjusted_now().max(0) as u64;
         self.detach(tx.txid(), now, Some(tx.clone()));
     }
 
@@ -3529,11 +3527,9 @@ impl WalletDb {
             // own time, but never later than now: Divi Core's time of a wallet
             // transaction is at most when the wallet received it (nTimeSmart,
             // wallet.cpp:1052-1086), so one in a block dated ahead of the clock
-            // counts from its arrival
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs();
+            // counts from its arrival, on the network-adjusted clock
+            // (nTimeReceived = GetAdjustedTime(), SpentOutputTracker.cpp:47)
+            let now = divi_primitives::clock::adjusted_now().max(0) as u64;
             let timestamp = block_time.map_or(now, |t| u64::from(t).min(now));
 
             let wallet_tx = WalletTx {
@@ -3702,12 +3698,9 @@ impl WalletDb {
             txid,
             block_hash: None,
             block_height: None,
-            timestamp: restored_time.unwrap_or_else(|| {
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs()
-            }),
+            // nTimeReceived = GetAdjustedTime() (SpentOutputTracker.cpp:47)
+            timestamp: restored_time
+                .unwrap_or_else(|| divi_primitives::clock::adjusted_now().max(0) as u64),
             amount: net_amount,
             fee,
             category: category.to_string(),
