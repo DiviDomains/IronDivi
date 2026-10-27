@@ -191,12 +191,17 @@ impl StakingRpc {
             .map(|sats| sats as f64 / COIN as f64)
             .unwrap_or(info.stake_split_threshold);
 
-        let staking_status_text = if info.staking && info.enabled {
-            "Staking Active"
-        } else if info.enabled {
-            "Staking Not Active"
-        } else {
+        // Divi Core's own words for it are getinfo's "staking status": "Staking
+        // Active" when a stake was tried lately, else "Staking Not Active"
+        // (rpcmisc.cpp:154-155), the bool below. A locked wallet tries none.
+        // "Staking Disabled" is irondivid's own: its staker can be switched off
+        // (setstaking false, -staking=0), which divid's cannot
+        let staking_status_text = if !info.enabled {
             "Staking Disabled"
+        } else if info.recently_attempted {
+            "Staking Active"
+        } else {
+            "Staking Not Active"
         };
 
         Ok(serde_json::json!({
@@ -488,6 +493,68 @@ mod tests {
         assert_eq!(
             rpc.get_stake_split_threshold(&Params::None).unwrap(),
             serde_json::json!(5000)
+        );
+    }
+
+    /// The text follows Divi Core's getinfo text, so a staker with coins but a
+    /// locked wallet, which tries no stake, is "Staking Not Active"
+    #[test]
+    fn staking_status_text_follows_a_recent_stake_attempt() {
+        let status = |enabled: bool, wallet_unlocked: bool, recently_attempted: bool| {
+            let rpc = StakingRpc::new();
+            rpc.set_status_callback(Arc::new(move || StakingInfo {
+                enabled,
+                staking: true,
+                errors: None,
+                current_block_size: 0,
+                current_block_tx: 0,
+                pooled_tx: 0,
+                difficulty: 0.0,
+                search_interval: 0,
+                weight: 0,
+                netstakeweight: 0,
+                expected_time: None,
+                staking_balance: 100000.0,
+                wallet_unlocked,
+                have_connections: false,
+                valid_time: true,
+                mintable_coins: true,
+                enough_coins: true,
+                mnsync: false,
+                recently_attempted,
+                blocks: 120,
+                stake_split_threshold: 20000.0,
+            }));
+            let reply = rpc.get_staking_status(&Params::None).unwrap();
+            (
+                reply["staking status"].clone(),
+                reply["staking status text"].clone(),
+            )
+        };
+        // Locked after a restart: stakable coins, no stake tried
+        assert_eq!(
+            status(true, false, false),
+            (
+                serde_json::json!(false),
+                serde_json::json!("Staking Not Active")
+            )
+        );
+        // Unlocked, no stake tried yet
+        assert_eq!(
+            status(true, true, false),
+            (
+                serde_json::json!(false),
+                serde_json::json!("Staking Not Active")
+            )
+        );
+        assert_eq!(
+            status(true, true, true),
+            (serde_json::json!(true), serde_json::json!("Staking Active"))
+        );
+        // The staker switched off
+        assert_eq!(
+            status(false, true, false).1,
+            serde_json::json!("Staking Disabled")
         );
     }
 
