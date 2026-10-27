@@ -1891,11 +1891,52 @@ impl PeerManager {
         }
     }
 
-    /// Periodic maintenance loop that ensures we maintain target outbound peer count.
-    ///
-    /// Runs every 30 seconds: dials the added nodes not connected, then, if
-    /// we've dropped below `max_outbound`, static peers (with exponential
-    /// backoff for repeatedly-failing peers), then DNS seeds.
+    /// The added nodes (-addnode, addnode add), dialled as Divi Core's
+    /// added-node thread dials them (ThreadOpenAddedConnections,
+    /// net.cpp:1239-1270): each one not connected, then 500 ms, and the
+    /// round again two minutes later, for as long as the node runs, with no
+    /// back-off. It runs beside the -connect loop and counts no outbound slot,
+    /// whatever -maxconnections says, since Divi Core f8c0d2e67 took its
+    /// semaphore grant out; a banned address is not dialled (net.cpp:1283)
+    /// but has its 500 ms
+    async fn run_added_loop(self: Arc<Self>) {
+        let pause = Duration::from_millis(500);
+        let round = Duration::from_secs(120);
+        loop {
+            // Each address once, however many texts name it
+            let mut added: Vec<SocketAddr> = Vec::new();
+            for (_, addr) in self.added_nodes.read().iter() {
+                if !added.contains(addr) {
+                    added.push(*addr);
+                }
+            }
+            for addr in added {
+                // A connected node is not in divid's list for the round
+                if self.peers.read().values().any(|p| p.addr == addr) {
+                    continue;
+                }
+                if !self.is_banned(&addr.ip()) && self.claim_dial(addr, DialRule::ByAddress) {
+                    info!(
+                        "Reconnecting to added node: {}",
+                        crate::peer_log::address(addr)
+                    );
+                    let self_clone = Arc::clone(&self);
+                    self.spawn_task(format!("dial of added node {addr}"), async move {
+                        if let Err(e) = self_clone.connect_to_peer(addr).await {
+                            debug!("Failed to reconnect to added node {}: {}", addr, e);
+                        }
+                    });
+                }
+                self.clock.sleep(pause).await;
+            }
+            self.clock.sleep(round).await;
+        }
+    }
+
+    /// Periodic maintenance: the added nodes on their own loop
+    /// (`run_added_loop`), and every 30 seconds, if we've dropped below
+    /// `max_outbound`, static peers (with exponential backoff for
+    /// repeatedly-failing peers), then DNS seeds.
     ///
     /// Backoff schedule for static peers (consecutive failures → min wait before retry):
     ///   1 failure  → 30 s
@@ -1906,53 +1947,19 @@ impl PeerManager {
     ///   6 failures → 16 min
     ///   7+ failures → 30 min (cap)
     pub async fn run_maintenance(self: Arc<Self>) {
+        tokio::join!(
+            Arc::clone(&self).run_added_loop(),
+            self.run_outbound_maintenance()
+        );
+    }
+
+    /// The 30-second pass of `run_maintenance`
+    async fn run_outbound_maintenance(self: Arc<Self>) {
         let mut interval = self.clock.interval(Duration::from_secs(30));
         loop {
             interval.tick().await;
 
             self.dial_one_shots();
-
-            // 1. The added nodes (-addnode, addnode add), with -connect or
-            // not and whatever -maxconnections says: divid's added-node
-            // thread runs beside the -connect loop and counts no outbound
-            // slot since Divi Core f8c0d2e67 took its semaphore grant out; it skips a
-            // banned address (net.cpp:1214-1271, :1275-1285)
-            let mut added: Vec<SocketAddr> = Vec::new();
-            for (_, addr) in self.added_nodes.read().iter() {
-                if !added.contains(addr) {
-                    added.push(*addr);
-                }
-            }
-            for addr in added {
-                if self.is_banned(&addr.ip()) {
-                    continue;
-                }
-                // Added nodes also respect backoff if they keep failing
-                if !self.peer_backoff_ready(addr) {
-                    debug!("Skipping added node {} (in backoff)", addr);
-                    continue;
-                }
-                if !self.claim_dial(addr, DialRule::ByAddress) {
-                    continue;
-                }
-                info!(
-                    "Reconnecting to added node: {}",
-                    crate::peer_log::address(addr)
-                );
-                let self_clone = Arc::clone(&self);
-                self.spawn_task(format!("dial of added node {addr}"), async move {
-                    let self_for_record = Arc::clone(&self_clone);
-                    match self_clone.connect_to_peer(addr).await {
-                        Ok(_) => {
-                            self_for_record.record_static_peer_success(addr);
-                        }
-                        Err(e) => {
-                            debug!("Failed to reconnect to added node {}: {}", addr, e);
-                            self_for_record.record_static_peer_failure(addr);
-                        }
-                    }
-                });
-            }
 
             let outbound = self.outbound_count();
             let target = self.config.max_outbound;
@@ -1966,7 +1973,7 @@ impl PeerManager {
                 outbound, target
             );
 
-            // 2. Try static peers (with exponential backoff for known-failing
+            // 1. Try static peers (with exponential backoff for known-failing
             // peers); -connect peers have run_connect_loop instead
             if self.can_connect_outbound() && !self.config.connect_only {
                 let static_peers = self.config.static_peers.clone();
@@ -2005,13 +2012,13 @@ impl PeerManager {
                 }
             }
 
-            // 3. Peers named by host name, through the proxy
+            // 2. Peers named by host name, through the proxy
             self.dial_named();
 
-            // 4. Addresses learnt from peers
+            // 3. Addresses learnt from peers
             self.dial_learnt();
 
-            // 5. Re-query DNS seeds as last resort
+            // 4. Re-query DNS seeds as last resort
             if self.can_connect_outbound()
                 && self.config.dns_seed
                 && !self.config.connect_only
