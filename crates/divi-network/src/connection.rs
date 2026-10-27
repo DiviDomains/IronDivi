@@ -912,8 +912,13 @@ impl Connection {
         size: u64,
     ) {
         match &msg {
-            // The peer's verack: nothing waits for it (main.cpp:498-507)
-            NetworkMessage::Verack => {}
+            // The peer's verack: nothing waits for it, but a peer we dialled
+            // is marked currently connected (main.cpp:498-507)
+            NetworkMessage::Verack => {
+                if info.direction == PeerDirection::Outbound {
+                    stats.verack_received.store(true, Ordering::Release);
+                }
+            }
             // Divi Core: one version per connection
             NetworkMessage::Version(_) => {
                 Self::answer_in_turn(stats, waiting, duplicate_version_reject());

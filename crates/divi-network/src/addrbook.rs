@@ -486,6 +486,17 @@ impl Tables {
         is_new
     }
 
+    /// Connected_ (addrman.cpp:472-490): the entry's time, at most every 20
+    /// minutes, for this exact address and port
+    fn connected(&mut self, ip: &[u8; 16], port: u16, now: i64) {
+        if let Some(id) = self.find(ip) {
+            let info = self.info.get_mut(&id).expect("found");
+            if info.port == port && now - info.time as i64 > 20 * 60 {
+                info.time = now.max(0) as u32;
+            }
+        }
+    }
+
     /// Attempt_ (addrman.cpp:315-332)
     fn attempt(&mut self, ip: &[u8; 16], port: u16, now: i64) {
         if let Some(id) = self.find(ip) {
@@ -876,6 +887,23 @@ impl AddressBook {
     /// leaving out terrible entries (addrman GetAddr_)
     pub fn sample(&self) -> Vec<(u32, NetAddr)> {
         self.tables.lock().get_addr(self.now())
+    }
+
+    /// A peer we dialled at `addr`, which sent its verack and no misbehaviour,
+    /// has gone: its time is brought up to now (addrman Connected, called
+    /// from CNodeState::Finalize, NodeState.cpp:38-40)
+    pub fn connected(&self, addr: SocketAddr) {
+        self.tables
+            .lock()
+            .connected(&ip16(addr.ip()), addr.port(), self.now());
+    }
+
+    /// When the book last heard of `addr` (its nTime), if it has it
+    pub fn time_of(&self, addr: SocketAddr) -> Option<u32> {
+        let t = self.tables.lock();
+        let id = t.find(&ip16(addr.ip()))?;
+        let info = &t.info[&id];
+        (info.port == addr.port()).then_some(info.time)
     }
 
     /// An address to dial and when it was last tried (addrman Select)

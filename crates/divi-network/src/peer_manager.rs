@@ -1369,6 +1369,7 @@ impl PeerManager {
         };
 
         let peer_id = handle.id;
+        let live = Arc::clone(&handle.stats);
 
         // Register with scoring system
         self.scoring.register_peer(peer_id, addr.ip());
@@ -1387,6 +1388,16 @@ impl PeerManager {
             if let Err(e) = conn.run().await {
                 debug!("Connection to {} ended: {}", addr, e);
                 self_clone.ban_obsolete(addr.ip(), &e);
+            }
+            // A peer that sent its verack and no misbehaviour is dated now in
+            // the address book as it goes (CNodeState::Finalize,
+            // NodeState.cpp:38-40)
+            let clean = self_clone
+                .scoring
+                .get_stats(peer_id)
+                .is_some_and(|s| s.misbehavior_score == 0);
+            if clean && live.verack_received.load(Ordering::Acquire) {
+                self_clone.address_book.connected(addr);
             }
             // Remove peer on disconnect
             self_clone.peers.write().remove(&peer_id);

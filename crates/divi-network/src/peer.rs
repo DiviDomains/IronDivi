@@ -228,6 +228,9 @@ pub struct LivePeerStats {
     pub time_offset: AtomicI64,
     /// Peer's advertised protocol version
     pub version: AtomicU64,
+    /// A peer we dialled has sent its verack (Divi Core fCurrentlyConnected,
+    /// main.cpp:498-507)
+    pub verack_received: std::sync::atomic::AtomicBool,
     /// Peer's advertised services
     pub services: AtomicU64,
     /// Peer's advertised start height (-1 when it named none)
