@@ -312,6 +312,8 @@ async fn a_dial_marks_the_address_tried_in_the_address_book() {
     let pm = PeerManager::with_clock(
         PeerManagerConfig {
             proxy: Some(proxy.config()),
+            // Only the added node is dialled: no picks from the book
+            connect_only: true,
             ..config()
         },
         clock.clone(),
@@ -343,6 +345,7 @@ async fn a_dial_marks_the_address_tried_in_the_address_book() {
                 addr: closed,
                 randomize_credentials: false,
             }),
+            connect_only: true,
             ..config()
         },
         clock.clone(),
