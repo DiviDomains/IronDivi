@@ -20,10 +20,13 @@
 //! The claim-time check (`[ltc].crosscheck_before_claim`, [`claim_crosscheck`]) also compares
 //! the block at `H - 1` ([`CLAIM_NEAR_DEPTH`]: a source one block behind or ahead still has
 //! it, so one block of lag is not a disagreement) and the spend of the output being claimed.
+//! With it on, every lock read (`htlc_output`: the maker about to fund against the taker's
+//! lock, the taker about to claim the maker's) also compares the output's script and value
+//! with the source ([`lock_view`], [`agree_lock`]) and fails closed.
 
 use std::str::FromStr;
 
-use divi_swap::Outpoint;
+use divi_swap::{LockedOutput, Outpoint};
 use serde_json::Value;
 
 use crate::client::{EsploraClient, RetryPolicy};
@@ -87,7 +90,7 @@ impl CrossCheckSource {
     /// (`vout[].spent`, `vout[].spentTxId`; trezor/blockbook `api/types.go`), BlockCypher
     /// `GET /txs/{txid}` (`outputs[].spent_by`, "only returned for outputs that have been
     /// spent"; BlockCypher API docs, TXOutput).
-    fn tx_path(self, txid: &str) -> String {
+    pub(crate) fn tx_path(self, txid: &str) -> String {
         match self {
             Self::Blockbook => format!("/tx/{txid}"),
             Self::BlockCypher => format!("/txs/{txid}"),
@@ -421,6 +424,116 @@ async fn compare_spend(
         "ltc claim cross-check FAILED on the spend of {at}: primary {primary_url} says {mine}, \
          independent source {other_url} says {theirs}; refusing"
     )))
+}
+
+/// A lock output as the cross-check source shows it (EL).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LockView {
+    /// scriptPubKey, lower-case hex.
+    script: String,
+    value: u64,
+    confirmations: u32,
+}
+
+/// `source`'s view of output `at` (the same transaction read as the spend check: Blockbook
+/// `GET /api/v2/tx/{txid}`, `vout[n].hex` / `vout[n].value` (decimal string of satoshis) /
+/// `confirmations`; BlockCypher `GET /txs/{txid}`, `outputs[n].script` / `outputs[n].value` /
+/// `confirmations`). An error is the reason, naming the URL asked.
+pub(crate) async fn lock_view(
+    source: CrossCheckSource,
+    source_base: &str,
+    retry: RetryPolicy,
+    at: &Outpoint,
+) -> Result<LockView, String> {
+    let other = EsploraClient::new(vec![source_base.to_string()], retry)
+        .map_err(|e| format!("{} client: {e}", source.as_str()))?;
+    let path = source.tx_path(&at.txid.to_rpc_hex());
+    let url = format!("{}{path}", source_base.trim_end_matches('/'));
+    let body = other
+        .get(&path)
+        .await
+        .map_err(|e| format!("{url}: {e:?}"))?;
+    source
+        .lock_from(&body, at.vout)
+        .map_err(|e| format!("{url}: {e}"))
+}
+
+impl CrossCheckSource {
+    fn lock_from(self, body: &str, vout: u32) -> Result<LockView, String> {
+        let v: Value = serde_json::from_str(body).map_err(|e| format!("not JSON: {e}"))?;
+        let (out, script_key) = match self {
+            Self::Blockbook => (
+                v["vout"]
+                    .as_array()
+                    .and_then(|a| a.iter().find(|o| o["n"].as_u64() == Some(vout as u64))),
+                "hex",
+            ),
+            Self::BlockCypher => (
+                v["outputs"].as_array().and_then(|a| a.get(vout as usize)),
+                "script",
+            ),
+        };
+        let out = out.ok_or_else(|| format!("no output {vout} in response"))?;
+        let script = out[script_key]
+            .as_str()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_hexdigit()))
+            .ok_or_else(|| format!("output {vout} lacks {script_key:?}"))?;
+        // Blockbook serialises satoshi amounts as decimal strings; BlockCypher as numbers.
+        let value = match &out["value"] {
+            Value::String(s) => s.parse().ok(),
+            n => n.as_u64(),
+        }
+        .ok_or_else(|| format!("output {vout} lacks \"value\""))?;
+        let confirmations = v["confirmations"]
+            .as_u64()
+            .ok_or_else(|| "no \"confirmations\" in response".to_string())?;
+        Ok(LockView {
+            script,
+            value,
+            confirmations: u32::try_from(confirmations).unwrap_or(u32::MAX),
+        })
+    }
+}
+
+/// Agree the primary's lock read (`mine`, at `primary_url`, already matched against the
+/// agreed script `want`) with the source's (`theirs`, from `source_url`), as
+/// `swap-chain-btc`'s `quorum::agree_htlc_output` does: the script must be the agreed one on
+/// both, the values equal, and the lower confirmation count is returned. Anything else,
+/// including a source that could not be read, is `Transient`: the caller (the maker about to
+/// fund, the taker about to reveal) waits and reads again.
+pub(crate) fn agree_lock(
+    at: &Outpoint,
+    want: &str,
+    mine: LockedOutput,
+    primary_url: &str,
+    theirs: &Result<LockView, String>,
+    source_url: &str,
+) -> Result<LockedOutput, divi_swap::SwapError> {
+    let sats = mine.amount.to_sat();
+    let refuse = |what: String| {
+        divi_swap::SwapError::Transient(format!(
+            "ltc lock cross-check FAILED for {at}: primary {primary_url} shows the agreed HTLC \
+             script with {sats} sat, {what}; not acting on the lock"
+        ))
+    };
+    match theirs {
+        Err(reason) => Err(refuse(format!(
+            "independent source could not be read ({reason})"
+        ))),
+        Ok(v) if v.script != want => Err(refuse(format!(
+            "independent source {source_url} shows scriptPubKey {} there",
+            v.script
+        ))),
+        Ok(v) if v.value != sats => Err(refuse(format!(
+            "independent source {source_url} shows {} sat there",
+            v.value
+        ))),
+        Ok(v) => Ok(LockedOutput {
+            amount: mine.amount,
+            confirmations: mine.confirmations.min(v.confirmations),
+        }),
+    }
 }
 
 /// Run the check for a mainnet backend and apply the policy: `Disagree` is an error naming

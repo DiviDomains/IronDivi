@@ -251,6 +251,9 @@ pub struct LtcSection {
     /// Off by default (no mainnet default chosen). A disagreement holds the claim and the
     /// engine retries it; an unreachable or rate-limited source logs a warning and the claim
     /// goes ahead. Needs `crosscheck` set to a source; on with `crosscheck = "off"` is refused.
+    /// It also checks every LTC lock read (before the maker funds, before the taker claims)
+    /// against the source's script and value at the outpoint; there a disagreeing or
+    /// unreachable source holds the swap (fail closed), since nothing is revealed or paid yet.
     #[serde(default)]
     pub crosscheck_before_claim: bool,
     /// Where the expiry sweep may start counting a dropped LTC lock's absent blocks:

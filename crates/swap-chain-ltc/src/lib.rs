@@ -32,6 +32,7 @@ pub use tx::{
     htlc_script_pubkey, verify_htlc_spend, Coin, Spend, DUST_SATS,
 };
 
+use std::collections::HashMap;
 use std::str::FromStr;
 
 use async_trait::async_trait;
@@ -39,7 +40,7 @@ use bitcoin::consensus::encode::serialize;
 use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::{All, Secp256k1, SecretKey};
 use bitcoin::{CompressedPublicKey, OutPoint};
-use crosscheck::{claim_crosscheck, enforce, ClaimCheck};
+use crosscheck::{agree_lock, claim_crosscheck, enforce, lock_view, ClaimCheck, LockView};
 use divi_swap::{
     Amount, Chain, ChainBackend, ClaimSizes, FeeBump, Funding, HtlcParams, InputReservations,
     LockedOutput, Outpoint, SignedTx, SpendInfo, SwapError, Txid,
@@ -129,7 +130,17 @@ struct ClaimCrossCheck {
     /// claim retried every engine tick reuses it until the primary's tip moves, so the
     /// (rate-limited) source is asked at most once per primary block per comparison.
     last: parking_lot::Mutex<Option<(String, Outpoint, ClaimCheck)>>,
+    /// The source's view of each lock read (EL), with the primary's answer it was taken
+    /// against. A lock polled every engine tick reuses it until the primary's answer changes
+    /// (a new confirmation, so about once per LTC block), keeping a rate-limited source's
+    /// quota for the reads that matter.
+    locks: parking_lot::Mutex<
+        HashMap<Outpoint, (LockedOutput, std::result::Result<LockView, String>)>,
+    >,
 }
+
+/// Cached lock reads kept before the cache is emptied; far more than the swaps in flight.
+const LOCK_CACHE_MAX: usize = 256;
 
 impl std::fmt::Debug for LtcBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -155,6 +166,10 @@ impl LtcBackend {
     /// `tip - CLAIM_NEAR_DEPTH` and its spend of the claimed output. `Disagree` refuses the claim as
     /// [`SwapError::Transient`] (the engine retries); `Unavailable` logs one warning per claim
     /// and builds it anyway. The result is reused until the primary's tip hash changes.
+    /// It also cross-checks every lock read (`htlc_output`, EL): the source must show the
+    /// agreed script and the primary's value at the outpoint, and the lower confirmation
+    /// count is used; a disagreeing or unreadable source is `Transient` (fail closed, since
+    /// neither caller has revealed or paid anything yet).
     /// `None` (the default) is off: no extra request. Mainnet only; the daemon's config
     /// enforces that.
     pub fn with_claim_crosscheck(self, source: Option<CrossCheckSource>) -> Self {
@@ -178,6 +193,7 @@ impl LtcBackend {
             source,
             base: base.into(),
             last: parking_lot::Mutex::new(None),
+            locks: parking_lot::Mutex::new(HashMap::new()),
         });
         self
     }
@@ -239,6 +255,84 @@ impl LtcBackend {
                 Err(SwapError::Transient(format!("{m}; claim of {at} held")))
             }
         }
+    }
+
+    /// The primary's lock read: the output at `at` if its scriptPubKey is `htlc`'s.
+    async fn htlc_output_primary(
+        &self,
+        htlc: &HtlcParams,
+        at: &Outpoint,
+    ) -> Result<Option<LockedOutput>> {
+        let Some(t) = self
+            .get_json_opt(&format!("/tx/{}", at.txid.to_rpc_hex()))
+            .await?
+        else {
+            return Ok(None);
+        };
+        let Some(out) = t["vout"].as_array().and_then(|v| v.get(at.vout as usize)) else {
+            return Ok(None);
+        };
+        let want = hex::encode(htlc_script_pubkey(htlc).as_bytes());
+        if out["scriptpubkey"].as_str() != Some(want.as_str()) {
+            return Ok(None);
+        }
+        let value = out["value"]
+            .as_u64()
+            .ok_or_else(|| SwapError::Other("vout lacks value".into()))?;
+        let confirmations = if t["status"]["confirmed"].as_bool() == Some(true) {
+            Self::confs_from_status(&t["status"], self.tip_height().await?)
+        } else {
+            0
+        };
+        Ok(Some(LockedOutput {
+            amount: Amount::from_sat(value),
+            confirmations,
+        }))
+    }
+
+    /// With `[ltc].crosscheck_before_claim` on: `mine` (the primary's read of a matching lock)
+    /// agreed with the cross-check source's script, value and confirmations at `at`. One
+    /// attempt, no backoff; the answer is reused while the primary's is unchanged. Fails
+    /// closed: a disagreeing or unreadable source is `Transient`, so the maker does not fund
+    /// and the taker does not reveal until both agree.
+    async fn agree_lock_with_source(
+        &self,
+        cc: &ClaimCrossCheck,
+        htlc: &HtlcParams,
+        at: &Outpoint,
+        mine: LockedOutput,
+    ) -> Result<LockedOutput> {
+        let cached = cc
+            .locks
+            .lock()
+            .get(at)
+            .filter(|(p, _)| *p == mine)
+            .map(|(_, v)| v.clone());
+        let theirs = match cached {
+            Some(v) => v,
+            None => {
+                let once = RetryPolicy {
+                    attempts: 1,
+                    ..self.retry
+                };
+                let v = lock_view(cc.source, &cc.base, once, at).await;
+                let mut m = cc.locks.lock();
+                if m.len() >= LOCK_CACHE_MAX {
+                    m.clear();
+                }
+                m.insert(*at, (mine, v.clone()));
+                v
+            }
+        };
+        let txid = at.txid.to_rpc_hex();
+        let want = hex::encode(htlc_script_pubkey(htlc).as_bytes());
+        let primary_url = format!("{}/tx/{txid}", self.esplora.primary_url());
+        let source_url = format!(
+            "{}{}",
+            cc.base.trim_end_matches('/'),
+            cc.source.tx_path(&txid)
+        );
+        agree_lock(at, &want, mine, &primary_url, &theirs, &source_url)
     }
 
     /// `coins` without those reserved by a broadcast transaction that has not confirmed.
@@ -858,31 +952,15 @@ impl ChainBackend for LtcBackend {
     }
 
     async fn htlc_output(&self, htlc: &HtlcParams, at: &Outpoint) -> Result<Option<LockedOutput>> {
-        let Some(t) = self
-            .get_json_opt(&format!("/tx/{}", at.txid.to_rpc_hex()))
-            .await?
-        else {
-            return Ok(None);
-        };
-        let Some(out) = t["vout"].as_array().and_then(|v| v.get(at.vout as usize)) else {
-            return Ok(None);
-        };
-        let want = hex::encode(htlc_script_pubkey(htlc).as_bytes());
-        if out["scriptpubkey"].as_str() != Some(want.as_str()) {
-            return Ok(None);
+        let mine = self.htlc_output_primary(htlc, at).await?;
+        match (&self.claim_check, mine) {
+            // Nothing to agree when the primary shows no matching lock: no side acts on `None`.
+            (Some(cc), Some(lo)) => self
+                .agree_lock_with_source(cc, htlc, at, lo)
+                .await
+                .map(Some),
+            (_, mine) => Ok(mine),
         }
-        let value = out["value"]
-            .as_u64()
-            .ok_or_else(|| SwapError::Other("vout lacks value".into()))?;
-        let confirmations = if t["status"]["confirmed"].as_bool() == Some(true) {
-            Self::confs_from_status(&t["status"], self.tip_height().await?)
-        } else {
-            0
-        };
-        Ok(Some(LockedOutput {
-            amount: Amount::from_sat(value),
-            confirmations,
-        }))
     }
 
     async fn find_spend(&self, outpoint: &Outpoint, from_height: u64) -> Result<Option<SpendInfo>> {
