@@ -900,9 +900,17 @@ impl RpcServer {
                 use crate::mn_broadcast::MnContext;
                 use divi_storage::chain::NetworkType;
                 let chain = self.blockchain.chain();
+                // setupmasternode's masternode key is the address of the
+                // account "reserved-><alias>" (rpcmasternode.cpp:207)
+                let account_address = |account: &str| match self.wallet.wallet_db() {
+                    Some(wallet) => self.wallet.account_address(&wallet, account, false),
+                    None => Err(RpcError::new(codes::WALLET_ERROR, "Wallet disabled!").into()),
+                };
                 let ctx = MnContext {
                     chain,
                     wallet: self.wallet.wallet_db(),
+                    mempool: self.blockchain.mempool(),
+                    account_address: Some(&account_address),
                 };
                 match method {
                     "setupmasternode" => {

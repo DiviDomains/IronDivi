@@ -5091,7 +5091,7 @@ impl WalletRpc {
     /// Divi Core's GetAccountAddress (rpcwallet.cpp:315-375): the account's
     /// last address, unless a wallet transaction already pays it or
     /// `force_new`; otherwise a new key from the pool labelled with the account
-    fn account_address(
+    pub(crate) fn account_address(
         &self,
         wallet: &WalletDb,
         account: &str,
