@@ -1760,16 +1760,24 @@ fn rpc_type_check(method: &str, params: &Params) -> Result<(), RpcError> {
     Ok(())
 }
 
-/// HTTP handler for JSON-RPC requests
+/// Divi Core's SanitizeString (utilstrencodings.cpp:24-37): only the
+/// characters of simple messages, URLs and addresses are kept
+fn sanitize_string(text: &str) -> String {
+    text.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || " .,;_-/:?@()".contains(*c))
+        .collect()
+}
+
+/// HTTP handler for JSON-RPC requests. Neither the request nor the reply is
+/// logged: either can carry a passphrase, private key or seed. Each call's
+/// method is, as Divi Core logs it (rpcserver.cpp:893-894).
 async fn handle_rpc(
     State(server): State<Arc<RpcServer>>,
     version: Version,
     headers: HeaderMap,
     body: String,
 ) -> impl IntoResponse {
-    debug!("RPC request: {}", body);
     let (status, reply) = handle_body(server, body).await;
-    debug!("RPC response: {}", reply);
     json_reply(status, reply, &version, &headers)
 }
 
@@ -1824,13 +1832,13 @@ async fn handle_wallet_rpc(
     headers: HeaderMap,
     body: String,
 ) -> impl IntoResponse {
-    debug!("RPC request for wallet '{}': {}", wallet_name, body);
+    debug!("RPC request for wallet '{}'", sanitize_string(&wallet_name));
 
     // TODO: In the future, we could use wallet_name to route to specific wallet instances
     // For now, we just log it and pass through to the default wallet
     // This enables multi-wallet CLI support even if server only has one wallet loaded
+    // As handle_rpc, neither the request nor the reply is logged
     let (status, reply) = handle_body(server, body).await;
-    debug!("RPC response for wallet '{}': {}", wallet_name, reply);
     json_reply(status, reply, &version, &headers)
 }
 
@@ -1923,6 +1931,10 @@ impl RpcServer {
             Some(Value::String(m)) => m,
             Some(_) => return Err(RpcError::invalid_request("Method must be a string")),
         };
+        // The method's name only, never its params (rpcserver.cpp:893-894)
+        if method != "getblocktemplate" {
+            debug!("ThreadRPCServer method={}", sanitize_string(method));
+        }
         let params = match obj.get("params") {
             None | Some(Value::Null) => Params::Array(Vec::new()),
             Some(Value::Array(a)) => Params::Array(a.clone()),
@@ -2668,6 +2680,15 @@ mod tests {
         let response = server.handle_request(request);
         assert!(response.error.is_some());
         assert!(response.result.is_none());
+    }
+
+    /// The logged method name keeps only SanitizeString's characters
+    #[test]
+    fn test_sanitize_string_as_divid() {
+        assert_eq!(sanitize_string("walletpassphrase"), "walletpassphrase");
+        assert_eq!(sanitize_string("a\nb<c>&d\"e'"), "abcde");
+        assert_eq!(sanitize_string("x .,;_-/:?@()9"), "x .,;_-/:?@()9");
+        assert_eq!(sanitize_string("é\u{0}"), "");
     }
 
     #[test]
