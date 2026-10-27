@@ -75,39 +75,41 @@ fn market() -> impl Strategy<Value = Market> {
         2000u64..20_000,
         prop_oneof![Just(None), (440u64..=USDC_GWEI_CAP).prop_map(Some)],
     )
-        .prop_map(|(chain, estimate, reveal, floors, refund_feerate, near_cap)| {
-            // Drawn per mille of the fixed cap (BTC, LTC: up to twice it) or of
-            // `cap_feerate` (USDC: up to it).
-            let esc = schedule(chain);
-            // USDC: a first claim at 1 to 19 gwei, so the 50x multiple binds (under the
-            // 500 gwei `cap_feerate`) about half the time; or, half the time, at 440 to 500
-            // gwei, across the band within one price bump of `cap_feerate` (456 to 499 at
-            // geth's 10%), where a version could never be replaced within the cap.
-            let estimate = match (chain, near_cap) {
-                (Chain::Usdc, Some(near)) => near,
-                (Chain::Usdc, None) => 1 + estimate % 19,
-                _ => estimate,
-            };
-            let (cap, scale) = match chain {
-                Chain::Usdc => (esc.cap_feerate, 2000),
-                _ => (esc.cap(estimate), 1000),
-            };
-            // A first claim near the cap: floors between it and `cap_feerate`, the only
-            // ones that hold it out of a block.
-            let low = match (chain, near_cap) {
-                (Chain::Usdc, Some(_)) => estimate.min(cap),
-                _ => 0,
-            };
-            let at = |f: u16| low + (cap - low) * u64::from(f) / scale;
-            let floors = floors.into_iter().map(|(b, m)| (at(b), at(m))).collect();
-            Market {
-                chain,
-                estimate,
-                reveal,
-                floors,
-                refund_feerate,
-            }
-        })
+        .prop_map(
+            |(chain, estimate, reveal, floors, refund_feerate, near_cap)| {
+                // Drawn per mille of the fixed cap (BTC, LTC: up to twice it) or of
+                // `cap_feerate` (USDC: up to it).
+                let esc = schedule(chain);
+                // USDC: a first claim at 1 to 19 gwei, so the 50x multiple binds (under the
+                // 500 gwei `cap_feerate`) about half the time; or, half the time, at 440 to 500
+                // gwei, across the band within one price bump of `cap_feerate` (456 to 499 at
+                // geth's 10%), where a version could never be replaced within the cap.
+                let estimate = match (chain, near_cap) {
+                    (Chain::Usdc, Some(near)) => near,
+                    (Chain::Usdc, None) => 1 + estimate % 19,
+                    _ => estimate,
+                };
+                let (cap, scale) = match chain {
+                    Chain::Usdc => (esc.cap_feerate, 2000),
+                    _ => (esc.cap(estimate), 1000),
+                };
+                // A first claim near the cap: floors between it and `cap_feerate`, the only
+                // ones that hold it out of a block.
+                let low = match (chain, near_cap) {
+                    (Chain::Usdc, Some(_)) => estimate.min(cap),
+                    _ => 0,
+                };
+                let at = |f: u16| low + (cap - low) * u64::from(f) / scale;
+                let floors = floors.into_iter().map(|(b, m)| (at(b), at(m))).collect();
+                Market {
+                    chain,
+                    estimate,
+                    reveal,
+                    floors,
+                    refund_feerate,
+                }
+            },
+        )
 }
 
 fn bump(chain: Chain) -> FeeBump {
