@@ -19,7 +19,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::backend::{ChainBackend, ClaimSizes, FeeBump, TipHeader};
@@ -861,6 +861,7 @@ impl MockChain {
             released: Arc::default(),
             nonce: Arc::new(AtomicU64::new(0)),
             lag: Arc::new(AtomicU64::new(0)),
+            tip_lead: Arc::new(AtomicU32::new(0)),
             reservations: None,
             coins: Arc::default(),
         }
@@ -876,6 +877,7 @@ pub struct MockBackend {
     nonce: Arc<AtomicU64>,
     released: Arc<Mutex<Vec<Txid>>>,
     lag: Arc<AtomicU64>,
+    tip_lead: Arc<AtomicU32>,
     reservations: Option<InputReservations>,
     coins: Arc<Vec<Outpoint>>,
 }
@@ -919,6 +921,13 @@ impl MockBackend {
             preimage: *preimage,
             feerate: feerate.max(1),
         }))
+    }
+
+    /// Make this backend (and its clones) report its tip block's time `secs` ahead of the
+    /// chain's MTP, as a block a miner stamped ahead of real time does. Other calls, MTP
+    /// included, see the chain as it is. Test-only.
+    pub fn set_tip_lead(&self, secs: u32) {
+        self.tip_lead.store(secs, Ordering::SeqCst);
     }
 
     /// Fund from `coins` (one per funding) and take part in `reservations`, as the live
@@ -1091,7 +1100,7 @@ impl ChainBackend for MockBackend {
     }
 
     /// The mock has one clock: its tip is as recent as its MTP (less one spacing per block
-    /// of [`MockBackend::set_lag`]).
+    /// of [`MockBackend::set_lag`], plus [`MockBackend::set_tip_lead`]).
     async fn tip_header(&self) -> Result<TipHeader> {
         self.check_online()?;
         let lag = self.lag.load(Ordering::SeqCst);
@@ -1102,7 +1111,8 @@ impl ChainBackend for MockBackend {
             time: self
                 .chain
                 .mtp()
-                .saturating_sub((lag as u32).saturating_mul(self.chain.block_secs)),
+                .saturating_sub((lag as u32).saturating_mul(self.chain.block_secs))
+                .saturating_add(self.tip_lead.load(Ordering::SeqCst)),
         })
     }
 

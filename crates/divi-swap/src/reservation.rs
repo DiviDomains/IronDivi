@@ -60,7 +60,8 @@ pub const EXPIRY_ABSENT_BLOCKS: u64 = 6;
 
 /// How far behind the wall clock a backend's tip may be, in target block spacings, for the
 /// expiry sweep to count blocks from it at once. A tip further behind still counts, but only
-/// from its first block newer than the wall clock of the check that found the lock absent.
+/// from the first tip whose median time past reaches the wall clock of the check that found
+/// the lock absent.
 pub const EXPIRY_MAX_TIP_LAG_BLOCKS: u32 = 2;
 
 /// How far behind the wall clock a backend's tip may be, in seconds, for the expiry sweep to
@@ -344,10 +345,15 @@ impl InputReservations {
     /// Only blocks mined after that check count, so a syncing endpoint replaying old blocks
     /// never releases: a record made at a tip more than [`EXPIRY_MAX_TIP_LAG_BLOCKS`] target
     /// spacings behind `now` is pending, keeps that check's `now`, and follows the tip until
-    /// a tip block's time reaches it. If that block is the one right after the record's, the
-    /// record starts counting where it is; otherwise it moves to the tip and counts from
-    /// there. A sparse chain whose blocks come minutes apart therefore releases after the
-    /// usual [`EXPIRY_ABSENT_BLOCKS`] once they are mined.
+    /// the backend's median time past reaches it. A tip block's own time does not end it: a
+    /// miner may stamp a block up to [`EXPIRY_MAX_TIP_LEAD_SECS`] ahead of real time, so an
+    /// endpoint replaying blocks from before the check could show one past it, while MTP
+    /// (monotonic by consensus, the median of the last eleven blocks) cannot run ahead of
+    /// real time like that. If the tip at which MTP reaches it is the block right after the
+    /// record's, the record starts counting where it is; otherwise it moves to the tip and
+    /// counts from there. MTP trails the tip by about six blocks, so a pending record on a
+    /// sparse chain whose blocks come minutes apart releases about
+    /// [`EXPIRY_ABSENT_BLOCKS`] + 5 blocks after the first check, once they are mined.
     /// A lock in the mempool or on chain, or before its deadline, keeps its inputs; so does
     /// every reservation `locks` does not name (`divi-swapd --release-reservation` is the
     /// override for those). Each sweep reads the tip's height, hash and time from one block
@@ -440,8 +446,9 @@ impl InputReservations {
                     self.record_absence(chain, txid, &tip, pending)?;
                     continue;
                 }
-                Some((_, _, Some(after))) if tip.time < after && pending.is_some() => {
-                    // Still at blocks from before the first absent check: follow the tip.
+                Some((_, _, Some(after))) if mtp < after => {
+                    // MTP is still before the first absent check, so the tip may be a
+                    // replayed block from before it, whatever its own time says: follow it.
                     self.record_absence(chain, txid, &tip, Some(after))?;
                     continue;
                 }
@@ -933,6 +940,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_sparse_divi_tip_whose_mtp_trails_it_starts_counting_once_mtp_passes_the_check() {
+        let (c, b) = divi_chain();
+        let r = InputReservations::in_memory().unwrap();
+        let t = lock(&r, &b, 1).await;
+        c.forget(&t);
+        c.advance_time(DEADLINE - T0);
+        let locks = [(t, DEADLINE)];
+        // Blocks ten minutes apart, MTP five blocks behind the tip's time (the median of the
+        // last eleven), sweeps three minutes after each block: the first check is pending, and
+        // MTP passes its clock six blocks on. The count starts at the block before that one
+        // (the record's), so the release comes eleven blocks after the first check.
+        b.set_tip_lead(5 * 600);
+        let first = c.height();
+        let sweep = |c: &MockChain| c.mtp() + 5 * 600 + 180;
+        let mut released = 0;
+        for _ in 0..2 * EXPIRY_ABSENT_BLOCKS - 1 {
+            released += r.release_expired(&b, &locks, sweep(&c)).await.unwrap();
+            assert_eq!(
+                released,
+                0,
+                "block {}: MTP not yet six blocks past the check",
+                c.height()
+            );
+            mine_after(&c, 600);
+        }
+        assert_eq!(c.height(), first + 2 * EXPIRY_ABSENT_BLOCKS - 1);
+        assert_eq!(r.release_expired(&b, &locks, sweep(&c)).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
     async fn a_syncing_divi_endpoint_releases_nothing() {
         let (c, b) = divi_chain();
         let r = InputReservations::in_memory().unwrap();
@@ -965,6 +1002,107 @@ mod tests {
                 "live block {i}"
             );
         }
+    }
+
+    /// A DIVI lock past its deadline whose first absent check is made at a tip an hour behind
+    /// the wall clock (`after`), so its record is pending. Returns the lock list and `after`.
+    async fn pending_divi_lock(
+        r: &InputReservations,
+        c: &MockChain,
+        b: &MockBackend,
+    ) -> ([(Txid, u32); 1], u32) {
+        let t = lock(r, b, 1).await;
+        c.forget(&t);
+        c.advance_time(DEADLINE - T0);
+        let locks = [(t, DEADLINE)];
+        let after = c.mtp() + 3_600;
+        assert_eq!(r.release_expired(b, &locks, after).await.unwrap(), 0);
+        assert_eq!(
+            r.absence(Chain::Divi, &t).unwrap(),
+            Some((c.height(), Some(c.tip_hash()), Some(after)))
+        );
+        (locks, after)
+    }
+
+    #[tokio::test]
+    async fn a_replayed_tip_stamped_ahead_of_the_first_check_counts_nothing_until_mtp_passes_it() {
+        let (c, b) = divi_chain();
+        let r = InputReservations::in_memory().unwrap();
+        let (locks, after) = pending_divi_lock(&r, &c, &b).await;
+        let t = locks[0].0;
+        // The endpoint replays the hour of blocks before the check, a second of wall clock
+        // each, every block stamped 70 minutes ahead of the chain's MTP: each tip's time is
+        // past `after`, and within the future limit, but every block predates the check.
+        b.set_tip_lead(3_600 + 600);
+        let mut now = after;
+        loop {
+            c.mine(1);
+            now += 1;
+            assert_eq!(
+                r.release_expired(&b, &locks, now).await.unwrap(),
+                0,
+                "replayed block {}",
+                c.height()
+            );
+            if c.mtp() >= after {
+                break;
+            }
+            assert_eq!(
+                r.absence(Chain::Divi, &t).unwrap(),
+                Some((c.height(), Some(c.tip_hash()), Some(after))),
+                "MTP {} is before the check: the record follows the tip",
+                c.mtp()
+            );
+        }
+        // MTP reached the check at the block right after the record's: the count starts
+        // where the record is, and runs the usual six blocks.
+        let first = c.height() - 1;
+        assert_eq!(
+            r.absence(Chain::Divi, &t).unwrap(),
+            Some((first, Some(c.block_hash(first)), None))
+        );
+        c.mine(EXPIRY_ABSENT_BLOCKS - 2);
+        assert_eq!(r.release_expired(&b, &locks, now).await.unwrap(), 0);
+        assert_eq!(held_by(&r), HashSet::from([t]));
+        c.mine(1);
+        assert_eq!(c.height(), first + EXPIRY_ABSENT_BLOCKS);
+        assert_eq!(r.release_expired(&b, &locks, now).await.unwrap(), 1);
+        assert_eq!(r.first_absent_height(Chain::Divi, &t).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_pending_record_seen_again_only_past_mtp_starts_its_count_at_the_tip() {
+        let (c, b) = divi_chain();
+        let r = InputReservations::in_memory().unwrap();
+        let (locks, after) = pending_divi_lock(&r, &c, &b).await;
+        let t = locks[0].0;
+        b.set_tip_lead(3_600 + 600);
+        // Ten replayed blocks unseen, then a sweep: the tip's time is past the check, its
+        // MTP is not, so the record follows the tip and counts nothing.
+        c.mine(10);
+        let now = after + 60;
+        assert_eq!(r.release_expired(&b, &locks, now).await.unwrap(), 0);
+        assert_eq!(
+            r.absence(Chain::Divi, &t).unwrap(),
+            Some((c.height(), Some(c.tip_hash()), Some(after)))
+        );
+        // The next sweep comes once MTP is past the check, many blocks on: the count starts
+        // at that tip.
+        while c.mtp() < after + 60 {
+            c.mine(1);
+        }
+        let now = now + 120;
+        assert_eq!(r.release_expired(&b, &locks, now).await.unwrap(), 0);
+        let first = c.height();
+        assert_eq!(
+            r.absence(Chain::Divi, &t).unwrap(),
+            Some((first, Some(c.tip_hash()), None))
+        );
+        c.mine(EXPIRY_ABSENT_BLOCKS - 1);
+        assert_eq!(r.release_expired(&b, &locks, now).await.unwrap(), 0);
+        assert_eq!(held_by(&r), HashSet::from([t]));
+        c.mine(1);
+        assert_eq!(r.release_expired(&b, &locks, now).await.unwrap(), 1);
     }
 
     #[tokio::test]
