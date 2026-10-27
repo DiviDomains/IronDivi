@@ -551,3 +551,75 @@ async fn sample_tx(b: &DiviBackend) -> SignedTx {
         raw: serialize(&tx),
     }
 }
+
+// ---- bounded read hold (EV): `Held` and the primary-only view ----
+
+fn is_held<T: std::fmt::Debug>(r: &Result<T, SwapError>) -> bool {
+    matches!(r, Err(SwapError::Held(m)) if m.contains("disagree"))
+}
+
+/// A fallback that disagrees or is down holds the read for the engine's deadline
+/// (`SwapError::Held`); a primary that is down stays `Transient`.
+#[tokio::test]
+async fn a_disagreeing_or_unreachable_fallback_holds_the_read() {
+    let (_h, _l, _liar_alone, _honest_alone, _liar_primary, liar_fallback) =
+        pair_lie(|c, _| c.skew = 3 * 3600, (8, SATS, false)).await;
+    assert!(is_held(&liar_fallback.median_time_past().await));
+
+    let (a, ac) = node().await;
+    let probe = single(&a.uri());
+    populate(&ac, &probe, 8, SATS, true);
+    let dead = "http://127.0.0.1:1";
+    let o = lock_outpoint();
+    let d = dual(&a.uri(), dead);
+    assert!(is_held(&d.confirmations(&o.txid).await));
+    assert!(is_held(&d.find_spend(&o, TIP - 2).await));
+    assert!(is_held(&d.median_time_past().await));
+    assert!(is_held(&d.tip_height().await));
+    let d = dual(dead, &a.uri());
+    assert!(matches!(
+        d.find_spend(&o, TIP - 2).await,
+        Err(SwapError::Transient(_))
+    ));
+    assert!(matches!(
+        d.median_time_past().await,
+        Err(SwapError::Transient(_))
+    ));
+}
+
+/// The primary-only view reads the primary alone, with the same key; the fallback is not
+/// asked. Without a fallback there is no view.
+#[tokio::test]
+async fn the_primary_only_view_reads_the_primary_alone() {
+    let (a, ac) = node().await;
+    let (f, fc) = node().await;
+    let probe = single(&a.uri());
+    populate(&ac, &probe, 8, SATS, true);
+    populate(&fc, &probe, 8, SATS, false);
+    fc.lock().skew = 3 * 3600;
+    let d = dual(&a.uri(), &f.uri());
+    let o = lock_outpoint();
+    assert!(is_held(&d.find_spend(&o, TIP - 2).await));
+    let asked = f.received_requests().await.unwrap().len();
+
+    let view = d
+        .primary_only()
+        .expect("a fallback has a primary-only view");
+    assert_eq!(view.pubkey(), d.pubkey());
+    assert!(view.primary_only().is_none());
+    let spend = view.find_spend(&o, TIP - 2).await.unwrap().expect("spent");
+    assert_eq!(spend.txid, spend_txid());
+    assert_eq!(view.confirmations(&o.txid).await.unwrap(), Some(8));
+    assert_eq!(
+        view.median_time_past().await.unwrap(),
+        probe.median_time_past().await.unwrap()
+    );
+    assert_eq!(view.tip_height().await.unwrap(), TIP);
+    assert_eq!(f.received_requests().await.unwrap().len(), asked);
+
+    assert!(single(&a.uri()).primary_only().is_none());
+    assert!(single(&a.uri())
+        .with_fallback_rpc("  ")
+        .primary_only()
+        .is_none());
+}

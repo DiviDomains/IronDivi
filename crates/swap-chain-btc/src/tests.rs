@@ -1978,3 +1978,100 @@ async fn quorum_fee_rate_is_the_higher_of_the_two() {
     let b = recommended(vec![primary.uri(), secondary.uri()], false);
     assert_eq!(b.claim_feerate().await.unwrap(), Some(3));
 }
+
+// ---- bounded read hold (EV): `Held` and the primary-only view ----
+
+fn held<T: std::fmt::Debug>(r: Result<T>) -> String {
+    match r {
+        Err(SwapError::Held(m)) => m,
+        other => panic!("expected Held, got {other:?}"),
+    }
+}
+
+/// With quorum reads, a secondary that disagrees or cannot be reached holds the read for the
+/// engine's deadline (`SwapError::Held`); a primary that cannot be reached stays `Transient`
+/// (nothing the primary alone could answer).
+#[tokio::test]
+async fn quorum_a_disagreeing_or_unreachable_secondary_holds_the_read() {
+    let (primary, secondary) = (MockServer::start().await, MockServer::start().await);
+    let fund = outpoint();
+    mock_unspent(&primary, &fund).await;
+    mock_spend(&secondary, &fund, &"ab".repeat(32), Some(777)).await;
+    let m = held(quorum(&primary, &secondary).find_spend(&fund, 700).await);
+    assert!(m.contains("unspent") && m.contains(&"ab".repeat(32)), "{m}");
+
+    let up = MockServer::start().await;
+    mock_chain_tip(&up, 110, TIP_A, TIP_C, 1_789_998_000).await;
+    mock_json(
+        &up,
+        format!("/tx/{}/status", fund.txid),
+        json!({"confirmed": true, "block_height": 109}),
+    )
+    .await;
+    mock_unspent(&up, &fund).await;
+    let b = backend(vec![up.uri(), dead_url()], MAKER_KEY)
+        .with_quorum_reads(true)
+        .unwrap();
+    held(b.confirmations(&fund.txid).await);
+    held(b.find_spend(&fund, 100).await);
+    held(b.tip_height().await);
+    held(b.median_time_past().await);
+
+    let b = backend(vec![dead_url(), up.uri()], MAKER_KEY)
+        .with_quorum_reads(true)
+        .unwrap();
+    transient(b.find_spend(&fund, 100).await);
+    transient(b.median_time_past().await);
+}
+
+/// The primary-only view reads the primary alone: the secondary that holds the quorum read
+/// (down, or answering otherwise) is not asked.
+#[tokio::test]
+async fn quorum_primary_only_view_reads_the_primary_alone() {
+    let (primary, secondary) = (MockServer::start().await, MockServer::start().await);
+    let fund = outpoint();
+    mock_chain_tip(&primary, 110, TIP_A, TIP_C, 1_789_998_000).await;
+    mock_json(
+        &primary,
+        format!("/tx/{}/status", fund.txid),
+        json!({"confirmed": true, "block_height": 109}),
+    )
+    .await;
+    mock_unspent(&primary, &fund).await;
+    mock_spend(&secondary, &fund, &"ab".repeat(32), Some(777)).await;
+    let b = quorum(&primary, &secondary);
+    held(b.find_spend(&fund, 100).await);
+    let asked = secondary.received_requests().await.unwrap().len();
+
+    let view = b
+        .primary_only()
+        .expect("quorum reads have a primary-only view");
+    assert!(view.find_spend(&fund, 100).await.unwrap().is_none());
+    assert_eq!(view.confirmations(&fund.txid).await.unwrap(), Some(2));
+    assert_eq!(view.tip_height().await.unwrap(), 110);
+    assert_eq!(view.median_time_past().await.unwrap(), 1_789_998_000);
+    assert_eq!(view.pubkey(), b.pubkey());
+    assert!(
+        view.primary_only().is_none(),
+        "the view has no second source"
+    );
+    assert_eq!(
+        secondary.received_requests().await.unwrap().len(),
+        asked,
+        "the view asked the secondary"
+    );
+
+    let b = backend(vec![primary.uri(), dead_url()], MAKER_KEY)
+        .with_quorum_reads(true)
+        .unwrap();
+    let view = b.primary_only().unwrap();
+    assert!(view.find_spend(&fund, 100).await.unwrap().is_none());
+}
+
+/// Off (the default): no view, so nothing is ever read on the primary alone by the engine.
+#[test]
+fn quorum_off_has_no_primary_only_view() {
+    let b = backend(vec![dead_url(), dead_url()], MAKER_KEY);
+    assert!(b.primary_only().is_none());
+    assert!(b.with_quorum_reads(false).unwrap().primary_only().is_none());
+}

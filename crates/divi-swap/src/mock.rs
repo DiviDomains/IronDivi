@@ -153,6 +153,16 @@ struct ChainState {
     hold_reads: Option<String>,
     /// `find_spend` calls answered by a [`ChainBackend::primary_only`] view.
     primary_only_reads: usize,
+    /// While set, `confirmations` and `tip_height` on a backend that is not a
+    /// [`ChainBackend::primary_only`] view fail with `SwapError::Held(this)`: two-source
+    /// reads whose second source is down or disagrees (EV; `find_spend`: `hold_reads`).
+    confs_hold: Option<String>,
+    /// While set, `median_time_past` on a backend that is not a primary-only view fails with
+    /// `SwapError::Held(this)`.
+    mtp_hold: Option<String>,
+    /// `confirmations`, `tip_height` and `median_time_past` calls answered by a
+    /// [`ChainBackend::primary_only`] view, in order.
+    primary_only_read_log: Vec<&'static str>,
     /// Every txid this chain ever accepted, kept when the tx later leaves the mempool.
     accepted: HashMap<Txid, TxKind>,
     /// Every `broadcast()` call that reached the node, by kind, whatever its answer
@@ -653,6 +663,27 @@ impl MockChain {
         self.state.lock().primary_only_reads
     }
 
+    /// While `Some(why)`, `confirmations` and `tip_height` fail with `SwapError::Held(why)`,
+    /// as the reads of a backend whose second source is down or disagrees (with
+    /// [`MockChain::hold_reads`], every two-source read but the MTP); a
+    /// [`ChainBackend::primary_only`] view still answers them (logged,
+    /// [`MockChain::primary_only_read_log`]). Builds, broadcasts and the MTP still answer.
+    /// `None` heals it.
+    pub fn hold_confirmations(&self, why: Option<&str>) {
+        self.state.lock().confs_hold = why.map(str::to_string);
+    }
+
+    /// As [`MockChain::hold_confirmations`] for `median_time_past` alone.
+    pub fn hold_mtp(&self, why: Option<&str>) {
+        self.state.lock().mtp_hold = why.map(str::to_string);
+    }
+
+    /// `confirmations`, `tip_height` and `median_time_past` calls answered through a
+    /// [`ChainBackend::primary_only`] view, in order.
+    pub fn primary_only_read_log(&self) -> Vec<&'static str> {
+        self.state.lock().primary_only_read_log.clone()
+    }
+
     /// While `Some`, every `broadcast()` on this chain fails with `err` before touching
     /// any state; reads still answer. `None` heals it.
     pub fn fail_broadcasts_with(&self, err: Option<SwapError>) {
@@ -1029,6 +1060,21 @@ impl MockBackend {
         }
     }
 
+    /// A two-source read `what` about to be made: `Held` while the chain holds it (`mtp`:
+    /// the MTP hold, else the read hold), unless this is a primary-only view, whose reads are
+    /// recorded.
+    fn check_read(&self, what: &'static str, mtp: bool) -> Result<()> {
+        let mut s = self.chain.state.lock();
+        if self.primary_only {
+            s.primary_only_read_log.push(what);
+            return Ok(());
+        }
+        match if mtp { &s.mtp_hold } else { &s.confs_hold } {
+            Some(why) => Err(SwapError::Held(why.clone())),
+            None => Ok(()),
+        }
+    }
+
     fn sign(tx: &MockTx) -> SignedTx {
         let raw = serde_json::to_vec(tx).expect("mock tx serializes");
         SignedTx {
@@ -1144,6 +1190,7 @@ impl ChainBackend for MockBackend {
 
     async fn tip_height(&self) -> Result<u64> {
         self.check_online()?;
+        self.check_read("tip_height", false)?;
         Ok(self.chain.height())
     }
 
@@ -1154,6 +1201,7 @@ impl ChainBackend for MockBackend {
 
     async fn median_time_past(&self) -> Result<u32> {
         self.check_online()?;
+        self.check_read("median_time_past", true)?;
         Ok(self
             .chain
             .mtp()
@@ -1549,6 +1597,7 @@ impl ChainBackend for MockBackend {
 
     async fn confirmations(&self, txid: &Txid) -> Result<Option<u32>> {
         self.check_online()?;
+        self.check_read("confirmations", false)?;
         let s = self.chain.state.lock();
         if s.blind.contains(txid) {
             return Ok(None);

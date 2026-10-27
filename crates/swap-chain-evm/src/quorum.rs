@@ -611,4 +611,67 @@ mod tests {
         backend.tip_hash().await.unwrap();
         assert_eq!(second.requests(), 8, "tip reads stay single-source");
     }
+
+    // ---- bounded read hold (EV): `Held` and the primary-only view ----
+
+    fn assert_held<T: std::fmt::Debug>(r: Result<T, SwapError>, what: &str) {
+        match r {
+            Err(SwapError::Held(msg)) => assert!(msg.contains("disagree"), "{what}: {msg}"),
+            other => panic!("{what}: expected Held, got {other:?}"),
+        }
+    }
+
+    /// A second node that disagrees or does not answer holds the read for the engine's
+    /// deadline (`SwapError::Held`).
+    #[tokio::test]
+    async fn a_disagreeing_or_unreachable_second_node_holds_the_read() {
+        let (_p, _s, backend) = pair(&with_lock(110), &claimed(with_lock(110))).await;
+        assert_held(
+            backend.find_spend(&lock_outpoint(), 100).await,
+            "claim only on second",
+        );
+        let p = serve(&claimed(with_lock(110))).await;
+        let backend = quorum(&p, "http://127.0.0.1:1");
+        assert_held(
+            backend.find_spend(&lock_outpoint(), 100).await,
+            "find_spend",
+        );
+        assert_held(
+            backend.confirmations(&Txid(LOCK_TX.0)).await,
+            "confirmations",
+        );
+        assert_held(backend.median_time_past().await, "median_time_past");
+    }
+
+    /// The primary-only view reads the primary alone; the second node is not asked. Without
+    /// the quorum there is no view.
+    #[tokio::test]
+    async fn the_primary_only_view_reads_the_primary_alone() {
+        let (primary, second) = (claimed(with_lock(110)), with_lock(110));
+        let (_p, _s, backend) = pair(&primary, &second).await;
+        assert_held(
+            backend.find_spend(&lock_outpoint(), 100).await,
+            "find_spend",
+        );
+        let asked = second.requests();
+        let view = backend
+            .primary_only()
+            .expect("the quorum has a primary-only view");
+        assert_eq!(view.pubkey(), backend.pubkey());
+        assert!(view.primary_only().is_none());
+        assert!(view
+            .find_spend(&lock_outpoint(), 100)
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            view.confirmations(&Txid(LOCK_TX.0)).await.unwrap(),
+            Some(11)
+        );
+        assert_eq!(view.median_time_past().await.unwrap(), LOCKTIME - 3600);
+        assert_eq!(second.requests(), asked, "the view asked the second node");
+
+        let p = serve(&with_lock(110)).await;
+        assert!(single(&p).primary_only().is_none());
+    }
 }
