@@ -24,9 +24,9 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use divi_swap::mock::MockChain;
-use divi_swap::reservation::ExpiryStart;
 use divi_swap::secrets::SecretRef;
 use divi_swap::{Amount, Chain, ChainBackend, InputReservations, Maker, Store};
+use divi_swapd::config::ExpiryStarts;
 use divi_swapd::{
     mock_counter_offers, mock_xmr_offers, router_with_auth, run_scan, spawn_gated_scheduler,
     AppState, BackendKind, BtcSection, DaemonConfig, HashlockAuth, LtcSection, ScanStatus,
@@ -610,11 +610,10 @@ fn live_divi(
 /// blocks apart gives its inputs back to the wallet ([`InputReservations::release_expired`];
 /// on DIVI the wallet file gets them back too, on the backend's own proof, through
 /// [`InputReservations::release_expired_swaps_and_bookings`]). A DIVI lock of a finished swap
-/// is released first ([`InputReservations::release_finished_swaps`]). `divi_start` is
-/// `[divi].expiry_start`: with `"mtp"` every DIVI count waits for the node's median time past
-/// ([`InputReservations::release_expired_from`]); the counter chains always use the default.
-/// A chain that cannot be
-/// asked, or whose backend is stale or went backwards, keeps its reservations this pass
+/// is released first ([`InputReservations::release_finished_swaps`]). `starts` holds each
+/// chain's `expiry_start` ([`DaemonConfig::expiry_starts`]): on a chain set to `"mtp"` every
+/// count waits for that backend's median time past
+/// ([`InputReservations::release_expired_from`]). A chain that cannot be asked, or whose backend is stale or went backwards, keeps its reservations this pass
 /// (`--release-reservation` stays the manual override). Returns how many inputs were released.
 async fn expiry_sweep_once(
     res: &InputReservations,
@@ -622,7 +621,7 @@ async fn expiry_sweep_once(
     divi: &dyn ChainBackend,
     counters: &[Arc<dyn ChainBackend>],
     now: u32,
-    divi_start: ExpiryStart,
+    starts: ExpiryStarts,
 ) -> usize {
     let mut expired = 0;
     for b in counters {
@@ -644,7 +643,7 @@ async fn expiry_sweep_once(
         tracing::info!(finished, "released the DIVI lock inputs of finished swaps");
     }
     match res
-        .release_expired_swaps_and_bookings(store, divi, now, divi_start)
+        .release_expired_swaps_and_bookings(store, divi, now, starts.divi)
         .await
     {
         Ok(n) => expired += n,
@@ -670,7 +669,7 @@ fn spawn_expiry_sweep(
     every: Duration,
 ) -> Result<tokio::task::JoinHandle<()>> {
     let res = InputReservations::open(&cfg.db_path).context("opening input reservations")?;
-    let divi_start = cfg.divi_expiry_start()?;
+    let starts = cfg.expiry_starts()?;
     Ok(tokio::spawn(async move {
         let mut tick = tokio::time::interval(every);
         loop {
@@ -678,7 +677,7 @@ fn spawn_expiry_sweep(
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs().min(u32::MAX as u64) as u32);
-            expiry_sweep_once(&res, &store, divi.as_ref(), &counters, now, divi_start).await;
+            expiry_sweep_once(&res, &store, divi.as_ref(), &counters, now, starts).await;
         }
     }))
 }
@@ -1615,7 +1614,7 @@ mod tests {
         // The wall clock at the chain's own: a fresh backend unless a test says otherwise.
         let divi = MockChain::new(Chain::Divi, deadline - 1, 60).backend(8, Amount(Amount::COIN));
         let sweep = |now: u32| {
-            expiry_sweep_once(&res, &store, &divi, &counters, now, ExpiryStart::default())
+            expiry_sweep_once(&res, &store, &divi, &counters, now, ExpiryStarts::default())
         };
 
         assert_eq!(sweep(chain.mtp()).await, 0);
@@ -2338,7 +2337,7 @@ mod tests {
         let btc: Vec<Arc<dyn ChainBackend>> = vec![Arc::new(
             MockChain::new(Chain::Btc, now, 600).backend(9, Amount(Amount::COIN)),
         )];
-        expiry_sweep_once(res, store, divi, &btc, now, ExpiryStart::default()).await
+        expiry_sweep_once(res, store, divi, &btc, now, ExpiryStarts::default()).await
     }
 
     #[tokio::test]
@@ -2376,7 +2375,7 @@ mod tests {
             let divi = chain.backend(8, Amount(Amount::COIN));
             divi.set_tip_lead(5 * 60);
             let first = chain.height();
-            let start = cfg.divi_expiry_start().unwrap();
+            let start = cfg.expiry_starts().unwrap();
             loop {
                 let now = chain.mtp() + 5 * 60;
                 if expiry_sweep_once(&res, &store, &divi, &[], now, start).await > 0 {
@@ -2389,6 +2388,69 @@ mod tests {
         }
         let n = divi_swap::reservation::EXPIRY_ABSENT_BLOCKS;
         assert_eq!(released_at, [n, n, n + 4]);
+    }
+
+    #[tokio::test]
+    async fn each_counter_chains_expiry_sweep_starts_its_count_where_its_section_says() {
+        let dir = tempfile::tempdir().unwrap();
+        let deadline = lock_swap("x", divi_swap::SwapState::MakerLocked, 0)
+            .maker_leg_htlc
+            .unwrap()
+            .locktime;
+        for chain in [Chain::Btc, Chain::Ltc, Chain::Zec] {
+            let section = chain.to_string().to_lowercase();
+            let mut released_at = Vec::new();
+            for (i, line) in ["", "expiry_start = \"tip\"\n", "expiry_start = \"mtp\"\n"]
+                .into_iter()
+                .enumerate()
+            {
+                let db = dir.path().join(format!("{section}{i}.db"));
+                // Every other section says "mtp": only this chain's own key counts.
+                let others: String = ["btc", "ltc", "zec"]
+                    .into_iter()
+                    .filter(|s| *s != section)
+                    .map(|s| format!("[{s}]\nkey = \"credential:{s}\"\nexpiry_start = \"mtp\"\n"))
+                    .collect();
+                let cfg = DaemonConfig::parse(&format!(
+                    "db_path = \"{}\"\n[divi]\nkey = \"credential:maker-divi\"\n\
+                     expiry_start = \"mtp\"\n[{section}]\nkey = \"credential:{section}\"\n{line}{others}",
+                    db.display()
+                ))
+                .unwrap();
+                let store = Store::open(&db).unwrap();
+                let mut dropped = lock_swap("dropped", divi_swap::SwapState::MakerLocked, 0x11);
+                dropped.quote.counter_chain = chain;
+                assert_eq!(dropped.quote.maker_chain(), chain);
+                store.put_maker_swap(&dropped).unwrap();
+                let res = InputReservations::open(&db).unwrap();
+                res.reserve(chain, &divi_swap::Txid([0x11; 32]), &[op(1, 0)])
+                    .unwrap();
+                // A chain past the deadline whose tips look fresh (swept at the tip's own
+                // time) while MTP trails them by five blocks.
+                let c = MockChain::new(chain, deadline, 600);
+                let b = c.backend(9, Amount(Amount::COIN));
+                b.set_tip_lead(5 * 600);
+                let counters: Vec<Arc<dyn ChainBackend>> = vec![Arc::new(b)];
+                let divi =
+                    MockChain::new(Chain::Divi, deadline, 60).backend(8, Amount(Amount::COIN));
+                let starts = cfg.expiry_starts().unwrap();
+                let first = c.height();
+                loop {
+                    let now = c.mtp() + 5 * 600;
+                    if expiry_sweep_once(&res, &store, &divi, &counters, now, starts).await > 0 {
+                        break;
+                    }
+                    assert!(
+                        c.height() < first + 20,
+                        "[{section}] {line:?}: never released"
+                    );
+                    c.mine(1);
+                }
+                released_at.push(c.height() - first);
+            }
+            let n = divi_swap::reservation::EXPIRY_ABSENT_BLOCKS;
+            assert_eq!(released_at, [n, n, n + 4], "[{section}]");
+        }
     }
 
     #[tokio::test]

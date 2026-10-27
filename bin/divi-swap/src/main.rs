@@ -79,6 +79,15 @@ struct Cli {
     /// check, however fresh the tip looks (about five blocks later on every release).
     #[arg(long, global = true, default_value = "tip")]
     divi_expiry_start: divi_swap::reservation::ExpiryStart,
+    /// As `--divi-expiry-start`, for the BTC lock-expiry sweep (`--counter-chain btc`).
+    #[arg(long, global = true, default_value = "tip")]
+    btc_expiry_start: divi_swap::reservation::ExpiryStart,
+    /// As `--divi-expiry-start`, for the LTC lock-expiry sweep (`--counter-chain ltc`).
+    #[arg(long, global = true, default_value = "tip")]
+    ltc_expiry_start: divi_swap::reservation::ExpiryStart,
+    /// As `--divi-expiry-start`, for the ZEC lock-expiry sweep (`--counter-chain zec`).
+    #[arg(long, global = true, default_value = "tip")]
+    zec_expiry_start: divi_swap::reservation::ExpiryStart,
     /// DIVI network: `testnet` (default) or `mainnet` (only with `--allow-mainnet`). Picks the
     /// DIVI RPC endpoint and address version; with `--profile` it must agree (not used by the
     /// xmr arm, whose DIVI side follows `--xmr-network`).
@@ -3145,7 +3154,11 @@ mod tests {
             Chain::Divi => Direction::TakerPaysDivi,
             _ => Direction::TakerPaysBtc,
         };
-        let s = taker_swap_paying(id, state, Chain::Btc, direction, &f);
+        let counter = match b.chain() {
+            Chain::Divi => Chain::Btc,
+            c => c,
+        };
+        let s = taker_swap_paying(id, state, counter, direction, &f);
         store.put_taker_swap(&s).unwrap();
         s
     }
@@ -3490,6 +3503,99 @@ mod tests {
         }
         let n = EXPIRY_ABSENT_BLOCKS;
         assert_eq!(released_at, [n, n, n + 4]);
+    }
+
+    #[tokio::test]
+    async fn each_counter_lock_sweep_starts_its_count_where_its_expiry_start_flag_says() {
+        use divi_swap::reservation::{ExpiryStart, EXPIRY_ABSENT_BLOCKS};
+        let dir = tempfile::tempdir().unwrap();
+        for chain in [Chain::Btc, Chain::Ltc, Chain::Zec] {
+            let name = chain.to_string().to_lowercase();
+            let flag = format!("--{name}-expiry-start");
+            let args = |db: &std::path::Path, start: Option<&str>| {
+                let mut a = vec![
+                    "--backend".to_string(),
+                    "live".into(),
+                    "--counter-chain".into(),
+                    name.clone(),
+                    "--db".into(),
+                    db.to_str().unwrap().into(),
+                ];
+                // Every other chain's flag, DIVI's included, says "mtp": only this
+                // chain's own counts.
+                for other in ["divi", "btc", "ltc", "zec"] {
+                    if other != name {
+                        a.extend([format!("--{other}-expiry-start"), "mtp".into()]);
+                    }
+                }
+                if let Some(s) = start {
+                    a.extend([flag.clone(), s.into()]);
+                }
+                a
+            };
+            let parse = |a: &[String]| cli(&a.iter().map(String::as_str).collect::<Vec<_>>());
+            let db = dir.path().join(format!("{name}.db"));
+            let own = |c: &Cli| match chain {
+                Chain::Btc => c.btc_expiry_start,
+                Chain::Ltc => c.ltc_expiry_start,
+                _ => c.zec_expiry_start,
+            };
+            assert_eq!(own(&parse(&args(&db, None))), ExpiryStart::Tip);
+            assert_eq!(own(&parse(&args(&db, Some("mtp")))), ExpiryStart::Mtp);
+            let Err(e) = Cli::try_parse_from(
+                ["divi-swap".to_string()]
+                    .into_iter()
+                    .chain(args(&db, Some("median")))
+                    .chain(
+                        [
+                            "quote",
+                            "--maker",
+                            "http://x",
+                            "--offer",
+                            "o",
+                            "--btc-sats",
+                            "1",
+                        ]
+                        .map(String::from),
+                    ),
+            ) else {
+                panic!("{flag} median parsed");
+            };
+            let e = e.to_string();
+            assert!(e.contains(&flag), "{e}");
+
+            let mut released_at = Vec::new();
+            for (i, start) in [None, Some("tip"), Some("mtp")].into_iter().enumerate() {
+                let db = dir.path().join(format!("{name}{i}.db"));
+                let c = MockChain::new(chain, T0, 600);
+                let b: Arc<divi_swap::mock::MockBackend> =
+                    Arc::new(c.backend(4, Amount(10 * Amount::COIN)));
+                let s = locked_swap(&db, b.as_ref(), "dropped", TakerState::Locked, 1).await;
+                c.forget(&lock_of(&s));
+                c.advance_time(3_601);
+                // Tips that look fresh (swept at the tip's own time) while MTP trails them
+                // by five blocks.
+                b.set_tip_lead(5 * 600);
+                let cli = parse(&args(&db, start));
+                assert_eq!(
+                    cli.counter_chain, chain,
+                    "{start:?}: the sweep runs on this chain"
+                );
+                let first = c.height();
+                loop {
+                    let (_, divi) = divi_chain();
+                    sweep_locks(&cli, divi.as_ref(), b.as_ref(), c.mtp() + 5 * 600).await;
+                    if held(&db).is_empty() {
+                        break;
+                    }
+                    assert!(c.height() < first + 20, "{flag} {start:?}: never released");
+                    c.mine(1);
+                }
+                released_at.push(c.height() - first);
+            }
+            let n = EXPIRY_ABSENT_BLOCKS;
+            assert_eq!(released_at, [n, n, n + 4], "{flag}");
+        }
     }
 
     #[tokio::test]

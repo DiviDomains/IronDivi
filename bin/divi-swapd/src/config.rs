@@ -76,6 +76,41 @@ fn default_divi_network() -> String {
     "testnet".into()
 }
 
+/// A section's `expiry_start`: `"tip"` when absent, `"mtp"`, or an error naming
+/// `[section].expiry_start`.
+fn expiry_start(section: &str, value: Option<&str>) -> Result<ExpiryStart> {
+    match value {
+        None => Ok(ExpiryStart::default()),
+        Some(s) => s
+            .parse()
+            .map_err(|e| anyhow::anyhow!("[{section}].expiry_start {e}")),
+    }
+}
+
+/// Each chain's `expiry_start` ([`DaemonConfig::expiry_starts`]): where its expiry sweep may
+/// start counting a dropped lock's absent blocks. A chain without the key or without a
+/// section is [`ExpiryStart::Tip`]; so is every chain without input reservations (USDC, XMR).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExpiryStarts {
+    pub divi: ExpiryStart,
+    pub btc: ExpiryStart,
+    pub ltc: ExpiryStart,
+    pub zec: ExpiryStart,
+}
+
+impl ExpiryStarts {
+    /// The setting for `chain`.
+    pub fn of(&self, chain: Chain) -> ExpiryStart {
+        match chain {
+            Chain::Divi => self.divi,
+            Chain::Btc => self.btc,
+            Chain::Ltc => self.ltc,
+            Chain::Zec => self.zec,
+            _ => ExpiryStart::default(),
+        }
+    }
+}
+
 impl DiviSection {
     /// The configured DIVI network (`testnet` or `mainnet`).
     pub fn network(&self) -> Result<divi_wallet::address::Network> {
@@ -98,12 +133,7 @@ impl DiviSection {
     /// dropped DIVI lock wait for the node's median time past
     /// ([`divi_swap::InputReservations::release_expired_from`]).
     pub fn expiry_start(&self) -> Result<ExpiryStart> {
-        match self.expiry_start.as_deref() {
-            None => Ok(ExpiryStart::default()),
-            Some(s) => s
-                .parse()
-                .map_err(|e| anyhow::anyhow!("[divi].expiry_start {e}")),
-        }
+        expiry_start("divi", self.expiry_start.as_deref())
     }
 
     /// `fallback_rpc_url` when set and non-blank; an identical URL to `rpc_url` is refused
@@ -144,9 +174,21 @@ pub struct BtcSection {
     pub quorum_reads: bool,
     /// Reference (`op://…` or `credential:<name>`) to the maker's BTC key.
     pub key: String,
+    /// Where the expiry sweep may start counting a dropped BTC lock's absent blocks:
+    /// `"tip"` (the default) or `"mtp"` ([`BtcSection::expiry_start`]).
+    #[serde(default)]
+    pub expiry_start: Option<String>,
 }
 
 impl BtcSection {
+    /// `expiry_start`: `"tip"` when absent, `"mtp"` to make every first absent check of a
+    /// dropped lock wait for the backend's median time past
+    /// ([`divi_swap::InputReservations::release_expired_from`]).
+    pub fn expiry_start(&self) -> Result<ExpiryStart> {
+        let _ = &self.expiry_start; // EK stub: ignores the key
+        Ok(ExpiryStart::default())
+    }
+
     /// Esplora endpoints, primary first: `esplora_url` (then `fallback_esplora_url`) when
     /// set, else `network`'s defaults (`swap_chain_btc::esplora_endpoints`).
     pub fn endpoints(&self) -> Result<Vec<String>> {
@@ -212,9 +254,21 @@ pub struct LtcSection {
     /// goes ahead. Needs `crosscheck` set to a source; on with `crosscheck = "off"` is refused.
     #[serde(default)]
     pub crosscheck_before_claim: bool,
+    /// Where the expiry sweep may start counting a dropped LTC lock's absent blocks:
+    /// `"tip"` (the default) or `"mtp"` ([`LtcSection::expiry_start`]).
+    #[serde(default)]
+    pub expiry_start: Option<String>,
 }
 
 impl LtcSection {
+    /// `expiry_start`: `"tip"` when absent, `"mtp"` to make every first absent check of a
+    /// dropped lock wait for the backend's median time past
+    /// ([`divi_swap::InputReservations::release_expired_from`]).
+    pub fn expiry_start(&self) -> Result<ExpiryStart> {
+        let _ = &self.expiry_start; // EK stub: ignores the key
+        Ok(ExpiryStart::default())
+    }
+
     /// Parsed `crosscheck`; `None` is `off`.
     pub fn crosscheck_source(&self) -> Result<Option<swap_chain_ltc::CrossCheckSource>> {
         swap_chain_ltc::CrossCheckSource::parse_opt(&self.crosscheck)
@@ -392,6 +446,10 @@ pub struct ZecSection {
     pub allow_single_source: bool,
     /// Reference (`op://…` or `credential:<name>`) to the maker's ZEC key.
     pub key: String,
+    /// Where the expiry sweep may start counting a dropped ZEC lock's absent blocks:
+    /// `"tip"` (the default) or `"mtp"` ([`ZecSection::expiry_start`]).
+    #[serde(default)]
+    pub expiry_start: Option<String>,
 }
 
 fn default_zec_network() -> String {
@@ -399,6 +457,14 @@ fn default_zec_network() -> String {
 }
 
 impl ZecSection {
+    /// `expiry_start`: `"tip"` when absent, `"mtp"` to make every first absent check of a
+    /// dropped lock wait for the backend's median time past
+    /// ([`divi_swap::InputReservations::release_expired_from`]).
+    pub fn expiry_start(&self) -> Result<ExpiryStart> {
+        let _ = &self.expiry_start; // EK stub: ignores the key
+        Ok(ExpiryStart::default())
+    }
+
     /// Lightwalletd endpoints, primary first: `lightwalletd_url` (then
     /// `fallback_lightwalletd_url` if also set) when present, else `network`'s probed
     /// defaults (`swap_chain_zec::lightwalletd_endpoints`).
@@ -656,6 +722,15 @@ impl DaemonConfig {
         Ok(match &self.divi {
             Some(d) => d.expiry_start()?,
             None => ExpiryStart::default(),
+        })
+    }
+
+    /// `expiry_start` of `[divi]`, `[btc]`, `[ltc]` and `[zec]`, each `"tip"` without its
+    /// section or key.
+    pub fn expiry_starts(&self) -> Result<ExpiryStarts> {
+        Ok(ExpiryStarts {
+            divi: self.divi_expiry_start()?,
+            ..ExpiryStarts::default()
         })
     }
 
@@ -1089,6 +1164,42 @@ key = "credential:btc"
             let e = format!("{:#}", with(bad).unwrap_err());
             assert!(e.contains("[divi].expiry_start"), "{bad:?}: {e}");
         }
+    }
+
+    #[test]
+    fn btc_ltc_and_zec_expiry_start_are_tip_by_default_take_mtp_and_refuse_anything_else() {
+        let base =
+            format!("{GOOD}[ltc]\nkey = \"credential:ltc\"\n[zec]\nkey = \"credential:zec\"\n");
+        let cfg = DaemonConfig::parse(&base).unwrap();
+        assert_eq!(cfg.expiry_starts().unwrap(), ExpiryStarts::default());
+        for chain in [Chain::Btc, Chain::Ltc, Chain::Zec] {
+            assert_eq!(ExpiryStarts::default().of(chain), ExpiryStart::Tip);
+            let section = chain.to_string().to_lowercase();
+            let with = |value: &str| {
+                DaemonConfig::parse(&base.replace(
+                    &format!("[{section}]\n"),
+                    &format!("[{section}]\nexpiry_start = \"{value}\"\n"),
+                ))
+            };
+            for (value, start) in [("tip", ExpiryStart::Tip), ("mtp", ExpiryStart::Mtp)] {
+                let starts = with(value).unwrap().expiry_starts().unwrap();
+                assert_eq!(starts.of(chain), start, "[{section}] {value}");
+                for other in [Chain::Divi, Chain::Btc, Chain::Ltc, Chain::Zec] {
+                    if other != chain {
+                        assert_eq!(starts.of(other), ExpiryStart::Tip, "[{section}] {value}");
+                    }
+                }
+            }
+            for bad in ["median", "MTP", ""] {
+                let e = format!("{:#}", with(bad).unwrap_err());
+                assert!(
+                    e.contains(&format!("[{section}].expiry_start")),
+                    "[{section}] {bad:?}: {e}"
+                );
+            }
+        }
+        // USDC and XMR have no input reservations, so no key: always the default.
+        assert_eq!(ExpiryStarts::default().of(Chain::Usdc), ExpiryStart::Tip);
     }
 
     #[test]
