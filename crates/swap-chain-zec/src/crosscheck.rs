@@ -53,9 +53,31 @@ pub enum CrossCheckOutcome {
 impl CrossCheckOutcome {
     /// The refusal text for a `Disagree`, naming both endpoints and both hashes.
     pub fn disagree_message(&self) -> Option<String> {
-        let _ = self;
-        None
+        match self {
+            Self::Disagree {
+                height,
+                primary_hash,
+                primary_url,
+                other_hash,
+                other_url,
+            } => Some(format!(
+                "zec tip cross-check FAILED at height {height}: primary lightwalletd \
+                 {primary_url} says {primary_hash}, second operator {other_url} says \
+                 {other_hash}; refusing"
+            )),
+            _ => None,
+        }
     }
+}
+
+/// The primary list as the messages name it (the endpoint that answered is not reported by
+/// the failover client, so every candidate is named).
+fn primary_label(primary: &LightwalletdClient) -> String {
+    primary.endpoints().join(", ")
+}
+
+fn other_label(other: &LightwalletdClient) -> String {
+    other.endpoints().join(", ")
 }
 
 /// Compare `primary` with `other` (the second operator). Never returns an error: every
@@ -64,10 +86,65 @@ pub async fn tip_crosscheck(
     primary: &LightwalletdClient,
     other: &LightwalletdClient,
 ) -> CrossCheckOutcome {
-    let _ = (primary, other);
-    CrossCheckOutcome::Unavailable {
-        reason: "not implemented".into(),
+    let unavailable = |reason: String| CrossCheckOutcome::Unavailable { reason };
+    let (primary_url, other_url) = (primary_label(primary), other_label(other));
+    let (p_tip, o_tip) = match tokio::join!(primary.latest_block(), other.latest_block()) {
+        (Ok(p), Ok(o)) => (p.height, o.height),
+        (Err(e), _) => return unavailable(format!("{primary_url}: tip: {e:?}")),
+        (_, Err(e)) => return unavailable(format!("{other_url}: tip: {e:?}")),
+    };
+    let height = p_tip.min(o_tip);
+    let lag = p_tip.abs_diff(o_tip);
+    if lag > MAX_LAG {
+        return unavailable(format!(
+            "tips {lag} blocks apart (primary {primary_url} at {p_tip}, second operator \
+             {other_url} at {o_tip}; more than {MAX_LAG})"
+        ));
     }
+    let Some(deep) = height.checked_sub(CROSSCHECK_DEPTH) else {
+        return unavailable(format!("tip {height} below depth {CROSSCHECK_DEPTH}"));
+    };
+    // The compared tip first: a lie there is the one that matters for a broadcast now.
+    let mut agreed = None;
+    for h in [height, deep] {
+        let (p, o) = match tokio::join!(block_hash(primary, h), block_hash(other, h)) {
+            (Ok(p), Ok(o)) => (p, o),
+            (Err(e), _) => return unavailable(format!("{primary_url}: {e}")),
+            (_, Err(e)) => return unavailable(format!("{other_url}: {e}")),
+        };
+        if p != o {
+            return CrossCheckOutcome::Disagree {
+                height: h,
+                primary_hash: p,
+                primary_url,
+                other_hash: o,
+                other_url,
+            };
+        }
+        agreed.get_or_insert(p);
+    }
+    CrossCheckOutcome::Agree {
+        height,
+        hash: agreed.expect("two heights compared"),
+    }
+}
+
+/// The display-order hash of the block at `height`, refusing an answer for another height.
+async fn block_hash(
+    client: &LightwalletdClient,
+    height: u64,
+) -> std::result::Result<String, String> {
+    let block = client
+        .block(height)
+        .await
+        .map_err(|e| format!("block {height}: {e:?}"))?;
+    if block.height != height {
+        return Err(format!(
+            "GetBlock({height}) answered block {}",
+            block.height
+        ));
+    }
+    crate::display_block_hash(&block.hash).map_err(|e| format!("block {height}: {e}"))
 }
 
 /// Startup policy: `Disagree` is [`SwapError::Transient`] naming both endpoints,
@@ -76,8 +153,24 @@ pub async fn enforce_at_startup(
     primary: &LightwalletdClient,
     other: &LightwalletdClient,
 ) -> Result<()> {
-    let _ = (primary, other);
-    Ok(())
+    let second = other_label(other);
+    match tip_crosscheck(primary, other).await {
+        CrossCheckOutcome::Agree { height, hash } => {
+            tracing::info!(height, %hash, second_operator = %second, "zec tip cross-check agrees");
+            Ok(())
+        }
+        CrossCheckOutcome::Unavailable { reason } => {
+            tracing::warn!(
+                %reason, second_operator = %second,
+                "zec tip cross-check unavailable at startup; continuing (claims and refunds \
+                 wait for it)"
+            );
+            Ok(())
+        }
+        d @ CrossCheckOutcome::Disagree { .. } => Err(SwapError::Transient(
+            d.disagree_message().expect("disagree"),
+        )),
+    }
 }
 
 /// Before a claim or refund (`what`) of `at`: `Disagree` and `Unavailable` are both
@@ -88,26 +181,85 @@ pub async fn enforce_before_spend(
     what: &str,
     at: &Outpoint,
 ) -> Result<()> {
-    let _ = (primary, other, what, at);
-    Ok(())
+    match tip_crosscheck(primary, other).await {
+        CrossCheckOutcome::Agree { height, hash } => {
+            tracing::debug!(height, %hash, outpoint = %at, "zec {what} cross-check agrees");
+            Ok(())
+        }
+        CrossCheckOutcome::Unavailable { reason } => Err(SwapError::Transient(format!(
+            "zec tip cross-check unavailable ({reason}); second operator {}: {what} of {at} \
+             held until it answers",
+            other_label(other)
+        ))),
+        d @ CrossCheckOutcome::Disagree { .. } => Err(SwapError::Transient(format!(
+            "{}; {what} of {at} held",
+            d.disagree_message().expect("disagree")
+        ))),
+    }
 }
 
-/// The operator a lightwalletd URL belongs to: its host's registrable domain.
+/// Second-level labels under which a two-letter country code is a public suffix
+/// (`example.co.uk`). An approximation of the Public Suffix List, enough to tell two
+/// lightwalletd operators apart; it does not know private suffixes.
+const CC_SECOND_LEVEL: [&str; 7] = ["ac", "co", "com", "edu", "gov", "net", "org"];
+
+/// The operator a lightwalletd URL belongs to: its host's registrable domain (the last two
+/// DNS labels, three under a `co.uk`-style suffix), or the host itself for an IP address or
+/// a one-label name. `None` when `url` is not an `http(s)://host…` URL.
 pub fn operator_domain(url: &str) -> Option<String> {
-    let _ = url;
-    None
+    let uri: http::Uri = url.trim().parse().ok()?;
+    if !matches!(uri.scheme_str(), Some("http" | "https")) {
+        return None;
+    }
+    let host = uri
+        .host()?
+        .trim_end_matches('.')
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+    if host.is_empty() {
+        return None;
+    }
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return Some(host);
+    }
+    let labels: Vec<&str> = host.split('.').collect();
+    let n = labels.len();
+    let keep = if n >= 3 && labels[n - 1].len() == 2 && CC_SECOND_LEVEL.contains(&labels[n - 2]) {
+        3
+    } else {
+        2
+    };
+    Some(labels[n.saturating_sub(keep)..].join("."))
 }
 
-/// `Ok` when `url` is a usable second operator for `primaries`.
+/// `Ok` when `url` is a usable second operator for `primaries`: it has a host, and that host
+/// is not under the registrable domain of **any** primary endpoint (one shared with a
+/// failover endpoint would compare that operator with itself whenever the primary fails
+/// over to it).
 pub fn check_second_operator(primaries: &[String], url: &str) -> std::result::Result<(), String> {
-    let _ = (primaries, url);
+    let domain =
+        operator_domain(url).ok_or_else(|| format!("{url:?} is not an https://host:port URL"))?;
+    if let Some(p) = primaries
+        .iter()
+        .find(|p| operator_domain(p).as_deref() == Some(domain.as_str()))
+    {
+        return Err(format!(
+            "{url} is under {domain}, the same operator as the lightwalletd endpoint {p}: \
+             that is not a second operator"
+        ));
+    }
     Ok(())
 }
 
-/// Whether `endpoints` already span more than one operator.
+/// Whether `endpoints` already span more than one operator (by [`operator_domain`]; an
+/// endpoint that is not a URL counts as no operator).
 pub fn has_second_operator(endpoints: &[String]) -> bool {
-    let _ = endpoints;
-    true
+    let mut domains = endpoints.iter().filter_map(|e| operator_domain(e));
+    match domains.next() {
+        Some(first) => domains.any(|d| d != first),
+        None => false,
+    }
 }
 
 #[cfg(test)]
@@ -284,6 +436,8 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
+        assert!(!has_second_operator(&eps));
+        eps.push("not a url".into());
         assert!(!has_second_operator(&eps));
         eps.push("https://lwd.other-operator.net:9067".into());
         assert!(has_second_operator(&eps));

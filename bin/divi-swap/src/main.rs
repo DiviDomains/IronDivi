@@ -603,6 +603,11 @@ fn live_backends(cli: &Cli) -> Result<Backends> {
                  --allow-mainnet opt-in"
             );
         }
+        if let Some(url) = &cli.zec_crosscheck_url {
+            let primaries = swap_chain_zec::lightwalletd_endpoints(&cli.zec_network)?;
+            swap_chain_zec::crosscheck::check_second_operator(&primaries, url)
+                .map_err(|e| anyhow::anyhow!("--zec-crosscheck-url: {e}"))?;
+        }
     }
     guard_network(
         "--divi-network",
@@ -743,7 +748,8 @@ fn live_counter(
                     swap_chain_zec::RetryPolicy::default(),
                 )?
                 .with_network(&cli.zec_network)?
-                .with_input_reservations(reservations.clone()),
+                .with_input_reservations(reservations.clone())
+                .with_crosscheck(cli.zec_crosscheck_url.clone())?,
             );
             (backend.clone(), CounterLive::Zec(backend))
         }
@@ -1122,16 +1128,19 @@ fn ltc_crosscheck_source(cli: &Cli) -> Result<Option<swap_chain_ltc::CrossCheckS
         .map_err(|e| anyhow::anyhow!("--ltc-crosscheck: {e}"))
 }
 
-/// Before any LTC action: the opt-in tip-hash cross-check. A disagreement is an error; an
-/// unavailable source warns and continues; `off` and non-LTC runs make no request.
+/// Before any LTC or ZEC action: the opt-in tip cross-check (`--ltc-crosscheck`,
+/// `--zec-crosscheck-url`). A disagreement is an error; an unavailable source warns and
+/// continues; off, and other chains, make no request.
 async fn ltc_preflight(cli: &Cli, b: &Backends) -> Result<()> {
-    if let Some((_, CounterLive::Ltc(ltc))) = &b.live {
-        ltc.crosscheck(ltc_crosscheck_source(cli)?).await?;
+    match &b.live {
+        Some((_, CounterLive::Ltc(ltc))) => ltc.crosscheck(ltc_crosscheck_source(cli)?).await?,
+        Some((_, CounterLive::Zec(zec))) => zec.crosscheck().await?,
+        _ => {}
     }
     Ok(())
 }
 
-/// [`backends`], then what every taker command runs first: the LTC crosscheck, the DIVI
+/// [`backends`], then what every taker command runs first: the LTC or ZEC crosscheck, the DIVI
 /// wallet scan and the lock-input sweep ([`sweep_locks`]).
 async fn ready_backends(cli: &Cli) -> Result<Backends> {
     let b = backends(cli)?;

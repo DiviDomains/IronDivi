@@ -457,7 +457,10 @@ async fn live_usdc(
     Ok((Arc::new(backend), underfunded))
 }
 
-fn live_zec(cfg: &ZecSection, reservations: &InputReservations) -> Result<Arc<dyn ChainBackend>> {
+async fn live_zec(
+    cfg: &ZecSection,
+    reservations: &InputReservations,
+) -> Result<Arc<dyn ChainBackend>> {
     let key = resolve_key(&cfg.key, "zec")?;
     let endpoints = cfg.endpoints()?;
     let backend = ZecBackend::new(
@@ -467,9 +470,16 @@ fn live_zec(cfg: &ZecSection, reservations: &InputReservations) -> Result<Arc<dy
         ZecRetryPolicy::default(),
     )?
     .with_network(&cfg.network)?
-    .with_input_reservations(reservations.clone());
+    .with_input_reservations(reservations.clone())
+    // Opt-in (`[zec].crosscheck_url`): the second operator is asked again before every claim
+    // and refund, failing closed.
+    .with_crosscheck(cfg.crosscheck_url.clone())?;
+    // A primary whose tip disagrees with the second operator refuses to start; an
+    // unreachable second operator only warns here.
+    backend.crosscheck().await?;
     tracing::info!(
-        address = %backend.encoded_address(), network = %cfg.network, "zec backend ready"
+        address = %backend.encoded_address(), network = %cfg.network,
+        crosscheck = cfg.crosscheck_url.as_deref().unwrap_or("off"), "zec backend ready"
     );
     Ok(Arc::new(backend))
 }
@@ -500,7 +510,9 @@ async fn live_backends(
                 underfunded_offers.extend(underfunded);
                 backend
             }
-            Chain::Zec => live_zec(cfg.zec.as_ref().expect("checked by config"), &reservations)?,
+            Chain::Zec => {
+                live_zec(cfg.zec.as_ref().expect("checked by config"), &reservations).await?
+            }
             other => bail!("no live {other} backend in this build"),
         });
     }

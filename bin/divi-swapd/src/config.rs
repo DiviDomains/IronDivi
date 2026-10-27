@@ -855,6 +855,21 @@ impl DaemonConfig {
                     self.profile
                 );
             }
+            let endpoints = z.endpoints()?;
+            if let Some(url) = &z.crosscheck_url {
+                swap_chain_zec::crosscheck::check_second_operator(&endpoints, url)
+                    .map_err(|e| anyhow::anyhow!("[zec].crosscheck_url: {e}"))?;
+            }
+            if profile_mainnet
+                && z.crosscheck_url.is_none()
+                && !swap_chain_zec::crosscheck::has_second_operator(&endpoints)
+            {
+                require_second_source(
+                    "zec",
+                    "[zec].crosscheck_url is unset and every lightwalletd endpoint is one operator's",
+                    z.allow_single_source,
+                )?;
+            }
         }
         // One rule for every section (xmr and usdc have no gate of their own above). DIVI
         // is checked after the counter coins, so their errors are reported first.
