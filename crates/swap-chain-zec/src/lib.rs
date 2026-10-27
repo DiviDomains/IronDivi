@@ -21,6 +21,10 @@ pub mod tx;
 #[cfg(test)]
 mod lwd_stub;
 
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+
 use async_trait::async_trait;
 use secp256k1::{All, Secp256k1, SecretKey};
 
@@ -156,6 +160,21 @@ pub struct ZecBackend {
     network: String,
     /// The second lightwalletd operator ([`ZecBackend::with_crosscheck`]); `None` is off.
     second: Option<LightwalletdClient>,
+    /// Shared with this backend's [`ChainBackend::primary_only`] views.
+    hold: Arc<HoldState>,
+}
+
+/// What a cross-checked backend and its primary-only views share.
+#[derive(Debug, Default)]
+struct HoldState {
+    /// The second operator, kept by the primary-only views too: a spend they build after a
+    /// `Disagree` is also sent to it (best effort; the primary may be the liar).
+    relay_to: Option<LightwalletdClient>,
+    /// The last spend cross-check disagreed (not merely unavailable).
+    disagreed: AtomicBool,
+    /// Spends built on the primary alone after a `Disagree`: every broadcast of them also
+    /// goes to `relay_to`. In memory only; after a restart the primary alone resends them.
+    relay: Mutex<HashSet<Txid>>,
 }
 
 impl std::fmt::Debug for ZecBackend {
@@ -187,6 +206,7 @@ impl ZecBackend {
             reservations: None,
             network: "testnet".to_string(),
             second: None,
+            hold: Arc::default(),
         })
     }
 
@@ -208,6 +228,10 @@ impl ZecBackend {
             Some(url) => Some(LightwalletdClient::new(vec![url], self.client.retry())?),
             None => None,
         };
+        self.hold = Arc::new(HoldState {
+            relay_to: self.second.clone(),
+            ..HoldState::default()
+        });
         Ok(self)
     }
 
@@ -219,12 +243,82 @@ impl ZecBackend {
         }
     }
 
-    /// Before a claim or refund (`what`) of `at` is built: fail closed on anything but
-    /// agreement ([`crosscheck::enforce_before_spend`]); `Ok` when off.
+    /// Before a claim or refund (`what`) of `at` is built: hold it on anything but
+    /// agreement ([`crosscheck::spend_hold`], [`SwapError::Held`]); `Ok` when off and in a
+    /// primary-only view.
     async fn check_before_spend(&self, what: &str, at: &Outpoint) -> Result<()> {
-        match &self.second {
-            Some(second) => crosscheck::enforce_before_spend(&self.client, second, what, at).await,
+        let Some(second) = &self.second else {
+            return Ok(());
+        };
+        let hold = crosscheck::spend_hold(&self.client, second, what, at).await;
+        self.hold
+            .disagreed
+            .store(hold.as_ref().is_some_and(|h| h.disagree), Ordering::SeqCst);
+        match hold {
             None => Ok(()),
+            Some(h) => Err(h.error),
+        }
+    }
+
+    /// A spend this backend built: in a primary-only view after a `Disagree`, also sent to
+    /// the second operator from now on.
+    fn built_spend(&self, tx: SignedTx) -> SignedTx {
+        if self.second.is_none()
+            && self.hold.relay_to.is_some()
+            && self.hold.disagreed.load(Ordering::SeqCst)
+        {
+            self.hold.relay.lock().expect("relay set").insert(tx.txid);
+        }
+        tx
+    }
+
+    /// Best effort: send `tx` to the second operator if it was built on the primary alone
+    /// after a `Disagree`. A failure is only logged; the primary's answer stands.
+    async fn relay(&self, tx: &SignedTx) {
+        let Some(second) = &self.hold.relay_to else {
+            return;
+        };
+        if !self
+            .hold
+            .relay
+            .lock()
+            .expect("relay set")
+            .contains(&tx.txid)
+        {
+            return;
+        }
+        match second.send_transaction(&tx.raw).await {
+            Ok(resp) if resp.error_code == 0 || is_already_known(&resp.error_message) => {
+                tracing::warn!(txid = %tx.txid, second_operator = %second.endpoints().join(", "),
+                    "zec spend built on the primary alone also sent to the second operator");
+            }
+            Ok(resp) => tracing::warn!(txid = %tx.txid,
+                second_operator = %second.endpoints().join(", "),
+                error = %resp.error_message, "second operator refused the zec spend"),
+            Err(e) => tracing::warn!(txid = %tx.txid,
+                second_operator = %second.endpoints().join(", "),
+                error = ?e, "zec spend not sent to the second operator"),
+        }
+    }
+
+    /// Send to the primary endpoints (failover order), reserving a funding's inputs first.
+    async fn broadcast_primary(&self, signed_tx: &SignedTx) -> Result<Txid> {
+        self.reserve_inputs(signed_tx)?;
+        match self.client.send_transaction(&signed_tx.raw).await {
+            Ok(resp) if resp.error_code == 0 => Ok(signed_tx.txid),
+            Ok(resp) => {
+                if is_already_known(&resp.error_message) {
+                    return Ok(signed_tx.txid);
+                }
+                Err(classify_broadcast_error(&resp.error_message))
+            }
+            Err(ClientError::Rejected(m)) => {
+                if is_already_known(&m) {
+                    return Ok(signed_tx.txid);
+                }
+                Err(classify_broadcast_error(&m))
+            }
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -592,7 +686,7 @@ impl ChainBackend for ZecBackend {
             branch_id,
             self.fees.zats_per_byte(),
         )?;
-        Ok(Self::to_signed(&built))
+        Ok(self.built_spend(Self::to_signed(&built)))
     }
 
     async fn build_refund(
@@ -620,27 +714,32 @@ impl ChainBackend for ZecBackend {
             branch_id,
             self.fees.zats_per_byte(),
         )?;
-        Ok(Self::to_signed(&built))
+        Ok(self.built_spend(Self::to_signed(&built)))
     }
 
     async fn broadcast(&self, signed_tx: &SignedTx) -> Result<Txid> {
-        self.reserve_inputs(signed_tx)?;
-        match self.client.send_transaction(&signed_tx.raw).await {
-            Ok(resp) if resp.error_code == 0 => Ok(signed_tx.txid),
-            Ok(resp) => {
-                if is_already_known(&resp.error_message) {
-                    return Ok(signed_tx.txid);
-                }
-                Err(classify_broadcast_error(&resp.error_message))
-            }
-            Err(ClientError::Rejected(m)) => {
-                if is_already_known(&m) {
-                    return Ok(signed_tx.txid);
-                }
-                Err(classify_broadcast_error(&m))
-            }
-            Err(e) => Err(e.into()),
-        }
+        let sent = self.broadcast_primary(signed_tx).await;
+        self.relay(signed_tx).await;
+        sent
+    }
+
+    /// With the cross-check on: the same key and primary endpoints, no second-operator check
+    /// before a spend. A spend it builds after a `Disagree` is also sent to the second operator
+    /// whenever it is broadcast ([`HoldState::relay`]).
+    fn primary_only(&self) -> Option<Arc<dyn ChainBackend>> {
+        self.second.as_ref()?;
+        Some(Arc::new(ZecBackend {
+            client: self.client.clone(),
+            secp: self.secp.clone(),
+            key: self.key,
+            pubkey: self.pubkey,
+            address: self.address,
+            fees: self.fees,
+            reservations: self.reservations.clone(),
+            network: self.network.clone(),
+            second: None,
+            hold: self.hold.clone(),
+        }))
     }
 
     async fn confirmations(&self, txid: &Txid) -> Result<Option<u32>> {

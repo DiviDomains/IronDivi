@@ -19,6 +19,7 @@ pub mod backend;
 mod claim_fee;
 pub mod config;
 pub mod error;
+mod hold;
 pub mod htlc;
 pub mod maker;
 pub mod mock;
