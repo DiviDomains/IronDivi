@@ -153,6 +153,34 @@ class NodePorts(unittest.TestCase):
         self.assertIsNone(proc.poll())
         self.assertNotIn(f"rpcport={held}\n", a.conf_text())
 
+    def test_a_node_running_on_with_its_rpc_port_taken_is_seen_by_a_poll_after_early(self):
+        held = self.hold()
+        a = Fake(self.work, "a", node_ports.free_port(HOST), ["rpc=partial"])
+        a.rpcport = held
+        with open(a.conf, "a") as f:
+            f.write(f"rpcport={held}\n")
+        early, node_ports.EARLY = node_ports.EARLY, 0.5
+        try:
+            proc = a.start(self.work)
+            self.procs.append(proc)
+            time.sleep(1.5)  # the script's RPC call blocked on the port's owner
+            proc.poll()
+        finally:
+            node_ports.EARLY = early
+        self.assertNotEqual(a.rpcport, held)
+
+    def test_a_read_only_datadir_is_left_as_it_is_and_its_failure_stands(self):
+        port = self.hold()
+        a = Fake(self.work, "a", port)
+        os.chmod(a.dir, 0o500)
+        try:
+            self.assertEqual(wait(a.start(self.work)), 1)
+        finally:
+            os.chmod(a.dir, 0o700)
+        self.assertEqual((a.p2p, node_ports.moved), (port, {}))
+        with open(os.path.join(self.work, "a.err")) as f:
+            self.assertEqual(f.read(), f"Error: Unable to bind to {HOST}:{port} on this computer.\n")
+
     def test_a_node_that_ends_for_another_reason_is_not_started_again(self):
         a = Fake(self.work, "a", self.hold(), ["fail=option"])
         proc = a.start(self.work)

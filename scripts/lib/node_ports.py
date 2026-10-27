@@ -146,9 +146,16 @@ def move_ports(node, datadir):
     while new[1] == new[0]:
         new = (new[0], free_port(host))
     with _lock:
+        before = dict(moved)
         moved[old[0]], moved[old[1]] = new
+    try:
+        _write_conf(conf_path, follow(conf))
+    except OSError:  # a datadir the script made read-only: the failure stands
+        with _lock:
+            moved.clear()
+            moved.update(before)
+        return None
     node.p2p, node.rpcport = new
-    _write_conf(conf_path, follow(conf))
     if hasattr(node, "ports_moved"):
         node.ports_moved()
     print(f"# {getattr(node, 'name', datadir)}: ports {old[0]}/{old[1]} in use, starting again on "
@@ -243,7 +250,10 @@ class Proc:
             return
         new = follow(old)
         if new != old:
-            _write_conf(path, new)
+            try:
+                _write_conf(path, new)
+            except OSError:
+                pass  # a datadir the script made read-only
 
     def _launch(self):
         self._follow_ports()
@@ -256,6 +266,7 @@ class Proc:
                 reopened.append(kw[key])
         self._offsets = {p: _size(p) for p in self._logs()}
         self._started = time.time()
+        self._early_done = False
         try:
             self._proc = subprocess.Popen(self._argv, **kw)
         finally:
@@ -271,9 +282,11 @@ class Proc:
         """divid with no -rpcbind binds RPC on ::1 and 127.0.0.1; when only the IPv4 port is taken it logs
         "Binding RPC on address 127.0.0.1 port <rpcport> failed: bind: Address already in use" and runs on with
         RPC the scripts cannot reach. Such a node (the message naming its own port, in its first EARLY seconds)
-        is stopped and started again like one that exited"""
-        if not self._left or not self._datadir or time.time() - self._started > EARLY:
+        is stopped and started again like one that exited. The first look after EARLY is the last, so a script
+        whose RPC call blocked on the port's other owner past EARLY still has it looked at"""
+        if not self._left or not self._datadir or self._early_done:
             return False
+        self._early_done = time.time() - self._started > EARLY
         if not bind_failure(self._node, self._ended()):
             return False
         self._proc.terminate()
