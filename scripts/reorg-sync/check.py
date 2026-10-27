@@ -503,6 +503,43 @@ one_tip(180)
 chain_rows("D depth 30, restart")
 row("D depth 30: the longer side won", "", "", tip(I2) == tip(C1) and tip(I2) != lost_d)
 
+# --- G. a spend in side L's mempool; side R confirms a double spend in the lower of its two blocks
+
+# A fresh coin, too young to stake, so no staker takes it
+fresh = C3.rpc("sendtoaddress", C3.rpc("getnewaddress"), 10)
+need(wait_for(lambda: fresh in C1.rpc("getrawmempool"), 30), "bridge L did not take the fresh coin")
+mine(C1, 1)
+need(one_tip(), "the nodes did not follow the fresh coin's block")
+x_coin = next(u for u in C3.rpc("listunspent") if u["txid"] == fresh and abs(u["amount"] - 10) < 1e-8)
+split()
+mine(C1, 1)                                  # side L's block, without the spend
+need(wait_for(lambda: tip(C3) == tip(C1) == tip(I1), 60), "side L did not agree")
+t_l = spend(C3, x_coin, C3.rpc("getnewaddress"))
+need(wait_for(lambda: all(t_l in n.rpc("getrawmempool") for n in (C1, C3, I1)), 30), "side L did not take the spend")
+t_lc = spend(C3, {"txid": t_l, "vout": 0, "amount": C3.rpc("getrawtransaction", t_l, 1)["vout"][0]["value"]},
+             C3.rpc("getnewaddress"))
+need(wait_for(lambda: all(t_lc in n.rpc("getrawmempool") for n in (C1, C3, I1)), 30), "side L did not take the child")
+# Side R spends the coin too: signed by the shared wallet, sent through divid R
+raw = C3.rpc("createrawtransaction", [{"txid": x_coin["txid"], "vout": x_coin["vout"]}],
+             {C3.rpc("getnewaddress"): round(x_coin["amount"] - 0.002, 8)})
+signed = C3.rpc("signrawtransaction", raw)
+need(signed.get("complete"), "could not sign side R's spend")
+t_r = C4.rpc("sendrawtransaction", signed["hex"])
+need(wait_for(lambda: t_r in I2.rpc("getrawmempool"), 30), "irondivid R did not take side R's spend")
+mine(I2, 2)
+need(wait_for(lambda: tip(C2) == tip(I2) == tip(C4), 60), "side R did not agree")
+need(t_r in I2.rpc("getblock", I2.rpc("getblockhash", I2.rpc("getblockcount") - 1))["tx"],
+     "side R's lower block lacks its spend")
+join()
+one_tip()
+time.sleep(3)
+chain_rows("G mempool double spend")
+mempool_rows("G mempool double spend")
+for t, what in ((t_l, "side L's losing spend"), (t_lc, "its child")):
+    gone = {n.name: t not in n.rpc("getrawmempool") for n in (C3, I1)}
+    row(f"G mempool double spend: {what} left the mempool (L)", gone[C3.name], gone[I1.name],
+        gone[C3.name] == gone[I1.name])
+
 # --- E. proof of stake: depth 1 and 6 past the last PoW block ---------------------------
 
 height = C1.rpc("getblockcount")
