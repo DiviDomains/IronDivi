@@ -37,10 +37,21 @@ reaches 2023-08-23 (`divi/src/ForkActivation.cpp:31`, `:47-57`), and then `FillB
   network has had it since 2023. Its blocks pay no masternode, and it accepts C's blocks, as it checks what a block
   mints, not who is paid.
 
-So the payments are made by divid C's blocks, to C's masternodes and to I's. divid picks the payee, and in one run it
-paid I's masternode in all ten of its blocks, so the payment phase mines on, up to 40 blocks, until a block has paid
-each controller's masternode. If one is still not paid, C's masternode list is printed. That is enough for the wallet rows,
-which this script is for: a wallet's view of a coinstake does not depend on who made it.
+So the payments are made by divid C's blocks, to C's masternodes and to I's.
+
+Two more things keep both masternodes paid:
+- **The silver collaterals are locked** (`lockunspent false`) on their controllers when the payment phase starts. A
+  controller locks its collaterals from masternode.conf when it starts (`divi/src/init.cpp:1246-1258`), and C and I
+  have none. Unlocked, a collateral is a coin to stake like any other (`divi/src/wallet.cpp:1433-1462`). A masternode
+  is paid to its collateral's address, so a stake from one of its rewards adds the collateral too, as coins of the
+  same script are combined (`divi/src/PoSTransactionCreator.cpp:172-209`). That ends the masternode: in earlier runs
+  irondivid I did it to mni2, and divid C likely did it to mnc2, which was then never paid. The controller restarts
+  drop locks, so the locks are made after them.
+- **The phase mines on past 20 blocks,** up to 40 and short of the treasury block (a height that is a multiple of 50),
+  until a block has paid each controller's masternode. If one is still not paid, C's masternode list is printed.
+
+That is enough for the wallet rows, which this script is for: a wallet's view of a coinstake does not depend on who
+made it.
 
 ## The rows (section 9 of scripts/mn-life/check.py)
 
@@ -62,6 +73,15 @@ The rows:
 
 The cases: C's block paying C's masternode, C's block paying I's masternode, and I's first block (a stake with no
 masternode paid). The categories each case shows are printed with `#`.
+
+## Votes after a collateral is spent
+
+Divi Core checks a masternode at most every five seconds unless it takes a ping (`MASTERNODE_CHECK_SECONDS`,
+`divi/src/masternodeman.cpp:153-180`, `:364-367`). So for up to five seconds after a collateral is spent, divid still
+takes and relays that masternode's payment votes. irondivid before fix/mn-reward checked the collateral on every vote
+and refused them ("masternode is not active", "payee not in the top of the payment queue"), so
+`getmasternodewinners 20` lost a vote for good. When such a row fails, the script prints the entries that differ
+and the reasons irondivid's debug.log gives for each vote it did not take.
 
 ## KNOWN differences
 

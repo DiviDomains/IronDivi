@@ -203,6 +203,21 @@ def setup_failed(kind, value, tb):
 sys.excepthook = setup_failed
 
 
+def refusals(node):
+    """The payment votes the irondivid node did not take, by reason, from its
+    debug.log (node.rs logs each at debug, which debug=masternode turns on)"""
+    reasons = {}
+    for root, _, files in os.walk(node.dir):
+        for f in files:
+            if f.startswith("debug.log"):
+                with open(os.path.join(root, f), errors="replace") as log:
+                    for line in log:
+                        if "Masternode winner from peer" in line and "not taken:" in line:
+                            why = line.split("not taken:", 1)[1].strip()
+                            reasons[why] = reasons.get(why, 0) + 1
+    info(f"votes {node.name} did not take, by reason: {json.dumps(reasons)}"[:600])
+
+
 def wait_for(fn, secs, step=1.0):
     deadline = time.time() + secs
     while time.time() < deadline:
@@ -659,6 +674,20 @@ if PAYMENTS:
     views_by = {C.name: [], I.name: []}
     paid = []  # (height, miner, masternode payments) of each block
     paid_owners = lambda: {mn[a]["controller"].name for _, _, p in paid for a, _ in p}
+    if REWARDS:
+        # A controller locks its collaterals from masternode.conf when it
+        # starts (init.cpp:1246-1258); C and I have none, so both would stake
+        # a collateral with its masternode's rewards, which share its script
+        # (PoSTransactionCreator.cpp:172-209), and end the masternode before
+        # each is paid. Locked here, after the restarts, which drop locks
+        for alias in ("mnc2", "mni2"):
+            d = mn[alias]
+            out = d["controller"].call("lockunspent", False, [{"txid": d["txhash"], "vout": d["vout"]}])
+            need(out == ("ok", True), f"lockunspent of {alias}'s collateral: {show(out)}")
+    by_txhash = {mn[a]["txhash"]: a for a in mn}
+    for n in (C, I):
+        info(f"masternodes on {n.name} before the payments: " + json.dumps(
+            {by_txhash.get(e.get("txhash"), e.get("txhash")): e.get("status") for e in n.rpc("listmasternodes")}))
     # With MN_LIFE_REWARDS, on until a block paid each controller's masternode
     # (divid picks the payee: in one run it paid one masternode 10 times)
     for k in range(40 if REWARDS else 20):
@@ -666,6 +695,10 @@ if PAYMENTS:
             break
         miner = (C, I)[k % 2]
         height = miner.rpc("getblockcount") + 1
+        # Past 20 blocks, short of the treasury block, which mints more
+        # (every 50 blocks on regtest, chainparams.cpp:492-493)
+        if k >= 20 and height % 50 == 0:
+            break
         out = miner.call("setgenerate", 1)
         if out[0] != "ok":
             row(f"payments: setgenerate by {miner.name} at height {height}", "ok", show(out), False)
@@ -677,11 +710,15 @@ if PAYMENTS:
         info(f"height {height} mined by {miner.name}: masternode payments {payments}, minted {minted}")
         same = lambda: C.call("getmasternodewinners", "20") == I.call("getmasternodewinners", "20")
         wait_for(same, 30)
+        before = fails
         compare(f"payments: getmasternodewinners 20 after height {height}",
                 C.call("getmasternodewinners", "20"), I.call("getmasternodewinners", "20"))
+        if fails > before:
+            refusals(I)
     if REWARDS and not paid_owners() >= {C.name, I.name}:
         info("masternodes on divid-C: " + json.dumps(
-            [{k: e.get(k) for k in ("txhash", "status", "lastpaid", "activetime")} for e in C.rpc("listmasternodes")]))
+            {by_txhash.get(e.get("txhash"), e.get("txhash")): {k: e.get(k) for k in ("status", "lastpaid", "activetime")}
+             for e in C.rpc("listmasternodes")}))
     voted = C.call("getmasternodewinners", "20")
     row("payments: divid's winners carry votes", any(
         (w["winner"].get("nVotes", 0) if isinstance(w["winner"], dict) else 1) for w in voted[1])

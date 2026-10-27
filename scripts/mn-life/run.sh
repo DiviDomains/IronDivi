@@ -42,7 +42,8 @@ cleanup() {
     done
     while read -r pid; do kill -KILL "$pid" 2>/dev/null; done < "$WORK/pids"
   fi
-  rm -rf "$WORK"
+  # MN_LIFE_KEEP=1 keeps the work directory, with each node's debug.log
+  if [ "${MN_LIFE_KEEP:-}" = 1 ]; then echo "# kept $WORK"; else rm -rf "$WORK"; fi
 }
 trap cleanup EXIT
 trap 'exit 255' INT TERM HUP

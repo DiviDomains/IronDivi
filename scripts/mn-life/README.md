@@ -26,7 +26,8 @@ MN_LIFE_PAYMENTS=1 scripts/mn-life/run.sh target/release ~/divi-3.0.0/bin 53900 
 - `<irondivid-bin-dir>` holds `irondivid`; `<core-bin-dir>` holds Divi Core's `divid`.
 - `<port-base>`: ports `<port-base>` to `<port-base>+11` on 127.0.0.2 (two per node, six nodes). The ports sit inside
   Linux's ephemeral range, where other programs' 127.0.0.1 sockets can hold them.
-- `[root]`: a fresh directory is made under it (default `$TMPDIR`, else `/tmp`) and deleted at the end.
+- `[root]`: a fresh directory is made under it (default `$TMPDIR`, else `/tmp`) and deleted at the end, unless
+  `MN_LIFE_KEEP=1` is set (to read each node's debug.log after a run).
 
 A run takes about six minutes and is stopped after 10 minutes. With `MN_LIFE_PAYMENTS=1` it waits for the masternodes
 to be ranked and the limit is 50 minutes. `MN_LIFE_REWARDS=1` (set by scripts/mn-reward, which see) also turns on the
