@@ -22,9 +22,13 @@
 //!
 //! A write goes to `<wallet file name>.tmp.<pid>.<n>` and is renamed over the file; a write
 //! that fails removes its own temporary file. One left by a process that died mid-write is
-//! removed by the next [`Wallet::open`], once no running process has that pid.
+//! removed by the next [`Wallet::open`], once no running process has that pid and the file
+//! is older than [`STALE_TEMP_FILE_AGE`]. The age matters for a writer in another pid
+//! namespace (a container sharing the wallet volume): it looks dead from here, but its
+//! in-flight file is only milliseconds old.
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use divi_swap::{Outpoint, SwapError, Txid};
 use serde::{Deserialize, Serialize};
@@ -291,6 +295,17 @@ impl Wallet {
     }
 }
 
+/// A dead writer's temporary file is removed only once its mtime is at least this old. A
+/// write takes milliseconds; ten minutes leaves room for a slow disk or a paused container.
+const STALE_TEMP_FILE_AGE: Duration = Duration::from_secs(10 * 60);
+
+/// Whether a file modified at `mtime` is old enough to be swept at `now`. An mtime in the
+/// future is not.
+fn is_stale(mtime: SystemTime, now: SystemTime) -> bool {
+    now.duration_since(mtime)
+        .is_ok_and(|age| age >= STALE_TEMP_FILE_AGE)
+}
+
 /// The temporary file of write `n` by process `pid` to `wallet`.
 fn temp_path(wallet: &Path, pid: u32, n: u64) -> PathBuf {
     let mut name = wallet.file_name().unwrap_or_default().to_os_string();
@@ -330,8 +345,9 @@ fn pid_running(pid: u32) -> bool {
     true
 }
 
-/// Remove the temporary files next to `wallet` left by writers that are no longer running.
-/// Only regular files are removed (never a symlink or what it points to); errors are
+/// Remove the temporary files next to `wallet` left by writers that are no longer running,
+/// once older than [`STALE_TEMP_FILE_AGE`]; a file whose mtime cannot be read, or is in the
+/// future, is kept. Only regular files are removed (never a symlink or what it points to); errors are
 /// ignored, as another process may sweep the same file.
 fn sweep_dead_temp_files(wallet: &Path) {
     let Some(wallet_name) = wallet.file_name().and_then(|n| n.to_str()) else {
@@ -351,6 +367,14 @@ fn sweep_dead_temp_files(wallet: &Path) {
         };
         // `file_type` does not follow symlinks.
         if !entry.file_type().is_ok_and(|t| t.is_file()) || pid_running(pid) {
+            continue;
+        }
+        // `DirEntry::metadata` does not follow symlinks either.
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .is_ok_and(|t| is_stale(t, SystemTime::now()));
+        if !stale {
             continue;
         }
         match std::fs::remove_file(entry.path()) {
@@ -478,6 +502,22 @@ mod temp_file_tests {
         pid
     }
 
+    /// Set the mtime of `path` to `secs` seconds ago (negative: in the future).
+    fn set_age(path: &Path, secs: i64) {
+        let now = std::time::SystemTime::now();
+        let d = std::time::Duration::from_secs(secs.unsigned_abs());
+        let t = if secs >= 0 { now - d } else { now + d };
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(t)
+            .unwrap();
+    }
+
+    /// Older than the sweep's age threshold (10 minutes).
+    const OLD: i64 = 11 * 60;
+
     #[test]
     fn a_failed_write_removes_its_own_temp_file_and_returns_the_error() {
         let dir = tempfile::tempdir().unwrap();
@@ -529,6 +569,8 @@ mod temp_file_tests {
         ];
         for n in swept.iter().chain(&kept) {
             touch(n.clone());
+            // Every file is old: only the pid and the name decide here.
+            set_age(&dir.path().join(n), OLD);
         }
         // A symlink and a directory with a matching name are never removed, nor is what
         // the symlink points to.
@@ -571,9 +613,85 @@ mod temp_file_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("w.json");
         let dead = dead_pid();
-        std::fs::write(dir.path().join(format!("w.json.tmp.{dead}.0")), b"{").unwrap();
+        let tmp = dir.path().join(format!("w.json.tmp.{dead}.0"));
+        std::fs::write(&tmp, b"{").unwrap();
+        set_age(&tmp, OLD);
         let w = Wallet::open(Some(path.clone())).unwrap();
         assert!(w.available().is_empty());
         assert!(names(dir.path()).is_empty(), "{:?}", names(dir.path()));
+    }
+    #[test]
+    fn a_dead_writers_temp_file_is_removed_only_once_it_is_old() {
+        // A writer in another pid namespace (a container sharing the wallet volume) looks
+        // dead from here; its in-flight file is recent, so it is kept.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("w.json");
+        let dead = dead_pid();
+        let file = |n: u32| dir.path().join(format!("w.json.tmp.{dead}.{n}"));
+        let ages: [(u32, Option<i64>); 6] = [
+            (0, None),              // just written
+            (1, Some(9 * 60)),      // under the threshold
+            (2, Some(-3600)),       // in the future
+            (3, Some(OLD)),         // just over
+            (4, Some(86_400)),      // a day old
+            (5, Some(10 * 86_400)), // ten days old
+        ];
+        for (n, age) in ages {
+            std::fs::write(file(n), b"partial").unwrap();
+            if let Some(a) = age {
+                set_age(&file(n), a);
+            }
+        }
+        Wallet::open(Some(path.clone())).unwrap();
+        let mut expect: Vec<String> = (0..3).map(|n| format!("w.json.tmp.{dead}.{n}")).collect();
+        expect.sort();
+        assert_eq!(names(dir.path()), expect);
+        for n in 0..3 {
+            assert_eq!(std::fs::read(file(n)).unwrap(), b"partial");
+        }
+    }
+
+    #[test]
+    fn a_running_writers_temp_file_is_kept_whatever_its_age() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("w.json");
+        let live = std::process::id();
+        let mut expect = Vec::new();
+        for (n, age) in [(0u32, 0i64), (1, OLD), (2, 10 * 86_400), (3, -3600)] {
+            let name = format!("w.json.tmp.{live}.{n}");
+            std::fs::write(dir.path().join(&name), b"partial").unwrap();
+            set_age(&dir.path().join(&name), age);
+            expect.push(name);
+        }
+        Wallet::open(Some(path.clone())).unwrap();
+        expect.sort();
+        assert_eq!(names(dir.path()), expect);
+    }
+
+    #[test]
+    fn an_in_flight_write_of_another_namespace_survives_an_open_and_completes() {
+        // The other writer's file, under a pid no process here has, just written.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("w.json");
+        let tmp = dir.path().join(format!("w.json.tmp.{}.0", dead_pid()));
+        let mut other = Wallet::default();
+        other.add(coin(7, 70));
+        std::fs::write(&tmp, serde_json::to_vec(&other).unwrap()).unwrap();
+        // This process opens the same wallet meanwhile.
+        Wallet::open(Some(path.clone())).unwrap();
+        // The other writer's rename still finds its file.
+        std::fs::rename(&tmp, &path).unwrap();
+        let w = Wallet::open(Some(path.clone())).unwrap();
+        assert_eq!(w.available(), vec![coin(7, 70)]);
+    }
+    #[test]
+    fn the_age_threshold_is_ten_minutes_and_a_future_mtime_is_never_stale() {
+        let now = SystemTime::now();
+        let ago = |s: u64| now - Duration::from_secs(s);
+        assert!(!is_stale(now, now));
+        assert!(!is_stale(ago(599), now));
+        assert!(is_stale(ago(600), now));
+        assert!(is_stale(ago(86_400), now));
+        assert!(!is_stale(now + Duration::from_secs(3600), now));
     }
 }
