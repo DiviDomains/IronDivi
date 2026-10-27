@@ -40,12 +40,13 @@ reaches 2023-08-23 (`divi/src/ForkActivation.cpp:31`, `:47-57`), and then `FillB
 So the payments are made by divid C's blocks, to C's masternodes and to I's.
 
 Two more things keep both masternodes paid:
-- **The silver collaterals are locked** (`lockunspent false`) on their controllers when the payment phase starts. A
+- **The silver collaterals are locked** (`lockunspent false`) on their controllers when the payment phase starts
+  (with `MN_LIFE_PAYMENTS=1` too). A
   controller locks its collaterals from masternode.conf when it starts (`divi/src/init.cpp:1246-1258`), and C and I
   have none. Unlocked, a collateral is a coin to stake like any other (`divi/src/wallet.cpp:1433-1462`). A masternode
   is paid to its collateral's address, so a stake from one of its rewards adds the collateral too, as coins of the
   same script are combined (`divi/src/PoSTransactionCreator.cpp:172-209`). That ends the masternode: in earlier runs
-  irondivid I did it to mni2, and divid C likely did it to mnc2, which was then never paid. The controller restarts
+  irondivid I did it to mni2, and divid C to mnc2, which was then never paid. The controller restarts
   drop locks, so the locks are made after them.
 - **The phase mines on past 20 blocks,** up to 40 and short of the treasury block (a height that is a multiple of 50),
   until a block has paid each controller's masternode. If one is still not paid, C's masternode list is printed.
@@ -77,11 +78,18 @@ masternode paid). The categories each case shows are printed with `#`.
 ## Votes after a collateral is spent
 
 Divi Core checks a masternode at most every five seconds unless it takes a ping (`MASTERNODE_CHECK_SECONDS`,
-`divi/src/masternodeman.cpp:153-180`, `:364-367`). So for up to five seconds after a collateral is spent, divid still
-takes and relays that masternode's payment votes. irondivid before fix/mn-reward checked the collateral on every vote
-and refused them ("masternode is not active", "payee not in the top of the payment queue"), so
-`getmasternodewinners 20` lost a vote for good. When such a row fails, the script prints the entries that differ
-and the reasons irondivid's debug.log gives for each vote it did not take.
+`divi/src/masternodeman.cpp:153-180`, `:364-367`); irondivid checks the collateral on every vote. A vote for a
+masternode whose collateral a block has just spent is therefore taken by a divid whose last check of it is under five
+seconds old, and refused by one whose check is older and by irondivid. Which it is depends on what else each node did
+in the second before the block:
+- with `-manual_fork`, divid works out the masternode payee for each block and so has just checked: C took such a vote
+  that irondivid refused;
+- without it, as on every network, C and the four divid masternode nodes refused one, as irondivid did.
+
+A five-second check in irondivid was tried and dropped: on mn-life's payment phase it made irondivid take votes every
+divid refused. The race comes only from a staked collateral, so the payment phase locks the collaterals (above), and a
+`getmasternodewinners` row that still fails prints the entries that differ and the reasons irondivid's debug.log gives
+for each vote it did not take.
 
 ## KNOWN differences
 

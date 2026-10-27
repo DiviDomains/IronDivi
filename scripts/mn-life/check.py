@@ -629,7 +629,13 @@ if PAYMENTS:
     # stakes again (wallet.cpp:1452-1457), so I gets twelve coins of its own,
     # each to a new address, well before they are needed. The silver
     # collaterals are locked, so neither is staked and both masternodes stay
-    # to vote (locked coins are not available, AvailableUtxoCalculator.cpp:91)
+    # to vote (locked coins are not available, AvailableUtxoCalculator.cpp:91).
+    # C and I have no masternode.conf to lock them when they start
+    # (init.cpp:1246-1258), and a collateral would be staked with its
+    # masternode's rewards, which share its script (PoSTransactionCreator.cpp
+    # :172-209); a vote for it within a second of that block is taken or
+    # refused by each node as its last check of the masternode is under 5 s
+    # old or not (masternodeman.cpp:153-180): a race, not a rule
     for alias in ("mnc2", "mni2"):
         d = mn[alias]
         need(d["controller"].call("lockunspent", False, [{"txid": d["txhash"], "vout": d["vout"]}]) == ("ok", True),
@@ -674,16 +680,6 @@ if PAYMENTS:
     views_by = {C.name: [], I.name: []}
     paid = []  # (height, miner, masternode payments) of each block
     paid_owners = lambda: {mn[a]["controller"].name for _, _, p in paid for a, _ in p}
-    if REWARDS:
-        # A controller locks its collaterals from masternode.conf when it
-        # starts (init.cpp:1246-1258); C and I have none, so both would stake
-        # a collateral with its masternode's rewards, which share its script
-        # (PoSTransactionCreator.cpp:172-209), and end the masternode before
-        # each is paid. Locked here, after the restarts, which drop locks
-        for alias in ("mnc2", "mni2"):
-            d = mn[alias]
-            out = d["controller"].call("lockunspent", False, [{"txid": d["txhash"], "vout": d["vout"]}])
-            need(out == ("ok", True), f"lockunspent of {alias}'s collateral: {show(out)}")
     by_txhash = {mn[a]["txhash"]: a for a in mn}
     for n in (C, I):
         info(f"masternodes on {n.name} before the payments: " + json.dumps(
