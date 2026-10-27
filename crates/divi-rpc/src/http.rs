@@ -121,8 +121,19 @@ pub fn connection_header(status: StatusCode, keep: bool) -> HeaderValue {
     })
 }
 
-/// The requests Divi Core serves at all: GET or POST (any other method closes
-/// the connection unanswered, rpcprotocol.cpp:150-152)
+/// What Divi Core answers a request it does not read: nothing, the connection
+/// closed (ReadHTTPRequestLine fails and ServiceConnection ends,
+/// rpcprotocol.cpp:150-157, rpcserver.cpp:1009-1010). The connection writes
+/// nothing ([`RawReply`]); a caller of the router sees a 400 with no body.
+pub fn no_reply() -> Response<Body> {
+    let mut res = Response::new(Body::empty());
+    *res.status_mut() = StatusCode::BAD_REQUEST;
+    res.extensions_mut().insert(RawReply(None));
+    res
+}
+
+/// The requests Divi Core serves at all: GET or POST, as written (any other
+/// method closes the connection unanswered, rpcprotocol.cpp:150-152)
 pub fn method_served(method: &Method) -> bool {
     method == Method::GET || method == Method::POST
 }

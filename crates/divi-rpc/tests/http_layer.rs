@@ -254,9 +254,39 @@ fn methods_and_paths_as_divid() {
         assert_eq!(r.header("connection"), Some("close"));
         assert_eq!(r.body, "Not Found");
     }
-    let r = one(s.addr, request("PUT", "/", Some(AUTH), GOOD, ""));
-    assert!(r.status_line.contains(" 405 "), "{}", r.status_line);
-    assert_eq!(r.header("connection"), Some("close"));
+}
+
+/// Any method but GET and POST, as written, closes the connection without a
+/// reply, before credentials and paths are looked at (rpcprotocol.cpp:150-152,
+/// rpcserver.cpp:1009-1010)
+#[test]
+fn other_methods_get_no_reply() {
+    let s = served();
+    for method in [
+        "PUT", "HEAD", "DELETE", "OPTIONS", "PATCH", "TRACE", "FOO", "post", "get",
+    ] {
+        for (path, auth) in [("/", Some(AUTH)), ("/", None), ("/x", Some(AUTH))] {
+            let (replies, closed) = exchange(s.addr, &[request(method, path, auth, GOOD, "")]);
+            assert!(
+                replies[0].is_none(),
+                "{method} {path}: {:?}",
+                replies[0].as_ref().map(|r| &r.status_line)
+            );
+            assert!(closed, "{method} {path}");
+        }
+    }
+    let put = String::from_utf8(request("PUT", "/", Some(AUTH), GOOD, ""))
+        .unwrap()
+        .replacen("HTTP/1.1", "HTTP/1.0", 1);
+    assert!(exchange(s.addr, &[put.into_bytes()]).0[0].is_none());
+
+    // after a reply on a kept connection too
+    let good = request("POST", "/", Some(AUTH), GOOD, "");
+    let put = request("PUT", "/", Some(AUTH), GOOD, "");
+    let (replies, closed) = exchange(s.addr, &[good, put]);
+    assert!(replies[0].is_some());
+    assert!(replies[1].is_none());
+    assert!(closed);
 }
 
 /// Every reply names the connection: kept after a 200 on HTTP/1.1, closed

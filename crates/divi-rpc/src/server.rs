@@ -2002,7 +2002,7 @@ fn build_router(
     let router = router.layer(middleware::from_fn(
         move |req: HttpRequest, next: Next| async move {
             if !crate::http::method_served(req.method()) {
-                return crate::http::error_page(StatusCode::METHOD_NOT_ALLOWED);
+                return crate::http::no_reply();
             }
             let uri = req.uri();
             let path = uri.path();

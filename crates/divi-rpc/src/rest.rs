@@ -345,7 +345,8 @@ mod tests {
             .unwrap_or_default()
     }
 
-    /// One request with `extra` headers: (status, head, body)
+    /// One request with `extra` headers, served as the RPC server serves a
+    /// connection: (status, head, body), status 0 when no reply came
     async fn exchange(
         router: &Router,
         method: &str,
@@ -356,7 +357,12 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let app = router.clone();
-        tokio::spawn(async move { axum::serve(listener, app).await });
+        tokio::spawn(crate::server::serve_listener(
+            listener,
+            app,
+            4,
+            std::future::pending(),
+        ));
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let request = format!(
             "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\n{extra}\r\n{body}",
@@ -371,9 +377,10 @@ mod tests {
             if let Some(i) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
                 break i;
             }
-            let n = stream.read(&mut buf).await.unwrap();
-            assert!(n > 0, "connection closed before the head");
-            raw.extend_from_slice(&buf[..n]);
+            match stream.read(&mut buf).await {
+                Ok(n) if n > 0 => raw.extend_from_slice(&buf[..n]),
+                _ => return (0, String::new(), Vec::new()),
+            }
         };
         let head = String::from_utf8_lossy(&raw[..split]).to_string();
         let status = head.split_whitespace().nth(1).unwrap().parse().unwrap();
@@ -561,7 +568,7 @@ mod tests {
     }
 
     /// On the RPC port: REST without credentials and only when on, beside
-    /// integration's HTTP rules (405 for other methods, 404 for other paths);
+    /// integration's HTTP rules (no reply to other methods, 404 for other paths);
     /// a 200 keeps the connection, an error closes it, as divid
     #[tokio::test]
     async fn on_the_rpc_port_as_divid() {
@@ -592,8 +599,10 @@ mod tests {
             assert_eq!(header_of(&head, "content-type"), "text/plain");
             assert_eq!(header_of(&head, "connection"), "close");
         }
-        let (status, _, _) = exchange(&on, "PUT", &path, "", "").await;
-        assert_eq!(status, 405);
+        for router in [&on, &off] {
+            let (status, _, _) = exchange(router, "PUT", &path, "", "").await;
+            assert_eq!(status, 0, "no reply");
+        }
         // the JSON-RPC path still asks for credentials
         let (status, _, _) = exchange(&on, "POST", "/", "{}", "Connection: close\r\n").await;
         assert_eq!(status, 401);
