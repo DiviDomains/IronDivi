@@ -548,6 +548,12 @@ pub struct Chain {
     /// mostWorkInvalidBlockIndex, BlockCheckingHelpers.cpp:364-381); None
     /// until the stored blocks are first looked through
     most_work_invalid: RwLock<Option<Option<BlockIndex>>>,
+    /// Blocks found to descend from a failed block, which Divi Core's
+    /// FindMostWorkChain marks BLOCK_FAILED_CHILD in memory only, never
+    /// writing the mark (BlockCheckingHelpers.cpp:340-345): a restart forgets
+    /// them. A block's own failure and the blocks invalidateblock disconnects
+    /// are written (BlockInvalidationHelpers.cpp:128-136)
+    inherited_failed: RwLock<std::collections::HashSet<Hash256>>,
     /// Divi Core's fLargeWorkInvalidChainFound (Warnings.cpp:7)
     invalid_chain_found: std::sync::atomic::AtomicBool,
     /// IsInitialBlockDownload's latch: once out, never in again
@@ -639,6 +645,7 @@ impl Chain {
             script_stats: ScriptStats::default(),
             consensus_sporks: Arc::new(RwLock::new(ConsensusSporks::default())),
             most_work_invalid: RwLock::new(None),
+            inherited_failed: RwLock::new(std::collections::HashSet::new()),
             invalid_chain_found: std::sync::atomic::AtomicBool::new(false),
             left_initial_download: std::sync::atomic::AtomicBool::new(false),
             fork_warning_listeners: RwLock::new(Vec::new()),
@@ -1882,7 +1889,7 @@ impl Chain {
             // CBlockIndex::IsValid(BLOCK_VALID_SCRIPTS): never a block that
             // failed, as one invalidateblock marks (chain.h:313-319)
             if !(index.status.contains(BlockStatus::VALID_SCRIPTS)
-                && !index.failed()
+                && !self.is_failed(&index)
                 && best_header_height > 0
                 && within_depth)
             {
@@ -1941,7 +1948,7 @@ impl Chain {
             let mut failed = false;
             let mut missing_data = false;
             while !active && !on_active(cur)? {
-                failed |= cur.status.contains(BlockStatus::FAILED);
+                failed |= self.is_failed(cur);
                 missing_data |= !cur.status.contains(BlockStatus::HAVE_DATA)
                     && !cur.status.contains(BlockStatus::VALID_SCRIPTS);
                 match by_hash.get(&cur.prev_hash) {
@@ -2322,7 +2329,7 @@ impl Chain {
         if let Some(existing_index) = self.db.get_block_index(&hash)? {
             // Divi Core AcceptBlockHeader (ChainExtensionService.cpp): a known
             // block marked failed is rejected, never re-evaluated.
-            if existing_index.failed() {
+            if self.is_failed(&existing_index) {
                 return Err(StorageError::invalid_block_scored(
                     0,
                     format!("block {} is marked invalid", hash),
@@ -2380,7 +2387,7 @@ impl Chain {
         // 5a. Divi Core AcceptBlock / AcceptBlockHeader (ChainExtensionService.cpp):
         // a block whose parent is marked failed is rejected and not stored.
         if let Some(ref parent) = parent_index {
-            if parent.failed() {
+            if self.is_failed(parent) {
                 return Err(StorageError::InvalidBlock(format!(
                     "bad-prevblk: prev block {} at height {} is invalid, unable to add block {}",
                     parent.hash, parent.height, hash
@@ -2938,13 +2945,14 @@ impl Chain {
                 // Divi Core ChainTipManager::connectTip -> InvalidBlockFound:
                 // a block that is invalid (not merely unreadable) is marked
                 // BLOCK_FAILED_VALID, and FindMostWorkChain marks its
-                // descendants BLOCK_FAILED_CHILD, so the chain is never
-                // selected again. Here the descendants on the path to the
-                // reorg target are exactly the rest of blocks_to_connect.
+                // descendants BLOCK_FAILED_CHILD in memory, so the chain is
+                // never selected again. Here the descendants on the path to
+                // the reorg target are exactly the rest of blocks_to_connect.
                 let invalid = Self::is_consensus_invalid(&e);
                 if invalid {
-                    for (_, failed) in &blocks_to_connect[i..] {
-                        self.mark_block_failed(&failed.hash)?;
+                    self.mark_block_failed(&index.hash)?;
+                    for (_, failed) in &blocks_to_connect[i + 1..] {
+                        self.mark_inherited_failed(&failed.hash);
                     }
                     // Divi Core connects 32 heights at a time; the batch's
                     // lowest block and the tip reached are what it reports
@@ -3015,6 +3023,16 @@ impl Chain {
     }
 
     /// Persist the FAILED status on a stored block index.
+    /// Whether a block is marked failed, on disk or in memory
+    fn is_failed(&self, index: &BlockIndex) -> bool {
+        index.failed() || self.inherited_failed.read().contains(&index.hash)
+    }
+
+    /// Mark a block failed because a block under it is, in memory only
+    fn mark_inherited_failed(&self, hash: &Hash256) {
+        self.inherited_failed.write().insert(*hash);
+    }
+
     fn mark_block_failed(&self, hash: &Hash256) -> Result<(), StorageError> {
         if let Some(mut index) = self.db.get_block_index(hash)? {
             if !index.failed() {
@@ -3027,15 +3045,15 @@ impl Chain {
 
     /// Whether `candidate` or any ancestor of it off the active chain is
     /// marked failed. Blocks between the candidate and the failed ancestor are
-    /// marked failed too, as Divi Core's FindMostWorkChain does with
-    /// BLOCK_FAILED_CHILD (BlockCheckingHelpers.cpp).
+    /// marked failed too, in memory, as Divi Core's FindMostWorkChain does
+    /// with BLOCK_FAILED_CHILD (BlockCheckingHelpers.cpp:340-345).
     fn has_failed_ancestor(&self, candidate: &BlockIndex) -> Result<bool, StorageError> {
         let mut walked: Vec<Hash256> = Vec::new();
         let mut current = self.db.get_block_index(&candidate.hash)?;
         while let Some(index) = current {
-            if index.failed() {
+            if self.is_failed(&index) {
                 for hash in &walked {
-                    self.mark_block_failed(hash)?;
+                    self.mark_inherited_failed(hash);
                 }
                 return Ok(true);
             }
@@ -3351,6 +3369,12 @@ impl Chain {
                 walk = by_hash.get(&w.prev_hash).cloned();
             }
         }
+        {
+            let mut inherited = self.inherited_failed.write();
+            for h in &to_clear {
+                inherited.remove(h);
+            }
+        }
         for h in to_clear {
             if let Some(mut i) = by_hash.get(&h).cloned() {
                 if i.failed() {
@@ -3370,7 +3394,7 @@ impl Chain {
             .db
             .iter_all_block_indexes()?
             .into_iter()
-            .filter(|i| !i.failed() && i.status.contains(BlockStatus::HAVE_DATA))
+            .filter(|i| !self.is_failed(i) && i.status.contains(BlockStatus::HAVE_DATA))
             .collect();
         candidates.sort_by(|a, b| Self::compare_chain_work(&b.chain_work, &a.chain_work));
         for cand in candidates {
@@ -4506,7 +4530,7 @@ impl Chain {
     fn update_best_known_block(&self, index: &BlockIndex) {
         // A block known to be invalid is never a candidate (Divi Core keeps
         // BLOCK_FAILED_MASK blocks out of setBlockIndexCandidates).
-        if index.failed() {
+        if self.is_failed(index) {
             return;
         }
         let mut best = self.best_known_block.write();
@@ -7364,8 +7388,8 @@ mod tests {
             "B2 failed to connect and must be marked invalid"
         );
         assert!(
-            idx_b3.failed(),
-            "B3 descends from B2 and must be marked invalid"
+            chain.is_failed(&idx_b3) && !idx_b3.failed(),
+            "B3 descends from B2 and must be marked invalid, in memory only"
         );
 
         // Re-receiving a failed block is rejected and does not retry the reorg.
@@ -8833,6 +8857,69 @@ mod tests {
         assert_eq!(tips[1].hash, hash_a2);
         assert_eq!(tips[1].branch_len, 2);
         assert_eq!(tips[1].status, ChainTipStatus::ValidFork);
+    }
+
+    /// A side branch found to sit above an invalidated block is marked failed
+    /// in memory only, as Divi Core's FindMostWorkChain marks it
+    /// BLOCK_FAILED_CHILD without writing it (BlockCheckingHelpers.cpp:344).
+    /// Once the invalidated block is reconsidered through the other branch,
+    /// the side branch stays out until a restart, then is a valid branch
+    /// again and can be extended (it was kept failed on disk for good).
+    #[test]
+    fn test_inherited_failure_is_forgotten_at_restart() {
+        let dir = tempdir().unwrap();
+        let params = ChainParams::for_network(NetworkType::Regtest, ChainMode::Divi);
+        let (hash_a4, hash_s3, s3);
+        {
+            let db = Arc::new(ChainDatabase::open(dir.path()).unwrap());
+            let chain = Chain::new(db, params.clone()).unwrap();
+            let (genesis_hash, genesis_time) = get_genesis_info(&chain);
+            let c1 = create_child_block_with_pubkey(genesis_hash, genesis_time, [0x01; 20]);
+            let hash_c1 = chain.accept_block(c1.clone()).unwrap().hash;
+            let c2 = create_child_block_with_pubkey(hash_c1, c1.header.time, [0x02; 20]);
+            let hash_c2 = chain.accept_block(c2.clone()).unwrap().hash;
+            let a3 = create_child_block_with_pubkey(hash_c2, c2.header.time, [0x0a; 20]);
+            let hash_a3 = chain.accept_block(a3.clone()).unwrap().hash;
+            // The stale block: same work as A3, arrives later
+            s3 = create_child_block_with_pubkey(hash_c2, c2.header.time + 1, [0x1a; 20]);
+            hash_s3 = chain.accept_block(s3.clone()).unwrap().hash;
+            let a4 = create_child_block_with_pubkey(hash_a3, a3.header.time, [0x0b; 20]);
+            hash_a4 = chain.accept_block(a4).unwrap().hash;
+            assert_eq!(chain.tip().unwrap().hash, hash_a4);
+
+            // Below the fork: S3 has more work than C1 and is looked at, and
+            // found to sit above the failed C2
+            chain.invalidate_block(&hash_c2).unwrap();
+            assert_eq!(chain.tip().unwrap().hash, hash_c1);
+            // Reconsidering A4 clears its ancestors, C2 among them, not S3
+            chain.reconsider_block(&hash_a4).unwrap();
+            assert_eq!(chain.tip().unwrap().hash, hash_a4);
+            let tips = chain.get_chain_tips().unwrap();
+            let s3_tip = tips.iter().find(|t| t.hash == hash_s3).unwrap();
+            assert_eq!(
+                s3_tip.status,
+                ChainTipStatus::Invalid,
+                "as divid until it restarts"
+            );
+        }
+
+        let db = Arc::new(ChainDatabase::open(dir.path()).unwrap());
+        let chain = Chain::new(db, params).unwrap();
+        assert_eq!(chain.tip().unwrap().hash, hash_a4);
+        let tips = chain.get_chain_tips().unwrap();
+        let s3_tip = tips.iter().find(|t| t.hash == hash_s3).unwrap();
+        // Never connected, so valid-headers as divid shows it
+        assert_eq!(
+            (s3_tip.status, s3_tip.branch_len),
+            (ChainTipStatus::ValidHeaders, 1),
+            "nothing under S3 is invalid: {tips:?}"
+        );
+        // The branch can be extended and win again
+        let s4 = create_child_block_with_pubkey(hash_s3, s3.header.time, [0x1b; 20]);
+        let hash_s4 = chain.accept_block(s4.clone()).unwrap().hash;
+        let s5 = create_child_block_with_pubkey(hash_s4, s4.header.time, [0x1c; 20]);
+        let hash_s5 = chain.accept_block(s5).unwrap().hash;
+        assert_eq!(chain.tip().unwrap().hash, hash_s5);
     }
 
     /// invalidateblock on an active block rolls the tip back to its parent
