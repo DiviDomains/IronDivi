@@ -798,6 +798,13 @@ EXPLAINED = {
         "divid's removeCoinbaseSpends drops with their descendants (txmempool.cpp:139-157, :91-126); the other "
         "side had spent an older coin of the same value (divid's coin choice among equal coins is by txid order); "
         "reconsiderblock confirms them again, so the end states agree"),
+    "divid balance cache in the middle of a reorg": (
+        "only the middle of the invalidate differs, in the immature balance, and the end states agree: both sides "
+        "lost as many transactions while the tip was lowered (spends of coins immature at that height, "
+        "removeCoinbaseSpends, txmempool.cpp:139-157), and divid's immature balance is below irondivid's by just the "
+        "immature coins those spent; divid's wallet still counts a coin spent while its spender is out of the mempool "
+        "but not in conflict (IsSpent with depth 0, UtxoBalanceCalculator.cpp:16-30, cached by "
+        "CachedUtxoBalanceCalculator.cpp:13-30), irondivid's counts it again"),
     "maturity after a reorg": (
         "after invalidateblock the dropped mempool transactions all spend a coinbase or coinstake "
         "output that is immature at the new height, which divid's removeCoinbaseSpends drops too "
@@ -1063,6 +1070,39 @@ def mid_maturity_explains(n, diff):
         lost_values.append(len(values))
     log(f"#   mid maturity rule: lost {lost_values}")
     return lost_values[0] != lost_values[1]
+
+
+def mid_balance_cache_explains(n, c_mid, i_mid, diff):
+    """Only the middle's immature balance differs (the end states agree), each
+    side lost as many transactions while its tip was lowered, and divid's is
+    below irondivid's by just the immature coins of node n's wallet its lost
+    transactions spent: divid's wallet still counts a coin spent while its
+    spender is out of the mempool but not in conflict (IsSpent with depth 0,
+    UtxoBalanceCalculator.cpp:16-30), irondivid's counts it again"""
+    key = "immature balance"
+    if list(diff) != ["after invalidateblock: " + key] or c_mid.get(key) is None or i_mid.get(key) is None:
+        return False
+    counts, spent = [], 0
+    for pair in PAIRS:
+        reorg = pair.reorg
+        if reorg is None or reorg["mid_pool"] is None:
+            return False
+        lost = (set(reorg["block_txs"]) | set(pair.pool_before)) - reorg["mid_pool"]
+        counts.append(len(lost))
+        if pair is not PAIRS[0]:
+            continue
+        for txid in lost:
+            inputs = pair.pool_before.get(txid) or wallet_inputs(pair, txid)
+            for prev_txid, vout in inputs or []:
+                if not spends_immature(pair, None, txid, reorg["mid"] + 1, [(prev_txid, vout)]):
+                    continue
+                prev = pair.node(n).call("gettransaction", prev_txid)
+                decoded = pair.node(n).call("decoderawtransaction", prev[1]["hex"]) if prev[0] == "ok" else prev
+                if decoded[0] == "ok":
+                    spent += round(float(decoded[1]["vout"][vout]["value"]) * 1e8)
+    gap = round(float(i_mid[key]) * 1e8) - round(float(c_mid[key]) * 1e8)
+    log(f"#   mid balance cache rule: lost {counts}, divid below by {gap / 1e8}, immature coins spent {spent / 1e8}")
+    return counts[0] == counts[1] and spent > 0 and gap == spent
 
 
 def parent_spends_immature(pair, holder, txid, mid, next_height, inputs=None):
@@ -1346,6 +1386,9 @@ for step in steps:
             explained = "maturity window"
         elif step["kind"] == "invalidate" and mid_maturity_explains(n, diff):
             explained = "maturity in the middle of a reorg"
+        elif step["kind"] == "invalidate" and c_res[1] and i_res[1] \
+                and mid_balance_cache_explains(n, c_res[1], i_res[1], diff):
+            explained = "divid balance cache in the middle of a reorg"
         elif step["kind"] == "kill" and PAIRS[0].note:
             explained = "divid reindex after a kill"
         elif step["kind"] == "kill" and (
@@ -1368,7 +1411,8 @@ for step in steps:
     if diff and (explained or known):
         log(f"KNOWN  {line}  {explained or ''}  [{EXPLAINED[explained] if explained else known}]")
         # the end states agree after a maturity window: the run goes on
-        if explained not in ("maturity window", "maturity in the middle of a reorg"):
+        if explained not in ("maturity window", "maturity in the middle of a reorg",
+                             "divid balance cache in the middle of a reorg"):
             new_episode()
             episode_steps = []
         continue

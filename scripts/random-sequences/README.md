@@ -194,6 +194,14 @@ episode) and the remaining steps, so every comparison stays exact:
   disconnected transaction that does. divid drops these with their descendants (`txmempool.cpp:139-157`, `:91-126`),
   and `reconsiderblock` confirms them again. The other side had spent an older coin of the same value. The run goes
   on without a new episode.
+- **divid balance cache in the middle of a reorg:** only the middle of an `invalidate` differs, in the immature
+  balance alone, and the end states agree. Both sides lost as many transactions while the tip was lowered (spends of
+  coins immature at that height, `removeCoinbaseSpends`), and divid's immature balance is below irondivid's by just
+  the immature coins of node n's wallet that those spent. divid's wallet still counts a coin spent while its spender is
+  out of the mempool but not in conflict (`IsSpent` with depth 0, `UtxoBalanceCalculator.cpp:16-30`, cached by
+  `CachedUtxoBalanceCalculator.cpp:13-30`), and irondivid's counts it again, as with **divid balance cache**. It showed
+  once irondivid's coinbases matched divid's (see "Fixed rows"): the two sides then drop the same send. The run goes on
+  without a new episode.
 - **divid reindex after a kill:** see below. divid's reindex runs on a thread of its own (`init.cpp:1580`), while
   its wallet's unconfirmed transactions are offered to the mempool at the end of the start (`init.cpp:1646`), before
   the chain is rebuilt. So they are refused, and divid's wallet counts their inputs unspent.
