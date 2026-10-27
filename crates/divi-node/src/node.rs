@@ -2170,9 +2170,8 @@ impl Node {
                                 if known.contains(&alert.hash()) {
                                     continue;
                                 }
-                                let now = std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .map_or(0, |d| d.as_secs() as i64);
+                                // GetAdjustedTime (alert.cpp:104)
+                                let now = divi_primitives::clock::adjusted_now();
                                 if alert.is_acceptable(key, now) {
                                     known.insert(alert.hash());
                                 } else {
@@ -2346,10 +2345,9 @@ impl Node {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
             loop {
                 interval.tick().await;
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0);
+                // GetTime: the node's clock, which setmocktime sets
+                // (main.cpp:1284-1291)
+                let now = divi_primitives::clock::now();
                 let current = chain_for_rebroadcast.tip().map(|t| t.hash);
                 if current != tip {
                     tip = current;
