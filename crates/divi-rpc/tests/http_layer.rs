@@ -256,6 +256,25 @@ fn methods_and_paths_as_divid() {
     }
 }
 
+/// A request target that is not a path closes the connection without a reply
+/// (rpcprotocol.cpp:155-157)
+#[test]
+fn a_target_that_is_not_a_path_gets_no_reply() {
+    let s = served();
+    let absolute = format!("http://{}/", s.addr);
+    for target in [absolute.as_str(), "*"] {
+        for auth in [Some(AUTH), None] {
+            let (replies, closed) = exchange(s.addr, &[request("POST", target, auth, GOOD, "")]);
+            assert!(
+                replies[0].is_none(),
+                "{target}: {:?}",
+                replies[0].as_ref().map(|r| &r.status_line)
+            );
+            assert!(closed, "{target}");
+        }
+    }
+}
+
 /// Any method but GET and POST, as written, closes the connection without a
 /// reply, before credentials and paths are looked at (rpcprotocol.cpp:150-152,
 /// rpcserver.cpp:1009-1010)

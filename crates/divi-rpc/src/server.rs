@@ -2005,6 +2005,11 @@ fn build_router(
                 return crate::http::no_reply();
             }
             let uri = req.uri();
+            // The target must be a path: an absolute URI, an authority or
+            // "*" closes the connection unanswered too (rpcprotocol.cpp:155-157)
+            if uri.scheme().is_some() || uri.authority().is_some() || !uri.path().starts_with('/') {
+                return crate::http::no_reply();
+            }
             let path = uri.path();
             let rpc_path = path == "/"
                 || path
