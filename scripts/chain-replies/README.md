@@ -38,8 +38,8 @@ are stopped and their directories deleted.
 ## Nodes and steps
 
 divid listens and irondivid dials it (`connect=`), so both see one chain, and both wallets own the same keys. Both run
-with `staking=0` and `txindex=1`. divid runs with `acceptnonstandard=1`, so it takes the version-2 transaction;
-irondivid gets that transaction in a block.
+with `staking=0`, `txindex=1` and `acceptnonstandard=1`. With it divid takes the version-2 transaction (irondivid
+gets it in a block), and both answer an unsigned spend from the script check.
 
 1. divid mines 40 blocks.
 2. A block with: a send, a `fundvault` vault funding, and two funding sends. One of them (`sendmany`) also pays an
@@ -112,15 +112,6 @@ ones (`<call>: fields divid lacks` rows).
 
 - `getblock <hash> 1`: irondivid takes verbosity 0, 1 or 2, as Bitcoin Core does (2: the transactions decoded).
   divid reads a bool (`rpcblockchain.cpp:216`).
-
-**Open, not closed yet.** These are listed so the run stays usable. A fix turns the row into a FAIL until it is
-taken out here and in `KNOWN` in `check.py`.
-
-- `sendrawtransaction` of an unsigned spend: irondivid answers -25 `""`, divid -26
-  `"16: mandatory-script-verify-flag-failed (...)"`.
-  - **Cause:** divid runs here with `acceptnonstandard=1`, which skips its input standardness check
-    (`MempoolConsensus.cpp:274`, `:362-364`), so its script check answers. irondivid has no `-acceptnonstandard`.
-  - Without the option divid answers -25 `""` too (the `unsigned` row of `scripts/reject-replies`).
 
 ## Proving a difference is caught
 

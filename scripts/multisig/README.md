@@ -79,10 +79,6 @@ Core paths are under `divi/src/` of the Divi Core source at v3.0.0 (commit 9e2f7
   `scripts/wallet-replies`); the entries are compared without them.
 - `decodescript: fields divid lacks`: irondivid's `hex`, the script given (as in `scripts/raw-replies` and
   `chain-replies`; divid's decodescript calls ScriptPubKeyToJSON without it, rpcrawtransaction.cpp:556-563).
-- `importaddress of the redeemScript hex (w0)`: irondivid watches P2PKH and P2SH scripts only (its watch list is kept
-  by address) and refuses another script with -4; divid watches any script (rpcdump.cpp:122-148). A watched script
-  never brings a transaction into divid's wallet (wallet.cpp:1299-1309 adds only what credits or debits a spendable
-  output), so the reply is the only difference.
 
 No other row differs from divid.
 

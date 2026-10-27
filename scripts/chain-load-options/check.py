@@ -69,9 +69,6 @@ def checklevel_shape(c, i):
     return m is not None and i == ("ok", f"exit 1 {m.group(1)}")
 
 
-PAR = ("divid starts that many script-check threads (TransactionInputChecker.cpp:16-26, init.cpp:801, capped at "
-       "16, defaultValues.h:76) and logs nothing; irondivid checks scripts on the thread that checks the block and "
-       "has no such threads, so it names -par as not supported (docs/divid-differences.md S2)")
 REINDEX_FILE = ("divid reads its blocks again from each blocks/blk?????.dat and names each file (init.cpp:675); "
                 "irondivid keeps its blocks in its chain database, with no blk files (scripts/restart-state: file "
                 "blocks/), and builds its indexes again from it, so it names no file")
@@ -86,9 +83,6 @@ def without_file_lines(c, i):
 
 KNOWN = {f"-checklevel={v}: start": (CHECKLEVEL, checklevel_shape) for v in range(5)}
 KNOWN["-reindex with -loadblock: log lines"] = (REINDEX_FILE, without_file_lines)
-for _v in ("0", "-1", "-100", "16", "17", "abc"):
-    KNOWN[f"-par={_v}: log lines naming -par"] = (
-        PAR, pair(("ok", []), ("ok", ["WARNING: Option -par is not supported by irondivid; ignored"])))
 for _o in ("prune", "blocksonly", "stopatheight", "assumevalid"):
     KNOWN[f"-loadblock with -{_o}: log lines naming -{_o}"] = unknown_line(_o)
     KNOWN[f"-{_o} on a node with the chain: log lines naming -{_o}"] = unknown_line(_o)

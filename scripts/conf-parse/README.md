@@ -84,7 +84,7 @@ parser. Then:
 | `datadir=` | `-conf=<absolute path>`, no `-datadir`, `datadir=<folder>` in the file | the chain is written in that folder (`ClearDatadirCache`, `:203-204`) |
 | `regtest=1` | `regtest=1` in the file, not on the command line | chain `regtest` |
 | a very long line | `nosuchoption=` and 200,000 characters | starts; the next line is read |
-| `-conf=<a directory>` | no file, `-conf=<the data directory>`, with `-server=0` (there is no password) | see KNOWN |
+| `-conf=<a directory>` | no file, `-conf=<the data directory>`, with `-server=0` (there is no password) | runs with no config file: divid opens the directory as a stream that reports no error and has no lines (`divi/src/Settings.cpp:186-195`) |
 
 Covered by `scripts/start-errors`, so not repeated here: a line with no `=`, `-conf=<a missing file>`, an unreadable
 `divi.conf`, and the start (not the values) for comments, spaces, sections, repeated keys and the command line over
@@ -94,10 +94,6 @@ the file.
 
 Core paths are under `divi/src/` of the Divi Core source at v3.0.0 (commit 9e2f76c). Each KNOWN row checks that the
 difference is exactly this one; any other outcome is a FAIL.
-
-- **`-conf=<a directory>`:** divid opens the directory as a stream. On Linux the stream reports no error but has no
-  lines, so divid runs without a config file: `ReadConfigFile` takes only a stream that is not `good()` as missing
-  (`divi/src/Settings.cpp:186-195`). That is accidental. irondivid says it cannot read the file and stops.
 
 - **A quoted value** (two rows): the same `Error:` line on both. divid then aborts (SIGABRT, exit -6): the shutdown
   after this early `InitError` flushes the chain state (`divi/src/init.cpp:381`), and `ChainstateManager::Get`

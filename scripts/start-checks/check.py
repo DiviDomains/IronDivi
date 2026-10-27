@@ -52,9 +52,6 @@ LEVEL = ("irondivid's start check reads each block, its hash, merkle root and pa
 CHECKLEVEL = ("same message; divid then aborts (SIGABRT) in the shutdown after this early InitError, before the "
               "chain state exists (init.cpp:381, ChainstateManager.cpp:102); irondivid exits 1 (also KNOWN in "
               "scripts/restart-options)")
-PAR = ("-par sets divid's script check threads (init.cpp:801, TransactionInputChecker.cpp:16-26) and it logs "
-       "the count (init.cpp:965); irondivid checks scripts on the block's own thread, accepts -par and logs that "
-       "it is not used. What is accepted is the same: the row above checks a block still connects")
 
 
 def checklevel_shape(c, i):
@@ -62,18 +59,11 @@ def checklevel_shape(c, i):
             and c[1][2] == i[1][2])
 
 
-def par_shape(c, i):
-    return (c[0] == i[0] == "ok" and len(c[1]["threads line"]) == 1 and not c[1]["not supported"]
-            and i[1] == {"threads line": [], "not supported": True})
-
-
 KNOWN = {
     "the log's 'No coin database inconsistencies' line (undamaged, default)": (LEVEL, pair(("ok", True), ("ok", False))),
 }
 for v in ("4", "3", "0"):
     KNOWN[f"an undamaged copy, -checklevel={v}"] = (CHECKLEVEL, checklevel_shape)
-for v in ("0", "1", "-1", "17"):
-    KNOWN[f"-par={v}: the log"] = (PAR, par_shape)
 
 fails = 0
 counts = {"PASS": 0, "KNOWN": 0, "FAIL": 0}

@@ -75,8 +75,7 @@ By design:
 
 - `getpeerinfo` `subver`, `getnetworkinfo` `subversion`: irondivid names itself (`/IronDivi:<version>/`); divid
   gives `DIVI Core: 3.0.0.0`.
-- `getnetworkinfo`: irondivid adds `connections_in` and `connections_out`; it shows `onion` as `limited`, since it
-  cannot address .onion peers; its `version` is irondivid's own, where divid gives `3.0.0.0` (`rpcnet.cpp:369`;
+- `getnetworkinfo`: irondivid adds `connections_in` and `connections_out`; its `version` is irondivid's own, where divid gives `3.0.0.0` (`rpcnet.cpp:369`;
   `docs/divid-differences.md` R5).
 - `getmasternodecount`: irondivid adds the tier counts `copper`, `silver`, `gold`, `platinum`, `diamond`.
 - `listbanned`: divid gives `{"banned:": "[\n<ip>,\n]"}`, one text under a key with a colon (`rpcmisc.cpp:1023-1030`,
@@ -94,8 +93,6 @@ Open (not closed yet):
   `NetworkLocalAddressHelpers.cpp:224-227`); irondivid does not serve bloom filters and gives 1.
 - `getpeerinfo` `synced_headers`, `synced_blocks`: irondivid gives -1; divid the heights it has synced with the peer
   (`rpcnet.cpp:139-140`).
-- `getaddednodeinfo` of a node given without a port: divid keeps the node as written (`192.0.2.3`); irondivid keeps
-  the address, with the network's port (`192.0.2.3:51476`).
 
 ## Proving a difference is caught
 

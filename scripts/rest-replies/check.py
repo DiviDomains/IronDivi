@@ -6,7 +6,7 @@ Both nodes sit on one regtest chain (irondivid dials divid) with -rest=1 and
 /rest/block/notxdetails/) is asked in each format (.json, .hex, .bin) and with
 each error divid answers, plus the paths divid does not serve, without any
 credentials (divid's REST needs none). Then both restart with -rest=0 and the
-paths are asked again. ZMQ topics are listed as KNOWN rows (README.md).
+paths are asked again. ZMQ topics are compared by scripts/zmq-replies.
 
 Each row prints PASS (same as divid), KNOWN (a difference listed in README.md)
 or FAIL. Exit code = FAILs. Started by run.sh, which owns the work directory and
@@ -38,11 +38,9 @@ DUMP = os.environ.get("REST_REPLIES_DUMP", "")
 RPC_TIMEOUT = 60
 START_TIMEOUT = 120
 
-ZMQ_REASON = ("irondivid has no ZMQ publisher (-zmqpub* are unsupported options); not compared: "
-              "a ZMQ subscriber needs pyzmq, which is not in the standard library")
 # Differences irondivid has on purpose, one per row name, each listed in
 # README.md. A KNOWN row that starts to match divid is a FAIL.
-KNOWN = {f"zmq {t}": ZMQ_REASON for t in ("hashblock", "hashtx", "rawblock", "rawtx")}
+KNOWN = {}
 
 fails = 0
 
@@ -356,10 +354,6 @@ compare("rest=0: block tip .hex", f"/rest/block/{tip}.hex")
 compare("rest=0: block notxdetails tip .bin", f"/rest/block/notxdetails/{tip}.bin")
 compare("rest=0: tx unknown txid", f"/rest/tx/{unknown}.json")
 compare("rest=0: not a rest path", "/foo")
-
-# ZMQ: not compared (README.md)
-for t in ("hashblock", "hashtx", "rawblock", "rawtx"):
-    row(f"zmq {t}", "topic published with -zmqpub" + t, "no such option", False)
 
 for n in (C, I):
     n.stop()

@@ -61,8 +61,6 @@ KNOWN = {
         "keypoololdest, keypoolsize, paytxfee (divid: rpcmisc.cpp:136-157)",
     "getblock tip 1":
         "verbosity 0, 1 or 2 as Bitcoin Core takes it (2: transactions decoded); divid reads a bool (rpcblockchain.cpp:216)",
-    "sendrawtransaction unsigned":
-        "open: divid runs with acceptnonstandard=1 here, which skips its input standardness check, so the script check answers -26 \"16: mandatory-script-verify-flag-failed (...)\" (MempoolConsensus.cpp:274, :362-364); irondivid has no -acceptnonstandard and answers -25 \"\" as divid does without it (scripts/reject-replies, row unsigned)",
 }
 
 # Fields irondivid adds to a reply on purpose: compared without them, and named
@@ -390,7 +388,7 @@ if not C.wait_ready():
     print(f"FAIL   start: divid did not answer within {START_TIMEOUT} s", flush=True)
     sys.exit(1)
 phrase = C.rpc("dumphdinfo")["mnemonic"]
-I = Node("irondivid", IRONDIVID, 1, ["listen=0", f"connect=127.0.0.1:{PORT_BASE}"],
+I = Node("irondivid", IRONDIVID, 1, ["listen=0", f"connect=127.0.0.1:{PORT_BASE}", "acceptnonstandard=1"],
          env={"WALLET_MNEMONIC": phrase})
 del phrase
 if not I.wait_ready():

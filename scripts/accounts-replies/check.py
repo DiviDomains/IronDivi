@@ -329,14 +329,14 @@ def seen_by(node, txid):
 # --- calls divid does not have -------------------------------------------------------
 
 def absent(name, method, *params):
-    """A call divid has nowhere in its table (rpcserver.cpp:324-467): KNOWN when
+    """A call divid has nowhere in its table (rpcserver.cpp:324-467): PASS when
     irondivid refuses it as divid does, FAIL when irondivid answers"""
     global fails
     core, iron = C.call(method, *params), I.call(method, *params)
     same = core[0] == iron[0] == "err" and core[1:] == iron[1:]
     if same:
-        print(f"KNOWN  {name}  divid={short(core)}  irondivid={short(iron)}  "
-              f"[known: divid has no {method} (not in rpcserver.cpp:324-467); irondivid refuses it the same way]",
+        print(f"PASS   {name}  divid={short(core)}  irondivid={short(iron)}  "
+              f"(divid has no {method}: not in rpcserver.cpp:324-467)",
               flush=True)
     else:
         fails += 1

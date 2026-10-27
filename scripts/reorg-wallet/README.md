@@ -55,7 +55,7 @@ So a payment the new branch drops is told of three times (disconnect, mempool, c
 ## KNOWN differences
 
 By design:
-- `getcoinavailability`: irondivid adds `total_vaults` and `vaults` (`rpcwallet.cpp:818-987`); `getstakingstatus`: `staking status text`, and `mnsync` (`rpcmisc.cpp:1068`).
+- `getcoinavailability`: irondivid adds `total_vaults` and `vaults` (`rpcwallet.cpp:818-987`); `getstakingstatus`: `staking status text`. `mnsync` differs on the owners from the topology alone: divid's owner has three inbound peers, so its masternode sync can finish (`rpcmisc.cpp:1069`); irondivid's owner has one peer and stays at SPORKS (`masternode-sync.cpp:437-440`).
 - **A kill.** divid cannot be started after `kill -9`: its block index is flushed only with its state (`FlushChainState.cpp:25-52`), and after an unprepared shutdown it stops with "Block database corruption detected" (`BlockIndexLoading.cpp:262-276`); irondivid starts (`scripts/unclean-stop`). With `-reindex` divid scans from the wallet's best block, written only when it flushes (`FlushChainState.cpp:50-53`), and tells of every wallet transaction since; irondivid saves its scan height with each block and tells of the last block only. The balances, lists and views agree.
 
 ## Proving a difference is caught

@@ -80,9 +80,9 @@ Core paths are under `divi/src/` of the Divi Core source at v3.0.0 (commit 9e2f7
 
 ## KNOWN differences
 
-None differ. The calls divid does not have are KNOWN rows only because both nodes refuse them the same way
-(-32601 "Method not found"; they are not in `rpcserver.cpp`'s table, `:324-467`): `listaddressgroupings`,
-`getmempoolentry`, `abandontransaction`. Such a row is a `FAIL` if irondivid answers it. So the balance and
+None. The calls divid does not have are PASS rows when both nodes refuse them the same way (-32601 "Method not
+found"; they are not in `rpcserver.cpp`'s table, `:324-467`): `listaddressgroupings`, `getmempoolentry`,
+`abandontransaction`. Such a row is a `FAIL` if irondivid answers it. So the balance and
 `listtransactions` rows after `abandontransaction` show that nothing was abandoned on either node.
 
 ## Proving a difference is caught

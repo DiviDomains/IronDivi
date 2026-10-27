@@ -64,15 +64,7 @@ How divid answers:
   (`rest.cpp:253-254`). irondivid starts its RPC server only once the node is ready, so it has no warm-up state to
   answer from.
 
-**ZMQ** (`src/zmq/`), each topic published on the address given by its option. Every message has three parts:
-topic, body, and a 4-byte little-endian sequence number per notifier (`zmqpublishnotifier.cpp:129-141`):
-
-| topic | option | body | Core | irondivid |
-|---|---|---|---|---|
-| `hashblock` | `-zmqpubhashblock=<address>` | the new tip's hash, 32 bytes | `zmqpublishnotifier.h:11`, `.cpp:146-154` | no (option accepted as unsupported) |
-| `hashtx` | `-zmqpubhashtx=<address>` | a transaction's hash, 32 bytes | `.h:12`, `.cpp:156-164` | no |
-| `rawblock` | `-zmqpubrawblock=<address>` | the serialized block | `.h:13`, `.cpp:166-186` | no |
-| `rawtx` | `-zmqpubrawtx=<address>` | the serialized transaction | `.h:14`, `.cpp:188-195` | no |
+**ZMQ** (`src/zmq/`) is compared topic by topic in `scripts/zmq-replies`.
 
 ## Nodes and steps
 
@@ -95,7 +87,6 @@ divid listens; irondivid dials it (`connect=`), so both see one chain. Both run 
 | `block bad hash`, `block unknown hash`, `block wrong format`, `block missing extension`, `block notxdetails unknown hash` | the same for blocks |
 | `headers`, `chaininfo`, `mempool info`, `mempool contents`, `getutxos one outpoint`, `getutxos several outpoints`, `getutxos too many outpoints`, `rest root`, `not a rest path` | paths divid does not serve |
 | `rest=0: …` | a tx and both block paths, an unknown txid, a non-REST path, with `-rest=0` |
-| `zmq hashblock`, `zmq hashtx`, `zmq rawblock`, `zmq rawtx` | not compared (below) |
 
 How a row compares:
 - the same status and the same `Content-Type`;
@@ -105,11 +96,7 @@ How a row compares:
 
 ## KNOWN differences
 
-- `zmq hashblock`, `zmq hashtx`, `zmq rawblock`, `zmq rawtx`: irondivid has no ZMQ publisher; `-zmqpub*` are
-  accepted and named unsupported at start. They are not compared because a ZMQ subscriber needs pyzmq, which is not
-  in the Python standard library.
-
-No other row differs from divid.
+No row differs from divid.
 
 ## Proving a difference is caught
 
