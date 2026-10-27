@@ -656,6 +656,19 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     }
     // divid serves RPC unless -server=0 (divid.cpp:139)
     config.rpc.enabled = s.get_bool("server", true);
+    // Off regtest divid will not serve RPC with the user name as the
+    // password: it stops at start (rpcserver.cpp:655-678). Without a password
+    // irondivid writes a cookie instead (auth_cookie.rs).
+    if config.rpc.enabled && !regtest {
+        if let (Some(user), Some(password)) = (&config.rpc.username, &config.rpc.password) {
+            if !password.is_empty() && user == password {
+                anyhow::bail!(
+                    "To use irondivid you must set an rpcpassword in the configuration file.\n\
+                     The username and password MUST NOT be the same."
+                );
+            }
+        }
+    }
     // The REST interface, off unless asked for (Divi Core -rest, rpcserver.cpp:1025)
     config.rpc.rest = s.get_bool("rest", false);
     // The RPC server listens on the loopback unless -rpcallowip lets others
@@ -672,7 +685,12 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     }
     let rpcbind = s.get_multi("rpcbind");
     if allowed.is_empty() {
+        // divid binds ::1 and 127.0.0.1, and runs on either alone
         config.rpc.listen_addr = "127.0.0.1".to_string();
+        config.rpc.also_listen = vec![std::net::SocketAddr::from((
+            std::net::Ipv6Addr::LOCALHOST,
+            config.rpc.port,
+        ))];
         if !rpcbind.is_empty() {
             warn!("option -rpcbind was ignored because -rpcallowip was not specified, refusing to allow everyone to connect");
         }
@@ -689,19 +707,28 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
                 anyhow::bail!("Could not parse -rpcbind value {} as network address", addr);
             }
         }
+        // Every -rpcbind is listened on, each without a port on -rpcport
+        // (rpcserver.cpp:694-695)
+        let default_port = config.rpc.port;
+        config.rpc.also_listen = rpcbind[1..]
+            .iter()
+            .map(|addr| {
+                let (host, p) = host_and_port(addr);
+                let ip = host
+                    .trim_matches(['[', ']'])
+                    .parse::<std::net::IpAddr>()
+                    .expect("checked above");
+                std::net::SocketAddr::new(ip, p.unwrap_or(default_port))
+            })
+            .collect();
         let (host, p) = host_and_port(first);
         config.rpc.listen_addr = host;
         if let Some(p) = p {
             config.rpc.port = p;
         }
-        if rpcbind.len() > 1 {
-            warn!(
-                "irondivid listens on one -rpcbind address: {} (the others are ignored)",
-                first
-            );
-        }
     } else {
         config.rpc.listen_addr = "[::]".to_string();
+        config.rpc.also_listen = Vec::new();
     }
     config.rpc.allowed_ips = allowed;
     // -rpckeepalive=0: each RPC connection is closed after its reply
@@ -2867,8 +2894,8 @@ async fn run_daemon(
     // while RPC answers, as Divi Core's (init.cpp:686-728, :1580, :1639)
     node.release_import();
 
-    // Start RPC server. RPC always requires authentication: without a complete
-    // rpcuser/rpcpassword pair a random cookie is written to <datadir>/.cookie
+    // Start RPC server. RPC always requires authentication: without an
+    // rpcpassword a random cookie is written to <datadir>/.cookie
     // (mode 0600) for local clients; `_rpc_cookie` removes it when we return.
     let (rpc_user, rpc_password, _rpc_cookie) = divi_rpc::resolve_rpc_auth(
         config.rpc.username.as_deref(),
@@ -2879,7 +2906,7 @@ async fn run_daemon(
     match &_rpc_cookie {
         Some(cookie) => {
             if config.rpc.username.is_some() || config.rpc.password.is_some() {
-                warn!("Only one of rpcuser/rpcpassword is set; using cookie authentication");
+                warn!("rpcuser is set without an rpcpassword; using cookie authentication");
             }
             info!("RPC cookie authentication: {:?}", cookie.path());
         }
@@ -2893,6 +2920,7 @@ async fn run_daemon(
             .filter_map(|a| divi_rpc::Subnet::parse(a))
             .collect(),
         bind_address: config.rpc.socket_addr(),
+        also_bind: config.rpc.also_listen.clone(),
         username: Some(rpc_user),
         password: Some(rpc_password),
         keep_alive: config.rpc.keep_alive,

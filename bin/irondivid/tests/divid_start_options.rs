@@ -902,6 +902,8 @@ fn pid_file_is_written_without_daemon_and_removed_at_the_end() {
     // belongs to regtest, the node is started for testnet
     let mut args = divid_args(dir.path(), free_port());
     args[0] = "-testnet".into();
+    // off regtest the user name must not be the password (rpcserver.cpp:656)
+    args.push("-rpcpassword=testnet".into());
     let out = output_within(Command::new(env!("CARGO_BIN_EXE_irondivid")).args(&args));
     assert!(!out.status.success());
     assert!(!pid_file.exists(), "divid.pid left after a failed start");

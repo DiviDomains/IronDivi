@@ -678,6 +678,15 @@ struct RpcClient {
 }
 
 impl RpcClient {
+    /// The Basic login: divi-cli sends "-rpcuser:-rpcpassword" with either
+    /// one empty (divi-cli.cpp:98-101)
+    fn login(&self) -> Option<(&str, &str)> {
+        match (&self.username, &self.password) {
+            (None, None) => None,
+            (u, p) => Some((u.as_deref().unwrap_or(""), p.as_deref().unwrap_or(""))),
+        }
+    }
+
     /// Send one request and return the reply object, checked as divi-cli's
     /// CallRPC does (divi-cli.cpp:85-134). There is no time limit: divi-cli
     /// waits for the node however long a call takes.
@@ -695,7 +704,7 @@ impl RpcClient {
             .post(&self.url)
             .header("Content-Type", "application/json")
             .body(request.to_string());
-        if let (Some(user), Some(pass)) = (&self.username, &self.password) {
+        if let Some((user, pass)) = self.login() {
             req = req.basic_auth(user, Some(pass));
         }
         let response = match req.send() {
@@ -899,12 +908,14 @@ fn resolve_endpoint(args: &Args, home: &Path) -> Result<Endpoint, CliError> {
     let conf_is_core_fallback = args.conf.is_none()
         && args.datadir.is_none()
         && conf_path == default_conf_path(home, privatedivi);
+    // A password alone logs in with an empty user name, as divi-cli sends
+    // "-rpcuser" + ":" + "-rpcpassword" (divi-cli.cpp:98)
     let conf_creds = match (config.rpcuser.clone(), config.rpcpassword.clone()) {
-        (Some(u), Some(p)) => Some((u, p)),
+        (u, Some(p)) => Some((u.unwrap_or_default(), p)),
         _ => None,
     };
     let (rpc_user, rpc_password) = match (&args.rpcuser, &args.rpcpassword) {
-        (Some(u), Some(p)) => (Some(u.clone()), Some(p.clone())),
+        (u, Some(p)) => (Some(u.clone().unwrap_or_default()), Some(p.clone())),
         _ => {
             let found = match conf_creds {
                 Some(creds) if !conf_is_core_fallback => Some(creds),

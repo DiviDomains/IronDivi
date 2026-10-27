@@ -358,7 +358,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let app = router.clone();
         tokio::spawn(crate::server::serve_listener(
-            listener,
+            vec![listener],
             app,
             4,
             std::future::pending(),

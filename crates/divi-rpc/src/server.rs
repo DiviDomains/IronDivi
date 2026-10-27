@@ -44,6 +44,9 @@ use tracing::{debug, error, info};
 pub struct RpcConfig {
     /// Listen address
     pub bind_address: SocketAddr,
+    /// More addresses to listen on, as Divi Core binds each -rpcbind, and ::1
+    /// beside 127.0.0.1 (rpcserver.cpp:683-750)
+    pub also_bind: Vec<SocketAddr>,
     /// RPC username (optional)
     pub username: Option<String>,
     /// RPC password (optional)
@@ -64,6 +67,7 @@ impl Default for RpcConfig {
     fn default() -> Self {
         RpcConfig {
             bind_address: "127.0.0.1:9998".parse().unwrap(),
+            also_bind: Vec::new(),
             username: None,
             password: None,
             allowed: Vec::new(),
@@ -104,12 +108,27 @@ async fn serve(
             }
         }
     }));
-    let listener = tokio::net::TcpListener::bind(config.bind_address).await?;
-    serve_listener(listener, app, config.threads, stopped).await;
+    // Divi Core goes on with the addresses it could bind and fails only
+    // when it has none (rpcserver.cpp:713-753)
+    let mut listeners = Vec::new();
+    let mut failure = None;
+    for addr in std::iter::once(config.bind_address).chain(config.also_bind.iter().copied()) {
+        match tokio::net::TcpListener::bind(addr).await {
+            Ok(listener) => listeners.push(listener),
+            Err(e) => {
+                error!("Binding RPC on address {addr} failed: {e}");
+                failure.get_or_insert(e);
+            }
+        }
+    }
+    if let Some(e) = failure.filter(|_| listeners.is_empty()) {
+        return Err(e.into());
+    }
+    serve_listener(listeners, app, config.threads, stopped).await;
     Ok(())
 }
 
-/// Serve `app` on `listener`, each connection with hyper's HTTP/1 as Divi
+/// Serve `app` on `listeners`, each connection with hyper's HTTP/1 as Divi
 /// Core's ServiceConnection serves it (rpcserver.cpp:1000-1033), on one of
 /// `threads` slots, until `stopped`.
 ///
@@ -124,7 +143,7 @@ async fn serve(
 /// answering (hyper's graceful shutdown), and this returns once they have
 /// closed, as axum's graceful shutdown did.
 pub(crate) async fn serve_listener(
-    listener: tokio::net::TcpListener,
+    listeners: Vec<tokio::net::TcpListener>,
     app: Router,
     threads: i64,
     stopped: impl std::future::Future<Output = ()> + Send + 'static,
@@ -142,8 +161,18 @@ pub(crate) async fn serve_listener(
     });
     let (open, open_rx) = tokio::sync::watch::channel(());
     loop {
+        // A connection on any of the addresses
+        let accept = std::future::poll_fn(|cx| {
+            listeners
+                .iter()
+                .find_map(|l| match l.poll_accept(cx) {
+                    std::task::Poll::Ready(r) => Some(std::task::Poll::Ready(r)),
+                    std::task::Poll::Pending => None,
+                })
+                .unwrap_or(std::task::Poll::Pending)
+        });
         let accepted = tokio::select! {
-            accepted = listener.accept() => accepted,
+            accepted = accept => accepted,
             _ = stop.closed() => break,
         };
         let (stream, peer) = match accepted {
@@ -177,7 +206,7 @@ pub(crate) async fn serve_listener(
         });
     }
     drop(open_rx);
-    drop(listener);
+    drop(listeners);
     open.closed().await;
 }
 
@@ -1921,9 +1950,9 @@ impl RpcServer {
 }
 
 /// Create the axum router for RPC, enforcing HTTP Basic authentication.
-/// Without both a username and a password every request is refused: the RPC
-/// is never served open (irondivid fills in cookie credentials when none are
-/// configured, see [`crate::auth_cookie`]).
+/// Without a password every request is refused: the RPC is never served
+/// open (irondivid fills in cookie credentials when none are configured, see
+/// [`crate::auth_cookie`]).
 pub fn create_router_with_auth(server: Arc<RpcServer>, config: &RpcConfig) -> Router {
     let router = build_router(server, rpc_credentials(config), config.rest);
     if config.keep_alive {
@@ -2029,16 +2058,17 @@ fn build_router(
     router
 }
 
-/// The credentials to enforce: both must be set. `None` means no request can
-/// authenticate.
+/// The credentials to enforce: a password, and the user name, which may be
+/// empty as Divi Core's "-rpcuser" + ":" + "-rpcpassword" (rpcserver.cpp:655).
+/// `None` means no request can authenticate.
 fn rpc_credentials(config: &RpcConfig) -> Option<Arc<(String, String)>> {
     match (&config.username, &config.password) {
-        (Some(u), Some(p)) if !u.is_empty() && !p.is_empty() => {
+        (u, Some(p)) if !p.is_empty() => {
             info!("RPC authentication enabled");
-            Some(Arc::new((u.clone(), p.clone())))
+            Some(Arc::new((u.clone().unwrap_or_default(), p.clone())))
         }
         _ => {
-            error!("RPC has no complete rpcuser/rpcpassword: every request will be refused");
+            error!("RPC has no rpcpassword: every request will be refused");
             None
         }
     }
@@ -2164,7 +2194,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-        let served = tokio::spawn(serve_listener(listener, app, 4, async move {
+        let served = tokio::spawn(serve_listener(vec![listener], app, 4, async move {
             let _ = stopped.await;
         }));
         let request = format!("POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Length: 0\r\n\r\n");

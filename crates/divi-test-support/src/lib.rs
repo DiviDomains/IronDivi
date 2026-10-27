@@ -153,6 +153,13 @@ pub fn wait_up(
 ) -> Started {
     let deadline = Instant::now() + START_WAIT;
     while !up() {
+        // A node that could bind only some of its RPC addresses runs on
+        // without the taken one, as divid does
+        if port_taken_since(datadir, log_from) && child.try_wait().unwrap().is_none() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Started::PortTaken;
+        }
         if let Some(status) = child.try_wait().unwrap() {
             if port_taken_since(datadir, log_from) {
                 return Started::PortTaken;
