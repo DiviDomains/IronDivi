@@ -1003,7 +1003,35 @@ def b4():
 
 reorg_round("vault", a4, b4)
 
-# 5. both managers killed with blocks and payments behind them, then started
+# 5. the owner pays itself a coin (p), then spends it (s), a block each; the new
+# branch mines p again but not s. The mempool takes s back before the wallet scans
+# the new branch's p, so s came before the coin it spends was back. divid counts
+# the coin spent by s in the mempool (SpentOutputTracker.cpp:22-34): only s's
+# change is left, unconfirmed
+def a6():
+    c = plain_coin(100)
+    coin_to, change_to = shared_address(CO, IO), shared_address(CO, IO)
+    p_raw = spend_raw(CO, [(c["txid"], c["vout"])], {coin_to: round(float(c["amount"]) - FEE, 8)})
+    state["p6"] = p_raw
+    p = CO.rpc("sendrawtransaction", p_raw)
+    TXS.append(("coin the new branch mines again", p))
+    wait_for(lambda: all(p in n.rpc("getrawmempool") for n in ACTIVE), 60)
+    mine(1)
+    left = round(float(c["amount"]) - FEE, 8)
+    s = CO.rpc("sendrawtransaction", spend_raw(CO, [(p, 0)], {MGR: 6, change_to: round(left - 6 - FEE, 8)}))
+    TXS.append(("spend of that coin, left to the mempool", s))
+    wait_for(lambda: all(s in n.rpc("getrawmempool") for n in ACTIVE), 60)
+    mine(1)
+
+
+def b6():
+    SECOND.rpc("sendrawtransaction", state["p6"])
+    mine(4, SECOND, follow=[])
+
+
+reorg_round("coin back after its spend", a6, b6)
+
+# 6. both managers killed with blocks and payments behind them, then started
 notify_mark()
 for k in range(4):
     pay(f"payment before the kill {k + 1}", CO, MGR, 2)
