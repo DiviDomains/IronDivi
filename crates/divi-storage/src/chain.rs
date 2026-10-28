@@ -554,6 +554,13 @@ pub struct Chain {
     /// them. A block's own failure and the blocks invalidateblock disconnects
     /// are written (BlockInvalidationHelpers.cpp:128-136)
     inherited_failed: RwLock<std::collections::HashSet<Hash256>>,
+    /// The order this run received each block in: Divi Core's nSequenceId,
+    /// given as a block's data is stored with its parent's
+    /// (UpdateBlockCandidatesAndSuccessors, BlockInvalidationHelpers.cpp:55-58)
+    /// and never written, so a block loaded at start has none and counts as
+    /// 0 (chain.h:151), before every block received since (ids from 1,
+    /// BlockInvalidationHelpers.cpp:23)
+    received_order: Mutex<std::collections::HashMap<Hash256, u64>>,
     /// Divi Core's fLargeWorkInvalidChainFound (Warnings.cpp:7)
     invalid_chain_found: std::sync::atomic::AtomicBool,
     /// IsInitialBlockDownload's latch: once out, never in again
@@ -646,6 +653,7 @@ impl Chain {
             consensus_sporks: Arc::new(RwLock::new(ConsensusSporks::default())),
             most_work_invalid: RwLock::new(None),
             inherited_failed: RwLock::new(std::collections::HashSet::new()),
+            received_order: Mutex::new(std::collections::HashMap::new()),
             invalid_chain_found: std::sync::atomic::AtomicBool::new(false),
             left_initial_download: std::sync::atomic::AtomicBool::new(false),
             fork_warning_listeners: RwLock::new(Vec::new()),
@@ -2538,6 +2546,7 @@ impl Chain {
         // which then fed the wrong kernel block time into PoS validation
         // (mainnet block 4,168,729 rejected).
         self.db.store_block_index_entry(&index)?;
+        self.note_received(&hash);
         debug!("  ├─ Storage: ✅ COMPLETE");
 
         // 8b. Track the best known block (highest chain work we've seen).
@@ -3412,15 +3421,20 @@ impl Chain {
             .into_iter()
             .filter(|i| !self.is_failed(i) && i.status.contains(BlockStatus::HAVE_DATA))
             .collect();
-        candidates.sort_by(|a, b| Self::compare_chain_work(&b.chain_work, &a.chain_work));
+        // Divi Core's order (CBlockIndexWorkComparator): most work first,
+        // then the earliest received
+        candidates.sort_by_cached_key(|i| {
+            (
+                std::cmp::Reverse(Self::work_key(&i.chain_work)),
+                self.received(&i.hash),
+            )
+        });
         for cand in candidates {
             let tip = match self.tip.read().clone() {
                 Some(t) => t,
                 None => return Ok(Vec::new()),
             };
-            if Self::compare_chain_work(&cand.chain_work, &tip.chain_work)
-                != std::cmp::Ordering::Greater
-            {
+            if !self.better_tip(&cand, &tip) {
                 break;
             }
             *self.best_known_block.write() = Some(cand);
@@ -4539,7 +4553,37 @@ impl Chain {
         std::cmp::Ordering::Equal
     }
 
-    /// Update the best known block if the given index has more chain work.
+    /// The chain work as a big-endian key, which orders as the work does
+    fn work_key(work: &[u8; 32]) -> [u8; 32] {
+        let mut key = *work;
+        key.reverse();
+        key
+    }
+
+    /// When this run received the block (see `received_order`)
+    fn received(&self, hash: &Hash256) -> u64 {
+        self.received_order.lock().get(hash).copied().unwrap_or(0)
+    }
+
+    fn note_received(&self, hash: &Hash256) {
+        let mut order = self.received_order.lock();
+        let next = order.len() as u64 + 1;
+        order.entry(*hash).or_insert(next);
+    }
+
+    /// Whether `a` is a better tip than `b` in Divi Core's order
+    /// (CBlockIndexWorkComparator, BlockIndexWork.h:12-30): more work, or as
+    /// much and received earlier. Two blocks received alike (both loaded at
+    /// start) Core orders by their address in memory, which nothing keeps
+    /// from one start to the next; here neither is better, so the tip stays.
+    fn better_tip(&self, a: &BlockIndex, b: &BlockIndex) -> bool {
+        match Self::compare_chain_work(&a.chain_work, &b.chain_work) {
+            std::cmp::Ordering::Equal => self.received(&a.hash) < self.received(&b.hash),
+            other => other == std::cmp::Ordering::Greater,
+        }
+    }
+
+    /// Update the best known block if the given index is a better tip.
     ///
     /// Called after storing a new block index so that `activate_best_chain`
     /// can later detect that a side chain has surpassed the current tip.
@@ -4552,10 +4596,7 @@ impl Chain {
         let mut best = self.best_known_block.write();
         let dominated = match &*best {
             None => true,
-            Some(current_best) => {
-                Self::compare_chain_work(&index.chain_work, &current_best.chain_work)
-                    == std::cmp::Ordering::Greater
-            }
+            Some(current_best) => self.better_tip(index, current_best),
         };
         if dominated {
             *best = Some(index.clone());
@@ -4604,9 +4645,10 @@ impl Chain {
             return Ok(None);
         }
 
-        // Only reorg if the best known block has strictly more work
-        let cmp = Self::compare_chain_work(&best_block.chain_work, &current_tip.chain_work);
-        if cmp != std::cmp::Ordering::Greater {
+        // Only reorg to a better tip: more work, or as much and received
+        // earlier (Divi Core's FindMostWorkChain takes the first of
+        // setBlockIndexCandidates, BlockCheckingHelpers.cpp:315-320)
+        if !self.better_tip(&best_block, &current_tip) {
             return Ok(None);
         }
 
