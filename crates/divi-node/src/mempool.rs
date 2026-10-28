@@ -300,9 +300,12 @@ pub struct Mempool {
     /// time it was last updated
     free_limiter: parking_lot::Mutex<(f64, i64)>,
 
-    /// Held for each add, and by a wallet send from picking its coins to its
-    /// commit (`with_admission`), as Divi Core's cs_main is (main.cpp:726,
-    /// rpcserver.cpp:1060-1093); reentrant, so the send's own add goes through
+    /// Held for each add, by a wallet send from picking its coins to its
+    /// commit (`with_admission`), and by the removals that follow a chain
+    /// change, as Divi Core's cs_main is (main.cpp:726, rpcserver.cpp:1060-1093,
+    /// ChainTipManager.cpp:107, :156): a transaction checked against the chain
+    /// before it moved is in the mempool when the removals look; reentrant, so
+    /// the send's own add goes through
     admission: parking_lot::ReentrantMutex<()>,
 }
 
@@ -672,6 +675,7 @@ impl Mempool {
     /// (ChainTipManager.cpp:139-141, :175-183); the staker leaves it out of
     /// its blocks until it is final.
     pub fn remove_for_block(&self, txids: &[Hash256]) {
+        let _admission = self.admission.lock();
         for txid in txids {
             self.remove(txid);
         }
@@ -685,6 +689,7 @@ impl Mempool {
     /// conflicts with the new chain, and what spends a coin the new chain does
     /// not have or has not matured. Returns how many were removed.
     pub fn remove_unspendable(&self, on_chain: impl Fn(&OutPoint) -> bool) -> usize {
+        let _admission = self.admission.lock();
         let mut removed = 0;
         loop {
             let doomed: Vec<Hash256> = {
@@ -759,6 +764,7 @@ impl Mempool {
     }
 
     pub fn remove_conflicts(&self, block_txs: &[Transaction]) -> usize {
+        let _admission = self.admission.lock();
         let mut doomed: Vec<Hash256> = {
             let spenders = self.spenders.read();
             block_txs
