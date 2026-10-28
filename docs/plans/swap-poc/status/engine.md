@@ -1441,3 +1441,35 @@ The Manager's rulings on the DJ2 report. Testnet only, $0, not pushed.
   - Row 2 (LTC) of `single-source-design.md` still says "Lock reads before funding stay fail-closed with no deadline". EX's maker deadline (`taker_lock_unread`) covers every backend; this lane edited only row 3, as briefed.
   - The wall clock is the host's own and is trusted as in EV; a host clock far ahead declines early (both legs refund, nothing lost).
   - No live run (mocks only, no funds). Not pushed.
+
+## 2026-10-28 round: integ-t32 IA phase 2 (builder IA, `lane/integ-t32`, on 132bf35; T32-18 phase 2, Manager ruling 4)
+- what: three merge commits on the IA result `132bf35`, in order: FA `8f3e4ca` (T32-16, the taker's own DIVI source) as `9284f91`, FB `bc25668` (T32-13, the agreed ZEC lock kept per block) as `efe65cb`, FC `b2dbc23` (T32-19, a held maker-leg MTP at the lock-read decline) as `e732b79`. No rebase, squash or cherry-pick; each tip is an ancestor of the result (`git merge-base --is-ancestor`). The tree after FA and FB equals the orchestrator's scratch trial (`P2TRIAL/trial-result.diff`) byte for byte.
+- resolutions (no behaviour conflict met):
+  - FA, `crates/swap-chain-zec/src/crosscheck.rs`: HEAD's (ET/EX) `LockView`, `lock_view` and `agree_lock` kept; HEAD's `CC_SECOND_LEVEL` dropped for FA's one `pub use divi_swap::operator::{has_second_operator, operator_domain};` (FA moved the same `operator_domain` logic there unchanged). `operator_domain_is_the_registrable_domain` stays and uses the re-export.
+  - FA, `deploy/divi-swapd/README.md`: HEAD's EM/EU/ET/EX/EW paragraphs kept (FA's side carried the pre-EU first paragraph); FA's taker CLI warning sentences appended to the first paragraph.
+  - FA, `bin/divi-swap/src/main.rs`: merged without conflict; FA's `taker_source_warnings` and `--divi-rpc-url` sit beside IA's code, and both crates' tests pass.
+  - FB: only this file (one hunk), rounds kept in order. Code (`crosscheck.rs`, `lib.rs`, `lock_terms.rs`, `backend.rs`, `maker.rs`, `taker.rs`) merged without conflict.
+  - FC: only this file (one hunk), rounds kept in order. Row 3 of `single-source-design.md` merged without conflict and carries FC's wording (EX's deadline, FC's wall clock), which closes phase 1's "no deadline" item. `taker.rs` gains exactly FC's diff.
+- every merged branch's new tests are present and pass: FA (CLI `taker_divi_rpc_url_replaces_the_default_primary`, `divi_rpc_url_unset_keeps_the_default_proxy`, `divi_fallback_must_differ_from_the_divi_rpc_url_in_use`, `mainnet_taker_on_the_default_divi_proxy_only_is_warned`, `mainnet_taker_on_one_zec_operator_is_warned`; swapd `zec_second_operator_rule_is_the_same_in_the_daemon_and_the_taker_cli`; divi-swap `same_operator_is_the_url_or_its_registrable_domain`, `a_second_operator_is_needed_without_a_second_url_or_a_second_domain`; zec `the_shared_operator_check_keeps_the_zec_answers`), FB (zec `a_mined_agreed_lock_read_n_times_asks_the_second_operator_once`, `a_kept_agreement_counts_no_higher_than_the_second_operators_tip`, `a_reorg_at_the_locks_height_asks_again_and_refuses_another_answer`, `a_later_disagreement_after_a_kept_agreement_is_refused`, `a_mempool_lock_is_asked_every_time`, `refusals_and_unmatched_blocks_are_never_kept`, `kept_agreements_are_capped`, `a_finished_lock_is_dropped`, `off_and_primary_only_keep_nothing_request_for_request`; divi-swap `the_kept_agreement_is_dropped_when_the_swap_ends`), FC (`bounded_read_hold` `fc_an_unread_maker_lock_with_a_held_mtp_declines_the_claim_and_the_taker_refunds`, `fc_an_unread_maker_lock_with_a_held_mtp_before_the_margin_retries`, `fc_an_unread_maker_lock_with_a_plain_mtp_error_retries`).
+- gates on e732b79 (the code of the final tree; the docs commit after it changes only Markdown, and fmt `--check` was re-run on it), hp1, own target dir, `nice -n 10`, `-j 8`, `--test-threads=8`, heavy-start before every cargo step, every step load5 < 35 at start and end:
+
+  | gate | passed | failed | ignored | load5 start / end |
+  |---|---|---|---|---|
+  | fmt `--check` | clean | | | 3.82 / 3.82 |
+  | clippy `--workspace --all-targets -D warnings` | clean | | | 3.49 / 3.64 |
+  | divi-swap | 476 | 0 | 0 | 3.14 / 8.80 |
+  | divi-swapd (under the e2e_xmr flock) | 191 | 0 | 0 | 12.22 / 17.09 |
+  | divi-swap-cli | 89 | 0 | 0 | 16.39 / 16.56 |
+  | divi-swap-xmr | 92 | 0 | 0 | 9.69 / 8.65 |
+  | swap-chain-divi | 84 | 0 | 1 | 7.68 / 7.80 |
+  | swap-chain-evm | 48 | 0 | 2 | 7.40 / 7.58 |
+  | swap-chain-ltc | 101 | 0 | 2 | 6.96 / 7.08 |
+  | swap-chain-zec | 104 | 0 | 4 | 5.97 / 6.08 |
+  | swap-chain-btc | 72 | 0 | 1 | 5.38 / 5.40 |
+  | claim_race `PROPTEST_CASES=5000` | 16 | 0 | 0 | 5.48 / 13.40 |
+  | maker_claim_race `PROPTEST_CASES=5000` | 8 | 0 | 0 | 13.40 / 7.05 |
+
+  Against phase 1 (132bf35): divi-swap +5, divi-swapd +1, divi-swap-cli +5, swap-chain-zec +11; the rest unchanged.
+- left:
+  - The merged branches' own `left:` items stand (FA: the mainnet taker start rule is Bert's, the rest of F4, the xmr arm's DIVI source; FB: per-process cache, the tip cross-check uncached; FC: the maker-leg MTP read after a successful lock read is still raw, row 2 of `single-source-design.md`).
+  - Not pushed. No live run (mocks only, no funds).
