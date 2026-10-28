@@ -409,6 +409,57 @@ mod tests {
         }
     }
 
+    const ZAT: u64 = 250_000;
+
+    fn view(script_pubkey: &[u8], value: u64) -> std::result::Result<LockView, String> {
+        Ok(LockView {
+            script_pubkey: script_pubkey.to_vec(),
+            value,
+            confirmations: 3,
+        })
+    }
+
+    fn mine() -> LockedOutput {
+        LockedOutput {
+            amount: divi_swap::Amount::from_sat(ZAT),
+            confirmations: 5,
+        }
+    }
+
+    /// `agree_lock` alone (since EW a well-formed answer with another script or value at the
+    /// outpoint is another transaction, refused before this comparison): another script at
+    /// the second operator is refused, naming it and both operators.
+    #[test]
+    fn agree_lock_names_the_script() {
+        let (p, o) = (client("http://p.example:1"), client("http://o.example:2"));
+        let (want, other) = ([0xa9u8, 0x14, 0x01], [0x76u8, 0xa9, 0x02]);
+        let got = agree_lock(&at(), &want, mine(), &p, view(&other, ZAT), &o);
+        let Err(SwapError::Transient(m)) = &got else {
+            panic!("not refused: {got:?}");
+        };
+        for needle in [hex::encode(other), "p.example".into(), "o.example".into()] {
+            assert!(m.contains(&needle), "{m} lacks {needle}");
+        }
+    }
+
+    /// `agree_lock` alone: any other value is refused, naming it; the same value agrees at
+    /// the lower confirmation count.
+    #[test]
+    fn agree_lock_names_the_value() {
+        let (p, o) = (client("http://p.example:1"), client("http://o.example:2"));
+        let want = [0xa9u8, 0x14, 0x01];
+        for value in [ZAT - 1, ZAT / 2, ZAT + 1] {
+            let got = agree_lock(&at(), &want, mine(), &p, view(&want, value), &o);
+            let Err(SwapError::Transient(m)) = &got else {
+                panic!("{value}: not refused: {got:?}");
+            };
+            assert!(m.contains(&value.to_string()), "{m}");
+        }
+        let ok = agree_lock(&at(), &want, mine(), &p, view(&want, ZAT), &o).unwrap();
+        assert_eq!(ok.confirmations, 3);
+        assert_eq!(ok.amount, mine().amount);
+    }
+
     #[tokio::test]
     async fn two_operators_on_one_chain_agree_at_the_tip() {
         let (p, o) = (Lightwalletd::start(TIP), Lightwalletd::start(TIP));

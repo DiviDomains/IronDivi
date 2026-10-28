@@ -22,6 +22,8 @@ pub mod tx;
 mod lock_terms;
 #[cfg(test)]
 mod lwd_stub;
+#[cfg(test)]
+mod txid_binding;
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};

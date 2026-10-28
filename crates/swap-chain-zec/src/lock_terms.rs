@@ -20,12 +20,11 @@
 use divi_swap::{Amount, ChainBackend, HtlcParams, LockedOutput, Outpoint, SwapError, Txid};
 
 use crate::address::{htlc_script_pubkey, TransparentAddress};
-use crate::lwd_stub::{raw_tx, Lightwalletd};
+use crate::lwd_stub::{raw_tx, tx_of, txid_of, Lightwalletd};
 use crate::ZecBackend;
 
 /// The stubs' tip in the backend tests.
 const TIP: u64 = 40;
-const LOCK: Txid = Txid([0x5e; 32]);
 const ZAT: u64 = 250_000;
 /// The value of the output in front of the lock.
 const FILLER: u64 = 1_000;
@@ -45,9 +44,19 @@ fn pk(n: u8) -> [u8; 33] {
     sk.public_key(&secp256k1::Secp256k1::new()).serialize()
 }
 
+/// The agreed lock: output 1 of [`lock_tx`]`(ZAT, agreed)`, under that transaction's own
+/// txid (EW: an answer that does not hash to the txid asked for is never read).
 fn at() -> Outpoint {
     Outpoint {
-        txid: LOCK,
+        txid: Txid(txid_of(&lock_tx(ZAT, agreed_spk(&htlc())))),
+        vout: 1,
+    }
+}
+
+/// Output 1 of a transaction with another script there, under its own txid.
+fn other_at() -> Outpoint {
+    Outpoint {
+        txid: Txid(txid_of(&lock_tx(ZAT, other_spk()))),
         vout: 1,
     }
 }
@@ -68,7 +77,7 @@ fn lock_tx(value: u64, spk: Vec<u8>) -> Vec<u8> {
 /// Both operators at [`TIP`]; `primary` holds the agreed lock at `height`.
 fn pair(height: u64) -> (Lightwalletd, Lightwalletd) {
     let (p, o) = (Lightwalletd::start(TIP), Lightwalletd::start(TIP));
-    p.put_tx(LOCK.0, lock_tx(ZAT, agreed_spk(&htlc())), height);
+    p.put_tx(at().txid.0, lock_tx(ZAT, agreed_spk(&htlc())), height);
     (p, o)
 }
 
@@ -102,7 +111,7 @@ async fn off_reads_the_primary_alone_request_for_request() {
         (0, 0, &["GetTransaction"][..]),
     ] {
         let (p, o) = pair(height);
-        o.put_tx(LOCK.0, lock_tx(ZAT, other_spk()), height);
+        o.put_tx(at().txid.0, lock_tx(ZAT, other_spk()), height);
         let b = p.backend().with_crosscheck(None).unwrap();
         let got = b.htlc_output(&htlc(), &at()).await.unwrap();
         assert_eq!(
@@ -116,19 +125,20 @@ async fn off_reads_the_primary_alone_request_for_request() {
         assert_eq!(p.take_calls(), calls, "{height}");
         assert!(o.take_calls().is_empty(), "{height}");
         // Another script at the outpoint is still `None` on the primary alone.
-        p.put_tx(LOCK.0, lock_tx(ZAT, other_spk()), height);
-        assert_eq!(b.htlc_output(&htlc(), &at()).await.unwrap(), None);
+        p.put_honest(lock_tx(ZAT, other_spk()), height);
+        assert_eq!(b.htlc_output(&htlc(), &other_at()).await.unwrap(), None);
     }
 }
 
 /// Wrong script: the primary shows the agreed HTLC and the full value, the second operator
-/// another scriptPubKey at the outpoint.
+/// another scriptPubKey at the outpoint. Such an answer is another transaction, so it is
+/// refused whichever check sees it first (EW binds the txid; `crosscheck`'s `agree_lock_names_the_script`
+/// keeps the script comparison's own refusal).
 #[tokio::test]
 async fn a_second_operator_showing_another_script_refuses_the_lock() {
     let (p, o) = pair(TIP - 2);
-    o.put_tx(LOCK.0, lock_tx(ZAT, other_spk()), TIP - 2);
-    let m = refused(&p, &o, "other script").await;
-    assert!(m.contains(&hex::encode(other_spk())), "{m}");
+    o.put_tx(at().txid.0, lock_tx(ZAT, other_spk()), TIP - 2);
+    refused(&p, &o, "other script").await;
 }
 
 /// Short value (and, as values must be equal, a larger one): the agreed script on both.
@@ -136,9 +146,8 @@ async fn a_second_operator_showing_another_script_refuses_the_lock() {
 async fn a_second_operator_showing_another_value_refuses_the_lock() {
     for value in [ZAT - 1, ZAT / 2, ZAT + 1] {
         let (p, o) = pair(TIP - 2);
-        o.put_tx(LOCK.0, lock_tx(value, agreed_spk(&htlc())), TIP - 2);
-        let m = refused(&p, &o, &format!("value {value}")).await;
-        assert!(m.contains(&value.to_string()), "{m}");
+        o.put_tx(at().txid.0, lock_tx(value, agreed_spk(&htlc())), TIP - 2);
+        refused(&p, &o, &format!("value {value}")).await;
     }
 }
 
@@ -147,7 +156,7 @@ async fn a_second_operator_showing_another_value_refuses_the_lock() {
 async fn a_lock_the_second_operator_does_not_have_is_refused() {
     let (p, o) = pair(TIP - 2);
     refused(&p, &o, "no such tx").await;
-    o.put_tx(LOCK.0, raw_tx(&[(ZAT, agreed_spk(&htlc()))]), TIP - 2);
+    o.put_tx(at().txid.0, raw_tx(&[(ZAT, agreed_spk(&htlc()))]), TIP - 2);
     refused(&p, &o, "no such vout").await;
 }
 
@@ -156,7 +165,7 @@ async fn a_lock_the_second_operator_does_not_have_is_refused() {
 #[tokio::test]
 async fn an_unreachable_second_operator_refuses_the_lock() {
     let (p, o) = pair(TIP - 2);
-    o.put_tx(LOCK.0, lock_tx(ZAT, agreed_spk(&htlc())), TIP - 2);
+    o.put_tx(at().txid.0, lock_tx(ZAT, agreed_spk(&htlc())), TIP - 2);
     o.set_down(true);
     refused(&p, &o, "down").await;
 }
@@ -171,7 +180,7 @@ async fn both_operators_agreeing_give_the_lower_confirmations() {
         (0, TIP - 5, 0),
     ] {
         let (p, o) = pair(p_height);
-        o.put_tx(LOCK.0, lock_tx(ZAT, agreed_spk(&htlc())), o_height);
+        o.put_tx(at().txid.0, lock_tx(ZAT, agreed_spk(&htlc())), o_height);
         let got = checked(&p, &o).htlc_output(&htlc(), &at()).await.unwrap();
         assert_eq!(
             got,
@@ -193,11 +202,11 @@ async fn both_operators_agreeing_give_the_lower_confirmations() {
 #[tokio::test]
 async fn no_lock_on_the_primary_asks_nothing_of_the_second() {
     let (p, o) = pair(TIP - 2);
-    o.put_tx(LOCK.0, lock_tx(ZAT, agreed_spk(&htlc())), TIP - 2);
-    p.put_tx(LOCK.0, lock_tx(ZAT, other_spk()), TIP - 2);
+    o.put_tx(at().txid.0, lock_tx(ZAT, agreed_spk(&htlc())), TIP - 2);
+    p.put_honest(lock_tx(ZAT, other_spk()), TIP - 2);
     let b = checked(&p, &o);
-    assert_eq!(b.htlc_output(&htlc(), &at()).await.unwrap(), None);
-    p.drop_tx(LOCK.0);
+    assert_eq!(b.htlc_output(&htlc(), &other_at()).await.unwrap(), None);
+    p.drop_tx(at().txid.0);
     assert_eq!(b.htlc_output(&htlc(), &at()).await.unwrap(), None);
     assert!(o.take_calls().is_empty());
 }
@@ -274,12 +283,13 @@ mod engine {
             self.second.set_down(s == Second::Down);
         }
 
-        /// Serve the mock chain's view of `at` on both stubs.
-        fn serve(&self, htlc: &HtlcParams, at: &Outpoint, real: Option<LockedOutput>) {
+        /// Serve the mock chain's view of `at` on both stubs, as a v5 transaction spending
+        /// `at`'s mock txid (one per lock) under its own ZEC txid; returns the outpoint the
+        /// stubs know it by (`at` itself, which no stub holds, when the mock chain has none).
+        /// The second operator's lies are answers to `GetTransaction` of that txid.
+        fn serve(&self, htlc: &HtlcParams, at: &Outpoint, real: Option<LockedOutput>) -> Outpoint {
             let Some(lo) = real else {
-                self.primary.drop_tx(at.txid.0);
-                self.second.drop_tx(at.txid.0);
-                return;
+                return *at;
             };
             let height = match lo.confirmations {
                 0 => 0,
@@ -288,25 +298,26 @@ mod engine {
             let outputs = |value: u64, spk: Vec<u8>| {
                 let mut v = vec![(FILLER, other_spk()); at.vout as usize];
                 v.push((value, spk));
-                raw_tx(&v)
+                tx_of(5, at.txid.0, &v).serialize()
             };
             let (zat, spk) = (lo.amount.to_sat(), agreed_spk(htlc));
-            self.primary
-                .put_tx(at.txid.0, outputs(zat, spk.clone()), height);
+            let txid = self.primary.put_honest(outputs(zat, spk.clone()), height);
             match *self.shows.lock().unwrap() {
                 Second::Honest | Second::Down => {
-                    self.second.put_tx(at.txid.0, outputs(zat, spk), height)
+                    self.second.put_tx(txid, outputs(zat, spk), height)
                 }
-                Second::OtherScript => {
-                    self.second
-                        .put_tx(at.txid.0, outputs(zat, other_spk()), height)
-                }
-                Second::Short => self.second.put_tx(at.txid.0, outputs(zat - 1, spk), height),
-                Second::NoTx => self.second.drop_tx(at.txid.0),
+                Second::OtherScript => self.second.put_tx(txid, outputs(zat, other_spk()), height),
+                Second::Short => self.second.put_tx(txid, outputs(zat - 1, spk), height),
+                Second::NoTx => self.second.drop_tx(txid),
                 Second::NoVout => {
                     let v = vec![(FILLER, other_spk()); at.vout as usize];
-                    self.second.put_tx(at.txid.0, raw_tx(&v), height)
+                    self.second
+                        .put_tx(txid, tx_of(5, at.txid.0, &v).serialize(), height)
                 }
+            }
+            Outpoint {
+                txid: Txid(txid),
+                vout: at.vout,
             }
         }
     }
@@ -372,8 +383,8 @@ mod engine {
             at: &Outpoint,
         ) -> Result<Option<LockedOutput>> {
             let real = self.mock.htlc_output(htlc, at).await?;
-            self.serve(htlc, at, real);
-            self.zec.htlc_output(htlc, at).await
+            let at = self.serve(htlc, at, real);
+            self.zec.htlc_output(htlc, &at).await
         }
         async fn find_spend(
             &self,
