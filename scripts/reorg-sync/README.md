@@ -57,6 +57,7 @@ proof-of-work block) makes proof-of-stake blocks (each is checked to have a coin
 | D | depth 30 (PoW): side R 30 (irondivid), side L 31 (divid) wins; `irondivid-R` is restarted while it reorganises | as A; L won |
 | E | proof of stake past height 100: depth 1 (R wins), 6 (L wins), 30 | as A; at depth 30 each side keeps its own tip (below) |
 | F | on side L's pair: `invalidateblock <tip-2>`, then `reconsiderblock`, and both of an unknown block | the replies; `getblockcount`, `getbestblockhash`, `getchaintips` after each |
+| G | depth 1 with a mempool spend (PoW, run before E): side L holds an unconfirmed spend of a fresh coin and a child of it; side R confirms another spend of the coin in the lower of its 2 blocks (irondivid R), side L's 1 block loses | as A; `getrawmempool` per side; the losing spend and its child left side L's mempool |
 
 How a row compares: the same outcome (a result, or an error with the same code and message); for a result every
 field's name, JSON type and value. `getchaintips` is compared after sorting by height and hash, `getrawmempool` and

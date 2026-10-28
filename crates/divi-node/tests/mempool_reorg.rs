@@ -319,3 +319,99 @@ fn a_locked_send_of_a_disconnected_block_returns_to_the_mempool() {
         "the locked send is back in the mempool"
     );
 }
+
+/// Make the next transaction checked for the mempool wait, after its checks
+/// and before it is inserted, until `resume` is called or two seconds pass.
+/// Returns once the checks are done, with the add still running on its own
+/// thread, and the add's handle.
+struct HeldAdd {
+    resume: std::sync::mpsc::Sender<()>,
+    add: std::thread::JoinHandle<Result<Hash256, divi_node::NodeError>>,
+}
+
+fn add_held_after_its_checks(t: &TestNode, tx: &Transaction) -> HeldAdd {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{mpsc, Mutex};
+    let (checked, checks_done) = mpsc::channel();
+    let (resume, resumed) = mpsc::channel::<()>();
+    let resumed = Mutex::new(resumed);
+    let armed = AtomicBool::new(true);
+    let chain = t.node.chain().clone();
+    t.node
+        .mempool()
+        .set_validator(std::sync::Arc::new(move |pool, tx, origin| {
+            let result = divi_node::check_mempool_transaction(&chain, pool, tx, origin);
+            if armed.swap(false, Ordering::SeqCst) {
+                let _ = checked.send(());
+                let _ = resumed
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(2));
+            }
+            result
+        }));
+    let mempool = t.node.mempool().clone();
+    let tx = tx.clone();
+    let add = std::thread::spawn(move || mempool.add(tx, Amount::from_sat(FEE)));
+    checks_done.recv().unwrap();
+    HeldAdd { resume, add }
+}
+
+impl HeldAdd {
+    fn finish(self) {
+        let _ = self.resume.send(());
+        // Accepted or refused, as long as it does not stay with a spent input
+        let _ = self.add.join().unwrap();
+    }
+}
+
+/// A send checked against the chain just before a block spending the same
+/// coin connects does not stay in the mempool once the block's transactions
+/// are cleaned out of it. Divi Core checks a transaction and connects a block
+/// under the same lock (cs_main: main.cpp:726, ChainTipManager.cpp:139-141),
+/// so a send either sees the block (refused, inputs spent) or is in the
+/// mempool when the block removes its conflicts.
+#[test]
+fn a_send_checked_before_a_block_spends_its_coin_does_not_stay() {
+    let t = TestNode::new();
+    let coin = t.mature_coins(1)[0];
+    let send = t.spend(coin, 1250 * COIN);
+    let double_spend = spend_with_fee(&t.key, coin, 1250 * COIN, 2 * FEE);
+
+    let held = add_held_after_its_checks(&t, &send);
+    // The block comes while the send is between its checks and its insert:
+    // connected, then the mempool cleaned of what it confirms and conflicts with
+    let block = t.block_on(t.tip(), 0, std::slice::from_ref(&double_spend));
+    t.node.accept_block(block).unwrap();
+    held.finish();
+
+    assert!(
+        !t.in_mempool(&send),
+        "a send whose coin the chain spent is not in the mempool"
+    );
+    assert_eq!(t.node.mempool().size(), 0);
+}
+
+/// The same across a reorganisation: a send checked against the old branch,
+/// added while the chain moves to a branch that spends its coin, does not
+/// stay in the mempool after the reorganisation's cleanup.
+#[test]
+fn a_send_checked_before_a_reorg_spends_its_coin_does_not_stay() {
+    let t = TestNode::new();
+    let coin = t.mature_coins(1)[0];
+    let fork = t.tip();
+    t.mine(&[]);
+    let send = t.spend(coin, 1250 * COIN);
+    let double_spend = spend_with_fee(&t.key, coin, 1250 * COIN, 2 * FEE);
+
+    let held = add_held_after_its_checks(&t, &send);
+    let orphaned = t.branch(fork, 2, std::slice::from_ref(&double_spend));
+    update_mempool_after_reorg(t.node.chain(), t.node.mempool(), orphaned);
+    held.finish();
+
+    assert!(
+        !t.in_mempool(&send),
+        "a send whose coin the new chain spent is not in the mempool"
+    );
+    assert_eq!(t.node.mempool().size(), 0);
+}
