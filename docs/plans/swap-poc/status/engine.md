@@ -1359,3 +1359,41 @@ The Manager's rulings on the DJ2 report. Testnet only, $0, not pushed.
   - EX's `maker_lock_unread` reads the maker leg's MTP straight from the backend. A maker-leg MTP that is held (EV: a BTC, USDC or DIVI second source) therefore keeps the retry there, so `claim_declined` is not written; EV's wall-clock fallback is not applied at that point. Nothing is revealed and the taker's refund check still runs first on every step. Only the record is missing. Kept as both lines wrote it (no behaviour beyond the union); a later lane can route it through `hold::median_time_past`.
   - Row 3 of `single-source-design.md` still says ET's read has "no deadline". EX did not edit that row; the README and this file describe EX's deadline.
   - Phase 2 (FA's T32-16, FB's T32-13) is a later brief. Not pushed. No live run.
+
+## 2026-10-28 round: taker-lock-unread-held-mtp FC (builder FC, `lane/taker-lock-unread-held-mtp`, on 132bf35; T32-19, FO-IA-1)
+- why: IA's `left:` (first item). EX's `Taker::maker_lock_unread` declines the first claim once the claim deadline passes while the maker's lock stays unreadable, but it read the maker leg's MTP straight from the backend and turned any MTP error into a retry. With an EV second source (BTC `[btc].quorum_reads`, the USDC quorum, DIVI `fallback_rpc_url`) down, that MTP read is itself `SwapError::Held`, so the swap retried for ever and `claim_declined` was never written: the decline EX promised did not happen in the case it was meant for. Nothing was revealed, and the taker's refund check still ran first on every step, so only the record was missing.
+- test (fail-first, `crates/divi-swap/tests/bounded_read_hold.rs`; the mock gained `MockChain::fail_lock_reads`, which fails `htlc_output` alone):
+  - `fc_an_unread_maker_lock_with_a_held_mtp_declines_the_claim_and_the_taker_refunds`: for both of EV's hold messages (second source down; the two disagree), with the wall clock past the claim margin, the first taker step writes `claim_declined` naming the lock read's error and the hold. Nothing is claimed or revealed. The taker leg does not refund one second before its locktime and refunds after it. Nothing is read or built on the primary alone.
+  - guard `..._before_the_margin_retries`: with the wall clock before the margin, the lock read's error is returned (retry) and nothing is declined.
+  - control `..._with_a_plain_mtp_error_retries`: an MTP that fails with a plain error (not `Held`) keeps the retry, as before, even far past the margin.
+  - on the base, the first test fails: the step returns `Err(Transient(<the lock read>))`. The guard and the control pass.
+- fix: the MTP read in `maker_lock_unread` goes through `first_claim_time`, the judging the first claim already uses in `on_maker_lock_confirmed`: the maker leg's MTP, or the wall clock with the hold while that MTP is held. The reason adds `(judged on the wall clock: the maker leg's MTP is held: <hold>)` in front of the lock read's error. `hold::median_time_past` was not used. Its `RefundRead` keeps holding until a refund deadline, one margin after a locktime. On the maker leg it would answer only after the maker could already refund, long after the claim deadline (`locktime - margin`). The wall clock runs ahead of MTP, so this route can only bring the decline earlier, never later. No other behaviour changed, and no existing test's expectation changed.
+- the other raw maker-leg MTP reads in `taker.rs`:
+  - `on_locked`, after a lock read that succeeded (`mb.median_time_past().await?`, used for the claim-deadline check and EP's exact floor against the maker's stated MTP): a held MTP returns `Held` and is retried, so `claim_declined` is not written while it lasts. This is the same trap shape, but no failing test was written: a wall-clock fallback there would also feed `check_maker_leg_locktime_exact`, which compares chain MTPs. That needs a decision, so it is left open (below). Nothing is revealed meanwhile, and the refund check still runs first.
+  - `first_claim_time`: this is the held-MTP path itself (wall clock while held). No trap.
+  - `prepare`'s MTP read (about line 286) is the taker leg's, not the maker leg's. It is out of scope.
+- gates (hp1, own target dir, `nice -n 10`, `-j 8`, `--test-threads=8`, heavy-start before every cargo step; code at b3e20df, the docs edits uncommitted):
+
+  | gate | passed | failed | ignored | load5 start / end |
+  |---|---|---|---|---|
+  | fmt `--check` | clean | | | 16.45 / 16.45 |
+  | clippy `--workspace --all-targets -D warnings` | clean | | | 23.21 / 25.34 |
+  | divi-swap | 474 | 0 | 0 | 17.75 / 16.88 |
+  | divi-swapd (under the e2e_xmr flock) | 190 | 0 | 0 | 10.62 / 7.21 |
+  | divi-swap-cli | 84 | 0 | 0 | 14.98 / 18.41 |
+  | divi-swap-xmr | 92 | 0 | 0 | 17.74 / 12.01 |
+  | swap-chain-divi | 84 | 0 | 1 | 12.01 / 12.35 |
+  | swap-chain-evm | 48 | 0 | 2 | 12.35 / 12.14 |
+  | swap-chain-ltc | 101 | 0 | 2 | 11.94 / 11.52 |
+  | swap-chain-zec | 93 | 0 | 4 | 11.52 / 10.65 |
+  | swap-chain-btc | 72 | 0 | 1 | 10.65 / 10.79 |
+  | claim_race `PROPTEST_CASES=5000` | 16 | 0 | 0 | 6.88 / 5.23 |
+  | maker_claim_race `PROPTEST_CASES=5000` | 8 | 0 | 0 | 5.23 / 3.72 |
+
+  IA's counts plus the three new divi-swap tests (471 + 3); every other crate is unchanged.
+- docs: `single-source-design.md` row 3 no longer says ET's lock reads wait with "no deadline". It names EX's deadlines (the maker aborts before funding, the taker declines before revealing) and this round's held-MTP judging.
+- left:
+  - `on_locked`'s MTP read after a successful lock read (above) is still raw. Whether a held MTP there should decline on the wall clock, and what EP's exact floor should do without a chain MTP, is a decision.
+  - Row 2 (LTC) of `single-source-design.md` still says "Lock reads before funding stay fail-closed with no deadline". EX's maker deadline (`taker_lock_unread`) covers every backend; this lane edited only row 3, as briefed.
+  - The wall clock is the host's own and is trusted as in EV; a host clock far ahead declines early (both legs refund, nothing lost).
+  - No live run (mocks only, no funds). Not pushed.
