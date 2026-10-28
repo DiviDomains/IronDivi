@@ -542,6 +542,49 @@ fn blocknotify_and_walletnotify_run_their_commands() {
     );
 }
 
+/// divid signals a new tip only out of the initial block download
+/// (ChainExtensionService.cpp:556-565, init.cpp:113-119): on a chain whose
+/// tip is a day old, the tips invalidateblock and reconsiderblock make run no
+/// -blocknotify; the first block the node makes, dated now, ends the
+/// download and runs it
+#[test]
+fn blocknotify_waits_for_the_end_of_the_initial_download() {
+    let dir = tempfile::tempdir().unwrap();
+    let hd = HdWallet::from_mnemonic(MNEMONIC, None, ChainMode::Divi).unwrap();
+    let first = WalletDb::with_hd_wallet(Network::Regtest, hd)
+        .new_receiving_address()
+        .unwrap();
+    mine_offline(dir.path(), &first, 25);
+    let blocks = dir.path().join("blocks.txt");
+    std::fs::write(
+        dir.path().join("divi.conf"),
+        format!("blocknotify=echo %s >> {}\n", blocks.display()),
+    )
+    .unwrap();
+    let rpc_port = free_port();
+    let daemon = Daemon::start(
+        &divid_args(dir.path(), rpc_port),
+        &[("WALLET_MNEMONIC", MNEMONIC), ("WALLET_LOOKAHEAD", "5")],
+        rpc_port,
+        true,
+    );
+    let old = daemon.rpc("getbestblockhash", json!([]));
+    daemon.rpc("invalidateblock", json!([old]));
+    daemon.rpc("reconsiderblock", json!([old]));
+    daemon.rpc("setgenerate", json!([1]));
+    let new = daemon.rpc("getbestblockhash", json!([]));
+    let new = new.as_str().unwrap().to_string();
+    let read = || std::fs::read_to_string(&blocks).unwrap_or_default();
+    assert!(
+        eventually(|| read().lines().any(|l| l == new)),
+        "blocknotify wrote: {:?}",
+        read()
+    );
+    // Each command runs on its own thread; give any late one time to write
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(read().lines().collect::<Vec<_>>(), vec![new.as_str()]);
+}
+
 /// -rescan scans the wallet from the first block when it loads
 /// (init.cpp:1242, wallet.cpp:279-313), and -salvagewallet sets -rescan
 /// (init.cpp:763-766): a key imported without a rescan shows its coins after
