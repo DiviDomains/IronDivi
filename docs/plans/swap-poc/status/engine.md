@@ -1327,3 +1327,35 @@ The Manager's rulings on the DJ2 report. Testnet only, $0, not pushed.
   - recommended first slice: F1 (taker `--divi-rpc-url`, mainnet warning or refusal without a DIVI source off the default's domain) with F4's CLI part (EH's operator check as a shared helper; the daemon's ZEC mainnet second-operator rule in the taker CLI, which has none, `main.rs:642-652`). Then F2 (mainnet value caps) and F3 (own divid and zebrad+lightwalletd on the maker host).
   - decisions for Bert named in the note's §5: the taker CLI's mainnet start rule (refuse vs warn), cap numbers, whether a mainnet second source must be own/loopback, how strict the operator rule is (PSL, IP, ASN), a schema field for the answer audit trail, a ZEC header checkpoint as a trust anchor.
   - no third-party fact checked (no network); operator identities rest on `colluding-endpoints.FACTS.md` rows marked "could not verify"; whether lightwalletd serves full headers (F8) not verified.
+
+## 2026-10-28 round: integ-t32 IA (builder IA, `lane/integ-t32`, on c39780b; T32-18 phase 1, Manager ruling A)
+- what: one merge commit, `b758dc7`, joins the EX line (`ab2dcfd`: EH, EM, ET, EW, EX) into the EY line (`c39780b`: EE ... EM, EU, EV, EY). Both are ancestors of it. No rebase, squash or cherry-pick. No behaviour changed beyond what the union needs, and no fix commit was needed.
+- finding: EH and EM are on both lines with the same content (`git diff f456c8f 50d643c` is empty for every divi-swap and swap-chain-zec file). Past EM, the EX line changed only `maker.rs`, `taker.rs`, swap-chain-zec and docs, and the EY line changed no swap-chain-zec file. Each of the 13 conflicts is therefore one side's change against EM's unchanged text. No conflict has two different behaviours.
+- resolutions:
+  - `hold.rs`, `claim_fee.rs`, `backend.rs`, `mock.rs`, `tests/bounded_hold.rs`: the EY line's semantics win (EU keeps holding a public-preimage claim, EV's read holds). The EX side is EM's text, which ET, EW and EX never touched. The result equals c39780b.
+  - swap-chain-zec `crosscheck.rs`, `lib.rs`, `lwd_stub.rs`: the EX line's semantics win (ET lock agreement, EW txid binding, EX's 20 s lock-read budget and failing-for count). The EY side is EM's text. The result equals ab2dcfd.
+  - `taker.rs`: combined. EX's `maker_lock_unread` (decline the first claim at its margin when the maker-lock read keeps failing) is added. EV's held-MTP wall-clock rule in `on_maker_lock_confirmed` stays; EX did not change it. `maker.rs` auto-merged with EX's `taker_lock_unread`. Both files equal c39780b plus EX's diff, exactly.
+  - `divi-swapd.toml.example`: the EY line (EK's `[zec] expiry_start` line). README `[zec]`: the EX side, which already has the EU-ruling text from EW plus the ET, EX and EW notes. `single-source-design.md`: the EY rows, and in row 3 the EY text plus ET's sentence and `htlc_output` as a code site. This file: every round of both lines, by date and then by the time of each round's docs commit (ET after EM, whose code it is on). EL's and EU's `left:` items closed by the other line are marked.
+- gates on b758dc7 (hp1, own target dir, `nice -n 10`, `-j 8`, `--test-threads=8`, heavy-start before every cargo step; a step counts only if load5 is at most 35 at its start and end):
+
+  | gate | passed | failed | ignored | load5 start / end |
+  |---|---|---|---|---|
+  | fmt `--check` | clean | | | 21.82 / 21.82 |
+  | clippy `--workspace --all-targets -D warnings` | clean | | | 22.75 / 22.75 (first run ended at 45.06; re-run) |
+  | divi-swap | 471 | 0 | 0 | 21.68 / 33.80 |
+  | divi-swapd (under the e2e_xmr flock) | 190 | 0 | 0 | 21.24 / 28.32 |
+  | divi-swap-cli | 84 | 0 | 0 | 16.22 / 15.97 |
+  | divi-swap-xmr | 92 | 0 | 0 | 15.97 / 22.20 |
+  | swap-chain-divi | 84 | 0 | 1 | 22.11 / 30.39 |
+  | swap-chain-evm | 48 | 0 | 2 | 27.97 / 29.05 |
+  | swap-chain-ltc | 101 | 0 | 2 | 27.44 / 26.04 |
+  | swap-chain-zec | 93 | 0 | 4 | 24.81 / 21.49 |
+  | swap-chain-btc | 72 | 0 | 1 | 17.17 / 19.37 |
+  | claim_race `PROPTEST_CASES=5000` | 16 | 0 | 0 | 26.11 / 23.18 |
+  | maker_claim_race `PROPTEST_CASES=5000` | 8 | 0 | 0 | 18.87 / 16.98 |
+
+  These counts equal EV's (EY line) for every crate except swap-chain-zec, which is EX's 93 (EY line: 60).
+- left:
+  - EX's `maker_lock_unread` reads the maker leg's MTP straight from the backend. A maker-leg MTP that is held (EV: a BTC, USDC or DIVI second source) therefore keeps the retry there, so `claim_declined` is not written; EV's wall-clock fallback is not applied at that point. Nothing is revealed and the taker's refund check still runs first on every step. Only the record is missing. Kept as both lines wrote it (no behaviour beyond the union); a later lane can route it through `hold::median_time_past`.
+  - Row 3 of `single-source-design.md` still says ET's read has "no deadline". EX did not edit that row; the README and this file describe EX's deadline.
+  - Phase 2 (FA's T32-16, FB's T32-13) is a later brief. Not pushed. No live run.
