@@ -80,6 +80,13 @@ struct Cli {
     /// the xmr arm.
     #[arg(long, global = true)]
     divi_fallback_rpc_url: Option<String>,
+    /// On `--profile mainnet`, start although every DIVI source (`--divi-rpc-url`, or the
+    /// default proxy, and `--divi-fallback-rpc-url`) is one operator's, which is refused
+    /// without it; a warning is then printed at every start (one lying or broken endpoint is
+    /// trusted). Off by default, as the daemon's `allow_single_source`. DIVI only; the ZEC
+    /// arm's one-operator case is a warning, and the xmr arm is not covered.
+    #[arg(long, global = true)]
+    allow_single_source: bool,
     /// Where the DIVI lock-expiry sweep may start counting a dropped lock's absent blocks:
     /// `tip` (default) counts at once from a tip whose own time is within two spacings of
     /// the clock; `mtp` waits until the node's median time past reaches the first absent
@@ -634,11 +641,12 @@ fn divi_rpc_url(cli: &Cli, network: divi_wallet::address::Network) -> String {
         .to_string()
 }
 
-/// The start warnings about who runs the taker's read sources, one per chain at most, on a
-/// mainnet profile only: every DIVI source on the default proxy's operator, and (with
-/// `--counter-chain zec`) one lightwalletd operator with no `--zec-crosscheck-url`
-/// ([`divi_swap_cli::sources`]). The xmr arm's DIVI side is not covered.
-fn taker_source_warnings(cli: &Cli) -> Vec<String> {
+/// The start checks of who runs the taker's read sources, on a mainnet profile only
+/// ([`divi_swap_cli::sources`]): every DIVI source on the default proxy's operator is
+/// refused (`Err`) unless `--allow-single-source`, and then warned; (with `--counter-chain
+/// zec`) one lightwalletd operator with no `--zec-crosscheck-url` is warned. At most one
+/// warning per chain. The xmr arm's DIVI side is not covered.
+fn taker_source_warnings(cli: &Cli) -> Result<Vec<String>> {
     let mainnet = cli.profile == divi_swap::Profile::Mainnet;
     let mut out = Vec::new();
     if cli.counter_chain == Chain::Zec {
@@ -666,13 +674,17 @@ fn taker_source_warnings(cli: &Cli) -> Vec<String> {
                 .filter(|u| !u.is_empty())
                 .map(String::from),
         );
-        out.extend(divi_swap_cli::sources::divi_warning(
-            mainnet,
-            swap_chain_divi::default_rpc(network),
-            &sources,
-        ));
+        out.extend(
+            divi_swap_cli::sources::check_divi(
+                mainnet,
+                cli.allow_single_source,
+                swap_chain_divi::default_rpc(network),
+                &sources,
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))?,
+        );
     }
-    out
+    Ok(out)
 }
 
 fn live_backends(cli: &Cli) -> Result<Backends> {
@@ -726,9 +738,10 @@ fn live_backends(cli: &Cli) -> Result<Backends> {
         cli.allow_mainnet,
     )?;
     guard_profile(cli)?;
-    // Mainnet ships these as warnings (no ruling yet on the taker start rule); a refusal is
-    // this one line as `bail!("{w}")`.
-    for w in taker_source_warnings(cli) {
+    // T32-20 (Manager ruling 2, 2026-10-28, provisional on Bert's 2026-10-26 "single-source
+    // stays opt-in and off on mainnet"): one DIVI operator is refused here unless
+    // `--allow-single-source`; what is left is warned at every start.
+    for w in taker_source_warnings(cli)? {
         tracing::warn!("{w}");
     }
     let divi_network = if cli.divi_network == "mainnet" {
@@ -3888,24 +3901,27 @@ mod tests {
 
     fn divi_warnings(cli: &Cli) -> Vec<String> {
         taker_source_warnings(cli)
+            .unwrap()
             .into_iter()
             .filter(|w| w.starts_with("DIVI"))
             .collect()
     }
 
-    /// On `--profile mainnet`, a taker whose every DIVI source is the default proxy or under
-    /// its registrable domain gets one warning naming the endpoint and the risk; an own
-    /// primary, or a second source of another operator, gets none. Testnet: nothing new.
+    /// On `--profile mainnet` with `--allow-single-source` (without it the start is refused:
+    /// T32-20), a taker whose every DIVI source is the default proxy or under its registrable
+    /// domain gets one warning naming the endpoint and the risk; an own primary, or a second
+    /// source of another operator, gets none. Testnet: nothing new.
     #[test]
     fn mainnet_taker_on_the_default_divi_proxy_only_is_warned() {
         let proxy = swap_chain_divi::MAINNET_RPC;
         for extra in [
-            &[][..],
+            &["--allow-single-source"][..],
             &[
+                "--allow-single-source",
                 "--divi-fallback-rpc-url",
                 "https://other.services.divi.domains/rpc/",
             ][..],
-            &["--divi-rpc-url", proxy][..],
+            &["--allow-single-source", "--divi-rpc-url", proxy][..],
         ] {
             let w = divi_warnings(&mainnet_cli("btc", extra));
             assert_eq!(w.len(), 1, "{extra:?}: {w:?}");
@@ -3922,20 +3938,34 @@ mod tests {
                 "{extra:?}"
             );
         }
-        assert!(taker_source_warnings(&cli(&[])).is_empty());
-        assert!(taker_source_warnings(&cli(&["--counter-chain", "zec"])).is_empty());
+        assert!(taker_source_warnings(&cli(&[])).unwrap().is_empty());
+        assert!(taker_source_warnings(&cli(&["--counter-chain", "zec"]))
+            .unwrap()
+            .is_empty());
     }
 
     /// On `--profile mainnet` with `--counter-chain zec`, one lightwalletd operator and no
     /// `--zec-crosscheck-url` is warned (the daemon's rule, as a warning); a second operator
-    /// silences it, and no other counter chain gets it.
+    /// silences it, and no other counter chain gets it. The DIVI side is an own node here, so
+    /// the DIVI single-source refusal stays out of the way.
     #[test]
     fn mainnet_taker_on_one_zec_operator_is_warned() {
         let zec = |cli: &Cli| -> Vec<String> {
             taker_source_warnings(cli)
+                .unwrap()
                 .into_iter()
                 .filter(|w| w.starts_with("ZEC"))
                 .collect()
+        };
+        let mainnet_cli = |counter: &str, extra: &[&str]| {
+            mainnet_cli(
+                counter,
+                &[
+                    &["--divi-rpc-url", "https://divi.own-node.example:51473"],
+                    extra,
+                ]
+                .concat(),
+            )
         };
         let w = zec(&mainnet_cli("zec", &[]));
         assert_eq!(w.len(), 1, "{w:?}");
