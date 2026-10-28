@@ -587,3 +587,111 @@ async fn without_a_hold_nothing_is_read_on_the_primary_alone() {
         assert!(c.primary_only_builds().is_empty());
     }
 }
+
+// ---- FC: the maker-lock read fails while the maker leg's MTP is held ----------------------
+
+/// What a maker-lock read says while it keeps failing (EX: a second source down).
+const LOCK_UNREAD: &str = "htlc_output: second source unavailable: connection refused";
+
+fn lock_unread() -> SwapError {
+    SwapError::Transient(LOCK_UNREAD.into())
+}
+
+/// The maker's lock cannot be read (EX) and the maker leg's MTP is held for its second
+/// source (EV). The claim deadline is judged on the wall clock, as for the first claim: past
+/// it the claim is declined for good, naming the lock read and the hold, nothing is revealed,
+/// and the taker leg refunds at its locktime.
+#[tokio::test]
+async fn fc_an_unread_maker_lock_with_a_held_mtp_declines_the_claim_and_the_taker_refunds() {
+    for why in HOLDS {
+        let w = world_at(past_t0());
+        let store = Store::in_memory().unwrap();
+        let (maker, taker) = (maker(&w, &store), taker(&w, &store));
+        let (tid, mid) = to_maker_lock_confirmed(&w, &maker, &taker).await;
+        w.btc.fail_lock_reads(Some(lock_unread()));
+        w.btc.hold_mtp(Some(why));
+
+        assert_eq!(
+            tstep(&taker, &maker, &tid, &mid).await.unwrap(),
+            TakerState::Locked,
+            "{why}"
+        );
+        let rec = store.get_taker_swap(&tid).unwrap().unwrap();
+        let reason = rec.claim_declined.clone().expect("declined");
+        assert!(reason.contains(LOCK_UNREAD), "{why}: {reason}");
+        assert!(reason.contains(why), "{why}: {reason}");
+        assert!(rec.maker_leg_htlc.is_none() && rec.maker_leg_claim.is_none());
+
+        // Nothing is claimed before the taker leg's locktime, nor revealed.
+        let v = view(&maker, &mid);
+        set_mtp(&w.divi, taker_locktime(&v) - 1);
+        assert_eq!(
+            tstep(&taker, &maker, &tid, &mid).await.unwrap(),
+            TakerState::Locked
+        );
+        assert!(store
+            .get_taker_swap(&tid)
+            .unwrap()
+            .unwrap()
+            .taker_leg_refund
+            .is_none());
+
+        set_mtp(&w.divi, taker_locktime(&v) + 1);
+        for _ in 0..20 {
+            w.divi.mine(1);
+            let _ = tstep(&taker, &maker, &tid, &mid).await;
+        }
+        let rec = store.get_taker_swap(&tid).unwrap().unwrap();
+        assert_eq!(rec.state, TakerState::Done, "{why}");
+        assert!(rec.taker_leg_refund.is_some() && rec.maker_leg_claim.is_none());
+        let mv = view(&maker, &mid);
+        assert!(mv.preimage.is_none(), "the preimage was never revealed");
+        let at = mv.maker_leg.as_ref().unwrap().outpoint.unwrap();
+        assert_eq!(w.btc.tx_counts(&at).claim_attempts, 0, "no claim was sent");
+        assert!(w.btc.primary_only_builds().is_empty());
+        assert!(no_primary_reads(&w.btc));
+        assert_eq!(w.btc.balance(&w.tbtc.pubkey()).0, FUNDS, "taker got no BTC");
+    }
+}
+
+/// Guard: with the wall clock still before the claim margin, an unread maker lock with a
+/// held MTP keeps the retry (the lock read's error) and declines nothing.
+#[tokio::test]
+async fn fc_an_unread_maker_lock_with_a_held_mtp_before_the_margin_retries() {
+    for why in HOLDS {
+        let w = world();
+        let store = Store::in_memory().unwrap();
+        let (maker, taker) = (maker(&w, &store), taker(&w, &store));
+        let (tid, mid) = to_maker_lock_confirmed(&w, &maker, &taker).await;
+        w.btc.fail_lock_reads(Some(lock_unread()));
+        w.btc.hold_mtp(Some(why));
+        set_mtp(&w.btc, maker_locktime(&view(&maker, &mid)) + 1);
+        match tstep(&taker, &maker, &tid, &mid).await {
+            Err(SwapError::Transient(m)) => assert_eq!(m, LOCK_UNREAD),
+            other => panic!("{why}: expected the lock read's error, got {other:?}"),
+        }
+        let rec = store.get_taker_swap(&tid).unwrap().unwrap();
+        assert!(rec.claim_declined.is_none() && rec.maker_leg_claim.is_none());
+        assert!(no_primary_reads(&w.btc));
+    }
+}
+
+/// Control: an MTP that fails with a plain error (not a hold) keeps the retry, as before,
+/// even with the wall clock long past the claim margin.
+#[tokio::test]
+async fn fc_an_unread_maker_lock_with_a_plain_mtp_error_retries() {
+    let w = world_at(past_t0());
+    let store = Store::in_memory().unwrap();
+    let (maker, taker) = (maker(&w, &store), taker(&w, &store));
+    let (tid, mid) = to_maker_lock_confirmed(&w, &maker, &taker).await;
+    w.btc.fail_with(Some(lock_unread()));
+    for _ in 0..3 {
+        match tstep(&taker, &maker, &tid, &mid).await {
+            Err(SwapError::Transient(m)) => assert_eq!(m, LOCK_UNREAD),
+            other => panic!("expected the lock read's error, got {other:?}"),
+        }
+    }
+    let rec = store.get_taker_swap(&tid).unwrap().unwrap();
+    assert_eq!(rec.state, TakerState::Locked);
+    assert!(rec.claim_declined.is_none() && rec.maker_leg_claim.is_none());
+}
