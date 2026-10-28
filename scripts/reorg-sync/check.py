@@ -640,6 +640,10 @@ def tie_rows(label, first, other):
         (tip(C3) == first) == (tip(I1) == first))
 
 
+# One block more first: the block below both then has no sibling of equal work (H leaves one under its tip,
+# and after the restart in split() divid orders two loaded blocks by their address in memory)
+mine(C1, 1)
+need(one_tip(), "the nodes did not follow bridge L's block")
 fork_i = tip(C3)
 split()
 mine(C1, 1)

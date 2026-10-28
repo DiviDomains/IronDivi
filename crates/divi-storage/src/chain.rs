@@ -9081,6 +9081,32 @@ mod tests {
         assert_eq!(chain.tip().unwrap().hash, hash_a1, "as divid: loaded first");
     }
 
+    /// A block first connected as the target of a reorganization, then left
+    /// by another, is a valid-fork tip as divid shows it: its stored index
+    /// keeps BLOCK_VALID_SCRIPTS (getchaintips, rpcblockchain.cpp), which the
+    /// disconnect must not write back from an older copy.
+    #[test]
+    fn a_reorganization_target_left_again_stays_a_valid_fork() {
+        let (chain, _dir) = create_test_chain();
+        let (genesis_hash, genesis_time) = get_genesis_info(&chain);
+        let a1 = create_child_block_with_pubkey(genesis_hash, genesis_time, [0x0a; 20]);
+        let hash_a1 = chain.accept_block(a1.clone()).unwrap().hash;
+        let b1 = create_child_block_with_pubkey(genesis_hash, genesis_time + 1, [0x1a; 20]);
+        let hash_b1 = chain.accept_block(b1.clone()).unwrap().hash;
+        let b2 = create_child_block_with_pubkey(hash_b1, b1.header.time, [0x1b; 20]);
+        let hash_b2 = chain.accept_block(b2).unwrap().hash;
+        assert_eq!(chain.tip().unwrap().hash, hash_b2, "reorganized to B");
+        let a2 = create_child_block_with_pubkey(hash_a1, a1.header.time, [0x0b; 20]);
+        let hash_a2 = chain.accept_block(a2.clone()).unwrap().hash;
+        let a3 = create_child_block_with_pubkey(hash_a2, a2.header.time, [0x0c; 20]);
+        let hash_a3 = chain.accept_block(a3).unwrap().hash;
+        assert_eq!(chain.tip().unwrap().hash, hash_a3, "reorganized back to A");
+
+        let tips = chain.get_chain_tips().unwrap();
+        let b2_tip = tips.iter().find(|t| t.hash == hash_b2).unwrap();
+        assert_eq!(b2_tip.status, ChainTipStatus::ValidFork, "{tips:?}");
+    }
+
     /// repair_height_index restores entries a pre-fix build corrupted and
     /// removes entries above the tip.
     #[test]
