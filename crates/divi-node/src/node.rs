@@ -892,21 +892,10 @@ impl Node {
                         alerts_known.remove(&peer_id);
                     }
                     PeerEvent::Message { peer_id, message } => {
-                        // Log all message types at INFO for debugging sync issues
+                        // Per message, so DEBUG: at INFO, initial sync filled the
+                        // 1 MB debug.log in seconds (the "Sync progress" line reports it)
                         let cmd = message.command();
-                        if cmd == "block" || cmd == "notfound" {
-                            tracing::info!(
-                                "Received P2P message from peer {}: {} (size: {} bytes)",
-                                peer_id,
-                                cmd,
-                                match &message {
-                                    NetworkMessage::Block(b) => b.transactions.len() * 200, // rough estimate
-                                    _ => 0,
-                                }
-                            );
-                        } else {
-                            tracing::debug!("Received P2P message from peer {}: {}", peer_id, cmd);
-                        }
+                        tracing::debug!("Received P2P message from peer {}: {}", peer_id, cmd);
 
                         match message {
                             NetworkMessage::Headers(headers) => {

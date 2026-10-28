@@ -1391,7 +1391,7 @@ impl BlockSync {
                         .take(3)
                         .map(|b| format!("{}", b.header.prev_block))
                         .collect();
-                    info!(
+                    debug!(
                         "try_connect_blocks_by_prev: tip={}, downloaded={} blocks, sample prev_blocks: {:?}",
                         tip_hash, downloaded.len(), sample_prev
                     );

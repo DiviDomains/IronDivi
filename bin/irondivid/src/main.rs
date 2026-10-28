@@ -1258,6 +1258,14 @@ fn init_logging(log_config: &LogConfig, data_dir: &PathBuf) {
             "Log rotation: max {} bytes per file, {} files kept",
             log_config.max_file_size, log_config.max_files
         );
+        // In the foreground the console stays quiet once started, which read as
+        // a hang or an exit to new users
+        if !std_is_log {
+            eprintln!(
+                "Running in the foreground; Ctrl+C stops the node. Follow it with: tail -f {:?}",
+                data_dir.join("debug.log")
+            );
+        }
     }
 }
 
