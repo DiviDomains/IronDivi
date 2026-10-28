@@ -117,7 +117,7 @@ fn interrupted_reorg_is_finished_at_start() {
     drop(chain);
 
     let chain = open_chain(dir.path(), true, false);
-    assert!(chain.finish_interrupted_reorg().unwrap());
+    assert!(chain.finish_interrupted_reorg().unwrap().is_some());
     assert_eq!(chain.tip().unwrap().hash, b3_hash);
     assert_eq!(chain.height(), 3);
     chain.verify_recent_blocks(100).unwrap();
@@ -125,7 +125,7 @@ fn interrupted_reorg_is_finished_at_start() {
     // Nothing left to finish at the next start
     drop(chain);
     let chain = open_chain(dir.path(), true, false);
-    assert!(!chain.finish_interrupted_reorg().unwrap());
+    assert!(chain.finish_interrupted_reorg().unwrap().is_none());
     assert_eq!(chain.tip().unwrap().hash, b3_hash);
 }
 
