@@ -1365,10 +1365,11 @@ impl BlockSync {
         // Divi Core announces the new tip to its peers each time the tip moves,
         // outside initial download (ChainExtensionService.cpp:553-565,
         // NotifyPeersOfNewChainTip net.cpp:1490-1497): the tip, not the block
-        // that came, which may be one of several that connected at once
+        // that came, which may be one of several that connected at once. The
+        // initial download is read after the tip moved, so the tip that ends
+        // it is announced
         if let Some(tip) = self.chain.tip().filter(|t| Some(t.hash) != tip_before) {
-            let best_height = *self.best_peer_height.read();
-            if best_height.saturating_sub(tip.height) < 10 {
+            if !self.chain.is_initial_block_download() {
                 if tip.hash == hash {
                     // The peer that sent it has it
                     self.peer_manager
@@ -4391,11 +4392,17 @@ mod tests {
     /// When a block lets blocks already received connect after it, the peers are
     /// told of the new tip, as Divi Core announces the tip each time it moves
     /// (ChainExtensionService.cpp:553-565, net.cpp:1490-1497); the block that
-    /// came is only the middle of the chain they need
+    /// came is only the middle of the chain they need. The blocks are dated now,
+    /// out of the initial download
     #[tokio::test]
     async fn the_new_tip_is_announced_when_held_blocks_connect() {
         let (sync, mut rxs, _dir) = sync_with_peers(2);
-        let parent = next_block(&sync.chain);
+        let mut parent = next_block(&sync.chain);
+        parent.header.time = divi_primitives::clock::now() as u32;
+        let target = Hash256::from_compact(parent.header.bits);
+        while compute_block_hash(&parent.header) > target {
+            parent.header.nonce += 1;
+        }
         let parent_hash = compute_block_hash(&parent.header);
         let tip = sync.chain.tip().unwrap();
         let mut child = parent.clone();

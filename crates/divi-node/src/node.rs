@@ -2893,7 +2893,6 @@ impl Node {
             .unwrap_or(1.0);
 
         let sync_progress = self.block_sync.progress();
-        let sync_state = sync_progress.state;
         let headers = sync_progress.headers_downloaded.max(height);
         let target_height = sync_progress.target_height.max(height);
 
@@ -2903,8 +2902,9 @@ impl Node {
             1.0
         };
 
-        let initial_block_download =
-            sync_state != SyncState::Synced && target_height > height + 144;
+        // Divi Core's IsInitialBlockDownload (ChainSyncHelpers.cpp:33-50), the
+        // state the chain keeps, not the sync's progress
+        let initial_block_download = self.chain.is_initial_block_download();
 
         BlockchainInfo {
             chain: match self.config.network.network_type {
