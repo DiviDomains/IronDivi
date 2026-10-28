@@ -166,7 +166,8 @@ def netaddr(ip="0.0.0.0", port=0):
 
 class Peer:
     """A script peer from 127.0.0.10 (one address: one time sample, which alone moves no offset) that offers blocks
-    with an inv and serves the header and the block when asked, and keeps the reject messages it is sent"""
+    with an inv and serves the header and the block when asked, and keeps the reject messages and the block invs it
+    is sent"""
 
     def __init__(self, node):
         self.s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -178,6 +179,7 @@ class Peer:
         self.s.sendall(frame("version", version))
         self.offers = {}
         self.rejects = []
+        self.invs = []
         self.lock = threading.Lock()
         self.alive = True
         while self.read()[0] != "verack":
@@ -211,6 +213,16 @@ class Peer:
                 elif cmd == "reject":
                     with self.lock:
                         self.rejects.append(payload)
+                elif cmd == "inv":
+                    # Count, then entries of a type and a hash; type 2 is a block
+                    n, at = payload[0], 1
+                    if n == 0xfd:
+                        n, at = struct.unpack("<H", payload[1:3])[0], 3
+                    with self.lock:
+                        for k in range(n):
+                            e = payload[at + 36 * k:at + 36 * (k + 1)]
+                            if struct.unpack("<I", e[:4])[0] == 2:
+                                self.invs.append(e[4:][::-1].hex())
                 elif cmd == "getheaders":
                     for header, _ in self.offers.values():
                         self.s.sendall(frame("headers", b"\x01" + header + b"\x00"))
@@ -238,6 +250,10 @@ class Peer:
                 m = p[2 + n]
                 out.append((msg, code, p[3 + n:3 + n + m].decode(errors="replace")))
         return out
+
+    def block_invs(self):
+        with self.lock:
+            return list(self.invs)
 
     def close(self):
         self.alive = False
@@ -418,6 +434,7 @@ finally:
 # --- part 2: blocks a divid makes, offered to a divid and an irondivid on chosen clocks -----------------------------
 
 maker = core = iron = None
+watchers = {}
 try:
     maker = Node("maker", DIVID, 2)
     core = Node("divid-2", DIVID, 3)
@@ -434,6 +451,9 @@ try:
         best = maker.rpc("getbestblockhash")
         hexes.append((maker.rpc("getblock", best, False), best))
 
+    # A second peer on each node, which offers nothing and keeps the block invs it is told of
+    watchers = {n.name: Peer(n) for n in (core, iron)}
+
     # Offered on the system clock: two days old, so each node is in its initial block download
     def take_all(node):
         peer = Peer(node)
@@ -446,6 +466,11 @@ try:
     time.sleep(2)
     c, i = both(lambda n: n.notified())
     row("blocknotify for blocks older than 6 h", c, i)
+    # The new tip goes to the other peers only out of the initial block download, on the signal that runs
+    # -blocknotify (init.cpp:113-119, ChainExtensionService.cpp:556-565)
+    c, i = both(lambda n: len(watchers[n.name].block_invs()))
+    row("new-tip inv to another peer for blocks older than 6 h", c, i)
+    seen = {name: len(w.block_invs()) for name, w in watchers.items()}
 
     def offer_at(block, ahead_of_clock):
         """Each node's clock set so that the block is `ahead_of_clock` s in its future; what it did, its count"""
@@ -470,6 +495,8 @@ try:
     time.sleep(2)
     c, i = both(lambda n: n.notified())
     row("blocknotify once a block ends the initial download", c, i)
+    c, i = both(lambda n: [h == pow_block["hash"] for h in watchers[n.name].block_invs()[seen[n.name]:]])
+    row("new-tip inv to another peer for the block that ends the initial download", c, i)
 
     # Proof of stake: 180 s ahead of the clock is the limit (Settings.cpp:215-218)
     t += 60
@@ -483,6 +510,8 @@ try:
     row("the same block 180 s ahead (offered again)", c, i)
 
 finally:
+    for w in watchers.values():
+        w.close()
     for n in (maker, core, iron):
         if n:
             n.stop()
