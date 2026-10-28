@@ -2,13 +2,14 @@
 # Clocks and block times of Divi Core divid and of irondivid on regtest:
 # setmocktime, the blocks each makes on a mocked clock, the stake window when
 # the clock is behind the median time, sporks, wallet and mempool times, and
-# blocks offered just inside and past the future limits. Prints
+# blocks offered just inside and past the future limits, and the peers a new
+# tip is announced to. Prints
 # PASS/KNOWN/FAIL per row; the exit code is the number of FAILs. See README.md.
 #
 #   run.sh <irondivid-bin-dir> <core-bin-dir> <port-base> [root]
 #
 # <irondivid-bin-dir> holds irondivid, <core-bin-dir> divid. Ports
-# <port-base> .. <port-base>+9 on 127.0.0.2 are used. A fresh directory is made under
+# <port-base> .. <port-base>+15 on 127.0.0.2 are used. A fresh directory is made under
 # [root] (default $TMPDIR or /tmp) and deleted, with all nodes stopped,
 # however the run ends.
 set -u
@@ -48,7 +49,7 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 255' INT TERM HUP
 
-echo "# network-time: ports $BASE..$((BASE + 9)), work directory $WORK"
+echo "# network-time: ports $BASE..$((BASE + 15)), work directory $WORK"
 # In the background, so a signal to this script runs the trap at once
 timeout 1800 python3 -I "$HERE/check.py" "$IRD" "$DIVID" "$BASE" "$WORK" &
 CHILD=$!
