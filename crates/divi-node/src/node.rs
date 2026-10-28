@@ -826,7 +826,8 @@ impl Node {
         if !chain.begin_run().map_err(damaged)? {
             tracing::warn!("irondivid did not stop cleanly last time");
         }
-        if chain.finish_interrupted_reorg().map_err(damaged)? {
+        let disconnected = chain.finish_interrupted_reorg().map_err(damaged)?;
+        if disconnected.is_some() {
             tracing::info!(
                 "Finished the interrupted reorganization; tip {} at height {}",
                 chain.tip().map(|t| t.hash.to_string()).unwrap_or_default(),
@@ -1021,6 +1022,13 @@ impl Node {
                     check_mempool_transaction(&chain_for_scripts, pool, tx, origin)
                 },
             ));
+        }
+
+        // The transactions of the blocks the finished reorganization
+        // disconnected go to the mempool, as Divi Core's start offers them
+        // there while it connects the best chain (ChainTipManager.cpp:175-182)
+        if let Some(disconnected) = disconnected {
+            update_mempool_after_reorg(&chain, &mempool, disconnected);
         }
 
         // Create block sync manager

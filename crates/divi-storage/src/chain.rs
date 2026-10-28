@@ -3246,10 +3246,13 @@ impl Chain {
     /// Finish a reorganization that a stop interrupted: the chain on disk is
     /// whole at the block it had reached, and the blocks of the branch it was
     /// moving to are stored, so connect them now, as Divi Core's
-    /// ActivateBestChain does at start. Returns whether the tip moved.
-    pub fn finish_interrupted_reorg(&self) -> Result<bool, StorageError> {
+    /// ActivateBestChain does at start (init.cpp:1569). When the tip moved,
+    /// returns the transactions of the blocks it disconnected, as
+    /// `reorganize_chain` gives them: Divi Core's disconnectTip offers them to
+    /// the mempool (ChainTipManager.cpp:175-182).
+    pub fn finish_interrupted_reorg(&self) -> Result<Option<Vec<Transaction>>, StorageError> {
         let Some(raw) = self.db.get_metadata(REORG_TARGET_KEY)? else {
-            return Ok(false);
+            return Ok(None);
         };
         let _chain_guard = self.chain_lock.lock();
         let target = match <[u8; 32]>::try_from(raw.as_slice()) {
@@ -3264,10 +3267,10 @@ impl Chain {
                 );
                 *self.best_known_block.write() = Some(target);
                 match self.activate_best_chain_inner() {
-                    Ok(result) => result.is_some(),
+                    Ok(result) => result.map(|(_, disconnected)| disconnected),
                     Err(e) if Self::is_consensus_invalid(&e) => {
                         warn!("The interrupted reorganization's branch is invalid: {}", e);
-                        false
+                        None
                     }
                     Err(e) => {
                         let tip = self.tip.read().clone();
@@ -3276,9 +3279,9 @@ impl Chain {
                     }
                 }
             }
-            None => false,
+            None => None,
         };
-        if !moved {
+        if moved.is_none() {
             let tip = self.tip.read().clone();
             *self.best_known_block.write() = tip;
         }
