@@ -540,6 +540,68 @@ for t, what in ((t_l, "side L's losing spend"), (t_lc, "its child")):
     row(f"G mempool double spend: {what} left the mempool (L)", gone[C3.name], gone[I1.name],
         gone[C3.name] == gone[I1.name])
 
+# --- H. invalidateblock and reconsiderblock that switch branches (PoW, before E): what the disconnected blocks hold
+
+# Two fresh coins, too young to stake
+fresh_h = C3.rpc("sendtoaddress", C3.rpc("getnewaddress"), 10)
+fresh_r = C3.rpc("sendtoaddress", C3.rpc("getnewaddress"), 10)
+need(wait_for(lambda: {fresh_h, fresh_r} <= set(C1.rpc("getrawmempool")), 30), "bridge L did not take the fresh coins")
+mine(C1, 1)
+need(one_tip(), "the nodes did not follow the fresh coins' block")
+unspent = C3.rpc("listunspent")
+h_coin, r_coin = (next(u for u in unspent if u["txid"] == t and abs(u["amount"] - 10) < 1e-8) for t in (fresh_h, fresh_r))
+fork_h = C3.rpc("getblockcount")
+split()
+# Side L, 3 blocks: a spend in the first, a child of it in the second
+t_h = spend(C3, h_coin, C3.rpc("getnewaddress"))
+need(wait_for(lambda: all(t_h in n.rpc("getrawmempool") for n in (C1, C3, I1)), 30), "side L did not take the spend")
+mine(C1, 1)
+need(wait_for(lambda: tip(C3) == tip(C1) == tip(I1), 60), "side L did not agree")
+t_hc = spend(C3, {"txid": t_h, "vout": 0, "amount": C3.rpc("getrawtransaction", t_h, 1)["vout"][0]["value"]},
+             C3.rpc("getnewaddress"))
+need(wait_for(lambda: all(t_hc in n.rpc("getrawmempool") for n in (C1, C3, I1)), 30), "side L did not take the child")
+mine(C1, 2)
+need(wait_for(lambda: tip(C3) == tip(C1) == tip(I1), 60), "side L did not agree")
+need(t_h in C3.rpc("getblock", C3.rpc("getblockhash", fork_h + 1))["tx"]
+     and t_hc in C3.rpc("getblock", C3.rpc("getblockhash", fork_h + 2))["tx"], "side L's blocks lack its spends")
+# Side R, 4 blocks: another spend, signed by the shared wallet and sent through divid R, in the first
+raw = C3.rpc("createrawtransaction", [{"txid": r_coin["txid"], "vout": r_coin["vout"]}],
+             {C3.rpc("getnewaddress"): round(r_coin["amount"] - 0.001, 8)})
+signed = C3.rpc("signrawtransaction", raw)
+need(signed.get("complete"), "could not sign side R's spend")
+t_r = C4.rpc("sendrawtransaction", signed["hex"])
+need(wait_for(lambda: t_r in I2.rpc("getrawmempool"), 30), "irondivid R did not take side R's spend")
+mine(I2, 1)
+need(wait_for(lambda: tip(C2) == tip(I2) == tip(C4), 60), "side R did not agree")
+need(t_r in I2.rpc("getblock", I2.rpc("getblockhash", fork_h + 1))["tx"], "side R's first block lacks its spend")
+mine(I2, 3)
+need(wait_for(lambda: tip(C2) == tip(I2) == tip(C4), 60), "side R did not agree")
+r3 = I2.rpc("getblockhash", fork_h + 3)
+tip_r, tip_l = tip(I2), tip(C3)
+join()
+need(one_tip(), "the nodes did not follow side R's longer branch")
+time.sleep(3)
+# On side L's pair: invalidateblock of side R's third block leaves its first two with less work than
+# side L, so the node disconnects them too and moves to side L; reconsiderblock moves it back
+pair("H invalidateblock <side R's third block>", C3, I1, "invalidateblock", r3)
+wait_for(lambda: tip(C3) == tip_l and tip(I1) == tip_l, 60)
+time.sleep(3)
+pair("H after invalidateblock: getbestblockhash", C3, I1, "getbestblockhash")
+pair("H after invalidateblock: getrawmempool", C3, I1, "getrawmempool", fix=lambda v: sorted(v))
+back = {n.name: t_r in n.rpc("getrawmempool") for n in (C3, I1)}
+row("H after invalidateblock: side R's spend is back in the mempool (L)", back[C3.name], back[I1.name],
+    back[C3.name] == back[I1.name])
+pair("H reconsiderblock <side R's third block>", C3, I1, "reconsiderblock", r3)
+wait_for(lambda: tip(C3) == tip_r and tip(I1) == tip_r, 60)
+time.sleep(3)
+pair("H after reconsiderblock: getbestblockhash", C3, I1, "getbestblockhash")
+pair("H after reconsiderblock: getrawmempool", C3, I1, "getrawmempool", fix=lambda v: sorted(v))
+for t, what in ((t_h, "side L's spend"), (t_hc, "its child")):
+    back = {n.name: t in n.rpc("getrawmempool") for n in (C3, I1)}
+    row(f"H after reconsiderblock: {what} is back in the mempool (L)", back[C3.name], back[I1.name],
+        back[C3.name] == back[I1.name])
+need(one_tip(), "the nodes did not come back to one tip")
+
 # --- E. proof of stake: depth 1 and 6 past the last PoW block ---------------------------
 
 height = C1.rpc("getblockcount")
