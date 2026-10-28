@@ -2999,6 +2999,11 @@ impl Chain {
                 }
                 return Err(e);
             }
+            // The tip takes the index as connected (valid, on the main
+            // chain), as stored; a disconnect writes back what the tip holds
+            if index_mut.hash == new_index.hash {
+                *new_index = index_mut;
+            }
         }
 
         self.db.delete_metadata(REORG_TARGET_KEY)?;
