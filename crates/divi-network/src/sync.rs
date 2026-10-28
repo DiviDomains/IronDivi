@@ -4425,6 +4425,59 @@ mod tests {
         assert_eq!(announced.last(), Some(&child_hash), "told of {announced:?}");
     }
 
+    /// Divi Core tells its peers of a new tip only out of the initial download
+    /// (ChainExtensionService.cpp:556-565, init.cpp:117): a block days old moves
+    /// the tip in silence, and the block dated now that ends the download is
+    /// announced
+    #[tokio::test]
+    async fn the_new_tip_is_announced_only_out_of_the_initial_download() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(ChainDatabase::open(dir.path()).unwrap());
+        let params = ChainParams::for_network(
+            divi_storage::NetworkType::Regtest,
+            divi_primitives::ChainMode::Divi,
+        );
+        let chain = Arc::new(Chain::new(db, params).unwrap());
+        let sync = BlockSync::new(chain, PeerManager::new(Default::default()));
+        let mut rxs = add_test_peers(&sync, 2);
+        let announced = |rxs: &mut HashMap<PeerId, tokio::sync::mpsc::Receiver<NetworkMessage>>| {
+            let mut hashes = Vec::new();
+            while let Ok(msg) = rxs.get_mut(&2).unwrap().try_recv() {
+                if let NetworkMessage::Inv(items) = msg {
+                    hashes.extend(items.into_iter().map(|i| i.hash));
+                }
+            }
+            hashes
+        };
+
+        let old = next_block(&sync.chain);
+        let old_hash = compute_block_hash(&old.header);
+        sync.handle_block(1, old).await;
+        assert_eq!(sync.chain.tip().unwrap().hash, old_hash);
+        assert!(sync.chain.is_initial_block_download());
+        assert_eq!(
+            announced(&mut rxs),
+            vec![],
+            "nothing in the initial download"
+        );
+
+        let mut fresh = next_block(&sync.chain);
+        fresh.header.time = divi_primitives::clock::now() as u32;
+        let target = Hash256::from_compact(fresh.header.bits);
+        while compute_block_hash(&fresh.header) > target {
+            fresh.header.nonce += 1;
+        }
+        let fresh_hash = compute_block_hash(&fresh.header);
+        sync.handle_block(1, fresh).await;
+        assert_eq!(sync.chain.tip().unwrap().hash, fresh_hash);
+        assert!(!sync.chain.is_initial_block_download());
+        assert_eq!(
+            announced(&mut rxs),
+            vec![fresh_hash],
+            "the tip that ends it"
+        );
+    }
+
     /// A block whose parent is not known gets the peer that sent it a getblocks
     /// from our chain up to that block (Divi Core main.cpp:822-833), so the
     /// blocks in between come; otherwise the block waits for good
