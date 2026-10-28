@@ -607,6 +607,16 @@ fn with_divi_fallback(
     Ok(backend.with_fallback_rpc(url))
 }
 
+/// The DIVI JSON-RPC endpoint the taker reads first.
+fn divi_rpc_url(_cli: &Cli, network: divi_wallet::address::Network) -> String {
+    swap_chain_divi::default_rpc(network).to_string()
+}
+
+/// The start warnings about who runs the taker's read sources.
+fn taker_source_warnings(_cli: &Cli) -> Vec<String> {
+    Vec::new()
+}
+
 fn live_backends(cli: &Cli) -> Result<Backends> {
     match cli.counter_chain {
         Chain::Btc => guard_network(
@@ -3678,5 +3688,207 @@ mod tests {
             ])
         );
         assert_eq!(b.released_locks(), vec![lock_of(&dropped)]);
+    }
+
+    // ---- the taker's own DIVI source, and who runs the taker's sources (T32-16) ----
+
+    /// A [`DiviNode`] on a fresh mock server.
+    async fn divi_node() -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(DiviNode(Arc::new(std::sync::atomic::AtomicUsize::new(0))))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// `--divi-rpc-url` is the taker's DIVI primary: every taker DIVI read (tip, median time,
+    /// confirmations, the HTLC output, find-spend) and the broadcast go to it, and to
+    /// `--divi-fallback-rpc-url` as well when that is set; the default proxy is not asked.
+    /// `tip` reads it too.
+    #[tokio::test]
+    async fn taker_divi_rpc_url_replaces_the_default_primary() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("cli.db");
+        let net = divi_wallet::address::Network::Testnet;
+        let (own, second) = (divi_node().await, divi_node().await);
+        let (own_uri, second_uri) = (own.uri(), second.uri());
+        for fallback in [None, Some(second_uri.as_str())] {
+            let mut argv = vec![
+                "--backend",
+                "live",
+                "--counter-chain",
+                "btc",
+                "--db",
+                db.to_str().unwrap(),
+                "--divi-rpc-url",
+                &own_uri,
+            ];
+            if let Some(f) = fallback {
+                argv.extend(["--divi-fallback-rpc-url", f]);
+            }
+            let cli = cli(&argv);
+            assert_eq!(divi_rpc_url(&cli, net), own_uri);
+            let (_, res) = divi_swap_cli::reservations::open(&cli.db).unwrap();
+            let b = live_divi(
+                &cli,
+                &divi_rpc_url(&cli, net),
+                divi_key(),
+                net,
+                Some(divi_wallet(dir.path())),
+                &res,
+            )
+            .unwrap();
+            assert_eq!(b.has_fallback(), fallback.is_some());
+            let tip = tip_backend(&cli, Chain::Divi).unwrap();
+            let at = divi_swap::Outpoint {
+                txid: divi_swap::Txid([9; 32]),
+                vout: 0,
+            };
+            let lock = b.build_funding(&lock_htlc(7), DIVI_LOCK).await.unwrap();
+            macro_rules! read_on_both {
+                ($what:literal, $read:expr) => {{
+                    let before = (posts(&own).await, posts(&second).await);
+                    let _ = $read.await;
+                    let after = (posts(&own).await, posts(&second).await);
+                    assert!(after.0 > before.0, "{}: not read on --divi-rpc-url", $what);
+                    assert_eq!(
+                        after.1 > before.1,
+                        fallback.is_some(),
+                        "{}: read on the fallback iff it is set",
+                        $what
+                    );
+                }};
+            }
+            read_on_both!("tip_height", b.tip_height());
+            read_on_both!("median_time_past", b.median_time_past());
+            read_on_both!("confirmations", b.confirmations(&at.txid));
+            read_on_both!("htlc_output", b.htlc_output(&lock_htlc(7), &at));
+            read_on_both!("find_spend", b.find_spend(&at, 1));
+            read_on_both!("broadcast", b.broadcast(&lock.tx));
+            read_on_both!("tip", tip.tip_height());
+        }
+    }
+
+    /// Without `--divi-rpc-url` (or with a blank one) the taker's DIVI primary is the
+    /// network's default proxy, as before the flag existed.
+    #[test]
+    fn divi_rpc_url_unset_keeps_the_default_proxy() {
+        use divi_wallet::address::Network;
+        for net in [Network::Testnet, Network::Mainnet] {
+            assert_eq!(
+                divi_rpc_url(&cli(&[]), net),
+                swap_chain_divi::default_rpc(net)
+            );
+        }
+    }
+
+    /// With `--divi-rpc-url` set, the fallback must differ from it (not from the default,
+    /// which is then a valid second source); a blank `--divi-rpc-url` is unset.
+    #[test]
+    fn divi_fallback_must_differ_from_the_divi_rpc_url_in_use() {
+        let net = divi_wallet::address::Network::Testnet;
+        let own = "http://127.0.0.1:51473";
+        let c = cli(&["--divi-rpc-url", own, "--divi-fallback-rpc-url", own]);
+        let err = with_divi_fallback(&c, net, throwaway_divi()).err().unwrap();
+        assert!(
+            err.to_string().contains("--divi-rpc-url") && err.to_string().contains("must differ"),
+            "{err}"
+        );
+        let proxy = swap_chain_divi::default_rpc(net);
+        let c = cli(&["--divi-rpc-url", own, "--divi-fallback-rpc-url", proxy]);
+        assert!(with_divi_fallback(&c, net, throwaway_divi())
+            .unwrap()
+            .has_fallback());
+        let blank = cli(&["--divi-rpc-url", " "]);
+        assert_eq!(divi_rpc_url(&blank, net), swap_chain_divi::default_rpc(net));
+    }
+
+    /// The argv of a mainnet taker against BTC, plus `extra`.
+    fn mainnet_cli(counter: &str, extra: &[&str]) -> Cli {
+        let mut argv = vec![
+            "--profile",
+            "mainnet",
+            "--allow-mainnet",
+            "--divi-network",
+            "mainnet",
+            "--counter-chain",
+            counter,
+            "--btc-network",
+            "mainnet",
+            "--zec-network",
+            "mainnet",
+        ];
+        argv.extend_from_slice(extra);
+        cli(&argv)
+    }
+
+    fn divi_warnings(cli: &Cli) -> Vec<String> {
+        taker_source_warnings(cli)
+            .into_iter()
+            .filter(|w| w.starts_with("DIVI"))
+            .collect()
+    }
+
+    /// On `--profile mainnet`, a taker whose every DIVI source is the default proxy or under
+    /// its registrable domain gets one warning naming the endpoint and the risk; an own
+    /// primary, or a second source of another operator, gets none. Testnet: nothing new.
+    #[test]
+    fn mainnet_taker_on_the_default_divi_proxy_only_is_warned() {
+        let proxy = swap_chain_divi::MAINNET_RPC;
+        for extra in [
+            &[][..],
+            &[
+                "--divi-fallback-rpc-url",
+                "https://other.services.divi.domains/rpc/",
+            ][..],
+            &["--divi-rpc-url", proxy][..],
+        ] {
+            let w = divi_warnings(&mainnet_cli("btc", extra));
+            assert_eq!(w.len(), 1, "{extra:?}: {w:?}");
+            assert!(w[0].contains(proxy), "{extra:?}: {}", w[0]);
+            assert!(w[0].contains("--divi-rpc-url"), "{}", w[0]);
+            assert!(w[0].contains("maker lock"), "{}", w[0]);
+        }
+        for extra in [
+            &["--divi-rpc-url", "https://divi.own-node.example:51473"][..],
+            &["--divi-fallback-rpc-url", "http://127.0.0.1:51473"][..],
+        ] {
+            assert!(
+                divi_warnings(&mainnet_cli("btc", extra)).is_empty(),
+                "{extra:?}"
+            );
+        }
+        assert!(taker_source_warnings(&cli(&[])).is_empty());
+        assert!(taker_source_warnings(&cli(&["--counter-chain", "zec"])).is_empty());
+    }
+
+    /// On `--profile mainnet` with `--counter-chain zec`, one lightwalletd operator and no
+    /// `--zec-crosscheck-url` is warned (the daemon's rule, as a warning); a second operator
+    /// silences it, and no other counter chain gets it.
+    #[test]
+    fn mainnet_taker_on_one_zec_operator_is_warned() {
+        let zec = |cli: &Cli| -> Vec<String> {
+            taker_source_warnings(cli)
+                .into_iter()
+                .filter(|w| w.starts_with("ZEC"))
+                .collect()
+        };
+        let w = zec(&mainnet_cli("zec", &[]));
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(
+            w[0].contains("zec.rocks") && w[0].contains("--zec-crosscheck-url"),
+            "{}",
+            w[0]
+        );
+        assert!(zec(&mainnet_cli(
+            "zec",
+            &[
+                "--zec-crosscheck-url",
+                "https://lwd.other-operator.net:9067"
+            ]
+        ))
+        .is_empty());
+        assert!(zec(&mainnet_cli("btc", &[])).is_empty());
     }
 }
