@@ -216,6 +216,9 @@ async fn a_failing_second_operator_is_named_with_how_long_it_has_failed() {
     assert!(failing_secs(&later) >= 1, "{later}");
     o.set_down(false);
     assert!(b.htlc_output(&htlc(), &at()).await.unwrap().is_some());
+    // FB: the agreement is kept while the primary is unchanged; one more block on the
+    // primary takes the count past what the second vouched for, so it is asked again.
+    p.mine(1);
     o.set_down(true);
     let again = b.htlc_output(&htlc(), &at()).await.unwrap_err().to_string();
     assert_eq!(

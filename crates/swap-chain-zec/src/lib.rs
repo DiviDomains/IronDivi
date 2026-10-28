@@ -155,6 +155,33 @@ impl FeePolicy {
 /// The most agreed locks one backend keeps (FB): past it the oldest is dropped.
 pub(crate) const LOCK_CACHE_CAP: usize = 64;
 
+/// What both operators agreed a mined lock is (FB): the agreed script, the value, and the
+/// block (height and hash) both showed it in. A kept agreement is reused only while the
+/// primary still shows exactly this.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LockKey {
+    script: Vec<u8>,
+    value: u64,
+    height: u64,
+    hash: String,
+}
+
+/// A kept agreement: its key, the second operator's confirmation count when last asked
+/// (the highest count the backend reports from it), and the order it was kept in (for the
+/// cap).
+#[derive(Debug)]
+struct KeptLock {
+    key: LockKey,
+    second_confs: u32,
+    kept: u64,
+}
+
+/// `height` as `GetTransaction` answers it is a main-chain block (0: mempool; `u64::MAX`:
+/// a block off the main chain).
+fn mined(height: u64) -> bool {
+    height != 0 && height != u64::MAX
+}
+
 /// Zcash testnet transparent [`ChainBackend`].
 pub struct ZecBackend {
     client: LightwalletdClient,
@@ -174,6 +201,11 @@ pub struct ZecBackend {
     /// Since when the second operator has refused each lock it has not agreed yet (EX), for
     /// the refusal's "failing for". In memory only; an agreement clears the entry.
     lock_failing: Mutex<HashMap<Outpoint, Instant>>,
+    /// Mined locks both operators agreed on, by outpoint (FB): reused, without asking the
+    /// second operator again, while the primary shows the same lock in the same block. In
+    /// memory only; at most [`LOCK_CACHE_CAP`], dropped when the swap ends
+    /// ([`ChainBackend::lock_finished`]) or the primary shows anything else.
+    agreed: Mutex<HashMap<Outpoint, KeptLock>>,
     /// Shared with this backend's [`ChainBackend::primary_only`] views.
     hold: Arc<HoldState>,
 }
@@ -222,6 +254,7 @@ impl ZecBackend {
             second: None,
             second_budget: crosscheck::LOCK_READ_BUDGET,
             lock_failing: Mutex::default(),
+            agreed: Mutex::default(),
             hold: Arc::default(),
         })
     }
@@ -263,7 +296,7 @@ impl ZecBackend {
     /// How many agreed locks this backend keeps (FB; tests).
     #[cfg(test)]
     pub(crate) fn agreed_locks(&self) -> usize {
-        0
+        self.agreed.lock().expect("agreed map").len()
     }
 
     /// The startup cross-check: `Disagree` is an error, `Unavailable` warns; `Ok` when off.
@@ -313,12 +346,13 @@ impl ZecBackend {
     }
 
     /// The primary's lock read: the output at `at` if its scriptPubKey is `htlc`'s, with its
-    /// value and confirmations ([`ChainBackend::htlc_output`] adds the second operator).
+    /// value and confirmations, and the height the primary shows it at
+    /// ([`ChainBackend::htlc_output`] adds the second operator).
     async fn htlc_output_primary(
         &self,
         htlc: &HtlcParams,
         at: &Outpoint,
-    ) -> Result<Option<LockedOutput>> {
+    ) -> Result<Option<(LockedOutput, u64)>> {
         let Some(raw) = self
             .client
             .get_transaction(&at.txid.0)
@@ -342,9 +376,95 @@ impl ZecBackend {
             let tip = self.tip_height().await?;
             (tip.saturating_sub(raw.height) + 1) as u32
         };
-        Ok(Some(LockedOutput {
+        let lo = LockedOutput {
             amount: Amount::from_sat(out.value),
             confirmations,
+        };
+        Ok(Some((lo, raw.height)))
+    }
+
+    /// Drop the kept agreement for `at`, if any (FB).
+    fn forget_agreed(&self, at: &Outpoint) {
+        self.agreed.lock().expect("agreed map").remove(at);
+    }
+
+    /// Keep an agreement on `at` (FB), dropping the oldest past [`LOCK_CACHE_CAP`].
+    fn keep_agreed(&self, at: &Outpoint, key: LockKey, second_confs: u32) {
+        let mut agreed = self.agreed.lock().expect("agreed map");
+        if !agreed.contains_key(at) && agreed.len() >= LOCK_CACHE_CAP {
+            let oldest = agreed.iter().min_by_key(|(_, k)| k.kept).map(|(op, _)| *op);
+            if let Some(op) = oldest {
+                agreed.remove(&op);
+            }
+        }
+        let kept = agreed.values().map(|k| k.kept + 1).max().unwrap_or(0);
+        agreed.insert(
+            *at,
+            KeptLock {
+                key,
+                second_confs,
+                kept,
+            },
+        );
+    }
+
+    /// The primary's read `lo` of `at` answered from a kept agreement with the same `key`
+    /// (FB), or `None` when there is none (the caller asks the second operator afresh). The
+    /// count is never above the second operator's: past the one it last gave, only its tip
+    /// is asked again (`GetLatestBlock`), and a failure there drops the agreement and refuses
+    /// as a fresh read would.
+    async fn kept_read(
+        &self,
+        at: &Outpoint,
+        key: &LockKey,
+        lo: LockedOutput,
+        second: &LightwalletdClient,
+    ) -> Option<Result<LockedOutput>> {
+        let vouched = {
+            let mut agreed = self.agreed.lock().expect("agreed map");
+            match agreed.get(at) {
+                Some(k) if k.key == *key => k.second_confs,
+                Some(_) => {
+                    agreed.remove(at);
+                    return None;
+                }
+                None => return None,
+            }
+        };
+        if lo.confirmations <= vouched {
+            return Some(Ok(lo));
+        }
+        let budget = self.second_budget;
+        let tip = match tokio::time::timeout(budget, second.latest_block()).await {
+            Ok(Ok(tip)) => tip.height,
+            failed => {
+                self.forget_agreed(at);
+                let what = match failed {
+                    Ok(Err(e)) => format!("could not be read (GetLatestBlock: {e:?})"),
+                    _ => format!("did not answer within {budget:?}"),
+                };
+                return Some(crosscheck::agree_lock(
+                    at,
+                    &key.script,
+                    lo,
+                    &self.client,
+                    Err(what),
+                    second,
+                ));
+            }
+        };
+        // Below the lock's block the second cannot vouch for it any more: ask afresh.
+        if tip < key.height {
+            self.forget_agreed(at);
+            return None;
+        }
+        let theirs = (tip - key.height + 1) as u32;
+        if let Some(k) = self.agreed.lock().expect("agreed map").get_mut(at) {
+            k.second_confs = theirs;
+        }
+        Some(Ok(LockedOutput {
+            confirmations: lo.confirmations.min(theirs),
+            ..lo
         }))
     }
 
@@ -862,6 +982,7 @@ impl ChainBackend for ZecBackend {
             second: None,
             second_budget: self.second_budget,
             lock_failing: Mutex::default(),
+            agreed: Mutex::default(),
             hold: self.hold.clone(),
         }))
     }
@@ -894,21 +1015,65 @@ impl ChainBackend for ZecBackend {
     }
 
     async fn htlc_output(&self, htlc: &HtlcParams, at: &Outpoint) -> Result<Option<LockedOutput>> {
-        let mine = self.htlc_output_primary(htlc, at).await?;
-        match (&self.second, mine) {
-            // Nothing to agree when the primary shows no matching lock: no side acts on `None`.
-            (Some(second), Some(lo)) => {
-                let want = address::htlc_script_pubkey(&htlc.redeem_script());
-                // EX: a second operator that never answers fails the read at the budget.
-                let budget = self.second_budget;
-                let theirs = tokio::time::timeout(budget, crosscheck::lock_view(second, at))
-                    .await
-                    .unwrap_or_else(|_| Err(format!("did not answer within {budget:?}")));
-                let agreed = crosscheck::agree_lock(at, &want, lo, &self.client, theirs, second);
-                self.failing_for(at, agreed).map(Some)
+        let mine = self.htlc_output_primary(htlc, at).await;
+        let Some(second) = &self.second else {
+            return mine.map(|m| m.map(|(lo, _)| lo));
+        };
+        // Nothing to agree when the primary shows no matching lock: no side acts on `None`.
+        let Some((lo, height)) = mine? else {
+            self.forget_agreed(at);
+            return Ok(None);
+        };
+        let want = address::htlc_script_pubkey(&htlc.redeem_script());
+        // FB: a mined lock is keyed by the primary's block at its height; without that
+        // block (mempool, or the primary cannot show it) nothing is kept or reused.
+        let key = match mined(height) {
+            true => crosscheck::block_hash(&self.client, height)
+                .await
+                .ok()
+                .map(|hash| LockKey {
+                    script: want.clone(),
+                    value: lo.amount.to_sat(),
+                    height,
+                    hash,
+                }),
+            false => None,
+        };
+        match &key {
+            Some(key) => {
+                if let Some(read) = self.kept_read(at, key, lo, second).await {
+                    return self.failing_for(at, read).map(Some);
+                }
             }
-            (_, mine) => Ok(mine),
+            None => self.forget_agreed(at),
         }
+        // EX: a second operator that never answers fails the read at the budget.
+        let budget = self.second_budget;
+        let theirs = tokio::time::timeout(budget, crosscheck::lock_view(second, at))
+            .await
+            .unwrap_or_else(|_| Err(format!("did not answer within {budget:?}")));
+        let seen = theirs
+            .as_ref()
+            .ok()
+            .map(|v| (v.height(), v.confirmations()));
+        let agreed = crosscheck::agree_lock(at, &want, lo, &self.client, theirs, second);
+        // FB: keep only an agreement both showed in the same block. The second's block is
+        // asked after the agreement, under its own budget, and decides keeping only.
+        if let (Ok(_), Some(key), Some((their_height, their_confs))) = (&agreed, key, seen) {
+            if their_height == height {
+                let hash = tokio::time::timeout(budget, crosscheck::block_hash(second, height));
+                if let Ok(Ok(hash)) = hash.await {
+                    if hash == key.hash {
+                        self.keep_agreed(at, key, their_confs);
+                    }
+                }
+            }
+        }
+        self.failing_for(at, agreed).map(Some)
+    }
+
+    fn lock_finished(&self, at: &Outpoint) {
+        self.forget_agreed(at);
     }
 
     async fn find_spend(&self, outpoint: &Outpoint, from_height: u64) -> Result<Option<SpendInfo>> {

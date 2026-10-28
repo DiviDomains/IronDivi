@@ -140,7 +140,7 @@ pub async fn tip_crosscheck(
 }
 
 /// The display-order hash of the block at `height`, refusing an answer for another height.
-async fn block_hash(
+pub(crate) async fn block_hash(
     client: &LightwalletdClient,
     height: u64,
 ) -> std::result::Result<String, String> {
@@ -246,6 +246,20 @@ pub(crate) struct LockView {
     script_pubkey: Vec<u8>,
     value: u64,
     confirmations: u32,
+    /// The height the second operator shows the transaction at (0: mempool), as answered.
+    height: u64,
+}
+
+impl LockView {
+    /// The height the second operator shows the lock at (FB keeps an agreement by it).
+    pub(crate) fn height(&self) -> u64 {
+        self.height
+    }
+
+    /// The second operator's confirmation count for the lock.
+    pub(crate) fn confirmations(&self) -> u32 {
+        self.confirmations
+    }
 }
 
 /// `other`'s view of output `at`, read as the primary's is: `GetTransaction` (an answer that
@@ -283,6 +297,7 @@ pub(crate) async fn lock_view(
         script_pubkey: out.script_pubkey.clone(),
         value: out.value,
         confirmations,
+        height: raw.height,
     })
 }
 
@@ -426,6 +441,7 @@ mod tests {
             script_pubkey: script_pubkey.to_vec(),
             value,
             confirmations: 3,
+            height: 38,
         })
     }
 
