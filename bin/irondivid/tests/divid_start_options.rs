@@ -491,8 +491,8 @@ fn rpcallowip_lets_the_allowed_subnets_in() {
 }
 
 /// -blocknotify runs its command with the new tip's hash whenever the best
-/// block changes; -walletnotify with the txid of each wallet transaction
-/// added or updated
+/// block changes out of the initial block download; -walletnotify with the
+/// txid of each wallet transaction added or updated
 #[test]
 fn blocknotify_and_walletnotify_run_their_commands() {
     let dir = tempfile::tempdir().unwrap();
@@ -519,6 +519,8 @@ fn blocknotify_and_walletnotify_run_their_commands() {
         rpc_port,
         true,
     );
+    // The chain above is a day old: a block of now ends the initial download
+    daemon.rpc("setgenerate", json!([1]));
     let tip = daemon.rpc("getbestblockhash", json!([]));
     let tip = tip.as_str().unwrap().to_string();
     daemon.rpc("invalidateblock", json!([tip]));

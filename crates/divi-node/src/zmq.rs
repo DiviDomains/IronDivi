@@ -32,7 +32,7 @@ use divi_storage::{BlockIndex, Chain, ChainEvent};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -93,10 +93,6 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 const QUEUE: usize = 1000;
 /// The largest frame a subscriber may send (a subscription or a command)
 const MAX_IN_FRAME: u64 = 64 * 1024;
-
-/// Divi Core's IsInitialBlockDownload by the tip's time: more than 6 hours
-/// old (ChainSyncHelpers.cpp:33-50); once false it stays false
-const IBD_TIP_AGE: i64 = 6 * 60 * 60;
 
 /// The ZMTP 3.0 greeting: signature, version 3.0, mechanism NULL, as-server 0
 fn greeting() -> [u8; 64] {
@@ -360,8 +356,6 @@ pub struct ZmqNotifier {
     notifiers: Vec<Notifier>,
     chain: Weak<Chain>,
     mempool: Weak<Mempool>,
-    /// The initial block download has ended (Core latches this)
-    past_ibd: AtomicBool,
     /// Transactions of disconnected blocks already sent as back in the
     /// mempool: sent once, when Core's disconnectTip takes them back, not
     /// again when the mempool here does after the reorganization
@@ -421,7 +415,6 @@ impl ZmqNotifier {
             notifiers,
             chain: Arc::downgrade(chain),
             mempool: Arc::downgrade(mempool),
-            past_ibd: AtomicBool::new(false),
             returned: Mutex::new(HashSet::new()),
         });
         let z = Arc::downgrade(&zmq);
@@ -553,7 +546,8 @@ impl ZmqNotifier {
         let Some(chain) = self.chain.upgrade() else {
             return;
         };
-        if self.initial_block_download(&chain, tip) {
+        // Divi Core's IsInitialBlockDownload (ChainSyncHelpers.cpp:33-50)
+        if chain.is_initial_block_download() {
             return;
         }
         let needs_block = self.notifiers.iter().any(|n| n.topic == Topic::RawBlock);
@@ -563,22 +557,6 @@ impl ZmqNotifier {
             None
         };
         self.block(&tip.hash, block.as_ref());
-    }
-
-    fn initial_block_download(&self, chain: &Chain, tip: &BlockIndex) -> bool {
-        if chain.is_importing() {
-            return true;
-        }
-        if self.past_ibd.load(Ordering::SeqCst) {
-            return false;
-        }
-        // GetTime: the node's clock, which setmocktime sets
-        let now = divi_primitives::clock::now();
-        if i64::from(tip.time) < now - IBD_TIP_AGE {
-            return true;
-        }
-        self.past_ibd.store(true, Ordering::SeqCst);
-        false
     }
 }
 
