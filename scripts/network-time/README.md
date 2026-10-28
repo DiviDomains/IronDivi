@@ -52,6 +52,9 @@ checks the script itself: every row passes.
      its time is not marked invalid, so the same block is taken once it is inside the limit.
    - how often `-blocknotify` ran once the work block, the first within 6 hours of the clock, ended the initial
      block download: divid signals that tip and no earlier one (ChainExtensionService.cpp:556-565).
+   - the block invs a second script peer on each node is sent: none for the 99 old blocks, and one, for the work
+     block, once it ends the initial block download. The new tip is announced to peers on the same signal as
+     `-blocknotify` (init.cpp:113-119, NotifyPeersOfNewChainTip net.cpp:1491-1497).
 
 What `net-time` covers is not repeated: the offset from peers' version messages, its cap and warning, and the
 2-hour limit on the network-adjusted clock.

@@ -2893,7 +2893,6 @@ impl Node {
             .unwrap_or(1.0);
 
         let sync_progress = self.block_sync.progress();
-        let sync_state = sync_progress.state;
         let headers = sync_progress.headers_downloaded.max(height);
         let target_height = sync_progress.target_height.max(height);
 
@@ -2903,8 +2902,9 @@ impl Node {
             1.0
         };
 
-        let initial_block_download =
-            sync_state != SyncState::Synced && target_height > height + 144;
+        // Divi Core's IsInitialBlockDownload (ChainSyncHelpers.cpp:33-50), the
+        // state the chain keeps, not the sync's progress
+        let initial_block_download = self.chain.is_initial_block_download();
 
         BlockchainInfo {
             chain: match self.config.network.network_type {
@@ -3679,13 +3679,49 @@ mod tests {
         config
     }
 
-    /// Write `n` regtest blocks to the node's chain database and flush the block bodies
-    /// to their own table file; returns the path of that file.
-    fn regtest_chain_on_disk(config: &NodeConfig, n: u32) -> std::path::PathBuf {
+    /// A regtest proof-of-work block on `parent`, at `height`, dated `time`
+    fn regtest_block(
+        parent: &divi_storage::BlockIndex,
+        height: u32,
+        time: u32,
+    ) -> divi_primitives::block::Block {
         use divi_primitives::amount::Amount;
         use divi_primitives::block::Block;
         use divi_primitives::script::Script;
         use divi_primitives::transaction::{Transaction, TxIn, TxOut};
+        let i = height - 1;
+        let mut block = Block::default();
+        block.header.version = 4;
+        block.header.prev_block = parent.hash;
+        block.header.time = time;
+        block.header.bits = 0x207fffff;
+        block.transactions.push(Transaction {
+            version: 1,
+            vin: vec![TxIn::coinbase(Script::from_bytes(
+                [
+                    divi_storage::bip34_height_script(height),
+                    vec![0x01, i as u8],
+                ]
+                .concat(),
+            ))],
+            vout: vec![TxOut::new(
+                Amount::from_sat(1250_00000000),
+                Script::new_p2pkh(&[i as u8 + 1; 20]),
+            )],
+            lock_time: 0,
+        });
+        block.header.merkle_root = divi_crypto::compute_merkle_root(&block.transactions);
+        // Proof of work for the block's bits
+        let target = divi_primitives::hash::Hash256::from_compact(block.header.bits);
+        while divi_crypto::compute_block_hash(&block.header) > target {
+            block.header.nonce += 1;
+        }
+        block
+    }
+
+    /// Write `n` regtest blocks to the node's chain database and flush the block bodies
+    /// to their own table file; returns the path of that file.
+    fn regtest_chain_on_disk(config: &NodeConfig, n: u32) -> std::path::PathBuf {
         let db = Arc::new(ChainDatabase::open(config.chainstate_path()).unwrap());
         let chain = Chain::new(
             db.clone(),
@@ -3694,32 +3730,7 @@ mod tests {
         .unwrap();
         let mut parent = chain.tip().unwrap();
         for i in 0..n {
-            let mut block = Block::default();
-            block.header.version = 4;
-            block.header.prev_block = parent.hash;
-            block.header.time = parent.time + 60;
-            block.header.bits = 0x207fffff;
-            block.transactions.push(Transaction {
-                version: 1,
-                vin: vec![TxIn::coinbase(Script::from_bytes(
-                    [
-                        divi_storage::bip34_height_script(i + 1),
-                        vec![0x01, i as u8],
-                    ]
-                    .concat(),
-                ))],
-                vout: vec![TxOut::new(
-                    Amount::from_sat(1250_00000000),
-                    Script::new_p2pkh(&[i as u8 + 1; 20]),
-                )],
-                lock_time: 0,
-            });
-            block.header.merkle_root = divi_crypto::compute_merkle_root(&block.transactions);
-            // Proof of work for the block's bits
-            let target = divi_primitives::hash::Hash256::from_compact(block.header.bits);
-            while divi_crypto::compute_block_hash(&block.header) > target {
-                block.header.nonce += 1;
-            }
+            let block = regtest_block(&parent, i + 1, parent.time + 60);
             chain.accept_block(block).unwrap();
             parent = chain.tip().unwrap();
         }
@@ -3737,6 +3748,32 @@ mod tests {
         config
             .chainstate_path()
             .join(file.name.trim_start_matches('/'))
+    }
+
+    /// The initial download in the blockchain info is the chain's
+    /// IsInitialBlockDownload (ChainSyncHelpers.cpp:33-50): in it while the best
+    /// block is more than 6 hours old, out once a block dated now is taken
+    #[test]
+    fn blockchain_info_reports_the_chain_s_initial_download() {
+        let dir = tempdir().unwrap();
+        let mut config = NodeConfig::regtest(ChainMode::Divi);
+        config.data_dir = dir.path().to_path_buf();
+        regtest_chain_on_disk(&config, 3);
+        let node = Node::new(config).unwrap();
+        assert!(
+            node.get_blockchain_info().initial_block_download,
+            "a tip days old is in the initial download"
+        );
+
+        let tip = node.chain().tip().unwrap();
+        let now = divi_primitives::clock::now() as u32;
+        node.chain()
+            .accept_block(regtest_block(&tip, tip.height + 1, now))
+            .unwrap();
+        assert!(
+            !node.get_blockchain_info().initial_block_download,
+            "a block dated now ends it"
+        );
     }
 
     /// A damaged block table must stop the node at start with a clear error, as C++
