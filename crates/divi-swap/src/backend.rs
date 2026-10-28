@@ -293,7 +293,9 @@ pub trait ChainBackend: Send + Sync {
     /// return [`SwapError::Held`] here are built on the primary alone. The engine asks for it
     /// only past the deadline of a claim whose preimage is already public, or of a refund
     /// (`docs/plans/swap-poc/status/engine.md`, EM round); never for a first claim that
-    /// would reveal the preimage. `None` (the default): this backend never holds a spend.
+    /// would reveal the preimage. Reads (EV): a two-source read that returns `Held` is made
+    /// on it past the deadline of the refund it sits in front of, or of a claim already
+    /// broadcast (its fee escalation). `None` (the default): this backend never holds.
     fn primary_only(&self) -> Option<std::sync::Arc<dyn ChainBackend>> {
         None
     }

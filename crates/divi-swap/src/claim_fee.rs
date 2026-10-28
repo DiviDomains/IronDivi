@@ -113,6 +113,23 @@ pub(crate) struct ClaimCtx<'a> {
 }
 
 impl ClaimCtx<'_> {
+    /// The same claim on `backend` (a primary-only view, [`crate::hold`]).
+    pub fn with_backend<'b>(&'b self, backend: &'b dyn ChainBackend) -> ClaimCtx<'b> {
+        ClaimCtx {
+            chain: self.chain,
+            backend,
+            escalation: self.escalation,
+            window: self.window,
+            htlc: self.htlc,
+            op: self.op,
+            amount: self.amount,
+            preimage: self.preimage,
+            store: self.store,
+        }
+    }
+}
+
+impl ClaimCtx<'_> {
     /// Sign the first claim. Where the backend can bump it and escalation is on, at the
     /// feerate it reports now, recorded as the base the escalation climbs from. A same-nonce
     /// claim whose estimate is within one price bump of the cap is signed at the cap

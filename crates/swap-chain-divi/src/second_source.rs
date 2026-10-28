@@ -9,7 +9,10 @@
 //! Reconciling a swap-relevant read made on two DIVI endpoints (`[divi].fallback_rpc_url`).
 //!
 //! Rule (docs/plans/swap-poc/single-source-design.md, DIVI): two endpoints that disagree on a
-//! read are never a decision. The answer is `SwapError::Transient`, which the engine retries.
+//! read are never a decision. The answer is `SwapError::Held`, which the engine retries like
+//! `Transient` and, in front of a refund, reads on the primary alone once the refund's deadline
+//! passes (`divi_swap` `hold.rs`, EV); a fallback that fails is the same hold, a primary that
+//! fails stays `Transient`.
 //! Where the two agree the combined answer is the more conservative of the two, so a single
 //! liar can lower a number but never raise one.
 
@@ -38,13 +41,14 @@ pub const TIP_TOLERANCE_BLOCKS: u64 = 2;
 fn disagree(op: &str, detail: String) -> SwapError {
     tracing::warn!(
         op,
-        "DIVI endpoints disagree, treating the read as transient: {detail}"
+        "DIVI endpoints disagree, holding the read for the second source: {detail}"
     );
-    SwapError::Transient(format!("{op}: DIVI endpoints disagree: {detail}"))
+    SwapError::Held(format!("{op}: DIVI endpoints disagree: {detail}"))
 }
 
-/// Join the two endpoints' results. Both answered: their answers. Exactly one failed: the read
-/// is `Transient` (one view is not enough). Both failed: the primary's error, unchanged.
+/// Join the two endpoints' results. Both answered: their answers. The fallback failed: the
+/// read is held (`Held`; one view is not enough). The primary failed: `Transient` (the
+/// primary alone has no answer either). Both failed: the primary's error, unchanged.
 pub(crate) fn pair<T>(op: &str, primary: Result<T>, fallback: Result<T>) -> Result<(T, T)> {
     match (primary, fallback) {
         (Ok(a), Ok(b)) => Ok((a, b)),
@@ -52,7 +56,12 @@ pub(crate) fn pair<T>(op: &str, primary: Result<T>, fallback: Result<T>) -> Resu
             tracing::warn!(op, "fallback endpoint also failed: {f}");
             Err(e)
         }
-        (Err(e), Ok(_)) => Err(disagree(op, format!("primary endpoint failed: {e}"))),
+        (Err(e), Ok(_)) => {
+            tracing::warn!(op, "primary DIVI endpoint failed, fallback answered: {e}");
+            Err(SwapError::Transient(format!(
+                "{op}: DIVI endpoints disagree: primary endpoint failed: {e}"
+            )))
+        }
         (Ok(_), Err(e)) => Err(disagree(op, format!("fallback endpoint failed: {e}"))),
     }
 }

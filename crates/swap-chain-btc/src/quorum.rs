@@ -11,7 +11,9 @@
 //!
 //! Rule (docs/plans/swap-poc/single-source-design.md section 5, BTC; the same as DIVI's
 //! `second_source`): two endpoints that disagree on a read are never a decision. The answer is
-//! `SwapError::Transient`, which the engine retries. Where the two agree on what exists, a
+//! `SwapError::Held`, which the engine retries like `Transient` and, in front of a refund,
+//! reads on the primary alone once the refund's deadline passes (`divi_swap` `hold.rs`, EV);
+//! a secondary that fails is the same hold, a primary that fails stays `Transient`. Where the two agree on what exists, a
 //! confirmation count is the lower of the two, so a single liar can lower a count but never
 //! raise one; endpoints a block apart are ordinary lag, not a disagreement. The tip reads
 //! follow the same rule: the lower tip height and median time, the header of the lower tip
@@ -28,14 +30,15 @@ type Result<T> = std::result::Result<T, SwapError>;
 pub(crate) fn disagree(op: &str, detail: String) -> SwapError {
     tracing::warn!(
         op,
-        "Esplora endpoints disagree, treating the read as transient: {detail}"
+        "Esplora endpoints disagree, holding the read for the second source: {detail}"
     );
-    SwapError::Transient(format!("{op}: Esplora endpoints disagree: {detail}"))
+    SwapError::Held(format!("{op}: Esplora endpoints disagree: {detail}"))
 }
 
-/// Join the two endpoints' results. Both answered: their answers. Exactly one failed: the read
-/// is `Transient` (one view is not enough; quorum mode fails closed). Both failed: the
-/// primary's error, unchanged.
+/// Join the two endpoints' results. Both answered: their answers. The secondary failed: the
+/// read is held (`Held`; one view is not enough, quorum mode fails closed). The primary
+/// failed: `Transient` (the primary alone has no answer either). Both failed: the primary's
+/// error, unchanged.
 pub(crate) fn pair<T>(op: &str, primary: Result<T>, secondary: Result<T>) -> Result<(T, T)> {
     match (primary, secondary) {
         (Ok(a), Ok(b)) => Ok((a, b)),
@@ -43,7 +46,12 @@ pub(crate) fn pair<T>(op: &str, primary: Result<T>, secondary: Result<T>) -> Res
             tracing::warn!(op, "secondary Esplora also failed: {f}");
             Err(e)
         }
-        (Err(e), Ok(_)) => Err(disagree(op, format!("primary failed: {e}"))),
+        (Err(e), Ok(_)) => {
+            tracing::warn!(op, "primary Esplora failed, secondary answered: {e}");
+            Err(SwapError::Transient(format!(
+                "{op}: Esplora endpoints disagree: primary failed: {e}"
+            )))
+        }
         (Ok(_), Err(e)) => Err(disagree(op, format!("secondary failed: {e}"))),
     }
 }

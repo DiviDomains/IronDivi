@@ -212,9 +212,9 @@ impl UsdcBackend {
     /// `find_spend`, `confirmations` and `median_time_past`. Off unless called; without it
     /// every read is the one node's, with the requests it always made. With it, both nodes
     /// are asked and their answers reconciled (`quorum.rs`): a disagreement on existence, on
-    /// the spending transaction or on the lock is `SwapError::Transient`, two confirmation
-    /// counts or block times are the smaller one, and a second node that does not answer is
-    /// `Transient` (fail closed). Tips, sending, nonces, gas and balances stay on the one node.
+    /// the spending transaction or on the lock is `SwapError::Held` (the engine's bounded hold,
+    /// with [`ChainBackend::primary_only`]), two confirmation counts or block times are the
+    /// smaller one, and a second node that does not answer is `Held` (fail closed). Tips, sending, nonces, gas and balances stay on the one node.
     pub fn with_quorum_rpc(mut self, rpc_url: &str) -> Result<Self> {
         let url = rpc_url
             .parse()
@@ -517,6 +517,16 @@ impl ChainBackend for UsdcBackend {
 
     fn pubkey(&self) -> [u8; 33] {
         self.compressed_pubkey
+    }
+
+    /// With the quorum, the same key on the one node alone: the engine reads and builds on it
+    /// only where a hold ends at its deadline (`divi_swap` `hold.rs`). Without it, none.
+    fn primary_only(&self) -> Option<std::sync::Arc<dyn ChainBackend>> {
+        self.quorum.as_ref()?;
+        Some(std::sync::Arc::new(UsdcBackend {
+            quorum: None,
+            ..self.clone()
+        }))
     }
 
     async fn tip_height(&self) -> Result<u64> {

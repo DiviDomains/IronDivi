@@ -44,6 +44,7 @@ use parking_lot::Mutex;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// Public RPC proxy for Divi testnet.
 pub const TESTNET_RPC: &str = "https://services.divi.domains/api/testnet/rpc/";
@@ -113,7 +114,7 @@ impl FeePolicy {
 pub struct DiviBackend {
     rpc: RpcClient,
     /// Optional second endpoint (`[divi].fallback_rpc_url`). When set, every swap-relevant
-    /// read is made on both and a disagreement is `Transient`; see [`second_source`].
+    /// read is made on both and a disagreement is `Held`; see [`second_source`].
     fallback: Option<RpcClient>,
     retry: RetryPolicy,
     key: SecretKey,
@@ -121,7 +122,8 @@ pub struct DiviBackend {
     spk: Script,
     network: Network,
     fee: FeePolicy,
-    wallet: Mutex<Wallet>,
+    /// Shared with the [`ChainBackend::primary_only`] view.
+    wallet: Arc<Mutex<Wallet>>,
     reservations: Option<InputReservations>,
 }
 
@@ -186,7 +188,7 @@ impl DiviBackend {
             key,
             network,
             fee,
-            wallet: Mutex::new(Wallet::open(wallet_path)?),
+            wallet: Arc::new(Mutex::new(Wallet::open(wallet_path)?)),
             reservations: None,
         })
     }
@@ -258,8 +260,9 @@ impl DiviBackend {
     }
 
     /// Add a second, independent endpoint. Every swap-relevant read (confirmations, HTLC
-    /// output, find-spend, MTP, tip height and hash, and the wallet scan reads) is then made on both and any disagreement is
-    /// `SwapError::Transient`; a broadcast goes to both. An empty `url` leaves the backend
+    /// output, find-spend, MTP, tip height and hash, and the wallet scan reads) is then made on both and any disagreement, or
+    /// the fallback failing, is `SwapError::Held` (the engine's bounded hold, with
+    /// [`ChainBackend::primary_only`]); a broadcast goes to both. An empty `url` leaves the backend
     /// single-source.
     pub fn with_fallback_rpc(mut self, url: &str) -> Self {
         let url = url.trim();
@@ -445,6 +448,25 @@ impl ChainBackend for DiviBackend {
 
     fn pubkey(&self) -> [u8; 33] {
         self.pubkey
+    }
+
+    /// With a fallback, the same key and wallet on the primary endpoint alone: the engine
+    /// reads and builds on it only where a hold ends at its deadline (`divi_swap` `hold.rs`).
+    /// Without one, none.
+    fn primary_only(&self) -> Option<Arc<dyn ChainBackend>> {
+        self.fallback.as_ref()?;
+        Some(Arc::new(DiviBackend {
+            rpc: self.rpc.clone(),
+            fallback: None,
+            retry: self.retry,
+            key: self.key.clone(),
+            pubkey: self.pubkey,
+            spk: self.spk.clone(),
+            network: self.network,
+            fee: self.fee,
+            wallet: self.wallet.clone(),
+            reservations: self.reservations.clone(),
+        }))
     }
 
     async fn tip_height(&self) -> Result<u64> {

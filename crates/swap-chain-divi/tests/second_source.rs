@@ -154,8 +154,14 @@ fn spend_txid() -> Txid {
     Txid([0xbb; 32])
 }
 
-fn is_transient<T: std::fmt::Debug>(r: &Result<T, SwapError>) -> bool {
-    matches!(r, Err(SwapError::Transient(m)) if m.contains("disagree"))
+/// A read held for the second source (EV: `Held`, the engine's bounded hold).
+fn is_held<T: std::fmt::Debug>(r: &Result<T, SwapError>) -> bool {
+    matches!(r, Err(SwapError::Held(m)) if m.contains("disagree"))
+}
+
+/// A read the primary could not answer: `Transient`, not a hold.
+fn is_primary_down<T: std::fmt::Debug>(r: &Result<T, SwapError>) -> bool {
+    matches!(r, Err(SwapError::Transient(m)) if m.contains("primary endpoint failed"))
 }
 
 /// Give `chain` the HTLC funding tx (`confs` confirmations, `sat` value) and, if `spent`, a
@@ -279,8 +285,8 @@ async fn inflated_confirmations_on_one_endpoint_are_transient() {
     let o = lock_outpoint();
     // The single-source backend trusts the liar.
     assert_eq!(liar_alone.confirmations(&o.txid).await.unwrap(), Some(100));
-    assert!(is_transient(&liar_primary.confirmations(&o.txid).await));
-    assert!(is_transient(&liar_fallback.confirmations(&o.txid).await));
+    assert!(is_held(&liar_primary.confirmations(&o.txid).await));
+    assert!(is_held(&liar_fallback.confirmations(&o.txid).await));
     let h = htlc(&liar_alone);
     assert_eq!(
         liar_alone
@@ -291,8 +297,8 @@ async fn inflated_confirmations_on_one_endpoint_are_transient() {
             .confirmations,
         100
     );
-    assert!(is_transient(&liar_primary.htlc_output(&h, &o).await));
-    assert!(is_transient(&liar_fallback.htlc_output(&h, &o).await));
+    assert!(is_held(&liar_primary.htlc_output(&h, &o).await));
+    assert!(is_held(&liar_fallback.htlc_output(&h, &o).await));
 }
 
 #[tokio::test]
@@ -317,7 +323,7 @@ async fn one_block_of_tip_lag_is_tolerated_and_the_lower_count_wins() {
 }
 
 #[tokio::test]
-async fn a_spend_hidden_by_one_endpoint_is_transient() {
+async fn a_spend_hidden_by_one_endpoint_is_held() {
     // The honest endpoint has the spend; the liar hides it (state passed has spent = true, then
     // the lie removes it).
     let (_h, _l, liar_alone, honest_alone, liar_primary, liar_fallback) = pair_lie(
@@ -336,12 +342,12 @@ async fn a_spend_hidden_by_one_endpoint_is_transient() {
         .is_some());
     // The single-source backend on the liar sees no spend and would act on that.
     assert!(liar_alone.find_spend(&o, TIP - 2).await.unwrap().is_none());
-    assert!(is_transient(&liar_primary.find_spend(&o, TIP - 2).await));
-    assert!(is_transient(&liar_fallback.find_spend(&o, TIP - 2).await));
+    assert!(is_held(&liar_primary.find_spend(&o, TIP - 2).await));
+    assert!(is_held(&liar_fallback.find_spend(&o, TIP - 2).await));
 }
 
 #[tokio::test]
-async fn a_spend_with_a_different_preimage_is_transient() {
+async fn a_spend_with_a_different_preimage_is_held() {
     let (_h, _l, _la, _ha, liar_primary, liar_fallback) = pair_lie(
         |c, _| {
             let s = spend_txid().to_rpc_hex();
@@ -351,8 +357,8 @@ async fn a_spend_with_a_different_preimage_is_transient() {
     )
     .await;
     let o = lock_outpoint();
-    assert!(is_transient(&liar_primary.find_spend(&o, TIP - 2).await));
-    assert!(is_transient(&liar_fallback.find_spend(&o, TIP - 2).await));
+    assert!(is_held(&liar_primary.find_spend(&o, TIP - 2).await));
+    assert!(is_held(&liar_fallback.find_spend(&o, TIP - 2).await));
 }
 
 #[tokio::test]
@@ -379,7 +385,7 @@ async fn a_spend_in_a_block_on_one_and_the_mempool_on_the_other_is_the_same_spen
 }
 
 #[tokio::test]
-async fn a_shifted_median_time_is_transient() {
+async fn a_shifted_median_time_is_held() {
     let (_h, _l, liar_alone, honest_alone, liar_primary, liar_fallback) =
         pair_lie(|c, _| c.skew = 3 * 3600, (8, SATS, false)).await;
     let honest = honest_alone.median_time_past().await.unwrap();
@@ -388,8 +394,8 @@ async fn a_shifted_median_time_is_transient() {
         liar_alone.median_time_past().await.unwrap(),
         honest + 3 * 3600
     );
-    assert!(is_transient(&liar_primary.median_time_past().await));
-    assert!(is_transient(&liar_fallback.median_time_past().await));
+    assert!(is_held(&liar_primary.median_time_past().await));
+    assert!(is_held(&liar_fallback.median_time_past().await));
 }
 
 #[tokio::test]
@@ -405,7 +411,7 @@ async fn a_small_median_time_skew_is_tolerated_and_the_lower_value_wins() {
 }
 
 #[tokio::test]
-async fn a_wrong_amount_on_one_endpoint_is_transient() {
+async fn a_wrong_amount_on_one_endpoint_is_held() {
     let (_h, _l, liar_alone, _ha, liar_primary, liar_fallback) = pair_lie(
         |c, probe| populate_amount(c, probe, SATS * 2),
         (8, SATS, false),
@@ -422,8 +428,8 @@ async fn a_wrong_amount_on_one_endpoint_is_transient() {
             .amount,
         Amount(SATS * 2)
     );
-    assert!(is_transient(&liar_primary.htlc_output(&h, &o).await));
-    assert!(is_transient(&liar_fallback.htlc_output(&h, &o).await));
+    assert!(is_held(&liar_primary.htlc_output(&h, &o).await));
+    assert!(is_held(&liar_fallback.htlc_output(&h, &o).await));
 }
 
 fn populate_amount(c: &mut Chain, probe: &DiviBackend, sat: u64) {
@@ -434,7 +440,7 @@ fn populate_amount(c: &mut Chain, probe: &DiviBackend, sat: u64) {
 }
 
 #[tokio::test]
-async fn an_output_one_endpoint_does_not_know_is_transient() {
+async fn an_output_one_endpoint_does_not_know_is_held() {
     let (a, ac) = node().await;
     let (b, _bc) = node().await;
     let probe = single(&a.uri());
@@ -442,13 +448,13 @@ async fn an_output_one_endpoint_does_not_know_is_transient() {
     // `b` has never heard of the funding tx.
     let o = lock_outpoint();
     for d in [dual(&a.uri(), &b.uri()), dual(&b.uri(), &a.uri())] {
-        assert!(is_transient(&d.confirmations(&o.txid).await));
-        assert!(is_transient(&d.htlc_output(&htlc(&d), &o).await));
+        assert!(is_held(&d.confirmations(&o.txid).await));
+        assert!(is_held(&d.htlc_output(&htlc(&d), &o).await));
     }
 }
 
 #[tokio::test]
-async fn one_endpoint_down_makes_every_read_transient() {
+async fn one_endpoint_down_fails_every_read_closed() {
     let (a, ac) = node().await;
     let probe = single(&a.uri());
     populate(&ac, &probe, 8, SATS, true);
@@ -459,11 +465,16 @@ async fn one_endpoint_down_makes_every_read_transient() {
         single(&a.uri()).confirmations(&o.txid).await.unwrap(),
         Some(8)
     );
-    for d in [dual(&a.uri(), dead), dual(dead, &a.uri())] {
-        assert!(is_transient(&d.confirmations(&o.txid).await));
-        assert!(is_transient(&d.htlc_output(&htlc(&d), &o).await));
-        assert!(is_transient(&d.find_spend(&o, TIP - 2).await));
-        assert!(is_transient(&d.median_time_past().await));
+    // The fallback down holds every read (`Held`); the primary down is `Transient`.
+    for (d, down) in [(dual(&a.uri(), dead), false), (dual(dead, &a.uri()), true)] {
+        let closed = |r: &Result<_, SwapError>| match down {
+            true => is_primary_down(r),
+            false => is_held(r),
+        };
+        assert!(closed(&d.confirmations(&o.txid).await.map(|_| ())));
+        assert!(closed(&d.htlc_output(&htlc(&d), &o).await.map(|_| ())));
+        assert!(closed(&d.find_spend(&o, TIP - 2).await.map(|_| ())));
+        assert!(closed(&d.median_time_past().await.map(|_| ())));
     }
 }
 
@@ -553,10 +564,6 @@ async fn sample_tx(b: &DiviBackend) -> SignedTx {
 }
 
 // ---- bounded read hold (EV): `Held` and the primary-only view ----
-
-fn is_held<T: std::fmt::Debug>(r: &Result<T, SwapError>) -> bool {
-    matches!(r, Err(SwapError::Held(m)) if m.contains("disagree"))
-}
 
 /// A fallback that disagrees or is down holds the read for the engine's deadline
 /// (`SwapError::Held`); a primary that is down stays `Transient`.

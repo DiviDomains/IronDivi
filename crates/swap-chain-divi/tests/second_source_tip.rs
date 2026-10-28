@@ -123,8 +123,14 @@ fn dead_url() -> String {
     format!("http://{}", l.local_addr().unwrap())
 }
 
-fn is_transient<T: std::fmt::Debug>(r: &Result<T, SwapError>) -> bool {
-    matches!(r, Err(SwapError::Transient(m)) if m.contains("disagree"))
+/// A read held for the second source (EV: `Held`, the engine's bounded hold).
+fn is_held<T: std::fmt::Debug>(r: &Result<T, SwapError>) -> bool {
+    matches!(r, Err(SwapError::Held(m)) if m.contains("disagree"))
+}
+
+/// A read the primary could not answer: `Transient`, not a hold.
+fn is_primary_down<T: std::fmt::Debug>(r: &Result<T, SwapError>) -> bool {
+    matches!(r, Err(SwapError::Transient(m)) if m.contains("primary endpoint failed"))
 }
 
 fn txid(n: u8) -> Txid {
@@ -160,7 +166,7 @@ async fn tip_agree_gives_the_same_answer() {
 }
 
 #[tokio::test]
-async fn tip_inflated_beyond_tolerance_is_transient_and_trusted_single_source() {
+async fn tip_inflated_beyond_tolerance_is_held_and_trusted_single_source() {
     let (a, ca) = node().await;
     let (b, _cb) = node().await;
     ca.lock().tip = TIP + TIP_TOLERANCE_BLOCKS + 1;
@@ -169,11 +175,11 @@ async fn tip_inflated_beyond_tolerance_is_transient_and_trusted_single_source() 
         single(&a.uri()).tip_height().await.unwrap(),
         TIP + TIP_TOLERANCE_BLOCKS + 1
     );
-    assert!(is_transient(&dual(&a.uri(), &b.uri()).tip_height().await));
+    assert!(is_held(&dual(&a.uri(), &b.uri()).tip_height().await));
 }
 
 #[tokio::test]
-async fn tip_deflated_beyond_tolerance_is_transient() {
+async fn tip_deflated_beyond_tolerance_is_held() {
     let (a, _ca) = node().await;
     let (b, cb) = node().await;
     cb.lock().tip = TIP - TIP_TOLERANCE_BLOCKS - 1;
@@ -181,7 +187,7 @@ async fn tip_deflated_beyond_tolerance_is_transient() {
         single(&b.uri()).tip_height().await.unwrap(),
         TIP - TIP_TOLERANCE_BLOCKS - 1
     );
-    assert!(is_transient(&dual(&a.uri(), &b.uri()).tip_height().await));
+    assert!(is_held(&dual(&a.uri(), &b.uri()).tip_height().await));
 }
 
 #[tokio::test]
@@ -196,11 +202,11 @@ async fn tip_within_tolerance_is_accepted_and_the_lower_is_used() {
 }
 
 #[tokio::test]
-async fn tip_with_one_endpoint_down_is_transient() {
+async fn tip_with_one_endpoint_down_is_held() {
     let (a, _ca) = node().await;
     let dead = dead_url();
-    assert!(is_transient(&dual(&a.uri(), &dead).tip_height().await));
-    assert!(is_transient(&dual(&dead, &a.uri()).tip_height().await));
+    assert!(is_held(&dual(&a.uri(), &dead).tip_height().await));
+    assert!(is_primary_down(&dual(&dead, &a.uri()).tip_height().await));
 }
 
 // ---- tip hash ----
@@ -216,14 +222,14 @@ async fn tip_hash_agree_and_disagree() {
     ca.lock().tip_hash = Some(block_hash(999));
     // Fail-before: single source trusts the lie.
     assert_eq!(single(&a.uri()).tip_hash().await.unwrap(), block_hash(999));
-    assert!(is_transient(&dual(&a.uri(), &b.uri()).tip_hash().await));
+    assert!(is_held(&dual(&a.uri(), &b.uri()).tip_hash().await));
 }
 
 #[tokio::test]
-async fn tip_hash_with_one_endpoint_down_is_transient() {
+async fn tip_hash_with_one_endpoint_down_is_held() {
     let (a, _ca) = node().await;
     let dead = dead_url();
-    assert!(is_transient(&dual(&a.uri(), &dead).tip_hash().await));
+    assert!(is_held(&dual(&a.uri(), &dead).tip_hash().await));
 }
 
 // ---- wallet scan ----
@@ -241,7 +247,7 @@ async fn scan_agree_adds_the_coin() {
 }
 
 #[tokio::test]
-async fn scan_invented_coin_is_transient_and_trusted_single_source() {
+async fn scan_invented_coin_is_held_and_trusted_single_source() {
     let (a, ca) = node().await;
     let (b, _cb) = node().await;
     let d = dual(&a.uri(), &b.uri());
@@ -251,7 +257,7 @@ async fn scan_invented_coin_is_transient_and_trusted_single_source() {
     s.scan_range(50, 50).await.unwrap();
     assert_eq!(s.balance(), 9_000_000);
     // Both endpoints: the block lists differ.
-    assert!(is_transient(&d.scan_range(50, 50).await));
+    assert!(is_held(&d.scan_range(50, 50).await));
     assert_eq!(d.balance(), 0);
     assert_eq!(
         d.scanned_height(),
@@ -261,7 +267,7 @@ async fn scan_invented_coin_is_transient_and_trusted_single_source() {
 }
 
 #[tokio::test]
-async fn scan_inflated_amount_is_transient() {
+async fn scan_inflated_amount_is_held() {
     let (a, ca) = node().await;
     let (b, cb) = node().await;
     let d = dual(&a.uri(), &b.uri());
@@ -270,12 +276,12 @@ async fn scan_inflated_amount_is_transient() {
     let s = single(&a.uri());
     s.scan_range(50, 50).await.unwrap();
     assert_eq!(s.balance(), 9_000_000);
-    assert!(is_transient(&d.scan_range(50, 50).await));
+    assert!(is_held(&d.scan_range(50, 50).await));
     assert_eq!(d.balance(), 0);
 }
 
 #[tokio::test]
-async fn scan_hidden_coin_is_transient() {
+async fn scan_hidden_coin_is_held() {
     let (a, ca) = node().await;
     let (b, cb) = node().await;
     let d = dual(&a.uri(), &b.uri());
@@ -289,11 +295,11 @@ async fn scan_hidden_coin_is_transient() {
         0,
         "single source: the hidden coin stays hidden"
     );
-    assert!(is_transient(&d.scan_range(50, 50).await));
+    assert!(is_held(&d.scan_range(50, 50).await));
 }
 
 #[tokio::test]
-async fn scan_hidden_spend_is_transient() {
+async fn scan_hidden_spend_is_held() {
     let (a, ca) = node().await;
     let (b, cb) = node().await;
     let d = dual(&a.uri(), &b.uri());
@@ -318,22 +324,20 @@ async fn scan_hidden_spend_is_transient() {
     let s = single(&a.uri());
     s.scan_range(50, 51).await.unwrap();
     assert_eq!(s.balance(), 7_000, "single source: the spend is hidden");
-    assert!(is_transient(&d.scan_range(50, 51).await));
+    assert!(is_held(&d.scan_range(50, 51).await));
 }
 
 #[tokio::test]
-async fn scan_with_one_endpoint_down_is_transient() {
+async fn scan_with_one_endpoint_down_is_held() {
     let (a, ca) = node().await;
     let d_probe = single(&a.uri());
     pay_to_us(&ca, &d_probe, 1, 7_000, 50);
     let dead = dead_url();
-    assert!(is_transient(
-        &dual(&a.uri(), &dead).scan_range(50, 50).await
-    ));
+    assert!(is_held(&dual(&a.uri(), &dead).scan_range(50, 50).await));
 }
 
 #[tokio::test]
-async fn add_funding_tx_lied_about_is_transient() {
+async fn add_funding_tx_lied_about_is_held() {
     let (a, ca) = node().await;
     let (b, cb) = node().await;
     let d = dual(&a.uri(), &b.uri());
@@ -342,7 +346,7 @@ async fn add_funding_tx_lied_about_is_transient() {
     let s = single(&a.uri());
     assert_eq!(s.add_funding_tx(&txid(1)).await.unwrap(), 1);
     assert_eq!(s.balance(), 9_000_000);
-    assert!(is_transient(&d.add_funding_tx(&txid(1)).await));
+    assert!(is_held(&d.add_funding_tx(&txid(1)).await));
     assert_eq!(d.balance(), 0);
 }
 
@@ -351,7 +355,5 @@ async fn scan_blocks_uses_the_agreed_tip() {
     let (a, ca) = node().await;
     let (b, _cb) = node().await;
     ca.lock().tip = TIP + TIP_TOLERANCE_BLOCKS + 1;
-    assert!(is_transient(
-        &dual(&a.uri(), &b.uri()).scan_blocks(99).await
-    ));
+    assert!(is_held(&dual(&a.uri(), &b.uri()).scan_blocks(99).await));
 }

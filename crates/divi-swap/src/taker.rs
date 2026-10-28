@@ -501,14 +501,16 @@ impl Taker {
         let tb = self.tk(r)?.clone();
         let locktime = self.taker_leg_htlc(r)?.locktime;
         let margin = self.claim_deadline(r.quote.taker_chain()).margin_secs();
-        let Some(confs) = tb
-            .confirmations(&f.outpoint.txid)
+        // The lock's confirmations and the tip are bounded by the same refund deadline (EV).
+        let at = self.taker_refund_read(r)?;
+        let what = "refund: taker-lock confirmation read";
+        let Some(confs) = hold::confirmations(tb.as_ref(), &f.outpoint.txid, &at, what)
             .await?
             .filter(|&c| c >= 1)
         else {
             return Ok(None);
         };
-        let tip = tb.tip_height().await?;
+        let tip = hold::tip_height(tb.as_ref(), &at, "refund: tip read").await?;
         let Some(spend) = hold::find_spend(
             tb.as_ref(),
             &f.outpoint,
@@ -529,11 +531,23 @@ impl Taker {
     }
 
     async fn taker_leg_refundable(&self, r: &TakerRecord) -> Result<bool> {
+        let locktime = self.taker_leg_htlc(r)?.locktime;
         let tk = self.tk(r)?;
-        Ok(tk.refund_final(
-            tk.median_time_past().await?,
-            self.taker_leg_htlc(r)?.locktime,
-        ))
+        let at = self.taker_refund_read(r)?;
+        let mtp = hold::median_time_past(tk.as_ref(), &at, "refund: taker-leg MTP read").await?;
+        Ok(tk.refund_final(mtp, locktime))
+    }
+
+    /// The deadline of a read in front of the taker-leg refund: a hold for the second
+    /// source ends one claim margin after the taker-leg locktime.
+    fn taker_refund_read<'a>(&self, r: &'a TakerRecord) -> Result<hold::RefundRead<'a>> {
+        let locktime = self.taker_leg_htlc(r)?.locktime;
+        let margin = self.claim_deadline(r.quote.taker_chain()).margin_secs();
+        Ok(hold::RefundRead {
+            deadline: hold::refund_deadline(locktime, margin),
+            locktime,
+            swap: &r.id,
+        })
     }
 
     async fn on_locked(&self, r: &mut TakerRecord, maker: Option<&SwapView>) -> Result<Flow> {
@@ -637,24 +651,41 @@ impl Taker {
         let htlc = r
             .maker_leg_htlc
             .ok_or_else(|| SwapError::Other("no verified maker lock".into()))?;
-        let mtp = self.mk(r)?.median_time_past().await?;
         let chain = r.quote.maker_chain();
         let deadline = match r.claim_declined {
             Some(_) => Ok(()), // decided below on an earlier pass
-            None => match self.claim_deadline(chain).check(chain, mtp, htlc.locktime) {
-                Ok(()) => self.claim_fee_check(r, &htlc).await?,
-                Err(late) => Err(match prev_error {
-                    // The claim was verified with the margin to spare and has not gone out
-                    // since: held for a second source, or failing. Never signed on one
-                    // source here, the preimage is still ours: decline, both legs refund.
-                    Some(prev) => {
-                        tracing::error!(swap = %r.id, %chain, locktime = htlc.locktime, mtp,
+            None => match self.first_claim_time(r).await? {
+                (mtp, Some(held)) => {
+                    match self.claim_deadline(chain).check(chain, mtp, htlc.locktime) {
+                        // Never claimed on one source: the preimage is still ours.
+                        Ok(()) => return Err(SwapError::Held(held)),
+                        Err(late) => {
+                            tracing::error!(swap = %r.id, %chain, locktime = htlc.locktime,
+                            wall_clock = mtp, held = %held, "the maker leg's MTP is held for \
+                            its second source past the claim margin on the wall clock; \
+                            declining the first claim, both legs refund");
+                            Err(format!(
+                                "{late} (judged on the wall clock: the maker leg's MTP \
+                            is held: {held})"
+                            ))
+                        }
+                    }
+                }
+                (mtp, None) => match self.claim_deadline(chain).check(chain, mtp, htlc.locktime) {
+                    Ok(()) => self.claim_fee_check(r, &htlc).await?,
+                    Err(late) => Err(match prev_error {
+                        // The claim was verified with the margin to spare and has not gone out
+                        // since: held for a second source, or failing. Never signed on one
+                        // source here, the preimage is still ours: decline, both legs refund.
+                        Some(prev) => {
+                            tracing::error!(swap = %r.id, %chain, locktime = htlc.locktime, mtp,
                             last_error = %prev, "the first claim did not go out before the \
                             claim margin; declining it, both legs refund");
-                        format!("{late}; the first claim did not go out before it: {prev}")
-                    }
-                    None => late,
-                }),
+                            format!("{late}; the first claim did not go out before it: {prev}")
+                        }
+                        None => late,
+                    }),
+                },
             },
         };
         if r.claim_declined.is_none() && deadline.is_ok() {
@@ -674,6 +705,21 @@ impl Taker {
             return self.enter(r, TakerState::Refunded);
         }
         Ok(Flow::Idle)
+    }
+
+    /// The time the first claim's margin is judged by: the maker leg's MTP, or, while that
+    /// is held for its second source, the wall clock with the hold. The wall clock runs ahead
+    /// of MTP, so the decline it gives can only come earlier ([`hold::judge_time`]).
+    async fn first_claim_time(&self, r: &TakerRecord) -> Result<(u32, Option<String>)> {
+        match self.mk(r)?.median_time_past().await {
+            Ok(mtp) => Ok((mtp, None)),
+            Err(SwapError::Held(why)) => {
+                let (now, _) =
+                    hold::judge_time(Err(SwapError::Held(why.clone())), hold::unix_now());
+                Ok((u32::try_from(now).unwrap_or(u32::MAX), Some(why)))
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// The maker-leg claim, for the shared escalation ([`crate::claim_fee`]).
@@ -708,8 +754,20 @@ impl Taker {
                 tx
             }
         };
+        // The claim is out: what follows only resends it and raises its fee. A read held for
+        // the second source goes to the primary alone from the claim deadline on (EV).
+        let mut view = None;
         // A version an RBF bump replaced may be the one that got mined.
-        if ctx.replaced_confirmed(r).await? {
+        let replaced = match ctx.replaced_confirmed(r).await {
+            Err(SwapError::Held(why)) => {
+                let v = self.claimed_view(&ctx, r, why).await?;
+                let replaced = ctx.with_backend(v.as_ref()).replaced_confirmed(r).await?;
+                view = Some(v);
+                replaced
+            }
+            other => other?,
+        };
+        if replaced {
             return self.enter(r, TakerState::Done);
         }
         if let Err(e) = ctx.backend.broadcast(&claim).await {
@@ -719,16 +777,53 @@ impl Taker {
             return Err(e);
         }
         ctx.resend_children(r).await?;
-        if ctx
-            .backend
-            .confirmations(&claim.txid)
-            .await?
-            .is_some_and(|c| c >= 1)
-        {
+        let reads = view.as_deref().unwrap_or(ctx.backend);
+        let confs = match reads.confirmations(&claim.txid).await {
+            Err(SwapError::Held(why)) => {
+                let v = self.claimed_view(&ctx, r, why).await?;
+                let confs = v.confirmations(&claim.txid).await?;
+                view = Some(v);
+                confs
+            }
+            other => other?,
+        };
+        if confs.is_some_and(|c| c >= 1) {
             return self.enter(r, TakerState::Done);
         }
-        ctx.escalate(r, &claim).await?;
+        match &view {
+            Some(v) => ctx.with_backend(v.as_ref()).escalate(r, &claim).await?,
+            None => match ctx.escalate(r, &claim).await {
+                Err(SwapError::Held(why)) => {
+                    let v = self.claimed_view(&ctx, r, why).await?;
+                    ctx.with_backend(v.as_ref()).escalate(r, &claim).await?
+                }
+                other => other?,
+            },
+        }
         Ok(Flow::Idle)
+    }
+
+    /// The primary-only view for a read of the broadcast maker-leg claim that is held for the
+    /// second source, from the claim deadline on (less than the claim margin left before the
+    /// maker's refund locktime, [`hold::claim_deadline`]), so its fee escalation runs; `Held`
+    /// until then. Only fees move on it: the claim was signed and sent on both sources.
+    async fn claimed_view(
+        &self,
+        ctx: &ClaimCtx<'_>,
+        r: &TakerRecord,
+        why: String,
+    ) -> Result<Arc<dyn ChainBackend>> {
+        let locktime = ctx.htlc.locktime;
+        let deadline = hold::claim_deadline(locktime, ctx.window);
+        hold::read_past_deadline(
+            ctx.backend,
+            why,
+            deadline,
+            &r.id,
+            "claim escalation",
+            locktime,
+        )
+        .await
     }
 
     /// The node refused `claim`, the current version of the maker-leg claim, for good.
@@ -844,12 +939,12 @@ impl Taker {
             }
             Err(e) => return Err(e),
         }
-        if self
-            .tk(r)?
-            .confirmations(&refund.txid)
-            .await?
-            .is_some_and(|c| c >= 1)
-        {
+        let at = self.taker_refund_read(r)?;
+        let tk = self.tk(r)?;
+        let confs =
+            hold::confirmations(tk.as_ref(), &refund.txid, &at, "refund: confirmation read")
+                .await?;
+        if confs.is_some_and(|c| c >= 1) {
             return self.enter(r, TakerState::Done);
         }
         Ok(Flow::Idle)

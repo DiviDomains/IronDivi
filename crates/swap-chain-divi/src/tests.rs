@@ -1110,12 +1110,12 @@ async fn with_a_fallback_the_tip_header_and_best_chain_must_agree() {
     f.result("getblockhash", json!("00".repeat(32)));
     assert!(matches!(
         b.in_best_chain(9, TIP).await,
-        Err(SwapError::Transient(_))
+        Err(SwapError::Held(_))
     ));
     f.result("getbestblockhash", json!("00".repeat(32)));
     f.result(
         "getblock",
         json!({"hash": "00".repeat(32), "height": 9, "time": 1_800_000_000u32}),
     );
-    assert!(matches!(b.tip_header().await, Err(SwapError::Transient(_))));
+    assert!(matches!(b.tip_header().await, Err(SwapError::Held(_))));
 }

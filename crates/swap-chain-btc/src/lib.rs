@@ -133,7 +133,9 @@ impl BtcBackend {
 
     /// Read `find_spend`, `htlc_output` and `confirmations` from the primary and the secondary
     /// Esplora and act only on an answer both give (single-source-design.md section 5, BTC).
-    /// A disagreement, or either endpoint failing, is `Transient` (see `quorum.rs`). The same
+    /// A disagreement, or the secondary failing, is `SwapError::Held` (the engine's bounded
+    /// hold, with [`ChainBackend::primary_only`]); the primary failing is `Transient` (see
+    /// `quorum.rs`). The same
     /// switch posts every broadcast to both endpoints (see `broadcast.rs`), funds only from
     /// coins both list, and takes the higher of their fee rates. Off by default; refused with
     /// fewer than two endpoints.
@@ -513,6 +515,24 @@ impl ChainBackend for BtcBackend {
 
     fn pubkey(&self) -> [u8; 33] {
         self.pubkey.to_bytes()
+    }
+
+    /// With quorum reads, the same key on the primary Esplora alone, quorum reads off and no
+    /// failover (the secondary is the source being held): the engine reads and builds on it
+    /// only where a hold ends at its deadline (`divi_swap` `hold.rs`). Off, none.
+    fn primary_only(&self) -> Option<std::sync::Arc<dyn ChainBackend>> {
+        let (primary, _) = self.quorum.as_ref()?;
+        Some(std::sync::Arc::new(BtcBackend {
+            esplora: primary.clone(),
+            secp: self.secp.clone(),
+            key: self.key,
+            pubkey: self.pubkey,
+            address: self.address.clone(),
+            network: self.network,
+            fees: self.fees,
+            reservations: self.reservations.clone(),
+            quorum: None,
+        }))
     }
 
     async fn tip_height(&self) -> Result<u64> {

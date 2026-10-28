@@ -31,11 +31,20 @@
 //! (`taker.rs`). Only if the chain's MTP cannot be read (a two-source MTP whose second source
 //! is down) is the wall clock used, which runs ahead of MTP and so can only bring a deadline
 //! earlier.
+//!
+//! Reads (EV): a two-source read (BTC `[btc].quorum_reads`, the USDC quorum, DIVI
+//! `fallback_rpc_url`) is `Held` the same way. Beyond the spend read above ([`find_spend`]),
+//! the other reads in front of a refund (the taker's `taker_leg_refundable` and the lock's
+//! confirmations and tip in `taker_leg_lost`, the maker's lock confirmations and
+//! `maker_leg_timed_out`, both refunds' confirmation) are made on the primary alone from the
+//! same refund deadline ([`confirmations`], [`tip_height`], [`median_time_past`]); the taker's claim already broadcast in `Claimed` reads on
+//! the primary alone from the claim deadline so its fee escalation runs (fee only, no new
+//! spend). A claim after the reveal is never read or built here.
 
 use crate::backend::ChainBackend;
 use crate::error::{Result, SwapError};
 use crate::htlc::HtlcParams;
-use crate::types::{Amount, Outpoint, SignedTx, SpendInfo};
+use crate::types::{Amount, Outpoint, SignedTx, SpendInfo, Txid};
 
 /// What `last_error` says of a public-preimage claim held past its old deadline.
 pub(crate) const NO_REFUND_PATH: &str = "held claim, no refund path: needs a human";
@@ -61,7 +70,7 @@ pub(crate) fn judge_time(mtp: Result<u32>, wall: u64) -> (i64, &'static str) {
     }
 }
 
-fn unix_now() -> u64 {
+pub(crate) fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -77,6 +86,30 @@ pub(crate) async fn past_deadline(
     swap: &str,
     what: &str,
     locktime: u32,
+) -> Result<std::sync::Arc<dyn ChainBackend>> {
+    past(backend, why, deadline, swap, what, locktime, "building it").await
+}
+
+/// [`past_deadline`] for a read: the log says the read is made on the primary alone.
+pub(crate) async fn read_past_deadline(
+    backend: &dyn ChainBackend,
+    why: String,
+    deadline: i64,
+    swap: &str,
+    what: &str,
+    locktime: u32,
+) -> Result<std::sync::Arc<dyn ChainBackend>> {
+    past(backend, why, deadline, swap, what, locktime, "reading it").await
+}
+
+async fn past(
+    backend: &dyn ChainBackend,
+    why: String,
+    deadline: i64,
+    swap: &str,
+    what: &str,
+    locktime: u32,
+    act: &str,
 ) -> Result<std::sync::Arc<dyn ChainBackend>> {
     let Some(view) = backend.primary_only() else {
         return Err(SwapError::Held(why));
@@ -94,8 +127,8 @@ pub(crate) async fn past_deadline(
         now,
         clock,
         held = %why,
-        "{what} held by the second source until its deadline: building it on the primary \
-         source alone"
+        "{what} held by the second source until its deadline: {act} on the primary source \
+         alone"
     );
     Ok(view)
 }
@@ -139,6 +172,65 @@ pub(crate) async fn keep_holding(
         );
     }
     SwapError::Held(format!("{NO_REFUND_PATH}: {why}"))
+}
+
+/// The deadline a held read in front of a refund waits for: the refund deadline
+/// ([`refund_deadline`]) of the HTLC with `locktime`, for swap `swap`.
+pub(crate) struct RefundRead<'a> {
+    pub deadline: i64,
+    pub locktime: u32,
+    pub swap: &'a str,
+}
+
+impl RefundRead<'_> {
+    /// The primary-only view for a read `what` held for `why`, once the deadline is reached.
+    async fn view(
+        &self,
+        backend: &dyn ChainBackend,
+        why: String,
+        what: &str,
+    ) -> Result<std::sync::Arc<dyn ChainBackend>> {
+        read_past_deadline(backend, why, self.deadline, self.swap, what, self.locktime).await
+    }
+}
+
+/// [`ChainBackend::confirmations`] in front of a refund: held for the second source, it is
+/// read on the primary alone from the refund deadline (`Held` until then).
+pub(crate) async fn confirmations(
+    backend: &dyn ChainBackend,
+    txid: &Txid,
+    at: &RefundRead<'_>,
+    what: &str,
+) -> Result<Option<u32>> {
+    match backend.confirmations(txid).await {
+        Err(SwapError::Held(why)) => at.view(backend, why, what).await?.confirmations(txid).await,
+        other => other,
+    }
+}
+
+/// [`ChainBackend::tip_height`] in front of a refund, as [`confirmations`].
+pub(crate) async fn tip_height(
+    backend: &dyn ChainBackend,
+    at: &RefundRead<'_>,
+    what: &str,
+) -> Result<u64> {
+    match backend.tip_height().await {
+        Err(SwapError::Held(why)) => at.view(backend, why, what).await?.tip_height().await,
+        other => other,
+    }
+}
+
+/// [`ChainBackend::median_time_past`] in front of a refund, as [`confirmations`]; the
+/// deadline itself is then judged on the wall clock ([`judge_time`]).
+pub(crate) async fn median_time_past(
+    backend: &dyn ChainBackend,
+    at: &RefundRead<'_>,
+    what: &str,
+) -> Result<u32> {
+    match backend.median_time_past().await {
+        Err(SwapError::Held(why)) => at.view(backend, why, what).await?.median_time_past().await,
+        other => other,
+    }
 }
 
 /// What a record says once a spend was built on the primary alone.

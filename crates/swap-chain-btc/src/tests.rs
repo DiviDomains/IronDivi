@@ -1272,31 +1272,31 @@ async fn mock_lock(server: &MockServer, fund: &Outpoint, spk: &str, value: u64, 
 }
 
 #[tokio::test]
-async fn quorum_find_spend_a_claim_the_primary_hides_is_transient() {
+async fn quorum_find_spend_a_claim_the_primary_hides_is_held() {
     let (primary, secondary) = (MockServer::start().await, MockServer::start().await);
     let fund = outpoint();
     mock_unspent(&primary, &fund).await;
     mock_spend(&secondary, &fund, &"ab".repeat(32), Some(777)).await;
-    let m = transient(quorum(&primary, &secondary).find_spend(&fund, 700).await);
+    let m = held(quorum(&primary, &secondary).find_spend(&fund, 700).await);
     assert!(m.contains("unspent") && m.contains(&"ab".repeat(32)), "{m}");
 }
 
 #[tokio::test]
-async fn quorum_find_spend_a_spend_only_the_primary_reports_is_transient() {
+async fn quorum_find_spend_a_spend_only_the_primary_reports_is_held() {
     let (primary, secondary) = (MockServer::start().await, MockServer::start().await);
     let fund = outpoint();
     mock_spend(&primary, &fund, &"ab".repeat(32), Some(777)).await;
     mock_unspent(&secondary, &fund).await;
-    transient(quorum(&primary, &secondary).find_spend(&fund, 700).await);
+    held(quorum(&primary, &secondary).find_spend(&fund, 700).await);
 }
 
 #[tokio::test]
-async fn quorum_find_spend_two_different_spenders_is_transient() {
+async fn quorum_find_spend_two_different_spenders_is_held() {
     let (primary, secondary) = (MockServer::start().await, MockServer::start().await);
     let fund = outpoint();
     mock_spend(&primary, &fund, &"ab".repeat(32), Some(777)).await;
     mock_spend(&secondary, &fund, &"cd".repeat(32), Some(777)).await;
-    let m = transient(quorum(&primary, &secondary).find_spend(&fund, 700).await);
+    let m = held(quorum(&primary, &secondary).find_spend(&fund, 700).await);
     assert!(
         m.contains(&"ab".repeat(32)) && m.contains(&"cd".repeat(32)),
         "{m}"
@@ -1304,7 +1304,7 @@ async fn quorum_find_spend_two_different_spenders_is_transient() {
 }
 
 #[tokio::test]
-async fn quorum_htlc_output_the_secondary_does_not_have_is_transient() {
+async fn quorum_htlc_output_the_secondary_does_not_have_is_held() {
     let (primary, secondary) = (MockServer::start().await, MockServer::start().await);
     let (_, hash) = new_preimage();
     let h = htlc(hash);
@@ -1315,11 +1315,11 @@ async fn quorum_htlc_output_the_secondary_does_not_have_is_transient() {
     }
     mock_lock(&primary, &fund, &spk, 20_000, 109).await;
     // The secondary does not know the transaction (wiremock 404).
-    transient(quorum(&primary, &secondary).htlc_output(&h, &fund).await);
+    held(quorum(&primary, &secondary).htlc_output(&h, &fund).await);
 }
 
 #[tokio::test]
-async fn quorum_htlc_output_with_another_value_is_transient() {
+async fn quorum_htlc_output_with_another_value_is_held() {
     let (primary, secondary) = (MockServer::start().await, MockServer::start().await);
     let (_, hash) = new_preimage();
     let h = htlc(hash);
@@ -1330,12 +1330,12 @@ async fn quorum_htlc_output_with_another_value_is_transient() {
     }
     mock_lock(&primary, &fund, &spk, 20_000, 109).await;
     mock_lock(&secondary, &fund, &spk, 2_000, 109).await;
-    let m = transient(quorum(&primary, &secondary).htlc_output(&h, &fund).await);
+    let m = held(quorum(&primary, &secondary).htlc_output(&h, &fund).await);
     assert!(m.contains("20000") && m.contains("2000"), "{m}");
 }
 
 #[tokio::test]
-async fn quorum_htlc_output_with_another_script_is_transient() {
+async fn quorum_htlc_output_with_another_script_is_held() {
     let (primary, secondary) = (MockServer::start().await, MockServer::start().await);
     let (_, hash) = new_preimage();
     let (_, other) = new_preimage();
@@ -1348,11 +1348,11 @@ async fn quorum_htlc_output_with_another_script_is_transient() {
     let other_spk = hex::encode(htlc_script_pubkey(&htlc(other)).as_bytes());
     mock_lock(&primary, &fund, &spk, 20_000, 109).await;
     mock_lock(&secondary, &fund, &other_spk, 20_000, 109).await;
-    transient(quorum(&primary, &secondary).htlc_output(&h, &fund).await);
+    held(quorum(&primary, &secondary).htlc_output(&h, &fund).await);
 }
 
 #[tokio::test]
-async fn quorum_confirmations_the_secondary_does_not_know_is_transient() {
+async fn quorum_confirmations_the_secondary_does_not_know_is_held() {
     let (primary, secondary) = (MockServer::start().await, MockServer::start().await);
     let fund = outpoint();
     for s in [&primary, &secondary] {
@@ -1364,7 +1364,7 @@ async fn quorum_confirmations_the_secondary_does_not_know_is_transient() {
         json!({"confirmed": true, "block_height": 109}),
     )
     .await;
-    transient(quorum(&primary, &secondary).confirmations(&fund.txid).await);
+    held(quorum(&primary, &secondary).confirmations(&fund.txid).await);
 }
 
 /// Agreement: the lower confirmation count wins (a block apart is lag, not a lie), and a
@@ -1410,10 +1410,10 @@ async fn quorum_agreeing_reads_take_the_lower_count() {
     assert!(b.find_spend(&unspent, 100).await.unwrap().is_none());
 }
 
-/// Quorum mode fails closed: a secondary that cannot be reached leaves every quorum read
-/// `Transient`, however healthy the primary's answer looks.
+/// Quorum mode fails closed: a secondary that cannot be reached holds every quorum read
+/// (`Held`), however healthy the primary's answer looks.
 #[tokio::test]
-async fn quorum_unreachable_secondary_is_transient() {
+async fn quorum_unreachable_secondary_is_held() {
     let primary = MockServer::start().await;
     let (_, hash) = new_preimage();
     let h = htlc(hash);
@@ -1425,9 +1425,9 @@ async fn quorum_unreachable_secondary_is_transient() {
     let b = backend(vec![primary.uri(), dead_url()], MAKER_KEY)
         .with_quorum_reads(true)
         .unwrap();
-    transient(b.confirmations(&fund.txid).await);
-    transient(b.htlc_output(&h, &fund).await);
-    transient(b.find_spend(&fund, 100).await);
+    held(b.confirmations(&fund.txid).await);
+    held(b.htlc_output(&h, &fund).await);
+    held(b.find_spend(&fund, 100).await);
 }
 
 /// Off (the default): the three reads go to the primary alone, exactly as before; the
@@ -1553,23 +1553,23 @@ async fn quorum_tip_reads_agree_on_the_lower_tip() {
 /// Two different blocks at one height are a disagreement: at the shared tip height, and at
 /// the lower tip's height when one endpoint is a block ahead on another branch.
 #[tokio::test]
-async fn quorum_tip_hash_two_blocks_at_one_height_is_transient() {
+async fn quorum_tip_hash_two_blocks_at_one_height_is_held() {
     let (primary, secondary) = (MockServer::start().await, MockServer::start().await);
     mock_chain_tip(&primary, 100, TIP_A, TIP_C, 1_789_998_000).await;
     mock_chain_tip(&secondary, 100, TIP_B, TIP_C, 1_789_998_000).await;
     let b = quorum(&primary, &secondary);
-    let m = transient(b.tip_hash().await);
+    let m = held(b.tip_hash().await);
     assert!(m.contains(TIP_A) && m.contains(TIP_B), "{m}");
-    transient(b.tip_header().await);
+    held(b.tip_header().await);
 
     let (primary, secondary) = (MockServer::start().await, MockServer::start().await);
     // The primary is a block ahead, but its block 100 is TIP_C, not the secondary's TIP_A.
     mock_chain_tip(&primary, 101, TIP_B, TIP_C, 1_789_998_600).await;
     mock_chain_tip(&secondary, 100, TIP_A, TIP_C, 1_789_998_000).await;
     let b = quorum(&primary, &secondary);
-    let m = transient(b.tip_hash().await);
+    let m = held(b.tip_hash().await);
     assert!(m.contains(TIP_A) && m.contains(TIP_C), "{m}");
-    transient(b.tip_header().await);
+    held(b.tip_header().await);
 }
 
 #[tokio::test]
@@ -1587,24 +1587,26 @@ async fn quorum_in_best_chain_needs_both_endpoints() {
         !b.in_best_chain(100, TIP_C).await.unwrap(),
         "orphaned on both"
     );
-    let m = transient(b.in_best_chain(101, TIP_B).await);
+    let m = held(b.in_best_chain(101, TIP_B).await);
     assert!(m.contains(TIP_B), "{m}");
 }
 
-/// Fail closed on the tip reads too: with either endpoint unreachable, all five are
-/// `Transient`, however healthy the other's answer looks.
+/// Fail closed on the tip reads too: with either endpoint unreachable, all five fail, however
+/// healthy the other's answer looks (`Held` with the secondary down, `Transient` with the
+/// primary down).
 #[tokio::test]
-async fn quorum_tip_reads_with_one_endpoint_down_are_transient() {
+async fn quorum_tip_reads_with_one_endpoint_down_are_held() {
     let up = MockServer::start().await;
     mock_chain_tip(&up, 100, TIP_A, TIP_C, 1_789_998_000).await;
     mock_best(&up, TIP_A, 100, true).await;
     for urls in [vec![up.uri(), dead_url()], vec![dead_url(), up.uri()]] {
+        let down = urls[0] == dead_url();
         let b = backend(urls, MAKER_KEY).with_quorum_reads(true).unwrap();
-        transient(b.tip_height().await);
-        transient(b.tip_hash().await);
-        transient(b.tip_header().await);
-        transient(b.median_time_past().await);
-        transient(b.in_best_chain(100, TIP_A).await);
+        one_down(down, b.tip_height().await);
+        one_down(down, b.tip_hash().await);
+        one_down(down, b.tip_header().await);
+        one_down(down, b.median_time_past().await);
+        one_down(down, b.in_best_chain(100, TIP_A).await);
     }
 }
 
@@ -1920,9 +1922,10 @@ async fn quorum_funding_a_coin_is_confirmed_only_on_both_words() {
     assert_eq!(spent_txids(&f), [[2u8; 32]]);
 }
 
-/// The UTXO list failing on either endpoint is `Transient`, as every quorum read.
+/// The UTXO list failing on either endpoint fails funding, as every quorum read (`Held` with
+/// the secondary down, `Transient` with the primary down).
 #[tokio::test]
-async fn quorum_funding_with_one_endpoint_down_is_transient() {
+async fn quorum_funding_with_one_endpoint_down_fails_closed() {
     let primary = MockServer::start().await;
     let probe = backend(vec![dead_url()], MAKER_KEY);
     mock_wallet(&primary, &probe, &[(1, 900_000, true)]).await;
@@ -1930,10 +1933,14 @@ async fn quorum_funding_with_one_endpoint_down_is_transient() {
         vec![primary.uri(), dead_url()],
         vec![dead_url(), primary.uri()],
     ] {
+        let down = urls[0] == dead_url();
         let b = backend(urls, MAKER_KEY).with_quorum_reads(true).unwrap();
         let (_, hash) = new_preimage();
-        transient(b.build_funding(&htlc(hash), Amount::from_sat(20_000)).await);
-        transient(b.spendable().await);
+        one_down(
+            down,
+            b.build_funding(&htlc(hash), Amount::from_sat(20_000)).await,
+        );
+        one_down(down, b.spendable().await);
     }
 }
 
@@ -1980,6 +1987,15 @@ async fn quorum_fee_rate_is_the_higher_of_the_two() {
 }
 
 // ---- bounded read hold (EV): `Held` and the primary-only view ----
+
+/// The secondary down holds a quorum read (`Held`); the primary down is `Transient`.
+fn one_down<T: std::fmt::Debug>(primary_down: bool, r: Result<T>) -> String {
+    if primary_down {
+        transient(r)
+    } else {
+        held(r)
+    }
+}
 
 fn held<T: std::fmt::Debug>(r: Result<T>) -> String {
     match r {

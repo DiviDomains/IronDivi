@@ -10,8 +10,9 @@
 //!
 //! Rule (docs/plans/swap-poc/single-source-design.md, USDC/EVM; the DIVI shape in
 //! `swap-chain-divi/src/second_source.rs`): two nodes that disagree on a read a claim or
-//! refund rests on are never a decision. The answer is `SwapError::Transient`, which the
-//! engine retries.
+//! refund rests on are never a decision. The answer is `SwapError::Held`, which the engine
+//! retries like `Transient` and, in front of a refund, reads on the primary alone once the
+//! refund's deadline passes (`divi_swap` `hold.rs`, EV).
 //!
 //! - Existence: `Some` on one node and `None` on the other is a disagreement.
 //! - A lock (`htlc_output`): each node checks the `Locked` log's parties, token, hashlock and
@@ -21,7 +22,7 @@
 //! - `confirmations`: two counts are the smaller one (nodes a block apart are ordinary lag).
 //! - `median_time_past`: the smaller latest-block timestamp, never a disagreement, so a refund
 //!   is never early on one node's word.
-//! - A second node that fails to answer is `Transient` (fail closed: one view is not enough).
+//! - A second node that fails to answer is `Held` (fail closed: one view is not enough).
 //!   A primary that fails returns its own error, as with no second node; the second node is
 //!   then not asked.
 
@@ -29,12 +30,12 @@ use divi_swap::{LockedOutput, SpendInfo, SwapError};
 
 type Result<T> = std::result::Result<T, SwapError>;
 
-/// The engine logs a `Transient` read and retries it, so the message names both answers.
+/// The engine logs a `Held` read and retries it, so the message names both answers.
 fn disagree(op: &str, detail: String) -> SwapError {
-    SwapError::Transient(format!("{op}: USDC nodes disagree: {detail}"))
+    SwapError::Held(format!("{op}: USDC nodes disagree: {detail}"))
 }
 
-/// The second node's answer, or `Transient` if it gave none.
+/// The second node's answer, or `Held` if it gave none.
 pub(crate) fn second<T>(op: &str, answer: Result<T>) -> Result<T> {
     answer.map_err(|e| disagree(op, format!("second node failed: {e}")))
 }
@@ -372,27 +373,18 @@ mod tests {
         (p, s, backend)
     }
 
-    fn assert_transient<T: std::fmt::Debug>(r: Result<T, SwapError>, what: &str) {
-        match r {
-            Err(SwapError::Transient(msg)) => {
-                assert!(msg.contains("disagree"), "{what}: {msg}");
-            }
-            other => panic!("{what}: expected Transient, got {other:?}"),
-        }
-    }
-
     /// The primary hides the taker's claim; the second node has it. One node's silence must
     /// not read as "unspent" (the maker would wait out its own lock's timelock while the
     /// taker holds the preimage).
     #[tokio::test]
-    async fn find_spend_hidden_by_the_primary_is_transient() {
+    async fn find_spend_hidden_by_the_primary_is_held() {
         let (_p, _s, backend) = pair(&with_lock(110), &claimed(with_lock(110))).await;
-        assert_transient(
+        assert_held(
             backend.find_spend(&lock_outpoint(), 100).await,
             "claim only on second",
         );
         let (_p, _s, backend) = pair(&claimed(with_lock(110)), &with_lock(110)).await;
-        assert_transient(
+        assert_held(
             backend.find_spend(&lock_outpoint(), 100).await,
             "claim only on primary",
         );
@@ -420,7 +412,7 @@ mod tests {
     /// The primary says the lock was refunded, the second node that it was claimed: two
     /// spending txids. The message names both answers.
     #[tokio::test]
-    async fn find_spend_with_two_spending_txids_is_transient_and_names_both() {
+    async fn find_spend_with_two_spending_txids_is_held_and_names_both() {
         const REFUND_TX: B256 = B256::repeat_byte(0xd1);
         let mut refunded = with_lock(110);
         let data = IErc20Htlc::Refunded {
@@ -430,7 +422,7 @@ mod tests {
         refunded.logs.push(rpc_log(&data, REFUND_TX, 106));
         let (_p, _s, backend) = pair(&refunded, &claimed(with_lock(110))).await;
         match backend.find_spend(&lock_outpoint(), 100).await {
-            Err(SwapError::Transient(msg)) => {
+            Err(SwapError::Held(msg)) => {
                 assert!(msg.contains("disagree"), "{msg}");
                 assert!(
                     msg.contains(&Txid(REFUND_TX.0).to_string()),
@@ -441,15 +433,15 @@ mod tests {
                     "claim txid missing: {msg}"
                 );
             }
-            other => panic!("expected Transient, got {other:?}"),
+            other => panic!("expected Held, got {other:?}"),
         }
     }
 
     /// The primary reports a lock the second node does not have, or has at another amount.
     #[tokio::test]
-    async fn htlc_output_seen_by_one_node_or_at_two_amounts_is_transient() {
+    async fn htlc_output_seen_by_one_node_or_at_two_amounts_is_held() {
         let (_p, _s, backend) = pair(&with_lock(110), &ChainNode::new(110)).await;
-        assert_transient(
+        assert_held(
             backend.htlc_output(&htlc(), &lock_outpoint()).await,
             "lock only on primary",
         );
@@ -458,12 +450,12 @@ mod tests {
             .receipts
             .insert(LOCK_TX, lock_receipt(UNITS / 2, 100));
         let (_p, _s, backend) = pair(&with_lock(110), &other_amount).await;
-        assert_transient(
+        assert_held(
             backend.htlc_output(&htlc(), &lock_outpoint()).await,
             "lock at another amount",
         );
         let (_p, _s, backend) = pair(&ChainNode::new(110), &with_lock(110)).await;
-        assert_transient(
+        assert_held(
             backend.htlc_output(&htlc(), &lock_outpoint()).await,
             "lock only on second",
         );
@@ -500,14 +492,14 @@ mod tests {
 
     /// The primary has a receipt for a transaction the second node does not know.
     #[tokio::test]
-    async fn confirmations_known_to_one_node_is_transient() {
+    async fn confirmations_known_to_one_node_is_held() {
         let (_p, _s, backend) = pair(&with_lock(110), &ChainNode::new(110)).await;
-        assert_transient(
+        assert_held(
             backend.confirmations(&Txid(LOCK_TX.0)).await,
             "primary only",
         );
         let (_p, _s, backend) = pair(&ChainNode::new(110), &with_lock(110)).await;
-        assert_transient(backend.confirmations(&Txid(LOCK_TX.0)).await, "second only");
+        assert_held(backend.confirmations(&Txid(LOCK_TX.0)).await, "second only");
     }
 
     /// Two counts a block apart are lag, not a disagreement: the smaller is used. Unknown to
@@ -531,25 +523,25 @@ mod tests {
         );
     }
 
-    /// A second node that does not answer fails the read closed: `Transient`, never the
+    /// A second node that does not answer fails the read closed: `Held`, never the
     /// primary's answer alone.
     #[tokio::test]
-    async fn an_unreachable_second_node_is_transient() {
+    async fn an_unreachable_second_node_is_held() {
         let p = serve(&claimed(with_lock(110))).await;
         let backend = quorum(&p, "http://127.0.0.1:1");
-        assert_transient(
+        assert_held(
             backend.find_spend(&lock_outpoint(), 100).await,
             "find_spend",
         );
-        assert_transient(
+        assert_held(
             backend.htlc_output(&htlc(), &lock_outpoint()).await,
             "htlc_output",
         );
-        assert_transient(
+        assert_held(
             backend.confirmations(&Txid(LOCK_TX.0)).await,
             "confirmations",
         );
-        assert_transient(backend.median_time_past().await, "median_time_past");
+        assert_held(backend.median_time_past().await, "median_time_past");
     }
 
     /// Quorum off (the default): every read is the primary's, with the requests it made on

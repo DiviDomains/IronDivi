@@ -749,9 +749,9 @@ impl Maker {
             Err(e) => return Err(e),
         }
         self.mark_lock_sent(r)?;
-        let confs = self
-            .mk(r)?
-            .confirmations(&funding.tx.txid)
+        let at = self.maker_refund_read(r)?;
+        let what = "refund: maker-lock confirmation read";
+        let confs = hold::confirmations(self.mk(r)?.as_ref(), &funding.tx.txid, &at, what)
             .await?
             .unwrap_or(0);
         let spent_already = confs >= 1 && self.revealed_preimage(r).await?.is_some();
@@ -905,12 +905,12 @@ impl Maker {
             }
             Err(e) => return Err(e),
         }
-        if self
-            .mk(r)?
-            .confirmations(&refund.txid)
-            .await?
-            .is_some_and(|c| c >= 1)
-        {
+        let at = self.maker_refund_read(r)?;
+        let mk = self.mk(r)?;
+        let confs =
+            hold::confirmations(mk.as_ref(), &refund.txid, &at, "refund: confirmation read")
+                .await?;
+        if confs.is_some_and(|c| c >= 1) {
             return self.enter(r, SwapState::MakerRefunded);
         }
         Ok(Flow::Idle)
@@ -1114,7 +1114,21 @@ impl Maker {
     async fn maker_leg_timed_out(&self, r: &MakerRecord) -> Result<bool> {
         let (htlc, _) = self.maker_leg(r)?;
         let mk = self.mk(r)?;
-        Ok(mk.refund_final(mk.median_time_past().await?, htlc.locktime))
+        let at = self.maker_refund_read(r)?;
+        let mtp = hold::median_time_past(mk.as_ref(), &at, "refund: maker-leg MTP read").await?;
+        Ok(mk.refund_final(mtp, htlc.locktime))
+    }
+
+    /// The deadline of a read in front of the maker-leg refund: a hold for the second
+    /// source ends one claim margin after the maker-leg locktime.
+    fn maker_refund_read<'a>(&self, r: &'a MakerRecord) -> Result<hold::RefundRead<'a>> {
+        let (htlc, _) = self.maker_leg(r)?;
+        let margin = ClaimDeadline::builtin(self.mk(r)?.chain()).margin_secs();
+        Ok(hold::RefundRead {
+            deadline: hold::refund_deadline(htlc.locktime, margin),
+            locktime: htlc.locktime,
+            swap: &r.id,
+        })
     }
 
     /// The preimage, if a transaction other than our own refund spent the maker-leg lock. Our
