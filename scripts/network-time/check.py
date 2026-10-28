@@ -36,13 +36,7 @@ START_TIMEOUT = 300
 POS_DRIFT, POW_DRIFT = 180, 7200
 
 # Differences listed in README.md, one per row name: (reason, shape(core, iron))
-KNOWN = {
-    "blocknotify for blocks older than 6 h": (
-        "irondivid runs -blocknotify during the initial block download; divid does not "
-        "(ChainExtensionService.cpp:556-565)",
-        lambda core, iron: core == 0 and iron > 0,
-    ),
-}
+KNOWN = {}
 
 fails = 0
 
@@ -471,6 +465,11 @@ try:
     row("work block 7201 s ahead of the clock", c, i)
     c, i = offer_at(pow_block, POW_DRIFT)
     row("the same block 7200 s ahead (offered again)", c, i)
+    # A block inside 6 h of the clock ends the initial block download (ChainSyncHelpers.cpp:42-49):
+    # divid signals that tip, the first it runs -blocknotify for (ChainExtensionService.cpp:556-565)
+    time.sleep(2)
+    c, i = both(lambda n: n.notified())
+    row("blocknotify once a block ends the initial download", c, i)
 
     # Proof of stake: 180 s ahead of the clock is the limit (Settings.cpp:215-218)
     t += 60
