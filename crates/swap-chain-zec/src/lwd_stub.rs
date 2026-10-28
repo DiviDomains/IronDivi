@@ -69,6 +69,8 @@ struct Chain {
     vtx: HashMap<u64, Vec<CompactTx>>,
     /// Every method fails `Unavailable`.
     down: bool,
+    /// Every method is accepted and never answered (EX).
+    hang: bool,
 }
 
 impl Chain {
@@ -226,6 +228,12 @@ impl Lightwalletd {
     pub(crate) fn set_down(&self, down: bool) {
         self.chain.lock().unwrap().down = down;
     }
+
+    /// While `hang`, every method is accepted and never answered (EX): the call ends only
+    /// when the client gives up on it.
+    pub(crate) fn set_hang(&self, hang: bool) {
+        self.chain.lock().unwrap().hang = hang;
+    }
 }
 
 /// A v5 transparent transaction with one placeholder input and `vout` as its outputs
@@ -284,6 +292,9 @@ impl Service<http::Request<Body>> for Stub {
     fn call(&mut self, req: http::Request<Body>) -> Self::Future {
         let chain = self.0.clone();
         Box::pin(async move {
+            if chain.lock().unwrap().hang {
+                std::future::pending::<()>().await;
+            }
             if chain.lock().unwrap().down {
                 return Ok(Status::unavailable("stub operator is down").into_http());
             }

@@ -28,6 +28,7 @@ mod txid_binding;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use secp256k1::{All, Secp256k1, SecretKey};
@@ -164,6 +165,10 @@ pub struct ZecBackend {
     network: String,
     /// The second lightwalletd operator ([`ZecBackend::with_crosscheck`]); `None` is off.
     second: Option<LightwalletdClient>,
+    /// The longest one lock read from the second operator may take
+    /// ([`crosscheck::LOCK_READ_BUDGET`]; tests shorten it).
+    #[allow(dead_code)] // EX: read by the bounded lock read (scaffolding for its tests)
+    second_budget: Duration,
     /// Shared with this backend's [`ChainBackend::primary_only`] views.
     hold: Arc<HoldState>,
 }
@@ -210,6 +215,7 @@ impl ZecBackend {
             reservations: None,
             network: "testnet".to_string(),
             second: None,
+            second_budget: crosscheck::LOCK_READ_BUDGET,
             hold: Arc::default(),
         })
     }
@@ -238,6 +244,14 @@ impl ZecBackend {
             ..HoldState::default()
         });
         Ok(self)
+    }
+
+    /// Bound each lock read from the second operator by `budget` instead of
+    /// [`crosscheck::LOCK_READ_BUDGET`] (tests).
+    #[cfg(test)]
+    pub(crate) fn with_second_budget(mut self, budget: Duration) -> Self {
+        self.second_budget = budget;
+        self
     }
 
     /// The startup cross-check: `Disagree` is an error, `Unavailable` warns; `Ok` when off.
@@ -813,6 +827,7 @@ impl ChainBackend for ZecBackend {
             reservations: self.reservations.clone(),
             network: self.network.clone(),
             second: None,
+            second_budget: self.second_budget,
             hold: self.hold.clone(),
         }))
     }

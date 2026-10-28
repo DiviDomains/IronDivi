@@ -38,6 +38,11 @@ pub const CROSSCHECK_DEPTH: u64 = 6;
 /// vouch for the other's recent blocks: [`CrossCheckOutcome::Unavailable`].
 pub const MAX_LAG: u64 = 6;
 
+/// The longest one lock read from the second operator ([`lock_view`]) may take before it
+/// counts as failed (EX): a second operator that accepts a call and never answers must not
+/// hold a maker or taker step for longer than this.
+pub const LOCK_READ_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+
 /// Result of one cross-check.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CrossCheckOutcome {
