@@ -28,7 +28,7 @@ fn a_spork_for_the_next_block_is_read_on_the_adjusted_clock() {
     t.chain
         .consensus_sporks()
         .write()
-        .set(LOTTERY_SPORK, vec![SporkEntry::new("500;0", signed)]);
+        .set(LOTTERY_SPORK, vec![SporkEntry::new("500;1", signed)]);
 
     // The system clock: not yet signed, the default holds
     set_mock_time(0);
