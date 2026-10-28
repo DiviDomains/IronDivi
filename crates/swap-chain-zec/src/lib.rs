@@ -281,6 +281,7 @@ impl ZecBackend {
             return Ok(None);
         };
         let parsed = tx::ParsedTx::parse(&raw.data)?;
+        self.requested(&parsed, &at.txid.0)?;
         let Some(out) = parsed.vout.get(at.vout as usize) else {
             return Ok(None);
         };
@@ -298,6 +299,23 @@ impl ZecBackend {
             amount: Amount::from_sat(out.value),
             confirmations,
         }))
+    }
+
+    /// `Ok` when `parsed`, the primary's answer to `GetTransaction(want)`, is that transaction;
+    /// else [`SwapError::Transient`] naming the primary endpoints ([`not_requested`]).
+    fn requested(&self, parsed: &tx::ParsedTx, want: &[u8; 32]) -> Result<()> {
+        match not_requested(parsed, want) {
+            None => Ok(()),
+            Some(why) => Err(self.refuse_answer(&why)),
+        }
+    }
+
+    /// The refusal of an answer of the primary's: `why` completes "zec lightwalletd <urls> …".
+    fn refuse_answer(&self, why: &str) -> SwapError {
+        SwapError::Transient(format!(
+            "zec lightwalletd {} {why}; not acting on it",
+            self.client.endpoints().join(", ")
+        ))
     }
 
     /// A spend this backend built: in a primary-only view after a `Disagree`, also sent to
@@ -524,6 +542,23 @@ impl ZecBackend {
         <[u8; 32]>::try_from(bytes)
             .map_err(|_| SwapError::Other(format!("{what} is {} bytes, want 32", bytes.len())))
     }
+}
+
+/// `Some(why)` when `parsed`, a lightwalletd's answer to `GetTransaction(want)`, is another
+/// transaction: its txid ([`tx::ParsedTx::txid`], ZIP-244 for v5, ZIP-229 for v6) is not
+/// `want` (both in internal byte order, as `get_transaction` takes it). Every read by txid
+/// checks this before it uses any field of the answer (EW): without it an operator could
+/// answer any transaction whose output at the index carries the agreed script and value.
+/// `why` completes "<operator> …".
+pub(crate) fn not_requested(parsed: &tx::ParsedTx, want: &[u8; 32]) -> Option<String> {
+    let got = parsed.txid();
+    (got != *want).then(|| {
+        format!(
+            "answered GetTransaction({}) with transaction {}, not the one asked for",
+            Txid(*want),
+            Txid(got)
+        )
+    })
 }
 
 /// Map a lightwalletd/zcashd reject reason to the engine's taxonomy (zcashd shares its
@@ -791,6 +826,13 @@ impl ChainBackend for ZecBackend {
         else {
             return Ok(None);
         };
+        // The answer counts only as `txid`'s: a transaction that does not parse cannot show it.
+        let parsed = tx::ParsedTx::parse(&raw.data).map_err(|e| {
+            self.refuse_answer(&format!(
+                "answered GetTransaction({txid}) with a transaction that does not parse ({e})"
+            ))
+        })?;
+        self.requested(&parsed, &txid.0)?;
         // height 0 = mempool; u64::MAX = mined on a fork that isn't the main chain (lightwalletd
         // `RawTransaction.height` doc). Neither is a main-chain confirmation yet.
         if raw.height == 0 || raw.height == u64::MAX {
@@ -841,9 +883,20 @@ impl ChainBackend for ZecBackend {
                 continue; // compact block saw it, full tx vanished (reorg); caller retries.
             };
             let parsed = tx::ParsedTx::parse(&full.data)?;
+            self.requested(&parsed, &spender_txid)?;
             let Some(input) = parsed.vin.get(input_index as usize) else {
                 continue;
             };
+            // The txid commits to the prevouts: the compact block's claim is now checkable.
+            if input.prevout.txid != outpoint.txid.0 || input.prevout.n != outpoint.vout {
+                return Err(self.refuse_answer(&format!(
+                    "named {} input {input_index} as the spend of {outpoint}, but that input \
+                     spends {}:{}",
+                    Txid(spender_txid),
+                    Txid(input.prevout.txid),
+                    input.prevout.n
+                )));
+            }
             let height = if full.height == 0 || full.height == u64::MAX {
                 None
             } else {

@@ -243,8 +243,9 @@ pub(crate) struct LockView {
     confirmations: u32,
 }
 
-/// `other`'s view of output `at`, read as the primary's is: `GetTransaction`, then (when
-/// mined) `GetLatestBlock` for its confirmations. An error completes "second operator …".
+/// `other`'s view of output `at`, read as the primary's is: `GetTransaction` (an answer that
+/// is not `at`'s transaction is refused, [`crate::not_requested`]), then (when mined)
+/// `GetLatestBlock` for its confirmations. An error completes "second operator …".
 pub(crate) async fn lock_view(
     other: &LightwalletdClient,
     at: &Outpoint,
@@ -256,6 +257,9 @@ pub(crate) async fn lock_view(
         .ok_or_else(|| "has no such transaction".to_string())?;
     let parsed = crate::tx::ParsedTx::parse(&raw.data)
         .map_err(|e| format!("answered a transaction that does not parse ({e})"))?;
+    if let Some(why) = crate::not_requested(&parsed, &at.txid.0) {
+        return Err(why);
+    }
     let out = parsed
         .vout
         .get(at.vout as usize)
