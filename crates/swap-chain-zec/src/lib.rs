@@ -152,6 +152,9 @@ impl FeePolicy {
     }
 }
 
+/// The most agreed locks one backend keeps (FB): past it the oldest is dropped.
+pub(crate) const LOCK_CACHE_CAP: usize = 64;
+
 /// Zcash testnet transparent [`ChainBackend`].
 pub struct ZecBackend {
     client: LightwalletdClient,
@@ -255,6 +258,12 @@ impl ZecBackend {
     pub(crate) fn with_second_budget(mut self, budget: Duration) -> Self {
         self.second_budget = budget;
         self
+    }
+
+    /// How many agreed locks this backend keeps (FB; tests).
+    #[cfg(test)]
+    pub(crate) fn agreed_locks(&self) -> usize {
+        0
     }
 
     /// The startup cross-check: `Disagree` is an error, `Unavailable` warns; `Ok` when off.
