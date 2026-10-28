@@ -19,7 +19,7 @@
 - Thin staking: snapshot channel, real signing-key rollout, hp1/hp3 cleanup, mainnet decision, usdc transcript (details in the sections below).
 - Mainnet stays off until Bert says go.
 
-## NEEDS HUMAN: ssh to hp3 refused (2026-10-18, ~05:50Z onward)
+## RESOLVED — hp3 ssh (2026-10-18): re-checked fine, stake watcher never stopped
 The ssh agent refused to sign for `~/.ssh/pub/hp3_ssh.pub` ("agent refused operation"), so the stake monitor on hp3 cannot run. Likely the 1Password SSH agent is locked or waiting on an approval. Not bypassed. Last good check: `stake-wins.log` heartbeat 05:50Z, no stake, prune-test pid 231853 still up. After the agent is unlocked: `ssh hp3 'tail -20 ~/prune-test/stake-wins.log'`, read it for any MATCH covering the gap, then re-arm the monitor (`tail -n0 -F ~/prune-test/node.log | grep -E "Hashproof SUCCESS|self-accept|Evicted phantom|panicked|Removed .* stale UTXOs"`).
 
 ## Thin staking item 15 (2026-10-17 evening, testnet only, nothing deployed or published)
@@ -209,9 +209,9 @@ Mainnet CF split measured (doc §8). Lottery-winner stripping built and validate
 ## NEEDS HUMAN
 * DONE 2026-10-17 18:51Z (Bert approved in writing): hp3 stake-test node swapped to the fixed build. Release built from a clean `git archive` of `e068a82` (sha256 `131853d9…f140e`); `/proc/<pid>/exe` of the running node (pid 231853, `IRONDIVI_EXPIRE=0`, datadir `~/prune-test`) has the same hash. `--version` prints only `0.2.6`, so the hash is the proof. Old binary kept as `hp3:~/bin/irondivid.pre-e068a82` (sha256 `687bab7c…8547f`) for rollback. Branch not pushed; nothing else deployed.
 * **Defect B left a durable mark (found at the swap, NOT fixed):** the earlier eviction went into the wallet's on-disk spent set, so the in-memory rescan restore did not survive a restart: load logged `Removed 1 stale UTXOs that were in spent set` and the wallet came up with 5,000. Re-ran `rescanblockchain 345000` at 19:08Z: back to 104,999.99996 in memory. Not yet checked whether it persists across another restart; do not restart the test node without rescanning afterwards. A wallet-side fix (clear the spent entry when a rescan or the chain shows the coin unspent) is not in `e068a82`.
-* Snapshot distribution channel: where do operators download snapshots, and do you want root hashes published (and by whom)?
-* Who runs the full-history (`NODE_NETWORK`) nodes, so thin nodes have something to fetch from?
-* Mainnet decision on `expire` + snapshots (everything so far is testnet only).
+* RESOLVED (Bert 2026-10-19 EDT) — Snapshots ship as GitHub releases from a SEPARATE snapshot repo (private first); the public flip is its own four-option question when the script is ready. — orig: Snapshot distribution channel: where do operators download snapshots, and do you want root hashes published (and by whom)?
+* RESOLVED (Bert 2026-10-19 EDT) — Full-history NODE_NETWORK nodes = the services.divi.domains testnet faucet servers (verify NODE_NETWORK). (Bert 1015) — orig: Who runs the full-history (`NODE_NETWORK`) nodes, so thin nodes have something to fetch from?
+* RESOLVED (Bert 2026-10-19 EDT) — No mainnet. Testnet first: publish, get 100 testnet users, measure. Mainnet held until Bert says go. (Bert 0945) — orig: Mainnet decision on `expire` + snapshots (everything so far is testnet only).
 
 ## Thin staking: status notes (2026-10-14)
 * Snapshot staking gate built: a snapshot-imported node does not stake until its tip is past the snapshot base (live-checked on hp1).
@@ -267,3 +267,81 @@ Status is only [x] with evidence. Anything open is either running or under NEEDS
 - Written go to delete `hp1:~/thin`, `hp1:~/snap-test` (stop its test node first), and hp3 `~/bin/irondivid.pre-e068a82` (after the first accepted stake). Never touch hp3 `~/prune-test`.
 - Where snapshots are hosted and who publishes the signed root (decision 1=A chosen; the server and publisher still need setting up). Mainnet stays off (decision 3=A).
 - Push scope: a housekeeping agent pushed to origin/main despite "do not push the branch"; say whether pushes to main need your written go.
+
+
+## NEEDS HUMAN — node wallet security fixes (2026-10-24, IronDivi-sec → main)
+
+These are the review's NODE findings that need a decision, or that change how existing setups behave. Each fix commit says which one it covers.
+
+**Changes that can break an existing setup**
+- **RPC access (NODE-1/12).**
+  - Browser origins are refused unless `rpcalloworigin` names them.
+  - Host names other than IP literals and `localhost` need `rpcallowhost`.
+  - A non-loopback `rpcbind` refuses to start unless it has `rpcuser`/`rpcpassword` (or `rpcauth`) and an `rpcallowip`. The cookie alone isn't enough.
+  - Anything that reaches the node by a DNS name, or from a web page, needs those settings added.
+- **RPC limits (NODE-13).**
+  - A batch over 100 calls is refused whole (-32600), so clients must split bigger batches.
+  - `getaddressutxos` returns at most 1000 UTXOs. New `skip` and `limit` parameters (4th and 5th) page through the rest. A caller on an address with more than 1000 UTXOs sees a short list until it pages.
+  - `validateaddresses` takes at most 1000 addresses.
+  - Bodies over 10 MB get HTTP 413. That is the existing `rpc.max_request_size` setting in divi-node, which was never applied before; irondivid has no command-line or irondivi.conf option for it.
+  - At most 16 RPC calls run at once; the rest wait.
+  - `getaddresshistory`'s `skip` is left unbounded. It walks only that address's own index entries and decodes nothing before `skip`.
+- **Wallet format (NODE-7/8/19).**
+  - The first unlock, or passphrase change, after upgrading moves an encrypted wallet to Argon2id + XChaCha20-Poly1305.
+  - After that, **an older irondivid reports "wrong passphrase" for that wallet.** Keep a backup made before the upgrade if a rollback might be needed.
+  - The old-format fixture `tests/fixtures/legacy_wallet_v1` is tested to open and migrate.
+- **signtransactionwithaddresskey (NODE-5)** now needs a full unlock and refuses SIGHASH_SINGLE with no matching output. Divi Core signs the hash "1" in that case, so this is a deliberate difference from C++.
+
+**Decisions left to you**
+- **NODE-9.** encryptwallet now leaves no plaintext on disk. But the HD seed is the same one that was stored in plaintext before, so any old backup or copy of the datadir still has it. The safe course is a new wallet and moving the funds to it. That needs your call and can't be automated safely.
+- **NODE-14.** Like Divi Core, `backupwallet` needs no unlock and writes to any path the daemon user can write. It now writes a private 0600 checkpoint and never overwrites an existing file. Should it also need an unlock, or be limited to the datadir?
+- **NODE-3.** An existing datadir that other users can read is reported in the log, not chmodded, because the datadir may hold other people's files. A new datadir and the wallet directory are made 0700.
+- **Recommendation 5, "ask for encryption at creation".** An unencrypted wallet now logs a warning at every start. It doesn't refuse to run or prompt, because irondivid has no interactive prompt. Should an unencrypted wallet refuse to start on mainnet?
+- **NODE-17/18.** sendmany refuses a total above MAX_MONEY. A send whose change is dust now takes no change key, so the dust goes to the fee. The RPC result doesn't report the dropped change, which matches Divi Core.
+- **Keypool.** A send that fails after a key was taken from the keypool still uses up that key (pre-existing; not changed).
+- **NODE-10.** SecretKey, BIP38 buffers, HD seed, entropy and mnemonic are now zeroized, and core dumps are off. Not covered:
+  - passphrase and WIF strings inside serde_json RPC values (serde owns those buffers);
+  - mlock (memory locking), which needs RLIMIT_MEMLOCK settings per host.
+- **Recommendation 7, not done on purpose.**
+  - `walletpassphrase` with timeout 0 still unlocks until `walletlock`. That is how Divi Core staking setups unlock (`walletpassphrase <pass> 0 true`), so changing it would break them. Only a huge timeout is capped now; it used to wrap.
+  - Secret reads are not moved behind one `with_unlocked` accessor. Each secret read checks the lock (NODE-5/16 tests), but the single-accessor refactor touches every key path and is left for later.
+- **NODE-26 (info).** The websocket isn't wired up, so there's no Origin check or auth to add. Add both if it ever is.
+
+**Recommendation 21 (release gate)**
+- `tools/release-check.sh` runs `cargo deny check` and `cargo audit`, and checks that Cargo.lock is current. Release builds happen outside GitHub Actions (270b2cd), and the CI workflow is disabled, so **whoever builds a release must run this script first.** The CI audit job also runs it, if CI is turned back on.
+- **The gate fails today, on purpose, and blocks a release until you decide.** RUSTSEC-2026-0387 (published 2026-10-23) says crypto-bigint 0.5.5 has operations that should be constant-time but can leak timing. irondivid links it through divi-wallet → bip32 0.5 → k256 0.13 → elliptic-curve 0.13, which is the HD key derivation path. The swap crates link it through alloy and dkg as well. The fix is crypto-bigint 0.7.6, which needs a semver-breaking upgrade of bip32/k256, so I didn't do it. Your choices:
+  - upgrade bip32/k256 (new HD derivation code, which must be re-checked against Divi Core's test vectors);
+  - or add a reasoned `ignore` to deny.toml and .cargo/audit.toml.
+
+  The old CI `cargo audit` job would have failed on this too.
+- tokio is bumped from 1.49.0 to 1.54.1 to clear RUSTSEC-2026-0386 (AsyncFd unsoundness).
+- RUSTSEC-2025-0127 (cggmp21) was already ignored in .cargo/audit.toml, and deny.toml now ignores it with the same reason: swap-xmr only, and the presigning protocol is never called.
+- Unmaintained crates are reported as warnings and don't block: bincode (RUSTSEC-2025-0141), derivative (RUSTSEC-2024-0388) and paste (RUSTSEC-2024-0436).
+- **The license allow list** in deny.toml is what the tree uses today. Check two entries:
+  - LGPL-3.0-or-later, from rug and gmp-mpfr-sys (GMP), which may be linked into AGPL-3.0 code;
+  - OpenSSL, CDLA-Permissive-2.0 and MITNFA. Remove any you don't accept.
+- The extension parts of recommendation 21 aren't in IronDivi and aren't done here: EXT-19, the failing supply-chain test; EXT-30, the Docker image digest; and the reproducible extension build with its releases.json commit.
+
+**Pre-existing test failures (not caused by this work)**
+- `divi-swapd` `e2e_mock_xmr_happy` and `daemon_swaps_ltc_and_zec_both_ways` failed on origin/main 270b2cd in earlier runs. They passed in the final `cargo test --workspace` run on hp1 (rc=0), so they look flaky or environment-dependent.
+
+**History note**
+- Commit 252c63c on its own takes no change key for dust in only some send paths. 1f74ece, the next commit, covers the rest. Don't cherry-pick 252c63c without 1f74ece.
+
+
+## Update: RUSTSEC-2026-0387 (crypto-bigint) upgraded, and NODE-9 docs
+
+This replaces the release-gate bullet under **Recommendation 21** above.
+
+- **Shipped binaries are fixed.** bip32 is now 0.6.0 (k256 0.14, elliptic-curve 0.14, crypto-bigint 0.7.8) — commit 3865e87. No source change was needed. irondivid and irondivi-cli no longer depend on crypto-bigint 0.5.5 (`cargo tree -i crypto-bigint@0.5.5 -p irondivid` finds nothing).
+- **Key derivation is byte-for-byte the same.** Commit b2d4caf added the BIP32 spec test vector 1 and fixed Divi and PrivateDivi BIP44 vectors (master key id, receive, change and second account keys and addresses) for the public "abandon … about" test mnemonic. They passed on bip32 0.5 and pass unchanged on 0.6.
+- Full workspace tests on hp1: `cargo test --workspace --no-fail-fast` rc=0, no failures, after the upgrade.
+- **The release gate is still red, only because of the swap crates.** crypto-bigint 0.5.5 stays in Cargo.lock through alloy (swap-chain-evm), monero-wallet, dkg and ciphersuite (swap-chain-xmr, divi-swap-xmr) and cggmp21 (divi-swap-xmr). All of them are already on their latest release, so no upgrade removes it, and none of them is in the release archives. `cargo audit` checks the whole Cargo.lock and can't be scoped to some packages, so the gate can't pass without either an ignore or a change to what the gate checks. This needs your decision; I asked it as one question.
+- **NODE-9:** commit 55c12bd adds docs/wallet-encryption.md, a RELEASE-NOTES.md entry and a README section. They say that up to v0.2.6 the seed stayed in plaintext after encryptwallet, so old datadir copies may expose it and funds should move to a new wallet if such copies exist; and that encryptwallet keeps the same seed.
+
+## Update: release gate scoped to shipped binaries (option 1), now green
+
+- **Commit 2ef1c3a**, pushed to main. `tools/release-check.sh` checks advisories for irondivid and irondivi-cli only. It runs `cargo deny check advisories` with each binary as the sole root. It runs `cargo audit` and fails on any advisory whose crate is in a shipped binary's dependency graph on any target. Swap-only advisories are printed and do not fail. Bans, licenses and sources are still checked for the whole workspace.
+- The cggmp21 ignore is removed (deny.toml, and `.cargo/audit.toml` deleted), because scoping makes it unnecessary. If a shipped binary ever links cggmp21, the gate fails.
+- On hp1 the gate passes (rc=0). It reports 0387 (crypto-bigint 0.5.5) and 2025-0127 (cggmp21) as "not in a shipped binary". A copy of the gate that also counts divi-swapd as shipped fails both cargo deny and cargo audit (rc=1). So a vulnerable crate in a shipped binary still stops a release.
+- The release is unblocked.
