@@ -1367,16 +1367,14 @@ impl BlockSync {
         // NotifyPeersOfNewChainTip net.cpp:1490-1497): the tip, not the block
         // that came, which may be one of several that connected at once. The
         // initial download is read after the tip moved, so the tip that ends
-        // it is announced
+        // it is announced. Only peers whose start height Divi Core accepts are
+        // told (crate::peer_manager::announces_new_tip_to)
         if let Some(tip) = self.chain.tip().filter(|t| Some(t.hash) != tip_before) {
             if !self.chain.is_initial_block_download() {
-                if tip.hash == hash {
-                    // The peer that sent it has it
-                    self.peer_manager
-                        .broadcast_block_inv_except(tip.hash, peer_id);
-                } else {
-                    self.peer_manager.broadcast_block_inv(tip.hash);
-                }
+                // The peer that sent it has it
+                let sender = (tip.hash == hash).then_some(peer_id);
+                self.peer_manager
+                    .announce_new_tip(tip.hash, tip.height, sender);
             }
         }
 
