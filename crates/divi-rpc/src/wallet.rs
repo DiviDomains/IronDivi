@@ -2660,15 +2660,18 @@ impl WalletRpc {
             // ComputeFeeTotalsAndIfInputsAreKnown (rpcrawtransaction.cpp:810-826,
             // :875-881): each input must be an output in the chain's coins or of
             // a mempool transaction, else -26 "Unknown inputs being spent". A
-            // transaction already in the mempool skips this, as in Core.
+            // transaction already in the mempool skips this, as in Core. A
+            // coinbase has no inputs to look up: HaveInputs and GetValueIn pass
+            // over it (coins.cpp:341-344, :353-355), so the mempool refuses it.
             let mempool = self.mempool.read().clone();
             let pooled = |id: &Hash256| mempool.as_ref().and_then(|m| m.get_transaction(id));
             if pooled(&txid).is_none() {
-                let known = tx.vin.iter().all(|i| {
-                    matches!(chain.get_utxo(&i.prevout), Ok(Some(_)))
-                        || pooled(&i.prevout.txid)
-                            .is_some_and(|p| (i.prevout.vout as usize) < p.vout.len())
-                });
+                let known = tx.is_coinbase()
+                    || tx.vin.iter().all(|i| {
+                        matches!(chain.get_utxo(&i.prevout), Ok(Some(_)))
+                            || pooled(&i.prevout.txid)
+                                .is_some_and(|p| (i.prevout.vout as usize) < p.vout.len())
+                    });
                 if !known {
                     return Err(RpcError::new(
                         codes::VERIFY_REJECTED,

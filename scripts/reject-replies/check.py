@@ -39,6 +39,9 @@ INJECT = os.environ.get("REJECT_REPLIES_INJECT", "")
 # A directory to write both replies of every compared row to (for looking into
 # a FAIL); nothing is written without it
 DUMP = os.environ.get("REJECT_REPLIES_DUMP", "")
+# The nodes listen on 127.0.0.2: the 127.0.0.1 ports of a busy host are often taken
+# for a while by other programs' clients (127/8 is all loopback)
+HOST = "127.0.0.2"
 RPC_TIMEOUT = 60
 START_TIMEOUT = 120
 
@@ -90,7 +93,7 @@ class Node:
             "regtest=1", f"port={self.p2p}", f"rpcport={self.rpcport}",
             f"rpcuser=replies{index}", f"rpcpassword={password}",
             "daemon=0", "printtoconsole=0", "server=1", "discover=0", "listenonion=0",
-            "bind=127.0.0.1", "dnsseed=0", "staking=0",
+            f"bind={HOST}", f"rpcbind={HOST}", "rpcallowip=127.0.0.0/8", "dnsseed=0", "staking=0",
         ] + list(extra_conf)
         self.base = lines[:-len(extra_conf)] if extra_conf else lines
         self.write_conf(extra_conf, os.O_EXCL)
@@ -113,7 +116,7 @@ class Node:
     def call(self, method, *params):
         """('ok', result) or ('err', code, message)"""
         body = json.dumps({"jsonrpc": "1.0", "id": 1, "method": method, "params": list(params)}).encode()
-        req = urllib.request.Request(f"http://127.0.0.1:{self.rpcport}/", data=body,
+        req = urllib.request.Request(f"http://{HOST}:{self.rpcport}/", data=body,
                                      headers={"Authorization": "Basic " + self.auth, "Content-Type": "text/plain"})
         try:
             with urllib.request.urlopen(req, timeout=RPC_TIMEOUT) as r:
@@ -349,7 +352,7 @@ if not C.wait_ready():
     print(f"FAIL   start: divid did not answer within {START_TIMEOUT} s", flush=True)
     sys.exit(1)
 phrase = C.rpc("dumphdinfo")["mnemonic"]
-I = Node("irondivid", IRONDIVID, 1, ["listen=0", f"connect=127.0.0.1:{PORT_BASE}"],
+I = Node("irondivid", IRONDIVID, 1, ["listen=0", f"connect={HOST}:{PORT_BASE}"],
          env={"WALLET_MNEMONIC": phrase})
 del phrase
 if not I.wait_ready():
@@ -366,7 +369,8 @@ if not synced():
 
 # The coins the cases spend: 10 DIVI each to an address of its own, one of 200
 NAMES = ["unsigned", "badsig", "wrongkey", "valid", "nofee", "lowfee", "dust", "nonstd", "metabig", "metalimit",
-         "metatwo", "oversize", "negative", "dup", "noout", "nonfinal", "malformed", "respent"]
+         "metatwo", "oversize", "negative", "dup", "noout", "nonfinal", "malformed", "respent", "stake", "nsinput",
+         "chain"]
 addr = {k: C.rpc("getnewaddress") for k in NAMES + ["big"]}
 Y = C.rpc("getnewaddress")
 Z = C.rpc("getnewaddress")
@@ -394,7 +398,7 @@ cs_out = next(o for o in C.rpc("getrawtransaction", coinstake, 1)["vout"] if flo
 print(f"# chain: {tip} blocks, coins in {fund[:16]}, coinstake {coinstake[:16]}", flush=True)
 
 # irondivid alone from here: no peer (connect= to an address nothing listens
-# on), listening for the raw peer
+# on: port 1), listening for the raw peer
 I.stop()
 I.write_conf(["listen=1", "connect=127.0.0.2:1"])
 I.start()
@@ -450,6 +454,25 @@ tx["non-final locktime"] = signed(spend(coin["nonfinal"], to_y(TEN - FEE), lockt
 tx["immature coinbase spend"] = signed(spend((coinbase, cb_out["n"]), to_y(int(round(float(cb_out["value"]) * SAT)) - FEE)))
 tx["immature coinstake spend"] = signed(spend((coinstake, cs_out["n"]), to_y(int(round(float(cs_out["value"]) * SAT)) - FEE)))
 malformed = signed(spend(coin["malformed"], to_y(TEN - FEE)))
+# A coinbase sent on its own: a null prevout and a scriptSig of 2 to 100 bytes
+# (BlockCheckingHelpers.cpp:139-141), or of 1 byte
+loose_coinbase = lambda script_sig, sats: serialize([("00" * 32, 0xffffffff, script_sig, 0xffffffff)], to_y(sats))
+tx["coinbase as a loose transaction"] = loose_coinbase(bytes([3, 1, 2, 3]), SAT)
+tx["coinbase with a negative output"] = loose_coinbase(bytes([3, 1, 2, 3]), -1)
+tx["coinbase with a 1-byte scriptSig"] = loose_coinbase(bytes([0x51]), SAT)
+# A coinstake shape (an empty first output) spending a coin of the wallet
+tx["coinstake as a loose transaction"] = signed(spend(coin["stake"], [(0, b"")] + to_y(TEN - FEE)))
+# A signed spend with one push more in front of the signature: AreInputsStandard
+# refuses it without a reject state (MempoolConsensus.cpp:189-190, :363-364)
+b = bytes.fromhex(signed(spend(coin["nsinput"], to_y(TEN - FEE))))
+script_sig = b[42:42 + b[41]]
+tx["non-standard input script"] = serialize([(*coin["nsinput"], b"\x00" + script_sig, 0xffffffff)], to_y(TEN - FEE))
+# A spend of a mempool transaction's output, then another spend of that output
+# (a second spend of a coin whose spender is itself unconfirmed)
+parent = signed(spend(coin["chain"], to_y(TEN - FEE)))
+parent_txid = txid_of(parent)
+child = lambda fee: signed(spend((parent_txid, 0), to_y(TEN - FEE - fee)),
+                           [{"txid": parent_txid, "vout": 0, "scriptPubKey": p2pkh(Y).hex()}])
 
 
 def mempool_has(node, txid):
@@ -485,6 +508,9 @@ def send_row(name, hexstr, *extra):
 for name in ("unsigned", "bad signature", "wrong key", "missing inputs", "input spent in the chain", "valid",
              "double spend of a mempool input"):
     send_row(f"sendrawtransaction {name}", tx[name])
+send_row("sendrawtransaction spend parent", parent)
+send_row("sendrawtransaction spend of a mempool output", child(FEE))
+send_row("sendrawtransaction double spend of a mempool output", child(2 * FEE))
 send_row("sendrawtransaction already in the mempool", tx["valid"])
 send_row("sendrawtransaction already in the chain", in_chain_hex)
 send_row("sendrawtransaction no fee", tx["no fee"])
@@ -496,7 +522,8 @@ for name in ("dust output", "non-standard output script", "OP_META of 604 bytes"
              "two OP_META outputs", "oversize", "negative output", "output over the money supply",
              "outputs past the int64 range",
              "duplicate inputs", "no inputs", "no outputs", "non-final locktime", "immature coinbase spend",
-             "immature coinstake spend"):
+             "immature coinstake spend", "coinbase as a loose transaction", "coinbase with a negative output",
+             "coinbase with a 1-byte scriptSig", "coinstake as a loose transaction", "non-standard input script"):
     send_row(f"sendrawtransaction {name}", tx[name])
 send_row("sendrawtransaction not hex", "zz")
 send_row("sendrawtransaction odd length", malformed[:-1])
@@ -516,7 +543,7 @@ def message(command, payload=b""):
 
 
 def netaddr(port):
-    return struct.pack("<Q", 1) + bytes(10) + b"\xff\xff" + socket.inet_aton("127.0.0.1") + struct.pack(">H", port)
+    return struct.pack("<Q", 1) + bytes(10) + b"\xff\xff" + socket.inet_aton(HOST) + struct.pack(">H", port)
 
 
 def read_message(sock):
@@ -546,7 +573,7 @@ def varstr(b, pos):
 def p2p_reject(port, hexstr):
     """What the node answers a peer that relays the transaction: its `reject`
     (command, code, reason, the txid it names) or None, within 5 seconds"""
-    sock = socket.create_connection(("127.0.0.1", port), timeout=10)
+    sock = socket.create_connection((HOST, port), timeout=10)
     try:
         version = (struct.pack("<iQq", 70920, 1, int(time.time())) + netaddr(port) + netaddr(0)
                    + secrets.token_bytes(8) + bytes([18]) + b"/reject-replies:1/" + struct.pack("<i", 0) + b"\x01")

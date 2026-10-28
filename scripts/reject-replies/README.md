@@ -21,7 +21,8 @@ scripts/reject-replies/run.sh target/release ~/divi-3.0.0/bin 53950 /var/tmp
 ```
 
 - `<irondivid-bin-dir>` holds `irondivid`; `<core-bin-dir>` holds Divi Core's `divid`.
-- `<port-base>`: ports `<port-base>` to `<port-base>+3` on 127.0.0.1 (divid p2p and RPC, then irondivid's).
+- `<port-base>`: ports `<port-base>` to `<port-base>+3` on 127.0.0.2 (divid p2p and RPC, then irondivid's). 127.0.0.2 is
+  loopback too; its ports are not taken by other programs' clients on a busy host.
 - `[root]`: a fresh directory is made under it (default `$TMPDIR`, else `/tmp`) and deleted at the end.
 
 A run takes 20 to 30 seconds and is stopped after 10 minutes. However it ends, both nodes are stopped and their
@@ -62,6 +63,8 @@ the same answer to "is the transaction in this node's mempool now".
 | valid | a signed spend with a fee of 0.001 DIVI (taken by both) |
 | double spend of a mempool input | another spend of the coin `valid` spends |
 | already in the mempool | `valid` again |
+| spend parent, spend of a mempool output | a spend taken by both, then a spend of its output (taken by both) |
+| double spend of a mempool output | another spend of that output: `-25` with an empty message on both, as for `double spend of a mempool input` (`AcceptToMemoryPool` refuses a conflict without a reject state, `MempoolConsensus.cpp:303-313`) |
 | already in the chain | the spend confirmed in step 1 |
 | no fee, fee of 100 satoshis | below the relay fee (10000 satoshis per kB) |
 | absurd fee | 150 DIVI of fee (the maximum is 100): no flag, `allowhighfees` false, `allowhighfees` true |
@@ -74,6 +77,10 @@ the same answer to "is the transaction in this node's mempool now".
 | duplicate inputs, no inputs, no outputs | |
 | non-final locktime | a lock time 100 blocks ahead, sequence 0 |
 | immature coinbase spend, immature coinstake spend | the coinbase of block 100 and the coinstake of the tip, both under the 20 blocks of maturity |
+| coinbase as a loose transaction | a null prevout with a 4-byte scriptSig: divid's input and fee checks pass over a coinbase (`coins.cpp:341-355`), so the mempool refuses it (16 `coinbase`) |
+| coinbase with a negative output, coinbase with a 1-byte scriptSig | -1 satoshi (the fee total throws); a scriptSig under 2 bytes (16 `bad-tx`) |
+| coinstake as a loose transaction | a spend with an empty first output (16 `coinstake`) |
+| non-standard input script | a signed spend with `OP_0` in front of the signature: `-25` with an empty message (`AreInputsStandard`, `MempoolConsensus.cpp:363-364`) |
 | not hex, odd length, truncated, trailing bytes, empty | the hex of a signed spend, cut or with a byte added (divid reads the transaction and leaves the extra byte: taken by both) |
 
 p2p rows: a raw peer connects to each node, does the handshake and sends the transaction as `tx`. The row compares
