@@ -112,9 +112,9 @@ pub struct FeeEstimate {
     pub blocks: u32,
 }
 
-/// Takes the transactions of blocks `invalidateblock` or
+/// Takes the transactions of blocks `invalidateblock`, `reconsiderblock` or
 /// `reverseblocktransactions` disconnected back into the mempool and drops
-/// what the chain now spends (called with none after `reconsiderblock`)
+/// what the chain now spends
 pub type ReorgHook = Arc<dyn Fn(Vec<divi_primitives::transaction::Transaction>) + Send + Sync>;
 
 /// Trait for mempool access (to avoid circular dependency)
@@ -789,14 +789,11 @@ impl BlockchainRpc {
             }
         };
         // The disconnected blocks' transactions go back to the mempool, as
-        // Divi Core's disconnectTip puts them back; after a reconsider the
-        // mempool drops what the chain now holds
+        // Divi Core's disconnectTip puts them back, and the mempool drops
+        // what the chain now holds
         let returned = match method {
             "invalidateblock" => self.chain.invalidate_block(&hash).map_err(map_err)?,
-            "reconsiderblock" => {
-                self.chain.reconsider_block(&hash).map_err(map_err)?;
-                Vec::new()
-            }
+            "reconsiderblock" => self.chain.reconsider_block(&hash).map_err(map_err)?,
             // C++ reverseblocktransactions invalidates (reversing the block's
             // transactions in the coin DB) then clears the invalid mark
             // without moving the tip, which stays at the block's parent
