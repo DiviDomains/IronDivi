@@ -572,10 +572,8 @@ impl ZmqNotifier {
         if self.past_ibd.load(Ordering::SeqCst) {
             return false;
         }
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
+        // GetTime: the node's clock, which setmocktime sets
+        let now = divi_primitives::clock::now();
         if i64::from(tip.time) < now - IBD_TIP_AGE {
             return true;
         }
