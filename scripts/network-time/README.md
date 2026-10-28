@@ -26,7 +26,7 @@ scripts/network-time/run.sh target/debug ~/divi-3.0.0/bin 46600 /var/tmp
 Each node's RPC password is a fresh random value written only to its `divi.conf`. A run takes about 4 minutes.
 Needs bash and python3 (standard library only). `NETWORK_TIME_INJECT=<row name>` makes that row differ, to show a
 difference is caught. Pointing both directories at Divi Core (a directory where `irondivid` is a link to `divid`)
-checks the script itself: every row passes but the KNOWN one, which then reports that it matches.
+checks the script itself: every row passes.
 
 ## Rows
 
@@ -50,13 +50,13 @@ checks the script itself: every row passes but the KNOWN one, which then reports
    - a work block 7201 s ahead of each node's clock (refused `time-too-new`), then 7200 s ahead (taken), and a stake
      block 181 s and then 180 s ahead (BlockCheckingHelpers.cpp:29-31, Settings.cpp:215-218). A block refused for
      its time is not marked invalid, so the same block is taken once it is inside the limit.
+   - how often `-blocknotify` ran once the work block, the first within 6 hours of the clock, ended the initial
+     block download: divid signals that tip and no earlier one (ChainExtensionService.cpp:556-565).
 
 What `net-time` covers is not repeated: the offset from peers' version messages, its cap and warning, and the
 2-hour limit on the network-adjusted clock.
 
 ## KNOWN
 
-- **`blocknotify for blocks older than 6 h`:** divid signals a new tip only out of the initial block download
-  (ChainExtensionService.cpp:556-565, init.cpp:113-119), so a node taking two-day-old blocks runs no
-  `-blocknotify`. irondivid runs it for every new tip. This is when a notification runs, not a clock, and is left for
-  a separate change.
+None. (`blocknotify for blocks older than 6 h` was one; irondivid now runs `-blocknotify` only out of the
+initial block download, as divid does.)

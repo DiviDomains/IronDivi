@@ -3303,25 +3303,15 @@ fn alert_notify(cmd: &str, message: &str) {
 /// version than it makes (ChainTipManager.cpp:43-60): once out of initial
 /// download, with more than 50 of them above version 4 (block.h:26), the
 /// miscellaneous warning is set and -alertnotify run, once. Initial download
-/// ends, for good, at a tip less than 6 hours old (ChainSyncHelpers.cpp:42-49)
+/// is the chain's IsInitialBlockDownload (ChainSyncHelpers.cpp:33-50)
 fn spawn_version_warning(chain: Arc<divi_storage::Chain>, alertnotify: Option<String>) {
     use std::sync::atomic::{AtomicBool, Ordering};
     const CURRENT_VERSION: i32 = 4;
     let warned = AtomicBool::new(false);
-    let synced = AtomicBool::new(false);
     let blocks = chain.clone();
     chain.add_tip_listener(Arc::new(move |tip| {
-        if warned.load(Ordering::SeqCst) {
+        if warned.load(Ordering::SeqCst) || blocks.is_initial_block_download() {
             return;
-        }
-        if !synced.load(Ordering::SeqCst) {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_secs() as i64);
-            if blocks.is_importing() || i64::from(tip.time) < now - 6 * 60 * 60 {
-                return;
-            }
-            synced.store(true, Ordering::SeqCst);
         }
         let upgraded = (0..100u32)
             .map_while(|back| tip.height.checked_sub(back))
@@ -3344,9 +3334,20 @@ fn spawn_version_warning(chain: Arc<divi_storage::Chain>, alertnotify: Option<St
 }
 
 /// -blocknotify: run the command each time the best block changes, with the
-/// new tip's hash (divid's UpdatedBlockTip, init.cpp:113-117, :518-523)
+/// new tip's hash (divid's UpdatedBlockTip, init.cpp:113-117, :518-523).
+/// Divi Core signals a new tip only out of the initial block download
+/// (ChainExtensionService.cpp:556-565), so the tip that ends it is the first
+/// one run
 fn spawn_block_notify(chain: Arc<divi_storage::Chain>, cmd: String) {
-    chain.add_tip_listener(Arc::new(move |tip| run_notify(&cmd, &tip.hash.to_string())));
+    let blocks = Arc::downgrade(&chain);
+    chain.add_tip_listener(Arc::new(move |tip| {
+        if blocks
+            .upgrade()
+            .is_some_and(|c| !c.is_initial_block_download())
+        {
+            run_notify(&cmd, &tip.hash.to_string());
+        }
+    }));
 }
 
 /// The staker's settings. The minimum coin age is the network's (Divi Core
