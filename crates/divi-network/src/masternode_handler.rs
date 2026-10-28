@@ -119,7 +119,7 @@ impl MasternodeHandler {
             }
             false
         } else {
-            info!(
+            debug!(
                 "Added masternode from broadcast: {} (tier: {:?})",
                 mnb.vin, mnb.tier
             );
@@ -190,7 +190,7 @@ impl MasternodeHandler {
             )));
         }
 
-        info!(
+        debug!(
             "Received masternode payment winner for height {} from peer {}",
             winner.block_height, peer_id
         );

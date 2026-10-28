@@ -513,7 +513,7 @@ impl BlockSync {
     pub fn update_peer_height(&self, peer_id: PeerId, height: u32) {
         self.peer_heights.write().insert(peer_id, height);
         let total_peers = self.peer_heights.read().len();
-        info!(
+        debug!(
             "Added peer {} with height {}, now have {} peers",
             peer_id, height, total_peers
         );
@@ -523,7 +523,7 @@ impl BlockSync {
         let old_best = *best;
         if height > *best {
             *best = height;
-            info!("New best peer height: {} (peer {})", height, peer_id);
+            debug!("New best peer height: {} (peer {})", height, peer_id);
         }
         drop(best); // Release lock before checking sync state
 
@@ -587,7 +587,7 @@ impl BlockSync {
         }
         let locator = self.build_block_locator();
         let msg = NetworkMessage::GetBlocks(GetHeadersMessage::new(locator, Hash256::zero()));
-        info!(
+        debug!(
             "Sending getblocks to peer {} from height {} (start of sync)",
             peer_id,
             self.chain.height()
@@ -613,7 +613,7 @@ impl BlockSync {
         let remaining_peers = self.peer_heights.read().len();
 
         if let Some(height) = removed_height {
-            info!(
+            debug!(
                 "Removed peer {} (was at height {}), {} peers remaining",
                 peer_id, height, remaining_peers
             );
@@ -742,7 +742,7 @@ impl BlockSync {
             NetworkMessage::GetBlocks(GetHeadersMessage::new(locator.clone(), Hash256::zero()));
 
         let locator_tip = locator.first().map(|h| h.to_string()).unwrap_or_default();
-        info!(
+        debug!(
             "Sending getblocks to peer {} from height {} (locator tip: {}...)",
             peer_id,
             self.chain.height(),
@@ -947,7 +947,7 @@ impl BlockSync {
             }
         } else {
             let genesis_hash = self.chain.genesis_hash();
-            info!(
+            debug!(
                 "Empty chain - using genesis hash in locator: {}",
                 genesis_hash
             );
@@ -975,7 +975,7 @@ impl BlockSync {
             return;
         }
 
-        info!(
+        debug!(
             "Received {} headers from peer {} (first: {})",
             headers.len(),
             peer_id,
@@ -1049,7 +1049,7 @@ impl BlockSync {
             self.request_headers().await;
         } else {
             // Switch to block download
-            info!(
+            debug!(
                 "Header sync complete, {} headers pending",
                 self.pending_headers.read().len()
             );
@@ -1349,7 +1349,7 @@ impl BlockSync {
                 }
             } else {
                 // Need to sync more - request next batch of block hashes
-                info!(
+                debug!(
                     "All queues empty, requesting more blocks (at height {}, target {})",
                     our_height, best_height
                 );
@@ -1692,7 +1692,7 @@ impl BlockSync {
                     let downloaded = self.downloaded_blocks.write();
                     let now = Instant::now();
 
-                    info!(
+                    debug!(
                         "Moving {} downloaded blocks to orphan storage (can't connect to tip {} at height {})",
                         remaining_count, tip_hash, our_height
                     );
@@ -1751,7 +1751,7 @@ impl BlockSync {
             let peer_count = self.peer_heights.read().len();
             if peer_count > 0 && target_height > our_height {
                 // We have peers and they're ahead - try to sync
-                info!(
+                debug!(
                     "Peers available with higher height ({} vs {}), requesting headers",
                     target_height, our_height
                 );
@@ -1822,7 +1822,7 @@ impl BlockSync {
         }
 
         if block_count > 0 {
-            info!(
+            debug!(
                 "Received inv with {} block hashes from peer {}",
                 block_count, peer_id
             );
@@ -1856,13 +1856,13 @@ impl BlockSync {
                         let has_index =
                             self.chain.get_block_index(&hash).is_ok_and(|o| o.is_some());
                         let has_full = self.chain.has_full_block(&hash).unwrap_or(false);
-                        info!(
+                        debug!(
                             "First inv block: hash={}, has_index={}, has_full_block={}",
                             hash, has_index, has_full
                         );
                         if has_index {
                             if let Ok(Some(index)) = self.chain.get_block_index(&hash) {
-                                info!(
+                                debug!(
                                     "  Block index exists: height={}, on_main_chain={}",
                                     index.height,
                                     index.is_on_main_chain()
@@ -1959,14 +1959,14 @@ impl BlockSync {
         }
 
         if block_count > 0 {
-            info!(
+            debug!(
                 "Inventory result: queued={}, already_have={}, already_downloading={}",
                 queued, already_have, already_downloading
             );
         }
         if known_side_chain > 0 {
             let side = *self.side_chain_tip.read();
-            info!(
+            debug!(
                 "{} inv blocks are already stored on a side chain (side-chain tip {:?}, main tip height {}); \
                  waiting for that fork to out-work the tip",
                 known_side_chain,
@@ -1982,7 +1982,7 @@ impl BlockSync {
         if let Some(locator) =
             self.inv_continuation_locator(block_count, queued, already_downloading, last_block_hash)
         {
-            info!(
+            debug!(
                 "All {} inv blocks already known; continuing getblocks from {} (long side chain)",
                 block_count, locator[0]
             );
@@ -2007,7 +2007,7 @@ impl BlockSync {
             let new_estimated_height = our_height + queued as u32;
             let current_best = *self.best_peer_height.read();
             if new_estimated_height > current_best {
-                info!(
+                debug!(
                     "Updating best_peer_height from {} to {} based on inv announcements",
                     current_best, new_estimated_height
                 );
@@ -2234,7 +2234,7 @@ impl BlockSync {
         };
 
         if attempts >= MAX_BLOCK_REQUEST_ATTEMPTS {
-            info!(
+            debug!(
                 "Giving up on block {} after {} failed requests (last: peer {} {}); \
                  will retry if a new peer announces it or after {}s",
                 hash,
@@ -2335,7 +2335,7 @@ impl BlockSync {
                             self.fire_reorg_callbacks(fork_height, result.orphaned_transactions);
                         }
                         let height = self.chain.height();
-                        info!("Connected orphan block {} at height {}", hash, height);
+                        debug!("Connected orphan block {} at height {}", hash, height);
 
                         // Remove from orphans
                         self.orphan_blocks.write().remove(&hash);
@@ -2390,7 +2390,7 @@ impl BlockSync {
             orphans.len()
         };
 
-        info!(
+        debug!(
             "Requesting blocks to fill gap at height {} for {} orphans",
             our_height, orphan_count
         );
@@ -2414,7 +2414,7 @@ impl BlockSync {
 
         if let Some(peer) = alt_peer {
             *self.sync_peer.write() = Some(peer);
-            info!(
+            debug!(
                 "Switching to alternative peer {} for gap fill (was {:?})",
                 peer, current_sync
             );

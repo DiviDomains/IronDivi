@@ -117,14 +117,21 @@ pub struct LogConfigInfo {
     pub max_file_size: u64,
     /// Number of log files to keep
     pub max_files: u32,
-    /// Whether debug logging is enabled
+    /// Whether any category writes debug or trace lines
     pub debug: bool,
+    /// The levels, as a `loglevel` value (e.g. `info,sync:debug`)
+    #[serde(default)]
+    pub levels: String,
     /// Whether logging to console instead of file
     pub print_to_console: bool,
 }
 
 /// Callback that starts a clean node shutdown (the same path as SIGTERM)
 pub type ShutdownCallback = Arc<dyn Fn() + Send + Sync>;
+
+/// Changes the log levels of the running node: takes a `loglevel` value
+/// (or `debug` / `default`) and returns the levels now in force
+pub type LogLevelsCallback = Arc<dyn Fn(&str) -> Result<String, String> + Send + Sync>;
 
 /// RPC server state
 pub struct RpcServer {
@@ -137,6 +144,7 @@ pub struct RpcServer {
     spork: SporkRpc,
     log_config: RwLock<Option<LogConfigInfo>>,
     shutdown: RwLock<Option<ShutdownCallback>>,
+    log_levels: RwLock<Option<LogLevelsCallback>>,
 }
 
 impl RpcServer {
@@ -152,6 +160,7 @@ impl RpcServer {
             spork: SporkRpc::new(),
             log_config: RwLock::new(None),
             shutdown: RwLock::new(None),
+            log_levels: RwLock::new(None),
         }
     }
 
@@ -167,6 +176,7 @@ impl RpcServer {
             spork: SporkRpc::new(),
             log_config: RwLock::new(None),
             shutdown: RwLock::new(None),
+            log_levels: RwLock::new(None),
         }
     }
 
@@ -182,6 +192,7 @@ impl RpcServer {
             spork: SporkRpc::new(),
             log_config: RwLock::new(None),
             shutdown: RwLock::new(None),
+            log_levels: RwLock::new(None),
         }
     }
 
@@ -201,6 +212,7 @@ impl RpcServer {
             spork: SporkRpc::new(),
             log_config: RwLock::new(None),
             shutdown: RwLock::new(None),
+            log_levels: RwLock::new(None),
         }
     }
 
@@ -289,6 +301,11 @@ impl RpcServer {
         *self.shutdown.write() = Some(callback);
     }
 
+    /// Set the hook that the `setlogconfig` RPC uses to change log levels
+    pub fn set_log_levels_callback(&self, callback: LogLevelsCallback) {
+        *self.log_levels.write() = Some(callback);
+    }
+
     /// Set the log configuration for RPC queries
     pub fn set_log_config(&self, config: LogConfigInfo) {
         *self.log_config.write() = Some(config);
@@ -303,6 +320,7 @@ impl RpcServer {
                 "max_file_size_mb": c.max_file_size / 1_048_576,
                 "max_files": c.max_files,
                 "debug": c.debug,
+                "levels": c.levels,
                 "print_to_console": c.print_to_console
             })),
             None => Ok(serde_json::json!({
@@ -311,30 +329,38 @@ impl RpcServer {
         }
     }
 
-    /// Set log configuration (note: only debug level can be changed at runtime)
+    /// Change the log levels of the running node: `true` is every category
+    /// at debug, `false` the start-up default, a string a `loglevel` value
     fn set_log_config_rpc(&self, params: &Params) -> Result<serde_json::Value, Error> {
-        // Parse parameters
-        let debug = params.get_bool(0);
-
-        if let Some(debug_enabled) = debug {
-            let mut config = self.log_config.write();
-            if let Some(ref mut c) = *config {
-                c.debug = debug_enabled;
-                // Note: Actually changing the log level at runtime would require
-                // using tracing_subscriber's reload functionality, which is more complex.
-                // For now, we just update the stored config for informational purposes.
-                return Ok(serde_json::json!({
-                    "success": true,
-                    "message": "Debug setting updated. Note: File size and count settings require restart.",
-                    "debug": debug_enabled
-                }));
-            }
+        let spec = match (params.get_bool(0), params.get_str(0)) {
+            (Some(true), _) => "debug".to_string(),
+            (Some(false), _) => "default".to_string(),
+            (None, Some(s)) => s.to_string(),
+            (None, None) => return Err(RpcError::invalid_params(
+                "setlogconfig needs true, false or a loglevel value such as \"info,sync:debug\"",
+            )
+            .into()),
+        };
+        let callback = self.log_levels.read().clone();
+        let Some(callback) = callback else {
+            return Err(
+                RpcError::internal_error("log levels cannot be changed in this node").into(),
+            );
+        };
+        let levels = callback(&spec).map_err(RpcError::invalid_params)?;
+        let debug = levels.split(',').any(|l| {
+            let lvl = l.rsplit(':').next().unwrap_or(l);
+            lvl == "debug" || lvl == "trace"
+        });
+        if let Some(c) = self.log_config.write().as_mut() {
+            c.levels = levels.clone();
+            c.debug = debug;
         }
-
-        Err(
-            RpcError::invalid_params("setlogconfig requires a boolean parameter for debug mode")
-                .into(),
-        )
+        Ok(serde_json::json!({
+            "success": true,
+            "levels": levels,
+            "debug": debug
+        }))
     }
 
     /// Composite getinfo handler that pulls data from all subsystems.
@@ -877,8 +903,8 @@ impl RpcServer {
                 "debitvaultbyname" => "debitvaultbyname vault-encoding destination amount (feeMode)\n\nWithdraw an amount from a specific vaults to a destination address. The amount is a real and is rounded to the nearest 0.00000001\n\nRequires wallet passphrase to be set with walletpassphrase call.\nArguments:\n1. \"vault-encoding\"  (string, required) The vault encoding to withdraw from.\n2. \"diviaddress\"  (string, required) The divi address of your choosing to send to.\n3. \"amount\"      (numeric, required) The amount in DIVI to move. eg 0.1\n4. \"fee mode\"      (string, optional) The fee + change output calculation mode\n\nResult:\n\"transactionid\"  (string) The transaction id.",
                 "reclaimvaultfunds" => "reclaimvaultfunds destination amount (feeMode|metadata) ( \"comment\" \"comment-to\" )\n\nWithdraw an amount from your vaults into a separate address. The amount is a real and is rounded to the nearest 0.00000001\n\nRequires wallet passphrase to be set with walletpassphrase call.\nArguments:\n1. \"diviaddress\"  (string, required) The divi address of your choosing to send to.\n2. \"amount\"      (numeric, required) The amount in DIVI to move. eg 0.1\n\nResult:\n\"transactionid\"  (string) The transaction id.",
                 // Logging
-                "getlogconfig" => "getlogconfig\n\nReturns the current logging configuration.\n\nResult:\n{\n  \"max_file_size\": n,      (numeric) Maximum log file size in bytes\n  \"max_file_size_mb\": n,   (numeric) Maximum log file size in MB\n  \"max_files\": n,          (numeric) Number of log files to keep\n  \"debug\": true|false,     (boolean) Whether debug logging is enabled\n  \"print_to_console\": true|false  (boolean) Whether logging to console\n}",
-                "setlogconfig" => "setlogconfig debug\n\nSets log configuration. Note: only debug level can be changed at runtime.\nFile size and count settings require a restart.\n\nArguments:\n1. debug    (boolean, required) Enable or disable debug logging\n\nResult:\n{\n  \"success\": true|false,\n  \"message\": \"...\",\n  \"debug\": true|false\n}",
+                "getlogconfig" => "getlogconfig\n\nReturns the current logging configuration.\n\nResult:\n{\n  \"max_file_size\": n,      (numeric) Maximum log file size in bytes\n  \"max_file_size_mb\": n,   (numeric) Maximum log file size in MB\n  \"max_files\": n,          (numeric) Number of log files to keep\n  \"debug\": true|false,     (boolean) Whether any category writes debug lines\n  \"levels\": \"...\",       (string) The log levels, as a loglevel value\n  \"print_to_console\": true|false  (boolean) Whether logging to console\n}",
+                "setlogconfig" => "setlogconfig levels\n\nChanges the log levels of the running node until it stops (the config file's\nloglevel= and debug= apply again at the next start). File size and count\nneed a restart.\n\nArguments:\n1. levels   (string or boolean, required) A loglevel value: a level for all of\n            IronDivi (off, error, warn, info, debug, trace) and/or\n            category:level pairs, separated by commas; \"default\" for the\n            start-up default. true is every category at debug, false the default.\n            Categories: net, sync, peers, node, mempool, staking, chain, wallet,\n            masternode, spork, rpc, electrum, webui, swap, zmq, daemon\n\nResult:\n{\n  \"success\": true,\n  \"levels\": \"...\",   (string) The levels now in force\n  \"debug\": true|false\n}\n\nExamples:\n> irondivi-cli setlogconfig \"info,sync:debug\"\n> irondivi-cli setlogconfig default",
                 // Control
                 "help" => "help ( \"command\" )\n\nList all commands, or get help for a specified command.",
                 "stop" => "stop\n\nStop Divi server.",

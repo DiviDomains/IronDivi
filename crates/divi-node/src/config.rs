@@ -816,6 +816,10 @@ impl Default for IndexConfig {
     }
 }
 
+fn default_log_levels() -> String {
+    "info".to_string()
+}
+
 /// Logging configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogConfig {
@@ -825,8 +829,12 @@ pub struct LogConfig {
     /// Number of log files to keep (default: 5)
     pub max_files: u32,
 
-    /// Enable debug logging
+    /// Whether any category writes debug or trace lines
     pub debug: bool,
+
+    /// The log levels, as a `loglevel` value (e.g. `info,sync:debug`)
+    #[serde(default = "default_log_levels")]
+    pub levels: String,
 
     /// Print to console instead of file
     pub print_to_console: bool,
@@ -838,6 +846,7 @@ impl Default for LogConfig {
             max_file_size: 1_048_576, // 1 MB
             max_files: 5,
             debug: false,
+            levels: default_log_levels(),
             print_to_console: false,
         }
     }

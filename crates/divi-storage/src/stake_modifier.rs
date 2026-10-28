@@ -256,7 +256,7 @@ pub fn compute_next_stake_modifier<'a>(
     // Debug: log the modifier computation for early heights
     let log_details = prev_index.height < 100;
     if log_details {
-        tracing::info!(
+        tracing::debug!(
             "Computing stake modifier for height {}: using last_modifier=0x{:016x} from height {}, {} candidate blocks",
             prev_index.height + 1,
             last_modifier_index.stake_modifier,
@@ -287,7 +287,7 @@ pub fn compute_next_stake_modifier<'a>(
 
         // Debug: log each round's selection for early heights
         if log_details {
-            tracing::info!(
+            tracing::debug!(
                 "StakeModifier round {}: selected height={}, entropy_bit={}",
                 round,
                 selected_block.height,

@@ -723,7 +723,7 @@ impl PeerManager {
                             if !self.claim_dial(addr, DialRule::Automatic) {
                                 continue;
                             }
-                            info!("Discovered peer: {}", addr);
+                            debug!("Discovered peer: {}", addr);
                             let self_clone = Arc::clone(&self);
                             tokio::spawn(async move {
                                 if let Err(e) = self_clone.connect_to_peer(addr).await {
@@ -768,7 +768,7 @@ impl PeerManager {
                 result = listener.accept() => {
                     match result {
                         Ok((stream, peer_addr)) => {
-                            info!("Accepted connection from {}", peer_addr);
+                            debug!("Accepted connection from {}", peer_addr);
 
                             // Divi Core counts every inbound connection, handshake
                             // done or not, against -maxconnections less the outbound
@@ -1068,7 +1068,7 @@ impl PeerManager {
                 debug!("Failed to send block inv to peer {}: {}", peer_id, e);
             }
         }
-        info!("Broadcast block inv {} to {} peers", block_hash, peer_count);
+        debug!("Broadcast block inv {} to {} peers", block_hash, peer_count);
     }
 
     /// Broadcast a block inv to all connected peers except the one specified.
@@ -1244,7 +1244,7 @@ impl PeerManager {
                 continue;
             }
 
-            info!(
+            debug!(
                 "Peer maintenance: {}/{} outbound peers, attempting reconnection",
                 outbound, target
             );
@@ -1266,7 +1266,7 @@ impl PeerManager {
                 if !self.claim_dial(addr, DialRule::ByAddress) {
                     continue;
                 }
-                info!("Reconnecting to added node: {}", addr);
+                debug!("Reconnecting to added node: {}", addr);
                 let self_clone = Arc::clone(&self);
                 tokio::spawn(async move {
                     let self_for_record = Arc::clone(&self_clone);
@@ -1300,7 +1300,7 @@ impl PeerManager {
                     if !self.claim_dial(addr, rule) {
                         continue;
                     }
-                    info!("Reconnecting to static peer: {}", addr);
+                    debug!("Reconnecting to static peer: {}", addr);
                     let self_clone = Arc::clone(&self);
                     tokio::spawn(async move {
                         let self_for_record = Arc::clone(&self_clone);
@@ -1322,7 +1322,7 @@ impl PeerManager {
 
             // 4. Re-query DNS seeds as last resort
             if self.can_connect_outbound() && !self.config.dns_seeds.is_empty() {
-                info!("Re-querying DNS seeds for peers");
+                debug!("Re-querying DNS seeds for peers");
                 Arc::clone(&self).discover_peers().await;
             }
         }

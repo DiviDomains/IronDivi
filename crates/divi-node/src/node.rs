@@ -882,7 +882,7 @@ impl Node {
                         }
                     }
                     PeerEvent::Disconnected { peer_id, reason } => {
-                        tracing::warn!("Peer {} disconnected: {}", peer_id, reason);
+                        tracing::debug!("Peer {} disconnected: {}", peer_id, reason);
                         block_sync.remove_peer(peer_id);
                         tx_relay.remove_peer(peer_id);
                         // Divi Core FinalizeNode: EraseOrphansFor (NodeState.cpp:41)

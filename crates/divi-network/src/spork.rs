@@ -181,7 +181,7 @@ impl SporkManager {
             };
             match stored {
                 Ok(spork) => {
-                    tracing::info!("Loaded spork {} with value {}", id, spork.value);
+                    tracing::debug!("Loaded spork {} with value {}", id, spork.value);
                     self.sporks.write().insert(spork.hash(), spork.clone());
                     self.add_active(spork);
                 }
@@ -240,7 +240,7 @@ impl SporkManager {
 
     /// Handle sporkcount message from a peer
     pub async fn handle_sporkcount(&self, peer_id: PeerId, count: u32) {
-        tracing::info!("Peer {} has {} sporks", peer_id, count);
+        tracing::debug!("Peer {} has {} sporks", peer_id, count);
 
         // Update peer state
         {
@@ -331,7 +331,7 @@ impl SporkManager {
             {
                 let new_received = received + 1;
                 if new_received >= expected {
-                    tracing::info!(
+                    tracing::debug!(
                         "Spork sync complete from peer {} ({} sporks)",
                         peer_id,
                         new_received

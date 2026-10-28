@@ -34,7 +34,7 @@ use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::timeout;
 use tokio_util::codec::FramedRead;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, trace, warn};
 
 /// Timeout for connection establishment in milliseconds: Divi Core's
 /// -timeout, default 5000 (net.cpp DEFAULT_CONNECT_TIMEOUT)
@@ -138,13 +138,13 @@ impl Connection {
         // connection when the proxy fails
         let stream = match proxy {
             Some(proxy) => {
-                info!("Connecting to peer {} via proxy {}", addr, proxy);
+                debug!("Connecting to peer {} via proxy {}", addr, proxy);
                 timeout(connect_timeout(), crate::socks5::connect(proxy, addr))
                     .await
                     .map_err(|_| NetworkError::Timeout)??
             }
             None => {
-                info!("Connecting to peer {}", addr);
+                debug!("Connecting to peer {}", addr);
                 timeout(connect_timeout(), TcpStream::connect(addr))
                     .await
                     .map_err(|_| NetworkError::Timeout)?
@@ -205,7 +205,7 @@ impl Connection {
         local: Arc<crate::local::LocalAddresses>,
     ) -> Result<(Self, PeerHandle), NetworkError> {
         let addr = stream.peer_addr()?;
-        info!("Accepting connection from {}", addr);
+        debug!("Accepting connection from {}", addr);
 
         stream.set_nodelay(true)?;
 
@@ -248,7 +248,7 @@ impl Connection {
     pub async fn run(mut self) -> Result<(), NetworkError> {
         // Perform handshake
         if let Err(e) = self.handshake().await {
-            error!("Handshake failed with {}: {}", self.info.addr, e);
+            debug!("Handshake failed with {}: {}", self.info.addr, e);
             let _ = self.event_tx.send(PeerEvent::Disconnected {
                 peer_id: self.peer_id,
                 reason: e.to_string(),
@@ -256,7 +256,7 @@ impl Connection {
             return Err(e);
         }
 
-        info!(
+        debug!(
             "Handshake complete with {} ({}), height {}",
             self.info.addr,
             self.info.user_agent().unwrap_or("unknown"),
@@ -322,7 +322,7 @@ impl Connection {
 
         // Divi Core IsSelfConnection: our own version came back
         if self.local_nonces.lock().contains(&their_version.nonce) {
-            info!("Connected to self at {}, disconnecting", self.info.addr);
+            debug!("Connected to self at {}, disconnecting", self.info.addr);
             return Err(NetworkError::Connection("connected to self".into()));
         }
 
@@ -559,7 +559,7 @@ impl Connection {
 
                 // Check for shutdown signal (highest priority)
                 _ = shutdown_rx.recv() => {
-                    info!("Shutdown signal received, disconnecting from {}", info.addr);
+                    debug!("Shutdown signal received, disconnecting from {}", info.addr);
                     break;
                 }
 
@@ -567,7 +567,7 @@ impl Connection {
                 // manager drops this peer (disconnect, ban): end the connection.
                 msg = outbound_rx.recv() => {
                     let Some(msg) = msg else {
-                        info!("Disconnecting from {} (dropped by the peer manager)", info.addr);
+                        debug!("Disconnecting from {} (dropped by the peer manager)", info.addr);
                         break;
                     };
                     // A queued ping (the `ping` RPC) gets a fresh nonce and is timed like the
@@ -583,7 +583,7 @@ impl Connection {
                         other => other,
                     };
                     if let Err(e) = Self::write_message(&mut writer, &mut info, magic, &total_bytes_sent, msg).await {
-                        error!("Failed to send message to {}: {}", info.addr, e);
+                        debug!("Failed to send message to {}: {}", info.addr, e);
                         break;
                     }
                 }
@@ -591,7 +591,7 @@ impl Connection {
                 // Proactive keepalive ping
                 _ = ping_timer.tick() => {
                     if inactivity_exceeded(info.last_recv, info.ping_time, std::time::Instant::now()) {
-                        info!("{} inactive for {:?}, disconnecting", info.addr, TIMEOUT_INTERVAL);
+                        debug!("{} inactive for {:?}, disconnecting", info.addr, TIMEOUT_INTERVAL);
                         break;
                     }
                     let now = std::time::Instant::now();
@@ -601,7 +601,7 @@ impl Connection {
                         info.ping_time = Some(now);
                         last_ping_sent = Some(now);
                         if let Err(e) = Self::write_message(&mut writer, &mut info, magic, &total_bytes_sent, NetworkMessage::Ping(nonce)).await {
-                            error!("Failed to send keepalive ping to {}: {}", info.addr, e);
+                            debug!("Failed to send keepalive ping to {}: {}", info.addr, e);
                             break;
                         }
                     }
@@ -615,7 +615,7 @@ impl Connection {
                             info.bytes_recv += bytes_received;
                             total_bytes_recv.fetch_add(bytes_received, Ordering::Relaxed);
                             if let Err(e) = Self::write_message(&mut writer, &mut info, magic, &total_bytes_sent, duplicate_version_reject()).await {
-                                error!("Failed to send reject to {}: {}", info.addr, e);
+                                debug!("Failed to send reject to {}: {}", info.addr, e);
                                 break;
                             }
                             let _ = event_tx.send(duplicate_version(peer_id));
@@ -629,7 +629,7 @@ impl Connection {
                             debug!("{} from {} does not parse: {}", command, info.addr, error);
                             if let Some(answer) = malformed_reject(&command) {
                                 if let Err(e) = Self::write_message(&mut writer, &mut info, magic, &total_bytes_sent, answer).await {
-                                    error!("Failed to send reject to {}: {}", info.addr, e);
+                                    debug!("Failed to send reject to {}: {}", info.addr, e);
                                     break;
                                 }
                             }
@@ -654,19 +654,19 @@ impl Connection {
                             }
                         }
                         Ok(Some(Err(e))) => {
-                            error!("Error reading from {}: {}", info.addr, e);
+                            debug!("Error reading from {}: {}", info.addr, e);
                             break;
                         }
                         Ok(None) => {
                             // Stream ended (connection closed)
-                            info!("Connection closed by {}", info.addr);
+                            debug!("Connection closed by {}", info.addr);
                             break;
                         }
                         Err(_) => {
                             // A quiet peer gets no extra ping: the keepalive above
                             // runs on its own interval, as in Divi Core
                             if inactivity_exceeded(info.last_recv, info.ping_time, std::time::Instant::now()) {
-                                info!("{} inactive for {:?}, disconnecting", info.addr, TIMEOUT_INTERVAL);
+                                debug!("{} inactive for {:?}, disconnecting", info.addr, TIMEOUT_INTERVAL);
                                 break;
                             }
                         }

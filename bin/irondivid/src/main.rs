@@ -23,6 +23,7 @@
 
 mod core_files;
 mod interfaces;
+mod log_filter;
 mod private_files;
 mod settings;
 mod snapshot_sig;
@@ -59,6 +60,8 @@ struct Args {
     daemon: bool,
     printtoconsole: bool,
     debug: bool,
+    /// -loglevel and -debug: what is written to debug.log
+    log_levels: log_filter::LogLevels,
     wallet: Option<PathBuf>,
     disablewallet: bool,
     pid: Option<PathBuf>,
@@ -90,7 +93,11 @@ Options are read as divid reads them: -name=value (or --name value), -noname\n\
 to turn an option off, then the config file (irondivi.conf, else divi.conf, in\n\
 the data directory) for whatever the command line left unset. Among them:\n  \
 -conf=<file> -datadir=<dir> -testnet -regtest -mode=<divi|privatedivi>\n  \
--daemon -pid=<file> -printtoconsole -debug -disablewallet -wallet=<name>\n  \
+-daemon -pid=<file> -printtoconsole -disablewallet -wallet=<name>\n  \
+-debug[=<category>] -loglevel=<level> -loglevel=<category>:<level>\n  \
+(levels: off error warn info debug trace; categories: net sync peers node\n  \
+mempool staking chain wallet masternode spork rpc electrum webui swap zmq\n  \
+daemon; the default is info; see docs/logging.md)\n  \
 -port=<port> -bind=<addr> -listen -connect=<ip> -addnode=<ip> -dnsseed\n  \
 -maxconnections=<n> -proxy=<ip:port> -banscore=<n> -bantime=<n> -timeout=<ms>\n  \
 -server -rpcbind=<addr> -rpcallowip=<ip> -rpcport=<port> -rpcuser=<user>\n  \
@@ -177,9 +184,12 @@ impl Args {
         self.mode = s.get("mode").map(String::from);
         self.daemon = s.get_bool("daemon", false);
         self.printtoconsole = s.get_bool("printtoconsole", false);
-        // -debug=<category> may repeat; -debug=0 is no debugging
-        let debug = s.get_multi("debug");
-        self.debug = !debug.is_empty() && !debug.iter().any(|c| c == "0");
+        // -debug=<category> and -loglevel=<[category:]level> may repeat;
+        // -debug=0 is no debugging
+        self.log_levels =
+            log_filter::LogLevels::parse(s.get_multi("debug"), s.get_multi("loglevel"))
+                .map_err(anyhow::Error::msg)?;
+        self.debug = self.log_levels.is_debug();
         self.wallet = path("wallet");
         self.disablewallet = s.get_bool("disablewallet", false);
         self.pid = path("pid");
@@ -368,6 +378,7 @@ const READ_ELSEWHERE: &[&str] = &[
     "daemon",
     "printtoconsole",
     "debug",
+    "loglevel",
     "wallet",
     "disablewallet",
     "pid",
@@ -1174,16 +1185,40 @@ fn stderr_is_file(_path: &std::path::Path) -> bool {
     false
 }
 
+/// The filter of the running logger, which `setlogconfig` replaces
+static LOG_FILTER: std::sync::OnceLock<
+    tracing_subscriber::reload::Handle<EnvFilter, tracing_subscriber::Registry>,
+> = std::sync::OnceLock::new();
+
+/// Change the log levels of the running node (the `setlogconfig` RPC);
+/// returns the levels now in force
+fn set_log_levels(spec: &str) -> std::result::Result<String, String> {
+    let levels = log_filter::LogLevels::parse_spec(spec)?;
+    let handle = LOG_FILTER
+        .get()
+        .ok_or_else(|| "logging is not set up".to_string())?;
+    let filter = EnvFilter::try_new(levels.directives()).map_err(|e| e.to_string())?;
+    handle.reload(filter).map_err(|e| e.to_string())?;
+    if !levels.unknown.is_empty() {
+        warn!(
+            "Unknown log categories {:?} (known: {})",
+            levels.unknown,
+            log_filter::category_names()
+        );
+    }
+    info!("Log levels set to {}", levels.spec());
+    Ok(levels.spec())
+}
+
 /// Initialize logging
-fn init_logging(log_config: &LogConfig, data_dir: &PathBuf) {
-    // Use RUST_LOG if set, otherwise use default based on debug config
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        if log_config.debug {
-            EnvFilter::new("debug")
-        } else {
-            EnvFilter::new("info")
-        }
-    });
+fn init_logging(log_config: &LogConfig, levels: &log_filter::LogLevels, data_dir: &PathBuf) {
+    // RUST_LOG, when set, replaces -loglevel and -debug
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(levels.directives()));
+    // First on the registry, so the handle's type does not depend on the
+    // writer chosen below
+    let (filter, handle) = tracing_subscriber::reload::Layer::new(filter);
+    let _ = LOG_FILTER.set(handle);
 
     // In daemon mode the console is debug.log itself, so it rotates like it
     let std_is_log = stderr_is_file(&data_dir.join("debug.log"));
@@ -1191,8 +1226,8 @@ fn init_logging(log_config: &LogConfig, data_dir: &PathBuf) {
     if log_config.print_to_console && !std_is_log {
         // Log to console only
         tracing_subscriber::registry()
-            .with(fmt::layer())
             .with(filter)
+            .with(fmt::layer())
             .init();
     } else {
         // Log to file (debug.log in data directory) like C++ divid
@@ -1204,8 +1239,8 @@ fn init_logging(log_config: &LogConfig, data_dir: &PathBuf) {
             );
             // Fall back to console logging
             tracing_subscriber::registry()
-                .with(fmt::layer())
                 .with(filter)
+                .with(fmt::layer())
                 .init();
             return;
         }
@@ -1231,8 +1266,8 @@ fn init_logging(log_config: &LogConfig, data_dir: &PathBuf) {
                     e
                 );
                 tracing_subscriber::registry()
-                    .with(fmt::layer())
                     .with(filter)
+                    .with(fmt::layer())
                     .init();
                 return;
             }
@@ -1247,10 +1282,10 @@ fn init_logging(log_config: &LogConfig, data_dir: &PathBuf) {
 
         // Set up file logging with timestamps
         tracing_subscriber::registry()
+            .with(filter)
             .with(
                 fmt::layer().with_writer(non_blocking).with_ansi(false), // No ANSI colors in file
             )
-            .with(filter)
             .init();
 
         eprintln!("Logging to {:?}", data_dir.join("debug.log"));
@@ -1843,7 +1878,7 @@ async fn run_daemon(
                     total_fees.as_sat()
                 );
             }));
-            info!("Unified block callback registered (mempool + fees + wallet)");
+            debug!("Unified block callback registered (mempool + fees + wallet)");
 
             // Mirror wallet-relevant mempool transactions into the wallet so
             // unconfirmed sends and receives show up immediately (0 confirmations).
@@ -1899,7 +1934,7 @@ async fn run_daemon(
                     }
                 }));
             }
-            info!("Wallet reorg callback registered");
+            debug!("Wallet reorg callback registered");
 
             // Catch-up scan: process blocks between last_scan_height and current chain tip.
             // Block notifications may already be arriving; they share the wallet's scan
@@ -2104,7 +2139,7 @@ async fn run_daemon(
                     block_hash, height
                 );
             }));
-            info!("Staker block callback registered (for self-accepted blocks)");
+            debug!("Staker block callback registered (for self-accepted blocks)");
         }
 
         // Start the staking loop unless disabled (-staking=0)
@@ -2208,6 +2243,7 @@ async fn run_daemon(
             max_file_size: config.log.max_file_size,
             max_files: config.log.max_files,
             debug: config.log.debug,
+            levels: config.log.levels.clone(),
             print_to_console: config.log.print_to_console,
         };
 
@@ -2236,6 +2272,7 @@ async fn run_daemon(
                     rpc_server.set_block_sync(block_sync_for_rpc);
                     rpc_server.set_spork_manager(spork_for_rpc);
                     rpc_server.set_log_config(log_config_for_rpc);
+                    rpc_server.set_log_levels_callback(Arc::new(set_log_levels));
 
                     // The masternode RPCs read the node's masternode list
                     rpc_server.set_masternode_manager(mn_for_rpc);
@@ -2268,7 +2305,7 @@ async fn run_daemon(
                         info!("Transaction {} submitted to mempool and announced to peers", txid);
                         Ok(txid)
                     }));
-                    info!("Transaction submission callback configured");
+                    debug!("Transaction submission callback configured");
 
                     if let Some(ref staker_arc) = staker_ref {
                         let staker_for_status = Arc::clone(staker_arc);
@@ -2347,7 +2384,7 @@ async fn run_daemon(
                                     })
                             }));
 
-                        info!("Staking RPC callbacks registered");
+                        debug!("Staking RPC callbacks registered");
                     }
                 }
             ) => {
@@ -2377,6 +2414,7 @@ async fn run_daemon(
             max_file_size: config.log.max_file_size,
             max_files: config.log.max_files,
             debug: config.log.debug,
+            levels: config.log.levels.clone(),
             print_to_console: config.log.print_to_console,
         };
 
@@ -2404,6 +2442,7 @@ async fn run_daemon(
                     rpc_server.set_block_sync(block_sync_for_rpc);
                     rpc_server.set_spork_manager(spork_for_rpc);
                     rpc_server.set_log_config(log_config_for_rpc);
+                    rpc_server.set_log_levels_callback(Arc::new(set_log_levels));
 
                     // The masternode RPCs read the node's masternode list
                     rpc_server.set_masternode_manager(mn_for_rpc);
@@ -3114,12 +3153,21 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
         max_file_size: args.maxlogsize.unwrap_or(1) as u64 * 1_048_576, // Convert MB to bytes
         max_files: args.maxlogfiles.unwrap_or(5),
         debug: args.debug,
+        levels: args.log_levels.spec(),
         // An export only reads the data directory: it logs to the console
         print_to_console: args.printtoconsole || args.export_chain,
     };
 
     // Initialize logging (writes to debug.log in data_dir by default)
-    init_logging(&log_config, &data_dir);
+    init_logging(&log_config, &args.log_levels, &data_dir);
+    if !args.log_levels.unknown.is_empty() {
+        warn!(
+            "Unknown log categories {:?} in -debug/-loglevel (known: {})",
+            args.log_levels.unknown,
+            log_filter::category_names()
+        );
+    }
+    info!("Log levels: {}", args.log_levels.spec());
 
     // Build configuration
     let mut config = build_config(&args)?;
@@ -3132,6 +3180,7 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
     // Check for conflicting network options
     if args.testnet && args.regtest {
         error!("Cannot use both --testnet and --regtest");
+        flush_log();
         std::process::exit(1);
     }
 
@@ -3238,6 +3287,7 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
             source = err.source();
         }
         remove_pid_file(&pid_file);
+        flush_log();
         std::process::exit(1);
     }
 
@@ -3481,6 +3531,44 @@ mod config_format_tests {
         let c = cfg("rpcuser=foo\n[test]\nrpcport=1\nrpcuser=bar\n", &[]).unwrap();
         assert_eq!(c.rpc.username.as_deref(), Some("foo"));
         assert_eq!(c.rpc.port, 1);
+    }
+
+    /// -debug and -loglevel, from the command line or the file, set the log
+    /// levels; nothing set is info, and a bad level stops the start
+    #[test]
+    fn log_levels_come_from_debug_and_loglevel() {
+        let dir = tempfile::tempdir().unwrap();
+        let dd = format!("--datadir={}", dir.path().display());
+        let levels = |extra: &[&str]| {
+            let mut argv = vec!["irondivid", dd.as_str()];
+            argv.extend(extra);
+            resolve_args(Args::parse_from(argv)).map(|a| (a.debug, a.log_levels.spec()))
+        };
+        assert_eq!(levels(&[]).unwrap(), (false, "info".to_string()));
+        assert_eq!(levels(&["-debug"]).unwrap(), (true, "debug".to_string()));
+        assert_eq!(
+            levels(&["-debug", "-nodebug"]).unwrap(),
+            (false, "info".to_string())
+        );
+        assert_eq!(
+            levels(&["-debug=sync", "-debug=rpc"]).unwrap(),
+            (true, "info,rpc:debug,sync:debug".to_string())
+        );
+        assert_eq!(
+            levels(&["-loglevel=warn", "-loglevel=peers:error"]).unwrap(),
+            (false, "warn,peers:error".to_string())
+        );
+        assert!(levels(&["-loglevel=sync:loud"]).is_err());
+
+        std::fs::write(
+            dir.path().join("irondivi.conf"),
+            "loglevel=warn\nloglevel=staking:trace\n",
+        )
+        .unwrap();
+        assert_eq!(
+            levels(&[]).unwrap(),
+            (true, "warn,staking:trace".to_string())
+        );
     }
 
     /// Log-file and console settings in the file reach the logger (they were overwritten
