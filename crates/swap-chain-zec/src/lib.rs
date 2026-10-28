@@ -25,10 +25,10 @@ mod lwd_stub;
 #[cfg(test)]
 mod txid_binding;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use secp256k1::{All, Secp256k1, SecretKey};
@@ -167,8 +167,10 @@ pub struct ZecBackend {
     second: Option<LightwalletdClient>,
     /// The longest one lock read from the second operator may take
     /// ([`crosscheck::LOCK_READ_BUDGET`]; tests shorten it).
-    #[allow(dead_code)] // EX: read by the bounded lock read (scaffolding for its tests)
     second_budget: Duration,
+    /// Since when the second operator has refused each lock it has not agreed yet (EX), for
+    /// the refusal's "failing for". In memory only; an agreement clears the entry.
+    lock_failing: Mutex<HashMap<Outpoint, Instant>>,
     /// Shared with this backend's [`ChainBackend::primary_only`] views.
     hold: Arc<HoldState>,
 }
@@ -216,6 +218,7 @@ impl ZecBackend {
             network: "testnet".to_string(),
             second: None,
             second_budget: crosscheck::LOCK_READ_BUDGET,
+            lock_failing: Mutex::default(),
             hold: Arc::default(),
         })
     }
@@ -276,6 +279,27 @@ impl ZecBackend {
         match hold {
             None => Ok(()),
             Some(h) => Err(h.error),
+        }
+    }
+
+    /// A lock refusal by [`crosscheck::agree_lock`], completed with how long the second
+    /// operator has been failing this lock (since its first refusal in this process; EX).
+    /// The engine retries it until its own deadline for the step.
+    fn failing_for(&self, at: &Outpoint, agreed: Result<LockedOutput>) -> Result<LockedOutput> {
+        let mut failing = self.lock_failing.lock().expect("lock_failing map");
+        match agreed {
+            Ok(lo) => {
+                failing.remove(at);
+                Ok(lo)
+            }
+            Err(SwapError::Transient(m)) => {
+                let since = *failing.entry(*at).or_insert_with(Instant::now);
+                Err(SwapError::Transient(format!(
+                    "{m}; the second operator has been failing this lock for {} s",
+                    since.elapsed().as_secs()
+                )))
+            }
+            Err(e) => Err(e),
         }
     }
 
@@ -828,6 +852,7 @@ impl ChainBackend for ZecBackend {
             network: self.network.clone(),
             second: None,
             second_budget: self.second_budget,
+            lock_failing: Mutex::default(),
             hold: self.hold.clone(),
         }))
     }
@@ -865,8 +890,13 @@ impl ChainBackend for ZecBackend {
             // Nothing to agree when the primary shows no matching lock: no side acts on `None`.
             (Some(second), Some(lo)) => {
                 let want = address::htlc_script_pubkey(&htlc.redeem_script());
-                let theirs = crosscheck::lock_view(second, at).await;
-                crosscheck::agree_lock(at, &want, lo, &self.client, theirs, second).map(Some)
+                // EX: a second operator that never answers fails the read at the budget.
+                let budget = self.second_budget;
+                let theirs = tokio::time::timeout(budget, crosscheck::lock_view(second, at))
+                    .await
+                    .unwrap_or_else(|_| Err(format!("did not answer within {budget:?}")));
+                let agreed = crosscheck::agree_lock(at, &want, lo, &self.client, theirs, second);
+                self.failing_for(at, agreed).map(Some)
             }
             (_, mine) => Ok(mine),
         }

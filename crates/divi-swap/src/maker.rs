@@ -640,6 +640,24 @@ impl Maker {
         Ok(remaining < needed)
     }
 
+    /// A taker-lock read that failed (`e`; EX: a second source down, hanging or not showing
+    /// the lock yet) is retried as before, but only until the taker-leg window is too short
+    /// to lock safely ([`Self::taker_window_too_short`]), the point past which this swap
+    /// never funds anyway: the swap then aborts, naming the failure. A failed read is never
+    /// taken for a lock, and nothing here reads one source alone to fund.
+    async fn taker_lock_unread(&self, r: &mut MakerRecord, e: SwapError) -> Result<Flow> {
+        // An unreadable MTP keeps the retry: not knowing the window is not its end.
+        if !self.taker_window_too_short(r).await.unwrap_or(false) {
+            return Err(e);
+        }
+        tracing::warn!(swap = %r.id, error = %e, "taker lock unverified until the taker-leg \
+            window ran out; aborting before funding");
+        self.abort(
+            r,
+            &format!("taker lock unverified until the taker-leg window ran out: {e}"),
+        )
+    }
+
     async fn on_accepted(&self, r: &mut MakerRecord) -> Result<Flow> {
         let taker_amount = r.quote.taker_leg_amount();
         let Some(op) = r.taker_leg_outpoint else {
@@ -648,7 +666,11 @@ impl Maker {
             }
             return Ok(Flow::Idle);
         };
-        match self.tk(r)?.htlc_output(&r.taker_leg_htlc, &op).await? {
+        let read = match self.tk(r)?.htlc_output(&r.taker_leg_htlc, &op).await {
+            Ok(read) => read,
+            Err(e) => return self.taker_lock_unread(r, e).await,
+        };
+        match read {
             Some(lo) if lo.amount < taker_amount => self.abort(r, "taker lock underfunded"),
             Some(lo) => {
                 r.taker_leg_locked = Some(lo.amount);
@@ -671,7 +693,11 @@ impl Maker {
     async fn on_taker_lock_seen(&self, r: &mut MakerRecord) -> Result<Flow> {
         let taker_amount = r.quote.taker_leg_amount();
         let op = self.taker_leg_outpoint(r)?;
-        match self.tk(r)?.htlc_output(&r.taker_leg_htlc, &op).await? {
+        let read = match self.tk(r)?.htlc_output(&r.taker_leg_htlc, &op).await {
+            Ok(read) => read,
+            Err(e) => return self.taker_lock_unread(r, e).await,
+        };
+        match read {
             Some(lo) if lo.amount < taker_amount => self.abort(r, "taker lock underfunded"),
             Some(lo) if lo.confirmations >= self.taker_leg_confs(r) => {
                 r.taker_leg_locked = Some(lo.amount);
@@ -701,7 +727,11 @@ impl Maker {
     async fn on_taker_lock_confirmed(&self, r: &mut MakerRecord) -> Result<Flow> {
         let taker_amount = r.quote.taker_leg_amount();
         let op = self.taker_leg_outpoint(r)?;
-        match self.tk(r)?.htlc_output(&r.taker_leg_htlc, &op).await? {
+        let read = match self.tk(r)?.htlc_output(&r.taker_leg_htlc, &op).await {
+            Ok(read) => read,
+            Err(e) => return self.taker_lock_unread(r, e).await,
+        };
+        match read {
             Some(lo)
                 if lo.amount >= taker_amount && lo.confirmations >= self.taker_leg_confs(r) => {}
             Some(lo) if lo.amount < taker_amount => return self.abort(r, "taker lock underfunded"),

@@ -291,7 +291,8 @@ pub(crate) async fn lock_view(
 /// `swap-chain-btc`'s `quorum::agree_htlc_output` do: the agreed script on both, equal
 /// values, the lower confirmation count. Anything else, a second operator that could not be
 /// read included, is [`SwapError::Transient`] naming both operators: the maker about to
-/// fund and the taker about to reveal wait and read again.
+/// fund and the taker about to reveal wait and read again, until the engine's deadline for
+/// that step (EX: the maker aborts, the taker declines; neither acts on one operator).
 pub(crate) fn agree_lock(
     at: &Outpoint,
     want: &[u8],

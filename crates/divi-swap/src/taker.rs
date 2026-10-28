@@ -557,8 +557,10 @@ impl Taker {
             return Err(bad("refund key is not the quote's maker key"));
         }
         // Trust the chain, not the maker's view, for amount and confirmations.
-        let Some(lo) = mb.htlc_output(&htlc, &op).await? else {
-            return Ok(Flow::Idle);
+        let lo = match mb.htlc_output(&htlc, &op).await {
+            Ok(Some(lo)) => lo,
+            Ok(None) => return Ok(Flow::Idle),
+            Err(e) => return self.maker_lock_unread(r, &htlc, e).await,
         };
         if lo.amount < r.quote.maker_leg_amount() {
             return Err(bad("underfunded"));
@@ -615,6 +617,32 @@ impl Taker {
         r.maker_leg_outpoint = Some(op);
         r.maker_leg_amount = Some(lo.amount);
         self.enter(r, TakerState::MakerLockConfirmed)
+    }
+
+    /// A maker-lock read that failed (`e`; EX: a second source down, hanging or not showing
+    /// the lock yet) is retried as before, but only until the claim deadline
+    /// ([`crate::ClaimDeadline::check`] on the maker leg's MTP), past which we never start a
+    /// first claim anyway: the claim is then declined for good, naming the failure, and our
+    /// own leg refunds at its locktime as before. Nothing is revealed either way.
+    async fn maker_lock_unread(
+        &self,
+        r: &mut TakerRecord,
+        htlc: &HtlcParams,
+        e: SwapError,
+    ) -> Result<Flow> {
+        let chain = r.quote.maker_chain();
+        // An unreadable MTP keeps the retry: not knowing the deadline is not its end.
+        let Ok(mtp) = self.mk(r)?.median_time_past().await else {
+            return Err(e);
+        };
+        let Err(late) = self.claim_deadline(chain).check(chain, mtp, htlc.locktime) else {
+            return Err(e);
+        };
+        let reason = format!("{late}; the maker's lock was not verified before it: {e}");
+        tracing::warn!(swap = %r.id, %reason, "declining to claim the maker leg");
+        r.claim_declined = Some(reason);
+        self.store.put_taker_swap(r)?;
+        Ok(Flow::Idle)
     }
 
     /// `prev_error`: what stopped the first claim on the previous step (a hold for the
