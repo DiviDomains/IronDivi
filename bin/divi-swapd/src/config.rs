@@ -1013,12 +1013,19 @@ impl DaemonConfig {
             }
             let endpoints = z.endpoints()?;
             if let Some(url) = &z.crosscheck_url {
-                swap_chain_zec::crosscheck::check_second_operator(&endpoints, url)
-                    .map_err(|e| anyhow::anyhow!("[zec].crosscheck_url: {e}"))?;
+                divi_swap::operator::check_second_operator(
+                    "lightwalletd endpoint",
+                    &endpoints,
+                    url,
+                )
+                .map_err(|e| anyhow::anyhow!("[zec].crosscheck_url: {e}"))?;
             }
+            // The rule the taker CLI shares as a warning (`divi_swap_cli::sources::check_zec`).
             if profile_mainnet
-                && z.crosscheck_url.is_none()
-                && !swap_chain_zec::crosscheck::has_second_operator(&endpoints)
+                && divi_swap::operator::needs_second_operator(
+                    &endpoints,
+                    z.crosscheck_url.as_deref(),
+                )
             {
                 require_second_source(
                     "zec",

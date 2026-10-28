@@ -67,10 +67,17 @@ struct Cli {
     /// DIVI height to start scanning for the taker's coins when the wallet has no cursor yet.
     #[arg(long, global = true)]
     divi_scan_from: Option<u64>,
+    /// The taker's own DIVI JSON-RPC endpoint (an own node, or an operator other than the
+    /// maker's): every DIVI read and broadcast goes here instead of the network's default
+    /// proxy, which the reference maker's operator runs. Unset or blank = the default proxy,
+    /// as before. Not used by the xmr arm (`--xmr-divi-rpc-url`).
+    #[arg(long, global = true)]
+    divi_rpc_url: Option<String>,
     /// A second, independent DIVI JSON-RPC endpoint. When set, the taker's DIVI reads
     /// (confirmations, HTLC output, find-spend, median time, tip, wallet scan) are made on both
-    /// endpoints and a disagreement is retried, never acted on. Must differ from the default
-    /// endpoint; unset = single endpoint. Not used by the xmr arm.
+    /// endpoints and a disagreement is retried, never acted on. Must differ from the DIVI
+    /// endpoint in use (`--divi-rpc-url`, or the default); unset = single endpoint. Not used by
+    /// the xmr arm.
     #[arg(long, global = true)]
     divi_fallback_rpc_url: Option<String>,
     /// Where the DIVI lock-expiry sweep may start counting a dropped lock's absent blocks:
@@ -587,7 +594,8 @@ fn guard_profile(cli: &Cli) -> Result<()> {
 }
 
 /// Apply `--divi-fallback-rpc-url` to a DIVI backend. Unset or blank leaves it untouched; the
-/// same URL as the default endpoint is refused (one node asked twice is not a second source).
+/// same URL as the primary in use ([`divi_rpc_url`]) is refused (one node asked twice is not a
+/// second source).
 fn with_divi_fallback(
     cli: &Cli,
     network: divi_wallet::address::Network,
@@ -601,20 +609,70 @@ fn with_divi_fallback(
     else {
         return Ok(backend);
     };
-    if url.trim_end_matches('/') == swap_chain_divi::default_rpc(network).trim_end_matches('/') {
+    if url.trim_end_matches('/') == divi_rpc_url(cli, network).trim_end_matches('/') {
+        if own_divi_rpc_url(cli).is_some() {
+            bail!("--divi-fallback-rpc-url must differ from --divi-rpc-url");
+        }
         bail!("--divi-fallback-rpc-url must differ from the default DIVI endpoint");
     }
     Ok(backend.with_fallback_rpc(url))
 }
 
-/// The DIVI JSON-RPC endpoint the taker reads first.
-fn divi_rpc_url(_cli: &Cli, network: divi_wallet::address::Network) -> String {
-    swap_chain_divi::default_rpc(network).to_string()
+/// `--divi-rpc-url` when set and non-blank.
+fn own_divi_rpc_url(cli: &Cli) -> Option<&str> {
+    cli.divi_rpc_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
 }
 
-/// The start warnings about who runs the taker's read sources.
-fn taker_source_warnings(_cli: &Cli) -> Vec<String> {
-    Vec::new()
+/// The DIVI JSON-RPC endpoint the taker reads first: `--divi-rpc-url`, else `network`'s
+/// default proxy.
+fn divi_rpc_url(cli: &Cli, network: divi_wallet::address::Network) -> String {
+    own_divi_rpc_url(cli)
+        .unwrap_or(swap_chain_divi::default_rpc(network))
+        .to_string()
+}
+
+/// The start warnings about who runs the taker's read sources, one per chain at most, on a
+/// mainnet profile only: every DIVI source on the default proxy's operator, and (with
+/// `--counter-chain zec`) one lightwalletd operator with no `--zec-crosscheck-url`
+/// ([`divi_swap_cli::sources`]). The xmr arm's DIVI side is not covered.
+fn taker_source_warnings(cli: &Cli) -> Vec<String> {
+    let mainnet = cli.profile == divi_swap::Profile::Mainnet;
+    let mut out = Vec::new();
+    if cli.counter_chain == Chain::Zec {
+        if let Ok(primaries) = swap_chain_zec::lightwalletd_endpoints(&cli.zec_network) {
+            if let Ok(Some(w)) = divi_swap_cli::sources::check_zec(
+                mainnet,
+                &primaries,
+                cli.zec_crosscheck_url.as_deref(),
+            ) {
+                out.push(w);
+            }
+        }
+    }
+    if cli.counter_chain != Chain::Xmr {
+        let network = if cli.divi_network == "mainnet" {
+            divi_wallet::address::Network::Mainnet
+        } else {
+            divi_wallet::address::Network::Testnet
+        };
+        let mut sources = vec![divi_rpc_url(cli, network)];
+        sources.extend(
+            cli.divi_fallback_rpc_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|u| !u.is_empty())
+                .map(String::from),
+        );
+        out.extend(divi_swap_cli::sources::divi_warning(
+            mainnet,
+            swap_chain_divi::default_rpc(network),
+            &sources,
+        ));
+    }
+    out
 }
 
 fn live_backends(cli: &Cli) -> Result<Backends> {
@@ -657,7 +715,7 @@ fn live_backends(cli: &Cli) -> Result<Backends> {
         }
         if let Some(url) = &cli.zec_crosscheck_url {
             let primaries = swap_chain_zec::lightwalletd_endpoints(&cli.zec_network)?;
-            swap_chain_zec::crosscheck::check_second_operator(&primaries, url)
+            divi_swap_cli::sources::check_zec(false, &primaries, Some(url))
                 .map_err(|e| anyhow::anyhow!("--zec-crosscheck-url: {e}"))?;
         }
     }
@@ -668,6 +726,11 @@ fn live_backends(cli: &Cli) -> Result<Backends> {
         cli.allow_mainnet,
     )?;
     guard_profile(cli)?;
+    // Mainnet ships these as warnings (no ruling yet on the taker start rule); a refusal is
+    // this one line as `bail!("{w}")`.
+    for w in taker_source_warnings(cli) {
+        tracing::warn!("{w}");
+    }
     let divi_network = if cli.divi_network == "mainnet" {
         divi_wallet::address::Network::Mainnet
     } else {
@@ -685,7 +748,7 @@ fn live_backends(cli: &Cli) -> Result<Backends> {
     let (_, reservations) = divi_swap_cli::reservations::open(&cli.db)?;
     let divi = Arc::new(live_divi(
         cli,
-        swap_chain_divi::default_rpc(divi_network),
+        &divi_rpc_url(cli, divi_network),
         dkey,
         divi_network,
         wallet,
@@ -723,7 +786,7 @@ fn live_backends(cli: &Cli) -> Result<Backends> {
     })
 }
 
-/// The live DIVI backend for `key` on `url` (the network's default in production), its
+/// The live DIVI backend for `key` on `url` ([`divi_rpc_url`] in production), its
 /// coin set in `wallet`, with `--divi-fallback-rpc-url` applied, reserving the inputs of its
 /// lock in `reservations` so a second DIVI-leg taker on the same wallet and `--db` never
 /// funds from them.
@@ -1010,7 +1073,7 @@ fn tip_backend(cli: &Cli, chain: Chain) -> Result<Arc<dyn ChainBackend>> {
                 cli,
                 network,
                 DiviBackend::new(
-                    swap_chain_divi::default_rpc(network),
+                    &divi_rpc_url(cli, network),
                     dkey,
                     network,
                     swap_chain_divi::FeePolicy::default(),

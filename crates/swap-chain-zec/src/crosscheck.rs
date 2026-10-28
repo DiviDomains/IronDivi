@@ -230,68 +230,12 @@ pub async fn enforce_before_spend(
     }
 }
 
-/// Second-level labels under which a two-letter country code is a public suffix
-/// (`example.co.uk`). An approximation of the Public Suffix List, enough to tell two
-/// lightwalletd operators apart; it does not know private suffixes.
-const CC_SECOND_LEVEL: [&str; 7] = ["ac", "co", "com", "edu", "gov", "net", "org"];
+pub use divi_swap::operator::{has_second_operator, operator_domain};
 
-/// The operator a lightwalletd URL belongs to: its host's registrable domain (the last two
-/// DNS labels, three under a `co.uk`-style suffix), or the host itself for an IP address or
-/// a one-label name. `None` when `url` is not an `http(s)://host…` URL.
-pub fn operator_domain(url: &str) -> Option<String> {
-    let uri: http::Uri = url.trim().parse().ok()?;
-    if !matches!(uri.scheme_str(), Some("http" | "https")) {
-        return None;
-    }
-    let host = uri
-        .host()?
-        .trim_end_matches('.')
-        .trim_start_matches('[')
-        .trim_end_matches(']')
-        .to_ascii_lowercase();
-    if host.is_empty() {
-        return None;
-    }
-    if host.parse::<std::net::IpAddr>().is_ok() {
-        return Some(host);
-    }
-    let labels: Vec<&str> = host.split('.').collect();
-    let n = labels.len();
-    let keep = if n >= 3 && labels[n - 1].len() == 2 && CC_SECOND_LEVEL.contains(&labels[n - 2]) {
-        3
-    } else {
-        2
-    };
-    Some(labels[n.saturating_sub(keep)..].join("."))
-}
-
-/// `Ok` when `url` is a usable second operator for `primaries`: it has a host, and that host
-/// is not under the registrable domain of **any** primary endpoint (one shared with a
-/// failover endpoint would compare that operator with itself whenever the primary fails
-/// over to it).
+/// `Ok` when `url` is a usable second operator for the lightwalletd endpoints `primaries`
+/// ([`divi_swap::operator::check_second_operator`], the check shared with the taker CLI).
 pub fn check_second_operator(primaries: &[String], url: &str) -> std::result::Result<(), String> {
-    let domain =
-        operator_domain(url).ok_or_else(|| format!("{url:?} is not an https://host:port URL"))?;
-    if let Some(p) = primaries
-        .iter()
-        .find(|p| operator_domain(p).as_deref() == Some(domain.as_str()))
-    {
-        return Err(format!(
-            "{url} is under {domain}, the same operator as the lightwalletd endpoint {p}: \
-             that is not a second operator"
-        ));
-    }
-    Ok(())
-}
-
-/// Whether `endpoints` already span more than one operator (by [`operator_domain`]; an
-/// endpoint that is not a URL counts as no operator).
-pub fn has_second_operator(endpoints: &[String]) -> bool {
-    let mut domains = endpoints.iter().filter_map(|e| operator_domain(e));
-    match domains.next() {
-        Some(first) => domains.any(|d| d != first),
-        None => false,
-    }
+    divi_swap::operator::check_second_operator("lightwalletd endpoint", primaries, url)
 }
 
 #[cfg(test)]
