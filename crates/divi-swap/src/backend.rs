@@ -191,6 +191,11 @@ pub trait ChainBackend: Send + Sync {
     /// indexes (plan §2: missing on the DIVI testnet proxy).
     async fn find_spend(&self, outpoint: &Outpoint, from_height: u64) -> Result<Option<SpendInfo>>;
 
+    /// The swap that read the lock at `at` through [`ChainBackend::htlc_output`] has reached
+    /// a terminal state: drop anything kept for that lock. Only the ZEC backend keeps
+    /// anything (its agreed-lock cache, FB); the default keeps nothing.
+    fn lock_finished(&self, _at: &Outpoint) {}
+
     /// `lock` (a funding transaction this backend built and broadcast) can never confirm:
     /// give back what the wallet booked for it. Returns `true` if anything was released.
     ///

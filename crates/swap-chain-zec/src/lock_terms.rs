@@ -216,6 +216,9 @@ async fn a_failing_second_operator_is_named_with_how_long_it_has_failed() {
     assert!(failing_secs(&later) >= 1, "{later}");
     o.set_down(false);
     assert!(b.htlc_output(&htlc(), &at()).await.unwrap().is_some());
+    // FB: the agreement is kept while the primary is unchanged; one more block on the
+    // primary takes the count past what the second vouched for, so it is asked again.
+    p.mine(1);
     o.set_down(true);
     let again = b.htlc_output(&htlc(), &at()).await.unwrap_err().to_string();
     assert_eq!(
@@ -264,6 +267,251 @@ async fn no_lock_on_the_primary_asks_nothing_of_the_second() {
     p.drop_tx(at().txid.0);
     assert_eq!(b.htlc_output(&htlc(), &at()).await.unwrap(), None);
     assert!(o.take_calls().is_empty());
+}
+
+// ---- FB: the agreed lock kept per height ----------------------------------------------------
+
+/// The lock at [`TIP`]` - 2` on both operators (3 confirmations), read once: agreed.
+async fn agreed_once(p: &Lightwalletd, o: &Lightwalletd) -> ZecBackend {
+    o.put_tx(at().txid.0, lock_tx(ZAT, agreed_spk(&htlc())), TIP - 2);
+    let b = checked(p, o);
+    assert_eq!(b.htlc_output(&htlc(), &at()).await.unwrap(), Some(lo(3)));
+    assert_eq!(b.agreed_locks(), 1, "a mined agreement is kept");
+    p.take_calls();
+    o.take_calls();
+    b
+}
+
+fn lo(confirmations: u32) -> LockedOutput {
+    LockedOutput {
+        amount: Amount::from_sat(ZAT),
+        confirmations,
+    }
+}
+
+fn count(calls: &[&str], method: &str) -> usize {
+    calls.iter().filter(|c| **c == method).count()
+}
+
+/// A mined lock both operators agree on, read N times at the same tip, costs the second
+/// operator one `GetTransaction` (its first read) and nothing after; the primary is still
+/// read in full every time.
+#[tokio::test]
+async fn a_mined_agreed_lock_read_n_times_asks_the_second_operator_once() {
+    const N: usize = 6;
+    let (p, o) = pair(TIP - 2);
+    o.put_tx(at().txid.0, lock_tx(ZAT, agreed_spk(&htlc())), TIP - 2);
+    let b = checked(&p, &o);
+    for n in 0..N {
+        assert_eq!(
+            b.htlc_output(&htlc(), &at()).await.unwrap(),
+            Some(lo(3)),
+            "{n}"
+        );
+    }
+    let (pc, oc) = (p.take_calls(), o.take_calls());
+    assert_eq!(count(&oc, "GetTransaction"), 1, "second operator: {oc:?}");
+    assert_eq!(count(&oc, "GetLatestBlock"), 1, "second operator: {oc:?}");
+    assert_eq!(count(&pc, "GetTransaction"), N, "primary: {pc:?}");
+    assert_eq!(count(&pc, "GetLatestBlock"), N, "primary: {pc:?}");
+    assert_eq!(b.agreed_locks(), 1);
+}
+
+/// The count from a kept agreement is never above what the second operator last vouched
+/// for: when the primary's tip moves past it, the second is asked for its tip (only), and
+/// a second operator behind the primary keeps the count down, as a fresh read would.
+#[tokio::test]
+async fn a_kept_agreement_counts_no_higher_than_the_second_operators_tip() {
+    let (p, o) = pair(TIP - 2);
+    let b = agreed_once(&p, &o).await;
+    // Both one block on: 4, asking the second for its tip only.
+    p.mine(1);
+    o.mine(1);
+    assert_eq!(b.htlc_output(&htlc(), &at()).await.unwrap(), Some(lo(4)));
+    assert_eq!(o.take_calls(), ["GetLatestBlock"]);
+    // The primary alone races ahead (or lies about its tip): still 4.
+    p.mine(5);
+    for _ in 0..3 {
+        assert_eq!(b.htlc_output(&htlc(), &at()).await.unwrap(), Some(lo(4)));
+    }
+    let oc = o.take_calls();
+    assert_eq!(count(&oc, "GetTransaction"), 0, "{oc:?}");
+    // The second catches up: the primary's count again.
+    o.mine(5);
+    assert_eq!(b.htlc_output(&htlc(), &at()).await.unwrap(), Some(lo(9)));
+    assert_eq!(b.agreed_locks(), 1);
+}
+
+/// Manager (a): same txid and vout, the primary's block at the lock's height replaced. The
+/// kept agreement is not used: the second operator is asked again and its answer re-checked
+/// (here it no longer has the transaction: refused).
+#[tokio::test]
+async fn a_reorg_at_the_locks_height_asks_again_and_refuses_another_answer() {
+    let (p, o) = pair(TIP - 2);
+    let b = agreed_once(&p, &o).await;
+    assert_eq!(b.htlc_output(&htlc(), &at()).await.unwrap(), Some(lo(3)));
+    assert!(o.take_calls().is_empty(), "a kept agreement asks nothing");
+    // The top three blocks (the lock's among them) replaced on the primary; the lock is
+    // still shown at the same height, in a block with another hash.
+    p.reorg(3);
+    o.drop_tx(at().txid.0);
+    let m = refused(&p, &o, "reorg").await;
+    assert!(m.contains("has no such transaction"), "{m}");
+    // `refused` builds its own backend; this one must re-ask too.
+    let got = b.htlc_output(&htlc(), &at()).await;
+    assert!(matches!(got, Err(SwapError::Transient(_))), "{got:?}");
+    assert_eq!(count(&o.take_calls(), "GetTransaction"), 2);
+    assert_eq!(b.agreed_locks(), 0, "the reorged agreement is dropped");
+    // Re-mined on the second operator's chain too: asked again, agreed again.
+    o.reorg(3);
+    o.put_tx(at().txid.0, lock_tx(ZAT, agreed_spk(&htlc())), TIP - 2);
+    assert_eq!(b.htlc_output(&htlc(), &at()).await.unwrap(), Some(lo(3)));
+    assert_eq!(count(&o.take_calls(), "GetTransaction"), 1);
+}
+
+/// After a kept agreement the primary changes (the lock now at another height) and the
+/// second operator shows something else: `Transient`, not the kept agreement.
+#[tokio::test]
+async fn a_later_disagreement_after_a_kept_agreement_is_refused() {
+    let (p, o) = pair(TIP - 2);
+    let b = agreed_once(&p, &o).await;
+    p.put_tx(at().txid.0, lock_tx(ZAT, agreed_spk(&htlc())), TIP - 1);
+    o.put_tx(at().txid.0, lock_tx(ZAT, other_spk()), TIP - 1);
+    let got = b.htlc_output(&htlc(), &at()).await;
+    let Err(SwapError::Transient(m)) = &got else {
+        panic!("a kept agreement outlived the primary's change: {got:?}");
+    };
+    assert!(m.contains(o.endpoint()), "{m}");
+    assert_eq!(b.agreed_locks(), 0);
+    // Gone from the primary: `None`, and the entry stays dropped.
+    p.drop_tx(at().txid.0);
+    assert_eq!(b.htlc_output(&htlc(), &at()).await.unwrap(), None);
+}
+
+/// A mempool lock is never kept: every read asks the second operator.
+#[tokio::test]
+async fn a_mempool_lock_is_asked_every_time() {
+    let (p, o) = pair(0);
+    o.put_tx(at().txid.0, lock_tx(ZAT, agreed_spk(&htlc())), 0);
+    let b = checked(&p, &o);
+    for _ in 0..3 {
+        assert_eq!(b.htlc_output(&htlc(), &at()).await.unwrap(), Some(lo(0)));
+    }
+    assert_eq!(count(&o.take_calls(), "GetTransaction"), 3);
+    assert_eq!(b.agreed_locks(), 0);
+}
+
+/// Nothing but an agreement on one block is kept: a refusal (another script), a second
+/// operator down or hanging, and an agreement at two different heights or in two different
+/// blocks are all asked again at the next read.
+#[tokio::test]
+async fn refusals_and_unmatched_blocks_are_never_kept() {
+    // Refused: another script at the second operator.
+    let (p, o) = pair(TIP - 2);
+    o.put_tx(at().txid.0, lock_tx(ZAT, other_spk()), TIP - 2);
+    let b = checked(&p, &o);
+    for _ in 0..2 {
+        assert!(b.htlc_output(&htlc(), &at()).await.is_err());
+    }
+    assert_eq!(count(&o.take_calls(), "GetTransaction"), 2);
+    assert_eq!(b.agreed_locks(), 0);
+    // Down, then hanging: refused each time, then the honest answer is asked for.
+    o.put_tx(at().txid.0, lock_tx(ZAT, agreed_spk(&htlc())), TIP - 2);
+    let b = checked(&p, &o).with_second_budget(std::time::Duration::from_millis(200));
+    for (down, hang) in [(true, false), (false, true)] {
+        o.set_down(down);
+        o.set_hang(hang);
+        assert!(b.htlc_output(&htlc(), &at()).await.is_err());
+        assert_eq!(b.agreed_locks(), 0, "{down}/{hang}");
+    }
+    o.set_hang(false);
+    o.take_calls();
+    assert_eq!(b.htlc_output(&htlc(), &at()).await.unwrap(), Some(lo(3)));
+    assert_eq!(count(&o.take_calls(), "GetTransaction"), 1);
+    // Agreed at two different heights (the lower count), or at one height in two different
+    // blocks: an agreement, never kept.
+    for tamper in [false, true] {
+        let (p, o) = pair(TIP - 2);
+        let o_height = if tamper { TIP - 2 } else { TIP - 4 };
+        if tamper {
+            o.tamper(TIP - 2);
+        }
+        o.put_tx(at().txid.0, lock_tx(ZAT, agreed_spk(&htlc())), o_height);
+        let b = checked(&p, &o);
+        for _ in 0..2 {
+            assert_eq!(b.htlc_output(&htlc(), &at()).await.unwrap(), Some(lo(3)));
+        }
+        assert_eq!(count(&o.take_calls(), "GetTransaction"), 2, "{tamper}");
+        assert_eq!(b.agreed_locks(), 0, "{tamper}");
+    }
+}
+
+/// Bounded: at most `LOCK_CACHE_CAP` agreements per backend, the oldest dropped first.
+#[tokio::test]
+async fn kept_agreements_are_capped() {
+    let (p, o) = (Lightwalletd::start(TIP), Lightwalletd::start(TIP));
+    let b = checked(&p, &o);
+    let n = crate::LOCK_CACHE_CAP + 3;
+    let mut outpoints = Vec::new();
+    for i in 0..n {
+        let raw = raw_tx(&[(FILLER + i as u64, other_spk()), (ZAT, agreed_spk(&htlc()))]);
+        p.put_honest(raw.clone(), TIP - 2);
+        let txid = o.put_honest(raw, TIP - 2);
+        let op = Outpoint {
+            txid: Txid(txid),
+            vout: 1,
+        };
+        assert_eq!(
+            b.htlc_output(&htlc(), &op).await.unwrap(),
+            Some(lo(3)),
+            "{i}"
+        );
+        outpoints.push(op);
+    }
+    assert_eq!(b.agreed_locks(), crate::LOCK_CACHE_CAP);
+    o.take_calls();
+    // The newest is kept, the oldest was dropped.
+    b.htlc_output(&htlc(), &outpoints[n - 1]).await.unwrap();
+    assert!(o.take_calls().is_empty());
+    b.htlc_output(&htlc(), &outpoints[0]).await.unwrap();
+    assert_eq!(count(&o.take_calls(), "GetTransaction"), 1);
+}
+
+/// Manager (b), at the backend: `lock_finished` (the engine's call when the swap reaching a
+/// terminal state) drops the lock's entry; the next read would ask afresh.
+#[tokio::test]
+async fn a_finished_lock_is_dropped() {
+    let (p, o) = pair(TIP - 2);
+    let b = agreed_once(&p, &o).await;
+    b.lock_finished(&other_at());
+    assert_eq!(b.agreed_locks(), 1, "another lock's end drops nothing");
+    b.lock_finished(&at());
+    assert_eq!(b.agreed_locks(), 0);
+    b.htlc_output(&htlc(), &at()).await.unwrap();
+    assert_eq!(count(&o.take_calls(), "GetTransaction"), 1);
+}
+
+/// Off and in EM's primary-only view: no cache, request for request as before, however
+/// often the lock is read.
+#[tokio::test]
+async fn off_and_primary_only_keep_nothing_request_for_request() {
+    let (p, o) = pair(TIP - 2);
+    o.put_tx(at().txid.0, lock_tx(ZAT, agreed_spk(&htlc())), TIP - 2);
+    let off = p.backend().with_crosscheck(None).unwrap();
+    let full = checked(&p, &o);
+    let view = full.primary_only().expect("a primary-only view");
+    for b in [&off as &dyn ChainBackend, view.as_ref()] {
+        p.take_calls();
+        for _ in 0..3 {
+            assert_eq!(b.htlc_output(&htlc(), &at()).await.unwrap(), Some(lo(3)));
+        }
+        assert_eq!(
+            p.take_calls(),
+            ["GetTransaction", "GetLatestBlock"].repeat(3)
+        );
+        assert!(o.take_calls().is_empty());
+    }
+    assert_eq!(off.agreed_locks(), 0);
 }
 
 // ---- The engine at both acting points -----------------------------------------------------
@@ -329,6 +577,9 @@ mod engine {
         /// The primary shows the lock buried [`LIE_DEPTH`] blocks deep, whatever the mock
         /// chain holds (EX).
         primary_lies: Arc<AtomicBool>,
+        /// The outpoint the stubs know each mock lock by ([`CrossRead::serve`]), so the
+        /// engine's `lock_finished` reaches the backend's entry (FB).
+        served: Arc<Mutex<std::collections::HashMap<Outpoint, Outpoint>>>,
     }
 
     /// How deep a lying primary shows a lock.
@@ -350,6 +601,7 @@ mod engine {
                 second: Arc::new(second),
                 shows: Arc::new(Mutex::new(Second::Honest)),
                 primary_lies: Arc::new(AtomicBool::new(false)),
+                served: Arc::default(),
             }
         }
 
@@ -387,6 +639,11 @@ mod engine {
             };
             let (zat, spk) = (lo.amount.to_sat(), agreed_spk(htlc));
             let txid = self.primary.put_honest(outputs(zat, spk.clone()), height);
+            let stub_at = Outpoint {
+                txid: Txid(txid),
+                vout: at.vout,
+            };
+            self.served.lock().unwrap().insert(*at, stub_at);
             match *self.shows.lock().unwrap() {
                 Second::Honest | Second::Down | Second::Hang => {
                     self.second.put_tx(txid, outputs(zat, spk), height)
@@ -400,10 +657,7 @@ mod engine {
                         .put_tx(txid, tx_of(5, at.txid.0, &v).serialize(), height)
                 }
             }
-            Outpoint {
-                txid: Txid(txid),
-                vout: at.vout,
-            }
+            stub_at
         }
     }
 
@@ -477,6 +731,11 @@ mod engine {
             from_height: u64,
         ) -> Result<Option<SpendInfo>> {
             self.mock.find_spend(outpoint, from_height).await
+        }
+        fn lock_finished(&self, at: &Outpoint) {
+            if let Some(stub_at) = self.served.lock().unwrap().get(at) {
+                self.zec.lock_finished(stub_at);
+            }
         }
         async fn release_dead_lock(&self, lock: &SignedTx) -> Result<bool> {
             self.mock.release_dead_lock(lock).await
@@ -913,6 +1172,42 @@ mod engine {
                     assert!(side.second.take_calls().is_empty(), "{dir:?}/{gone:?}");
                 }
             }
+        }
+    }
+
+    // ---- FB: the agreed lock kept per height, at the engine --------------------------------
+
+    /// Manager (b): with honest operators the reading side keeps the agreed lock while the
+    /// swap confirms it, and drops it once its swap reaches a terminal state (maker: ZEC as
+    /// the taker leg; taker: ZEC as the maker leg), so a long-running daemon does not grow
+    /// the cache.
+    #[tokio::test]
+    async fn the_kept_agreement_is_dropped_when_the_swap_ends() {
+        for dir in [Direction::TakerPaysBtc, Direction::TakerPaysDivi] {
+            let w = World::new(dir);
+            let reader = match dir {
+                Direction::TakerPaysBtc => &w.mzec,
+                _ => &w.tzec,
+            };
+            let (tid, mid) = w.through_taker_lock().await;
+            let mut kept = false;
+            for _ in 0..80 {
+                w.round(&tid, &mid).await;
+                kept |= reader.zec.agreed_locks() > 0;
+                if w.maker_state(&mid).0 == SwapState::Done
+                    && w.taker_record(&tid).state == TakerState::Done
+                {
+                    break;
+                }
+            }
+            assert_eq!(w.maker_state(&mid).0, SwapState::Done, "{dir:?}");
+            assert_eq!(w.taker_record(&tid).state, TakerState::Done, "{dir:?}");
+            assert!(kept, "{dir:?}: no agreement was ever kept");
+            assert_eq!(
+                reader.zec.agreed_locks(),
+                0,
+                "{dir:?}: kept past the swap's end"
+            );
         }
     }
 }

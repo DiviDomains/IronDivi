@@ -560,6 +560,12 @@ impl Maker {
         }
         r.state = next;
         self.store.put_maker_swap(r)?;
+        if next.is_terminal() {
+            // FB: the taker's lock is never read again; a backend may drop what it kept.
+            if let (Some(op), Ok(tk)) = (r.taker_leg_outpoint, self.tk(r)) {
+                tk.lock_finished(&op);
+            }
+        }
         if *self.halt_after.lock() == Some(next) {
             return Ok(Flow::Halted);
         }

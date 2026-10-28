@@ -445,6 +445,12 @@ impl Taker {
     fn enter(&self, r: &mut TakerRecord, next: TakerState) -> Result<Flow> {
         r.state = next;
         self.store.put_taker_swap(r)?;
+        if next.is_terminal() {
+            // FB: the maker's lock is never read again; a backend may drop what it kept.
+            if let (Some(op), Ok(mk)) = (r.maker_leg_outpoint, self.mk(r)) {
+                mk.lock_finished(&op);
+            }
+        }
         if *self.halt_after.lock() == Some(next) {
             return Ok(Flow::Halted);
         }
