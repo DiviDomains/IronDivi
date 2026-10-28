@@ -3954,4 +3954,86 @@ mod tests {
         .is_empty());
         assert!(zec(&mainnet_cli("btc", &[])).is_empty());
     }
+
+    /// The start error of `cli`: `live_backends` without a `--divi-key` stops at the key, so
+    /// any earlier refusal is the one returned, and nothing touches the network.
+    fn start_error(cli: &Cli) -> String {
+        match live_backends(cli) {
+            Ok(_) => panic!("built a live backend without a --divi-key"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    /// The DIVI one-operator shapes of a mainnet taker: the default proxy alone, the proxy
+    /// plus another host of its operator, the proxy named as `--divi-rpc-url`.
+    const ONE_DIVI_OPERATOR: [&[&str]; 3] = [
+        &[],
+        &[
+            "--divi-fallback-rpc-url",
+            "https://other.services.divi.domains/rpc/",
+        ],
+        &["--divi-rpc-url", swap_chain_divi::MAINNET_RPC],
+    ];
+
+    /// T32-20 (Manager ruling 2, 2026-10-28): on `--profile mainnet`, a taker whose every
+    /// DIVI source is one operator's is refused at start, before any network action, naming
+    /// the missing second source and the `--allow-single-source` opt-in.
+    #[test]
+    fn mainnet_taker_on_one_divi_operator_is_refused_without_the_opt_in() {
+        for extra in ONE_DIVI_OPERATOR {
+            let e = start_error(&mainnet_cli("btc", extra));
+            assert!(
+                e.contains("second, independent DIVI source")
+                    && e.contains("--divi-fallback-rpc-url")
+                    && e.contains("--allow-single-source"),
+                "{extra:?}: {e}"
+            );
+            assert!(!e.contains("--divi-key"), "{extra:?}: {e}");
+        }
+    }
+
+    /// With `--allow-single-source` the same taker starts (it gets as far as its key) and is
+    /// warned at every start, in the daemon's `allow_single_source` wording.
+    #[test]
+    fn mainnet_taker_on_one_divi_operator_starts_with_the_opt_in_and_is_warned() {
+        for extra in ONE_DIVI_OPERATOR {
+            let mut argv = extra.to_vec();
+            argv.push("--allow-single-source");
+            let c = mainnet_cli("btc", &argv);
+            let e = start_error(&c);
+            assert!(e.contains("--divi-key"), "{argv:?}: {e}");
+            let w = divi_warnings(&c);
+            assert_eq!(w.len(), 1, "{argv:?}: {w:?}");
+            assert!(
+                w[0].contains(swap_chain_divi::MAINNET_RPC)
+                    && w[0].contains("--allow-single-source")
+                    && w[0].contains("one lying or broken endpoint is trusted"),
+                "{argv:?}: {}",
+                w[0]
+            );
+        }
+    }
+
+    /// Controls: testnet is neither refused nor warned, with or without the opt-in; a
+    /// mainnet taker with a second operator is neither refused nor warned, and the opt-in
+    /// on such a taker adds no warning.
+    #[test]
+    fn the_divi_single_source_rule_leaves_testnet_and_two_operators_alone() {
+        for extra in [&[][..], &["--allow-single-source"][..]] {
+            let c = cli(extra);
+            assert!(start_error(&c).contains("--divi-key"), "{extra:?}");
+            assert!(divi_warnings(&c).is_empty(), "{extra:?}");
+        }
+        for two in [
+            &["--divi-rpc-url", "https://divi.own-node.example:51473"][..],
+            &["--divi-fallback-rpc-url", "http://127.0.0.1:51473"][..],
+        ] {
+            for opt_in in [&[][..], &["--allow-single-source"][..]] {
+                let argv = [two, opt_in].concat();
+                let c = mainnet_cli("btc", &argv);
+                assert!(start_error(&c).contains("--divi-key"), "{argv:?}");
+                assert!(divi_warnings(&c).is_empty(), "{argv:?}");
+            }
+        }
+    }
 }
