@@ -310,7 +310,9 @@ C1 = Node("bridge-L", DIVID, 0, ["listen=1"])
 I1 = Node("irondivid-L", IRONDIVID, 1, ["listen=0", lambda: f"connect=127.0.0.2:{C1.p2p}"])
 C2 = Node("bridge-R", DIVID, 2, ["listen=1"])
 I2 = Node("irondivid-R", IRONDIVID, 3, ["listen=0", lambda: f"connect=127.0.0.2:{C2.p2p}"])
-C3 = Node("divid-L", DIVID, 4, ["listen=0", lambda: f"connect=127.0.0.2:{C1.p2p}"])
+# checkblockindex=0 as on a live node: regtest turns it on, and its check aborts divid after some
+# invalidateblock / reconsiderblock sequences (BlockCheckingHelpers.cpp:231)
+C3 = Node("divid-L", DIVID, 4, ["listen=0", "checkblockindex=0", lambda: f"connect=127.0.0.2:{C1.p2p}"])
 C4 = Node("divid-R", DIVID, 5, ["listen=0", lambda: f"connect=127.0.0.2:{C2.p2p}"])
 ALL = (C1, I1, C2, I2, C3, C4)
 BRIDGES = (C1, C2)
@@ -600,6 +602,71 @@ for t, what in ((t_h, "side L's spend"), (t_hc, "its child")):
     back = {n.name: t in n.rpc("getrawmempool") for n in (C3, I1)}
     row(f"H after reconsiderblock: {what} is back in the mempool (L)", back[C3.name], back[I1.name],
         back[C3.name] == back[I1.name])
+need(one_tip(), "the nodes did not come back to one tip")
+
+# --- I. equal-work tips: invalidateblock / reconsiderblock pick the one received first (PoW, before E)
+
+# Divi Core orders tips of equal work by when their blocks were received (CBlockIndexWorkComparator,
+# BlockIndexWork.h:18-20); blocks loaded at start count as received before any received since (nSequenceId 0)
+
+
+def has_block(n, block_hash):
+    return n.call("getblock", block_hash)[0] == "ok"
+
+
+def tie_rows(label, first, other):
+    """On side L's pair, which holds `first` received before `other` (equal work): invalidateblock of
+    `first` moves to `other`, reconsiderblock of it moves back"""
+    pair(f"{label}: getbestblockhash", C3, I1, "getbestblockhash")
+    pair(f"{label}: invalidateblock <the tip received first>", C3, I1, "invalidateblock", first)
+    wait_for(lambda: tip(C3) != first and tip(I1) != first, 60)
+    pair(f"{label}: after invalidateblock: getbestblockhash", C3, I1, "getbestblockhash")
+    pair(f"{label}: reconsiderblock <the tip received first>", C3, I1, "reconsiderblock", first)
+    wait_for(lambda: tip(C3) == first and tip(I1) == first, 20)
+    time.sleep(2)
+    pair(f"{label}: after reconsiderblock: getbestblockhash", C3, I1, "getbestblockhash")
+    row(f"{label}: after reconsiderblock: on the tip received first (L)", tip(C3) == first, tip(I1) == first,
+        (tip(C3) == first) == (tip(I1) == first))
+
+
+fork_i = tip(C3)
+split()
+mine(C1, 1)
+l1 = tip(C1)
+need(wait_for(lambda: tip(C3) == l1 and tip(I1) == l1, 60), "side L did not agree")
+mine(I2, 1)
+r1 = tip(I2)
+need(wait_for(lambda: tip(C2) == r1 and tip(C4) == r1, 60), "side R did not agree")
+join()
+need(wait_for(lambda: has_block(C3, r1) and has_block(I1, r1), 60), "side L's pair did not receive side R's block")
+time.sleep(3)
+tie_rows("I equal tips", l1, r1)
+# The block below both: invalidateblock leaves neither, reconsiderblock brings both back at once
+pair("I invalidateblock <the block below both>", C3, I1, "invalidateblock", fork_i)
+wait_for(lambda: tip(C3) != l1 and tip(I1) != l1, 60)
+pair("I after invalidateblock <the block below both>: getbestblockhash", C3, I1, "getbestblockhash")
+pair("I reconsiderblock <the block below both>", C3, I1, "reconsiderblock", fork_i)
+wait_for(lambda: tip(C3) == l1 and tip(I1) == l1, 20)
+time.sleep(2)
+pair("I after reconsiderblock <the block below both>: getbestblockhash", C3, I1, "getbestblockhash")
+# After a restart: side L's pair loads its tip from disk; side R's equal-work block arrives after
+split()
+mine(C1, 1)
+x1 = tip(C1)
+need(wait_for(lambda: tip(C3) == x1 and tip(I1) == x1, 60), "side L did not agree")
+for n in (C3, I1):
+    n.stop()
+for n in (C3, I1):
+    need(n.start(), f"{n.name} did not start again: {n.why}")
+need(wait_for(connected_within_sides, 60), "side L did not connect again")
+mine(I2, 1)
+y1 = tip(I2)
+need(wait_for(lambda: tip(C2) == y1 and tip(C4) == y1, 60), "side R did not agree")
+join()
+need(wait_for(lambda: has_block(C3, y1) and has_block(I1, y1), 60), "side L's pair did not receive side R's block")
+time.sleep(3)
+tie_rows("I equal tips, after a restart", x1, y1)
+mine(C1, 1)
 need(one_tip(), "the nodes did not come back to one tip")
 
 # --- E. proof of stake: depth 1 and 6 past the last PoW block ---------------------------
