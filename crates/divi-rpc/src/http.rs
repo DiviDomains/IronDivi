@@ -156,10 +156,139 @@ pub fn parse_json(text: &str) -> Result<Value, serde_json::Error> {
 /// Parse JSON keeping every member of each object in order, as json_spirit's
 /// Object (a vector of pairs) holds them, equal keys included
 pub fn parse_json_members(text: &str) -> Result<Json, serde_json::Error> {
+    let numbers = numbers_as_json_spirit(text).ok_or_else(|| {
+        <serde_json::Error as serde::de::Error>::custom("integer out of int64 and uint64 range")
+    })?;
+    let text = numbers.as_deref().unwrap_or(text);
     let mut de = serde_json::Deserializer::from_str(text);
     let value = Json::deserialize(&mut de)?;
     de.end()?;
     Ok(value)
+}
+
+/// The text with each number outside strings read as json_spirit reads it
+/// (json_spirit_reader_template.h:498-501: Spirit's strict real, else an
+/// int64, else a uint64) and written as serde_json reads the same value:
+/// - a number with a dot or an exponent is a real, "1." and ".5" too;
+/// - any other is an integer: "+5" and "05" are 5, "-0" is 0, and one that
+///   fits neither int64 nor uint64 makes the whole request a parse error
+///   (`None`), where serde_json would read it as a real.
+///
+/// `Some(None)` leaves the text as it is. A token that is no number, or a real
+/// beyond f64 (json_spirit's infinity, which serde_json has no value for), is
+/// left for serde_json to refuse.
+pub fn numbers_as_json_spirit(text: &str) -> Option<Option<String>> {
+    let b = text.as_bytes();
+    let mut out = String::new();
+    let mut copied = 0;
+    let mut in_string = false;
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if in_string {
+            match c {
+                b'\\' => i += 2,
+                b'"' => {
+                    in_string = false;
+                    i += 1;
+                }
+                _ => i += 1,
+            }
+            continue;
+        }
+        if c == b'"' {
+            in_string = true;
+            i += 1;
+            continue;
+        }
+        if !matches!(c, b'0'..=b'9' | b'+' | b'-' | b'.') {
+            i += 1;
+            continue;
+        }
+        let Some((end, value)) = json_spirit_number(b, i) else {
+            i += 1;
+            continue;
+        };
+        let token = &text[i..end];
+        let written = match value {
+            Number::Int(v) => v.to_string(),
+            Number::UInt(v) => v.to_string(),
+            Number::Real(v) if v.is_finite() => format!("{v:e}"),
+            Number::Real(_) => token.to_string(),
+            Number::OutOfRange => return None,
+        };
+        if written != token {
+            out.push_str(&text[copied..i]);
+            out.push_str(&written);
+            copied = end;
+        }
+        i = end;
+    }
+    if copied == 0 {
+        return Some(None);
+    }
+    out.push_str(&text[copied..]);
+    Some(Some(out))
+}
+
+enum Number {
+    Int(i64),
+    UInt(u64),
+    Real(f64),
+    OutOfRange,
+}
+
+/// The number json_spirit reads at `start`, and where it ends: an optional
+/// sign, digits with an optional dot (digits on at least one side of it), an
+/// optional exponent. `None` when there is no number there.
+fn json_spirit_number(b: &[u8], start: usize) -> Option<(usize, Number)> {
+    let digits = |from: usize| {
+        (from..b.len())
+            .find(|&k| !b[k].is_ascii_digit())
+            .unwrap_or(b.len())
+    };
+    let mut i = start;
+    if matches!(b[i], b'+' | b'-') {
+        i += 1;
+    }
+    let int_end = digits(i);
+    let int_digits = int_end - i;
+    i = int_end;
+    let mut real = false;
+    if b.get(i) == Some(&b'.') {
+        let frac_end = digits(i + 1);
+        if int_digits + (frac_end - i - 1) > 0 {
+            real = true;
+            i = frac_end;
+        }
+    }
+    if int_digits == 0 && !real {
+        return None;
+    }
+    if matches!(b.get(i), Some(b'e' | b'E')) {
+        let mut e = i + 1;
+        if matches!(b.get(e), Some(b'+' | b'-')) {
+            e += 1;
+        }
+        let exp_end = digits(e);
+        if exp_end > e {
+            real = true;
+            i = exp_end;
+        }
+    }
+    let token = std::str::from_utf8(&b[start..i]).ok()?;
+    let unsigned = token.strip_prefix('+').unwrap_or(token);
+    let value = if real {
+        Number::Real(unsigned.parse::<f64>().ok()?)
+    } else if let Ok(v) = unsigned.parse::<i64>() {
+        Number::Int(v)
+    } else {
+        match unsigned.parse::<u64>() {
+            Ok(v) if !token.starts_with('-') => Number::UInt(v),
+            _ => Number::OutOfRange,
+        }
+    };
+    Some((i, value))
 }
 
 /// A JSON value whose objects keep all their members, equal keys included
@@ -286,6 +415,7 @@ impl<'de> Visitor<'de> for JsonVisitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn json_keeps_the_first_of_two_equal_keys() {
@@ -298,6 +428,40 @@ mod tests {
         assert_eq!(parse_json(" [] ").unwrap(), serde_json::json!([]));
         assert!(parse_json("{bad").is_err());
         assert!(parse_json(r#"{"a":1}x"#).is_err());
+    }
+
+    #[test]
+    fn numbers_are_read_as_json_spirit_reads_them() {
+        let one = |n: &str| parse_json(&format!("[{n}]")).map(|v| v[0].clone());
+        // json_spirit has no value for an integer outside int64 and uint64:
+        // the request is a parse error, not a real
+        assert!(one("18446744073709551616").is_err());
+        assert!(one("-9223372036854775809").is_err());
+        assert!(one("100000000000000000000000").is_err());
+        assert_eq!(one("18446744073709551615").unwrap(), json!(u64::MAX));
+        assert_eq!(one("-9223372036854775808").unwrap(), json!(i64::MIN));
+        // A sign of '+' and leading zeros are an integer; "-0" is 0
+        assert_eq!(one("+5").unwrap(), json!(5));
+        assert_eq!(one("05").unwrap(), json!(5));
+        assert_eq!(one("-0").unwrap(), json!(0));
+        assert!(one("-0").unwrap().is_i64());
+        // A dot or an exponent is a real, with digits on one side of the dot
+        assert_eq!(one("1.").unwrap(), json!(1.0));
+        assert_eq!(one(".5").unwrap(), json!(0.5));
+        assert_eq!(one("-.5").unwrap(), json!(-0.5));
+        assert_eq!(one("1e5").unwrap(), json!(100000.0));
+        assert_eq!(one("1E+2").unwrap(), json!(100.0));
+        assert_eq!(one("0.1").unwrap(), json!(0.1));
+        assert_eq!(one("123456.789e-3").unwrap(), json!(123.456789));
+        // Not numbers
+        for bad in ["-", "+", ".", "1e", "5x", "0x10", "--1"] {
+            assert!(one(bad).is_err(), "{bad}");
+        }
+        // Text in strings is left alone, escaped quotes included
+        assert_eq!(
+            parse_json(r#"["+5 \" 05", -0, {"k": "1."}]"#).unwrap(),
+            json!(["+5 \" 05", 0, {"k": "1."}])
+        );
     }
 
     #[test]
