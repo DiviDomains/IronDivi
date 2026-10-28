@@ -415,3 +415,112 @@ fn a_send_checked_before_a_reorg_spends_its_coin_does_not_stay() {
     );
     assert_eq!(t.node.mempool().size(), 0);
 }
+
+impl TestNode {
+    /// The blockchain RPC with the reorg hook irondivid gives it
+    /// (bin/irondivid/src/main.rs mempool_reorg_hook, without a wallet)
+    fn chain_rpc(&self) -> divi_rpc::blockchain::BlockchainRpc {
+        let rpc = divi_rpc::blockchain::BlockchainRpc::new(self.node.chain().clone());
+        let chain = self.node.chain().clone();
+        let mempool = self.node.mempool().clone();
+        rpc.set_reorg_hook(std::sync::Arc::new(move |disconnected| {
+            update_mempool_after_reorg(&chain, &mempool, disconnected)
+        }));
+        rpc
+    }
+
+    fn block_rpc(&self, rpc: &divi_rpc::blockchain::BlockchainRpc, method: &str, hash: Hash256) {
+        let params = divi_rpc::Params::Array(vec![serde_json::json!(hash.to_string())]);
+        rpc.invalidate_block_family(method, &params).unwrap();
+    }
+
+    /// Store `n` blocks on `fork` as a side chain (`tag` sets them apart);
+    /// returns their hashes, lowest first
+    fn side_branch(&self, fork: Hash256, n: usize, tag: u8) -> Vec<Hash256> {
+        let tip = self.tip();
+        let mut hashes = Vec::new();
+        let mut parent = fork;
+        for _ in 0..n {
+            let block = self.block_on(parent, tag, &[]);
+            parent = self.node.chain().accept_block(block).unwrap().hash;
+            hashes.push(parent);
+        }
+        assert_eq!(self.tip(), tip, "the side branch stays a side chain");
+        hashes
+    }
+}
+
+/// reconsiderblock that moves the node back to a branch with more work
+/// returns the transactions of the blocks it disconnects to the mempool, a
+/// send and the send spending its change: Divi Core's reconsiderblock
+/// activates the best chain (rpcblockchain.cpp:676-678), which disconnects
+/// each block through disconnectTip and offers its transactions to the mempool
+/// (MostWorkChainTransitionMediator.cpp:33-38, ChainTipManager.cpp:175-182).
+#[test]
+fn reconsiderblock_that_switches_branches_returns_their_transactions() {
+    let t = TestNode::new();
+    let rpc = t.chain_rpc();
+    let coin = t.mature_coins(1)[0];
+    let fork = t.tip();
+
+    // Branch A, two blocks: the send, then the send of its change
+    let send = t.spend(coin, 1250 * COIN);
+    let child = t.spend(OutPoint::new(send.txid(), 0), 1250 * COIN - FEE);
+    t.mine(std::slice::from_ref(&send));
+    t.mine(std::slice::from_ref(&child));
+    let tip_a = t.tip();
+
+    // Branch B, three blocks, takes over
+    let b = t.side_branch(fork, 2, 1);
+    let b3 = t.block_on(b[1], 1, &[]);
+    let orphaned = t
+        .node
+        .chain()
+        .accept_block(b3)
+        .unwrap()
+        .orphaned_transactions;
+    update_mempool_after_reorg(t.node.chain(), t.node.mempool(), orphaned);
+    let tip_b = t.tip();
+    assert_ne!(tip_b, tip_a, "branch B is the active chain");
+
+    // invalidateblock on B's first block: the node goes back to branch A,
+    // which confirms both sends again
+    t.block_rpc(&rpc, "invalidateblock", b[0]);
+    assert_eq!(t.tip(), tip_a, "the node moved to branch A");
+    assert!(!t.in_mempool(&send) && !t.in_mempool(&child));
+
+    // reconsiderblock: B has more work again, so the node disconnects A
+    t.block_rpc(&rpc, "reconsiderblock", b[0]);
+    assert_eq!(t.tip(), tip_b, "the node moved back to branch B");
+    assert!(t.in_mempool(&send), "the send is back in the mempool");
+    assert!(t.in_mempool(&child), "the send of its change is back too");
+}
+
+/// invalidateblock whose tip the node then leaves for another branch returns
+/// the transactions of every block it disconnects to the mempool, not only
+/// those of the invalidated block and the blocks above it: Divi Core's
+/// invalidateblock disconnects down to the block (BlockInvalidationHelpers.cpp
+/// :129-143), then activates the best chain (rpcblockchain.cpp:638-640), which
+/// disconnects the rest down to the fork the same way.
+#[test]
+fn invalidateblock_that_switches_branches_returns_every_disconnected_transaction() {
+    let t = TestNode::new();
+    let rpc = t.chain_rpc();
+    let coin = t.mature_coins(1)[0];
+    let fork = t.tip();
+
+    // Branch B, active, three blocks: the send in the lowest
+    let send = t.spend(coin, 1250 * COIN);
+    t.mine(std::slice::from_ref(&send));
+    t.mine(&[]);
+    t.mine(&[]);
+    let tip_b = t.tip();
+    // Branch A, three blocks of the same work, stays on the side
+    let a = t.side_branch(fork, 3, 1);
+
+    // invalidateblock on B's tip: B's two lower blocks have less work than
+    // A, so the node disconnects them too and moves to A
+    t.block_rpc(&rpc, "invalidateblock", tip_b);
+    assert_eq!(t.tip(), a[2], "the node moved to branch A");
+    assert!(t.in_mempool(&send), "the send of B's lowest block is back");
+}

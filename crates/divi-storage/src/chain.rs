@@ -3143,7 +3143,9 @@ impl Chain {
     /// transactions of the disconnected blocks, coinbases and coinstakes left
     /// out, from the lowest block up, for the mempool to take back as Divi
     /// Core's disconnectTip does (ChainTipManager.cpp disconnectTip:
-    /// "Resurrect mempool transactions from the disconnected block").
+    /// "Resurrect mempool transactions from the disconnected block"). Blocks
+    /// the activation disconnects below the block, down to a lower fork, are
+    /// lower, so their transactions come first.
     fn invalidate_block_unnotified(
         &self,
         hash: &Hash256,
@@ -3211,10 +3213,13 @@ impl Chain {
         if let Some(tip) = self.tip() {
             self.note_invalid_chain(&target, &tip);
         }
-        if activate {
-            self.activate_best_valid_chain()?;
-        }
-        Ok(disconnected.into_iter().rev().flatten().collect())
+        let mut returned = if activate {
+            self.activate_best_valid_chain()?
+        } else {
+            Vec::new()
+        };
+        returned.extend(disconnected.into_iter().rev().flatten());
+        Ok(returned)
     }
 
     /// Record that a node now runs on this database. Returns whether the run
@@ -3282,12 +3287,18 @@ impl Chain {
     }
 
     /// Clear the invalid flag on a block, its ancestors and its descendants
-    /// (`reconsiderblock`), then activate the best valid chain.
-    pub fn reconsider_block(&self, hash: &Hash256) -> Result<(), StorageError> {
+    /// (`reconsiderblock`), then activate the best valid chain. Returns the
+    /// transactions of the blocks that leaves, as `invalidate_block` does:
+    /// Divi Core's reconsiderblock activates the best chain through
+    /// disconnectTip, which offers them to the mempool (rpcblockchain.cpp:676-678).
+    pub fn reconsider_block(&self, hash: &Hash256) -> Result<Vec<Transaction>, StorageError> {
         abort_on_write_failure(self.notifying_tip(|| self.reconsider_block_unnotified(hash)))
     }
 
-    fn reconsider_block_unnotified(&self, hash: &Hash256) -> Result<(), StorageError> {
+    fn reconsider_block_unnotified(
+        &self,
+        hash: &Hash256,
+    ) -> Result<Vec<Transaction>, StorageError> {
         let _chain_guard = self.chain_lock.lock();
         self.clear_failed_marks(hash)?;
         self.activate_best_valid_chain()
@@ -3392,8 +3403,9 @@ impl Chain {
 
     /// Move the active chain to the most-work valid chain, trying candidates
     /// in descending work order and skipping any that turn out invalid.
-    /// Caller must hold `chain_lock`.
-    fn activate_best_valid_chain(&self) -> Result<(), StorageError> {
+    /// Returns the transactions of the blocks it disconnects, as
+    /// `reorganize_chain` gives them. Caller must hold `chain_lock`.
+    fn activate_best_valid_chain(&self) -> Result<Vec<Transaction>, StorageError> {
         let mut candidates: Vec<BlockIndex> = self
             .db
             .iter_all_block_indexes()?
@@ -3404,7 +3416,7 @@ impl Chain {
         for cand in candidates {
             let tip = match self.tip.read().clone() {
                 Some(t) => t,
-                None => return Ok(()),
+                None => return Ok(Vec::new()),
             };
             if Self::compare_chain_work(&cand.chain_work, &tip.chain_work)
                 != std::cmp::Ordering::Greater
@@ -3413,7 +3425,7 @@ impl Chain {
             }
             *self.best_known_block.write() = Some(cand);
             match self.activate_best_chain_inner() {
-                Ok(Some(_)) => return Ok(()),
+                Ok(Some((_, orphaned))) => return Ok(orphaned),
                 Ok(None) => continue,
                 Err(e) if Self::is_consensus_invalid(&e) => continue,
                 Err(e) => return Err(e),
@@ -3421,7 +3433,7 @@ impl Chain {
         }
         let tip = self.tip.read().clone();
         *self.best_known_block.write() = tip;
-        Ok(())
+        Ok(Vec::new())
     }
 
     /// Disconnect a block from the chain (reverse UTXO changes)
