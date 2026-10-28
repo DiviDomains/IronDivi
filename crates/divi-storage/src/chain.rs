@@ -8998,6 +8998,89 @@ mod tests {
         assert_eq!(chain.height(), 1);
     }
 
+    /// Divi Core orders tips of equal work by the order their blocks were
+    /// received (CBlockIndexWorkComparator, BlockIndexWork.h:18-20), so
+    /// reconsiderblock of a tip seen before an equal-work sibling moves back
+    /// to it.
+    #[test]
+    fn reconsiderblock_returns_to_the_equal_work_tip_seen_first() {
+        let (chain, _dir) = create_test_chain();
+        let (genesis_hash, genesis_time) = get_genesis_info(&chain);
+        let a1 = create_child_block_with_pubkey(genesis_hash, genesis_time, [0x0a; 20]);
+        let hash_a1 = chain.accept_block(a1).unwrap().hash;
+        let b1 = create_child_block_with_pubkey(genesis_hash, genesis_time + 1, [0x1a; 20]);
+        let hash_b1 = chain.accept_block(b1).unwrap().hash;
+        assert_eq!(chain.tip().unwrap().hash, hash_a1, "the first seen stays");
+
+        chain.invalidate_block(&hash_a1).unwrap();
+        assert_eq!(chain.tip().unwrap().hash, hash_b1);
+        chain.reconsider_block(&hash_a1).unwrap();
+        assert_eq!(chain.tip().unwrap().hash, hash_a1, "as divid: seen first");
+    }
+
+    /// Two equal-work tips above a block that is invalidated and reconsidered:
+    /// Divi Core takes the one received first, whatever the hashes. A is
+    /// received first and is the later of the two in the block index's key
+    /// order.
+    #[test]
+    fn reconsiderblock_below_equal_work_tips_takes_the_one_seen_first() {
+        let (chain, _dir) = create_test_chain();
+        let (genesis_hash, genesis_time) = get_genesis_info(&chain);
+        let p1 = create_child_block_with_pubkey(genesis_hash, genesis_time, [0x0a; 20]);
+        let hash_p1 = chain.accept_block(p1.clone()).unwrap().hash;
+        let x2 = create_child_block_with_pubkey(hash_p1, p1.header.time, [0x0b; 20]);
+        let y2 = create_child_block_with_pubkey(hash_p1, p1.header.time + 1, [0x1b; 20]);
+        let key = |hash: &Hash256| crate::block_index::block_index_key(hash);
+        let (a2, b2) = if key(&divi_crypto::compute_block_hash(&x2.header))
+            > key(&divi_crypto::compute_block_hash(&y2.header))
+        {
+            (x2, y2)
+        } else {
+            (y2, x2)
+        };
+        let hash_a2 = chain.accept_block(a2).unwrap().hash;
+        let hash_b2 = chain.accept_block(b2).unwrap().hash;
+        assert!(key(&hash_a2) > key(&hash_b2));
+        assert_eq!(chain.tip().unwrap().hash, hash_a2);
+
+        chain.invalidate_block(&hash_p1).unwrap();
+        assert_eq!(chain.tip().unwrap().hash, genesis_hash);
+        chain.reconsider_block(&hash_p1).unwrap();
+        assert_eq!(chain.tip().unwrap().hash, hash_a2, "as divid: seen first");
+    }
+
+    /// Divi Core does not keep the receive order: blocks loaded at start all
+    /// count as received before any block received since (nSequenceId 0,
+    /// chain.h:151; ids from 1, BlockInvalidationHelpers.cpp:23). So after a
+    /// restart, reconsiderblock of the loaded tip moves back to it from an
+    /// equal-work sibling received after the restart.
+    #[test]
+    fn after_a_restart_reconsiderblock_returns_to_the_loaded_equal_work_tip() {
+        let dir = tempdir().unwrap();
+        let params = ChainParams::for_network(NetworkType::Regtest, ChainMode::Divi);
+        let (hash_a1, genesis_hash, genesis_time) = {
+            let db = Arc::new(ChainDatabase::open(dir.path()).unwrap());
+            let chain = Chain::new(db, params.clone()).unwrap();
+            let (genesis_hash, genesis_time) = get_genesis_info(&chain);
+            let a1 = create_child_block_with_pubkey(genesis_hash, genesis_time, [0x0a; 20]);
+            (
+                chain.accept_block(a1).unwrap().hash,
+                genesis_hash,
+                genesis_time,
+            )
+        };
+        let db = Arc::new(ChainDatabase::open(dir.path()).unwrap());
+        let chain = Chain::new(db, params).unwrap();
+        let b1 = create_child_block_with_pubkey(genesis_hash, genesis_time + 1, [0x1a; 20]);
+        let hash_b1 = chain.accept_block(b1).unwrap().hash;
+        assert_eq!(chain.tip().unwrap().hash, hash_a1);
+
+        chain.invalidate_block(&hash_a1).unwrap();
+        assert_eq!(chain.tip().unwrap().hash, hash_b1);
+        chain.reconsider_block(&hash_a1).unwrap();
+        assert_eq!(chain.tip().unwrap().hash, hash_a1, "as divid: loaded first");
+    }
+
     /// repair_height_index restores entries a pre-fix build corrupted and
     /// removes entries above the tip.
     #[test]
