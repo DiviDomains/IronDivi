@@ -306,12 +306,12 @@ sys.excepthook = setup_failed
 
 # --- the six nodes: side L (bridge C1; C3 and I1 behind it), side R (C2; C4, I2) -------
 
-C1 = Node("bridge-L", DIVID, 0, ["listen=1"])
+# checkblockindex=0 on the divid that run invalidateblock / reconsiderblock, as on a live node: regtest turns
+# it on, and its check aborts divid after some such sequences (BlockCheckingHelpers.cpp:231)
+C1 = Node("bridge-L", DIVID, 0, ["listen=1", "checkblockindex=0"])
 I1 = Node("irondivid-L", IRONDIVID, 1, ["listen=0", lambda: f"connect=127.0.0.2:{C1.p2p}"])
 C2 = Node("bridge-R", DIVID, 2, ["listen=1"])
 I2 = Node("irondivid-R", IRONDIVID, 3, ["listen=0", lambda: f"connect=127.0.0.2:{C2.p2p}"])
-# checkblockindex=0 as on a live node: regtest turns it on, and its check aborts divid after some
-# invalidateblock / reconsiderblock sequences (BlockCheckingHelpers.cpp:231)
 C3 = Node("divid-L", DIVID, 4, ["listen=0", "checkblockindex=0", lambda: f"connect=127.0.0.2:{C1.p2p}"])
 C4 = Node("divid-R", DIVID, 5, ["listen=0", lambda: f"connect=127.0.0.2:{C2.p2p}"])
 ALL = (C1, I1, C2, I2, C3, C4)
@@ -614,6 +614,17 @@ def has_block(n, block_hash):
     return n.call("getblock", block_hash)[0] == "ok"
 
 
+def hand_to_pair_l(own, other):
+    """Bridge L keeps its own tip and does not announce side R's equal-work block; so bridge L moves to that
+    block for a moment (invalidateblock of its own tip), which announces it to side L's pair, and back"""
+    need(wait_for(lambda: has_block(C1, other), 60), "bridge L did not receive side R's block")
+    C1.rpc("invalidateblock", own)
+    need(wait_for(lambda: has_block(C3, other) and has_block(I1, other), 60),
+         "side L's pair did not receive side R's block")
+    C1.rpc("reconsiderblock", own)
+    need(wait_for(lambda: tip(C1) == own, 60), "bridge L did not come back to its tip")
+
+
 def tie_rows(label, first, other):
     """On side L's pair, which holds `first` received before `other` (equal work): invalidateblock of
     `first` moves to `other`, reconsiderblock of it moves back"""
@@ -638,7 +649,7 @@ mine(I2, 1)
 r1 = tip(I2)
 need(wait_for(lambda: tip(C2) == r1 and tip(C4) == r1, 60), "side R did not agree")
 join()
-need(wait_for(lambda: has_block(C3, r1) and has_block(I1, r1), 60), "side L's pair did not receive side R's block")
+hand_to_pair_l(l1, r1)
 time.sleep(3)
 tie_rows("I equal tips", l1, r1)
 # The block below both: invalidateblock leaves neither, reconsiderblock brings both back at once
@@ -663,7 +674,7 @@ mine(I2, 1)
 y1 = tip(I2)
 need(wait_for(lambda: tip(C2) == y1 and tip(C4) == y1, 60), "side R did not agree")
 join()
-need(wait_for(lambda: has_block(C3, y1) and has_block(I1, y1), 60), "side L's pair did not receive side R's block")
+hand_to_pair_l(x1, y1)
 time.sleep(3)
 tie_rows("I equal tips, after a restart", x1, y1)
 mine(C1, 1)
