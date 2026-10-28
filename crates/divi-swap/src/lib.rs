@@ -23,6 +23,7 @@ mod hold;
 pub mod htlc;
 pub mod maker;
 pub mod mock;
+pub mod operator;
 pub mod reservation;
 pub mod secrets;
 pub mod state;

@@ -1013,12 +1013,19 @@ impl DaemonConfig {
             }
             let endpoints = z.endpoints()?;
             if let Some(url) = &z.crosscheck_url {
-                swap_chain_zec::crosscheck::check_second_operator(&endpoints, url)
-                    .map_err(|e| anyhow::anyhow!("[zec].crosscheck_url: {e}"))?;
+                divi_swap::operator::check_second_operator(
+                    "lightwalletd endpoint",
+                    &endpoints,
+                    url,
+                )
+                .map_err(|e| anyhow::anyhow!("[zec].crosscheck_url: {e}"))?;
             }
+            // The rule the taker CLI shares as a warning (`divi_swap_cli::sources::check_zec`).
             if profile_mainnet
-                && z.crosscheck_url.is_none()
-                && !swap_chain_zec::crosscheck::has_second_operator(&endpoints)
+                && divi_swap::operator::needs_second_operator(
+                    &endpoints,
+                    z.crosscheck_url.as_deref(),
+                )
             {
                 require_second_source(
                     "zec",
@@ -2062,6 +2069,107 @@ divi_fund_txids = ["ab"]
         }
         // Testnet stays as today: one operator is fine.
         DaemonConfig::parse(&format!("{GOOD}\n[zec]\nkey = \"credential:maker-btc\"\n")).unwrap();
+    }
+
+    /// The ZEC second-operator rule, case for case, in the daemon (a refusal unless waived) and
+    /// in the taker CLI (a warning, `divi_swap_cli::sources::check_zec`): one table over both.
+    #[test]
+    fn zec_second_operator_rule_is_the_same_in_the_daemon_and_the_taker_cli() {
+        const OTHER: &str = "https://lwd.other-operator.net:9067";
+        const ROCKS: &str = "https://zec.rocks:443";
+        // (mainnet, lightwalletd_url, fallback_lightwalletd_url, crosscheck_url, verdict)
+        type Case<'a> = (
+            bool,
+            Option<&'a str>,
+            Option<&'a str>,
+            Option<&'a str>,
+            &'a str,
+        );
+        let cases: [Case; 13] = [
+            (true, None, None, None, "single"),
+            (
+                true,
+                Some(ROCKS),
+                Some("https://na.zec.rocks:443"),
+                None,
+                "single",
+            ),
+            (true, Some(ROCKS), None, None, "single"),
+            (true, Some("http://127.0.0.1:9067"), None, None, "single"),
+            (
+                true,
+                Some("https://lwd.example.co.uk:9067"),
+                Some("https://b.example.co.uk:9067"),
+                None,
+                "single",
+            ),
+            (true, Some(ROCKS), Some(OTHER), None, "ok"),
+            (
+                true,
+                Some("https://lwd.a.co.uk:9067"),
+                Some("https://lwd.b.co.uk:9067"),
+                None,
+                "ok",
+            ),
+            (true, None, None, Some(OTHER), "ok"),
+            (true, None, None, Some("https://zec.rocks:9067"), "refused"),
+            (true, None, None, Some("not a url"), "refused"),
+            (false, None, None, None, "ok"),
+            (false, None, None, Some(OTHER), "ok"),
+            (
+                false,
+                Some("https://na.zec.rocks:443"),
+                None,
+                Some("https://eu.zec.rocks:443"),
+                "refused",
+            ),
+        ];
+        for (mainnet, primary, fallback, crosscheck, want) in cases {
+            let case = format!("{mainnet} {primary:?} {fallback:?} {crosscheck:?}");
+            let mut extra = String::new();
+            for (key, v) in [
+                ("lightwalletd_url", primary),
+                ("fallback_lightwalletd_url", fallback),
+                ("crosscheck_url", crosscheck),
+            ] {
+                if let Some(v) = v {
+                    extra.push_str(&format!("{key} = \"{v}\"\n"));
+                }
+            }
+            let text = if mainnet {
+                mainnet_zec(&extra)
+            } else {
+                format!("{GOOD}\n[zec]\nkey = \"credential:maker-btc\"\n{extra}")
+            };
+            let daemon = match DaemonConfig::parse(&text) {
+                Ok(_) => "ok",
+                Err(e) if e.to_string().contains("allow_single_source") => "single",
+                Err(e) if e.to_string().contains("[zec].crosscheck_url") => "refused",
+                Err(e) => panic!("{case}: {e}"),
+            };
+            let primaries = match primary {
+                Some(p) => std::iter::once(p)
+                    .chain(fallback)
+                    .map(String::from)
+                    .collect(),
+                None => swap_chain_zec::lightwalletd_endpoints(if mainnet {
+                    "mainnet"
+                } else {
+                    "testnet"
+                })
+                .unwrap(),
+            };
+            let cli = match divi_swap_cli::sources::check_zec(mainnet, &primaries, crosscheck) {
+                Ok(None) => "ok",
+                Ok(Some(w)) => {
+                    assert!(w.contains(&primaries[0]), "{case}: {w}");
+                    "single"
+                }
+                Err(_) => "refused",
+            };
+            assert_eq!(daemon, want, "daemon: {case}");
+            assert_eq!(cli, want, "taker cli: {case}");
+        }
     }
 
     #[test]

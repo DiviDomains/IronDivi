@@ -2889,6 +2889,7 @@ dependencies = [
  "divi-primitives",
  "divi-wallet",
  "hex",
+ "http",
  "parking_lot",
  "proptest",
  "rand 0.8.8",
