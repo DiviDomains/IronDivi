@@ -7,7 +7,7 @@
 
 //! sendrawtransaction refusals as Divi Core 3.0.0's divid gives them
 //! (scripts/reject-replies compares them on live nodes): output values the
-//! fee total cannot add up.
+//! fee total cannot add up, and a coinbase sent as a loose transaction.
 
 use divi_crypto::compute_merkle_root;
 use divi_primitives::{
@@ -153,4 +153,49 @@ fn output_values_the_fee_total_cannot_add_are_refused_as_core() {
     // (here the submit stand-in takes it)
     let big = spend(coin, &[1 << 62]);
     assert_eq!(n.send(&big), Ok(json!(big.txid().to_string())));
+}
+
+/// A coinbase as a loose transaction has no inputs to look up: divid's
+/// HaveInputs and GetValueIn pass over a coinbase (coins.cpp:341-344, :353-355),
+/// so sendrawtransaction adds up its outputs and hands it to the mempool, which
+/// refuses it with 16 "coinbase" (rpcrawtransaction.cpp:877-891,
+/// MempoolConsensus.cpp:279-281). It is not "Unknown inputs being spent".
+#[test]
+fn a_loose_coinbase_reaches_the_mempool_as_in_core() {
+    let n = node();
+    n.mine();
+    // The stand-in refuses a coinbase as irondivid's mempool does
+    n.server.wallet().set_tx_submit(Arc::new(|tx: Transaction| {
+        if tx.is_coinbase() {
+            Err(divi_rpc::TxSubmitError::Rejected {
+                code: 16,
+                reason: "coinbase".into(),
+            })
+        } else {
+            Ok(tx.txid())
+        }
+    }));
+    let coinbase = |values: &[i64]| Transaction {
+        version: 1,
+        vin: vec![TxIn::coinbase(Script::from_bytes(vec![
+            0x03, 0x01, 0x02, 0x03,
+        ]))],
+        vout: values
+            .iter()
+            .map(|v| TxOut::new(Amount::from_sat(*v), payee()))
+            .collect(),
+        lock_time: 0,
+    };
+    assert_eq!(
+        n.send(&coinbase(&[COIN])),
+        Err((-26, "16: coinbase".to_string()))
+    );
+    // Its outputs are added up first, as for any transaction with known inputs
+    assert_eq!(
+        n.send(&coinbase(&[-1])),
+        Err((
+            -1,
+            "CTransaction::GetValueOut() : value out of range : less than 0".to_string()
+        ))
+    );
 }
