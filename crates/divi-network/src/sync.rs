@@ -4576,19 +4576,23 @@ mod tests {
         );
     }
 
-    /// A peer whose version named no start height is told of a new tip only
-    /// above height 100, the estimate Divi Core uses for it (init.cpp:117,
-    /// net.cpp:1495)
+    /// A peer whose version named no start height is not told of a new tip
+    /// up to height 100, the estimate Divi Core uses for it (init.cpp:117,
+    /// net.cpp:1495); a peer that started at 0 is told of each. Block 101 is a
+    /// stake block on regtest: the side above 100 is a network-time row
     #[tokio::test]
-    async fn the_new_tip_is_announced_to_a_peer_with_no_start_height_only_above_100() {
+    async fn the_new_tip_is_not_announced_to_a_peer_with_no_start_height_up_to_100() {
         let (sync, mut rxs, _dir) = regtest_sync_with_start_heights(&[(1, 1), (2, -1), (3, 0)]);
-        for height in 1..=101u32 {
+        for height in 1..=100u32 {
             let block = fresh_next_block(&sync.chain);
             let hash = compute_block_hash(&block.header);
             sync.handle_block(1, block).await;
             assert_eq!(sync.chain.tip().unwrap().hash, hash, "height {height}");
-            let told = if height > 100 { vec![hash] } else { vec![] };
-            assert_eq!(invs_to(&mut rxs, 2), told, "no start height, tip {height}");
+            assert_eq!(
+                invs_to(&mut rxs, 2),
+                vec![],
+                "no start height, tip {height}"
+            );
             assert_eq!(
                 invs_to(&mut rxs, 3),
                 vec![hash],

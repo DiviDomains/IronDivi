@@ -58,10 +58,12 @@ checks the script itself: every row passes.
 7. **The peers a new tip is announced to** (NotifyPeersOfNewChainTip net.cpp:1491-1497, called with 100 from
    init.cpp:117): five script peers on a fresh divid and irondivid name start heights 5000, 2001, 2000 and 0 in their
    version, and the fifth none (its version ends after the user agent). A third node (a divid) mines blocks 1 to 101
-   on the system clock and a script peer offers them, block 1 and then blocks 2 to 101; each watching peer's count of
-   block invs. A peer is told of a tip above its start height less 2000, a peer that named none of a tip above 100:
-   for block 1 none, none, one, one, none; for blocks 2 to 101 none, 100, 100, 100 and one (block 101). A node's
-   own mined block goes to every peer (CoinMinter.cpp:119), so it is not used here.
+   on the system clock and a script peer sends them unasked, block 1 and then blocks 2 to 101; each watching peer's
+   count of block invs. A peer is told of a tip above its start height less 2000, a peer that named none of a tip
+   above 100: for block 1 none, none, one, one, none; for blocks 2 to 101 none, 100, 100, 100 and one (block 101).
+   A node's own mined block goes to every peer (CoinMinter.cpp:119), so it is not used here. The blocks are sent
+   unasked because irondivid, syncing headers from the peer that started at 5000, does not ask another peer for a
+   block it announces, where divid does.
 
 What `net-time` covers is not repeated: the offset from peers' version messages, its cap and warning, and the
 2-hour limit on the network-adjusted clock.

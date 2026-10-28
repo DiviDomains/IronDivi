@@ -243,6 +243,10 @@ class Peer:
         self.offers = {inv_hash: (raw[:80 + (32 if version > 3 else 0)], raw)}
         self.s.sendall(frame("inv", b"\x01" + struct.pack("<I", 2) + inv_hash))
 
+    def push(self, block_hex):
+        """Send the block unasked"""
+        self.s.sendall(frame("block", bytes.fromhex(block_hex)))
+
     def reject_reasons(self):
         out = []
         with self.lock:
@@ -541,12 +545,15 @@ try:
     watchers = {n.name: [Peer(n, h) for h in starts] for n in (core, iron)}
 
     def invs_for(node, part):
-        """Offer `part` of the blocks from a script peer; the node's height, and the block invs each watcher was sent"""
+        """Send `part` of the blocks from a script peer; the node's height, and the block invs each watcher was sent"""
         before = [len(w.block_invs()) for w in watchers[node.name]]
         peer = Peer(node)
         try:
+            # Sent unasked: irondivid, syncing headers from the peer that started at 5000, does not ask the
+            # offering peer for a block it announces
             for h, b in part:
-                if offer(node, h, b, peer) != ("taken",):
+                peer.push(h)
+                if not wait_for(lambda: node.call("getblock", b)[0] == "ok", 8):
                     raise RuntimeError(f"{node.name} did not take {b}")
         finally:
             peer.close()
