@@ -18,8 +18,13 @@
 //! The lower tip (not the primary's) is used so that the few seconds by which one operator
 //! leads the other cannot cause a false `Disagree`; a lag of more than [`MAX_LAG`] blocks is
 //! `Unavailable` (the second operator is behind), not a comparison.
+//!
+//! It also checks the lock itself (ET): every `htlc_output` (the maker about to fund against
+//! the taker's lock, the taker about to claim the maker's) reads the output from the second
+//! operator too ([`lock_view`]) and needs the agreed script and the same value there
+//! ([`agree_lock`]), failing closed.
 
-use divi_swap::{Outpoint, SwapError};
+use divi_swap::{LockedOutput, Outpoint, SwapError};
 
 use crate::grpc::LightwalletdClient;
 
@@ -32,6 +37,11 @@ pub const CROSSCHECK_DEPTH: u64 = 6;
 /// The largest tip difference (blocks) still compared. Beyond it the lagging side cannot
 /// vouch for the other's recent blocks: [`CrossCheckOutcome::Unavailable`].
 pub const MAX_LAG: u64 = 6;
+
+/// The longest one lock read from the second operator ([`lock_view`]) may take before it
+/// counts as failed (EX): a second operator that accepts a call and never answers must not
+/// hold a maker or taker step for longer than this.
+pub const LOCK_READ_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Result of one cross-check.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -230,6 +240,90 @@ pub async fn enforce_before_spend(
     }
 }
 
+/// A lock output as the second operator shows it ([`lock_view`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LockView {
+    script_pubkey: Vec<u8>,
+    value: u64,
+    confirmations: u32,
+}
+
+/// `other`'s view of output `at`, read as the primary's is: `GetTransaction` (an answer that
+/// is not `at`'s transaction is refused, [`crate::not_requested`]), then (when mined)
+/// `GetLatestBlock` for its confirmations. An error completes "second operator …".
+pub(crate) async fn lock_view(
+    other: &LightwalletdClient,
+    at: &Outpoint,
+) -> std::result::Result<LockView, String> {
+    let raw = other
+        .get_transaction(&at.txid.0)
+        .await
+        .map_err(|e| format!("could not be read (GetTransaction: {e:?})"))?
+        .ok_or_else(|| "has no such transaction".to_string())?;
+    let parsed = crate::tx::ParsedTx::parse(&raw.data)
+        .map_err(|e| format!("answered a transaction that does not parse ({e})"))?;
+    if let Some(why) = crate::not_requested(&parsed, &at.txid.0) {
+        return Err(why);
+    }
+    let out = parsed
+        .vout
+        .get(at.vout as usize)
+        .ok_or_else(|| format!("has no output {} in that transaction", at.vout))?;
+    let confirmations = if raw.height == 0 || raw.height == u64::MAX {
+        0
+    } else {
+        let tip = other
+            .latest_block()
+            .await
+            .map_err(|e| format!("could not be read (GetLatestBlock: {e:?})"))?
+            .height;
+        (tip.saturating_sub(raw.height) + 1) as u32
+    };
+    Ok(LockView {
+        script_pubkey: out.script_pubkey.clone(),
+        value: out.value,
+        confirmations,
+    })
+}
+
+/// Agree the primary's lock read (`mine`, already matched against the agreed script `want`)
+/// with the second operator's (`theirs`), as `swap-chain-ltc`'s `agree_lock` (EL) and
+/// `swap-chain-btc`'s `quorum::agree_htlc_output` do: the agreed script on both, equal
+/// values, the lower confirmation count. Anything else, a second operator that could not be
+/// read included, is [`SwapError::Transient`] naming both operators: the maker about to
+/// fund and the taker about to reveal wait and read again, until the engine's deadline for
+/// that step (EX: the maker aborts, the taker declines; neither acts on one operator).
+pub(crate) fn agree_lock(
+    at: &Outpoint,
+    want: &[u8],
+    mine: LockedOutput,
+    primary: &LightwalletdClient,
+    theirs: std::result::Result<LockView, String>,
+    other: &LightwalletdClient,
+) -> Result<LockedOutput> {
+    let zat = mine.amount.to_sat();
+    let refuse = |what: String| {
+        SwapError::Transient(format!(
+            "zec lock cross-check FAILED for {at}: primary lightwalletd {} shows the agreed \
+             HTLC script with {zat} zat, second operator {} {what}; not acting on the lock",
+            primary_label(primary),
+            other_label(other)
+        ))
+    };
+    match theirs {
+        Err(what) => Err(refuse(what)),
+        Ok(v) if v.script_pubkey != want => Err(refuse(format!(
+            "shows scriptPubKey {} there",
+            hex::encode(&v.script_pubkey)
+        ))),
+        Ok(v) if v.value != zat => Err(refuse(format!("shows {} zat there", v.value))),
+        Ok(v) => Ok(LockedOutput {
+            amount: mine.amount,
+            confirmations: mine.confirmations.min(v.confirmations),
+        }),
+    }
+}
+
 /// Second-level labels under which a two-letter country code is a public suffix
 /// (`example.co.uk`). An approximation of the Public Suffix List, enough to tell two
 /// lightwalletd operators apart; it does not know private suffixes.
@@ -323,6 +417,57 @@ mod tests {
             txid: Txid([0x42; 32]),
             vout: 0,
         }
+    }
+
+    const ZAT: u64 = 250_000;
+
+    fn view(script_pubkey: &[u8], value: u64) -> std::result::Result<LockView, String> {
+        Ok(LockView {
+            script_pubkey: script_pubkey.to_vec(),
+            value,
+            confirmations: 3,
+        })
+    }
+
+    fn mine() -> LockedOutput {
+        LockedOutput {
+            amount: divi_swap::Amount::from_sat(ZAT),
+            confirmations: 5,
+        }
+    }
+
+    /// `agree_lock` alone (since EW a well-formed answer with another script or value at the
+    /// outpoint is another transaction, refused before this comparison): another script at
+    /// the second operator is refused, naming it and both operators.
+    #[test]
+    fn agree_lock_names_the_script() {
+        let (p, o) = (client("http://p.example:1"), client("http://o.example:2"));
+        let (want, other) = ([0xa9u8, 0x14, 0x01], [0x76u8, 0xa9, 0x02]);
+        let got = agree_lock(&at(), &want, mine(), &p, view(&other, ZAT), &o);
+        let Err(SwapError::Transient(m)) = &got else {
+            panic!("not refused: {got:?}");
+        };
+        for needle in [hex::encode(other), "p.example".into(), "o.example".into()] {
+            assert!(m.contains(&needle), "{m} lacks {needle}");
+        }
+    }
+
+    /// `agree_lock` alone: any other value is refused, naming it; the same value agrees at
+    /// the lower confirmation count.
+    #[test]
+    fn agree_lock_names_the_value() {
+        let (p, o) = (client("http://p.example:1"), client("http://o.example:2"));
+        let want = [0xa9u8, 0x14, 0x01];
+        for value in [ZAT - 1, ZAT / 2, ZAT + 1] {
+            let got = agree_lock(&at(), &want, mine(), &p, view(&want, value), &o);
+            let Err(SwapError::Transient(m)) = &got else {
+                panic!("{value}: not refused: {got:?}");
+            };
+            assert!(m.contains(&value.to_string()), "{m}");
+        }
+        let ok = agree_lock(&at(), &want, mine(), &p, view(&want, ZAT), &o).unwrap();
+        assert_eq!(ok.confirmations, 3);
+        assert_eq!(ok.amount, mine().amount);
     }
 
     #[tokio::test]

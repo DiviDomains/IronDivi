@@ -19,11 +19,16 @@ pub mod grpc;
 pub mod tx;
 
 #[cfg(test)]
+mod lock_terms;
+#[cfg(test)]
 mod lwd_stub;
+#[cfg(test)]
+mod txid_binding;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use secp256k1::{All, Secp256k1, SecretKey};
@@ -160,6 +165,12 @@ pub struct ZecBackend {
     network: String,
     /// The second lightwalletd operator ([`ZecBackend::with_crosscheck`]); `None` is off.
     second: Option<LightwalletdClient>,
+    /// The longest one lock read from the second operator may take
+    /// ([`crosscheck::LOCK_READ_BUDGET`]; tests shorten it).
+    second_budget: Duration,
+    /// Since when the second operator has refused each lock it has not agreed yet (EX), for
+    /// the refusal's "failing for". In memory only; an agreement clears the entry.
+    lock_failing: Mutex<HashMap<Outpoint, Instant>>,
     /// Shared with this backend's [`ChainBackend::primary_only`] views.
     hold: Arc<HoldState>,
 }
@@ -206,6 +217,8 @@ impl ZecBackend {
             reservations: None,
             network: "testnet".to_string(),
             second: None,
+            second_budget: crosscheck::LOCK_READ_BUDGET,
+            lock_failing: Mutex::default(),
             hold: Arc::default(),
         })
     }
@@ -220,8 +233,9 @@ impl ZecBackend {
     }
 
     /// Opt-in (`[zec].crosscheck_url`): a lightwalletd run by a second operator, asked at
-    /// startup ([`ZecBackend::crosscheck`]) and before every claim and refund is built (see
-    /// [`crosscheck`]). `None` (the default) is off: no extra request. The URL is checked by
+    /// startup ([`ZecBackend::crosscheck`]), before every claim and refund is built, and for
+    /// the lock output at every `htlc_output` (see [`crosscheck`]). `None` (the default) is
+    /// off: no extra request. The URL is checked by
     /// the caller against the primaries ([`crosscheck::check_second_operator`]).
     pub fn with_crosscheck(mut self, url: Option<String>) -> Result<Self> {
         self.second = match url {
@@ -233,6 +247,14 @@ impl ZecBackend {
             ..HoldState::default()
         });
         Ok(self)
+    }
+
+    /// Bound each lock read from the second operator by `budget` instead of
+    /// [`crosscheck::LOCK_READ_BUDGET`] (tests).
+    #[cfg(test)]
+    pub(crate) fn with_second_budget(mut self, budget: Duration) -> Self {
+        self.second_budget = budget;
+        self
     }
 
     /// The startup cross-check: `Disagree` is an error, `Unavailable` warns; `Ok` when off.
@@ -258,6 +280,80 @@ impl ZecBackend {
             None => Ok(()),
             Some(h) => Err(h.error),
         }
+    }
+
+    /// A lock refusal by [`crosscheck::agree_lock`], completed with how long the second
+    /// operator has been failing this lock (since its first refusal in this process; EX).
+    /// The engine retries it until its own deadline for the step.
+    fn failing_for(&self, at: &Outpoint, agreed: Result<LockedOutput>) -> Result<LockedOutput> {
+        let mut failing = self.lock_failing.lock().expect("lock_failing map");
+        match agreed {
+            Ok(lo) => {
+                failing.remove(at);
+                Ok(lo)
+            }
+            Err(SwapError::Transient(m)) => {
+                let since = *failing.entry(*at).or_insert_with(Instant::now);
+                Err(SwapError::Transient(format!(
+                    "{m}; the second operator has been failing this lock for {} s",
+                    since.elapsed().as_secs()
+                )))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The primary's lock read: the output at `at` if its scriptPubKey is `htlc`'s, with its
+    /// value and confirmations ([`ChainBackend::htlc_output`] adds the second operator).
+    async fn htlc_output_primary(
+        &self,
+        htlc: &HtlcParams,
+        at: &Outpoint,
+    ) -> Result<Option<LockedOutput>> {
+        let Some(raw) = self
+            .client
+            .get_transaction(&at.txid.0)
+            .await
+            .map_err(SwapError::from)?
+        else {
+            return Ok(None);
+        };
+        let parsed = tx::ParsedTx::parse(&raw.data)?;
+        self.requested(&parsed, &at.txid.0)?;
+        let Some(out) = parsed.vout.get(at.vout as usize) else {
+            return Ok(None);
+        };
+        let want = address::htlc_script_pubkey(&htlc.redeem_script());
+        if out.script_pubkey != want {
+            return Ok(None);
+        }
+        let confirmations = if raw.height == 0 || raw.height == u64::MAX {
+            0
+        } else {
+            let tip = self.tip_height().await?;
+            (tip.saturating_sub(raw.height) + 1) as u32
+        };
+        Ok(Some(LockedOutput {
+            amount: Amount::from_sat(out.value),
+            confirmations,
+        }))
+    }
+
+    /// `Ok` when `parsed`, the primary's answer to `GetTransaction(want)`, is that transaction;
+    /// else [`SwapError::Transient`] naming the primary endpoints ([`not_requested`]).
+    fn requested(&self, parsed: &tx::ParsedTx, want: &[u8; 32]) -> Result<()> {
+        match not_requested(parsed, want) {
+            None => Ok(()),
+            Some(why) => Err(self.refuse_answer(&why)),
+        }
+    }
+
+    /// The refusal of an answer of the primary's: `why` completes "zec lightwalletd <urls> …".
+    fn refuse_answer(&self, why: &str) -> SwapError {
+        SwapError::Transient(format!(
+            "zec lightwalletd {} {why}; not acting on it",
+            self.client.endpoints().join(", ")
+        ))
     }
 
     /// A spend this backend built: in a primary-only view after a `Disagree`, also sent to
@@ -484,6 +580,23 @@ impl ZecBackend {
         <[u8; 32]>::try_from(bytes)
             .map_err(|_| SwapError::Other(format!("{what} is {} bytes, want 32", bytes.len())))
     }
+}
+
+/// `Some(why)` when `parsed`, a lightwalletd's answer to `GetTransaction(want)`, is another
+/// transaction: its txid ([`tx::ParsedTx::txid`], ZIP-244 for v5, ZIP-229 for v6) is not
+/// `want` (both in internal byte order, as `get_transaction` takes it). Every read by txid
+/// checks this before it uses any field of the answer (EW): without it an operator could
+/// answer any transaction whose output at the index carries the agreed script and value.
+/// `why` completes "<operator> …".
+pub(crate) fn not_requested(parsed: &tx::ParsedTx, want: &[u8; 32]) -> Option<String> {
+    let got = parsed.txid();
+    (got != *want).then(|| {
+        format!(
+            "answered GetTransaction({}) with transaction {}, not the one asked for",
+            Txid(*want),
+            Txid(got)
+        )
+    })
 }
 
 /// Map a lightwalletd/zcashd reject reason to the engine's taxonomy (zcashd shares its
@@ -738,6 +851,8 @@ impl ChainBackend for ZecBackend {
             reservations: self.reservations.clone(),
             network: self.network.clone(),
             second: None,
+            second_budget: self.second_budget,
+            lock_failing: Mutex::default(),
             hold: self.hold.clone(),
         }))
     }
@@ -751,6 +866,13 @@ impl ChainBackend for ZecBackend {
         else {
             return Ok(None);
         };
+        // The answer counts only as `txid`'s: a transaction that does not parse cannot show it.
+        let parsed = tx::ParsedTx::parse(&raw.data).map_err(|e| {
+            self.refuse_answer(&format!(
+                "answered GetTransaction({txid}) with a transaction that does not parse ({e})"
+            ))
+        })?;
+        self.requested(&parsed, &txid.0)?;
         // height 0 = mempool; u64::MAX = mined on a fork that isn't the main chain (lightwalletd
         // `RawTransaction.height` doc). Neither is a main-chain confirmation yet.
         if raw.height == 0 || raw.height == u64::MAX {
@@ -763,32 +885,21 @@ impl ChainBackend for ZecBackend {
     }
 
     async fn htlc_output(&self, htlc: &HtlcParams, at: &Outpoint) -> Result<Option<LockedOutput>> {
-        let Some(raw) = self
-            .client
-            .get_transaction(&at.txid.0)
-            .await
-            .map_err(SwapError::from)?
-        else {
-            return Ok(None);
-        };
-        let parsed = tx::ParsedTx::parse(&raw.data)?;
-        let Some(out) = parsed.vout.get(at.vout as usize) else {
-            return Ok(None);
-        };
-        let want = address::htlc_script_pubkey(&htlc.redeem_script());
-        if out.script_pubkey != want {
-            return Ok(None);
+        let mine = self.htlc_output_primary(htlc, at).await?;
+        match (&self.second, mine) {
+            // Nothing to agree when the primary shows no matching lock: no side acts on `None`.
+            (Some(second), Some(lo)) => {
+                let want = address::htlc_script_pubkey(&htlc.redeem_script());
+                // EX: a second operator that never answers fails the read at the budget.
+                let budget = self.second_budget;
+                let theirs = tokio::time::timeout(budget, crosscheck::lock_view(second, at))
+                    .await
+                    .unwrap_or_else(|_| Err(format!("did not answer within {budget:?}")));
+                let agreed = crosscheck::agree_lock(at, &want, lo, &self.client, theirs, second);
+                self.failing_for(at, agreed).map(Some)
+            }
+            (_, mine) => Ok(mine),
         }
-        let confirmations = if raw.height == 0 || raw.height == u64::MAX {
-            0
-        } else {
-            let tip = self.tip_height().await?;
-            (tip.saturating_sub(raw.height) + 1) as u32
-        };
-        Ok(Some(LockedOutput {
-            amount: Amount::from_sat(out.value),
-            confirmations,
-        }))
     }
 
     async fn find_spend(&self, outpoint: &Outpoint, from_height: u64) -> Result<Option<SpendInfo>> {
@@ -817,9 +928,20 @@ impl ChainBackend for ZecBackend {
                 continue; // compact block saw it, full tx vanished (reorg); caller retries.
             };
             let parsed = tx::ParsedTx::parse(&full.data)?;
+            self.requested(&parsed, &spender_txid)?;
             let Some(input) = parsed.vin.get(input_index as usize) else {
                 continue;
             };
+            // The txid commits to the prevouts: the compact block's claim is now checkable.
+            if input.prevout.txid != outpoint.txid.0 || input.prevout.n != outpoint.vout {
+                return Err(self.refuse_answer(&format!(
+                    "named {} input {input_index} as the spend of {outpoint}, but that input \
+                     spends {}:{}",
+                    Txid(spender_txid),
+                    Txid(input.prevout.txid),
+                    input.prevout.n
+                )));
+            }
             let height = if full.height == 0 || full.height == u64::MAX {
                 None
             } else {
