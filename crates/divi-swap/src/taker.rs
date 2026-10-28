@@ -645,7 +645,8 @@ impl Taker {
 
     /// A maker-lock read that failed (`e`; EX: a second source down, hanging or not showing
     /// the lock yet) is retried as before, but only until the claim deadline
-    /// ([`crate::ClaimDeadline::check`] on the maker leg's MTP), past which we never start a
+    /// ([`crate::ClaimDeadline::check`] on the maker leg's MTP, or on the wall clock while
+    /// that is held for its second source, as for the first claim), past which we never start a
     /// first claim anyway: the claim is then declined for good, naming the failure, and our
     /// own leg refunds at its locktime as before. Nothing is revealed either way.
     async fn maker_lock_unread(
@@ -655,12 +656,20 @@ impl Taker {
         e: SwapError,
     ) -> Result<Flow> {
         let chain = r.quote.maker_chain();
-        // An unreadable MTP keeps the retry: not knowing the deadline is not its end.
-        let Ok(mtp) = self.mk(r)?.median_time_past().await else {
+        // A held MTP is judged on the wall clock, as for the first claim
+        // ([`Self::first_claim_time`]); any other unreadable MTP keeps the retry: not knowing
+        // the deadline is not its end.
+        let Ok((mtp, held)) = self.first_claim_time(r).await else {
             return Err(e);
         };
         let Err(late) = self.claim_deadline(chain).check(chain, mtp, htlc.locktime) else {
             return Err(e);
+        };
+        let late = match held {
+            Some(held) => {
+                format!("{late} (judged on the wall clock: the maker leg's MTP is held: {held})")
+            }
+            None => late,
         };
         let reason = format!("{late}; the maker's lock was not verified before it: {e}");
         tracing::warn!(swap = %r.id, %reason, "declining to claim the maker leg");
