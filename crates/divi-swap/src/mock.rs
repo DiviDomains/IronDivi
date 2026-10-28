@@ -143,6 +143,8 @@ struct ChainState {
     fail: Option<SwapError>,
     /// While set, every `broadcast()` fails with this error; reads still work.
     fail_broadcasts: Option<SwapError>,
+    /// While set, every `htlc_output` fails with this error; other calls still answer.
+    fail_lock_reads: Option<SwapError>,
     /// While set, claims and refunds built by a backend that is not a
     /// [`ChainBackend::primary_only`] view fail with `SwapError::Held(this)`.
     hold: Option<String>,
@@ -636,6 +638,13 @@ impl MockChain {
     /// but erroring, or down (`Transient`). `None` heals it.
     pub fn fail_with(&self, err: Option<SwapError>) {
         self.state.lock().fail = err;
+    }
+
+    /// While `Some`, every `htlc_output` on this chain fails with `err`: a lock read that
+    /// keeps failing (EX: a second source down, hanging or not showing the lock yet) while
+    /// the other calls still answer. `None` heals it.
+    pub fn fail_lock_reads(&self, err: Option<SwapError>) {
+        self.state.lock().fail_lock_reads = err;
     }
 
     /// While `Some`, every claim and refund built on this chain fails with
@@ -1617,6 +1626,9 @@ impl ChainBackend for MockBackend {
     async fn htlc_output(&self, htlc: &HtlcParams, at: &Outpoint) -> Result<Option<LockedOutput>> {
         self.check_online()?;
         let s = self.chain.state.lock();
+        if let Some(e) = &s.fail_lock_reads {
+            return Err(e.clone());
+        }
         if s.blind.contains(&at.txid) {
             return Ok(None);
         }
