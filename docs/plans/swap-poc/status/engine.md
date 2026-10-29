@@ -1473,3 +1473,35 @@ The Manager's rulings on the DJ2 report. Testnet only, $0, not pushed.
 - left:
   - The merged branches' own `left:` items stand (FA: the mainnet taker start rule is Bert's, the rest of F4, the xmr arm's DIVI source; FB: per-process cache, the tip cross-check uncached; FC: the maker-leg MTP read after a successful lock read is still raw, row 2 of `single-source-design.md`).
   - Not pushed. No live run (mocks only, no funds).
+
+## 2026-10-28 round: taker-single-source-refuse FD (builder FD, `lane/taker-single-source-refuse`, on FA 8f3e4ca)
+- why: T32-20, Manager ruling 2 (2026-10-28 ~10:40Z), a **provisional decision** resting on Bert's 2026-10-26 20:36Z ruling "single-source stays opt-in and off on mainnet". FA shipped the taker's mainnet one-DIVI-operator case as a warning; the daemon already refuses the same case unless `[section].allow_single_source = true` (`require_second_source`, `bin/divi-swapd/src/config.rs`).
+- what changed:
+  - `divi-swap --allow-single-source` (default off). On `--profile mainnet`, a taker whose every DIVI source (`--divi-rpc-url` or the default proxy, plus `--divi-fallback-rpc-url`) is the default proxy or under its registrable domain is refused at start, in `live_backends` before the key is resolved and before any network action; the error is FA's warning (endpoint, risk) plus "a mainnet taker needs a second, independent DIVI source; set one, or pass --allow-single-source". With the flag it starts and logs a warning at every start, worded like `require_second_source` (one lying or broken endpoint is trusted for HTLC, confirmation and spend reads).
+  - `divi_swap_cli::sources::check_divi` wraps FA's `divi_warning` (shaped like `check_zec`); `taker_source_warnings` returns `Result` and the start path propagates it in the same place. The operator check itself did not move.
+  - Scope: DIVI only. The ZEC arm's one-lightwalletd-operator case stays a warning; the xmr arm (`--xmr-divi-rpc-url`) is not covered. Testnet unchanged. No protocol, schema, fee, timelock or dependency change.
+- reversing it: if the provisional ruling is reversed, `check_divi` returns `Ok(Some(w))` without the opt-in (or the start path logs the `Err` instead of propagating it); the three FD tests then state the old behaviour.
+- tests (test-first, 2a8e5d8): `mainnet_taker_on_one_divi_operator_is_refused_without_the_opt_in`, `mainnet_taker_on_one_divi_operator_starts_with_the_opt_in_and_is_warned`, `the_divi_single_source_rule_leaves_testnet_and_two_operators_alone` (testnet with and without the flag; a second operator as primary or fallback, with and without the flag). FA's `mainnet_taker_on_the_default_divi_proxy_only_is_warned` now passes the opt-in; `mainnet_taker_on_one_zec_operator_is_warned` uses an own DIVI node so the DIVI refusal stays out of its way.
+- fail-first on 2a8e5d8: divi-swap-cli 87 passed / 3 failed, exactly the three new tests (no refusal: the `--divi-key` error; unknown argument `--allow-single-source`).
+- gates on dd4148d (the code of the final tree; the docs commit changes only Markdown), every step load5 < 35 at start and end:
+
+| step | passed | failed | ignored | load5 start→end |
+|---|---|---|---|---|
+| `cargo fmt --all --check` | clean | | | |
+| `clippy --workspace --all-targets -D warnings` | clean | | | 17.15→17.44 |
+| divi-swap | 473 | 0 | 0 | 16.75→15.89 |
+| divi-swap-cli | 92 | 0 | 0 | 9.67→9.75 |
+| divi-swap-xmr | 92 | 0 | 0 | 7.92→7.40 |
+| swap-chain-divi | 84 | 0 | 1 | 6.02→7.11 |
+| swap-chain-evm | 48 | 0 | 2 | 5.89→6.51 |
+| swap-chain-ltc | 101 | 0 | 2 | 5.54→5.57 |
+| swap-chain-zec | 61 | 0 | 4 | 5.01→5.53 |
+| swap-chain-btc | 72 | 0 | 1 | 6.42→6.76 |
+| divi-swapd (under `flock /tmp/e2e_xmr.lock`) | 191 | 0 | 0 | 6.55→10.08 |
+| `claim_race`, `PROPTEST_CASES=5000` | 16 | 0 | 0 | 9.34→6.61 |
+| `maker_claim_race`, `PROPTEST_CASES=5000` | 8 | 0 | 0 | 6.61→4.51 |
+
+- left:
+  - The ruling is provisional; Bert's confirmation of the taker start rule stands open.
+  - ZEC arm: the same refusal should apply (the daemon already refuses one ZEC operator on mainnet, and in the reverse direction the taker claims against a ZEC lock it read on that one operator, L2's shape), but with the default endpoint list all on `zec.rocks` it would refuse every default mainnet ZEC taker until `--zec-crosscheck-url` is set, so it needs its own ruling.
+  - xmr arm's DIVI source: separate backlog slice. F4's remaining parts (PSL, resolved IPs, plain `http://`, ASN) as FA left them. No live run (no funds, no network).

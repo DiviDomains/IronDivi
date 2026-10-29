@@ -15,8 +15,9 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 //! Who runs the taker's read sources: the start-time operator checks of the taker CLI, on
-//! the helper the daemon uses ([`divi_swap::operator`]). On mainnet they warn; whether a
-//! mainnet taker should be refused instead is Bert's call on the taker start rule.
+//! the helper the daemon uses ([`divi_swap::operator`]). On mainnet, every DIVI source on
+//! one operator is refused unless `--allow-single-source` (then warned at every start, as
+//! the daemon's `allow_single_source`); one ZEC operator is warned.
 
 use divi_swap::operator;
 
@@ -58,4 +59,28 @@ pub fn divi_warning(mainnet: bool, default: &str, sources: &[String]) -> Option<
          another operator's.",
         sources.join(", ")
     ))
+}
+
+/// The taker's DIVI start rule, the daemon's `require_second_source` for the taker: where
+/// [`divi_warning`] fires, `Err` refuses the start unless `allow_single_source`, and with it
+/// `Ok(Some(warning))`, to be printed at every start; `Ok(None)` otherwise.
+pub fn check_divi(
+    mainnet: bool,
+    allow_single_source: bool,
+    default: &str,
+    sources: &[String],
+) -> Result<Option<String>, String> {
+    let Some(w) = divi_warning(mainnet, default, sources) else {
+        return Ok(None);
+    };
+    if !allow_single_source {
+        return Err(format!(
+            "{w} A mainnet taker needs a second, independent DIVI source; set one, or pass \
+             --allow-single-source to run on one source deliberately"
+        ));
+    }
+    Ok(Some(format!(
+        "{w} This mainnet taker runs on a single DIVI operator (--allow-single-source): one \
+         lying or broken endpoint is trusted for HTLC, confirmation and spend reads"
+    )))
 }
