@@ -3,11 +3,11 @@
 Status 2026-10-14: **not ready for mainnet.** The POC's definition of done is "proven on public
 testnets" (`docs/plans/atomic-swap-poc.md` §1), and that is met for XMR: the redeem, refund and
 punish paths ran live (RESULTS.md, 2026-10-12), and the deployed `divi-swapd` served a stagenet
-swap on 2026-10-14. Mainnet is a separate decision Bert makes. This plan lists what stands
+swap on 2026-10-14. Mainnet is a separate decision Human makes. This plan lists what stands
 between the two; `mainnet-readiness.md` §XMR is the review it builds on.
 
 Every phase ends with a gate. Nothing moves real funds before phase D. The hard mainnet refusal
-became an explicit opt-in on 2026-10-14 (Bert's full go, decision log): mainnet now needs
+became an explicit opt-in on 2026-10-14 (Human's full go, decision log): mainnet now needs
 `[xmr].allow_mainnet = true` (maker) or `--xmr-allow-mainnet` (taker), both off by default, and
 nobody sets them before phase D.
 
@@ -24,7 +24,7 @@ nobody sets them before phase D.
 | A7 | One global `gate` mutex serialises every XMR swap's step, so one slow scan stalls all requests | `crates/divi-swap-xmr/src/maker.rs:265` | ~~per-swap locking~~ done 2026-10-14: one lock per swap (pruned when unheld), plus a quote claim that closes a concurrent-`setup` double-use race; `a_stuck_scan_does_not_hold_up_other_swaps` (fails with one shared lock). The taker keeps its global gate (it steps only its own swaps); `tick` is still sequential |
 | A8 | Stagenet soak: many concurrent swaps through dnsdivi, including maker restarts mid-swap and every outcome (redeem/refund/punish) | `tools/swap-poc/` | ≥ 20 swaps, 0 stuck, 0 lost; results in RESULTS.md **done 2026-10-15**: 22 maker swaps all `done`, 0 stuck, 0 lost: 14 redeemed, 2 restarts with swaps open, 4 accept-only + 3 lock-only refunded on both chains; 1 accept refused (one-coin maker DIVI wallet, nothing on chain). Punish evidence is the 2026-10-12 CLI-maker run. See RESULTS.md. |
 
-Gate A: all A-items done, CI green, soak clean. Bert reviews.
+Gate A: all A-items done, CI green, soak clean. Human reviews.
 
 ## Phase B — operations
 
@@ -47,7 +47,7 @@ What the maker host must hold, and what it must not:
 | maker XMR wallet spend key (sweep target) | **no** | the daemon only needs `sweep_address`. The spend key lives in 1Password (and a paper/offline copy for mainnet); a view-only wallet on another host proves receipts |
 | `wallet_rpc_*` | **no** | `monero_chain::lock` (wallet RPC) is the taker's XMR lock; the maker never sends XMR from a wallet, and sweeps with the recovered key. Drop `monero-wallet-rpc` from the mainnet maker; make `wallet_rpc_url` optional in config |
 
-Mainnet items are new 1Password items, never the stagenet ones renamed: `IronDivi Swap - maker-divi-xmr-mainnet`, `IronDivi Swap - maker-xmr-wallet-mainnet`, generated on Bert's machine at the keyboard (phase D). They go on a separate mainnet host, provisioned by `deploy.sh provision-secrets`. Rotation follows `xmr-runbook.md` §Keys.
+Mainnet items are new 1Password items, never the stagenet ones renamed: `IronDivi Swap - maker-divi-xmr-mainnet`, `IronDivi Swap - maker-xmr-wallet-mainnet`, generated on Human's machine at the keyboard (phase D). They go on a separate mainnet host, provisioned by `deploy.sh provision-secrets`. Rotation follows `xmr-runbook.md` §Keys.
 
 Code consequences for the mainnet lift: the xmr DIVI address now follows the configured network (`bin/divi-swapd/src/main.rs:196-198`, done in f919e5c). `wallet_rpc_url` should become optional for the maker (`bin/divi-swapd/src/config.rs:141`).
 
@@ -55,14 +55,14 @@ Code consequences for the mainnet lift: the xmr DIVI address now follows the con
 
 Hand-written adaptor signatures, the cross-group DLEQ proof, encsig recovery and the DIVI script
 templates (`crates/divi-swap-xmr/`, `crates/swap-chain-xmr/`) reviewed by someone outside the
-project. Gate C: findings fixed or accepted in writing by Bert.
+project. Gate C: findings fixed or accepted in writing by Human.
 
 The reviewer's brief is `xmr-review-brief.md` (pinned to a commit in its §8). Drafting it turned
 up findings that block mainnet on their own, before any outside review:
 
 | # | Finding | Status |
 |---|---|---|
-| C1 | **Counterparty malleation of `Tx_cancel`.** `Tx_refund`/`Tx_punish` spend `Tx_cancel` by txid (`crates/divi-swap-xmr/src/api.rs:129`); DIVI has no segwit, and each side holds the other's `Tx_cancel` signature, so either can re-sign its own half with a fresh nonce (a valid low-S signature, relayed normally) and broadcast a `Tx_cancel` with a different txid after `t_cancel`. Both presigned children are then invalid and both coins sit in a 2-of-2 neither side can spend alone: a ransom, not just a liveness risk. `xmr-design.md` §Risks covered only a miner. Needs a protocol change (or a written acceptance) before mainnet. Stakers can malleate too (NULLDUMMY/SIGPUSHONLY/CLEANSTACK/MINIMALDATA are relay-only), and any relay node can S-flip: Divi 3.0.0 does not make LOW_S standard (regtest 2026-10-15). | **design written 2026-10-14** (`xmr-c1-design.md`: 2P-ECDSA joint cancel key, OP_DEPTH guard, unilateral punish branch); **implemented 2026-10-15** (`c1-impl`, cggmp21), deployed to the stagenet maker (1841a12 since 2026-10-15 16:29Z); **all §7 tests PASS**: 5a/5b/7 on regtest (`c1-regtest-results.md`), 1-4 and 6 live on stagenet (RESULTS.md, `c1-punish-results.md`); **reviewed 2026-10-15: Bert chose option A** (interim first, Lindell-2017 J, exhaustive 120-variant presign); gaps vs built in `xmr-c1-design.md` §9 being closed; blocks D until the new build passes stagenet |
+| C1 | **Counterparty malleation of `Tx_cancel`.** `Tx_refund`/`Tx_punish` spend `Tx_cancel` by txid (`crates/divi-swap-xmr/src/api.rs:129`); DIVI has no segwit, and each side holds the other's `Tx_cancel` signature, so either can re-sign its own half with a fresh nonce (a valid low-S signature, relayed normally) and broadcast a `Tx_cancel` with a different txid after `t_cancel`. Both presigned children are then invalid and both coins sit in a 2-of-2 neither side can spend alone: a ransom, not just a liveness risk. `xmr-design.md` §Risks covered only a miner. Needs a protocol change (or a written acceptance) before mainnet. Stakers can malleate too (NULLDUMMY/SIGPUSHONLY/CLEANSTACK/MINIMALDATA are relay-only), and any relay node can S-flip: Divi 3.0.0 does not make LOW_S standard (regtest 2026-10-15). | **design written 2026-10-14** (`xmr-c1-design.md`: 2P-ECDSA joint cancel key, OP_DEPTH guard, unilateral punish branch); **implemented 2026-10-15** (`c1-impl`, cggmp21), deployed to the stagenet maker (1841a12 since 2026-10-15 16:29Z); **all §7 tests PASS**: 5a/5b/7 on regtest (`c1-regtest-results.md`), 1-4 and 6 live on stagenet (RESULTS.md, `c1-punish-results.md`); **reviewed 2026-10-15: Human chose option A** (interim first, Lindell-2017 J, exhaustive 120-variant presign); gaps vs built in `xmr-c1-design.md` §9 being closed; blocks D until the new build passes stagenet |
 | C2 | Taker does not check `Tx_cancel`'s output value (`taker.rs:277-287`); a tiny output zeroes `Tx_punish`. | open |
 | C3 | Unauthenticated setup reserves maker UTXOs that an abort never releases (`maker.rs:438`, `wallet.rs:168` `release` has no XMR caller); no auth or rate limit on XMR routes; `quote()` stores unbounded records. | open |
 | C4 | No check that the DIVI RPC is on the expected chain (`main.rs:183-187` compares only the URL); every timelock trusts its median time past. | open |
@@ -71,17 +71,17 @@ up findings that block mainnet on their own, before any outside review:
 | C8 | A transient monerod connection error panics a taker task (`crates/swap-chain-xmr/src/live_rpc.rs:249` `expect("get_block reachable")`); seen twice in A8 on the public node and again in the C1 soak. The rerun resumed from the journal, but it must be an error, not a panic. | **fixed 2026-10-15** (1841a12: `fetch_scannable_block`/`scan_block`/`scan_for_lock_output` return errors; `find_lock`/`sweep` map them to `MoneroChainError::Rpc`, not "no output in this block"); taker rebuilt; maker redeployed to dnsdivi 2026-10-15 16:29Z (sha `929c9b54…`) |
 | C7 | Staker malleation of `Tx_lock`: `Tx_cancel` is presigned against `Tx_lock`'s txid before it confirms, and its P2PKH inputs are malleable by any staker. A malleated `Tx_lock` leaves the maker's DIVI in the 2-of-2 with no cancel (the taker locks nothing). | design: maker-unilateral `t_late` branch, `xmr-c1-design.md` §4.3; blocks D |
 
-## Phase D — staged mainnet trials (needs Bert's explicit go)
+## Phase D — staged mainnet trials (needs Human's explicit go)
 
 Separate mainnet infrastructure (not dnsdivi testnet). The refusals are an opt-in since
 2026-10-14 (`live::profile_for`); set `allow_mainnet` / `--xmr-allow-mainnet` only in this phase.
 Mainnet also needs an explicit DIVI mainnet RPC (`[xmr].divi_rpc_url`, `--xmr-divi-rpc-url`): the
 default is the testnet proxy and both binaries refuse it on mainnet.
-Dust-sized swaps first, with Bert at the keyboard, per-run confirmation, then a raised cap.
+Dust-sized swaps first, with Human at the keyboard, per-run confirmation, then a raised cap.
 Each trial records lock/claim/sweep txids the same way RESULTS.md does.
 
 ## Decision log
 
-- 2026-10-14, Bert: **full go** — phases A and B, and the code change that lifts the mainnet
+- 2026-10-14, Human: **full go** — phases A and B, and the code change that lifts the mainnet
   refusal. Hard stop before any real-money swap: phase C needs an outside reviewer, phase D needs
-  Bert at the keyboard. No mainnet or real-funds swap is run by an agent. Report at each gate.
+  Human at the keyboard. No mainnet or real-funds swap is run by an agent. Report at each gate.

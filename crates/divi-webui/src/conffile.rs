@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 Bert Shuler
+// Copyright (C) 2026 human
 // IronDivi - https://github.com/DiviDomains/IronDivi
 //
 // This program is free software: you can redistribute it and/or modify
@@ -439,7 +439,7 @@ mod tests {
     #[test]
     fn divi_edit_replaces_every_spelling_in_place() {
         let path = Path::new("/d/divi.conf");
-        let before = "# my node\nrpcuser=bert\n-port=1 # old port\nnolisten=1\naddnode=a\n\
+        let before = "# my node\nrpcuser=human\n-port=1 # old port\nnolisten=1\naddnode=a\n\
                       addnode=b\n[test]\nport=2\nmaxconnections=8\n";
         let after = edit(
             path,
@@ -455,11 +455,11 @@ mod tests {
         .unwrap();
         assert_eq!(
             after,
-            "# my node\nrpcuser=bert\n# old port\nport=51472\nlisten=1\naddnode=c\n\
+            "# my node\nrpcuser=human\n# old port\nport=51472\nlisten=1\naddnode=c\n\
              staking=0\n[test]\n"
         );
         let values = read_values(path, &after).unwrap();
-        assert_eq!(values["rpcuser"], ["bert"]);
+        assert_eq!(values["rpcuser"], ["human"]);
         assert_eq!(values["listen"], ["1"]);
         assert!(!values.contains_key("maxconnections"));
     }
@@ -479,7 +479,7 @@ mod tests {
     fn toml_edit_keeps_comments_and_types() {
         let path = Path::new("/d/irondivi.conf");
         let before =
-            "# mine\nrpcuser = \"bert\"  # who\nport = 1\nnolisten = true\n\n[extra]\nx = 1\n";
+            "# mine\nrpcuser = \"human\"  # who\nport = 1\nnolisten = true\n\n[extra]\nx = 1\n";
         let after = edit(
             path,
             Some(before),

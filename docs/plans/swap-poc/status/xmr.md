@@ -974,7 +974,7 @@
 
 ## Live stagenet swap (orchestrator, 2026-10-13) — PARKED on one 1Password approval
 Running on stagenet — project is testnet-only; mainnet would be separate infra and a separate
-decision. Bert's go: "Full go — live swap now."
+decision. Human's go: "Full go — live swap now."
 - Built: maker `divi-swapd` at 8e431c0 on hp2 (sha256 `7c4e5123b9d30e902a381130b86849ed68fbdde0120899086ad86f617fd94f1d`,
   `/mnt/storage1/bshuler-cargo/release/divi-swapd-8e431c0`); taker `divi-swap` (divi-swap-cli) at
   8e431c0 on the Mac (`~/.cache/divi-swap-8e431c0`).
@@ -1036,9 +1036,9 @@ taker local `bd63938c-a93c-491a-ac8e-ee9e282ef31b`, outcome `redeemed`.
 
 ## C1 full fix on stagenet (orchestrator, 2026-10-15)
 
-**Ruling (Bert, 2026-10-15): option A, the full C1 fix.** Interim hardening lands first; J uses Lindell-2017 2P-ECDSA; presign is exhaustive across all 120 staker variants. The gap list (built `61ca99a`/`929c9b54` vs A) is `xmr-c1-design.md` §9; the gaps are being closed. Mainnet stays blocked until the new build passes stagenet. Also approved: the hp2 root `divid` (pid 3626) restart with its recovery phrase moved into a root-only 0600 file, no rotation.
+**Ruling (Human, 2026-10-15): option A, the full C1 fix.** Interim hardening lands first; J uses Lindell-2017 2P-ECDSA; presign is exhaustive across all 120 staker variants. The gap list (built `61ca99a`/`929c9b54` vs A) is `xmr-c1-design.md` §9; the gaps are being closed. Mainnet stays blocked until the new build passes stagenet. Also approved: the hp2 root `divid` (pid 3626) restart with its recovery phrase moved into a root-only 0600 file, no rotation.
 
-Bert's order: build the complete C1 design (option 3), not the §4.4 interim fix; stagenet only.
+Human's order: build the complete C1 design (option 3), not the §4.4 interim fix; stagenet only.
 
 - **Code:** `c1-impl`, merged to `main`. cggmp21 2P-ECDSA (SecurityLevel128) for the joint cancel
   key `J`; the new `Tx_lock` script (cancel branch `J` only, plus the maker's `t_late` branch);
@@ -1091,12 +1091,12 @@ Bert's order: build the complete C1 design (option 3), not the §4.4 interim fix
   lock-only refunded through the `J` branch by 11:28Z, both lock-only takers swept their XMR
   back). Test 4 **PASS** (silent maker: Tx_cancel `6e972874…` via `J` at 09:23Z, Tx_punish
   `ced1572d…` paid the taker 9.999 tDIVI at 12:22Z, no refund). **All §7 tests pass on the
-  Lindell-2017 build.** Mainnet stays blocked pending Bert's go. RESULTS.md.
+  Lindell-2017 build.** Mainnet stays blocked pending Human's go. RESULTS.md.
 - **Known gaps (not blocking stagenet):** ~~a retried `j` message (lost HTTP reply) breaks the
   keying session~~ (closed in `5481207`); pre-C1 XMR records are not readable; a maker restart mid-keying aborts that
   swap; the rare malleated-`Tx_lock` path still scans under the swap lock while `tick` is
   sequential; C3's pool drain is now worse (each setup also costs a prime set).
-- **hp2 recovery-phrase fix (Bert-approved, done 2026-10-16 ~03:50Z):** root's `divid` in
+- **hp2 recovery-phrase fix (Human-approved, done 2026-10-16 ~03:50Z):** root's `divid` in
   container `divi-testnet-node2` (was pid 3626) had the wallet phrase in its argv. Pre-check: every
   divid on hp2 is testnet/regtest (node2, the two c1-regtest nodes, `bsx-b` `testnet=1`); a
   phrase grep of /root, /home, /etc, /opt, /usr/local, /srv, docker volumes and containers,
@@ -1121,7 +1121,7 @@ Bert's order: build the complete C1 design (option 3), not the §4.4 interim fix
 
 ## Mainnet plan gates (orchestrator, 2026-10-14)
 
-Scope from Bert: run through Phase B and prepare the Phase C brief; test coins only; the mainnet
+Scope from Human: run through Phase B and prepare the Phase C brief; test coins only; the mainnet
 block stays in (`[xmr].allow_mainnet` exists since f919e5c, off by default, set nowhere). Stop
 before any real-money swap.
 
@@ -1142,8 +1142,8 @@ before any real-money swap.
 - **Gate B: open on people, not code.**
   - done: B1 (rollback rehearsed), B1b, B2 (swap-watch, plus the `t_punish` margin alert).
   - B3 needs one human walk-through of `xmr-runbook.md`.
-  - B4 mainnet keys are generated at Bert's keyboard (Phase D).
-- **C1 (Bert 2026-10-14: fix C1 first, stay on stagenet).** The fix is a large protocol change
+  - B4 mainnet keys are generated at Human's keyboard (Phase D).
+- **C1 (Human 2026-10-14: fix C1 first, stay on stagenet).** The fix is a large protocol change
   (2P-ECDSA joint cancel key, new `Tx_lock` script, wire changes), so it is designed, not built:
   `xmr-c1-design.md`. It also found C7 (stakers can malleate `Tx_lock`). No mainnet keys, no
   Phase D/B4 until C1 is implemented and passes the design's §7 stagenet tests.

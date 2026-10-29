@@ -1,6 +1,6 @@
 # Reverse direction — taker sells DIVI for BTC (`taker_pays_divi`)
 
-Bert, 2026-10-10: "add the reverse direction, sell divi for btc". Same HTLC protocol, legs swapped.
+Human, 2026-10-10: "add the reverse direction, sell divi for btc". Same HTLC protocol, legs swapped.
 
 ## Protocol (offer `btc-divi-testnet`, `Direction::TakerPaysDivi`)
 

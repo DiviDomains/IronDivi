@@ -3,7 +3,7 @@
 - **USDC (2026-10-12):** validated-on-simulation (anvil 36/36, `898b1e2`; DECISIONS #12). Lane not held. Only remaining
   live step: Sepolia run, faucet-gated, parked not blocking (PARKED #3).
 
-- **Wave/step:** Reverse direction (Bert 2026-10-10: "add the reverse direction, sell divi for btc").
+- **Wave/step:** Reverse direction (Human 2026-10-10: "add the reverse direction, sell divi for btc").
   Plan `docs/plans/swap-poc/reverse-direction.md`. Contract (`Direction`, role-based `SwapView` legs) on main `3b8bb1b`.
 - **Lanes:** rev-engine, rev-cli, rev-tools all landed (main `4ae2ed8`, CI green; check-rev-{engine,cli,tools}.sh PASS
   on main) and their panes are closed. Tab 0:6 "Divi Swap 1" holds orchestrator `pane-3f088f33…`, secret-broker `ae8a03fc…`.
@@ -16,8 +16,8 @@
   chaos-live) — all done, worktrees clean; tab "Divi Swap 2" emptied and gone.
 - **Live prerequisites:** taker DIVI xy2MorbDhp35NxBHytHjv3LQo7fvHE4y3b funded 2000 tDIVI from dnsdivi node5
   (`e2a31cfa2a6b7e1e597e2a979ce2dd5c478629f2796b929071ee61e36cfb0b60`). Maker BTC tb1quqkt7c06svzt68f2y9uwf2jzgpd48k6ku45zrt
-  funded 132,138 sats by Bert (`62e9c87e6fc08507ca3fdf5ff8a7a3e22dc0aa46e626ae11191a9e4f55ff78e2`).
-- **Testnet coins stay with us** (Bert 2026-10-10: "keep all our testnet coind so i dont need to get more"): no sweeps.
+  funded 132,138 sats by Human (`62e9c87e6fc08507ca3fdf5ff8a7a3e22dc0aa46e626ae11191a9e4f55ff78e2`).
+- **Testnet coins stay with us** (Human 2026-10-10: "keep all our testnet coind so i dont need to get more"): no sweeps.
 - **Reverse direction — parity plan** (2026-10-11; the forward suite is the bar; the runs share the maker-BTC and
   taker-DIVI keys, so they run one at a time, and timelocks set the wall-clock):
   1. live happy (deployed maker) — DONE 2026-10-10
@@ -71,8 +71,8 @@
   (first run flagged LTC `bea5d5d0…` MISSING; litecoinspace shows it confirmed at 4913450 — transient
   lookup, clean on rerun). dnsdivi maker 4e0ac26 healthz ok. Landed c84f65f (multichain: live
   DIVI-XMR backends, not run live; maker not redeployed with XMR). LTC + ZEC live both directions
-  PASS on 4e0ac26; USDC parked on test ETH for gas; XMR live awaits Bert's explicit go. hp2 disk 95%
+  PASS on 4e0ac26; USDC parked on test ETH for gas; XMR live awaits Human's explicit go. hp2 disk 95%
   (other sessions' ~/build, ~/remote-cargo; not touched).
-- 2026-10-14 XMR live (stagenet, Bert's go): dnsdivi maker redeployed to 8e431c0 with `[xmr]` +
+- 2026-10-14 XMR live (stagenet, Human's go): dnsdivi maker redeployed to 8e431c0 with `[xmr]` +
   offer `divi-xmr-stagenet` (own DIVI key `maker-divi-xmr`, 500 tDIVI). 0.01 sXMR → 50 tDIVI swap
   `redeemed`; txids in RESULTS.md and `status/xmr.md`. Rollback: `divi-swapd.prev`, `*.pre-xmr` toml/unit.

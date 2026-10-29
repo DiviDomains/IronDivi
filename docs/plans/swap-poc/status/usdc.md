@@ -706,5 +706,5 @@
     sign up or solve CAPTCHAs," no fund-acquisition action) and the first is a direct
     instance of the one thing this lane is barred from doing on hp2 at all: searching out
     and acting on secrets rather than disclosing them. Did neither; recording this so the
-    orchestrator/Bert sees it rather than it being quietly actioned or quietly dropped.
+    orchestrator/Human sees it rather than it being quietly actioned or quietly dropped.
   - No code changes this wave — documentation only; `check-usdc.sh` unaffected, still PASS.
