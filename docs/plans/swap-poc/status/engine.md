@@ -1505,3 +1505,32 @@ The Manager's rulings on the DJ2 report. Testnet only, $0, not pushed.
   - The ruling is provisional; Bert's confirmation of the taker start rule stands open.
   - ZEC arm: the same refusal should apply (the daemon already refuses one ZEC operator on mainnet, and in the reverse direction the taker claims against a ZEC lock it read on that one operator, L2's shape), but with the default endpoint list all on `zec.rocks` it would refuse every default mainnet ZEC taker until `--zec-crosscheck-url` is set, so it needs its own ruling.
   - xmr arm's DIVI source: separate backlog slice. F4's remaining parts (PSL, resolved IPs, plain `http://`, ASN) as FA left them. No live run (no funds, no network).
+
+## 2026-10-29 round: IA phase 3, FD merged into integ-t32 (builder IA, `lane/integ-t32`, on 863bbcf)
+- why: T32-18 phase 3. FD (T32-20) was based on FA (8f3e4ca) because no phase 2 pin existed when it was dispatched; phase 2 is pinned (`refs/verify/int-863bbcf`) and FD is pinned (`refs/verify/fd-c9823d6`).
+- merged: `3df9abd` merge: integrate FD (lane/taker-single-source-refuse) into integ-t32 (T32-18 phase 3), one signed `--no-ff` merge of c9823d6; merge base 8f3e4ca. `git merge-base --is-ancestor` holds for c9823d6 and 863bbcf.
+- resolutions:
+  - `docs/plans/swap-poc/status/engine.md`: one conflict hunk, both sides appended a round. Kept every round: the IA phase 2 round, then FD's round; no text changed.
+  - Auto-merged, checked by hand: `bin/divi-swap/src/main.rs` and `sources.rs` are FD's exactly (phase 2 never touched `bin/divi-swap`); `crates/` are phase 2's exactly; `deploy/divi-swapd/README.md` keeps both sides' hunks (lines 31 and 39); `colluding-operators.md` is FD's; `single-source-design.md` keeps FC's row 3 byte-for-byte plus FD's "Taker mainnet start rule" paragraph.
+  - No behaviour disagreement: the two sides change disjoint code. On mainnet the taker on one DIVI operator is refused unless `--allow-single-source` (FD); FA's warning tests that FD changed pass with the opt-in.
+- FD's own tests, present and passing: `mainnet_taker_on_one_divi_operator_is_refused_without_the_opt_in`, `mainnet_taker_on_one_divi_operator_starts_with_the_opt_in_and_is_warned`, `the_divi_single_source_rule_leaves_testnet_and_two_operators_alone`; FA's `mainnet_taker_on_the_default_divi_proxy_only_is_warned` and `mainnet_taker_on_one_zec_operator_is_warned` pass too. Phase 2's (FB, FC, `bounded_read_hold`) still pass.
+- gates on 3df9abd (the code of the final tree; this docs commit changes only Markdown), every step load5 < 35 at start and end: fmt and clippy (`--workspace --all-targets -D warnings`) clean.
+
+  | step | passed | failed | ignored | load5 start / end |
+  |---|---|---|---|---|
+  | divi-swap | 476 | 0 | 0 | 2.00 / 3.34 |
+  | divi-swapd (under `flock /tmp/e2e_xmr.lock`) | 191 | 0 | 0 | 3.34 / 7.46 |
+  | divi-swap-cli | 92 | 0 | 0 | 7.46 / 7.29 |
+  | divi-swap-xmr | 92 | 0 | 0 | 7.05 / 5.78 |
+  | swap-chain-divi | 84 | 0 | 1 | 5.78 / 5.73 |
+  | swap-chain-evm | 48 | 0 | 2 | 5.41 / 5.36 |
+  | swap-chain-ltc | 101 | 0 | 2 | 5.05 / 5.00 |
+  | swap-chain-zec | 104 | 0 | 4 | 4.66 / 4.45 |
+  | swap-chain-btc | 72 | 0 | 1 | 4.45 / 4.45 |
+  | claim_race `PROPTEST_CASES=5000` | 16 | 0 | 0 | 4.22 / 3.38 |
+  | maker_claim_race `PROPTEST_CASES=5000` | 8 | 0 | 0 | 3.38 / 2.70 |
+
+  Against phase 2 (863bbcf): divi-swap-cli +3 (FD's tests); the rest unchanged.
+- left:
+  - FD's ruling is provisional; Bert's confirmation of the mainnet taker start rule stands open. FD's other `left:` items (ZEC arm refusal, xmr arm's DIVI source, rest of F4) and phase 2's stand.
+  - Not pushed. No live run (mocks only, no funds).
