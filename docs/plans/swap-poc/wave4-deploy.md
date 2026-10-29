@@ -1,6 +1,6 @@
 # Wave 4: LTC (and ZEC, switched off) on dnsdivi's divi-swapd
 
-Bert deploys this from the Mac. Prepared by lane multichain; nothing here has been run on
+Human deploys this from the Mac. Prepared by lane multichain; nothing here has been run on
 dnsdivi. Do not start until the BTC reverse chaos run has ended.
 
 **What changes:** `divi-swapd` gains a live LTC backend (litecoinspace.org, Litecoin

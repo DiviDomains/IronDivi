@@ -1,11 +1,11 @@
 # Orchestrator brief — atomic swap POC
 
 You are the **orchestrator** for `docs/plans/atomic-swap-poc.md`. Read it fully first, then
-`~/code/claude-standards/working-with-bert.md`, `context-budget.md` §2 and §4.1, and
+`~/code/claude-standards/working-with-human.md`, `context-budget.md` §2 and §4.1, and
 `secret-management.md` §2 and §7. Their MUST rules bind you.
 
-You run in an Avada Terminal tab. Bert may watch or type, but do not wait for him: **never stop to ask.** Where a
-decision is Bert's, take the sane default, record it in `docs/plans/swap-poc/DECISIONS.md`, and
+You run in an Avada Terminal tab. Human may watch or type, but do not wait for him: **never stop to ask.** Where a
+decision is Human's, take the sane default, record it in `docs/plans/swap-poc/DECISIONS.md`, and
 keep going. Stop only when the plan's §1 definition of done is proven, or when everything left
 is parked behind a human turn.
 
@@ -29,10 +29,10 @@ is parked behind a human turn.
    ```
    (`--window 0` is required; the pane shell's PATH lacks `~/.local/bin`, so use the absolute path —
    a pane whose command is not found closes at once. `new-pane` lands in the window's
-   *active* tab: remember Bert's active tab, `focus-tab` Swap POC, create, then `focus-tab` back.) `new-pane` prints the pane id; record it in your status file. Lanes are interactive so Bert
+   *active* tab: remember Human's active tab, `focus-tab` Swap POC, create, then `focus-tab` back.) `new-pane` prints the pane id; record it in your status file. Lanes are interactive so Human
    can watch and type into them. To wait on a lane, run `$HP_CTL ctl read <pane> --wait --tail 40`
    with Bash `run_in_background: true` (you are notified when it goes idle); never poll. Never
-   submit into a lane pane without reading it first. Never `close-pane` a lane without Bert.
+   submit into a lane pane without reading it first. Never `close-pane` a lane without Human.
    Lanes push to `main` themselves (`git push origin HEAD:main`) after rebasing; the repo-local
    credential helper makes that work. A lane that goes idle before its
    `tools/swap-poc/check-<lane>.sh` passes gets one nudge via `ctl submit`; a lane that is stuck
@@ -50,9 +50,9 @@ is parked behind a human turn.
   with `op read`. Never print, log, commit or write a key to disk, not even in the scratchpad.
 - **1Password prompts** (SSH to dnsdivi, commit signing, `op`): if a call blocks or fails because
   no one approved it, that is a **pause**. Park it in `docs/plans/swap-poc/PARKED.md` with the
-  exact one-line command Bert should run, then continue with every other piece of work. Never
+  exact one-line command Human should run, then continue with every other piece of work. Never
   `--no-gpg-sign`, never a key to disk, never a substituted token, never `op whoami`.
-- **Commits**: author `Bert Shuler <BertShuler@proton.me>`, no AI attribution or Co-Authored-By
+- **Commits**: author the repo's configured git identity, no AI attribution or Co-Authored-By
   lines, straight to `main`. Never `gh auth switch`.
 - **SSH**: only via the `dnsdivi` block in `~/.ssh/config`; stop after one failed auth and park.
   Read-only probing on dnsdivi is fine; installing the service is Wave 3.
@@ -72,4 +72,4 @@ Tailscale; (3) park and continue Wave 1 against the mock backend.
 `docs/plans/swap-poc/status/orchestrator.md`: current wave and step, done (with txids and shas),
 running (lane, worktree, pid/log), broken, parked, next. Commit it at each wave seam.
 
-When you finish or must stop, end with a status report in the `working-with-bert.md` shape.
+When you finish or must stop, end with a status report in the `working-with-human.md` shape.
