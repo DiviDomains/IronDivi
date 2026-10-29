@@ -40,7 +40,7 @@ if [[ $lock_excluded == 1 ]]; then
     || { echo "hp2-land: Cargo.lock needs new crates; run cargo fetch, then land again"; exit 1; }
 fi
 git add -A
-git -c user.name="Bert Shuler" -c user.email=BertShuler@proton.me commit -q -m "$subject"
+git commit -q -m "$subject"
 git push -q origin HEAD:main
 git push -q hp2:swap-lanes/IronDivi.git HEAD:main
 "${ssh_[@]}" "sed -i -E '/^- *ready_to_land:/d' ~/$lane/docs/plans/swap-poc/status/$coin.md"
