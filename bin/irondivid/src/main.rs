@@ -2195,6 +2195,10 @@ async fn run_daemon(
         .context("Invalid RPC configuration")?;
 
     info!("Starting RPC server on {}...", rpc_config.bind_address);
+    // Start-up is done: say so, or a slow start and a running node look alike
+    if !config.log.print_to_console {
+        eprintln!("IronDivi is running (chain height {}).", chain.height());
+    }
 
     // Run RPC server with shutdown handling
     let mut shutdown_rx = shutdown_rx;
@@ -3171,6 +3175,7 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
 
     // Build configuration
     let mut config = build_config(&args)?;
+    let log_config_console = log_config.print_to_console;
     config.log = log_config;
 
     // Print banner
@@ -3224,6 +3229,7 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
 
     // Set up signal handler
     let shutdown_tx_clone = shutdown_tx.clone();
+    let console = !log_config_console;
     tokio::spawn(async move {
         let ctrl_c = async {
             signal::ctrl_c()
@@ -3245,9 +3251,15 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
         tokio::select! {
             _ = ctrl_c => {
                 info!("Received Ctrl+C, initiating shutdown...");
+                if console {
+                    eprintln!("Received Ctrl+C, stopping...");
+                }
             }
             _ = terminate => {
                 info!("Received SIGTERM, initiating shutdown...");
+                if console {
+                    eprintln!("Received SIGTERM, stopping...");
+                }
             }
         }
 
@@ -3294,6 +3306,9 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
     remove_pid_file(&pid_file);
 
     info!("IronDivi shutdown complete");
+    if !log_config_console {
+        eprintln!("IronDivi stopped.");
+    }
     Ok(())
 }
 

@@ -5,8 +5,10 @@ default). The file rotates by size: `-maxlogsize=<MB>` per file (default 1)
 and `-maxlogfiles=<n>` files kept (default 5: `debug.log`, `debug.log.1`, …).
 `-printtoconsole` writes to the terminal instead.
 
-When it starts in the foreground the node prints only where it logs to, and
-then nothing more on the console. Follow the log with `tail -f ~/.irondivi/debug.log`.
+When it starts in the foreground the node prints where it logs to and how to
+stop it (Ctrl+C), then one line when start-up is done and one when it stops.
+Everything else goes to the log: follow it with
+`tail -f ~/.irondivi/debug.log`.
 
 ## What is written
 
