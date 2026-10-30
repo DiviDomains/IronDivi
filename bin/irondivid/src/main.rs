@@ -2079,6 +2079,20 @@ async fn run_daemon(
         ));
     }
 
+    // A credential change would make the process dumpable again, and a pipe core handler
+    // would then store a core holding wallet keys (NODE-10). Until the health log exists
+    // this is its own tick, at the health log's 60 s rate.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    tokio::spawn(async {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            tick.tick().await;
+            if let Some(was) = private_files::restore_non_dumpable() {
+                warn!("dumpable restored (was {})", was);
+            }
+        }
+    });
+
     // Block-expiry pruning: runs after the wallet catch-up scan above, then periodically.
     // Bodies within MIN_BLOCKS_TO_KEEP of the tip (and above the wallet's scan height)
     // are never touched, so a racing reorg cannot need pruned data.

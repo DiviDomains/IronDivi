@@ -55,6 +55,22 @@ pub fn disable_core_dumps() -> io::Result<()> {
     result
 }
 
+/// The kernel resets the non-dumpable flag on `execve` and on any credential change. Checked
+/// on every health tick: if the flag is set again, clear it and return what it was.
+pub fn restore_non_dumpable() -> Option<i32> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        // SAFETY: PR_GET_DUMPABLE takes no pointers.
+        let was = unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) };
+        if was > 0 {
+            // SAFETY: PR_SET_DUMPABLE takes only integer arguments.
+            unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
+            return Some(was);
+        }
+    }
+    None
+}
+
 /// Create `dir` with mode 0700 if it is missing. If it exists and other users can read or
 /// enter it, warn, and with `tighten` set it to 0700. Returns whether it was loose.
 pub fn ensure_private_dir(dir: &Path, tighten: bool) -> io::Result<bool> {
@@ -167,9 +183,14 @@ mod tests {
         assert_eq!(mode(&log), 0o600);
     }
 
+    /// The dumpable flag is per process and tests run in parallel threads.
+    #[cfg(unix)]
+    static DUMPABLE_FLAG: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[cfg(unix)]
     #[test]
     fn node10_core_dumps_are_disabled() {
+        let _flag = DUMPABLE_FLAG.lock().unwrap_or_else(|e| e.into_inner());
         disable_core_dumps().unwrap();
         let mut lim = libc::rlimit {
             rlim_cur: 1,
@@ -182,6 +203,21 @@ mod tests {
         #[cfg(any(target_os = "linux", target_os = "android"))]
         // SAFETY: PR_GET_DUMPABLE takes no pointers.
         assert_eq!(unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) }, 0);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn node10_reset_dumpable_flag_is_restored() {
+        let _flag = DUMPABLE_FLAG.lock().unwrap_or_else(|e| e.into_inner());
+        disable_core_dumps().unwrap();
+        assert_eq!(restore_non_dumpable(), None);
+        // What a credential change does to the flag.
+        // SAFETY: PR_SET_DUMPABLE takes only integer arguments.
+        assert_eq!(unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0) }, 0);
+        assert_eq!(restore_non_dumpable(), Some(1));
+        // SAFETY: PR_GET_DUMPABLE takes no pointers.
+        assert_eq!(unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) }, 0);
+        assert_eq!(restore_non_dumpable(), None);
     }
 
     #[test]
