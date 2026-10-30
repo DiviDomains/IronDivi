@@ -47,6 +47,42 @@ use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
+/// Set once a console write has failed (terminal gone after an SSH drop, or
+/// stdout/stderr closed): noted in debug.log the first time only
+static CONSOLE_LOST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Write one line to stderr (or stdout). `eprintln!` and `println!` panic when
+/// the write fails (EPIPE, EIO after the terminal is gone), which killed the
+/// task that made the call; a console line is never worth that (D1, D2)
+fn console_line(to_stdout: bool, line: std::fmt::Arguments<'_>) {
+    use std::io::Write as _;
+    let written = if to_stdout {
+        writeln!(std::io::stdout(), "{}", line)
+    } else {
+        writeln!(std::io::stderr(), "{}", line)
+    };
+    if let Err(e) = written {
+        if !CONSOLE_LOST.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            // The log line's own timestamp says when
+            warn!(
+                "{} lost: {}; console lines are dropped from now on",
+                if to_stdout { "stdout" } else { "stderr" },
+                e
+            );
+        }
+    }
+}
+
+/// `eprintln!` that never panics
+macro_rules! console {
+    ($($arg:tt)*) => { console_line(false, format_args!($($arg)*)) };
+}
+
+/// `println!` that never panics
+macro_rules! console_out {
+    ($($arg:tt)*) => { console_line(true, format_args!($($arg)*)) };
+}
+
 /// irondivid's start-up options. They are read as Divi Core's divid reads
 /// its own (settings.rs): `-name=value` or `--name value` on the command line,
 /// then the config file, which fills only what the command line left unset.
@@ -149,7 +185,7 @@ impl Args {
         T: Into<String>,
     {
         Args::try_parse_from(argv).unwrap_or_else(|e| {
-            eprintln!("Error: {:#}", e);
+            console!("Error: {:#}", e);
             std::process::exit(1)
         })
     }
@@ -1233,7 +1269,7 @@ fn init_logging(log_config: &LogConfig, levels: &log_filter::LogLevels, data_dir
         // Log to file (debug.log in data directory) like C++ divid
         // Create data directory if it doesn't exist
         if let Err(e) = private_files::ensure_private_dir(data_dir, false) {
-            eprintln!(
+            console!(
                 "Warning: Could not create data directory {:?}: {}",
                 data_dir, e
             );
@@ -1260,7 +1296,7 @@ fn init_logging(log_config: &LogConfig, levels: &log_filter::LogLevels, data_dir
         ) {
             Ok(log) => log,
             Err(e) => {
-                eprintln!(
+                console!(
                     "Warning: Could not open {:?}: {}",
                     data_dir.join("debug.log"),
                     e
@@ -1288,15 +1324,15 @@ fn init_logging(log_config: &LogConfig, levels: &log_filter::LogLevels, data_dir
             )
             .init();
 
-        eprintln!("Logging to {:?}", data_dir.join("debug.log"));
-        eprintln!(
+        console!("Logging to {:?}", data_dir.join("debug.log"));
+        console!(
             "Log rotation: max {} bytes per file, {} files kept",
             log_config.max_file_size, log_config.max_files
         );
         // In the foreground the console stays quiet once started, which read as
         // a hang or an exit to new users
         if !std_is_log {
-            eprintln!(
+            console!(
                 "Running in the foreground; Ctrl+C stops the node. Follow it with: tail -f {:?}",
                 data_dir.join("debug.log")
             );
@@ -1631,7 +1667,7 @@ fn warn_if_unencrypted(wallet: &WalletDb) {
             "The wallet is NOT encrypted: its seed and private keys are stored in the clear. \
              Run encryptwallet, then walletpassphrase <passphrase> 0 true to keep staking."
         );
-        eprintln!(
+        console!(
             "WARNING: the wallet is not encrypted; anyone who can read its files can spend \
              its coins. Run the encryptwallet RPC."
         );
@@ -2197,7 +2233,7 @@ async fn run_daemon(
     info!("Starting RPC server on {}...", rpc_config.bind_address);
     // Start-up is done: say so, or a slow start and a running node look alike
     if !config.log.print_to_console {
-        eprintln!("IronDivi is running (chain height {}).", chain.height());
+        console!("IronDivi is running (chain height {}).", chain.height());
     }
 
     // Run RPC server with shutdown handling
@@ -2850,7 +2886,7 @@ fn snapshot_command(config: &NodeConfig, args: &Args) -> Result<()> {
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         let sig = snapshot_sig::sign_root(&m, &key)?;
         snapshot_sig::write_sig(dir, &sig)?;
-        println!(
+        console_out!(
             "signed root_hash {} ({}) as {}\nwrote {}",
             m.root_hash,
             m.network,
@@ -2862,7 +2898,7 @@ fn snapshot_command(config: &NodeConfig, args: &Args) -> Result<()> {
     if let Some(dir) = &args.verify_snapshot {
         let signer = args.snapshot_signer.as_deref().unwrap_or_default();
         let m = snapshot_sig::verify_dir(dir, signer)?;
-        println!(
+        console_out!(
             "OK: root_hash {} ({}, tip {}) is signed by {}",
             m.root_hash, m.network, m.tip_height, signer
         );
@@ -2875,7 +2911,7 @@ fn snapshot_command(config: &NodeConfig, args: &Args) -> Result<()> {
             storage_params(config),
         )
         .context("snapshot export failed")?;
-        println!(
+        console_out!(
             "snapshot written to {:?}\nnetwork {} tip {} {}\nroot_hash {}\nstate_hash {}\n\
              Other nodes import it only once a release lists this state. If this node validated \
              the chain from genesis, the entry for divi_storage::snapshot::KNOWN_STATES is:\n  \
@@ -2896,7 +2932,7 @@ fn snapshot_command(config: &NodeConfig, args: &Args) -> Result<()> {
     } else if let Some(dir) = &args.import_snapshot {
         if let Some(signer) = &args.snapshot_signer {
             let signed = snapshot_sig::verify_dir(dir, signer)?;
-            println!(
+            console_out!(
                 "signature OK: root_hash {} signed by {}",
                 signed.root_hash, signer
             );
@@ -2908,7 +2944,7 @@ fn snapshot_command(config: &NodeConfig, args: &Args) -> Result<()> {
             args.snapshot_root.as_deref(),
         )
         .context("snapshot import failed")?;
-        println!(
+        console_out!(
             "snapshot installed at {:?}\nnetwork {} tip {} {}\nroot_hash {}\nthe chain state at the tip matches the one this release knows; history below it was not validated by this node\nstart the node with --expire so it stays thin; blocks after the tip are fully validated",
             config.chainstate_path(), m.network, m.tip_height, m.tip_hash, m.root_hash
         );
@@ -2983,18 +3019,33 @@ fn remove_pid_file(pid_file: &std::path::Path) {
 }
 
 fn main() -> Result<()> {
+    // A closed stdin, stdout or stderr is reopened on /dev/null before any
+    // file is opened: the next open() would take that number, and console
+    // lines would be written into a database or the wallet (D2)
+    #[cfg(unix)]
+    for fd in 0..=2 {
+        if unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1 {
+            let null = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDWR) };
+            if null >= 0 && null != fd {
+                unsafe {
+                    libc::dup2(null, fd);
+                    libc::close(null);
+                }
+            }
+        }
+    }
     // Before anything is written: the datadir holds the wallet and the RPC cookie (NODE-3)
     private_files::restrict_umask();
     // A core dump would hold unlocked wallet keys (NODE-10)
     if let Err(e) = private_files::disable_core_dumps() {
-        eprintln!("Warning: could not disable core dumps: {}", e);
+        console!("Warning: could not disable core dumps: {}", e);
     }
 
     // Parse CLI arguments, completed from the config file where they are unset
     let args = match Args::try_parse_from(std::env::args()) {
         Ok(args) => args,
         Err(e) => {
-            eprintln!("Error: {:#}", e);
+            console!("Error: {:#}", e);
             std::process::exit(1);
         }
     };
@@ -3010,7 +3061,7 @@ fn main() -> Result<()> {
     // ... a -datadir that is not a directory is refused (divid.cpp)
     if let Some(dir) = &args.datadir {
         if !dir.is_dir() {
-            eprintln!(
+            console!(
                 "Error: Specified data directory \"{}\" does not exist.",
                 dir.display()
             );
@@ -3022,15 +3073,15 @@ fn main() -> Result<()> {
         Err(e) => {
             // divid prints its config file errors under their own heading (divid.cpp:97-98)
             match e.downcast_ref::<ConfigFileError>() {
-                Some(c) => eprintln!("Error reading configuration file: {}", c),
-                None => eprintln!("Error: {:#}", e),
+                Some(c) => console!("Error reading configuration file: {}", c),
+                None => console!("Error: {:#}", e),
             }
             std::process::exit(1);
         }
     };
     // ... and so are -testnet and -regtest together
     if args.testnet && args.regtest {
-        eprintln!("Error: Invalid combination of -regtest and -testnet.");
+        console!("Error: Invalid combination of -regtest and -testnet.");
         std::process::exit(1);
     }
 
@@ -3039,7 +3090,7 @@ fn main() -> Result<()> {
     if let Err(e) =
         core_files::refuse_at_start(&data_dir, args.wallet.as_deref(), args.disablewallet)
     {
-        eprintln!("Error: {:#}", e);
+        console!("Error: {:#}", e);
         std::process::exit(1);
     }
 
@@ -3050,18 +3101,18 @@ fn main() -> Result<()> {
 
         // Ensure data directory exists before daemonizing
         if let Err(e) = private_files::ensure_private_dir(&data_dir, false) {
-            eprintln!("Failed to create data directory {:?}: {}", data_dir, e);
+            console!("Failed to create data directory {:?}: {}", data_dir, e);
             std::process::exit(1);
         }
 
         let log_file = data_dir.join("debug.log");
 
-        eprintln!("Logging to {:?}", log_file);
+        console!("Logging to {:?}", log_file);
 
         // First fork
         match unsafe { libc::fork() } {
             -1 => {
-                eprintln!("Failed to fork: {}", std::io::Error::last_os_error());
+                console!("Failed to fork: {}", std::io::Error::last_os_error());
                 std::process::exit(1);
             }
             pid if pid > 0 => std::process::exit(0), // Parent exits
@@ -3070,14 +3121,14 @@ fn main() -> Result<()> {
 
         // Create new session
         if unsafe { libc::setsid() } == -1 {
-            eprintln!("Failed to setsid: {}", std::io::Error::last_os_error());
+            console!("Failed to setsid: {}", std::io::Error::last_os_error());
             std::process::exit(1);
         }
 
         // Second fork (prevent reacquiring a controlling terminal)
         match unsafe { libc::fork() } {
             -1 => {
-                eprintln!("Failed to fork: {}", std::io::Error::last_os_error());
+                console!("Failed to fork: {}", std::io::Error::last_os_error());
                 std::process::exit(1);
             }
             pid if pid > 0 => std::process::exit(0), // Intermediate parent exits
@@ -3096,7 +3147,7 @@ fn main() -> Result<()> {
             .mode(0o600)
             .open(&log_file)
             .unwrap_or_else(|e| {
-                eprintln!("Failed to open log file: {}", e);
+                console!("Failed to open log file: {}", e);
                 std::process::exit(1);
             });
         let log_fd = log.as_raw_fd();
@@ -3110,7 +3161,7 @@ fn main() -> Result<()> {
 
     #[cfg(not(unix))]
     if args.daemon {
-        eprintln!("Warning: Daemon mode is only supported on Unix systems, running in foreground");
+        console!("Warning: Daemon mode is only supported on Unix systems, running in foreground");
     }
 
     // Now enter the tokio runtime (after daemonization)
@@ -3135,7 +3186,10 @@ fn exit_after_stop(runtime: tokio::runtime::Runtime, result: Result<()>) -> ! {
     let code = match &result {
         Ok(()) => 0,
         Err(e) => {
-            eprintln!("Error: {:#}", e);
+            // In debug.log as well: on a -daemon node the console is that file,
+            // but a foreground node's only record would be a lost terminal (D3)
+            error!("Error: {:#}", e);
+            console!("Error: {:#}", e);
             1
         }
     };
@@ -3230,40 +3284,41 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
     // Set up signal handler
     let shutdown_tx_clone = shutdown_tx.clone();
     let console = !log_config_console;
+    // Installed here, not inside the task, so a failure stops start-up with
+    // an error line instead of a panic in a task nobody joins
+    #[cfg(unix)]
+    let mut interrupt = signal::unix::signal(signal::unix::SignalKind::interrupt())
+        .context("Failed to install SIGINT handler")?;
+    #[cfg(unix)]
+    let mut terminate = signal::unix::signal(signal::unix::SignalKind::terminate())
+        .context("Failed to install SIGTERM handler")?;
     tokio::spawn(async move {
+        #[cfg(unix)]
+        let ctrl_c = interrupt.recv();
+        #[cfg(not(unix))]
         let ctrl_c = async {
-            signal::ctrl_c()
-                .await
-                .expect("Failed to install Ctrl+C handler");
+            if let Err(e) = signal::ctrl_c().await {
+                error!("Ctrl+C handler failed: {}", e);
+                std::future::pending::<()>().await;
+            }
         };
 
         #[cfg(unix)]
-        let terminate = async {
-            signal::unix::signal(signal::unix::SignalKind::terminate())
-                .expect("Failed to install signal handler")
-                .recv()
-                .await;
-        };
-
+        let terminate = terminate.recv();
         #[cfg(not(unix))]
         let terminate = std::future::pending::<()>();
 
-        tokio::select! {
-            _ = ctrl_c => {
-                info!("Received Ctrl+C, initiating shutdown...");
-                if console {
-                    eprintln!("Received Ctrl+C, stopping...");
-                }
-            }
-            _ = terminate => {
-                info!("Received SIGTERM, initiating shutdown...");
-                if console {
-                    eprintln!("Received SIGTERM, stopping...");
-                }
-            }
-        }
-
+        // The stop goes out before anything is written to the console: the
+        // terminal may be gone, and the stop must not depend on it (D1)
+        let what = tokio::select! {
+            _ = ctrl_c => "Ctrl+C",
+            _ = terminate => "SIGTERM",
+        };
         let _ = shutdown_tx_clone.send(());
+        info!("Received {}, initiating shutdown...", what);
+        if console {
+            console!("Received {}, stopping...", what);
+        }
     });
 
     let wallet_seed = WalletSeed::from_settings(&args.settings);
@@ -3307,7 +3362,7 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
 
     info!("IronDivi shutdown complete");
     if !log_config_console {
-        eprintln!("IronDivi stopped.");
+        console!("IronDivi stopped.");
     }
     Ok(())
 }
