@@ -2774,7 +2774,7 @@ dependencies = [
 
 [[package]]
 name = "divi-consensus"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "bs58",
  "byteorder",
@@ -2790,7 +2790,7 @@ dependencies = [
 
 [[package]]
 name = "divi-crypto"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "aes",
  "bs58",
@@ -2810,7 +2810,7 @@ dependencies = [
 
 [[package]]
 name = "divi-electrum"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "anyhow",
  "divi-crypto",
@@ -2830,7 +2830,7 @@ dependencies = [
 
 [[package]]
 name = "divi-masternode"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "byteorder",
  "chrono",
@@ -2852,7 +2852,7 @@ dependencies = [
 
 [[package]]
 name = "divi-network"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "byteorder",
  "bytes",
@@ -2879,7 +2879,7 @@ dependencies = [
 
 [[package]]
 name = "divi-node"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "divi-consensus",
  "divi-crypto",
@@ -2903,7 +2903,7 @@ dependencies = [
 
 [[package]]
 name = "divi-primitives"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "byteorder",
  "criterion",
@@ -2920,7 +2920,7 @@ dependencies = [
 
 [[package]]
 name = "divi-rpc"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -2955,7 +2955,7 @@ dependencies = [
 
 [[package]]
 name = "divi-script"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "divi-crypto",
  "divi-primitives",
@@ -2970,7 +2970,7 @@ dependencies = [
 
 [[package]]
 name = "divi-storage"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "byteorder",
  "chrono",
@@ -2993,7 +2993,7 @@ dependencies = [
 
 [[package]]
 name = "divi-swap"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "alloy",
  "async-trait",
@@ -3020,7 +3020,7 @@ dependencies = [
 
 [[package]]
 name = "divi-swap-cli"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "anyhow",
  "axum",
@@ -3051,7 +3051,7 @@ dependencies = [
 
 [[package]]
 name = "divi-swap-xmr"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "async-trait",
  "cggmp21",
@@ -3081,7 +3081,7 @@ dependencies = [
 
 [[package]]
 name = "divi-swapd"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "alloy",
  "anyhow",
@@ -3117,11 +3117,11 @@ dependencies = [
 
 [[package]]
 name = "divi-test-support"
-version = "0.2.8"
+version = "0.2.9"
 
 [[package]]
 name = "divi-wallet"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "aes",
  "argon2",
@@ -3152,7 +3152,7 @@ dependencies = [
 
 [[package]]
 name = "divi-webui"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "anyhow",
  "argon2",
@@ -4309,7 +4309,7 @@ dependencies = [
 
 [[package]]
 name = "integration-tests"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "divi-consensus",
  "divi-crypto",
@@ -4361,7 +4361,7 @@ dependencies = [
 
 [[package]]
 name = "irondivi-cli"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "anyhow",
  "dirs",
@@ -4374,7 +4374,7 @@ dependencies = [
 
 [[package]]
 name = "irondivid"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -7142,7 +7142,7 @@ checksum = "734676eb262c623cec13c3155096e08d1f8f29adce39ba17948b18dad1e54142"
 
 [[package]]
 name = "swap-adaptor"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "curve25519-dalek-ng",
  "ecdsa_fun",
@@ -7158,7 +7158,7 @@ dependencies = [
 
 [[package]]
 name = "swap-chain-btc"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "async-trait",
  "bitcoin",
@@ -7181,7 +7181,7 @@ dependencies = [
 
 [[package]]
 name = "swap-chain-divi"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "async-trait",
  "divi-crypto",
@@ -7208,7 +7208,7 @@ dependencies = [
 
 [[package]]
 name = "swap-chain-evm"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "alloy",
  "async-trait",
@@ -7225,7 +7225,7 @@ dependencies = [
 
 [[package]]
 name = "swap-chain-ltc"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "async-trait",
  "bech32",
@@ -7249,7 +7249,7 @@ dependencies = [
 
 [[package]]
 name = "swap-chain-xmr"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "ciphersuite",
  "curve25519-dalek",
@@ -7283,7 +7283,7 @@ dependencies = [
 
 [[package]]
 name = "swap-chain-zec"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "async-trait",
  "blake2b_simd",
@@ -7305,7 +7305,7 @@ dependencies = [
 
 [[package]]
 name = "swap-keys"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "bip39",
  "bitcoin",
@@ -7320,7 +7320,7 @@ dependencies = [
 
 [[package]]
 name = "swap-wasm"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "async-trait",
  "chacha20poly1305",
