@@ -40,6 +40,14 @@ pub fn disable_core_dumps() -> io::Result<()> {
             return Err(io::Error::last_os_error());
         }
     }
+    // A pipe core_pattern (systemd-coredump passes its own size limit) is run whatever
+    // RLIMIT_CORE says, and stores the core; the kernel does not hand a non-dumpable
+    // process to it. This also makes /proc/<pid> root-owned and blocks same-user ptrace.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    // SAFETY: PR_SET_DUMPABLE takes only integer arguments and changes only this process.
+    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
     Ok(())
 }
 
@@ -167,6 +175,9 @@ mod tests {
         assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_CORE, &mut lim) }, 0);
         assert_eq!(lim.rlim_cur, 0);
         assert_eq!(lim.rlim_max, 0);
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        // SAFETY: PR_GET_DUMPABLE takes no pointers.
+        assert_eq!(unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) }, 0);
     }
 
     #[test]

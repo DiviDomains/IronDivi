@@ -29,6 +29,7 @@ kill -SEGV $P; sleep 2; kill -0 $P 2>/dev/null && kill -SEGV $P
 wait $P; echo "irondivid exit=$?"; sleep 2
 echo "irondivid cores:"; find_cores | tee $T/nd
 # A pipe core_pattern (apport, systemd-coredump) is invoked whatever RLIMIT_CORE
-# says; the handler is what honours the zero limit. Only apport is tested here.
+# says. apport honours the zero limit itself; systemd-coredump does not, and only
+# PR_SET_DUMPABLE keeps the core from it: core-dump-vm/vm.sh tests that case.
 [ -s $T/nd ] && echo "D5 FAIL" || echo "D5 PASS"
 cd /; rm -rf "$T"
