@@ -29,6 +29,10 @@ pub fn restrict_umask() {
 /// Stop the process from writing core dumps, which would hold unlocked wallet keys
 /// (NODE-10). Call first, before the wallet is opened.
 pub fn disable_core_dumps() -> io::Result<()> {
+    // Both steps always run, so a failed setrlimit (a seccomp filter, say) cannot skip
+    // the prctl that actually stops pipe core handlers. The first error is returned.
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut result = Ok(());
     #[cfg(unix)]
     {
         let none = libc::rlimit {
@@ -37,7 +41,7 @@ pub fn disable_core_dumps() -> io::Result<()> {
         };
         // SAFETY: setrlimit reads the struct passed by reference and changes only this process.
         if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &none) } != 0 {
-            return Err(io::Error::last_os_error());
+            result = Err(io::Error::last_os_error());
         }
     }
     // A pipe core_pattern (systemd-coredump passes its own size limit) is run whatever
@@ -45,10 +49,10 @@ pub fn disable_core_dumps() -> io::Result<()> {
     // process to it. This also makes /proc/<pid> root-owned and blocks same-user ptrace.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     // SAFETY: PR_SET_DUMPABLE takes only integer arguments and changes only this process.
-    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
-        return Err(io::Error::last_os_error());
+    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 && result.is_ok() {
+        result = Err(io::Error::last_os_error());
     }
-    Ok(())
+    result
 }
 
 /// Create `dir` with mode 0700 if it is missing. If it exists and other users can read or
