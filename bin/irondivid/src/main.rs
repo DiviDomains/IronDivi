@@ -3188,8 +3188,22 @@ fn main() -> Result<()> {
         .enable_all()
         .build()
         .context("Failed to build tokio runtime")?;
-    let result = runtime.block_on(async_main(args, data_dir));
-    exit_after_stop(runtime, result)
+    // A panic on this thread would otherwise unwind through the runtime's drop,
+    // which waits with no deadline, and then exit through the C++ destructors,
+    // which join RocksDB's thread pools: the node could hang until the service
+    // manager killed it. The panic message is already written by then.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        runtime.block_on(async_main(args, data_dir))
+    }));
+    match result {
+        Ok(result) => exit_after_stop(runtime, result),
+        Err(_) => {
+            std::mem::forget(runtime);
+            error!("Error: the node's main task panicked");
+            flush_log();
+            unsafe { libc::_exit(101) }
+        }
+    }
 }
 
 /// End the process once `async_main` has stopped the node and recorded the
@@ -3631,7 +3645,10 @@ mod config_format_tests {
         let levels = |extra: &[&str]| {
             let mut argv = vec!["irondivid", dd.as_str()];
             argv.extend(extra);
-            resolve_args(Args::parse_from(argv)).map(|a| (a.debug, a.log_levels.spec()))
+            // try_parse_from: parse_from exits the test process on a bad level
+            Args::try_parse_from(argv)
+                .and_then(resolve_args)
+                .map(|a| (a.debug, a.log_levels.spec()))
         };
         assert_eq!(levels(&[]).unwrap(), (false, "info".to_string()));
         assert_eq!(levels(&["-debug"]).unwrap(), (true, "debug".to_string()));
