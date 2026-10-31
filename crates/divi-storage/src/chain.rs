@@ -554,6 +554,13 @@ pub struct Chain {
     /// them. A block's own failure and the blocks invalidateblock disconnects
     /// are written (BlockInvalidationHelpers.cpp:128-136)
     inherited_failed: RwLock<std::collections::HashSet<Hash256>>,
+    /// The order this run received each block in: Divi Core's nSequenceId,
+    /// given as a block's data is stored with its parent's
+    /// (UpdateBlockCandidatesAndSuccessors, BlockInvalidationHelpers.cpp:55-58)
+    /// and never written, so a block loaded at start has none and counts as
+    /// 0 (chain.h:151), before every block received since (ids from 1,
+    /// BlockInvalidationHelpers.cpp:23)
+    received_order: Mutex<std::collections::HashMap<Hash256, u64>>,
     /// Divi Core's fLargeWorkInvalidChainFound (Warnings.cpp:7)
     invalid_chain_found: std::sync::atomic::AtomicBool,
     /// IsInitialBlockDownload's latch: once out, never in again
@@ -646,6 +653,7 @@ impl Chain {
             consensus_sporks: Arc::new(RwLock::new(ConsensusSporks::default())),
             most_work_invalid: RwLock::new(None),
             inherited_failed: RwLock::new(std::collections::HashSet::new()),
+            received_order: Mutex::new(std::collections::HashMap::new()),
             invalid_chain_found: std::sync::atomic::AtomicBool::new(false),
             left_initial_download: std::sync::atomic::AtomicBool::new(false),
             fork_warning_listeners: RwLock::new(Vec::new()),
@@ -2538,6 +2546,7 @@ impl Chain {
         // which then fed the wrong kernel block time into PoS validation
         // (mainnet block 4,168,729 rejected).
         self.db.store_block_index_entry(&index)?;
+        self.note_received(&hash);
         debug!("  ├─ Storage: ✅ COMPLETE");
 
         // 8b. Track the best known block (highest chain work we've seen).
@@ -2990,6 +2999,11 @@ impl Chain {
                 }
                 return Err(e);
             }
+            // The tip takes the index as connected (valid, on the main
+            // chain), as stored; a disconnect writes back what the tip holds
+            if index_mut.hash == new_index.hash {
+                *new_index = index_mut;
+            }
         }
 
         self.db.delete_metadata(REORG_TARGET_KEY)?;
@@ -3415,15 +3429,20 @@ impl Chain {
             .into_iter()
             .filter(|i| !self.is_failed(i) && i.status.contains(BlockStatus::HAVE_DATA))
             .collect();
-        candidates.sort_by(|a, b| Self::compare_chain_work(&b.chain_work, &a.chain_work));
+        // Divi Core's order (CBlockIndexWorkComparator): most work first,
+        // then the earliest received
+        candidates.sort_by_cached_key(|i| {
+            (
+                std::cmp::Reverse(Self::work_key(&i.chain_work)),
+                self.received(&i.hash),
+            )
+        });
         for cand in candidates {
             let tip = match self.tip.read().clone() {
                 Some(t) => t,
                 None => return Ok(Vec::new()),
             };
-            if Self::compare_chain_work(&cand.chain_work, &tip.chain_work)
-                != std::cmp::Ordering::Greater
-            {
+            if !self.better_tip(&cand, &tip) {
                 break;
             }
             *self.best_known_block.write() = Some(cand);
@@ -4542,7 +4561,37 @@ impl Chain {
         std::cmp::Ordering::Equal
     }
 
-    /// Update the best known block if the given index has more chain work.
+    /// The chain work as a big-endian key, which orders as the work does
+    fn work_key(work: &[u8; 32]) -> [u8; 32] {
+        let mut key = *work;
+        key.reverse();
+        key
+    }
+
+    /// When this run received the block (see `received_order`)
+    fn received(&self, hash: &Hash256) -> u64 {
+        self.received_order.lock().get(hash).copied().unwrap_or(0)
+    }
+
+    fn note_received(&self, hash: &Hash256) {
+        let mut order = self.received_order.lock();
+        let next = order.len() as u64 + 1;
+        order.entry(*hash).or_insert(next);
+    }
+
+    /// Whether `a` is a better tip than `b` in Divi Core's order
+    /// (CBlockIndexWorkComparator, BlockIndexWork.h:12-30): more work, or as
+    /// much and received earlier. Two blocks received alike (both loaded at
+    /// start) Core orders by their address in memory, which nothing keeps
+    /// from one start to the next; here neither is better, so the tip stays.
+    fn better_tip(&self, a: &BlockIndex, b: &BlockIndex) -> bool {
+        match Self::compare_chain_work(&a.chain_work, &b.chain_work) {
+            std::cmp::Ordering::Equal => self.received(&a.hash) < self.received(&b.hash),
+            other => other == std::cmp::Ordering::Greater,
+        }
+    }
+
+    /// Update the best known block if the given index is a better tip.
     ///
     /// Called after storing a new block index so that `activate_best_chain`
     /// can later detect that a side chain has surpassed the current tip.
@@ -4555,10 +4604,7 @@ impl Chain {
         let mut best = self.best_known_block.write();
         let dominated = match &*best {
             None => true,
-            Some(current_best) => {
-                Self::compare_chain_work(&index.chain_work, &current_best.chain_work)
-                    == std::cmp::Ordering::Greater
-            }
+            Some(current_best) => self.better_tip(index, current_best),
         };
         if dominated {
             *best = Some(index.clone());
@@ -4607,9 +4653,10 @@ impl Chain {
             return Ok(None);
         }
 
-        // Only reorg if the best known block has strictly more work
-        let cmp = Self::compare_chain_work(&best_block.chain_work, &current_tip.chain_work);
-        if cmp != std::cmp::Ordering::Greater {
+        // Only reorg to a better tip: more work, or as much and received
+        // earlier (Divi Core's FindMostWorkChain takes the first of
+        // setBlockIndexCandidates, BlockCheckingHelpers.cpp:315-320)
+        if !self.better_tip(&best_block, &current_tip) {
             return Ok(None);
         }
 
@@ -8999,6 +9046,115 @@ mod tests {
         chain.invalidate_block(&hash_a1).unwrap();
         assert_eq!(chain.tip().unwrap().hash, hash_b1);
         assert_eq!(chain.height(), 1);
+    }
+
+    /// Divi Core orders tips of equal work by the order their blocks were
+    /// received (CBlockIndexWorkComparator, BlockIndexWork.h:18-20), so
+    /// reconsiderblock of a tip seen before an equal-work sibling moves back
+    /// to it.
+    #[test]
+    fn reconsiderblock_returns_to_the_equal_work_tip_seen_first() {
+        let (chain, _dir) = create_test_chain();
+        let (genesis_hash, genesis_time) = get_genesis_info(&chain);
+        let a1 = create_child_block_with_pubkey(genesis_hash, genesis_time, [0x0a; 20]);
+        let hash_a1 = chain.accept_block(a1).unwrap().hash;
+        let b1 = create_child_block_with_pubkey(genesis_hash, genesis_time + 1, [0x1a; 20]);
+        let hash_b1 = chain.accept_block(b1).unwrap().hash;
+        assert_eq!(chain.tip().unwrap().hash, hash_a1, "the first seen stays");
+
+        chain.invalidate_block(&hash_a1).unwrap();
+        assert_eq!(chain.tip().unwrap().hash, hash_b1);
+        chain.reconsider_block(&hash_a1).unwrap();
+        assert_eq!(chain.tip().unwrap().hash, hash_a1, "as divid: seen first");
+    }
+
+    /// Two equal-work tips above a block that is invalidated and reconsidered:
+    /// Divi Core takes the one received first, whatever the hashes. A is
+    /// received first and is the later of the two in the block index's key
+    /// order.
+    #[test]
+    fn reconsiderblock_below_equal_work_tips_takes_the_one_seen_first() {
+        let (chain, _dir) = create_test_chain();
+        let (genesis_hash, genesis_time) = get_genesis_info(&chain);
+        let p1 = create_child_block_with_pubkey(genesis_hash, genesis_time, [0x0a; 20]);
+        let hash_p1 = chain.accept_block(p1.clone()).unwrap().hash;
+        let x2 = create_child_block_with_pubkey(hash_p1, p1.header.time, [0x0b; 20]);
+        let y2 = create_child_block_with_pubkey(hash_p1, p1.header.time + 1, [0x1b; 20]);
+        let key = |hash: &Hash256| crate::block_index::block_index_key(hash);
+        let (a2, b2) = if key(&divi_crypto::compute_block_hash(&x2.header))
+            > key(&divi_crypto::compute_block_hash(&y2.header))
+        {
+            (x2, y2)
+        } else {
+            (y2, x2)
+        };
+        let hash_a2 = chain.accept_block(a2).unwrap().hash;
+        let hash_b2 = chain.accept_block(b2).unwrap().hash;
+        assert!(key(&hash_a2) > key(&hash_b2));
+        assert_eq!(chain.tip().unwrap().hash, hash_a2);
+
+        chain.invalidate_block(&hash_p1).unwrap();
+        assert_eq!(chain.tip().unwrap().hash, genesis_hash);
+        chain.reconsider_block(&hash_p1).unwrap();
+        assert_eq!(chain.tip().unwrap().hash, hash_a2, "as divid: seen first");
+    }
+
+    /// Divi Core does not keep the receive order: blocks loaded at start all
+    /// count as received before any block received since (nSequenceId 0,
+    /// chain.h:151; ids from 1, BlockInvalidationHelpers.cpp:23). So after a
+    /// restart, reconsiderblock of the loaded tip moves back to it from an
+    /// equal-work sibling received after the restart.
+    #[test]
+    fn after_a_restart_reconsiderblock_returns_to_the_loaded_equal_work_tip() {
+        let dir = tempdir().unwrap();
+        let params = ChainParams::for_network(NetworkType::Regtest, ChainMode::Divi);
+        let (hash_a1, genesis_hash, genesis_time) = {
+            let db = Arc::new(ChainDatabase::open(dir.path()).unwrap());
+            let chain = Chain::new(db, params.clone()).unwrap();
+            let (genesis_hash, genesis_time) = get_genesis_info(&chain);
+            let a1 = create_child_block_with_pubkey(genesis_hash, genesis_time, [0x0a; 20]);
+            (
+                chain.accept_block(a1).unwrap().hash,
+                genesis_hash,
+                genesis_time,
+            )
+        };
+        let db = Arc::new(ChainDatabase::open(dir.path()).unwrap());
+        let chain = Chain::new(db, params).unwrap();
+        let b1 = create_child_block_with_pubkey(genesis_hash, genesis_time + 1, [0x1a; 20]);
+        let hash_b1 = chain.accept_block(b1).unwrap().hash;
+        assert_eq!(chain.tip().unwrap().hash, hash_a1);
+
+        chain.invalidate_block(&hash_a1).unwrap();
+        assert_eq!(chain.tip().unwrap().hash, hash_b1);
+        chain.reconsider_block(&hash_a1).unwrap();
+        assert_eq!(chain.tip().unwrap().hash, hash_a1, "as divid: loaded first");
+    }
+
+    /// A block first connected as the target of a reorganization, then left
+    /// by another, is a valid-fork tip as divid shows it: its stored index
+    /// keeps BLOCK_VALID_SCRIPTS (getchaintips, rpcblockchain.cpp), which the
+    /// disconnect must not write back from an older copy.
+    #[test]
+    fn a_reorganization_target_left_again_stays_a_valid_fork() {
+        let (chain, _dir) = create_test_chain();
+        let (genesis_hash, genesis_time) = get_genesis_info(&chain);
+        let a1 = create_child_block_with_pubkey(genesis_hash, genesis_time, [0x0a; 20]);
+        let hash_a1 = chain.accept_block(a1.clone()).unwrap().hash;
+        let b1 = create_child_block_with_pubkey(genesis_hash, genesis_time + 1, [0x1a; 20]);
+        let hash_b1 = chain.accept_block(b1.clone()).unwrap().hash;
+        let b2 = create_child_block_with_pubkey(hash_b1, b1.header.time, [0x1b; 20]);
+        let hash_b2 = chain.accept_block(b2).unwrap().hash;
+        assert_eq!(chain.tip().unwrap().hash, hash_b2, "reorganized to B");
+        let a2 = create_child_block_with_pubkey(hash_a1, a1.header.time, [0x0b; 20]);
+        let hash_a2 = chain.accept_block(a2.clone()).unwrap().hash;
+        let a3 = create_child_block_with_pubkey(hash_a2, a2.header.time, [0x0c; 20]);
+        let hash_a3 = chain.accept_block(a3).unwrap().hash;
+        assert_eq!(chain.tip().unwrap().hash, hash_a3, "reorganized back to A");
+
+        let tips = chain.get_chain_tips().unwrap();
+        let b2_tip = tips.iter().find(|t| t.hash == hash_b2).unwrap();
+        assert_eq!(b2_tip.status, ChainTipStatus::ValidFork, "{tips:?}");
     }
 
     /// repair_height_index restores entries a pre-fix build corrupted and
