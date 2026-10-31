@@ -68,6 +68,8 @@ pub struct Ctx {
     pub rpc_refused: Vec<String>,
     /// the data dir whose node answers them
     pub rpc_datadir: Option<usize>,
+    /// B6.1 `--capture`: minutes, events and the watched data dir
+    pub capture: crate::collectors::capture::Plan,
 }
 
 impl Ctx {

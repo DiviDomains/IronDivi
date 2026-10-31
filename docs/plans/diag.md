@@ -497,6 +497,32 @@ Tested on hp1, hp2 and hp3 as a user and as root; on macOS only
   block hashes (other than the `blk:` tip), 100 txids, the addresses,
   the hostname, the user, the home path or `rpcpassword` reached the
   package.
+- B6.1 `--capture <minutes> [--until <event>]` was built (crates/
+  divi-diag/src/collectors/capture.rs). Minutes are 1 to 10080 (7 days);
+  `--until` takes a comma list and repeats; `--until` without
+  `--capture`, and `--capture` with `--import`/`--send`, are usage
+  errors. The node watched is the observed data dir's, and it must be
+  running, else the capture is skipped with a note and the collection
+  runs. Every 10 s, after the R1 (a) free-space check, one line goes to
+  `capture/samples.txt`: time, seconds since start, alive or GONE, the
+  node's resident memory, `getblockcount`, `getconnectioncount`, load
+  average, free memory and Linux PSI `some avg10`; each line is flushed
+  at once, so a killed capture keeps its samples. With a terminal the
+  run prints the tmux, screen and (Linux) `systemd-run --user` command
+  lines that keep a capture running after the terminal closes.
+  Deviations: one snapshot only (the normal collection runs once, after
+  the capture ends); `fork`, `ban` and `incident` events are not built
+  and are refused at parse time; `stall` is the tip unmoved for 600 s;
+  the 200 MB output cap stops writing rather than thinning samples (10 s
+  lines over 7 days stay far below it); a free-space shortfall stops the
+  capture rather than moving it; Ctrl+C (SIGINT) ends only the capture
+  and the collection follows, while SIGTERM/SIGHUP end the run. Tested
+  for real on hp1 against a regtest node: time up (6 samples in 1 min),
+  `--until exit` with the node stopped at 25 s, `peers<1` firing at
+  once, no running node, usage errors, and Ctrl+C under tmux (3 samples
+  kept, collection complete); no hostname, user, home path or
+  `rpcpassword` reached the package. Not tested: the Mac paths
+  (`sysctl vm.loadavg`, `ps` resident memory).
 - Smaller: `irondivi-cli --version` exits 1 with the usage text; the
   first divi-diag commit (d3502999) lacks its `Cargo.lock` entry, so
   `--locked` builds need c83a9dd4 or later; `diag --run` (B3) and the

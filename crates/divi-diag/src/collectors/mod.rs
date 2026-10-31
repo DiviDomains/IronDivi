@@ -17,6 +17,7 @@ use crate::util::{self, CmdOut};
 use std::path::Path;
 use std::time::Duration;
 
+pub mod capture;
 pub mod chain;
 pub mod components;
 pub mod files;
@@ -76,6 +77,11 @@ pub static OBSERVED: Spec = Spec { id: "B3", name: "observed", secs: 660, what: 
 /// calls the user named; every call has 2 s, all of them 60 s together
 pub static RPC: Spec = Spec { id: "B6.5", name: "rpc", secs: 75, what: "RPC calls you named" };
 
+/// B6.1 `--capture`: not in [`ALL`]; runs first, for the minutes the
+/// user gave (the parent sets the budget); the collection after it is the
+/// snapshot
+pub static CAPTURE: Spec = Spec { id: "B6.1", name: "capture", secs: 0, what: "samples every 10 s (--capture)" };
+
 /// B2 items this version does not collect; listed in the summary
 pub static NOT_YET: &[&str] = &[];
 
@@ -107,6 +113,7 @@ pub fn run(name: &str, ctx: &Ctx, o: &mut Out) -> bool {
         "install" => files::install(ctx, o),
         "observed" => observed::observed(ctx, o),
         "rpc" => rpc::rpc(ctx, o),
+        "capture" => capture::capture(ctx, o),
         _ => return false,
     }
     true

@@ -20,8 +20,10 @@
 //! `--attach <file>` (B6.6, [`attach`]): a file the user names, redacted,
 //! JSON through the RPC answer layer ([`rpcjson`]). `--rpc <method>
 //! [args…]` (B6.5, [`collectors::rpc`]): one allowlisted, clamped call to
-//! the running node, its answer through the same layer. Not in this crate
-//! yet: `--capture`, `--tx`, `--rpc-clear` and the host package (B6.2).
+//! the running node, its answer through the same layer. `--capture
+//! <minutes> [--until <event>]` (B6.1, [`collectors::capture`]): a sample
+//! every 10 s before the collection. Not in this crate yet: `--tx`,
+//! `--rpc-clear` and the host package (B6.2).
 
 pub mod attach;
 pub mod collectors;
@@ -72,11 +74,16 @@ pub struct Options {
     /// `--rpc <method> [args…]`: the method, then every word up to the
     /// next `--` option (B6.5)
     pub rpc: Vec<(String, Vec<String>)>,
+    /// `--capture <minutes>` (B6.1)
+    pub capture: Option<u64>,
+    /// `--until <event>[,<event>]`, repeatable (B6.1)
+    pub until: Vec<collectors::capture::Until>,
 }
 
 const USAGE: &str = "usage: irondivi-cli diag [--datadir DIR] [--conf FILE] [--run|--no-run] \
 [--submit|--no-submit] [--out DIR] [--offline] [--no-fsync-test] [--report-file FILE] \
-[--attach FILE [--attach-method METHOD]]... [--rpc METHOD [ARG...]]...\n       \
+[--attach FILE [--attach-method METHOD]]... [--rpc METHOD [ARG...]]... \
+[--capture MINUTES [--until exit|stall|'rss>MB'|'peers<N']...]\n       \
 irondivi-cli diag --import <folder|-> [--keep-raw] [--out DIR] [--no-submit]\n       \
 irondivi-cli diag --send <folder>";
 
@@ -121,6 +128,25 @@ pub fn parse_options(args: &[String]) -> Result<Options, String> {
                 }
                 o.rpc.push((m, words));
             }
+            "--capture" => {
+                let v = value(&mut i)?;
+                let m: u64 = v.parse().map_err(|_| format!("--capture {v}: minutes, a whole number"))?;
+                if m == 0 || m > collectors::capture::MAX_MINUTES {
+                    return Err(format!(
+                        "--capture {m}: from 1 to {} minutes (7 days)",
+                        collectors::capture::MAX_MINUTES
+                    ));
+                }
+                o.capture = Some(m);
+            }
+            "--until" => {
+                for w in value(&mut i)?.split(',').filter(|w| !w.trim().is_empty()) {
+                    let u = collectors::capture::parse_until(w)?;
+                    if !o.until.contains(&u) {
+                        o.until.push(u);
+                    }
+                }
+            }
             "--attach-method" => {
                 let m = value(&mut i)?;
                 match o.attach.last_mut() {
@@ -139,6 +165,9 @@ pub fn parse_options(args: &[String]) -> Result<Options, String> {
             _ => return Err(format!("unknown option {a}")),
         }
         i += 1;
+    }
+    if !o.until.is_empty() && o.capture.is_none() {
+        return Err("--until belongs to --capture".into());
     }
     Ok(o)
 }
@@ -162,6 +191,10 @@ pub fn run(args: &[String]) -> i32 {
             }
             (i, s) if !o.rpc.is_empty() && (i.is_some() || s.is_some()) => {
                 eprintln!("irondivi-cli diag: --rpc is part of a collection run, not of --import or --send\n{USAGE}");
+                EX_USAGE
+            }
+            (i, s) if o.capture.is_some() && (i.is_some() || s.is_some()) => {
+                eprintln!("irondivi-cli diag: --capture is part of a collection run, not of --import or --send\n{USAGE}");
                 EX_USAGE
             }
             (i, s) if !o.attach.is_empty() && (i.is_some() || s.is_some()) => {
@@ -206,6 +239,20 @@ mod tests {
         assert_eq!(o.rpc, vec![("listtransactions".to_string(), s(&["*", "5000"])), ("getblockcount".to_string(), vec![])]);
         assert!(o.offline);
         assert!(parse_options(&s(&["--rpc"])).is_err());
+    }
+
+    #[test]
+    fn capture_options() {
+        use collectors::capture::Until;
+        let o = parse_options(&s(&["--capture", "90", "--until", "exit,rss>4000", "--until=peers<3"])).unwrap();
+        assert_eq!(o.capture, Some(90));
+        assert_eq!(o.until, vec![Until::Exit, Until::RssOver(4000), Until::PeersUnder(3)]);
+        assert!(parse_options(&s(&["--capture", "0"])).is_err());
+        assert!(parse_options(&s(&["--capture", "10081"])).is_err());
+        assert!(parse_options(&s(&["--capture", "10080"])).is_ok());
+        assert!(parse_options(&s(&["--until", "exit"])).unwrap_err().contains("--capture"));
+        assert!(parse_options(&s(&["--capture", "5", "--until", "fork"])).is_err());
+        assert_eq!(run(&s(&["--capture", "5", "--send", "x"])), EX_USAGE);
     }
 
     #[test]

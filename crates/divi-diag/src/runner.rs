@@ -138,7 +138,7 @@ fn kernel_at_least(maj: u32, min: u32) -> bool {
 }
 
 /// Resident memory of a child, for the poll mechanisms
-fn rss_of(pid: u32) -> Option<u64> {
+pub(crate) fn rss_of(pid: u32) -> Option<u64> {
     if cfg!(target_os = "linux") {
         let s = fs::read_to_string(format!("/proc/{pid}/statm")).ok()?;
         let pages: u64 = s.split_whitespace().nth(1)?.parse().ok()?;
@@ -260,7 +260,7 @@ fn reserve(out_dev: u64, total: u64, ctx: &Ctx) -> u64 {
 }
 
 /// Is there room to keep writing to `dir` under the free-space rule?
-fn room(dir: &Path, ctx: &Ctx) -> Result<(), String> {
+pub(crate) fn room(dir: &Path, ctx: &Ctx) -> Result<(), String> {
     let dev = fs::metadata(dir).map(|m| m.dev()).map_err(|e| util::io_err(&e))?;
     let (free, total, _, _) = util::statvfs(dir).ok_or("statvfs failed")?;
     let need = reserve(dev, total, ctx);
@@ -339,7 +339,7 @@ fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
 pub fn parent_main(o: Options) -> i32 {
     unsafe { libc::umask(0o077) };
     install_signal_handlers();
-    let t0 = Instant::now();
+    let mut t0 = Instant::now();
 
     // B1.1 discovery
     let known = discovery::known_values();
@@ -384,6 +384,20 @@ pub fn parent_main(o: Options) -> i32 {
         match observed_target(&ctx, &o) {
             Ok(n) => ctx.rpc_datadir = Some(n),
             Err(why) => ctx.rpc_refused.push(format!("no --rpc call made: {why}")),
+        }
+    }
+    // B6.1: the node to watch is the one --datadir names, else the only
+    // data dir; it must be running
+    let mut capture_skip = None;
+    if let Some(m) = o.capture {
+        ctx.capture.minutes = m;
+        ctx.capture.until = o.until.clone();
+        match observed_target(&ctx, &o) {
+            Ok(n) if ctx.datadirs.iter().any(|d| d.n == n && ctx.node_for(d).is_some()) => {
+                ctx.capture.datadir = Some(n)
+            }
+            Ok(n) => capture_skip = Some(format!("no node is running on datadir-{n}")),
+            Err(why) => capture_skip = Some(why),
         }
     }
     let red = Arc::new(ctx.redactor());
@@ -462,6 +476,42 @@ pub fn parent_main(o: Options) -> i32 {
     p.log.log("memory cap: cgroup scopes are not implemented in this version");
     p.log_discovery();
     eprintln!("irondivi-cli diag: writing to {}", out.display());
+
+    // B6.1 first: the samples, then the normal collection is the snapshot
+    if let Some(why) = capture_skip {
+        eprintln!("irondivi-cli diag: --capture: not run: {why}");
+        p.notes.push(format!("--capture (B6.1) not run: {why}."));
+    } else if p.ctx.capture.datadir.is_some() {
+        let m = p.ctx.capture.minutes;
+        if util::is_tty() {
+            let args: Vec<String> = std::env::args()
+                .skip_while(|a| a != "diag")
+                .skip(1)
+                .map(|a| if a.chars().all(|c| c.is_ascii_alphanumeric() || "-_=./,".contains(c)) { a } else { format!("'{a}'") })
+                .collect();
+            eprintln!(
+                "irondivi-cli diag: --capture samples the node every 10 s for {m} min, then collects as usual.\n\
+                 Ctrl+C ends the capture early and goes on to the collection. To keep it running after\n\
+                 this terminal closes, start it as one of these (the folder is then reviewed with --send):\n{}",
+                collectors::capture::keep_running_hint(&args.join(" "))
+            );
+        }
+        let spec = &collectors::CAPTURE;
+        p.run_one(spec, Duration::from_secs(m * 60 + 30), None);
+        if STOP.load(Ordering::SeqCst) && STOP_SIG.load(Ordering::SeqCst) == libc::SIGINT {
+            // Ctrl+C ends the capture, not the run: the snapshot follows
+            STOP.store(false, Ordering::SeqCst);
+            STOP_SIG.store(0, Ordering::SeqCst);
+            p.log.log("capture: ended by Ctrl+C; the collection follows");
+            p.notes.push("--capture (B6.1) was ended early by Ctrl+C.".into());
+        }
+        if let Ok(t) = fs::read_to_string(p.out.join("capture/ended.txt")) {
+            p.log.log(&format!("capture: ended: {}", t.trim()));
+        }
+        p.write_summary();
+        // the collection has its own budget after the capture
+        t0 = Instant::now();
+    }
 
     for spec in collectors::ALL {
         if STOP.load(Ordering::SeqCst) {

@@ -261,6 +261,7 @@ pub fn why(collector: &str) -> String {
         "diag" => "diag's own summary and log".into(),
         "attach" => "attached by you (B6.6)".into(),
         "rpc" => "RPC calls you named (B6.5)".into(),
+        "capture" => "samples every 10 s while the capture ran (B6.1)".into(),
         "observed" => "observed start of irondivid (B3)".into(),
         c => crate::collectors::ALL
             .iter()
