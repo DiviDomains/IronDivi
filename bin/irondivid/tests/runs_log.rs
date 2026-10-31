@@ -109,54 +109,81 @@ fn kinds(log: &str) -> Vec<String> {
 fn each_run_records_its_start_phases_stop_and_exit() {
     let dir = tempfile::tempdir().unwrap();
 
-    // Run 1: stopped by SIGTERM
+    // Run 1: stopped by SIGTERM, sent by this process
     let (mut node, _) = start(dir.path());
-    let pid = node.0.id().to_string();
-    let killed = Command::new("kill").args(["-TERM", &pid]).status().unwrap();
-    assert!(killed.success());
+    assert_eq!(unsafe { libc::kill(node.0.id() as i32, libc::SIGTERM) }, 0);
     assert!(wait_exit(&mut node).success());
 
-    // Run 2: stopped by the stop RPC
+    // Run 2: SIGHUP reopens debug.log and the node keeps running; then the
+    // stop RPC
     let (mut node, rpc_port) = start(dir.path());
+    assert_eq!(unsafe { libc::kill(node.0.id() as i32, libc::SIGHUP) }, 0);
+    wait_for(dir.path(), " signal signo=HUP ");
+    assert!(rpc(rpc_port, "getblockcount").is_some());
     rpc(rpc_port, "stop").expect("stop reply");
     assert!(wait_exit(&mut node).success());
 
     let log = runs_log(dir.path());
-    let run = [
-        "start",
-        "phase:config",
-        "phase:datadir",
-        "phase:lock",
-        "phase:db-open",
-        "phase:network",
-        "phase:wallet-load",
-        "phase:staking",
-        "phase:rpc",
-        "phase:running",
-        "stop-requested",
-        "exit",
-    ];
-    let expected: Vec<String> = run
-        .iter()
-        .chain(run.iter())
-        .map(|s| s.to_string())
+    let run = |signal: bool| {
+        let mut kinds = vec![
+            "start",
+            "phase:config",
+            "phase:datadir",
+            "phase:lock",
+            "phase:db-open",
+            "phase:network",
+            "phase:wallet-load",
+            "phase:staking",
+            "phase:rpc",
+            "phase:running",
+        ];
+        if signal {
+            kinds.push("signal");
+        }
+        kinds.extend(["stop-requested", "exit"]);
+        kinds
+    };
+    let expected: Vec<String> = run(true)
+        .into_iter()
+        .chain(run(true))
+        .map(String::from)
         .collect();
     assert_eq!(kinds(&log), expected, "{log}");
 
     let lines: Vec<&str> = log.lines().collect();
     assert!(lines[0].contains(" start run=1 "), "{log}");
-    assert!(lines[12].contains(" start run=2 "), "{log}");
+    assert!(lines[13].contains(" start run=2 "), "{log}");
     assert!(lines[0].contains(" network=regtest/divi "), "{log}");
     assert!(lines[0].contains(" daemon=no "), "{log}");
+    // The sender: this test process, its command line masked
+    let me = std::process::id();
+    let uid = unsafe { libc::getuid() };
     assert!(
-        lines[10].ends_with(" stop-requested by=signal=TERM"),
+        lines[10].contains(&format!(
+            " signal signo=TERM code=SI_USER pid={me} uid={uid} sender=read comm=\"runs_log"
+        )),
         "{log}"
     );
-    assert!(lines[22].ends_with(" stop-requested by=rpc"), "{log}");
-    for i in [11, 23] {
+    assert!(lines[10].contains(" action=stop count=1"), "{log}");
+    let cmd = lines[10].split(" cmd=\"").nth(1).unwrap();
+    let cmd = &cmd[..cmd.find('"').unwrap()];
+    assert!(cmd.starts_with("runs_log") && !cmd.contains('/'), "{log}");
+    assert!(
+        lines[11].ends_with(" stop-requested by=signal=TERM"),
+        "{log}"
+    );
+    assert!(
+        lines[23].contains(" signal signo=HUP code=SI_USER "),
+        "{log}"
+    );
+    assert!(lines[23].contains(" action=reopen-log"), "{log}");
+    assert!(lines[24].ends_with(" stop-requested by=rpc"), "{log}");
+    for i in [12, 25] {
         assert!(lines[i].contains(" exit code=0 "), "{log}");
         assert!(lines[i].contains(" peak_rss_kb="), "{log}");
+        assert!(lines[i].ends_with(" sigpipe=0 epipe=0"), "{log}");
     }
+    assert_eq!(log.matches(" stop-requested ").count(), 2, "{log}");
     // <RFC 3339 UTC µs> mono=<s.µs> <kind>
     for line in &lines {
         let mut words = line.split(' ');
@@ -267,6 +294,68 @@ fn a_daemon_records_its_forks_with_one_thread() {
     assert!(killed.success());
     let log = wait_for(" exit code=0 ");
     assert!(log.contains(" stop-requested by=signal=TERM"), "{log}");
+}
+
+/// The runs.log text once it holds `what` (two minutes at most)
+fn wait_for(dir: &Path, what: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let log = runs_log(dir);
+        if log.contains(what) {
+            return log;
+        }
+        assert!(Instant::now() < deadline, "no {what:?} in runs.log:\n{log}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// A3: the second stop signal is recorded and ignored; the third ends the
+/// process with code 10 from the signal handler, which writes the exit
+/// record itself and leaves the marker, so the next start finds the exit
+#[test]
+fn a_third_stop_signal_ends_the_run_with_code_10() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut node, _) = start(dir.path());
+    let pid = node.0.id() as i32;
+    // All three pending at once, so the node cannot finish stopping between
+    // them: stopped, three different stop signals (two of the same kind
+    // would merge), then resumed
+    for signo in [
+        libc::SIGSTOP,
+        libc::SIGTERM,
+        libc::SIGINT,
+        libc::SIGQUIT,
+        libc::SIGCONT,
+    ] {
+        assert_eq!(unsafe { libc::kill(pid, signo) }, 0);
+    }
+    assert_eq!(wait_exit(&mut node).code(), Some(10));
+    assert!(
+        marker(dir.path()).is_some(),
+        "the third signal removed the marker"
+    );
+    let log = runs_log(dir.path());
+    assert!(
+        log.lines()
+            .any(|l| l.contains(" code=SI_USER pid=") && l.ends_with(" action=exit count=3")),
+        "{log}"
+    );
+    let exit = log.lines().find(|l| l.contains(" exit code=")).expect(&log);
+    assert!(exit.contains(" exit code=10 run=1 "), "{log}");
+    assert!(exit.contains(" reason=\"a third stop signal\" "), "{log}");
+    assert!(exit.ends_with(" sigpipe=0 epipe=0"), "{log}");
+    assert_eq!(exit.split(' ').next().unwrap().len(), 27, "{log}");
+
+    let (mut node, rpc_port) = start(dir.path());
+    let log = runs_log(dir.path());
+    let unclean = log
+        .lines()
+        .find(|l| l.contains(" unclean-previous "))
+        .expect(&log);
+    assert!(unclean.contains(" verdict=exit-recorded "), "{log}");
+    assert!(unclean.contains(" exit_recorded=yes "), "{log}");
+    rpc(rpc_port, "stop").expect("stop reply");
+    assert!(wait_exit(&mut node).success());
 }
 
 fn marker(dir: &Path) -> Option<String> {

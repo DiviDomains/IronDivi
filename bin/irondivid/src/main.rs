@@ -28,6 +28,8 @@ mod private_files;
 mod running_marker;
 mod runs_log;
 mod settings;
+#[cfg(unix)]
+mod signals;
 mod snapshot_sig;
 
 use anyhow::{Context, Result};
@@ -44,6 +46,7 @@ use std::error::Error as StdError;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+#[cfg(not(unix))]
 use tokio::signal;
 use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
@@ -64,6 +67,10 @@ fn console_line(to_stdout: bool, line: std::fmt::Arguments<'_>) {
         writeln!(std::io::stderr(), "{}", line)
     };
     if let Err(e) = written {
+        #[cfg(unix)]
+        if e.kind() == std::io::ErrorKind::BrokenPipe {
+            signals::note_epipe();
+        }
         if !CONSOLE_LOST.swap(true, std::sync::atomic::Ordering::Relaxed) {
             // The log line's own timestamp says when
             warn!(
@@ -112,7 +119,9 @@ mod exit_code {
 /// debug.log and the console, the log writer is flushed, and the process
 /// ends with `_exit`, which runs no destructors: RocksDB's would join its
 /// thread pools. The only way irondivid exits with a code other than 0
-/// or 101 (A9, R3); a test refuses any other exit path in this crate.
+/// or 101 (A9, R3), apart from signals.rs: a third stop signal (10) and a
+/// signal whose default action ends the process (128+N), which write their
+/// own exit records. A test refuses any other exit call in this crate.
 fn die(code: i32, reason: std::fmt::Arguments<'_>) -> ! {
     let reason = reason.to_string();
     // Durable before anything else that could stall (A1); a no-op before
@@ -3307,6 +3316,10 @@ fn main() {
     }
     // Before the -daemon forks hide the parent and the terminal (A1)
     runs_log::note_launch();
+    // Every signal is recorded from here on (A3); fds 0-2 are open, so the
+    // handler's pipe does not take one. Its thread starts after the forks.
+    #[cfg(unix)]
+    signals::install();
     // Before anything is written: the datadir holds the wallet and the RPC cookie (NODE-3)
     private_files::restrict_umask();
     // A core dump would hold unlocked wallet keys (NODE-10)
@@ -3465,6 +3478,11 @@ fn main() {
         console!("Warning: Daemon mode is only supported on Unix systems, running in foreground");
     }
 
+    // The thread that records signals and acts on them (A3); those received
+    // before now wait in its pipe
+    #[cfg(unix)]
+    signals::start_writer();
+
     // A credential change would make the process dumpable again, and a pipe core handler
     // would then store a core holding wallet keys (NODE-10). A plain thread, started after
     // the forks and before the wallet opens, so a stalled runtime cannot stop it. Until the
@@ -3567,6 +3585,11 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
         || args.sign_snapshot.is_some()
         || args.verify_snapshot.is_some()
         || args.export_chain;
+    // A stop signal ends a one-shot command at once, as before A3
+    #[cfg(unix)]
+    if one_shot {
+        signals::one_shot();
+    }
     if !one_shot {
         let network = if args.regtest {
             "regtest"
@@ -3618,60 +3641,29 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
 
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
 
-    // SIGHUP reopens debug.log and the node keeps running, as Divi Core does
-    // (init.cpp:513-516), so a logrotate postrotate line does not stop it
+    // Stop signals (TERM, INT, QUIT) reach the node from here; one received
+    // earlier is delivered now. SIGHUP reopens debug.log and the node keeps
+    // running, as Divi Core does (init.cpp:513-516). See signals.rs (A3).
     #[cfg(unix)]
+    signals::set_stop_sink(shutdown_tx.clone(), !log_config_console);
+    #[cfg(not(unix))]
     {
-        let mut hangup = signal::unix::signal(signal::unix::SignalKind::hangup())
-            .context("Failed to install SIGHUP handler")?;
+        let shutdown_tx_clone = shutdown_tx.clone();
+        let console = !log_config_console;
         tokio::spawn(async move {
-            while hangup.recv().await.is_some() {
-                REOPEN_LOG.store(true, std::sync::atomic::Ordering::Relaxed);
-                info!("Received SIGHUP, reopening debug.log");
+            if let Err(e) = signal::ctrl_c().await {
+                error!("Ctrl+C handler failed: {}", e);
+                return;
+            }
+            // The stop goes out before anything is written to the console (D1)
+            let _ = shutdown_tx_clone.send(());
+            runs_log::stop_requested("signal=INT");
+            info!("Received Ctrl+C, initiating shutdown...");
+            if console {
+                console!("Received Ctrl+C, stopping...");
             }
         });
     }
-
-    // Set up signal handler
-    let shutdown_tx_clone = shutdown_tx.clone();
-    let console = !log_config_console;
-    // Installed here, not inside the task, so a failure stops start-up with
-    // an error line instead of a panic in a task nobody joins
-    #[cfg(unix)]
-    let mut interrupt = signal::unix::signal(signal::unix::SignalKind::interrupt())
-        .context("Failed to install SIGINT handler")?;
-    #[cfg(unix)]
-    let mut terminate = signal::unix::signal(signal::unix::SignalKind::terminate())
-        .context("Failed to install SIGTERM handler")?;
-    tokio::spawn(async move {
-        #[cfg(unix)]
-        let ctrl_c = interrupt.recv();
-        #[cfg(not(unix))]
-        let ctrl_c = async {
-            if let Err(e) = signal::ctrl_c().await {
-                error!("Ctrl+C handler failed: {}", e);
-                std::future::pending::<()>().await;
-            }
-        };
-
-        #[cfg(unix)]
-        let terminate = terminate.recv();
-        #[cfg(not(unix))]
-        let terminate = std::future::pending::<()>();
-
-        // The stop goes out before anything is written to the console: the
-        // terminal may be gone, and the stop must not depend on it (D1)
-        let (what, by) = tokio::select! {
-            _ = ctrl_c => ("Ctrl+C", "signal=INT"),
-            _ = terminate => ("SIGTERM", "signal=TERM"),
-        };
-        let _ = shutdown_tx_clone.send(());
-        runs_log::stop_requested(by);
-        info!("Received {}, initiating shutdown...", what);
-        if console {
-            console!("Received {}, stopping...", what);
-        }
-    });
 
     let wallet_seed = WalletSeed::from_settings(&args.settings);
     let wallet_options = WalletOptions::from_settings(&args.settings);

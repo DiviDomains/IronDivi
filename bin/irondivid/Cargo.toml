@@ -39,6 +39,7 @@ tempfile = { workspace = true }
 # Daemonization (Unix only)
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+signal-hook-registry = "1.4.8"
 
 # Utilities
 dirs = "5.0"
