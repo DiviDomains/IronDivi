@@ -2178,9 +2178,7 @@ impl Node {
                                 if known.contains(&alert.hash()) {
                                     continue;
                                 }
-                                // GetAdjustedTime (alert.cpp:104)
-                                let now = divi_primitives::clock::adjusted_now();
-                                if alert.is_acceptable(key, now) {
+                                if alert_acceptable(&alert, key, Clocks::read()) {
                                     known.insert(alert.hash());
                                 } else {
                                     peer_manager.report_misbehavior_score(
@@ -2353,9 +2351,7 @@ impl Node {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
             loop {
                 interval.tick().await;
-                // GetTime: the node's clock, which setmocktime sets
-                // (main.cpp:1284-1291)
-                let now = divi_primitives::clock::now();
+                let now = rebroadcast_time(Clocks::read());
                 let current = chain_for_rebroadcast.tip().map(|t| t.hash);
                 if current != tip {
                     tip = current;
@@ -3664,6 +3660,50 @@ fn money_range(
     max_money: divi_primitives::amount::Amount,
 ) -> bool {
     value >= divi_primitives::amount::Amount::ZERO && value <= max_money
+}
+
+/// The clocks the message loop's time checks read: the system clock, the
+/// time setmocktime set (0: none) and the network time offset
+#[derive(Debug, Clone, Copy)]
+struct Clocks {
+    system: i64,
+    mock: i64,
+    offset: i64,
+}
+
+impl Clocks {
+    fn read() -> Self {
+        Clocks {
+            system: divi_primitives::clock::system_now(),
+            mock: divi_primitives::clock::mock_time(),
+            offset: divi_primitives::clock::time_offset(),
+        }
+    }
+
+    /// GetTime: the mocked time when one is set (utiltime.cpp:24-29)
+    fn node(&self) -> i64 {
+        match self.mock {
+            0 => self.system,
+            mock => mock,
+        }
+    }
+
+    /// GetAdjustedTime: GetTime plus the network offset (timedata.cpp:35-38)
+    fn adjusted(&self) -> i64 {
+        self.node() + self.offset
+    }
+}
+
+/// Whether an alert from a peer is accepted: in effect until GetAdjustedTime
+/// reaches its expiry (alert.cpp:102-105, ProcessAlert :151-155)
+fn alert_acceptable(alert: &divi_network::alert::Alert, key: &[u8], clocks: Clocks) -> bool {
+    alert.is_acceptable(key, clocks.adjusted())
+}
+
+/// The mempool rebroadcast timer's clock: GetTime, which setmocktime sets
+/// (main.cpp:1284-1291)
+fn rebroadcast_time(clocks: Clocks) -> i64 {
+    clocks.node()
 }
 
 #[cfg(test)]
