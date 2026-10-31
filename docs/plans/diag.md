@@ -200,14 +200,23 @@ Tested on hp1, hp2 and hp3 as a user and as root; on macOS only
   again (list, menu, final question), and with no terminal it refuses
   (exit 1) rather than send unreviewed. It builds a fresh redactor from
   the machine as it is now; the folder's own salt is not re-checked.
-- §8.4: no developer key exists yet, so `DEV_KEY` is empty and `seal()`
-  is a stub. After `yes` diag says plainly that nothing was packed,
-  written or sent and keeps the folder; nothing is ever written beside
-  the folder. The pack step (tar, mtime 0, each file's SHA-256 checked)
-  is built. No receiver address is compiled in (§9 hosting is open). To
-  finish: generate the `age` key, keep the private half in 1Password, put
-  the public key and fingerprint in `DEV_KEY`, add zstd and age, and
-  implement `seal()`.
+- §8.4: built on the offline path. After `yes` the files and their
+  manifest are packed as a tar (mtime 0, each file's SHA-256 checked),
+  compressed with zstd (level 12) and encrypted with `age` (binary
+  format, X25519) to the developer key in `DEV_KEY`, the one place it
+  lives. The fingerprint printed at send is the first 16 hex characters
+  of the SHA-256 of the `age1…` recipient string (`9274ffc0368679fe`); the
+  private half is in the developer's 1Password only. The result is written
+  beside the folder as `<folder>.age` (mode 0600) with its SHA-256, for
+  the user to send by hand; nothing unencrypted is ever written beside the
+  folder. Crates pinned: `age =0.11.1`, `zstd =0.13.3`. No receiver
+  address is compiled in (§9 hosting is open). A build with `DEV_KEY`
+  empty still stops after `yes` and writes nothing.
+- Exit codes after the review: a collection run exits on its own result
+  (0 when complete) whatever the review ends in, including `yes` on a
+  build with no key, because the folder it made is the run's product;
+  `--send` exits 0 only when a package was sealed and 1 otherwise (`q`,
+  no terminal, no key, a failed check), since sending is its only job.
 - Smaller: `irondivi-cli --version` exits 1 with the usage text; the
   first divi-diag commit (d3502999) lacks its `Cargo.lock` entry, so
   `--locked` builds need c83a9dd4 or later; `diag --run` (B3) and the

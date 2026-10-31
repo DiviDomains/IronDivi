@@ -11,11 +11,13 @@
 //!   manifest, runs the §6.3 scanner again and sends only on the full word
 //!   `yes`;
 //! - §8.4 the offline path only. The §9 receiver's hosting is an open
-//!   decision, so this build never contacts any server. A package becomes
-//!   send-ready only when it is encrypted to the developer's key, and no
-//!   key is compiled into this build ([`DEV_KEY`] is `None`): `send` stops
-//!   after `yes` and writes nothing, so no unencrypted archive can be
-//!   mistaken for a sendable one.
+//!   decision, so this build never contacts any server. After `yes` the
+//!   files and their manifest are packed as a tar, compressed with zstd and
+//!   encrypted with `age` to the developer's key ([`DEV_KEY`]), and the
+//!   result is written beside the folder as `<folder>.age` for the user to
+//!   send by hand. Nothing unencrypted is ever written beside the folder. A
+//!   build with no key ([`DEV_KEY`] `None`) stops after `yes` and writes
+//!   nothing.
 //!
 //! R2: with no terminal nothing is ever sent, whatever the flags. A review
 //! writes `preview.ok` (the file list with each file's SHA-256, and the
@@ -40,14 +42,24 @@ pub const SUMMARY: &str = "00-SUMMARY.txt";
 pub const PREVIEW_OK: &str = "preview.ok";
 
 /// §8.4: the developer's `age` recipient and its fingerprint
+#[derive(Clone, Copy, Debug)]
 pub struct DevKey {
+    /// an `age` X25519 recipient, `age1…`
     pub recipient: &'static str,
+    /// the first 16 hex characters of the SHA-256 of `recipient`, printed
+    /// at send so the user can check it against the published one
     pub fingerprint: &'static str,
 }
 
-/// No developer key has been made yet, so nothing is send-ready. Filling
-/// this in also needs `age` and `zstd` in [`seal`].
-pub const DEV_KEY: Option<DevKey> = None;
+/// The one place the developer's public key lives. The private half is
+/// kept in the developer's 1Password, never in this tree.
+pub const DEV_KEY: Option<DevKey> = Some(DevKey {
+    recipient: "age10r8rlmzg5c3n8c0cslzzpa9vjq879pq32fghv2skmfu3twzl4vmqt7lq0j",
+    fingerprint: "9274ffc0368679fe",
+});
+
+/// zstd level for the package: well compressed, still quick on a Pi
+const ZSTD_LEVEL: i32 = 12;
 
 /// §8.3 step 1, said always (adversarial AC3, privacy N3)
 pub const BY_HAND: &str = "A debug.log or crash.log you send by hand, outside this package, is not \
@@ -389,6 +401,8 @@ pub struct Review<'a> {
     added: BTreeSet<String>,
     /// why the send-time scan left a file out
     left_out: BTreeMap<String, String>,
+    /// the key `send` encrypts to: [`DEV_KEY`], or a test's own
+    key: Option<DevKey>,
 }
 
 fn listable(rel: &str) -> bool {
@@ -414,6 +428,7 @@ impl<'a> Review<'a> {
             excluded: BTreeSet::new(),
             added: BTreeSet::new(),
             left_out: BTreeMap::new(),
+            key: DEV_KEY,
         })
     }
 
@@ -616,7 +631,7 @@ impl<'a> Review<'a> {
             Ok(None) => {}
             Err(e) => io.say(&format!("{e}; your earlier exclusions are not used, check the list again\n")),
         }
-        if DEV_KEY.is_none() {
+        if self.key.is_none() {
             io.say(
                 "\nThis build of irondivi-cli carries no developer key, so [s]end checks the folder \
                  and asks, then stops before anything is packed or written (§8.4).\n",
@@ -703,7 +718,7 @@ impl<'a> Review<'a> {
                         io.say("Not sent: only the full word yes sends.\n");
                         continue;
                     }
-                    let Some(key) = DEV_KEY.as_ref() else {
+                    let Some(key) = self.key else {
                         io.say(
                             "No developer key is compiled into this build of irondivi-cli, so nothing \
                              is send-ready: nothing was packed, written or sent. The folder is kept.\n",
@@ -717,7 +732,7 @@ impl<'a> Review<'a> {
                             return Outcome::Kept;
                         }
                     };
-                    match seal(key, &tar) {
+                    match seal(key.recipient, &tar) {
                         Ok(ct) => {
                             let name = format!("{}.age", self.root.file_name().and_then(|n| n.to_str()).unwrap_or("irondivi-diag"));
                             let path = self.root.with_file_name(name);
@@ -760,10 +775,18 @@ pub fn pack(root: &Path, send: &[Entry], manifest: &str) -> Result<Vec<u8>, Stri
     w.finish().map_err(|e| e.to_string())
 }
 
-/// §8.4: zstd, then `age` to the developer's key. Not in this build: no
-/// key exists yet ([`DEV_KEY`]), so this is never reached.
-fn seal(_key: &DevKey, _tar: &[u8]) -> Result<Vec<u8>, String> {
-    Err("age and zstd are not in this build".into())
+/// §8.4: zstd, then `age` (binary format, X25519) to `recipient`. Only
+/// the holder of the matching identity can open it; a changed byte makes
+/// it fail to open rather than open to something else.
+pub fn seal(recipient: &str, tar: &[u8]) -> Result<Vec<u8>, String> {
+    let r: age::x25519::Recipient = recipient.parse().map_err(|e| format!("the developer key does not parse: {e}"))?;
+    let z = zstd::bulk::compress(tar, ZSTD_LEVEL).map_err(|e| format!("compressing: {}", e.kind()))?;
+    let enc = age::Encryptor::with_recipients(std::iter::once(&r as &dyn age::Recipient)).map_err(|e| format!("encrypting: {e}"))?;
+    let mut out = Vec::with_capacity(z.len() + 512);
+    let mut w = enc.wrap_output(&mut out).map_err(|e| format!("encrypting: {}", e.kind()))?;
+    w.write_all(&z).map_err(|e| format!("encrypting: {}", e.kind()))?;
+    w.finish().map_err(|e| format!("encrypting: {}", e.kind()))?;
+    Ok(out)
 }
 
 // ----------------------------------------------------------- entry points
@@ -958,7 +981,9 @@ mod tests {
         let before = beside();
         let inside = folder_files(d.path());
         let (o, out) = io_run("l\nx 2\ns\ny\ns\nYES\ns\nyes\n", |io| {
-            Review::open(d.path(), ScanCtx { red: &r, secrets: vec![], salt: vec![] }).unwrap().run(io)
+            let mut rv = Review::open(d.path(), ScanCtx { red: &r, secrets: vec![], salt: vec![] }).unwrap();
+            rv.key = None; // a build with no developer key
+            rv.run(io)
         });
         assert_eq!(o, Outcome::NoKey, "{out}");
         assert_eq!(out.matches("Not sent: only the full word yes sends.").count(), 2, "{out}");
@@ -1014,5 +1039,101 @@ mod tests {
             })
             .collect();
         assert_eq!(names, vec![SUMMARY.to_string(), "host/host.txt".into(), MANIFEST.into()]);
+    }
+
+    // ------------------------------------------------------------ §8.4 seal
+
+    fn open_sealed(id: &age::x25519::Identity, ct: &[u8]) -> Result<Vec<u8>, String> {
+        let dec = age::Decryptor::new_buffered(ct).map_err(|e| e.to_string())?;
+        let mut r = dec.decrypt(std::iter::once(id as &dyn age::Identity)).map_err(|e| e.to_string())?;
+        let mut z = Vec::new();
+        io::Read::read_to_end(&mut r, &mut z).map_err(|e| e.to_string())?;
+        zstd::stream::decode_all(&z[..]).map_err(|e| e.to_string())
+    }
+
+    fn members(tar: &[u8]) -> BTreeMap<String, Vec<u8>> {
+        crate::tar::read_all(&mut &tar[..], u64::MAX, u64::MAX)
+            .unwrap()
+            .into_iter()
+            .map(|m| match m {
+                crate::tar::Member::File { name, data } => (name, data),
+                _ => panic!("unexpected tar member"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn dev_key_parses_as_an_age_recipient() {
+        let k = DEV_KEY.expect("a developer key is compiled in");
+        let _: age::x25519::Recipient = k.recipient.parse().expect("DEV_KEY is an age X25519 recipient");
+        assert_eq!(k.fingerprint, &hex::encode(Sha256::digest(k.recipient.as_bytes()))[..16]);
+        // and seal() accepts it
+        assert!(seal(k.recipient, b"x").unwrap().starts_with(b"age-encryption.org/v1\n"));
+    }
+
+    #[test]
+    fn seal_round_trips_byte_identical_and_tamper_fails() {
+        let d = tempfile::tempdir().unwrap();
+        folder(d.path());
+        // a binary file that does not compress, and an empty one
+        let noise: Vec<u8> = (0..70_000u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+        fs::write(d.path().join("host/noise.bin"), &noise).unwrap();
+        fs::write(d.path().join("host/empty.txt"), b"").unwrap();
+        let mut send = read_manifest(d.path()).unwrap().1;
+        for rel in ["host/noise.bin", "host/empty.txt"] {
+            let p = d.path().join(rel);
+            send.push(Entry { rel: rel.into(), size: fs::metadata(&p).unwrap().len(), sha: util::sha256_file(&p).unwrap(), collector: "t".into() });
+        }
+        let man = fs::read_to_string(d.path().join(MANIFEST)).unwrap();
+        let tar = pack(d.path(), &send, &man).unwrap();
+
+        let id = age::x25519::Identity::generate();
+        let ct = seal(&id.to_public().to_string(), &tar).unwrap();
+        assert!(!ct.windows(14).any(|w| w == b"uptime 3 days\n"), "plaintext leaked into the package");
+        let back = open_sealed(&id, &ct).unwrap();
+        assert_eq!(back, tar);
+        let got = members(&back);
+        assert_eq!(got.len(), send.len() + 1);
+        for e in &send {
+            assert_eq!(got[&e.rel], fs::read(d.path().join(&e.rel)).unwrap(), "{}", e.rel);
+        }
+        assert_eq!(got[MANIFEST], man.as_bytes());
+
+        // another identity cannot open it
+        assert!(open_sealed(&age::x25519::Identity::generate(), &ct).is_err());
+        // a changed byte in the header, in the body, or a cut tail fails to open
+        for at in [30, ct.len() / 2, ct.len() - 1] {
+            let mut bad = ct.clone();
+            bad[at] ^= 0x01;
+            assert!(open_sealed(&id, &bad).is_err(), "flipped byte {at} still opened");
+        }
+        assert!(open_sealed(&id, &ct[..ct.len() - 20]).is_err());
+        // a bad recipient is refused, never sent in clear
+        assert!(seal("age1notakey", &tar).is_err());
+    }
+
+    #[test]
+    fn review_yes_seals_beside_the_folder() {
+        let d = tempfile::tempdir().unwrap();
+        folder(d.path());
+        let r = red();
+        let id = age::x25519::Identity::generate();
+        let pk: &'static str = Box::leak(id.to_public().to_string().into_boxed_str());
+        let (o, out) = io_run("x 2\ns\nyes\n", |io| {
+            let mut rv = Review::open(d.path(), ScanCtx { red: &r, secrets: vec![], salt: vec![] }).unwrap();
+            rv.key = Some(DevKey { recipient: pk, fingerprint: "testfingerprint0" });
+            rv.run(io)
+        });
+        let Outcome::Sealed(path) = o else { panic!("not sealed: {out}") };
+        assert_eq!(path.parent(), d.path().parent());
+        assert!(out.contains("testfingerprint0"), "{out}");
+        let ct = fs::read(&path).unwrap();
+        let _ = fs::remove_file(&path);
+        let got = members(&open_sealed(&id, &ct).unwrap());
+        // the excluded report is not in it; the manifest notes it
+        assert!(!got.contains_key(REPORT));
+        assert_eq!(got["host/host.txt"], b"uptime 3 days\n");
+        assert_eq!(got[SUMMARY], fs::read(d.path().join(SUMMARY)).unwrap());
+        assert!(String::from_utf8_lossy(&got[MANIFEST]).contains(REPORT), "the manifest names the excluded file");
     }
 }

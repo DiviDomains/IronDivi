@@ -17,6 +17,9 @@ serde_json = { workspace = true }
 toml = { workspace = true }
 regex = "1.12"
 libc = "0.2"
+# §8.4: the package is zstd-compressed, then encrypted with age
+age = "=0.11.1"
+zstd = "=0.13.3"
 rocksdb = { workspace = true, optional = true }
 
 [features]
