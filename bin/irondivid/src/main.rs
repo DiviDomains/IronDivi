@@ -37,6 +37,7 @@ mod settings;
 #[cfg(unix)]
 mod signals;
 mod snapshot_sig;
+mod startup;
 mod tasks;
 
 /// System's, with a crash.log line when an allocation fails (A5)
@@ -550,6 +551,72 @@ fn resolve_args(mut args: Args) -> Result<Args> {
     Ok(args)
 }
 
+/// Keys apply_settings reads
+const APPLIED: &[&str] = &[
+    "vault",
+    "rescan",
+    "salvagewallet",
+    "spendzeroconfchange",
+    "keypool",
+    "upgradewallet",
+    "rpcuser",
+    "rpcpassword",
+    "rpcport",
+    "server",
+    "rest",
+    "rpcallowip",
+    "rpcbind",
+    "rpckeepalive",
+    "rpcauth",
+    "rpcwhitelist",
+    "rpcwhitelistdefault",
+    "rpcalloworigin",
+    "rpcallowhost",
+    "port",
+    "bind",
+    "listen",
+    "connect",
+    "addnode",
+    "fullnode",
+    "dnsseed",
+    "maxconnections",
+    "timeout",
+    "proxy",
+    "discover",
+    "externalip",
+    "protocolversion",
+    "banscore",
+    "bantime",
+    "checkblocks",
+    "loadblock",
+    "stopafterblockimport",
+    "maxreorg",
+    "maxorphantx",
+    "minrelaytxfee",
+    "maxtxfee",
+    "sporkkey",
+    "staking",
+    "stakeonstaletip",
+    "stakesplitthreshold",
+    "blockmaxsize",
+    "blockprioritysize",
+    "blockminsize",
+    "txindex",
+    "spentindex",
+    "addressindex",
+    "reindex",
+    "utxocachesize",
+    "expire",
+    "blocknotify",
+    "walletnotify",
+    "zmqpubhashblock",
+    "zmqpubhashtx",
+    "zmqpubrawblock",
+    "zmqpubrawtx",
+    "whitelist",
+    "whitebind",
+];
+
 /// Options divid takes that irondivid has nothing for: accepted, with a warning
 const UNSUPPORTED_OPTIONS: &[&str] = &[
     "alertnotify",
@@ -1007,70 +1074,6 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     };
     config.vault = s.get_bool("vault", false);
 
-    const APPLIED: &[&str] = &[
-        "vault",
-        "rescan",
-        "salvagewallet",
-        "spendzeroconfchange",
-        "keypool",
-        "upgradewallet",
-        "rpcuser",
-        "rpcpassword",
-        "rpcport",
-        "server",
-        "rest",
-        "rpcallowip",
-        "rpcbind",
-        "rpckeepalive",
-        "rpcauth",
-        "rpcwhitelist",
-        "rpcwhitelistdefault",
-        "rpcalloworigin",
-        "rpcallowhost",
-        "port",
-        "bind",
-        "listen",
-        "connect",
-        "addnode",
-        "fullnode",
-        "dnsseed",
-        "maxconnections",
-        "timeout",
-        "proxy",
-        "discover",
-        "externalip",
-        "protocolversion",
-        "banscore",
-        "bantime",
-        "checkblocks",
-        "loadblock",
-        "stopafterblockimport",
-        "maxreorg",
-        "maxorphantx",
-        "minrelaytxfee",
-        "maxtxfee",
-        "sporkkey",
-        "staking",
-        "stakeonstaletip",
-        "stakesplitthreshold",
-        "blockmaxsize",
-        "blockprioritysize",
-        "blockminsize",
-        "txindex",
-        "spentindex",
-        "addressindex",
-        "reindex",
-        "utxocachesize",
-        "expire",
-        "blocknotify",
-        "walletnotify",
-        "zmqpubhashblock",
-        "zmqpubhashtx",
-        "zmqpubrawblock",
-        "zmqpubrawtx",
-        "whitelist",
-        "whitebind",
-    ];
     let mut keys: Vec<&String> = settings.keys().collect();
     keys.sort();
     for key in keys {
@@ -3385,6 +3388,8 @@ fn main() {
     }
     // Before the -daemon forks hide the parent and the terminal (A1)
     runs_log::note_launch();
+    // The working directory, before -daemon moves it (A7)
+    startup::capture();
     // Every signal is recorded from here on (A3); fds 0-2 are open, so the
     // handler's pipe does not take one. Its thread starts after the forks.
     #[cfg(unix)]
@@ -3693,6 +3698,14 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
             crash::open(&data_dir);
             crash::refresh_maps();
         }
+        startup::write(
+            &data_dir,
+            &startup::Options {
+                cli: &args.cli,
+                all: &args.settings,
+                known_keys: &[APPLIED, READ_ELSEWHERE, UNSUPPORTED_OPTIONS],
+            },
+        );
         runs_log::phase("config");
     }
 

@@ -735,3 +735,48 @@ fn a_fatal_signal_sent_by_another_process_names_the_sender() {
     assert!(unclean.contains(" verdict=sent-by comm="), "{log}");
     assert!(unclean.contains(" crash_log=record "), "{log}");
 }
+
+/// A7: diag/startup/<run>.txt holds the masked argv, the config keys with
+/// their sources, the environment's names, and no secret or path
+#[test]
+fn the_startup_record_masks_secrets_and_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut node, rpc_port) = start_with(
+        dir.path(),
+        &[("IRONDIVI_SECRETX", "topsecret9"), ("RUST_BACKTRACE", "1")],
+    );
+    let text = wait_for_file(dir.path(), "diag/startup/1.txt", "\ncwd=\"");
+    assert!(text.starts_with("startup run=1 "), "{text}");
+    for want in [
+        "-rpcpassword=<v>",
+        "-datadir=<v>",
+        "-staking=0",
+        "rpcpassword source=argument value=<set>\n",
+        "staking source=argument value=0\n",
+        "regtest source=argument",
+        "defaults=",
+        "\nIRONDIVI_SECRETX\n",
+        "\nRUST_BACKTRACE=\"1\"\n",
+        "\n[rlimits]\ncore soft=",
+        "nofile soft=",
+        "\n[build]\ntarget=",
+    ] {
+        assert!(text.contains(want), "{want}: {text}");
+    }
+    #[cfg(target_os = "linux")]
+    for want in ["\ndumpable=0\n", "\nNoNewPrivs=", "\nfs_type="] {
+        assert!(text.contains(want), "{want}: {text}");
+    }
+    let datadir = dir.path().display().to_string();
+    for absent in [SECRET, "topsecret9", datadir.as_str()] {
+        assert!(!text.contains(absent), "{absent}: {text}");
+    }
+    let mode = {
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.path().join("diag/startup/1.txt");
+        std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+    };
+    assert_eq!(mode, 0o600);
+    rpc(rpc_port, "stop").expect("stop reply");
+    assert!(wait_exit(&mut node).success());
+}
