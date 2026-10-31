@@ -644,7 +644,7 @@ fn kernel_filter(l: &str, pids: &[String]) -> bool {
 
 /// Reduce an OOM report's process table to the killed task and the node's
 /// tasks (the rest is every other user's process list)
-fn reduce_oom(lines: Vec<String>, pids: &[String]) -> Vec<String> {
+pub(crate) fn reduce_oom(lines: Vec<String>, pids: &[String]) -> Vec<String> {
     let mut out = Vec::new();
     let mut in_table = false;
     let mut hidden = 0;
@@ -805,7 +805,7 @@ pub fn kernel(ctx: &Ctx, o: &mut Out) {
 /// The kernel quotes whole command lines in some messages (`ptrace attach
 /// of "python3 -I /x/y secret"[123] was attempted by "cat ..."[456]`):
 /// keep only the program's name, since arguments can hold anything
-fn mask_quoted_cmdlines(l: &str) -> String {
+pub(crate) fn mask_quoted_cmdlines(l: &str) -> String {
     let mut out = String::with_capacity(l.len());
     let mut rest = l;
     while let Some(a) = rest.find('"') {

@@ -12,18 +12,21 @@
 //! ([`frame`]); the parent scrubs every byte (§6.2 step 1, [`redact`])
 //! before it reaches the package folder.
 //!
-//! Not in this crate yet: B3 observed start (`--run`), §8 preview, consent
-//! and sending (`--submit`), the §6 scanner and B6 recording modes.
+//! `--import <folder|->` (B6.4, [`import`]) turns a contrib/diag.sh folder
+//! into a package. Not in this crate yet: B3 observed start (`--run`), §8
+//! preview, consent and sending (`--submit`) and the B6 recording modes.
 
 pub mod collectors;
 pub mod ctx;
 pub mod discovery;
 pub mod frame;
+pub mod import;
 pub mod mem;
 pub mod oldlog;
 pub mod redact;
 pub mod runner;
 pub mod scanner;
+pub mod tar;
 pub mod util;
 
 /// The node's own configuration parser (B1.3: "parsed with the node's
@@ -50,10 +53,15 @@ pub struct Options {
     pub out: Option<std::path::PathBuf>,
     pub offline: bool,
     pub fsync_test: Option<bool>,
+    /// `--import <folder|->` (B6.4)
+    pub import: Option<String>,
+    /// `--keep-raw`: an imported diag.sh folder is not deleted afterwards
+    pub keep_raw: bool,
 }
 
 const USAGE: &str = "usage: irondivi-cli diag [--datadir DIR] [--conf FILE] [--run|--no-run] \
-[--submit|--no-submit] [--out DIR] [--offline] [--no-fsync-test]";
+[--submit|--no-submit] [--out DIR] [--offline] [--no-fsync-test]\n       \
+irondivi-cli diag --import <folder|-> [--keep-raw] [--out DIR]";
 
 pub fn parse_options(args: &[String]) -> Result<Options, String> {
     let mut o = Options::default();
@@ -82,6 +90,8 @@ pub fn parse_options(args: &[String]) -> Result<Options, String> {
             "--offline" => o.offline = true,
             "--fsync-test" => o.fsync_test = Some(true),
             "--no-fsync-test" => o.fsync_test = Some(false),
+            "--import" => o.import = Some(value(&mut i)?),
+            "--keep-raw" => o.keep_raw = true,
             // R2: `--yes` is gone; it said yes to everything at once
             "--yes" | "-y" => {
                 return Err("--yes was removed: consent is given per step. Use --run or \
@@ -106,7 +116,10 @@ pub fn run(args: &[String]) -> i32 {
         };
     }
     match parse_options(args) {
-        Ok(o) => runner::parent_main(o),
+        Ok(o) => match o.import.clone() {
+            Some(src) => import::import_main(&src, &o),
+            None => runner::parent_main(o),
+        },
         Err(e) => {
             if !e.is_empty() {
                 eprintln!("irondivi-cli diag: {e}");

@@ -218,14 +218,14 @@ fn tmp_base() -> PathBuf {
 
 /// The local id names the folder. The real ticket is issued by the receiver
 /// at send time (§8.4); this is a stand-in drawn from the same alphabet.
-fn local_id() -> String {
+pub(crate) fn local_id() -> String {
     use rand::Rng;
     const A: &[u8] = b"abcdefghijklmnopqrstuvwxyz234567";
     let mut r = rand::thread_rng();
     (0..8).map(|_| A[r.gen_range(0..32)] as char).collect()
 }
 
-fn create_out(o: &Options, id: &str, ctx: &Ctx) -> Result<(PathBuf, Vec<String>), String> {
+pub(crate) fn create_out(o: &Options, id: &str, ctx: &Ctx) -> Result<(PathBuf, Vec<String>), String> {
     let name = format!("irondivi-diag-{id}");
     let mut cands: Vec<PathBuf> = Vec::new();
     if let Some(p) = &o.out {
