@@ -217,6 +217,23 @@ Tested on hp1, hp2 and hp3 as a user and as root; on macOS only
   build with no key, because the folder it made is the run's product;
   `--send` exits 0 only when a package was sealed and 1 otherwise (`q`,
   no terminal, no key, a failed check), since sending is its only job.
+- §6.2 "Paths", over-redaction (decided; the plan named only "well-known
+  system directories"): the fixed names the OS, systemd, Docker, snapd
+  and LXD give mount points stay readable (`/boot`, `/boot/efi`,
+  `/run/lock`, `/run/rpc_pipefs`, `/run/credentials`, `/sys/kernel/debug`,
+  Docker's `overlay2/<id>/merged`, `containers/<id>/mounts/secrets`,
+  `plugins/<id>/propagated-mount`, `netns/ingress_sbox`, snapd and LXD
+  `ns`/`mntns`/`shmounts`). Generated IDs stay pseudonymised (Docker layer
+  and container hashes, netns IDs): they are not names but they are
+  unique to the host. `/dev/mapper/<vg-lv>` stays pseudonymised as a
+  mount source (step 1); the `/dev/mapper/` prefix shows it is a
+  device-mapper volume. User-chosen mount points (`/mnt/<name>`) stay
+  pseudonymised. Tightened at the same time: a component directly under
+  `/home` or `/Users` is masked even when it is a word kept elsewhere
+  (`/home/user`, `/home/debug`), except `/Users/Shared`.
+- Built bug found in testing: storage.txt read `statvfs` as (total, free)
+  and printed more free than total, and the fsync-test skip rule sized
+  itself on free space; fixed (bcc8d835).
 - Smaller: `irondivi-cli --version` exits 1 with the usage text; the
   first divi-diag commit (d3502999) lacks its `Cargo.lock` entry, so
   `--locked` builds need c83a9dd4 or later; `diag --run` (B3) and the

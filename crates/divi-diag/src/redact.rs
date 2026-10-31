@@ -64,6 +64,12 @@ const KEEP_COMPONENTS: &[&str] = &[
     "nfsd", "snap", "core", "core18", "core20", "core22", "core24", "lxd", "snapd",
     // macOS APFS system volumes (`df` on any Mac)
     "Data", "Preboot", "VM", "Update", "xarts", "iSCPreboot", "Hardware", "Recovery",
+    // fixed mount-point names the OS, systemd, Docker, snapd and LXD create
+    // (Revision 16, §6.2 "Paths"); IDs below them stay pseudonymised
+    "boot", "efi", "firmware", "lock", "credentials", "rpc_pipefs", "binfmt_misc", "netns",
+    "ingress_sbox", "snapd", "lxd.mnt", "common", "mntns", "shmounts", "merged", "diff", "work",
+    "mounts", "secrets", "plugins", "propagated-mount", "debug", "tracing", "config", "pstore",
+    "bpf", "efivars", "fusectl", "nsfs", "Shared",
 ];
 
 const KEEP_PREFIXES: &[&str] = &[
@@ -210,6 +216,11 @@ impl Redactor {
 
     /// One path component: kept when well known, else a pseudonym
     fn component(&self, c: &str, parent: Option<&str>) -> String {
+        // A user name under /home or /Users is masked even when it is a
+        // common word that is kept elsewhere (§6.2 step 1)
+        if matches!(parent, Some("home") | Some("Users")) && !c.is_empty() && c != "Shared" && !is_pseudonym(c) {
+            return self.pseudonym("u", c);
+        }
         if self.keep_comp.contains(c)
             || c.chars().all(|ch| ch.is_ascii_digit())
             || KEEP_PREFIXES.iter().any(|p| c.starts_with(p))
@@ -221,9 +232,6 @@ impl Redactor {
             || is_pseudonym(c)
         {
             return c.to_string();
-        }
-        if matches!(parent, Some("home") | Some("Users")) {
-            return self.pseudonym("u", c);
         }
         // A user-chosen unit or scope name keeps its systemd suffix
         for suf in [".service", ".scope", ".slice", ".mount", ".socket", ".timer"] {
@@ -477,6 +485,27 @@ mod tests {
         assert_eq!(r.path("/dev/disk3s1s1"), "/dev/disk3s1s1");
         assert_eq!(r.path("/System/Volumes/Preboot"), "/System/Volumes/Preboot");
         assert_eq!(r.path("/system.slice/irondivid.service"), "/system.slice/irondivid.service");
+        // fixed mount-point names stay readable; IDs and user-chosen names do not
+        for keep in ["/boot", "/boot/efi", "/run/lock", "/run/rpc_pipefs", "/run/snapd/ns/lxd.mnt",
+            "/var/snap/lxd/common/ns/shmounts", "/run/credentials/systemd-sysusers.service",
+            "/sys/kernel/debug", "/sys/firmware/efi/efivars", "/run/docker/netns/ingress_sbox"] {
+            assert_eq!(r.path(keep), keep);
+        }
+        let h = "8a3f".repeat(16);
+        for (p, tail) in [(format!("/var/lib/docker/overlay2/{h}/merged"), "/merged"),
+            (format!("/var/lib/docker/containers/{h}/mounts/secrets"), "/mounts/secrets"),
+            (format!("/var/lib/docker/plugins/{h}/propagated-mount"), "/propagated-mount")] {
+            let got = r.path(&p);
+            assert!(!got.contains(&h) && got.ends_with(tail), "{got}");
+        }
+        for u in ["user", "debug", "work", "ubuntu"] {
+            assert!(r.path(&format!("/home/{u}/.irondivi")).starts_with("/home/u-"), "{u}");
+        }
+        assert_eq!(r.path("/Users/Shared"), "/Users/Shared");
+        for p in ["/dev/mapper/vgdata-lvchain", "/mnt/mydisk", "/run/docker/netns/07b2aa7135fd"] {
+            let got = r.path(p);
+            assert!(!got.contains("vgdata") && !got.contains("mydisk") && !got.contains("07b2aa"), "{got}");
+        }
         let cg = "/user.slice/user-1000.slice/session-2.scope";
         assert_eq!(r.scrub(&format!("  {cg} memory.max=max")), format!("  {cg} memory.max=max"));
         assert_eq!(r.scrub("CPUs in /proc/cpuinfo: 32"), "CPUs in /proc/cpuinfo: 32");
