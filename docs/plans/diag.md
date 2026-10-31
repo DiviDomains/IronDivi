@@ -241,6 +241,22 @@ and are not re-based.
   both fields as `WalletLabel`/`WalletValue`. Not converted: wallet
   names in `divi-wallet` `manager.rs` and file paths in `backup.rs`;
   they are not on the plan's list and name no coin.
+- A11 own blocks like peer blocks, items 1–5 (314a2dc5): the shared
+  functions are `divi_network::log_block_connected` and
+  `log_block_connect_failed` (re-exported from `sync`). The connect
+  line takes the chain height after the accept on every path, the
+  staker's included, as the sync paths already did. The
+  `try_connect_blocks_by_prev` accept writes it only where `:1499`
+  was, when the height grew; a block stored on a side chain there
+  connects nothing and gets no line. The orphan path's own wording
+  ("Connected orphan block") goes; the orphan-pool count is left to the
+  counted list (slice 5). `Node::accept_block` loses both its lines and
+  writes the shared one; the bootstrap import writes it per loaded
+  block (debug, so only at `-debug=sync`/`net`). Item 4 is one
+  `wallet_block_callback` in `main.rs` that both `BlockSync` and the
+  staker are given, rather than two closures sharing a format. The
+  staker's phantom-UTXO eviction warning (failure-only) stays, with
+  its outpoint masked as `OwnOutpoint`.
 
 Part B as built so far: B1 discovery, the B2 collectors (B2.0–B2.19),
 `contrib/diag.sh` (B1.4), `--import` (B6.4), the §6.2 redaction and §6.3
