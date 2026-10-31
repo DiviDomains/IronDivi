@@ -196,12 +196,6 @@ impl TxRelay {
 
         // Queue new transactions for request
         if !new_txs.is_empty() {
-            debug!(
-                "Queuing {} new transactions to request from peer {}",
-                new_txs.len(),
-                peer_id
-            );
-
             let mut queue = self.request_queue.write();
             for (txid, peer) in new_txs {
                 queue.push_back((txid, peer));
