@@ -25,6 +25,7 @@ mod core_files;
 mod interfaces;
 mod log_filter;
 mod private_files;
+mod runs_log;
 mod settings;
 mod snapshot_sig;
 
@@ -113,6 +114,9 @@ mod exit_code {
 /// or 101 (A9, R3); a test refuses any other exit path in this crate.
 fn die(code: i32, reason: std::fmt::Arguments<'_>) -> ! {
     let reason = reason.to_string();
+    // Durable before anything else that could stall (A1); a no-op before
+    // runs.log is open
+    runs_log::exit(code, &reason);
     if !reason.is_empty() {
         // Before init_logging this goes nowhere; the console line is enough then
         error!("{} (exit code {})", reason, code);
@@ -1976,12 +1980,14 @@ async fn run_daemon(
     webui: Option<divi_webui::WebUiConfig>,
     electrum: Option<divi_electrum::ElectrumConfig>,
 ) -> Result<()> {
+    runs_log::phase("datadir");
     // Create data directory if it doesn't exist
     private_files::ensure_private_dir(&config.data_dir, false)
         .with_context(|| format!("Failed to create data directory: {:?}", config.data_dir))
         .or_exit(exit_code::DATADIR)?;
     // One process per data directory, held until this one exits
     // (TryLockDataDirectory, init.cpp:850-862)
+    runs_log::phase("lock");
     let _datadir_lock = lock_data_dir(&config.data_dir).or_exit(exit_code::DATADIR)?;
     // divid reads masternode.conf at every start and makes it when missing
     core_files::ensure_masternode_conf(&config.data_dir);
@@ -2006,6 +2012,9 @@ async fn run_daemon(
 
     // Initialize the node
     info!("Initializing node...");
+    // The databases open and the chain loads in Node::new (db-open and
+    // chain-load are one phase until divi-node reports the boundary)
+    runs_log::phase("db-open");
     // Never dropped: the process ends without running the destructors of the
     // node's state (databases, caches, mempool), see `exit_after_stop`
     let node = std::mem::ManuallyDrop::new(Node::new(config.clone()).map_err(start_error)?);
@@ -2020,6 +2029,7 @@ async fn run_daemon(
     let _zmq = divi_node::zmq::ZmqNotifier::start(&config.zmq, node.chain(), node.mempool());
 
     // Start the node
+    runs_log::phase("network");
     node.start().await.map_err(|e| match e {
         // start()'s only Init: no P2P listener could be bound
         // (bind_listeners); its io error is text by then (R3)
@@ -2041,6 +2051,7 @@ async fn run_daemon(
             }
             info!("Stopping after block import");
             let _ = tx.send(());
+            runs_log::stop_requested("stopafterblockimport");
         });
     }
 
@@ -2051,6 +2062,7 @@ async fn run_daemon(
     let peer_manager = node.peer_manager().clone();
 
     // Load or create wallet (unless disabled)
+    runs_log::phase("wallet-load");
     let wallet = if disable_wallet {
         info!("Wallet disabled");
 
@@ -2343,6 +2355,7 @@ async fn run_daemon(
     }
 
     // Start staker if wallet is available
+    runs_log::phase("staking");
     let staker = if let Some(ref wallet_opt) = wallet {
         let wallet_arc = wallet_opt.clone();
         let mempool = node.mempool().clone();
@@ -2422,6 +2435,7 @@ async fn run_daemon(
         None
     };
 
+    runs_log::phase("rpc");
     // Start RPC server. RPC always requires authentication: without a complete
     // rpcuser/rpcpassword pair a random cookie is written to <datadir>/.cookie
     // (mode 0600) for local clients; `_rpc_cookie` removes it when we return.
@@ -2463,6 +2477,7 @@ async fn run_daemon(
 
     info!("Starting RPC server on {}...", rpc_config.bind_address);
     // Start-up is done: say so, or a slow start and a running node look alike
+    runs_log::phase("running");
     if !config.log.print_to_console {
         console!("IronDivi is running (chain height {}).", chain.height());
     }
@@ -2476,6 +2491,7 @@ async fn run_daemon(
     // RPC `stop` takes the same path as SIGTERM. The short delay lets the
     // "DIVI server stopping" reply reach the client before the server is dropped.
     let rpc_stop: divi_rpc::ShutdownCallback = Arc::new(move || {
+        runs_log::stop_requested("rpc");
         let tx = shutdown_tx.clone();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -3286,6 +3302,8 @@ fn main() {
             }
         }
     }
+    // Before the -daemon forks hide the parent and the terminal (A1)
+    runs_log::note_launch();
     // Before anything is written: the datadir holds the wallet and the RPC cookie (NODE-3)
     private_files::restrict_umask();
     // A core dump would hold unlocked wallet keys (NODE-10)
@@ -3374,6 +3392,7 @@ fn main() {
         console!("Logging to {:?}", log_file);
 
         // First fork
+        runs_log::note_first_fork();
         match unsafe { libc::fork() } {
             -1 => die!(
                 exit_code::DAEMON,
@@ -3395,6 +3414,7 @@ fn main() {
         }
 
         // Second fork (prevent reacquiring a controlling terminal)
+        runs_log::note_second_fork();
         match unsafe { libc::fork() } {
             -1 => die!(
                 exit_code::DAEMON,
@@ -3428,8 +3448,12 @@ fn main() {
         unsafe {
             libc::dup2(log_fd, libc::STDOUT_FILENO);
             libc::dup2(log_fd, libc::STDERR_FILENO);
-            // Close stdin
-            libc::close(libc::STDIN_FILENO);
+            // stdin on /dev/null, not closed: the next open() would take fd 0 (D2)
+            let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
+            if null >= 0 && null != libc::STDIN_FILENO {
+                libc::dup2(null, libc::STDIN_FILENO);
+                libc::close(null);
+            }
         }
     }
 
@@ -3473,6 +3497,7 @@ fn main() {
         Ok(result) => exit_after_stop(runtime, result),
         Err(_) => {
             std::mem::forget(runtime);
+            runs_log::exit(101, "Error: the node's main task panicked");
             error!("Error: the node's main task panicked");
             flush_log();
             unsafe { libc::_exit(101) }
@@ -3497,6 +3522,7 @@ fn exit_after_stop(runtime: tokio::runtime::Runtime, result: Result<()>) -> ! {
         // _exit: no atexit handlers or C++ static destructors either (RocksDB's
         // thread pools would be joined there)
         Ok(()) => {
+            runs_log::exit(0, "stopped");
             flush_log();
             unsafe { libc::_exit(0) }
         }
@@ -3530,6 +3556,26 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
         );
     }
     info!("Log levels: {}", args.log_levels.spec());
+
+    // diag/runs.log (A1); not for the snapshot and export commands, which
+    // only read the data directory
+    let one_shot = args.export_snapshot.is_some()
+        || args.import_snapshot.is_some()
+        || args.sign_snapshot.is_some()
+        || args.verify_snapshot.is_some()
+        || args.export_chain;
+    if !one_shot {
+        let network = if args.regtest {
+            "regtest"
+        } else if args.testnet {
+            "testnet"
+        } else {
+            "main"
+        };
+        let network = format!("{}/{:?}", network, args.chain_mode()).to_lowercase();
+        runs_log::open(&data_dir, &network, cfg!(unix) && args.daemon);
+        runs_log::phase("config");
+    }
 
     // Build configuration
     let mut config = build_config(&args).or_exit(exit_code::USAGE)?;
@@ -3612,11 +3658,12 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
 
         // The stop goes out before anything is written to the console: the
         // terminal may be gone, and the stop must not depend on it (D1)
-        let what = tokio::select! {
-            _ = ctrl_c => "Ctrl+C",
-            _ = terminate => "SIGTERM",
+        let (what, by) = tokio::select! {
+            _ = ctrl_c => ("Ctrl+C", "signal=INT"),
+            _ = terminate => ("SIGTERM", "signal=TERM"),
         };
         let _ = shutdown_tx_clone.send(());
+        runs_log::stop_requested(by);
         info!("Received {}, initiating shutdown...", what);
         if console {
             console!("Received {}, stopping...", what);
