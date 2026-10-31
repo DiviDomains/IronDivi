@@ -560,7 +560,7 @@ impl BlockSync {
                     "Already synced (height {} >= best peer {}), exiting IBD mode",
                     our_height, best
                 );
-                *self.state.write() = SyncState::Synced;
+                self.enter_synced();
                 self.chain.set_ibd_mode(false);
             }
         }
@@ -711,7 +711,7 @@ impl BlockSync {
 
         if our_height >= best_height {
             info!("Chain is up to date (height {})", our_height);
-            *self.state.write() = SyncState::Synced;
+            self.enter_synced();
             return;
         }
 
@@ -979,9 +979,14 @@ impl BlockSync {
                 *self.state.write() = SyncState::BlockDownload;
                 self.request_blocks().await;
             } else {
-                // We're synced
-                *self.state.write() = SyncState::Synced;
-                info!("Header sync complete");
+                // We're synced. Logged at info only after a real catch-up:
+                // near the tip this fires about once per peer block, and
+                // never for an own block (see CAUGHT_UP_LAG)
+                if self.enter_synced() {
+                    info!("Header sync complete");
+                } else {
+                    debug!("Header sync complete");
+                }
             }
             return;
         }
@@ -1355,13 +1360,7 @@ impl BlockSync {
                 // Writing this per peer block would leave a height gap at every
                 // own staked block (own blocks never pass through here), naming
                 // them in default logs; see CAUGHT_UP_LAG.
-                let was_synced = {
-                    let mut state = self.state.write();
-                    let was = *state == SyncState::Synced;
-                    *state = SyncState::Synced;
-                    was
-                };
-                if !was_synced && self.fell_behind.swap(false, Ordering::Relaxed) {
+                if self.enter_synced() {
                     info!("Block sync complete at height {}", our_height);
                 }
                 // Disable IBD mode — enable full PoS and script validation for new blocks
@@ -1590,6 +1589,20 @@ impl BlockSync {
 
     /// Whether the node is more than `CAUGHT_UP_LAG` blocks behind `target`;
     /// remembers it for the next "Block sync complete"
+    /// Enter Synced. True when this ends a real catch-up (the node had
+    /// fallen more than CAUGHT_UP_LAG behind): only then may the caller write
+    /// an info line. Every way into Synced goes through here, so the flag is
+    /// cleared by whichever path first reaches the tip
+    fn enter_synced(&self) -> bool {
+        let was_synced = {
+            let mut state = self.state.write();
+            let was = *state == SyncState::Synced;
+            *state = SyncState::Synced;
+            was
+        };
+        !was_synced && self.fell_behind.swap(false, Ordering::Relaxed)
+    }
+
     fn note_lag(&self, our_height: u32, target: u32) -> bool {
         let far = target.saturating_sub(our_height) > CAUGHT_UP_LAG;
         if far {
@@ -2555,6 +2568,13 @@ mod tests {
         *sync.best_peer_height.write() = our + CAUGHT_UP_LAG + 1;
         sync.try_connect_blocks().await;
         assert!(sync.fell_behind.load(Ordering::Relaxed));
+
+        // Any way into Synced ends the catch-up: an empty headers reply
+        // clears the flag, so no stray line follows on a later peer block
+        *sync.best_peer_height.write() = our;
+        sync.handle_headers(1, Vec::new()).await;
+        assert_eq!(sync.state(), SyncState::Synced);
+        assert!(!sync.fell_behind.load(Ordering::Relaxed));
     }
 
     #[test]
