@@ -548,3 +548,53 @@ fn a_critical_panic_ends_the_run_with_code_10() {
         assert!(marker(dir.path()).is_none(), "{what}");
     }
 }
+
+/// A5: a fatal signal is written to crash.log (record, frames, the debug
+/// ring, end line) and the process still ends by that signal; the next run
+/// names it as the cause. A Rust stack overflow keeps std's message and
+/// abort, and the record names the thread
+#[cfg(debug_assertions)]
+#[test]
+fn a_fatal_signal_is_recorded_and_ends_the_run_by_that_signal() {
+    use std::os::unix::process::ExitStatusExt;
+    for (what, signo, name) in [
+        ("segv", libc::SIGSEGV, "SEGV"),
+        ("abort", libc::SIGABRT, "ABRT"),
+        ("overflow", libc::SIGABRT, "SEGV"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut node = start_with(dir.path(), &[("IRONDIVI_TEST_CRASH", what)]).0;
+        let status = wait_exit(&mut node);
+        assert_eq!(status.signal(), Some(signo), "{what}: {status:?}");
+        let crash = crash_log(dir.path());
+        let record = crash
+            .lines()
+            .find(|l| l.contains(" fatal-signal run=1 "))
+            .unwrap_or_else(|| panic!("{what}: {crash}"));
+        assert!(record.contains(&format!(" signal={name} ")), "{what}: {crash}");
+        assert!(record.contains(" thread=\"test-crash\" "), "{what}: {crash}");
+        assert!(record.contains(" sent=no"), "{what}: {crash}");
+        assert!(crash.contains(" fatal-signal-end run=1"), "{what}: {crash}");
+        assert!(crash.contains("debug ring (A8"), "{what}: {crash}");
+        if cfg!(target_os = "linux") {
+            assert!(crash.contains(" frame #0 0x"), "{what}: {crash}");
+            assert!(crash.contains("irondivid"), "{what}: maps: {crash}");
+        }
+        assert!(marker(dir.path()).is_some(), "{what}: no marker left");
+
+        // The next run gives the record as the cause
+        let (mut node, rpc_port) = start(dir.path());
+        rpc(rpc_port, "stop").expect("stop reply");
+        assert!(wait_exit(&mut node).success());
+        let log = runs_log(dir.path());
+        let unclean = log
+            .lines()
+            .find(|l| l.contains(" unclean-previous "))
+            .unwrap_or_else(|| panic!("{what}: {log}"));
+        assert!(
+            unclean.contains(&format!(" verdict=crash signal={name} ")),
+            "{what}: {log}"
+        );
+        assert!(unclean.contains(" crash_log=record "), "{what}: {log}");
+    }
+}

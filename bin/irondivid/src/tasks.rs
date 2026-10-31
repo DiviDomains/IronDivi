@@ -169,6 +169,9 @@ where
     std::thread::Builder::new()
         .name(name.into())
         .spawn(move || {
+            // In the crash handler's table, with an alternate stack (A5)
+            #[cfg(unix)]
+            let _entered = crate::crash::enter_thread(name);
             if kind == Kind::Critical {
                 CRITICAL_THREAD.with(|c| c.set(Some(name)));
             }

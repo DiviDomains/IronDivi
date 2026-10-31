@@ -158,8 +158,15 @@ fn unclean_previous(text: &str, diag_dir: &Path) -> String {
     let run: u64 = get("run").parse().unwrap_or(0);
     let exited = exit_recorded(&diag_dir.join("runs.log"), run);
     // An exit on record means the run was already ending: no kill verdict
+    // A fatal signal's record in crash.log names the cause (A5)
+    #[cfg(unix)]
+    let crash = crate::crash::verdict_for(&diag_dir.join("crash.log"), run);
+    #[cfg(not(unix))]
+    let crash: Option<String> = None;
     let verdict = if exited {
         "exit-recorded"
+    } else if let Some(c) = crash.as_deref() {
+        c
     } else if boot == "changed" && wsl {
         "wsl-vm-stopped"
     } else if boot == "changed" {
@@ -182,7 +189,7 @@ fn unclean_previous(text: &str, diag_dir: &Path) -> String {
         .collect();
     format!(
         "run={} pid={} phase={} stop={} verdict={} boot={} pid1={} oom_kill={} \
-         exit_recorded={} crash_log=not-read kernel_log=not-read{}",
+         exit_recorded={} crash_log={} kernel_log=not-read{}",
         run,
         get("pid"),
         get("phase"),
@@ -192,6 +199,7 @@ fn unclean_previous(text: &str, diag_dir: &Path) -> String {
         pid1,
         oom,
         crate::runs_log::yes(exited),
+        if crash.is_some() { "record" } else { "none" },
         prev,
     )
 }

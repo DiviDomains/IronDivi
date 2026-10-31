@@ -22,6 +22,8 @@
 //!   irondivid --rpcuser=user --rpcpassword=pass
 
 mod core_files;
+#[cfg(unix)]
+mod crash;
 mod interfaces;
 mod log_delivery;
 mod log_filter;
@@ -33,6 +35,11 @@ mod settings;
 mod signals;
 mod snapshot_sig;
 mod tasks;
+
+/// System's, with a crash.log line when an allocation fails (A5)
+#[cfg(unix)]
+#[global_allocator]
+static ALLOC: crash::Alloc = crash::Alloc;
 
 use anyhow::{Context, Result};
 use divi_crypto::compute_block_hash;
@@ -2495,6 +2502,8 @@ async fn run_daemon(
     // From here a slow disk holds the writer thread, not the node (A8)
     log_delivery::start_writer();
     tasks::start_test_panics(config.network.network_type == NetworkType::Regtest);
+    #[cfg(unix)]
+    crash::start_test_crash(config.network.network_type == NetworkType::Regtest);
     if !config.log.print_to_console {
         console!("IronDivi is running (chain height {}).", chain.height());
     }
@@ -3309,8 +3318,34 @@ fn remove_pid_file(pid_file: &std::path::Path) {
     }
 }
 
+#[cfg(unix)]
+thread_local! {
+    /// A runtime thread's entry in the crash handler's table (A5)
+    static CRASH_ENTRY: std::cell::RefCell<Option<crash::Entered>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// A runtime thread starts: enter it in the crash handler's table
+fn crash_enter() {
+    #[cfg(unix)]
+    {
+        let name = std::thread::current().name().unwrap_or("tokio").to_string();
+        let entered = crash::enter_thread(name.as_str());
+        let _ = CRASH_ENTRY.try_with(|e| *e.borrow_mut() = Some(entered));
+    }
+}
+
+/// A runtime thread ends: its entry and alternate stack go
+fn crash_leave() {
+    #[cfg(unix)]
+    let _ = CRASH_ENTRY.try_with(|e| e.borrow_mut().take());
+}
+
 fn main() {
     // Every panic is recorded from here on (A4)
+    // Fatal signals to crash.log, before anything else can fault (A5)
+    #[cfg(unix)]
+    crash::install();
     tasks::install_hook();
     // A closed stdin, stdout or stderr is reopened on /dev/null before any
     // file is opened: the next open() would take that number, and console
@@ -3503,6 +3538,8 @@ fn main() {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     if let Err(e) = tasks::thread("dumpable-check", tasks::Kind::Supervised, || loop {
             std::thread::sleep(std::time::Duration::from_secs(60));
+            // The maps copy a crash record carries (A5)
+            crash::refresh_maps();
             match private_files::restore_non_dumpable() {
                 Some((was, Ok(()))) => warn!("dumpable restored (was {})", was),
                 Some((was, Err(e))) => error!("dumpable is {} and could not be reset: {}", was, e),
@@ -3516,6 +3553,10 @@ fn main() {
     // Now enter the tokio runtime (after daemonization)
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
+        // Each runtime thread in the crash handler's table, with its own
+        // alternate stack (A5)
+        .on_thread_start(crash_enter)
+        .on_thread_stop(crash_leave)
         .build()
         .unwrap_or_else(|e| die!(exit_code::FAILED, "Error: Failed to build tokio runtime: {}", e));
     // A panic on this thread would otherwise unwind through the runtime's drop,
@@ -3614,6 +3655,11 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
         let network = format!("{}/{:?}", network, args.chain_mode()).to_lowercase();
         runs_log::open(&data_dir, &network, cfg!(unix) && args.daemon);
         tasks::set_data_dir(&data_dir);
+        #[cfg(unix)]
+        {
+            crash::open(&data_dir);
+            crash::refresh_maps();
+        }
         runs_log::phase("config");
     }
 

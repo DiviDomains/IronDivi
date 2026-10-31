@@ -188,6 +188,11 @@ fn last_run(path: &Path) -> u64 {
         .unwrap_or(0)
 }
 
+/// This run's number (`run=` of its start record); 0 before runs.log is open
+pub fn run_number() -> u64 {
+    RUN.get().map_or(0, |r| r.0)
+}
+
 /// Write one record: `<time> mono=<s> <kind> <fields>`, then fdatasync.
 /// A no-op until runs.log is open; a write error is ignored (the node goes on).
 pub fn record(kind: &str, fields: &str) {
@@ -375,9 +380,30 @@ impl RawLine {
         self.text(std::str::from_utf8(&digits[d..]).unwrap_or(""))
     }
 
+    /// `v` in hex with a `0x` prefix
+    pub fn hex(&mut self, v: u64) -> &mut RawLine {
+        let mut digits = [0u8; 16];
+        let mut d = digits.len();
+        let mut u = v;
+        loop {
+            d -= 1;
+            digits[d] = b"0123456789abcdef"[(u & 15) as usize];
+            u >>= 4;
+            if u == 0 {
+                break;
+            }
+        }
+        self.text("0x");
+        self.text(std::str::from_utf8(&digits[d..]).unwrap_or(""))
+    }
+
     /// Append the line to runs.log, then fdatasync; a no-op before it is open
     pub fn write(&mut self) {
-        let fd = RAW_FD.load(Ordering::Acquire);
+        self.write_to(RAW_FD.load(Ordering::Acquire));
+    }
+
+    /// Append the line to `fd`, then fdatasync; a no-op when `fd` is -1
+    pub fn write_to(&mut self, fd: i32) {
         if fd < 0 {
             return;
         }

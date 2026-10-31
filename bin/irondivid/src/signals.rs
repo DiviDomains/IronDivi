@@ -273,7 +273,7 @@ fn mono_ns() -> u64 {
 }
 
 /// Whether `code` says a process sent the signal (kill, tgkill, sigqueue)
-fn from_process(code: i32) -> bool {
+pub(crate) fn from_process(code: i32) -> bool {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         code == libc::SI_USER || code == libc::SI_TKILL || code == libc::SI_QUEUE
@@ -349,7 +349,7 @@ fn copy(from: &[u8], to: &mut [u8]) -> usize {
 
 /// `/proc/<pid>/<leaf>` into `buf` with open/read/close; the errno on failure
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn read_proc(pid: i32, leaf: &[u8], buf: &mut [u8]) -> Result<usize, i32> {
+pub(crate) fn read_proc(pid: i32, leaf: &[u8], buf: &mut [u8]) -> Result<usize, i32> {
     let mut path = [0u8; 48];
     let mut n = copy(b"/proc/", &mut path);
     let mut digits = [0u8; 12];
