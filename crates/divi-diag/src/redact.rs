@@ -62,6 +62,8 @@ const KEEP_COMPONENTS: &[&str] = &[
     ".local", ".config", ".cache", "irondivi.service",
     "irondivid.service", "wallet.dat", "zmq", "certs", "tls", "txindex", ".dockerenv", ".containerenv", "swap.img", "swapfile",
     "nfsd", "snap", "core", "core18", "core20", "core22", "core24", "lxd", "snapd",
+    // macOS APFS system volumes (`df` on any Mac)
+    "Data", "Preboot", "VM", "Update", "xarts", "iSCPreboot", "Hardware", "Recovery",
 ];
 
 const KEEP_PREFIXES: &[&str] = &[
@@ -169,7 +171,7 @@ impl Redactor {
             // "Application Support" is the one well-known macOS directory with a space
             re_path: Regex::new(r#"(^|[\s='"(\[,<>|:])(/(?:Application Support|[^\s'"()\[\],;|<>])+)"#).unwrap(),
             re_home: Regex::new(r"(/home/|/Users/)([^/\s:'\x22]+)").unwrap(),
-            re_dev: Regex::new(r"^(sd[a-z]+|hd[a-z]+|vd[a-z]+|xvd[a-z]+|nvme\d+n\d+|mmcblk\d+|dm-|loop|md|nbd|zram|sr)\d*(p\d+)?$").unwrap(),
+            re_dev: Regex::new(r"^(sd[a-z]+|hd[a-z]+|vd[a-z]+|xvd[a-z]+|nvme\d+n\d+|mmcblk\d+|dm-|loop|md|nbd|zram|sr)\d*(p\d+)?$|^disk\d+(s\d+)*$").unwrap(),
         }
     }
 
@@ -472,6 +474,8 @@ mod tests {
         assert!(!p.contains("divimarket"), "{p}");
         assert_eq!(r.path("/proc/123/status"), "/proc/123/status");
         assert_eq!(r.path("/dev/sda1"), "/dev/sda1");
+        assert_eq!(r.path("/dev/disk3s1s1"), "/dev/disk3s1s1");
+        assert_eq!(r.path("/System/Volumes/Preboot"), "/System/Volumes/Preboot");
         assert_eq!(r.path("/system.slice/irondivid.service"), "/system.slice/irondivid.service");
         let cg = "/user.slice/user-1000.slice/session-2.scope";
         assert_eq!(r.scrub(&format!("  {cg} memory.max=max")), format!("  {cg} memory.max=max"));

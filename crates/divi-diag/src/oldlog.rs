@@ -355,7 +355,7 @@ pub fn mask_wallet_msg(msg: &str, r: &Redactor) -> String {
 
 fn re_amount() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?i)\b-?\d[\d,_]*(?:\.\d+)?\s*(sats|sat|DIVI)\b").unwrap())
+    RE.get_or_init(|| Regex::new(r"(?i)\b-?\d[\d,_]*(?:\.\d+)?\s*(sats|sat|DIVI)\b(\.[A-Za-z])?").unwrap())
 }
 
 fn re_invalid() -> &'static Regex {
@@ -377,7 +377,11 @@ fn plain_rules(l: &str, r: &Redactor) -> String {
             r.pseudonym("h64", &c[2].to_ascii_lowercase())
         }
     });
-    let t = re_amount().replace_all(&t, "<num> $1");
+    // `29 divi.conf` (an `ls -l` time before a file name) is not an amount
+    let t = re_amount().replace_all(&t, |c: &regex::Captures| match c.get(2) {
+        Some(_) => c[0].to_string(),
+        None => format!("<num> {}", &c[1]),
+    });
     let t = re_invalid().replace_all(&t, "$1");
     t.into_owned()
 }
@@ -555,6 +559,8 @@ mod tests {
         let t = filter(log, &r()).text;
         assert!(!t.contains("1.23456789") && !t.contains("5000"), "{t}");
         assert!(t.contains("<num> DIVI") && t.contains("<num> sats"), "{t}");
+        let r2 = Redactor::new([0; 32], &Known::default());
+        assert_eq!(plain_rules("Oct 31 04:29 divi.conf; sent 5 DIVI.", &r2), "Oct 31 04:29 divi.conf; sent <num> DIVI.");
         assert!(!t.contains("CANARY"), "{t}");
         assert!(t.contains("Invalid -rpcpassword="), "{t}");
         assert!(t.contains("hash h64-"), "{t}");
