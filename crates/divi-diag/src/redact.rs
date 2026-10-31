@@ -299,6 +299,24 @@ impl Redactor {
         })
     }
 
+    /// Every Divi base58 and bech32 address replaced by its own pseudonym
+    /// (`addr-3c1a`): the --rpc call lines and answers, where two calls
+    /// naming the same address must still be seen to name the same one
+    /// (B6.5). The same digit-and-lowercase rule as the scrub decides what
+    /// is an address; the scrub then leaves the pseudonyms alone
+    pub fn addresses(&self, text: &str) -> String {
+        let t = self.re_divi_addr.replace_all(text, |c: &Captures| {
+            let s = &c[0];
+            if s.chars().any(|ch| ch.is_ascii_digit()) && s.chars().any(|ch| ch.is_ascii_lowercase()) {
+                self.pseudonym("addr", s)
+            } else {
+                s.to_string()
+            }
+        });
+        let t = self.re_bech32.replace_all(&t, |c: &Captures| self.pseudonym("addr", &c[0].to_ascii_lowercase()));
+        t.into_owned()
+    }
+
     /// The whole §6.2 pass this step implements, over one block of text
     pub fn scrub(&self, text: &str) -> String {
         let t = self.re_pem.replace_all(text, "<pem block removed>");
@@ -436,7 +454,7 @@ fn is_pseudonym(c: &str) -> bool {
     hex_ok
         && matches!(
             kind,
-            "u" | "p" | "host" | "h64" | "mid" | "rfc1918" | "public4" | "cgnat" | "linklocal" | "loopback"
+            "u" | "p" | "host" | "h64" | "mid" | "addr" | "rfc1918" | "public4" | "cgnat" | "linklocal" | "loopback"
                 | "multicast" | "ula" | "linklocal6" | "public6" | "multicast6"
         )
 }
@@ -475,6 +493,24 @@ mod tests {
                 ips: vec![],
             },
         )
+    }
+
+    #[test]
+    fn addresses_get_their_own_pseudonym() {
+        let r = r();
+        let a = "DLhq6dWyzzoLu1WGRKp7SxA7NGLMbeVjWN";
+        let b = "DPhJsztbZafDc1YeyrRqSjmKjkmLJpQpUn";
+        let t = r.addresses(&format!("validateaddress {a} then {b} and {a}"));
+        assert!(!t.contains(a) && !t.contains(b), "{t}");
+        let pa = r.pseudonym("addr", a);
+        assert_eq!(t.matches(&pa).count(), 2, "{t}");
+        assert!(t.contains(&r.pseudonym("addr", b)));
+        // the scrub keeps the pseudonyms and so does a path component
+        assert_eq!(r.scrub(&t), t);
+        assert!(is_pseudonym(&pa));
+        // a word that only looks like an address stays
+        let w = "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD";
+        assert_eq!(r.addresses(w), w);
     }
 
     #[test]

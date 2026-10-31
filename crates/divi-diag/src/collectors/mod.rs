@@ -74,8 +74,9 @@ pub static ALL: &[Spec] = &[
 pub static OBSERVED: Spec = Spec { id: "B3", name: "observed", secs: 660, what: "observed start of irondivid" };
 
 /// B6.5 `--rpc`: not in [`ALL`]; run after the collection, only for the
-/// calls the user named; every call has 2 s, all of them 60 s together
-pub static RPC: Spec = Spec { id: "B6.5", name: "rpc", secs: 75, what: "RPC calls you named" };
+/// calls the user named; every call has 2 s, all of them 60 s together,
+/// and the block lookups another 60 s (10 s each)
+pub static RPC: Spec = Spec { id: "B6.5", name: "rpc", secs: 135, what: "RPC calls you named" };
 
 /// B6.1 `--capture`: not in [`ALL`]; runs first, for the minutes the
 /// user gave (the parent sets the budget); the collection after it is the

@@ -301,6 +301,10 @@ impl Walk {
 
     /// B6.5 "Undecided is reduced": version, size to the next power of two, nTx
     fn reduce_block(&mut self, m: &Map<String, Value>, path: &str) -> Value {
+        self.reduce_block_why(m, path, "own staked block undecided")
+    }
+
+    fn reduce_block_why(&mut self, m: &Map<String, Value>, path: &str, why: &str) -> Value {
         let mut out = Map::new();
         if let Some(v) = m.get("version") {
             out.insert("version".into(), v.clone());
@@ -312,7 +316,7 @@ impl Walk {
         if let Some(n) = ntx {
             out.insert("nTx".into(), Value::from(n));
         }
-        self.note(path, "block answer reduced to version, size and nTx (own staked block undecided)");
+        self.note(path, &format!("block answer reduced to version, size and nTx ({why})"));
         Value::Object(out)
     }
 
@@ -408,12 +412,14 @@ impl Walk {
             // an address is masked here too, not only by §6.2's address check
             if k == "address" || k == "addresses" {
                 let nv = match v {
-                    Value::String(s) if s.starts_with("pub-") => Value::String(s),
+                    Value::String(s) if s.starts_with("pub-") || is_addr_pseudonym(&s) => Value::String(s),
                     Value::String(_) => {
                         self.note(&kp, "masked");
                         Value::from("<addr>")
                     }
-                    Value::Array(a) if a.iter().all(|x| x.as_str().is_some_and(|s| s.starts_with("pub-"))) => {
+                    Value::Array(a)
+                        if a.iter().all(|x| x.as_str().is_some_and(|s| s.starts_with("pub-") || is_addr_pseudonym(s))) =>
+                    {
                         Value::Array(a)
                     }
                     Value::Array(a) if a.iter().all(Value::is_string) => {
@@ -527,6 +533,87 @@ pub fn treat_call(v: Value, method: &str) -> Treated {
         w.value(v, "", false, true, false)
     } else {
         w.value(v, "", false, false, false)
+    };
+    Treated { json, treatment, actions: w.actions }
+}
+
+/// `addr-<4 hex>`: an address the --rpc collector already replaced by its
+/// own pseudonym ([`crate::redact::Redactor::addresses`])
+fn is_addr_pseudonym(s: &str) -> bool {
+    s.strip_prefix("addr-").is_some_and(|h| h.len() == 4 && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+}
+
+/// Whose block a block answer is about (B6.5 "Own staked blocks")
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BlockDecision {
+    /// the coinstake's staked input pays an address of this wallet
+    Own,
+    /// decided not this wallet's: a public record
+    NotOwn,
+    /// could not be decided (the reason); reduced like an own block
+    Undecided(String),
+}
+
+/// The treatment of a block answer (`getblock`, `getblockheader`,
+/// `getblockhash`) once the block is decided. Own and undecided: only
+/// version, size class and nTx, and the getblockhash answer dropped whole.
+/// Not own: a public record, except `previousblockhash` and
+/// `nextblockhash`, dropped from every block (S4), and each txid replaced
+/// by `public_txid` (its public-record pseudonym; at verbosity 2 a
+/// transaction entry is reduced to that pseudonym).
+pub fn treat_block(v: Value, method: &str, d: &BlockDecision, public_txid: &dyn Fn(&str) -> String) -> Treated {
+    let mut w = Walk { actions: BTreeMap::new() };
+    let treatment = format!("RPC answer: {method}");
+    let why = match d {
+        BlockDecision::Own => "staked by this wallet".to_string(),
+        BlockDecision::Undecided(r) => format!("could not be checked against the wallet: {r}"),
+        BlockDecision::NotOwn => String::new(),
+    };
+    if method == "getblockhash" {
+        let json = match (d, v) {
+            (BlockDecision::NotOwn, Value::String(h)) if is_hex64(&h) => Value::String(format!("blk:{h}")),
+            _ => {
+                let why = if why.is_empty() { "not a block hash".to_string() } else { why };
+                w.note("(answer)", &format!("dropped (the block hash names the block; {why})"));
+                Value::Null
+            }
+        };
+        return Treated { json, treatment, actions: w.actions };
+    }
+    let json = match (d, v) {
+        (BlockDecision::NotOwn, Value::Object(mut m)) => {
+            for k in ["previousblockhash", "nextblockhash"] {
+                if m.remove(k).is_some() {
+                    w.note(k, "dropped from every block (S4)");
+                }
+            }
+            let tx = m.remove("tx");
+            let mut out = w.object(m, "", false, true, false);
+            if let (Some(Value::Array(a)), Value::Object(o)) = (tx, &mut out) {
+                let n = a.len();
+                let ids: Vec<Value> = a
+                    .into_iter()
+                    .map(|t| {
+                        let id = match &t {
+                            Value::String(s) => Some(s.clone()),
+                            Value::Object(e) => e.get("txid").and_then(Value::as_str).map(str::to_string),
+                            _ => None,
+                        };
+                        match id {
+                            Some(s) if is_hex64(&s) => Value::from(public_txid(&s.to_ascii_lowercase())),
+                            _ => Value::from("<dropped>"),
+                        }
+                    })
+                    .collect();
+                for _ in 0..n {
+                    w.note("tx[]", "each txid pseudonymised under the public-record salt");
+                }
+                o.insert("tx".into(), Value::Array(ids));
+            }
+            out
+        }
+        (_, Value::Object(m)) if !matches!(d, BlockDecision::NotOwn) => w.reduce_block_why(&m, "", &why),
+        (_, other) => w.value(other, "", false, false, false),
     };
     Treated { json, treatment, actions: w.actions }
 }
