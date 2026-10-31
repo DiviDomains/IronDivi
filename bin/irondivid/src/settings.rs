@@ -237,13 +237,15 @@ impl Settings {
     /// divid's format (Settings::ReadConfigFile with boost's parser): one
     /// `name=value` per line, `#` starting a comment. A line that is neither
     /// that nor a `[section]` header is boost's error, which stops divid's
-    /// start (divid.cpp:95-99); its text is returned. A `[section]` header and
+    /// start (divid.cpp:95-99); boost's text is returned with the line's
+    /// number, never the line itself, which may hold a password (R3, code 3).
+    /// A `[section]` header and
     /// a `net.name` prefix do not keep a setting from applying: Divi Core
     /// 3.0.0 applies them on every network (ParseNetworkSpecificFlag tests
     /// "testnet" without its dash).
     pub fn read_config(&mut self, content: &str) -> Result<(), String> {
         let mut section: Option<String> = None;
-        for raw in content.lines() {
+        for (number, raw) in content.lines().enumerate() {
             let line = raw.split('#').next().unwrap_or("").trim();
             if line.is_empty() {
                 continue;
@@ -256,7 +258,8 @@ impl Settings {
                 Some((k, v)) => (k.trim(), v.trim()),
                 None => {
                     return Err(format!(
-                        "the options configuration file contains an invalid line '{line}'"
+                        "the options configuration file contains an invalid line (line {})",
+                        number + 1
                     ))
                 }
             };
@@ -384,7 +387,7 @@ mod tests {
         let mut s = cli(&[]);
         assert_eq!(
             s.read_config("port=2\n  listen   # no value\nrpcport=3\n"),
-            Err("the options configuration file contains an invalid line 'listen'".to_string())
+            Err("the options configuration file contains an invalid line (line 2)".to_string())
         );
         let mut s = cli(&[]);
         assert!(s.read_config("# only\n\n[main]\nport=2\n").is_ok());

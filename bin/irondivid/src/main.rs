@@ -334,7 +334,7 @@ fn resolve_args(mut args: Args) -> Result<Args> {
             _ => args
                 .settings
                 .read_config(&content)
-                .map_err(ConfigFileError)?,
+                .map_err(|e| ConfigFileError(format!("{}: {}", path.display(), e)))?,
         }
     }
     args.refresh()?;
@@ -4830,10 +4830,13 @@ mod start_errors {
     /// A divi.conf line with no "=" is boost's error (divid.cpp:95-99)
     #[test]
     fn config_line_without_a_value_stops_the_start() {
-        assert_eq!(
-            refused(&format!("{CONF}listen\n"), &[]),
-            "the options configuration file contains an invalid line 'listen'"
+        let refusal = refused(&format!("{CONF}listen\n"), &[]);
+        assert!(
+            refusal.ends_with("divi.conf: the options configuration file contains an invalid line (line 4)"),
+            "{refusal}"
         );
+        // The line itself is never shown: it may hold a password (R3, code 3)
+        assert!(!refused(&format!("{CONF}rpcpassword secret\n"), &[]).contains("secret"));
     }
 
     /// divid takes -? and -help, and -version; -h and -V are not its options
