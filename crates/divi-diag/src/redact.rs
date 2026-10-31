@@ -166,7 +166,7 @@ impl Redactor {
             ))
             .unwrap(),
             // "Application Support" is the one well-known macOS directory with a space
-            re_path: Regex::new(r#"(^|[\s='"(\[,<>|])(/(?:Application Support|[^\s'"()\[\],;|<>])+)"#).unwrap(),
+            re_path: Regex::new(r#"(^|[\s='"(\[,<>|:])(/(?:Application Support|[^\s'"()\[\],;|<>])+)"#).unwrap(),
             re_home: Regex::new(r"(/home/|/Users/)([^/\s:'\x22]+)").unwrap(),
             re_dev: Regex::new(r"^(sd[a-z]+|hd[a-z]+|vd[a-z]+|xvd[a-z]+|nvme\d+n\d+|mmcblk\d+|dm-|loop|md|nbd|zram|sr)\d*(p\d+)?$").unwrap(),
         }
@@ -362,6 +362,10 @@ impl Redactor {
         let t = self.re_path.replace_all(&t, |c: &Captures| {
             // "/proc/cpuinfo:" — trailing punctuation is not part of the name
             let whole = &c[2];
+            // "scheme://host/..." is a URL: its host was handled above
+            if &c[1] == ":" && whole.starts_with("//") {
+                return c[0].to_string();
+            }
             let body = whole.trim_end_matches([':', '.', ',']);
             let body = if body.is_empty() { whole } else { body };
             format!("{}{}{}", &c[1], self.path(body), &whole[body.len()..])
@@ -467,6 +471,10 @@ mod tests {
         let mac = "/Users/x/Library/Application Support/IronDivi";
         assert!(r.scrub(mac).ends_with("/Library/Application Support/IronDivi"), "{}", r.scrub(mac));
         assert_eq!(r.scrub("at /home/u-1a2b/.irondivi/txindex"), "at /home/u-1a2b/.irondivi/txindex");
+        // rocksdb writes "manifest file:/home/..." with no space before the path
+        let m = r.scrub("Recovered from manifest file:/home/alice/mynode/txindex/MANIFEST-000001 ok");
+        assert!(!m.contains("alice") && !m.contains("mynode") && m.contains("/txindex/MANIFEST-000001"), "{m}");
+        assert!(r.scrub("url http://127.0.0.1:8480/healthz").contains("http://127.0.0.1:8480/healthz"));
     }
 
     #[test]
