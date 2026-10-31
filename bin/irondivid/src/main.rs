@@ -31,6 +31,7 @@ mod settings;
 #[cfg(unix)]
 mod signals;
 mod snapshot_sig;
+mod tasks;
 
 use anyhow::{Context, Result};
 use divi_crypto::compute_block_hash;
@@ -121,7 +122,9 @@ mod exit_code {
 /// thread pools. The only way irondivid exits with a code other than 0
 /// or 101 (A9, R3), apart from signals.rs: a third stop signal (10) and a
 /// signal whose default action ends the process (128+N), which write their
-/// own exit records. A test refuses any other exit call in this crate.
+/// own exit records. The panic hook in tasks.rs calls it too: 10 for a
+/// critical task or thread, 101 for a main-thread panic before main's
+/// `catch_unwind`. A test refuses any other exit call in this crate.
 fn die(code: i32, reason: std::fmt::Arguments<'_>) -> ! {
     let reason = reason.to_string();
     // Durable before anything else that could stall (A1); a no-op before
@@ -1938,7 +1941,7 @@ fn resubmit_wallet_txs(node: &Node, wallet: &Arc<WalletDb>) {
             Ok(_) => {
                 resubmitted += 1;
                 let relay = node.tx_relay().clone();
-                tokio::spawn(async move {
+                tasks::spawn_supervised("tx-announce", async move {
                     relay.announce_tx(txid).await;
                 });
             }
@@ -2057,7 +2060,7 @@ async fn run_daemon(
     if config.stop_after_block_import {
         let chain = node.chain().clone();
         let tx = shutdown_tx.clone();
-        tokio::spawn(async move {
+        tasks::spawn_supervised("stop-after-import", async move {
             while chain.is_importing() {
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             }
@@ -2287,7 +2290,7 @@ async fn run_daemon(
             if config.network.network_type != NetworkType::Regtest {
                 let wallet_for_backup = Arc::clone(wallet_arc);
                 let backup_root = wallet_dir.parent().map(|p| p.to_path_buf());
-                tokio::spawn(async move {
+                tasks::spawn_supervised("wallet-backup", async move {
                     let Some(root) = backup_root else { return };
                     let mut daily =
                         tokio::time::interval(std::time::Duration::from_secs(24 * 3600));
@@ -2340,7 +2343,7 @@ async fn run_daemon(
         let chain_for_prune = node.chain().clone();
         let wallet_for_prune = wallet.clone();
         info!("Block-expiry pruning enabled: expire={:?}", expire);
-        tokio::spawn(async move {
+        tasks::spawn_supervised("block-expiry", async move {
             loop {
                 let floor = wallet_for_prune.as_ref().map(|w| w.last_scan_height());
                 let now = std::time::SystemTime::now()
@@ -2490,6 +2493,7 @@ async fn run_daemon(
     info!("Starting RPC server on {}...", rpc_config.bind_address);
     // Start-up is done: say so, or a slow start and a running node look alike
     runs_log::phase("running");
+    tasks::start_test_panics(config.network.network_type == NetworkType::Regtest);
     if !config.log.print_to_console {
         console!("IronDivi is running (chain height {}).", chain.height());
     }
@@ -2505,7 +2509,7 @@ async fn run_daemon(
     let rpc_stop: divi_rpc::ShutdownCallback = Arc::new(move || {
         runs_log::stop_requested("rpc");
         let tx = shutdown_tx.clone();
-        tokio::spawn(async move {
+        tasks::spawn_supervised("rpc-stop", async move {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             let _ = tx.send(());
         });
@@ -2597,7 +2601,7 @@ async fn run_daemon(
                         // Announce to peers (async, fire-and-forget)
                         let relay = tx_relay_for_submit.clone();
                         let txid_copy = txid;
-                        tokio::spawn(async move {
+                        tasks::spawn_supervised("tx-announce", async move {
                             relay.announce_tx(txid_copy).await;
                         });
 
@@ -2629,7 +2633,7 @@ async fn run_daemon(
                         rpc_server.staking().set_staking_control(Arc::new(move |enable| {
                             if enable {
                                 let staker = Arc::clone(&staker_for_control);
-                                tokio::spawn(async move {
+                                tasks::spawn_critical("staker", async move {
                                     staker.start().await;
                                 });
                             } else {
@@ -2765,6 +2769,9 @@ async fn run_daemon(
 
     // Stop the node
     info!("Stopping node...");
+    if tasks::test_panic(config.network.network_type == NetworkType::Regtest, "main") {
+        panic!("test panic: this text stays in crash.log");
+    }
     let started = std::time::Instant::now();
     node.stop().await.with_context(|| "Failed to stop node")?;
     shutdown_stage("node stopped", started);
@@ -2943,7 +2950,7 @@ fn webui_config(args: &Args, config: &NodeConfig) -> Result<Option<divi_webui::W
 /// replaced, not waited for
 fn run_notify(cmd: &str, value: &str) {
     let cmd = cmd.replace("%s", value);
-    std::thread::spawn(move || {
+    let started = tasks::thread("notify", tasks::Kind::Supervised, move || {
         match std::process::Command::new("sh")
             .arg("-c")
             .arg(&cmd)
@@ -2954,6 +2961,9 @@ fn run_notify(cmd: &str, value: &str) {
             Err(e) => warn!("runCommand error: {} ({})", cmd, e),
         }
     });
+    if let Err(e) = started {
+        warn!("runCommand not started: {}", e);
+    }
 }
 
 /// -blocknotify: run the command each time the best block changes, with the
@@ -3299,6 +3309,8 @@ fn remove_pid_file(pid_file: &std::path::Path) {
 }
 
 fn main() {
+    // Every panic is recorded from here on (A4)
+    tasks::install_hook();
     // A closed stdin, stdout or stderr is reopened on /dev/null before any
     // file is opened: the next open() would take that number, and console
     // lines would be written into a database or the wallet (D2)
@@ -3488,9 +3500,7 @@ fn main() {
     // the forks and before the wallet opens, so a stalled runtime cannot stop it. Until the
     // health log exists this is its own tick, at the health log's 60 s rate.
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    if let Err(e) = std::thread::Builder::new()
-        .name("dumpable-check".into())
-        .spawn(|| loop {
+    if let Err(e) = tasks::thread("dumpable-check", tasks::Kind::Supervised, || loop {
             std::thread::sleep(std::time::Duration::from_secs(60));
             match private_files::restore_non_dumpable() {
                 Some((was, Ok(()))) => warn!("dumpable restored (was {})", was),
@@ -3511,6 +3521,8 @@ fn main() {
     // which waits with no deadline, and then exit through the C++ destructors,
     // which join RocksDB's thread pools: the node could hang until the service
     // manager killed it. The panic message is already written by then.
+    // The only catch_unwind in the node (A4; a test keeps it so)
+    tasks::main_caught();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         runtime.block_on(async_main(args, data_dir))
     }));
@@ -3600,6 +3612,7 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
         };
         let network = format!("{}/{:?}", network, args.chain_mode()).to_lowercase();
         runs_log::open(&data_dir, &network, cfg!(unix) && args.daemon);
+        tasks::set_data_dir(&data_dir);
         runs_log::phase("config");
     }
 
@@ -3650,7 +3663,7 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
     {
         let shutdown_tx_clone = shutdown_tx.clone();
         let console = !log_config_console;
-        tokio::spawn(async move {
+        tasks::spawn_supervised("ctrl-c", async move {
             if let Err(e) = signal::ctrl_c().await {
                 error!("Ctrl+C handler failed: {}", e);
                 return;

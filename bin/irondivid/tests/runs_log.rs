@@ -54,6 +54,10 @@ fn runs_log(dir: &Path) -> String {
 }
 
 fn start(dir: &Path) -> (KillOnDrop, u16) {
+    start_with(dir, &[])
+}
+
+fn start_with(dir: &Path, env: &[(&str, &str)]) -> (KillOnDrop, u16) {
     let (child, rpc_port, _) = start_node(
         dir,
         |rpc_port, p2p_port| {
@@ -64,6 +68,7 @@ fn start(dir: &Path) -> (KillOnDrop, u16) {
                 .arg(format!("-port={p2p_port}"))
                 .args(["-bind=127.0.0.1", "-staking=0", "-rpcuser=test"])
                 .arg(format!("-rpcpassword={SECRET}"))
+                .envs(env.iter().copied())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
             cmd
@@ -470,4 +475,76 @@ fn a_second_instance_refused_at_the_lock_leaves_the_marker() {
     rpc(rpc_port, "stop").expect("stop reply");
     assert!(wait_exit(&mut node).success());
     assert!(marker(dir.path()).is_none(), "a clean stop left the marker");
+}
+
+fn crash_log(dir: &Path) -> String {
+    std::fs::read_to_string(dir.join("diag").join("crash.log")).unwrap_or_default()
+}
+
+/// A4: a supervised task's panic ends that task alone; it is recorded in
+/// runs.log without its message, which goes to crash.log. A main-thread
+/// panic ends the run with 101 through `die`, whose exit record replaces
+/// the marker
+#[test]
+fn a_task_panic_is_recorded_and_a_main_panic_exits_101() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut node, rpc_port) = start_with(dir.path(), &[("IRONDIVI_TEST_PANIC", "task,main")]);
+    let log = wait_for(dir.path(), " task=\"test-panic\" ");
+    let panic = log.lines().find(|l| l.contains(" panic ")).expect(&log);
+    assert!(panic.ends_with(" ends_node=no"), "{log}");
+    assert!(panic.contains("tasks.rs:"), "{log}");
+    assert!(rpc(rpc_port, "getblockcount").is_some(), "the node stopped");
+
+    rpc(rpc_port, "stop").expect("stop reply");
+    assert_eq!(wait_exit(&mut node).code(), Some(101));
+    assert!(marker(dir.path()).is_none(), "the exit record left the marker");
+    let log = runs_log(dir.path());
+    assert!(!log.contains("stays in crash.log"), "{log}");
+    assert_eq!(log.matches(" panic ").count(), 2, "{log}");
+    assert!(
+        log.lines()
+            .any(|l| l.contains(" panic thread=\"main\" ") && l.ends_with(" ends_node=yes")),
+        "{log}"
+    );
+    let exit = log.lines().find(|l| l.contains(" exit code=")).expect(&log);
+    assert!(exit.contains(" exit code=101 run=1 "), "{log}");
+    assert!(
+        exit.contains(" reason=\"Error: the node's main task panicked\" "),
+        "{log}"
+    );
+    let crash = crash_log(dir.path());
+    assert_eq!(crash.matches("stays in crash.log").count(), 2, "{crash}");
+    assert!(crash.contains("\nbacktrace:\n"), "{crash}");
+    let mode = {
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.path().join("diag/crash.log");
+        std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+    };
+    assert_eq!(mode, 0o600);
+}
+
+/// A4: a critical task's or thread's panic ends the node with code 10,
+/// naming it
+#[test]
+fn a_critical_panic_ends_the_run_with_code_10() {
+    for what in ["critical-task", "critical-thread"] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut node = start_with(dir.path(), &[("IRONDIVI_TEST_PANIC", what)]).0;
+        assert_eq!(wait_exit(&mut node).code(), Some(10), "{what}");
+        let log = runs_log(dir.path());
+        let panic = log.lines().find(|l| l.contains(" panic ")).expect(&log);
+        assert!(panic.ends_with(" ends_node=yes"), "{what}: {log}");
+        let exit = log.lines().find(|l| l.contains(" exit code=")).expect(&log);
+        assert!(exit.contains(" exit code=10 run=1 "), "{what}: {log}");
+        assert!(
+            exit.contains(" reason=\"Error: test-panic panicked\" "),
+            "{what}: {log}"
+        );
+        assert!(!log.contains("stays in crash.log"), "{what}: {log}");
+        assert!(
+            crash_log(dir.path()).contains("stays in crash.log"),
+            "{what}"
+        );
+        assert!(marker(dir.path()).is_none(), "{what}");
+    }
 }

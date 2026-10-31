@@ -438,39 +438,38 @@ pub fn start_writer() {
     if fd < 0 {
         return;
     }
-    let spawned = std::thread::Builder::new()
-        .name("signals".into())
-        .spawn(move || loop {
-            let mut byte = 0u8;
-            let r = unsafe { libc::read(fd, (&mut byte as *mut u8).cast(), 1) };
-            if r < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            if r != 1 {
-                return;
-            }
-            if byte & 0x80 != 0 {
-                let mut raw = Raw::new();
-                raw.signo = i32::from(byte & 0x7f);
-                raw.mono_ns = mono_ns();
-                raw.count = if STOP_SIGNALS.contains(&raw.signo) {
-                    STOPS.load(Ordering::SeqCst)
-                } else {
-                    0
-                };
-                act(&raw, " detail=lost");
-                continue;
-            }
-            let Some(slot) = SLOT.get(usize::from(byte)) else {
-                continue;
+    // Without it no signal is acted on: a panic here ends the node (A4)
+    let spawned = crate::tasks::thread("signals", crate::tasks::Kind::Critical, move || loop {
+        let mut byte = 0u8;
+        let r = unsafe { libc::read(fd, (&mut byte as *mut u8).cast(), 1) };
+        if r < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        if r != 1 {
+            return;
+        }
+        if byte & 0x80 != 0 {
+            let mut raw = Raw::new();
+            raw.signo = i32::from(byte & 0x7f);
+            raw.mono_ns = mono_ns();
+            raw.count = if STOP_SIGNALS.contains(&raw.signo) {
+                STOPS.load(Ordering::SeqCst)
+            } else {
+                0
             };
-            if slot.state.load(Ordering::Acquire) != READY {
-                continue;
-            }
-            let raw = unsafe { *slot.raw.get() };
-            slot.state.store(FREE, Ordering::Release);
-            act(&raw, "");
-        });
+            act(&raw, " detail=lost");
+            continue;
+        }
+        let Some(slot) = SLOT.get(usize::from(byte)) else {
+            continue;
+        };
+        if slot.state.load(Ordering::Acquire) != READY {
+            continue;
+        }
+        let raw = unsafe { *slot.raw.get() };
+        slot.state.store(FREE, Ordering::Release);
+        act(&raw, "");
+    });
     if let Err(e) = spawned {
         crate::console_line(
             false,
