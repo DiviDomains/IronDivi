@@ -155,7 +155,12 @@ fn unclean_previous(text: &str, diag_dir: &Path) -> String {
     };
     let wsl = std::fs::read_to_string("/proc/sys/kernel/osrelease")
         .is_ok_and(|s| s.to_lowercase().contains("microsoft"));
-    let verdict = if boot == "changed" && wsl {
+    let run: u64 = get("run").parse().unwrap_or(0);
+    let exited = exit_recorded(&diag_dir.join("runs.log"), run);
+    // An exit on record means the run was already ending: no kill verdict
+    let verdict = if exited {
+        "exit-recorded"
+    } else if boot == "changed" && wsl {
         "wsl-vm-stopped"
     } else if boot == "changed" {
         "rebooted-or-power-loss"
@@ -168,10 +173,16 @@ fn unclean_previous(text: &str, diag_dir: &Path) -> String {
     } else {
         "no-trace"
     };
-    let run: u64 = get("run").parse().unwrap_or(0);
+    // The counters at the last rewrite: the marker is about to be replaced,
+    // and these are the only record of them (space-free `key=value`)
+    let prev: String = old
+        .iter()
+        .filter(|(k, _)| is_counter(k))
+        .map(|(k, v)| format!(" prev.{}={}", k, v.replace(' ', "_")))
+        .collect();
     format!(
         "run={} pid={} phase={} stop={} verdict={} boot={} pid1={} oom_kill={} \
-         exit_recorded={} crash_log=not-read kernel_log=not-read",
+         exit_recorded={} crash_log=not-read kernel_log=not-read{}",
         run,
         get("pid"),
         get("phase"),
@@ -180,20 +191,41 @@ fn unclean_previous(text: &str, diag_dir: &Path) -> String {
         boot,
         pid1,
         oom,
-        crate::runs_log::yes(exit_recorded(&diag_dir.join("runs.log"), run)),
+        crate::runs_log::yes(exited),
+        prev,
     )
+}
+
+/// A key `counters()` writes
+fn is_counter(k: &str) -> bool {
+    [
+        "memory.",
+        "pids.",
+        "cgroup",
+        "cpu.stat.",
+        "meminfo.",
+        "overcommit_memory",
+    ]
+    .iter()
+    .any(|p| k.starts_with(p))
 }
 
 const OOM_KILL: &str = "memory.events.oom_kill";
 
 /// Whether runs.log has an `exit` record for run `run` (the process may have
-/// died between that record and removing the marker)
+/// died between that record and removing the marker). An exit record names
+/// its run; one that does not (older) counts for the last `start` before it.
 fn exit_recorded(runs_log: &Path, run: u64) -> bool {
     let text = std::fs::read_to_string(runs_log).unwrap_or_default();
     let start = format!(" start run={} ", run);
+    let own = format!(" run={} ", run);
     let mut inside = false;
     for line in text.lines() {
-        if line.contains(&start) {
+        if line.contains(" exit code=") && line.contains(" run=") {
+            if line.contains(&own) {
+                return true;
+            }
+        } else if line.contains(&start) {
             inside = true;
         } else if line.contains(" start run=") {
             inside = false;
@@ -360,6 +392,14 @@ mod tests {
         assert!(exit_recorded(&path, 1));
         assert!(!exit_recorded(&path, 2));
         assert!(exit_recorded(&path, 3));
+        // Named exits: run 2, refused at the lock, exits inside run 1's span
+        std::fs::write(
+            &path,
+            "t m start run=1 pid=1\nt m start run=2 pid=2\nt m exit code=4 run=2 pid=2 x\n",
+        )
+        .unwrap();
+        assert!(!exit_recorded(&path, 1));
+        assert!(exit_recorded(&path, 2));
     }
 
     #[test]

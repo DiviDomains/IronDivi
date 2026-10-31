@@ -334,6 +334,11 @@ fn a_killed_run_leaves_its_marker_for_the_next_start() {
             unclean.contains(" verdict=no-trace boot=same pid1=same "),
             "{log}"
         );
+        // The dead run's memory counters survive the marker's replacement
+        assert!(
+            unclean.contains(" prev.memory.") || unclean.contains(" prev.meminfo."),
+            "{log}"
+        );
     }
     assert_eq!(log.matches(" unclean-previous ").count(), 1, "{log}");
 }

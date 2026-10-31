@@ -236,8 +236,10 @@ pub fn exit(code: i32, reason: &str) {
     record(
         "exit",
         &format!(
-            "code={} uptime_s={:.3} peak_rss_kb={} reason={}",
+            "code={} run={} pid={} uptime_s={:.3} peak_rss_kb={} reason={}",
             code,
+            RUN.get().map_or(0, |r| r.0),
+            std::process::id(),
             uptime,
             peak_rss_kb(),
             quote(reason)
