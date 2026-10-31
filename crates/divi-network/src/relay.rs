@@ -285,7 +285,9 @@ impl TxRelay {
             return;
         }
 
-        debug!("Received tx {} from peer {}", txid, peer_id);
+        // No per-tx line here or in relay_tx: a "Received" line exists only
+        // for a peer's tx, so a "Relaying" line without one names a tx this
+        // node sent itself.
 
         // Mark as seen
         self.seen_txs.write().insert(txid);
@@ -321,17 +323,9 @@ impl TxRelay {
             }
 
             if let Some(tx) = get_tx(&item.hash) {
-                let tx_version = tx.version;
-                let tx_vin = tx.vin.len();
-                let tx_vout = tx.vout.len();
                 let msg = NetworkMessage::Tx(tx);
                 if let Err(e) = self.peer_manager.send_to_peer(peer_id, msg).await {
                     warn!("Failed to send tx {} to peer {}: {}", item.hash, peer_id, e);
-                } else {
-                    debug!(
-                        "Sent tx {} to peer {} (version={}, vin={}, vout={})",
-                        item.hash, peer_id, tx_version, tx_vin, tx_vout
-                    );
                 }
             } else {
                 debug!(
@@ -388,8 +382,6 @@ impl TxRelay {
             return;
         }
 
-        debug!("Relaying tx {} to {} peers", txid, peers_to_notify.len());
-
         let inv = vec![InvItem::new(InvType::Tx, txid)];
         let msg = NetworkMessage::Inv(inv);
 
@@ -426,7 +418,6 @@ impl TxRelay {
             };
 
             if let Some(other_peer) = alternate_peer {
-                debug!("Retrying tx {} from peer {}", txid, other_peer);
                 self.request_tx(txid, other_peer).await;
             }
         }

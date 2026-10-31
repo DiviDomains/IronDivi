@@ -2342,7 +2342,6 @@ async fn run_daemon(
                             relay.announce_tx(txid_copy).await;
                         });
 
-                        info!("Transaction {} submitted to mempool and announced to peers", txid);
                         Ok(txid)
                     }));
                     debug!("Transaction submission callback configured");

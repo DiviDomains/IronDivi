@@ -2473,8 +2473,6 @@ impl WalletRpc {
         // Submit to mempool and broadcast
         self.submit_transaction(tx)?;
 
-        info!("Broadcasted transaction {}", txid);
-
         Ok(serde_json::json!(txid.to_string()))
     }
 
@@ -3742,8 +3740,6 @@ impl WalletRpc {
                 ("comment", params.get_str(2)),
             ]),
         );
-
-        info!("Sent {} outputs (txid: {})", plan.outputs.len(), txid);
 
         Ok(serde_json::json!(txid.to_string()))
     }

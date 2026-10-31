@@ -1346,7 +1346,6 @@ impl Node {
                 }
                 match result {
                     Ok(txid) => {
-                        tracing::debug!("Added relayed tx {} to mempool", txid);
                         let _ = event_tx_for_relay.send(NodeEvent::TransactionAccepted(txid));
                         for txid in accept_orphans(
                             &mempool_for_relay,
@@ -1783,7 +1782,6 @@ impl Node {
             relay.announce_tx(txid).await;
         });
 
-        tracing::debug!("Accepted transaction {} to mempool", txid);
         Ok(txid)
     }
 
@@ -1987,7 +1985,7 @@ pub fn accept_relayed_transaction(
 ) -> Result<Hash256, NodeError> {
     let result = mempool.add_relayed(event.tx.clone(), divi_primitives::amount::Amount::ZERO);
     match &result {
-        Ok(txid) => tracing::debug!("Added relayed tx {} to mempool", txid),
+        Ok(_) => {}
         Err(e) => score_relayed_refusal(peers, event, e),
     }
     result
@@ -2059,7 +2057,6 @@ pub fn accept_orphans(
             }
             match mempool.add_relayed(tx, divi_primitives::amount::Amount::ZERO) {
                 Ok(_) => {
-                    tracing::debug!("   accepted orphan tx {}", orphan_id);
                     work.push(orphan_id);
                     accepted.push(orphan_id);
                     erase.push(orphan_id);
