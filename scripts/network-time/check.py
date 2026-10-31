@@ -166,8 +166,8 @@ def netaddr(ip="0.0.0.0", port=0):
 
 class Peer:
     """A script peer from 127.0.0.10 (one address: one time sample, which alone moves no offset) that offers blocks
-    with an inv and serves the header and the block when asked, and keeps the reject messages and the block invs it
-    is sent"""
+    with an inv and serves the header and the block when asked, and keeps the reject messages and the block and
+    transaction invs it is sent"""
 
     def __init__(self, node, start_height=0):
         self.s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -183,6 +183,7 @@ class Peer:
         self.offers = {}
         self.rejects = []
         self.invs = []
+        self.tx_invs = []
         self.lock = threading.Lock()
         self.alive = True
         while self.read()[0] != "verack":
@@ -217,15 +218,18 @@ class Peer:
                     with self.lock:
                         self.rejects.append(payload)
                 elif cmd == "inv":
-                    # Count, then entries of a type and a hash; type 2 is a block
+                    # Count, then entries of a type and a hash; type 1 is a transaction, 2 a block
                     n, at = payload[0], 1
                     if n == 0xfd:
                         n, at = struct.unpack("<H", payload[1:3])[0], 3
                     with self.lock:
                         for k in range(n):
                             e = payload[at + 36 * k:at + 36 * (k + 1)]
-                            if struct.unpack("<I", e[:4])[0] == 2:
+                            kind = struct.unpack("<I", e[:4])[0]
+                            if kind == 2:
                                 self.invs.append(e[4:][::-1].hex())
+                            elif kind == 1:
+                                self.tx_invs.append(e[4:][::-1].hex())
                 elif cmd == "getheaders":
                     for header, _ in self.offers.values():
                         self.s.sendall(frame("headers", b"\x01" + header + b"\x00"))
@@ -261,6 +265,14 @@ class Peer:
     def block_invs(self):
         with self.lock:
             return list(self.invs)
+
+    def transaction_invs(self):
+        with self.lock:
+            return list(self.tx_invs)
+
+    def ping(self):
+        """Something sent, so the node counts the peer active on its clock (CheckForInnactivity, Node.cpp:812-834)"""
+        self.s.sendall(frame("ping", struct.pack("<Q", secrets.randbits(64))))
 
     def close(self):
         self.alive = False
@@ -570,6 +582,47 @@ finally:
         for w in ws:
             w.close()
     for n in (maker, core, iron):
+        if n:
+            n.stop()
+
+# --- part 4: the mempool rebroadcast timer on a mocked clock ---------------------------------------------------------
+
+core = iron = None
+watchers = {}
+try:
+    core = Node("divid-4", DIVID, 8)
+    iron = Node("irondivid-4", IRONDIVID, 9)
+    # Work blocks on the system clock, then a send: the tip has moved and the transaction waits in the mempool.
+    # The first rebroadcast check, at the start, set the next one within 30 minutes on the node's clock
+    # (main.cpp:1280-1294)
+    for n in (core, iron):
+        for _ in range(100):
+            if gen(n)[0] != "ok":
+                raise RuntimeError(f"{n.name} could not mine")
+    sent = {n.name: n.rpc("sendtoaddress", n.rpc("getnewaddress"), 1) for n in (core, iron)}
+    # A peer that connects after the send is not told of the transaction, until a rebroadcast
+    watchers = {n.name: Peer(n) for n in (core, iron)}
+    time.sleep(3)
+    start = int(time.time())
+
+    def rebroadcast_on_mock(node):
+        """The clock moved on in 15-minute steps (a bigger step drops a peer, Node.cpp:812-834), the peer pinging after
+        each, up to 45 minutes; was the transaction announced before the first step, and at which step"""
+        w = watchers[node.name]
+        before = sent[node.name] in w.transaction_invs()
+        for k in range(1, 4):
+            node.rpc("setmocktime", start + 900 * k)
+            w.ping()
+            if wait_for(lambda: sent[node.name] in w.transaction_invs(), 10):
+                return {"before": before, "announced": True, "within 30 min": k <= 2}
+        return {"before": before, "announced": False}
+    c, i = both(rebroadcast_on_mock)
+    # The system clock moved on less than a minute: the timer runs on GetTime, which setmocktime sets
+    row("mempool rebroadcast once the mocked clock passes the next check (main.cpp:1284-1291)", c, i)
+finally:
+    for w in watchers.values():
+        w.close()
+    for n in (core, iron):
         if n:
             n.stop()
 

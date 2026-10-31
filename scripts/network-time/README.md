@@ -20,7 +20,7 @@ scripts/network-time/run.sh target/debug ~/divi-3.0.0/bin 46600 /var/tmp
 ```
 
 - `<irondivid-bin-dir>` holds `irondivid`; `<core-bin-dir>` holds Divi Core's `divid`.
-- `<port-base>`: ports `<port-base>` to `<port-base>+15` on 127.0.0.2 (p2p and RPC of each node).
+- `<port-base>`: ports `<port-base>` to `<port-base>+19` on 127.0.0.2 (p2p and RPC of each node).
 - `[root]`: a fresh directory is made under it (default `$TMPDIR`, else `/tmp`) and deleted at the end.
 
 Each node's RPC password is a fresh random value written only to its `divi.conf`. A run takes about 4 minutes.
@@ -64,6 +64,12 @@ checks the script itself: every row passes.
    A node's own mined block goes to every peer (CoinMinter.cpp:119), so it is not used here. The blocks are sent
    unasked because irondivid, syncing headers from the peer that started at 5000, does not ask another peer for a
    block it announces, where divid does.
+8. **The mempool rebroadcast timer on a mocked clock** (PeriodicallyRebroadcastMempoolTxs, main.cpp:1280-1294, on
+   GetTime): each node mines 100 work blocks on the system clock and sends to itself; a script peer that connects
+   after the send is not told of the transaction. Then the clock is set 15, 30 and 45 minutes on (the peer pings after
+   each step, so it is not dropped as silent, Node.cpp:812-834): the first check after the start is due within
+   30 minutes of the node's clock, so the transaction is announced to the peer by the second step, while the system
+   clock has moved on less than a minute.
 
 What `net-time` covers is not repeated: the offset from peers' version messages, its cap and warning, and the
 2-hour limit on the network-adjusted clock.
