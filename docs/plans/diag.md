@@ -226,6 +226,21 @@ and are not re-based.
   `setlogconfig-refused` record (`option=logwalletdetail`) are as the
   plan says; `logwalletdetail` is listed in the A7 record so diag can
   read it there.
+- A11 wallet lines (301691f2): every `wallet_db.rs` txid, outpoint,
+  address and amount goes through a wrapper, more sites than the plan's
+  seven (the detached and unconfirmed store warnings, the notes lines,
+  the imported and watch-only key lines, the reconciliation and restore
+  lines). An outpoint prints as one `OwnOutpoint` pseudonym, not
+  `<txid>:<vout>`, and the ` sat`/` sats` units leave the formats
+  because `WalletAmount` prints its own unit with `-logwalletdetail=1`.
+  The three relay warns (249, 322, 403) mask the txid with
+  `WalletTxid` even though most are peer txids: the line cannot tell
+  whose tx it is, and an unmasked peer txid next to a masked own one
+  would mark the own one. `core_files.rs` prints the collateral only
+  after it parses; an entry that does not parse prints its alias and
+  both fields as `WalletLabel`/`WalletValue`. Not converted: wallet
+  names in `divi-wallet` `manager.rs` and file paths in `backup.rs`;
+  they are not on the plan's list and name no coin.
 
 Part B as built so far: B1 discovery, the B2 collectors (B2.0–B2.19),
 `contrib/diag.sh` (B1.4), `--import` (B6.4), the §6.2 redaction and §6.3
