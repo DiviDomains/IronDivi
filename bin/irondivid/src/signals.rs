@@ -83,6 +83,9 @@ struct Raw {
     mono_ns: u64,
     /// The stop signals counted so far, this one included (TERM, INT, QUIT)
     count: u32,
+    /// A stop signal within [`WINDOW_NS`] of the last counted one: recorded,
+    /// not counted
+    repeat: bool,
     sender: u8,
     comm: [u8; NAME],
     comm_len: usize,
@@ -101,6 +104,7 @@ impl Raw {
             uid: 0,
             mono_ns: 0,
             count: 0,
+            repeat: false,
             sender: SENDER_NOT_READ,
             comm: [0; NAME],
             comm_len: 0,
@@ -136,8 +140,14 @@ static SLOT: [Slot; SLOTS] = [const {
 /// `0x80 | signo` when every slot was taken
 static PIPE_READ: AtomicI32 = AtomicI32::new(-1);
 static PIPE_WRITE: AtomicI32 = AtomicI32::new(-1);
-/// Stop signals (TERM, INT) in this run
+/// Stop signals (TERM, INT, QUIT) counted in this run
 static STOPS: AtomicU32 = AtomicU32::new(0);
+/// When the last counted one arrived (monotonic ns)
+static LAST_STOP_NS: AtomicU64 = AtomicU64::new(0);
+/// A stop signal this soon after the last counted one is recorded and not
+/// counted, so one keypress or one `kill` of a process group that arrives
+/// as two signals does not bring the third nearer (A3)
+static WINDOW_NS: AtomicU64 = AtomicU64::new(5_000_000_000);
 /// SIGPIPEs received, and console writes that failed with EPIPE
 static SIGPIPES: AtomicU64 = AtomicU64::new(0);
 static EPIPES: AtomicU64 = AtomicU64::new(0);
@@ -172,6 +182,15 @@ fn handled() -> Vec<i32> {
 /// Install the handlers. Called first in `main`, once fds 0-2 are open (the
 /// pipe must not take one of them); it starts no thread.
 pub fn install() {
+    // Debug builds: the A3 test of the third signal sends all three at once
+    if cfg!(debug_assertions) {
+        if let Some(ms) = std::env::var("IRONDIVI_TEST_STOP_WINDOW_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            WINDOW_NS.store(ms.saturating_mul(1_000_000), Ordering::Relaxed);
+        }
+    }
     let mut fds = [-1; 2];
     if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
         crate::console_line(
@@ -210,12 +229,22 @@ fn on_signal(info: &libc::siginfo_t) {
         return;
     }
     let (pid, uid) = unsafe { (info.si_pid(), info.si_uid()) };
+    let now = mono_ns();
+    let mut repeat = false;
     let count = if STOP_SIGNALS.contains(&signo) {
-        let n = STOPS.fetch_add(1, Ordering::SeqCst) + 1;
-        if n >= 3 {
-            third_stop(signo, info.si_code, pid, uid, n);
+        let last = LAST_STOP_NS.load(Ordering::SeqCst);
+        let counted = STOPS.load(Ordering::SeqCst);
+        if counted > 0 && now.saturating_sub(last) < WINDOW_NS.load(Ordering::Relaxed) {
+            repeat = true;
+            counted
+        } else {
+            LAST_STOP_NS.store(now, Ordering::SeqCst);
+            let n = STOPS.fetch_add(1, Ordering::SeqCst) + 1;
+            if n >= 3 {
+                third_stop(signo, info.si_code, pid, uid, n);
+            }
+            n
         }
-        n
     } else {
         0
     };
@@ -236,7 +265,8 @@ fn on_signal(info: &libc::siginfo_t) {
     raw.pid = pid;
     raw.uid = uid;
     raw.count = count;
-    raw.mono_ns = mono_ns();
+    raw.repeat = repeat;
+    raw.mono_ns = now;
     read_sender(raw);
     SLOT[i].state.store(READY, Ordering::Release);
     let byte = i as u8;
@@ -489,7 +519,9 @@ fn act(raw: &Raw, detail: &str) {
     };
     match signo {
         libc::SIGTERM | libc::SIGINT | libc::SIGQUIT => {
-            if raw.count >= 2 {
+            if raw.repeat {
+                record(&format!("ignored count={} within=5s", raw.count));
+            } else if raw.count >= 2 {
                 record(&format!("ignored count={}", raw.count));
                 tracing::warn!(
                     "Received SIG{} again while stopping; a third stop signal ends the process",

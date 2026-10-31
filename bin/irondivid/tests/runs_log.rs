@@ -314,13 +314,41 @@ fn wait_for(dir: &Path, what: &str) -> String {
     }
 }
 
-/// A3: the second stop signal is recorded and ignored; the third ends the
-/// process with code 10 from the signal handler, which writes the exit
-/// record itself and leaves the marker, so the next start finds the exit
+/// A3: stop signals within 5 s of the counted one are recorded and not
+/// counted, so three at once stop the node cleanly
+#[test]
+fn stop_signals_within_five_seconds_count_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut node, _) = start(dir.path());
+    let pid = node.0.id() as i32;
+    for signo in [
+        libc::SIGSTOP,
+        libc::SIGTERM,
+        libc::SIGINT,
+        libc::SIGQUIT,
+        libc::SIGCONT,
+    ] {
+        assert_eq!(unsafe { libc::kill(pid, signo) }, 0);
+    }
+    assert_eq!(wait_exit(&mut node).code(), Some(0));
+    let log = runs_log(dir.path());
+    let ignored = log
+        .lines()
+        .filter(|l| l.ends_with(" action=ignored count=1 within=5s"))
+        .count();
+    assert_eq!(ignored, 2, "{log}");
+    assert!(log.lines().any(|l| l.ends_with(" action=stop count=1")
+        || l.ends_with(" action=stop count=1 dump=not-implemented")), "{log}");
+}
+
+/// A3: the second counted stop signal is recorded and ignored; the third
+/// ends the process with code 10 from the signal handler, which writes the
+/// exit record itself and leaves the marker, so the next start finds the
+/// exit. The 5 s window is set to 0 so all three can be sent at once.
 #[test]
 fn a_third_stop_signal_ends_the_run_with_code_10() {
     let dir = tempfile::tempdir().unwrap();
-    let (mut node, _) = start(dir.path());
+    let (mut node, _) = start_with(dir.path(), &[("IRONDIVI_TEST_STOP_WINDOW_MS", "0")]);
     let pid = node.0.id() as i32;
     // All three pending at once, so the node cannot finish stopping between
     // them: stopped, three different stop signals (two of the same kind
