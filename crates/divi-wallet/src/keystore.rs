@@ -50,10 +50,7 @@ impl KeyEntry {
         KeyEntry {
             secret: Some(secret),
             public,
-            created: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
+            created: node_now(),
             label: None,
             hd_path: None,
             is_watch_only: false,
@@ -80,10 +77,7 @@ impl KeyEntry {
         KeyEntry {
             secret: None,
             public,
-            created: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
+            created: node_now(),
             label,
             hd_path: None,
             is_watch_only: true,
@@ -161,6 +155,13 @@ impl HdPublicIds {
     }
 }
 
+/// Now on the node's clock, which setmocktime sets: Divi Core dates a key
+/// (CKeyMetadata(GetTime()), wallet.cpp:429-430) and a keypool key (CKeyPool,
+/// wallet.cpp:2254-2262) with GetTime
+fn node_now() -> u64 {
+    divi_primitives::clock::now().max(0) as u64
+}
+
 /// Default keypool size of each chain, receiving and change (Divi Core's
 /// DEFAULT_KEYPOOL_SIZE, wallet.cpp:2059)
 pub const DEFAULT_KEYPOOL_SIZE: u32 = 1000;
@@ -168,10 +169,7 @@ pub const DEFAULT_KEYPOOL_SIZE: u32 = 1000;
 impl KeyStore {
     /// Create a new empty keystore
     pub fn new(network: Network) -> Self {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        let now = node_now();
         KeyStore {
             keys: RwLock::new(HashMap::new()),
             hd_wallet: RwLock::new(None),
@@ -188,10 +186,7 @@ impl KeyStore {
 
     /// Create with HD wallet
     pub fn with_hd_wallet(network: Network, wallet: HdWallet) -> Self {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        let now = node_now();
         KeyStore {
             keys: RwLock::new(HashMap::new()),
             hd_public_ids: RwLock::new(HdPublicIds::of(&wallet)),
@@ -649,10 +644,7 @@ impl KeyStore {
 
         // Update oldest timestamp if this is the first fill
         if *self.keypool_oldest.read() == 0 && !added.is_empty() {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs();
+            let now = node_now();
             *self.keypool_oldest.write() = now;
         }
 

@@ -4972,11 +4972,11 @@ fn parents_first(
     ordered
 }
 
-/// Seconds since the Unix epoch
+/// Now on the node's clock, which setmocktime sets: unlocked_until is
+/// GetTime() plus the timeout (rpcserver.cpp:1205, :1215); the timer itself
+/// runs on the system clock, as Divi Core's RPCRunLater does
 fn unix_time_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64)
+    divi_primitives::clock::now()
 }
 
 #[cfg(test)]
