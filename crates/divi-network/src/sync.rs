@@ -26,7 +26,7 @@ use divi_storage::{Chain, StorageError};
 
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
@@ -69,6 +69,13 @@ const LAST_POW_BLOCK: u32 = 100;
 
 /// Maximum time to keep an orphan block before discarding
 const ORPHAN_BLOCK_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// How far behind the best peer the node may be and still count as caught up
+/// for the sync lines at info. A synced node trails its peers by a block or
+/// two while a peer's block is in flight; writing "Block sync complete" or
+/// "Sync progress" then would mark peer blocks and leave out own staked blocks
+/// (which never pass through the sync), naming them in default logs.
+const CAUGHT_UP_LAG: u32 = 6;
 
 /// Result of header validation
 #[derive(Debug)]
@@ -380,6 +387,9 @@ pub struct BlockSync {
     /// A growing side chain counts as progress: while a deep fork is fetched the
     /// main-chain height stays put for many rounds.
     stall_counter: RwLock<((u32, u32), u32)>,
+    /// The node was more than `CAUGHT_UP_LAG` blocks behind since it last
+    /// wrote "Block sync complete" (true until the first sync completes)
+    fell_behind: AtomicBool,
     /// Sync peers that stalled since the chain last moved: the next sync peer
     /// is one not in here, until every peer has had its turn
     stalled_sync_peers: RwLock<HashSet<PeerId>>,
@@ -430,6 +440,7 @@ impl BlockSync {
             reorg_callback: RwLock::new(None),
             orphaned_tx_callback: RwLock::new(None),
             stall_counter: RwLock::new(((0, 0), 0)),
+            fell_behind: AtomicBool::new(true),
             stalled_sync_peers: RwLock::new(HashSet::new()),
             side_chain_tip: RwLock::new(None),
             sync_started_peers: RwLock::new(HashSet::new()),
@@ -1340,16 +1351,17 @@ impl BlockSync {
             let best_height = *self.best_peer_height.read();
 
             if our_height >= best_height {
-                // Log only on the transition into Synced. Writing this per peer
-                // block would leave a height gap at every own staked block (own
-                // blocks never pass through here), naming them in default logs.
+                // Log only on the transition into Synced after a real catch-up.
+                // Writing this per peer block would leave a height gap at every
+                // own staked block (own blocks never pass through here), naming
+                // them in default logs; see CAUGHT_UP_LAG.
                 let was_synced = {
                     let mut state = self.state.write();
                     let was = *state == SyncState::Synced;
                     *state = SyncState::Synced;
                     was
                 };
-                if !was_synced {
+                if !was_synced && self.fell_behind.swap(false, Ordering::Relaxed) {
                     info!("Block sync complete at height {}", our_height);
                 }
                 // Disable IBD mode — enable full PoS and script validation for new blocks
@@ -1358,6 +1370,7 @@ impl BlockSync {
                     self.chain.set_ibd_mode(false);
                 }
             } else {
+                self.note_lag(our_height, best_height);
                 // Need to sync more - request next batch of block hashes
                 debug!(
                     "All queues empty, requesting more blocks (at height {}, target {})",
@@ -1575,6 +1588,16 @@ impl BlockSync {
         }
     }
 
+    /// Whether the node is more than `CAUGHT_UP_LAG` blocks behind `target`;
+    /// remembers it for the next "Block sync complete"
+    fn note_lag(&self, our_height: u32, target: u32) -> bool {
+        let far = target.saturating_sub(our_height) > CAUGHT_UP_LAG;
+        if far {
+            self.fell_behind.store(true, Ordering::Relaxed);
+        }
+        far
+    }
+
     /// Check for stalled downloads and retry
     pub async fn check_timeouts(&self) {
         let now = Instant::now();
@@ -1586,7 +1609,9 @@ impl BlockSync {
         let in_flight = self.blocks_in_flight.read().len();
         let queued = self.pending_block_requests.read().len();
 
-        if state != SyncState::Synced && state != SyncState::Idle {
+        // Within CAUGHT_UP_LAG the node is only waiting on a peer's block
+        let far_behind = self.note_lag(our_height, target_height);
+        if state != SyncState::Synced && state != SyncState::Idle && far_behind {
             info!(
                 "Sync progress: height {}/{}, state {:?}, in_flight={}, queued={}",
                 our_height, target_height, state, in_flight, queued
@@ -1603,10 +1628,17 @@ impl BlockSync {
             if stall.0 == progress && state != SyncState::Synced && state != SyncState::Idle {
                 stall.1 += 1;
                 if stall.1 >= 3 {
-                    warn!(
-                        "Sync stalled at height {} for {} cycles, rotating sync peer",
-                        our_height, stall.1
-                    );
+                    if far_behind {
+                        warn!(
+                            "Sync stalled at height {} for {} cycles, rotating sync peer",
+                            our_height, stall.1
+                        );
+                    } else {
+                        debug!(
+                            "Sync stalled at height {} for {} cycles, rotating sync peer",
+                            our_height, stall.1
+                        );
+                    }
                     stall.1 = 0;
                     true
                 } else {
@@ -2490,6 +2522,39 @@ mod tests {
             sync.inv_continuation_locator(500, 0, 0, Some(unknown)),
             None
         );
+    }
+
+    /// A synced node trailing its peers by a block (a peer's block announced
+    /// and not yet connected) must not write "Block sync complete" again when
+    /// it catches up: that line would mark peer blocks and skip own stakes
+    #[tokio::test]
+    async fn short_lag_does_not_rearm_sync_complete() {
+        let (sync, _dir) = create_test_sync();
+        let our = sync.chain.height();
+
+        // First catch-up: written
+        sync.try_connect_blocks().await;
+        assert_eq!(sync.state(), SyncState::Synced);
+        assert!(!sync.fell_behind.load(Ordering::Relaxed));
+
+        // One block behind, queues empty: leaves Synced, but not "behind"
+        *sync.best_peer_height.write() = our + 1;
+        sync.try_connect_blocks().await;
+        assert_eq!(sync.state(), SyncState::HeaderSync);
+        assert!(!sync.fell_behind.load(Ordering::Relaxed));
+        sync.check_timeouts().await;
+        assert!(!sync.fell_behind.load(Ordering::Relaxed));
+
+        // Caught up again: Synced, with no line to write
+        *sync.best_peer_height.write() = our;
+        sync.try_connect_blocks().await;
+        assert_eq!(sync.state(), SyncState::Synced);
+        assert!(!sync.fell_behind.load(Ordering::Relaxed));
+
+        // Far behind: the next catch-up is written
+        *sync.best_peer_height.write() = our + CAUGHT_UP_LAG + 1;
+        sync.try_connect_blocks().await;
+        assert!(sync.fell_behind.load(Ordering::Relaxed));
     }
 
     #[test]
