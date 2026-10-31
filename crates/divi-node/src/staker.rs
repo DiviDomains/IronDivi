@@ -794,10 +794,8 @@ impl Staker {
         match self.chain.accept_block(block.clone()) {
             Ok(result) => {
                 if let Some(fork_height) = result.reorg_fork_height {
-                    warn!(
-                        "Reorg detected during self-accept of staked block {} (fork height {})",
-                        block_hash, fork_height
-                    );
+                    // No line of its own: the chain's reorganisation lines
+                    // are written for an own block as for a peer's (A11)
                     // Undo what the wallet recorded from the disconnected
                     // blocks; the callback below rescans the new branch
                     self.wallet.handle_reorg(fork_height);
@@ -809,10 +807,8 @@ impl Staker {
                         result.orphaned_transactions,
                     );
                 }
-                info!(
-                    "Self-accepted staked block {} at height {}",
-                    block_hash, height
-                );
+                // The line every connected block gets (A11)
+                divi_network::log_block_connected(&block_hash, self.chain.height());
                 // Fire the block connected callback (wallet scan, mempool cleanup, fee estimation)
                 if let Some(ref callback) = *self.block_connected_callback.read() {
                     callback(block, height);
@@ -825,10 +821,7 @@ impl Staker {
             }
             Err(e) => {
                 let err_msg = format!("{}", e);
-                warn!(
-                    "Failed to self-accept staked block {}: {} (not broadcasting)",
-                    block_hash, err_msg
-                );
+                divi_network::log_block_connect_failed(&block_hash, &err_msg);
                 // If the failure is due to a phantom UTXO (spent on chain but
                 // still in wallet), evict the coinstake input to prevent the
                 // staker from repeatedly trying to use it.
@@ -845,8 +838,8 @@ impl Staker {
                                 if gone && self.wallet.has_utxo(outpoint) {
                                     self.wallet.spend_utxo(outpoint);
                                     warn!(
-                                        "Evicted phantom UTXO {}:{} from wallet after failed self-accept",
-                                        outpoint.txid, outpoint.vout
+                                        "Evicted phantom UTXO {} from wallet after failed self-accept",
+                                        divi_primitives::redact::OwnOutpoint::of(outpoint)
                                     );
                                 }
                             }

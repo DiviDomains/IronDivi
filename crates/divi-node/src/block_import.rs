@@ -211,7 +211,11 @@ pub fn import_block_file(
             }
         }
         match chain.accept_block(block) {
-            Ok(_) => result.loaded += 1,
+            Ok(_) => {
+                result.loaded += 1;
+                // The line every connected block gets (A11)
+                divi_network::log_block_connected(&hash, chain.height());
+            }
             Err(e) if is_system_error(&e) => {
                 tracing::error!(
                     "Block import of {} stopped at block {}: {}",

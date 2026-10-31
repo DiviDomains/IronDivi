@@ -2160,45 +2160,14 @@ async fn run_daemon(
 
         // Register unified block-connected callback (mempool cleanup + fee estimation + wallet scan)
         if let Some(ref wallet_arc) = wallet {
-            let wallet_for_scan = Arc::clone(wallet_arc);
             let block_sync = node.block_sync();
-            let mempool_for_callback = node.mempool().clone();
-            let fee_estimator_for_callback = node.fee_estimator().clone();
-            let tx_relay_for_callback = node.tx_relay().clone();
-            let chain_for_scan = node.chain().clone();
-            block_sync.set_block_connected_callback(Arc::new(move |block, height| {
-                let block_hash = compute_block_hash(&block.header);
-
-                // 1. Bring the wallet up to the active tip (adds new UTXOs, removes spent
-                // ones). The block handed in may be one of several connected by a reorg,
-                // or a side-chain block, so scan the active chain itself, in order.
-                // This runs before the mempool cleanup below so the wallet's mempool
-                // entries for this block are replaced by confirmed records in one step;
-                // otherwise a send would briefly show its inputs as unspent again.
-                sync_wallet_to_tip(&wallet_for_scan, &chain_for_scan);
-
-                // 2. Calculate fees from mempool entries and clean mempool
-                let total_fees = mempool_block_connected(
-                    &mempool_for_callback,
-                    &chain_for_scan,
-                    |txid| tx_relay_for_callback.mark_seen(txid),
-                    &fee_estimator_for_callback,
-                    block,
-                    height,
-                );
-
-                // 3. Persist dirty wallet changes to database (incremental, not full rewrite)
-                if let Err(e) = wallet_for_scan.save_incremental() {
-                    error!("Failed to save wallet after block {}: {}", height, e);
-                }
-
-                debug!(
-                    "Block {} at height {} processed (fees: {}, mempool cleaned, wallet scanned)",
-                    block_hash,
-                    height,
-                    total_fees.as_sat()
-                );
-            }));
+            block_sync.set_block_connected_callback(wallet_block_callback(
+                Arc::clone(wallet_arc),
+                node.mempool().clone(),
+                node.fee_estimator().clone(),
+                node.tx_relay().clone(),
+                node.chain().clone(),
+            ));
             debug!("Unified block callback registered (mempool + fees + wallet)");
 
             // Mirror wallet-relevant mempool transactions into the wallet so
@@ -2426,41 +2395,15 @@ async fn run_daemon(
         // so that self-accepted staked blocks trigger wallet scanning, mempool
         // cleanup, and fee estimation without waiting for the P2P round-trip.
         {
-            let wallet_for_staker = Arc::clone(&wallet_arc);
-            let mempool_for_staker = node.mempool().clone();
-            let fee_estimator_for_staker = node.fee_estimator().clone();
-            let tx_relay_for_staker = node.tx_relay().clone();
-            let chain_for_staker_scan = node.chain().clone();
-            staker.set_block_connected_callback(Arc::new(move |block, height| {
-                let block_hash = compute_block_hash(&block.header);
-
-                // 1. Bring the wallet up to the active tip, before the mempool cleanup
-                // (see the block-connected callback for why)
-                sync_wallet_to_tip(&wallet_for_staker, &chain_for_staker_scan);
-
-                // 2. Clean the mempool and feed the fee estimator
-                mempool_block_connected(
-                    &mempool_for_staker,
-                    &chain_for_staker_scan,
-                    |txid| tx_relay_for_staker.mark_seen(txid),
-                    &fee_estimator_for_staker,
-                    block,
-                    height,
-                );
-
-                // 3. Persist wallet changes
-                if let Err(e) = wallet_for_staker.save_incremental() {
-                    error!(
-                        "Failed to save wallet after self-accepted block {}: {}",
-                        height, e
-                    );
-                }
-
-                debug!(
-                    "Self-accepted block {} at height {} processed (wallet + mempool + fees)",
-                    block_hash, height
-                );
-            }));
+            // The same callback, so an own block writes the lines a peer's
+            // does (A11 "Own blocks log like peer blocks" item 4)
+            staker.set_block_connected_callback(wallet_block_callback(
+                Arc::clone(&wallet_arc),
+                node.mempool().clone(),
+                node.fee_estimator().clone(),
+                node.tx_relay().clone(),
+                node.chain().clone(),
+            ));
             debug!("Staker block callback registered (for self-accepted blocks)");
         }
 
@@ -3156,6 +3099,51 @@ fn mempool_reorg_hook(
 /// is. Blocks a reorganisation connected below the new tip are covered by
 /// `update_mempool_after_reorg`. Returns the fees of the block's transactions
 /// that were in the mempool.
+/// The block-connected callback of a node with a wallet. BlockSync runs it
+/// for peer blocks and the staker for own staked blocks, so both write the
+/// same lines (A11 "Own blocks log like peer blocks" item 4).
+fn wallet_block_callback(
+    wallet: Arc<WalletDb>,
+    mempool: Arc<divi_node::Mempool>,
+    fee_estimator: Arc<divi_node::FeeEstimator>,
+    tx_relay: Arc<divi_network::TxRelay>,
+    chain: Arc<divi_storage::Chain>,
+) -> divi_network::BlockConnectedCallback {
+    Arc::new(move |block, height| {
+        let block_hash = compute_block_hash(&block.header);
+
+        // 1. Bring the wallet up to the active tip (adds new UTXOs, removes spent
+        // ones). The block handed in may be one of several connected by a reorg,
+        // or a side-chain block, so scan the active chain itself, in order.
+        // This runs before the mempool cleanup below so the wallet's mempool
+        // entries for this block are replaced by confirmed records in one step;
+        // otherwise a send would briefly show its inputs as unspent again.
+        sync_wallet_to_tip(&wallet, &chain);
+
+        // 2. Calculate fees from mempool entries and clean mempool
+        let total_fees = mempool_block_connected(
+            &mempool,
+            &chain,
+            |txid| tx_relay.mark_seen(txid),
+            &fee_estimator,
+            block,
+            height,
+        );
+
+        // 3. Persist dirty wallet changes to database (incremental, not full rewrite)
+        if let Err(e) = wallet.save_incremental() {
+            error!("Failed to save wallet after block {}: {}", height, e);
+        }
+
+        debug!(
+            "Block {} at height {} processed (fees: {}, mempool cleaned, wallet scanned)",
+            block_hash,
+            height,
+            total_fees.as_sat()
+        );
+    })
+}
+
 fn mempool_block_connected(
     mempool: &divi_node::Mempool,
     chain: &divi_storage::Chain,

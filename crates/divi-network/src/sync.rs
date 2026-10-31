@@ -324,6 +324,27 @@ struct OrphanBlock {
 /// Callback for when a block is connected to the chain
 pub type BlockConnectedCallback = Arc<dyn Fn(&Block, u32) + Send + Sync>;
 
+/// The one "Connected block" line. Every path that connects a block writes
+/// it: a peer's block, an orphan, an own staked block, the node API and the
+/// bootstrap import, so an own block logs like a peer's (A11 "Own blocks
+/// log like peer blocks" item 1). The explicit target lets the `net` and
+/// `sync` debug categories select it whichever module calls it.
+pub fn log_block_connected(hash: &Hash256, height: u32) {
+    debug!(
+        target: "divi_network::sync",
+        "Connected block {} at height {}", hash, height
+    );
+}
+
+/// The one line for a block that does not connect, with its error (A11
+/// "Own blocks log like peer blocks" item 2)
+pub fn log_block_connect_failed(hash: &Hash256, err: &dyn std::fmt::Display) {
+    error!(
+        target: "divi_network::sync",
+        "Failed to connect block {}: {}", hash, err
+    );
+}
+
 /// Callback for when a chain reorganization occurs (parameter is fork height)
 pub type ReorgCallback = Arc<dyn Fn(u32) + Send + Sync>;
 
@@ -1319,7 +1340,7 @@ impl BlockSync {
                     self.note_block_accepted(&hash);
                     // Remove from pending headers
                     self.pending_headers.write().pop_front();
-                    debug!("Connected block {} at height {}", hash, height);
+                    log_block_connected(&hash, height);
 
                     // Call block connected callback if set
                     if let Some(callback) = self.block_connected_callback.read().as_ref() {
@@ -1327,7 +1348,7 @@ impl BlockSync {
                     }
                 }
                 Err(e) => {
-                    error!("Failed to connect block {}: {}", hash, e);
+                    log_block_connect_failed(&hash, &e);
                     self.note_block_rejected(&hash, &e);
                     break;
                 }
@@ -1443,7 +1464,7 @@ impl BlockSync {
                     }
                     let height = self.chain.height();
                     self.note_block_accepted(&hash);
-                    debug!("Connected block {} at height {}", hash, height);
+                    log_block_connected(&hash, height);
                     self.stats.write().blocks_connected += 1;
 
                     // Call block connected callback if set
@@ -1452,7 +1473,7 @@ impl BlockSync {
                     }
                 }
                 Err(e) => {
-                    error!("Failed to connect block {}: {}", hash, e);
+                    log_block_connect_failed(&hash, &e);
                     self.note_block_rejected(&hash, &e);
                     break;
                 }
@@ -1496,10 +1517,7 @@ impl BlockSync {
                         // Check if our height changed (reorg happened)
                         let new_height = self.chain.height();
                         if new_height > initial_height {
-                            info!(
-                                "Chain reorganized! Height changed from {} to {} after accepting block {}",
-                                initial_height, new_height, hash
-                            );
+                            log_block_connected(&hash, new_height);
 
                             // Call block connected callback if set
                             if let Some(callback) = self.block_connected_callback.read().as_ref() {
@@ -2390,7 +2408,7 @@ impl BlockSync {
                             self.fire_reorg_callbacks(fork_height, result.orphaned_transactions);
                         }
                         let height = self.chain.height();
-                        debug!("Connected orphan block {} at height {}", hash, height);
+                        log_block_connected(&hash, height);
 
                         // Remove from orphans
                         self.orphan_blocks.write().remove(&hash);

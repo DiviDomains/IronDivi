@@ -1534,12 +1534,7 @@ impl Node {
             self.mempool.remove_for_block(&txids);
             self.mempool.remove_conflicts(&block.transactions);
         }
-        if let Some(fork_height) = result.reorg_fork_height {
-            tracing::info!(
-                "Block {} reorganised the chain at height {}",
-                hash,
-                fork_height
-            );
+        if result.reorg_fork_height.is_some() {
             update_mempool_after_reorg(&self.chain, &self.mempool, result.orphaned_transactions);
         }
         for txid in &txids {
@@ -1548,7 +1543,8 @@ impl Node {
 
         let _ = self.event_tx.send(NodeEvent::BlockAccepted(hash));
 
-        tracing::info!("Accepted block {} at height {}", hash, self.chain.height());
+        // The line every connected block gets (A11)
+        divi_network::log_block_connected(&hash, self.chain.height());
         Ok(())
     }
 

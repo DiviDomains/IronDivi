@@ -1061,14 +1061,13 @@ impl PeerManager {
     pub fn broadcast_block_inv(&self, block_hash: Hash256) {
         let inv_item = InvItem::new(InvType::Block, block_hash);
         let msg = NetworkMessage::Inv(vec![inv_item]);
+        // No per-block line: an announce line would mark own blocks (A11)
         let peers = self.peers.read();
-        let peer_count = peers.len();
         for (peer_id, handle) in peers.iter() {
             if let Err(e) = handle.try_send(msg.clone()) {
                 debug!("Failed to send block inv to peer {}: {}", peer_id, e);
             }
         }
-        debug!("Broadcast block inv {} to {} peers", block_hash, peer_count);
     }
 
     /// Broadcast a block inv to all connected peers except the one specified.
@@ -1077,21 +1076,15 @@ impl PeerManager {
     pub fn broadcast_block_inv_except(&self, block_hash: Hash256, exclude: PeerId) {
         let inv_item = InvItem::new(InvType::Block, block_hash);
         let msg = NetworkMessage::Inv(vec![inv_item]);
+        // No per-block line, as for broadcast_block_inv (A11)
         let peers = self.peers.read();
-        let mut sent_count = 0;
         for (peer_id, handle) in peers.iter() {
             if *peer_id != exclude {
                 if let Err(e) = handle.try_send(msg.clone()) {
                     debug!("Failed to send block inv to peer {}: {}", peer_id, e);
-                } else {
-                    sent_count += 1;
                 }
             }
         }
-        debug!(
-            "Relayed block inv {} to {} peers (excluding {})",
-            block_hash, sent_count, exclude
-        );
     }
 
     /// Send a full block to a specific peer (in response to a getdata request).
