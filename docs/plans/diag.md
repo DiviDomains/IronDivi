@@ -517,11 +517,12 @@ Tested on hp1, hp2 and hp3 as a user and as root; on macOS only
   lines over 7 days stay far below it); a free-space shortfall stops the
   capture rather than moving it; Ctrl+C (SIGINT) ends only the capture
   and the collection follows, while SIGTERM/SIGHUP end the run. Tested
-  for real on hp1 against a regtest node: time up (6 samples in 1 min),
+  for real on hp1 against a regtest node: time up (7 samples, 0 to 60 s),
   `--until exit` with the node stopped at 25 s, `peers<1` firing at
   once, no running node, usage errors, and Ctrl+C under tmux (3 samples
   kept, collection complete); no hostname, user, home path or
-  `rpcpassword` reached the package. Not tested: the Mac paths
+  `rpcpassword` reached the package (rerun on hp3: 7 samples, Ctrl+C
+  kept 3, both packages clean). Not tested: the Mac paths
   (`sysctl vm.loadavg`, `ps` resident memory).
 - Smaller: `irondivi-cli --version` exits 1 with the usage text; the
   first divi-diag commit (d3502999) lacks its `Cargo.lock` entry, so

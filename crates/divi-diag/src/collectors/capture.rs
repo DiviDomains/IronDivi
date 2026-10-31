@@ -187,14 +187,13 @@ pub fn capture(ctx: &Ctx, o: &mut Out) {
     );
     outln!(o, "columns: time (UTC), seconds since start, node, rss MB, height, peers, load avg, free memory MB, PSI some avg10");
     let start = Instant::now();
-    let end = start + Duration::from_secs(plan.minutes * 60);
+    let total = Duration::from_secs(plan.minutes * 60);
     let mut bytes = 0u64;
     let mut last_tip: Option<u64> = None;
     let mut tip_since = Instant::now();
     let mut n = 0u64;
     let mut why_end = "the time is up".to_string();
     loop {
-        let t = Instant::now();
         if let Err(why) = crate::runner::room(&ctx.out_dir, ctx) {
             why_end = format!("free space: {why}");
             break;
@@ -248,10 +247,12 @@ pub fn capture(ctx: &Ctx, o: &mut Out) {
             why_end = "the node process is gone".into();
             break;
         }
-        let next = t + EVERY;
-        if next > end {
+        // the next sample is due at n * EVERY from the start; the last one
+        // falls on the end itself (a 1 min capture: 0 s to 60 s, 7 samples)
+        if EVERY * n as u32 > total {
             break;
         }
+        let next = start + EVERY * n as u32;
         std::thread::sleep(next.saturating_duration_since(Instant::now()));
     }
     outln!(o, "capture ended after {} s and {n} samples: {why_end}", start.elapsed().as_secs());
