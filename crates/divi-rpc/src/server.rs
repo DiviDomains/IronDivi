@@ -1416,15 +1416,13 @@ async fn rpc_reply(
     version: &Version,
     headers: &HeaderMap,
 ) -> axum::response::Response {
-    let request_len = body.len();
     let Ok(_slot) = slots.acquire_owned().await else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     let (status, reply) = handle_body(server, grant, body).await;
-    debug!(
-        "RPC request: {request_len} bytes, reply {} bytes, status {status}",
-        reply.len()
-    );
+    // No byte counts: a sendrawtransaction request is about twice the raw
+    // tx's size, which with the time names the user's tx on chain.
+    debug!("RPC request: status {status}");
     if status == StatusCode::FORBIDDEN {
         return crate::http::error_page(StatusCode::FORBIDDEN);
     }
@@ -1575,11 +1573,7 @@ impl RpcServer {
                     Ok(result) => (StatusCode::OK, reply_text(Ok(result), &id) + "\n"),
                     Err(e) => error_reply(e, id),
                 };
-                debug!(
-                    "RPC {method}: {} byte request, {} byte response",
-                    body.len(),
-                    reply.1.len()
-                );
+                debug!("RPC {method}");
                 reply
             }
             Value::Array(requests) => {
