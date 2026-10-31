@@ -308,6 +308,8 @@ struct Args {
     daemon: bool,
     printtoconsole: bool,
     debug: bool,
+    /// -logwalletdetail: wallet values in clear in the logs (A11), start only
+    logwalletdetail: bool,
     /// -loglevel and -debug: what is written to debug.log
     log_levels: log_filter::LogLevels,
     wallet: Option<PathBuf>,
@@ -428,6 +430,7 @@ impl Args {
         self.mode = s.get("mode").map(String::from);
         self.daemon = s.get_bool("daemon", false);
         self.printtoconsole = s.get_bool("printtoconsole", false);
+        self.logwalletdetail = s.get_bool("logwalletdetail", false);
         // -debug=<category> and -loglevel=<[category:]level> may repeat;
         // -debug=0 is no debugging
         self.log_levels =
@@ -553,6 +556,7 @@ fn resolve_args(mut args: Args) -> Result<Args> {
 
 /// Keys apply_settings reads
 const APPLIED: &[&str] = &[
+    "logwalletdetail",
     "vault",
     "rescan",
     "salvagewallet",
@@ -1473,6 +1477,11 @@ static LOG_FILTER: std::sync::OnceLock<
 /// Change the log levels of the running node (the `setlogconfig` RPC);
 /// returns the levels now in force
 fn set_log_levels(spec: &str) -> std::result::Result<String, String> {
+    // Start only, so a run's A7 record is the whole truth about it (A11)
+    if spec.to_ascii_lowercase().contains("logwalletdetail") {
+        events::event("setlogconfig-refused", "option=logwalletdetail");
+        return Err("logwalletdetail can be set only at start".to_string());
+    }
     let levels = log_filter::LogLevels::parse_spec(spec)?;
     let handle = LOG_FILTER
         .get()
@@ -3657,8 +3666,18 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
         print_to_console: args.printtoconsole || args.export_chain,
     };
 
+    // Wallet values print as per-run pseudonyms unless -logwalletdetail=1
+    // (A11); set before the first line
+    divi_primitives::redact::set_wallet_detail(args.logwalletdetail);
+
     // Initialize logging (writes to debug.log in data_dir by default)
     init_logging(&log_config, &args.log_levels, &data_dir);
+    if args.logwalletdetail {
+        warn!(
+            "-logwalletdetail=1: wallet txids, addresses, amounts and labels are written \
+             in clear to the logs of this run; diag treats every file of this run as unredacted"
+        );
+    }
     if !args.log_levels.unknown.is_empty() {
         warn!(
             "Unknown log categories {:?} in -debug/-loglevel (known: {})",

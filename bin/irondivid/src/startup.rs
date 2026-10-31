@@ -50,6 +50,7 @@ const SHOWN: &[&str] = &[
     "expire",
     "listen",
     "loglevel",
+    "logwalletdetail",
     "maxconnections",
     "maxlogfiles",
     "maxlogsize",

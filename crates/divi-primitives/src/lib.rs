@@ -21,6 +21,7 @@ pub mod compact;
 pub mod error;
 pub mod hash;
 pub mod lottery;
+pub mod redact;
 pub mod script;
 pub mod serialize;
 pub mod test_vectors;
