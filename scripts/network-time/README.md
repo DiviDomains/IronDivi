@@ -20,7 +20,7 @@ scripts/network-time/run.sh target/debug ~/divi-3.0.0/bin 46600 /var/tmp
 ```
 
 - `<irondivid-bin-dir>` holds `irondivid`; `<core-bin-dir>` holds Divi Core's `divid`.
-- `<port-base>`: ports `<port-base>` to `<port-base>+15` on 127.0.0.2 (p2p and RPC of each node).
+- `<port-base>`: ports `<port-base>` to `<port-base>+19` on 127.0.0.2 (p2p and RPC of each node).
 - `[root]`: a fresh directory is made under it (default `$TMPDIR`, else `/tmp`) and deleted at the end.
 
 Each node's RPC password is a fresh random value written only to its `divi.conf`. A run takes about 4 minutes.
@@ -43,7 +43,9 @@ checks the script itself: every row passes.
    (IsSporkActive on GetAdjustedTime, spork.cpp:379).
 5. **Wallet and mempool times on a clock two hours ahead of the system's:** a send's `getrawmempool true` time, its
    `time` and `timereceived` before and after a block (nTimeReceived = GetAdjustedTime, SpentOutputTracker.cpp:47;
-   smart time, wallet.cpp:1052-1086; the pool's entry time, MempoolConsensus.cpp:386); a coinstake's times.
+   smart time, wallet.cpp:1052-1086; the pool's entry time, MempoolConsensus.cpp:386); a coinstake's times; then the
+   wallet encrypted, and `unlocked_until` after `walletpassphrase` with a 60 s timeout, ten minutes on: the clock
+   plus 60 (nWalletUnlockTime = GetTime() + timeout, rpcserver.cpp:1205, :1215).
 6. **Blocks a third node (a divid) made, offered from a script peer** (an inv, then the header and block on request) to
    a fresh divid and irondivid:
    - 99 blocks two days old on the system clock: all taken, and how often `-blocknotify` ran;
@@ -64,6 +66,12 @@ checks the script itself: every row passes.
    A node's own mined block goes to every peer (CoinMinter.cpp:119), so it is not used here. The blocks are sent
    unasked because irondivid, syncing headers from the peer that started at 5000, does not ask another peer for a
    block it announces, where divid does.
+8. **A wallet made on a mocked clock** (a fresh divid and irondivid started with `-mocktime` two hours ahead): a new
+   key's time and a keypool key's are the node's clock (CKeyMetadata(GetTime()), wallet.cpp:429-430; CKeyPool,
+   wallet.cpp:2254-2262). divid shows neither (its getwalletinfo has no `keypoololdest`, rpcwallet.cpp:2895-2907;
+   validateaddress no `timestamp`, rpcmisc.cpp:369-373) and Divi Core 3.0.0 has no dumpwallet, so the row checks
+   irondivid's own `keypoololdest` against the mocked clock: it passes when divid sends none and irondivid's is the
+   clock.
 
 What `net-time` covers is not repeated: the offset from peers' version messages, its cap and warning, and the
 2-hour limit on the network-adjusted clock.
