@@ -10,14 +10,14 @@
 //!   include files, and `send`, which re-checks the folder against its
 //!   manifest, runs the §6.3 scanner again and sends only on the full word
 //!   `yes`;
-//! - §8.4 the offline path only. The §9 receiver's hosting is an open
-//!   decision, so this build never contacts any server. After `yes` the
-//!   files and their manifest are packed as a tar, compressed with zstd and
-//!   encrypted with `age` to the developer's key ([`DEV_KEY`]), and the
-//!   result is written beside the folder as `<folder>.age` for the user to
-//!   send by hand. Nothing unencrypted is ever written beside the folder. A
-//!   build with no key ([`DEV_KEY`] `None`) stops after `yes` and writes
-//!   nothing.
+//! - §8.4 after `yes` the files and their manifest are packed as a tar,
+//!   compressed with zstd and encrypted with `age` to the developer's key
+//!   ([`DEV_KEY`]), and the result is written beside the folder as
+//!   `<folder>.age`. Then, unless `--offline`, [`crate::upload`] sends that
+//!   file to the §9 receiver and prints the ticket; if the upload fails the
+//!   file stays, with instructions for sending it by hand. Nothing
+//!   unencrypted is ever written beside the folder or sent. A build with no
+//!   key ([`DEV_KEY`] `None`) stops after `yes` and writes nothing.
 //!
 //! R2: with no terminal nothing is ever sent, whatever the flags. A review
 //! writes `preview.ok` (the file list with each file's SHA-256, and the
@@ -407,6 +407,8 @@ pub struct Review<'a> {
     left_out: BTreeMap<String, String>,
     /// the key `send` encrypts to: [`DEV_KEY`], or a test's own
     key: Option<DevKey>,
+    /// `--offline`: the send prompt says nothing is uploaded
+    pub offline: bool,
 }
 
 fn listable(rel: &str) -> bool {
@@ -433,6 +435,7 @@ impl<'a> Review<'a> {
             added: BTreeSet::new(),
             left_out: BTreeMap::new(),
             key: DEV_KEY,
+            offline: false,
         })
     }
 
@@ -710,6 +713,7 @@ impl<'a> Review<'a> {
                         io.say(&format!("  {:>9}  {}\n", util::human(e.size), e.rel));
                     }
                     io.say(&format!("  {:>9}  {MANIFEST}\n", util::human(man.len() as u64)));
+                    io.say(&crate::upload::prompt_note(self.offline));
                     let q = format!(
                         "Send these {} files ({}) to the IronDivi developer? [yes/no] ",
                         send.len() + 1,
@@ -820,10 +824,10 @@ pub fn after_collect(root: &Path, o: &Options, scan: ScanCtx) -> Outcome {
         eprintln!("irondivi-cli diag: no terminal, so nothing is sent (R2). To review and send it later: {}", send_cmd(root));
         return Outcome::Kept;
     }
-    review_on_terminal(root, scan)
+    review_on_terminal(root, scan, o.offline)
 }
 
-fn review_on_terminal(root: &Path, scan: ScanCtx) -> Outcome {
+fn review_on_terminal(root: &Path, scan: ScanCtx, offline: bool) -> Outcome {
     let mut rv = match Review::open(root, scan) {
         Ok(r) => r,
         Err(e) => {
@@ -835,7 +839,12 @@ fn review_on_terminal(root: &Path, scan: ScanCtx) -> Outcome {
     let mut inp = stdin.lock();
     let mut out = io::stdout();
     let mut t = Io { inp: &mut inp, out: &mut out, tty: true };
+    rv.offline = offline;
     let r = rv.run(&mut t);
+    if let Outcome::Sealed(p) = &r {
+        // §8.4: a failed upload keeps the sealed file, with instructions
+        crate::upload::after_seal(root, p, offline);
+    }
     if r == Outcome::Kept {
         println!("Nothing was sent. The folder stays at {}\nTo send it later: {}", root.display(), send_cmd(root));
     }
@@ -862,7 +871,9 @@ pub fn send_main(folder: &Path, o: &Options) -> i32 {
     }
     let red = Redactor::new(Redactor::new_salt(), &discovery::known_values());
     let scan = ScanCtx { red: &red, secrets: current_secrets(o), salt: Vec::new() };
-    match review_on_terminal(&root, scan) {
+    // 0 once sealed, uploaded or not: on a failed upload the sealed file
+    // is the product, to send by hand (§8.4)
+    match review_on_terminal(&root, scan, o.offline) {
         Outcome::Sealed(_) => 0,
         _ => 1,
     }

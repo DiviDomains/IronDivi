@@ -20,6 +20,8 @@ libc = "0.2"
 # §8.4: the package is zstd-compressed, then encrypted with age
 age = "=0.11.1"
 zstd = "=0.13.3"
+# §8.4 upload to the §9 receiver: Mozilla roots built in, plus the system store
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "rustls-tls-native-roots"] }
 rocksdb = { workspace = true, optional = true }
 
 [features]

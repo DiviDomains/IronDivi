@@ -39,6 +39,7 @@ pub mod rpcjson;
 pub mod runner;
 pub mod scanner;
 pub mod tar;
+pub mod upload;
 pub mod util;
 
 /// The node's own configuration parser (B1.3: "parsed with the node's

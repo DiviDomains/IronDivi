@@ -1,0 +1,39 @@
+[package]
+license = "AGPL-3.0-only"
+name = "irondivi-diag-receiver"
+version.workspace = true
+edition.workspace = true
+description = "§9 receiver for `irondivi-cli diag` packages, and the developer's irondivi-diag-open"
+
+[lib]
+name = "irondivi_diag_receiver"
+path = "src/lib.rs"
+
+[[bin]]
+name = "irondivi-diag-receiver"
+path = "src/main.rs"
+
+[[bin]]
+name = "irondivi-diag-open"
+path = "src/open.rs"
+
+[dependencies]
+axum = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+subtle = "2.6"
+# irondivi-diag-open only: download, decrypt, unpack
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+age = "=0.11.1"
+zstd = "=0.13.3"
+# tar::read_all and the manifest format; no RocksDB
+divi-diag = { path = "../../crates/divi-diag", default-features = false }
+
+[dev-dependencies]
+tower = { workspace = true, features = ["util"] }
+tempfile = { workspace = true }

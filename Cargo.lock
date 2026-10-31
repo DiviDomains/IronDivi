@@ -2904,6 +2904,7 @@ dependencies = [
  "libc",
  "rand 0.8.8",
  "regex",
+ "reqwest 0.12.28",
  "rocksdb",
  "serde",
  "serde_json",
@@ -4630,6 +4631,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "irondivi-diag-receiver"
+version = "0.2.9"
+dependencies = [
+ "age",
+ "axum",
+ "divi-diag",
+ "futures",
+ "hex",
+ "rand 0.8.8",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "subtle",
+ "tempfile",
+ "tokio",
+ "tower 0.4.13",
+ "zstd",
+]
+
+[[package]]
 name = "irondivid"
 version = "0.2.9"
 dependencies = [
@@ -6345,6 +6367,7 @@ dependencies = [
  "pin-project-lite",
  "quinn",
  "rustls",
+ "rustls-native-certs",
  "rustls-pki-types",
  "serde",
  "serde_json",
@@ -8137,6 +8160,10 @@ version = "0.4.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b8fa9be0de6cf49e536ce1851f987bd21a43b771b09473c3549a6c853db37c1c"
 dependencies = [
+ "futures-core",
+ "futures-util",
+ "pin-project",
+ "pin-project-lite",
  "tower-layer",
  "tower-service",
  "tracing",
