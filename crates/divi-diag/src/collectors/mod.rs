@@ -22,6 +22,7 @@ pub mod components;
 pub mod files;
 pub mod live;
 pub mod logs;
+pub mod observed;
 pub mod platform;
 pub mod probe;
 pub mod procs;
@@ -65,6 +66,11 @@ pub static ALL: &[Spec] = &[
     Spec { id: "B2.19", name: "install", secs: 30, what: "package and install" },
 ];
 
+/// B3 observed start: not in [`ALL`]; run last, only with consent (R2),
+/// with its own budget on top of the collection's (B5: +5 min; the ladder
+/// can take 300 + 120 + 120 + 5 s, so the parent allows 660)
+pub static OBSERVED: Spec = Spec { id: "B3", name: "observed", secs: 660, what: "observed start of irondivid" };
+
 /// B2 items this version does not collect; listed in the summary
 pub static NOT_YET: &[&str] = &[];
 
@@ -94,6 +100,7 @@ pub fn run(name: &str, ctx: &Ctx, o: &mut Out) -> bool {
         "components" => components::components(ctx, o),
         "seccomp" => sys::seccomp(ctx, o),
         "install" => files::install(ctx, o),
+        "observed" => observed::observed(ctx, o),
         _ => return false,
     }
     true

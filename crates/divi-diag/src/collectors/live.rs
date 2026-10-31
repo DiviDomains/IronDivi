@@ -773,12 +773,13 @@ fn len_of(p: &Path) -> u64 {
 }
 
 /// The A17 snapshot request, in the V7 order, and the wait for its incident
-pub fn snapshot(o: &mut Out, ctx: &Ctx, d: &DataDir, node: &Node, base: &str) {
+/// true when an incident appeared
+pub fn snapshot(o: &mut Out, ctx: &Ctx, d: &DataDir, node: &Node, base: &str) -> bool {
     let me = util::euid();
     if me != 0 && Some(me) != node.uid {
         outln!(o, "snapshot request: not written (diag runs as another user than the node; {})",
             crate::discovery::sudo_hint(node.uid, &d.path));
-        return;
+        return false;
     }
     let mirror = mirror_dir(ctx, d);
     let since = SystemTime::now() - Duration::from_secs(1);
@@ -844,7 +845,7 @@ pub fn snapshot(o: &mut Out, ctx: &Ctx, d: &DataDir, node: &Node, base: &str) {
     }
     if found.is_empty() {
         outln!(o, "snapshot incident: none within 5 s{}", if refused { "" } else { " (a node from before A17, or its watchdog is stuck too)" });
-        return;
+        return false;
     }
     for f in found.iter().take(4) {
         let name = f.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
@@ -859,6 +860,7 @@ pub fn snapshot(o: &mut Out, ctx: &Ctx, d: &DataDir, node: &Node, base: &str) {
             Err(e) => outln!(o, "  not readable: {}", util::io_err(&e)),
         }
     }
+    true
 }
 
 // --------------------------------------------------------------- driver

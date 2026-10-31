@@ -15,8 +15,9 @@
 //! `--import <folder|->` (B6.4, [`import`]) turns a contrib/diag.sh folder
 //! into a package. §8 ([`consent`]): the user's report, the review, and
 //! `--send <folder>`, which seals the package to the developer key (§8.4).
-//! Not in this crate yet: B3 observed start (`--run`) and the B6 recording
-//! modes.
+//! B3 ([`collectors::observed`]): with consent, irondivid is started once
+//! and watched; `--exec-as` is its single-threaded id-switching helper.
+//! Not in this crate yet: the B6 recording modes.
 
 pub mod collectors;
 pub mod consent;
@@ -115,6 +116,9 @@ pub fn parse_options(args: &[String]) -> Result<Options, String> {
 
 /// Entry point for `irondivi-cli diag <args>`; returns the process exit code
 pub fn run(args: &[String]) -> i32 {
+    if args.first().map(String::as_str) == Some("--exec-as") {
+        return collectors::observed::exec_as(&args[1..]);
+    }
     if args.first().map(String::as_str) == Some("--collector") {
         return match args.get(1) {
             Some(name) => runner::child_main(name),

@@ -143,7 +143,7 @@ fn is_leveldb(p: &Path) -> bool {
     !rocks
 }
 
-fn one(ctx: &Ctx, d: &DataDir, o: &mut Out) -> bool {
+pub(crate) fn one(ctx: &Ctx, d: &DataDir, o: &mut Out) -> bool {
     let r = ctx.redactor();
     head(o, &format!("data dir {} ({}): {}", d.n, d.network, r.path_of(&d.chain)));
     let cs = d.chain.join("chainstate");

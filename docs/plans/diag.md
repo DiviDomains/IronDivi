@@ -356,6 +356,32 @@ Tested on hp1, hp2 and hp3 as a user and as root; on macOS only
   hp3 lacks, and the glibc build does not run under Alpine's gcompat).
   The macOS branch is compiled and linted on Linux (no `cfg` gate) but
   has not run on a Mac.
+- B3: built as the `observed` collector (`observed/`), run after the
+  B2 collectors with its own 660 s budget (the ladder's worst case is
+  300 + 60 + 60 + 60 + 5 s plus the checks, about 605 s), never with
+  RLIMIT_DATA, and on Ctrl+C sent one SIGTERM and given 200 s to stop
+  the node before it is killed. Consent is asked once, before
+  collection, after the user report. With no terminal there is no
+  observed start even with `--run` (R2, as for sending). Decisions: a
+  B2.8 `PENDING` line that only names the network marker does not
+  block; on macOS any launchd job naming irondivi blocks (the plan
+  named only `KeepAlive`); `-staking=0`, `-daemon=0`, `-debug=1` and
+  `-disablewallet` are passed only when `irondivid -help` lists them,
+  and with no A18 flags `-disablewallet` is the fallback, said in the
+  summary. As root the node is started through a hidden
+  `irondivi-cli diag --exec-as` helper (initgroups, setgid, setuid,
+  then a check that setuid(0) fails, then setsid and exec). Not in this
+  version: the `systemd-run --scope` (the node shares diag's cgroup and
+  its counters are read before and after), the pty, B3.3 strace/gdb,
+  the unit's own ExecStart arguments, the SIGQUIT step; per-thread
+  sampling is Linux only. The node's cwd shows as unreadable when the
+  node is not dumpable. Tested for real on hp1 on a regtest data dir
+  made for the test (conf with `reindex=1` and `checkblocks=500`, both
+  stripped), as the user and as root through `sudo`: running reached in
+  0.3 s, RPC stop at 120 s, exit 0, temporary conf folder removed, no
+  file changed owner, rpcpassword in neither package. The overrun
+  ladder (no running, snapshot, SIGTERM, SIGKILL) is tested only with
+  stub nodes.
 - Smaller: `irondivi-cli --version` exits 1 with the usage text; the
   first divi-diag commit (d3502999) lacks its `Cargo.lock` entry, so
   `--locked` builds need c83a9dd4 or later; `diag --run` (B3) and the

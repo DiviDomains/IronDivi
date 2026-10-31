@@ -38,7 +38,7 @@ extern "C" fn on_signal(sig: libc::c_int) {
     STOP.store(true, Ordering::SeqCst);
 }
 
-fn install_signal_handlers() {
+pub(crate) fn install_signal_handlers() {
     for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
         unsafe {
             let mut sa: libc::sigaction = std::mem::zeroed();
@@ -47,6 +47,58 @@ fn install_signal_handlers() {
             libc::sigaction(sig, &sa, std::ptr::null_mut());
         }
     }
+}
+
+/// Ctrl+C or a signal reached this process
+pub(crate) fn stopped() -> bool {
+    STOP.load(Ordering::SeqCst)
+}
+
+/// B3 (R2): which data dir the observed start uses — the one `--datadir`
+/// names, else the only one; `Err` says why none
+fn observed_target(ctx: &Ctx, o: &Options) -> Result<usize, String> {
+    let dirs = &ctx.datadirs;
+    if let Some(want) = &o.datadir {
+        return dirs
+            .iter()
+            .find(|d| &d.path == want || &d.chain == want || (want.canonicalize().ok().is_some_and(|w| d.path.canonicalize().ok() == Some(w.clone()) || d.chain.canonicalize().ok() == Some(w))))
+            .map(|d| d.n)
+            .ok_or_else(|| "the --datadir given was not found by discovery".into());
+    }
+    match dirs.len() {
+        0 => Err("no data dir was found".into()),
+        1 => Ok(dirs[0].n),
+        n => Err(format!("{n} data dirs were found; run with --datadir to choose one")),
+    }
+}
+
+/// B3 consent (R2): `--no-run` and no terminal never start; `--run` does;
+/// otherwise ask, and only the full word `yes` starts it
+fn observed_consent(o: &Options, notes: &mut Vec<String>) -> bool {
+    match o.run {
+        Some(false) => {
+            notes.push("--no-run: no observed start (B3).".into());
+            return false;
+        }
+        _ if !util::is_tty() => {
+            notes.push("no terminal: no observed start, even with --run (R2).".into());
+            return false;
+        }
+        Some(true) => return true,
+        None => {}
+    }
+    eprint!(
+        "\nirondivi-cli diag can also start irondivid once on this data dir and watch it start (B3).\n\
+         It uses a copy of the config with reindex/rescan/wallet repair removed, no wallet\n\
+         (-disablewallet), and stops the node again within about 10 minutes.\n\
+         It refuses if the node is running, supervised, a masternode, or has a migration pending.\n\
+         Start the node and watch it? Type yes to start, anything else to skip: "
+    );
+    let mut l = String::new();
+    let _ = std::io::stdin().read_line(&mut l);
+    let yes = consent::is_yes(&l);
+    notes.push(if yes { "observed start: you typed yes (B3).".into() } else { "observed start: not started (you did not type yes).".into() });
+    yes
 }
 
 /// The memory cap of B2: 1 GB, 512 MB on a 32-bit build
@@ -333,9 +385,6 @@ pub fn parent_main(o: Options) -> i32 {
     for t in &tried {
         p.notes.push(format!("output folder not used: {t}"));
     }
-    if o.run == Some(true) {
-        p.notes.push("--run: the observed start (B3) is not in this version of diag; nothing was started.".into());
-    }
     if !util::is_tty() {
         p.notes.push("no terminal: nothing is ever sent without one (R2).".into());
     }
@@ -344,7 +393,7 @@ pub fn parent_main(o: Options) -> i32 {
     }
     p.notes.push(
         "not asked (§8.2): own-invalid blocks (A13), --tx, the host package (B6.2), --rpc, the crash stack, \
-         --attach and the observed start (B3) are not in this version"
+         and --attach are not in this version"
             .into(),
     );
     // §8.1: the user's own words, before anything is collected
@@ -354,6 +403,22 @@ pub fn parent_main(o: Options) -> i32 {
         let _ = f.write_all(report.as_bytes());
         p.owners.lock().unwrap().insert(consent::REPORT.into(), "user".into());
     }
+    // B3: asked before anything is collected (R2)
+    let observed = match observed_target(&p.ctx, &o) {
+        Ok(n) => {
+            if observed_consent(&o, &mut p.notes) {
+                Some(n)
+            } else {
+                None
+            }
+        }
+        Err(why) => {
+            if o.run != Some(false) {
+                p.notes.push(format!("observed start (B3): not offered: {why}."));
+            }
+            None
+        }
+    };
     if o.offline {
         p.notes.push("--offline: the network probe (B2.15) was skipped.".into());
     }
@@ -392,11 +457,19 @@ pub fn parent_main(o: Options) -> i32 {
             }
         }
         let left = TOTAL_BUDGET.saturating_sub(t0.elapsed());
-        p.run_one(spec, Duration::from_secs(spec.secs).min(left));
+        p.run_one(spec, Duration::from_secs(spec.secs).min(left), None);
         if spec.name == "storage" {
             p.remove_fsync_files();
         }
         p.write_summary();
+    }
+    // B3 after collection, with its own +5 min budget (B5)
+    if let Some(n) = observed {
+        if !STOP.load(Ordering::SeqCst) {
+            let spec = &collectors::OBSERVED;
+            p.run_one(spec, Duration::from_secs(spec.secs), Some(n));
+            p.write_summary();
+        }
     }
     if STOP.load(Ordering::SeqCst) {
         p.state = "interrupted";
@@ -547,7 +620,7 @@ impl Parent {
         }
     }
 
-    fn run_one(&mut self, spec: &'static Spec, budget: Duration) {
+    fn run_one(&mut self, spec: &'static Spec, budget: Duration, observed: Option<usize>) {
         let started = Instant::now();
         if util::is_tty() {
             eprint!("  {} {:<12}", spec.id, spec.name);
@@ -570,8 +643,15 @@ impl Parent {
             .env("MALLOC_ARENA_MAX", "2")
             .env("LC_ALL", "C")
             .env("LANG", "C");
-        if mech == "RLIMIT_DATA" {
-            cmd.env("DIVI_DIAG_RLIMIT_DATA", mem_cap().to_string());
+        match observed {
+            // B3: the node's own memory is not diag's to cap
+            Some(n) => {
+                cmd.env(collectors::observed::DATADIR_ENV, n.to_string());
+            }
+            None if mech == "RLIMIT_DATA" => {
+                cmd.env("DIVI_DIAG_RLIMIT_DATA", mem_cap().to_string());
+            }
+            None => {}
         }
         let mut child = match cmd.spawn() {
             Ok(c) => c,
@@ -652,8 +732,9 @@ impl Parent {
             let _ = etx.send(buf);
         });
 
-        let deadline = started + budget;
-        let poll = mech != "RLIMIT_DATA";
+        let mut deadline = started + budget;
+        let poll = mech != "RLIMIT_DATA" && observed.is_none();
+        let mut stop_seen = false;
         let mut last_poll = Instant::now();
         let mut killed_for: Option<String> = None;
         let mut status = None;
@@ -666,7 +747,18 @@ impl Parent {
                 Ok(None) => {}
                 Err(_) => break,
             }
-            if STOP.load(Ordering::SeqCst) {
+            if STOP.load(Ordering::SeqCst) && observed.is_some() {
+                // B3: the collector stops the node by the ladder itself;
+                // a SIGKILL here would leave the node running unwatched
+                if !stop_seen {
+                    stop_seen = true;
+                    unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+                    deadline = Instant::now() + Duration::from_secs(200);
+                    self.log.log(&format!("{} {}: Ctrl+C; the collector stops the node (up to 200 s)", spec.id, spec.name));
+                } else if Instant::now() >= deadline {
+                    killed_for = Some(format!("INTERRUPTED: {} did not finish 200 s after Ctrl+C", spec.name));
+                }
+            } else if STOP.load(Ordering::SeqCst) {
                 killed_for = Some(format!("INTERRUPTED: {} stopped by Ctrl+C or a signal", spec.name));
             } else if Instant::now() >= deadline {
                 killed_for = Some(format!("TRUNCATED: {} exceeded {} s", spec.name, budget.as_secs()));
@@ -785,6 +877,12 @@ impl Parent {
             });
         }
 
+        if let Ok(t) = fs::read_to_string(self.out.join("observed/summary.txt")) {
+            s.push_str("\n== Observed start (B3) ==\n");
+            s.push_str(t.trim_end());
+            s.push('\n');
+        }
+
         s.push_str("\n== Collectors (B2.20) ==\n");
         for d in &self.done {
             s.push_str(&format!("{:<6} {:<11} {:>6.1} s {:>10} B  {}\n", d.spec.id, d.spec.name, d.secs, d.bytes, d.status));
@@ -873,7 +971,7 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) {
 
 /// B2: a collector that survived SIGKILL for 5 s is left behind, and its
 /// state is itself evidence (a hung disk)
-fn abandoned_record(pid: u32) -> String {
+pub(crate) fn abandoned_record(pid: u32) -> String {
     let state = discovery::proc_stat(pid).map(|(s, _, _)| s).unwrap_or('?');
     let wchan = fs::read_to_string(format!("/proc/{pid}/wchan")).unwrap_or_default();
     let wchan = match wchan.trim() {
