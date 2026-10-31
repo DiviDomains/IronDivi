@@ -30,8 +30,8 @@
 //! `task-failed cause=error` record in events.log with its name, and the
 //! error text goes to debug.log through the logging layers.
 //!
-//! Blocking work goes through [`spawn_blocking`], which names it and keeps
-//! the caller's task name for its panics.
+//! Blocking work goes through [`spawn_blocking`], which names it: its
+//! panics are reported under that name, critical when the caller is.
 //!
 //! The default hook's message to stderr stays: it is the panic text, which
 //! crash.log also holds, and stderr is the console (or /dev/null under
@@ -224,15 +224,15 @@ fn supervised_error(name: &str, error: &str) {
     );
 }
 
-/// Run blocking work on tokio's blocking pool, named; a panic in it is
-/// reported under the calling task (or `name` outside one)
+/// Run blocking work on tokio's blocking pool as `name`; a panic in it is
+/// critical when the calling task is
 pub fn spawn_blocking<F, R>(name: &'static str, f: F) -> tokio::task::JoinHandle<R>
 where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
 {
-    let task = TASK.try_with(|t| *t).unwrap_or((name, false));
-    tokio::task::spawn_blocking(move || TASK.sync_scope(task, f))
+    let critical = TASK.try_with(|t| t.1).unwrap_or(false);
+    tokio::task::spawn_blocking(move || TASK.sync_scope((name, critical), f))
 }
 
 /// Start a named thread
