@@ -3095,13 +3095,8 @@ impl WalletDb {
         // spendable coin of ours (AvailableUtxoCalculator.cpp:33-43); a vault
         // coin is not spendable in that sense
         let trusted = spends.len() == inputs.len() && !spends_vault;
-        info!(
-            "Mempool wallet tx {} {} {} sats ({})",
-            category,
-            txid,
-            net_amount.abs(),
-            if trusted { "trusted" } else { "untrusted" }
-        );
+        // No log line: its time and txid beside the relay lines would pick
+        // out the wallet's own transactions in debug.log
         let timestamp = record.timestamp;
         overlay.insert(
             txid,
