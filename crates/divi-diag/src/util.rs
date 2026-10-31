@@ -349,6 +349,7 @@ pub fn human(n: u64) -> String {
 }
 
 /// Free and total bytes, free and total inodes of the filesystem holding `p`
+/// (bytes free to a user, bytes in all, inodes free, inodes in all)
 pub fn statvfs(p: &Path) -> Option<(u64, u64, u64, u64)> {
     use std::os::unix::ffi::OsStrExt;
     let c = std::ffi::CString::new(p.as_os_str().as_bytes()).ok()?;
@@ -372,6 +373,13 @@ pub fn is_tty() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn statvfs_order_is_free_total_ffree_files() {
+        let (free, total, ffree, files) = statvfs(Path::new("/")).unwrap();
+        assert!(total > 0 && free <= total, "free {free} total {total}");
+        assert!(ffree <= files, "inodes free {ffree} of {files}");
+    }
 
     #[test]
     fn escapes_invalid_utf8_only() {

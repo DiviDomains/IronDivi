@@ -62,7 +62,7 @@ fn source_shown(src: &str, fstype: &str) -> String {
 
 fn space_line(o: &mut Out, what: &str, p: &Path) {
     match util::statvfs(p) {
-        Some((total, free, files, ffree)) => outln!(
+        Some((free, total, ffree, files)) => outln!(
             o,
             "{what}: {} free of {} ({}%), inodes {} free of {}",
             util::human(free),
@@ -137,7 +137,7 @@ fn fsync_test(ctx: &Ctx, d: &DataDir, o: &mut Out) {
         outln!(o, "skipped: a node is running on this data dir (the test would compete with it)");
         return;
     }
-    if let Some((total, free, _, _)) = util::statvfs(&d.path) {
+    if let Some((free, total, _, _)) = util::statvfs(&d.path) {
         let need = (1u64 << 30).max(total / 20);
         if free < need {
             outln!(o, "skipped: less than {} free", util::human(need));
