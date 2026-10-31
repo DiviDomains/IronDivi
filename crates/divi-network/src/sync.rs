@@ -1340,8 +1340,18 @@ impl BlockSync {
             let best_height = *self.best_peer_height.read();
 
             if our_height >= best_height {
-                info!("Block sync complete at height {}", our_height);
-                *self.state.write() = SyncState::Synced;
+                // Log only on the transition into Synced. Writing this per peer
+                // block would leave a height gap at every own staked block (own
+                // blocks never pass through here), naming them in default logs.
+                let was_synced = {
+                    let mut state = self.state.write();
+                    let was = *state == SyncState::Synced;
+                    *state = SyncState::Synced;
+                    was
+                };
+                if !was_synced {
+                    info!("Block sync complete at height {}", our_height);
+                }
                 // Disable IBD mode — enable full PoS and script validation for new blocks
                 if self.chain.is_ibd() {
                     info!("Exiting IBD mode — full validation enabled for new blocks");
