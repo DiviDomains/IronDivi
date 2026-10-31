@@ -59,8 +59,9 @@ and are not re-based.
   sentinel value to each and checks it is absent from stderr and from
   every log under the data directory.
 - R3, `divi.conf` values: a bad value read from `divi.conf` exits 2
-  (usage), not 3; code 3 is a file that cannot be read or a line that
-  does not parse. Several divid-style options still accept a bad value
+  (usage), not 3: code 3 is a file that cannot be read or that divid's
+  parser refuses (`ConfigFileError`), and a value that parses but is
+  refused when the settings are applied exits 2. Several divid-style options still accept a bad value
   and fall back to the default instead of refusing it; they are not yet
   checked.
 - R3, code 7: a P2P listener that fails to start, and an RPC bind that
@@ -1137,8 +1138,8 @@ stopped it and the exact command to run instead.
 |---|---|
 | 0 | Clean stop (RPC `stop`, SIGTERM, SIGINT; SIGHUP never stops the node, A3). A clean stop after SIGTERM is 0; `runs.log` records the signal and its sender. The two `-daemon` parents also exit 0, through `_exit(0)`, writing nothing; the grandchild writes the A1 `daemon` record (today `process::exit(0)` at about `main.rs:3117` and `:3133`). A stop request during start-up is also 0: the node closes what it has opened, removes the pid file and the A2 marker, and calls `die(0, "stopped during start-up in <phase>")` (A1). |
 | 1 | `-help` / `-version` only (D4), through `die(1)` (about `main.rs:3052`). |
-| 2 | Usage: unknown or malformed command-line argument. The reason names the argument's key and why it was refused, never its value or the argument as typed (a malformed `-rpcpassword=…` must not be echoed). |
-| 3 | Configuration file error. The reason names the file, the line number, the key (when one parses) and why, never the value or the line's text. The same holds for every copy of these reasons: `runs.log`, `debug.log`, stderr, and the A14 `_unresolved/` record. |
+| 2 | Usage: unknown or malformed command-line argument, and (as built, Revision 16) a value from `divi.conf` that parses but is refused. The reason names the argument's key and why it was refused, never its value or the argument as typed (a malformed `-rpcpassword=…` must not be echoed). |
+| 3 | Configuration file error: as built (Revision 16), a file that cannot be read or that divid's parser refuses; a refused value is 2. The reason names the file, the line number, the key (when one parses) and why, never the value or the line's text. The same holds for every copy of these reasons: `runs.log`, `debug.log`, stderr, and the A14 `_unresolved/` record. |
 | 4 | Data dir error (create, lock held by another node, permissions). Also the `-daemon` child failing to open its log file (about `main.rs:3150`) for any reason other than the two in code 9. |
 | 5 | Database error (open, corruption, migration refused or failed). |
 | 6 | Wallet error (load, decrypt, version). |
