@@ -23,7 +23,7 @@
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI32, AtomicI64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
@@ -37,6 +37,8 @@ static FIRST_PID: AtomicI32 = AtomicI32::new(0);
 static MIDDLE_PID: AtomicI32 = AtomicI32::new(0);
 /// Threads in the process just before the first fork (-1: not counted)
 static THREADS_AT_FORK: AtomicI64 = AtomicI64::new(-1);
+/// This run's number and `<datadir>/diag`, once runs.log is open
+static RUN: OnceLock<(u64, PathBuf)> = OnceLock::new();
 /// The phase entered last, and when
 static PHASE: Mutex<Option<(&'static str, Instant)>> = Mutex::new(None);
 
@@ -91,6 +93,7 @@ pub fn open(data_dir: &Path, network: &str, daemon: bool) {
     }
     let launch = LAUNCH.get();
     let run = last_run(&data_dir.join("diag").join("runs.log")) + 1;
+    let _ = RUN.set((run, data_dir.join("diag")));
     let (uid, euid, gid) = unsafe { (libc::getuid(), libc::geteuid(), libc::getgid()) };
     let exe = std::env::current_exe()
         .map(|p| quote(&p.display().to_string()))
@@ -184,6 +187,14 @@ pub fn record(kind: &str, fields: &str) {
     }
 }
 
+/// Once the data directory's lock is held: the A2 marker (and the
+/// `unclean-previous` record when the last run left its marker behind)
+pub fn marker_create() {
+    if let Some((run, dir)) = RUN.get() {
+        crate::running_marker::create(dir, *run);
+    }
+}
+
 /// Enter start-up phase `name`; the record carries the phase before it and
 /// how long that took
 pub fn phase(name: &'static str) {
@@ -206,11 +217,13 @@ pub fn phase(name: &'static str) {
             tid()
         ),
     );
+    crate::running_marker::phase(name);
 }
 
 /// A stop was asked for, `by` what (`signal=TERM`, `rpc`, ...)
 pub fn stop_requested(by: &str) {
     record("stop-requested", &format!("by={}", by));
+    crate::running_marker::stop_requested(by);
 }
 
 /// The process is ending with `code`; `reason` is the line printed for it
@@ -226,9 +239,11 @@ pub fn exit(code: i32, reason: &str) {
             quote(reason)
         ),
     );
+    // The end is on record: the marker goes, last (A2)
+    crate::running_marker::remove();
 }
 
-fn yes(b: bool) -> &'static str {
+pub(crate) fn yes(b: bool) -> &'static str {
     if b {
         "yes"
     } else {
@@ -252,7 +267,7 @@ fn quote(s: &str) -> String {
 }
 
 /// RFC 3339 UTC with microseconds
-fn utc_now() -> String {
+pub(crate) fn utc_now() -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();

@@ -25,6 +25,7 @@ mod core_files;
 mod interfaces;
 mod log_filter;
 mod private_files;
+mod running_marker;
 mod runs_log;
 mod settings;
 mod snapshot_sig;
@@ -1989,6 +1990,8 @@ async fn run_daemon(
     // (TryLockDataDirectory, init.cpp:850-862)
     runs_log::phase("lock");
     let _datadir_lock = lock_data_dir(&config.data_dir).or_exit(exit_code::DATADIR)?;
+    // Only the holder of the lock may read or replace the marker (A2)
+    runs_log::marker_create();
     // divid reads masternode.conf at every start and makes it when missing
     core_files::ensure_masternode_conf(&config.data_dir);
 
