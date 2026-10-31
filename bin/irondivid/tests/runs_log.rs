@@ -745,7 +745,7 @@ fn the_startup_record_masks_secrets_and_paths() {
         dir.path(),
         &[("IRONDIVI_SECRETX", "topsecret9"), ("RUST_BACKTRACE", "1")],
     );
-    let text = wait_for_file(dir.path(), "diag/startup/1.txt", "\ncwd=\"");
+    let text = wait_for_file(dir.path(), "diag/startup/1.txt", "\n[cwd]\ncwd=");
     assert!(text.starts_with("startup run=1 "), "{text}");
     for want in [
         "-rpcpassword=<v>",
@@ -760,6 +760,7 @@ fn the_startup_record_masks_secrets_and_paths() {
         "\n[rlimits]\ncore soft=",
         "nofile soft=",
         "\n[build]\ntarget=",
+        "\ncwd=<other>\n",
     ] {
         assert!(text.contains(want), "{want}: {text}");
     }

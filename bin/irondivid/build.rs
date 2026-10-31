@@ -26,10 +26,13 @@ fn main() {
     };
     let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
     println!("cargo:rustc-env=IRONDIVID_RUSTC={}", out(&rustc, &["--version"]));
-    println!(
-        "cargo:rustc-env=IRONDIVID_GIT={}",
-        out("git", &["rev-parse", "--short=12", "HEAD"])
-    );
+    // A build host with no checkout is given the commit by the caller
+    println!("cargo:rerun-if-env-changed=IRONDIVID_GIT_SHA");
+    let git = std::env::var("IRONDIVID_GIT_SHA")
+        .ok()
+        .filter(|v| !v.is_empty() && v.chars().all(|c| c.is_ascii_hexdigit()))
+        .unwrap_or_else(|| out("git", &["rev-parse", "--short=12", "HEAD"]));
+    println!("cargo:rustc-env=IRONDIVID_GIT={}", git);
     let env = |name: &str| std::env::var(name).unwrap_or_else(|_| "-".into());
     println!("cargo:rustc-env=IRONDIVID_TARGET={}", env("TARGET"));
     println!("cargo:rustc-env=IRONDIVID_PROFILE={}", env("PROFILE"));

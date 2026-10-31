@@ -16,7 +16,8 @@
 //! allowlist; rlimits; seccomp, `NoNewPrivs` and capabilities from
 //! `/proc/self/status`; the dumpable flag; CPU model and features; page
 //! size; the data dir's filesystem type and mount options; build facts;
-//! the time zone; the working directory from before the `-daemon` chdir.
+//! the time zone; the working directory from before the `-daemon` chdir,
+//! as a class (`/`, `datadir`, `<other>`), not a path.
 //!
 //! Never read: `/proc/self/environ` (D5); the environment comes from the
 //! process's own copy.
@@ -32,7 +33,8 @@ const CAP: usize = 64 * 1024;
 static START_CWD: OnceLock<String> = OnceLock::new();
 
 /// Keys whose values are numbers, switches or plain words: written as they
-/// are. Every other value (secrets, addresses, paths, commands) is `<set>`.
+/// are. Every other value (secrets, addresses, paths, commands) is `<set>`;
+/// so are the `electrum*` keys, which take bind addresses.
 const SHOWN: &[&str] = &[
     "addressindex",
     "banscore",
@@ -45,10 +47,6 @@ const SHOWN: &[&str] = &[
     "debug",
     "disablewallet",
     "discover",
-    "electrum",
-    "electrumtls",
-    "electrumws",
-    "electrumwss",
     "expire",
     "listen",
     "loglevel",
@@ -178,9 +176,29 @@ fn record(run: u64, argv: &[String], options: &Options, data_dir: &Path) -> Stri
     let _ = writeln!(
         s,
         "\n[cwd]\ncwd={}",
-        crate::runs_log::quote(START_CWD.get().map_or("-", |c| c.as_str()))
+        cwd_class(START_CWD.get().map(|c| c.as_str()), data_dir)
     );
     s
+}
+
+/// The start directory as a class, not a path: `/`, `datadir`, `inside-datadir`
+/// or `<other>`; `-` when it was not noted
+fn cwd_class(cwd: Option<&str>, data_dir: &Path) -> &'static str {
+    let Some(cwd) = cwd else { return "-" };
+    if cwd.starts_with("unreadable") {
+        return "unreadable";
+    }
+    let cwd = Path::new(cwd);
+    let data = std::fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
+    if cwd == Path::new("/") {
+        "/"
+    } else if cwd == data || cwd == data_dir {
+        "datadir"
+    } else if cwd.starts_with(&data) || cwd.starts_with(data_dir) {
+        "inside-datadir"
+    } else {
+        "<other>"
+    }
 }
 
 /// A value fit to write as it is: short, and only word characters
