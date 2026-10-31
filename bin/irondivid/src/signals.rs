@@ -142,8 +142,13 @@ static PIPE_READ: AtomicI32 = AtomicI32::new(-1);
 static PIPE_WRITE: AtomicI32 = AtomicI32::new(-1);
 /// Stop signals (TERM, INT, QUIT) counted in this run
 static STOPS: AtomicU32 = AtomicU32::new(0);
-/// When the last counted one arrived (monotonic ns)
-static LAST_STOP_NS: AtomicU64 = AtomicU64::new(0);
+/// The count of stop signals and when the last counted one arrived, in one
+/// word: the count in the top 8 bits, monotonic ms in the rest (0 before
+/// the first). A signal counts only by moving this word with one
+/// compare-and-swap, so two handlers running at once on different threads
+/// cannot both count, and a repeat reads the count its window belongs to.
+static STOP_STATE: AtomicU64 = AtomicU64::new(0);
+const STOP_MS_BITS: u32 = 56;
 /// A stop signal this soon after the last counted one is recorded and not
 /// counted, so one keypress or one `kill` of a process group that arrives
 /// as two signals does not bring the third nearer (A3)
@@ -232,18 +237,31 @@ fn on_signal(info: &libc::siginfo_t) {
     let now = mono_ns();
     let mut repeat = false;
     let count = if STOP_SIGNALS.contains(&signo) {
-        let last = LAST_STOP_NS.load(Ordering::SeqCst);
-        let counted = STOPS.load(Ordering::SeqCst);
-        if counted > 0 && now.saturating_sub(last) < WINDOW_NS.load(Ordering::Relaxed) {
-            repeat = true;
-            counted
-        } else {
-            LAST_STOP_NS.store(now, Ordering::SeqCst);
-            let n = STOPS.fetch_add(1, Ordering::SeqCst) + 1;
-            if n >= 3 {
-                third_stop(signo, info.si_code, pid, uid, n);
+        let window_ms = WINDOW_NS.load(Ordering::Relaxed) / 1_000_000;
+        let now_ms = (now / 1_000_000) & ((1 << STOP_MS_BITS) - 1);
+        let mut state = STOP_STATE.load(Ordering::SeqCst);
+        loop {
+            let counted = (state >> STOP_MS_BITS) as u32;
+            let last_ms = state & ((1 << STOP_MS_BITS) - 1);
+            if counted > 0 && now_ms.saturating_sub(last_ms) < window_ms {
+                repeat = true;
+                break counted;
             }
-            n
+            // Whoever moves the word counts; a handler that loses sees the
+            // winner's count and time and decides again
+            let n = counted.saturating_add(1).min(255);
+            let next = (u64::from(n) << STOP_MS_BITS) | now_ms;
+            match STOP_STATE.compare_exchange(state, next, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => {
+                    STOPS.fetch_max(n, Ordering::SeqCst);
+                    if n >= 3 {
+                        third_stop(signo, info.si_code, pid, uid, n);
+                    }
+                    break n;
+                }
+                Err(seen) => state = seen,
+            }
         }
     } else {
         0
