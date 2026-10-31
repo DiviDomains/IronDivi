@@ -18,6 +18,7 @@ use std::path::Path;
 use std::time::Duration;
 
 pub mod chain;
+pub mod components;
 pub mod files;
 pub mod live;
 pub mod logs;
@@ -57,14 +58,13 @@ pub static ALL: &[Spec] = &[
     Spec { id: "B2.13", name: "network", secs: 30, what: "network" },
     Spec { id: "B2.15", name: "probe", secs: 30, what: "network probe of the compiled-in seeds" },
     Spec { id: "B2.16", name: "live", secs: 60, what: "live node: RPC, process state, thread sample" },
+    Spec { id: "B2.17", name: "components", secs: 60, what: "Electrum, web UI, ZMQ and the swap daemons" },
     Spec { id: "B2.18", name: "seccomp", secs: 30, what: "seccomp and sandbox" },
     Spec { id: "B2.19", name: "install", secs: 30, what: "package and install" },
 ];
 
 /// B2 items this version does not collect; listed in the summary
-pub static NOT_YET: &[&str] = &[
-    "B2.17 Electrum, web UI, ZMQ and swap services",
-];
+pub static NOT_YET: &[&str] = &[];
 
 /// Run one collector in this (child) process; false for an unknown name
 pub fn run(name: &str, ctx: &Ctx, o: &mut Out) -> bool {
@@ -88,6 +88,7 @@ pub fn run(name: &str, ctx: &Ctx, o: &mut Out) -> bool {
         "network" => sys::network(ctx, o),
         "probe" => probe::probe(ctx, o),
         "live" => live::live(ctx, o),
+        "components" => components::components(ctx, o),
         "seccomp" => sys::seccomp(ctx, o),
         "install" => files::install(ctx, o),
         _ => return false,
