@@ -192,8 +192,8 @@ Tested on hp1, hp2 and hp3 as a user and as root; on macOS only
   changed since the last review and keeps the exclusions. The packed
   manifest names every excluded file and every file the scan left out at
   send, as comment lines. A file added with `i` is listed with collector
-  `user-added`. `00-SUMMARY.txt` and `02-manifest.txt` can be excluded
-  like any other file.
+  `user-added`. `00-SUMMARY.txt` can be excluded like any other file;
+  `02-manifest.txt` is not listed and is always sent, rewritten at send.
 - §8.3 step 4, a file the send-time scan still matches is left out and
   listed with the reason, not sent and not a refusal of the whole send.
 - §8.3 step 5 with R2: `--send <folder>` always runs the whole review
