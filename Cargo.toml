@@ -14,6 +14,7 @@ members = [
     "crates/divi-test-support",
     "crates/divi-webui",
     "crates/divi-electrum",
+    "crates/divi-diag",
     "bin/irondivid",
     "bin/irondivi-cli",
     "crates/divi-swap",
@@ -42,6 +43,7 @@ repository = "https://github.com/DiviDomains/IronDivi"
 [workspace.dependencies]
 # Internal crates
 divi-primitives = { path = "crates/divi-primitives" }
+divi-diag = { path = "crates/divi-diag" }
 divi-crypto = { path = "crates/divi-crypto" }
 divi-script = { path = "crates/divi-script" }
 divi-consensus = { path = "crates/divi-consensus" }

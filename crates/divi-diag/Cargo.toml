@@ -1,0 +1,21 @@
+[package]
+license = "AGPL-3.0-only"
+name = "divi-diag"
+version.workspace = true
+edition.workspace = true
+description = "IronDivi diagnostics: discovery and collectors for `irondivi-cli diag`"
+
+[dependencies]
+divi-primitives = { workspace = true }
+sha2 = { workspace = true }
+hmac = "0.12"
+hex = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+regex = "1.12"
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = { workspace = true }
