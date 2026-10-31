@@ -163,7 +163,7 @@ fn system_name(n: &str) -> bool {
         )
 }
 
-struct Rules {
+pub(crate) struct Rules {
     home: Regex,
     win: Regex,
     hostname_kv: Regex,
@@ -177,7 +177,7 @@ struct Rules {
 }
 
 impl Rules {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Rules {
             home: Regex::new(r#"(?:/home/|/Users/)([^/\s:'"\\*$]+)"#).unwrap(),
             win: Regex::new(r#"(?i)\b[a-z]:\\Users\\([^\\\s"':]+)"#).unwrap(),
@@ -217,12 +217,12 @@ fn is_kernel(rel: &str) -> bool {
     rel.starts_with("kernel/")
 }
 
-struct Harvest {
-    known: Known,
-    secrets: Vec<Secret>,
+pub(crate) struct Harvest {
+    pub(crate) known: Known,
+    pub(crate) secrets: Vec<Secret>,
 }
 
-fn harvest(raw: &Raw, rules: &Rules) -> Harvest {
+pub(crate) fn harvest(raw: &Raw, rules: &Rules) -> Harvest {
     let mut hosts = BTreeSet::new();
     let mut users = BTreeSet::new();
     let mut secrets = Vec::new();
@@ -318,7 +318,7 @@ fn out_rel(rel: &str, r: &Redactor) -> String {
         .join("/")
 }
 
-fn render(rel: &str, data: &[u8], r: &Redactor, rules: &Rules) -> String {
+pub(crate) fn render(rel: &str, data: &[u8], r: &Redactor, rules: &Rules) -> String {
     let text = util::escape_bytes(data);
     let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
     if is_kernel(rel) {

@@ -17,8 +17,11 @@
 //! `--send <folder>`, which seals the package to the developer key (§8.4).
 //! B3 ([`collectors::observed`]): with consent, irondivid is started once
 //! and watched; `--exec-as` is its single-threaded id-switching helper.
-//! Not in this crate yet: the B6 recording modes.
+//! `--attach <file>` (B6.6, [`attach`]): a file the user names, redacted,
+//! JSON through the RPC answer layer ([`rpcjson`]). Not in this crate yet:
+//! the other B6 recording modes.
 
+pub mod attach;
 pub mod collectors;
 pub mod consent;
 pub mod ctx;
@@ -28,6 +31,7 @@ pub mod import;
 pub mod mem;
 pub mod oldlog;
 pub mod redact;
+pub mod rpcjson;
 pub mod runner;
 pub mod scanner;
 pub mod tar;
@@ -61,10 +65,13 @@ pub struct Options {
     pub send: Option<std::path::PathBuf>,
     /// `--report-file <path>`: the §8.1 answers, `## N` starts answer N
     pub report_file: Option<std::path::PathBuf>,
+    /// `--attach <file>` with its `--attach-method <method>`, if any (B6.6)
+    pub attach: Vec<(std::path::PathBuf, Option<String>)>,
 }
 
 const USAGE: &str = "usage: irondivi-cli diag [--datadir DIR] [--conf FILE] [--run|--no-run] \
-[--submit|--no-submit] [--out DIR] [--offline] [--no-fsync-test] [--report-file FILE]\n       \
+[--submit|--no-submit] [--out DIR] [--offline] [--no-fsync-test] [--report-file FILE] \
+[--attach FILE [--attach-method METHOD]]...\n       \
 irondivi-cli diag --import <folder|-> [--keep-raw] [--out DIR] [--no-submit]\n       \
 irondivi-cli diag --send <folder>";
 
@@ -99,6 +106,14 @@ pub fn parse_options(args: &[String]) -> Result<Options, String> {
             "--keep-raw" => o.keep_raw = true,
             "--send" => o.send = Some(value(&mut i)?.into()),
             "--report-file" => o.report_file = Some(value(&mut i)?.into()),
+            "--attach" => o.attach.push((value(&mut i)?.into(), None)),
+            "--attach-method" => {
+                let m = value(&mut i)?;
+                match o.attach.last_mut() {
+                    Some((_, l @ None)) => *l = Some(m),
+                    _ => return Err("--attach-method names the method of the --attach just before it".into()),
+                }
+            }
             // R2: `--yes` is gone; it said yes to everything at once
             "--yes" | "-y" => {
                 return Err("--yes was removed: consent is given per step. Use --run or \
@@ -131,6 +146,10 @@ pub fn run(args: &[String]) -> i32 {
                 eprintln!("irondivi-cli diag: --import and --send cannot be used together\n{USAGE}");
                 EX_USAGE
             }
+            (i, s) if !o.attach.is_empty() && (i.is_some() || s.is_some()) => {
+                eprintln!("irondivi-cli diag: --attach is part of a collection run, not of --import or --send\n{USAGE}");
+                EX_USAGE
+            }
             (Some(src), None) => import::import_main(&src, &o),
             (None, Some(folder)) => consent::send_main(&folder, &o),
             (None, None) => runner::parent_main(o),
@@ -161,6 +180,16 @@ mod tests {
     fn yes_is_refused_with_exit_64() {
         assert!(parse_options(&s(&["--yes"])).unwrap_err().contains("--submit"));
         assert_eq!(run(&s(&["--yes"])), EX_USAGE);
+    }
+
+    #[test]
+    fn attach_options() {
+        let o = parse_options(&s(&["--attach", "a.json", "--attach-method=listunspent", "--attach", "b.log"])).unwrap();
+        assert_eq!(o.attach.len(), 2);
+        assert_eq!(o.attach[0].1.as_deref(), Some("listunspent"));
+        assert_eq!(o.attach[1].1, None);
+        assert!(parse_options(&s(&["--attach-method", "getbalance"])).is_err());
+        assert!(parse_options(&s(&["--attach", "a", "--attach-method", "x", "--attach-method", "y"])).is_err());
     }
 
     #[test]

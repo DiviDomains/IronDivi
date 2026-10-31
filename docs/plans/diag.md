@@ -399,6 +399,28 @@ Tested on hp1, hp2 and hp3 as a user and as root; on macOS only
   temporary folder, and wrote the summary. Ctrl+C during a B2 collector
   was not timed for real (each takes under 2 s on the test hosts); the
   folder cleanup is covered by a unit test.
+- B6.6 `--attach <file> [--attach-method <method>]` was built
+  (crates/divi-diag/src/attach.rs, rpcjson.rs). The names in an attached
+  file (syslog host column, home paths, `rpcpassword`, docker container
+  names) are harvested before the redactor is built, so every file masks
+  them; the file lands in `host/attached/` and the summary lists it under
+  "Attached by you" with its treatment and every dropped, bucketed or
+  masked key path. JSON goes through the B6.5 JSON layer: the envelope is
+  removed, the always-dropped and script keys go, wallet methods and
+  wallet-shaped objects get A11 buckets and lose heights, times and block
+  references, the key-name rule covers the rest, a label naming a public
+  method is honoured only on a strict shape match (gettxoutsetinfo,
+  getblockchaininfo), and a block answer is reduced to version, size and
+  nTx, since diag cannot tell an own staked block here. Added beyond the
+  plan: an `address`/`addresses` string is masked by the JSON layer as
+  well as by §6.2 (a malformed address would pass §6.2's checksum test).
+  Not built: the "value is an own address or txid" wallet-shape test
+  (diag holds no own addresses), and recognition of `pct config`,
+  `lxc config show`, `lxc-info` and `docker inspect` output (treated as
+  text or JSON of unknown origin). Tested for real on hp1 with a syslog
+  file, a listunspent and a gettxoutsetinfo answer, a docker events line
+  and a conf file: no hostname, user, container name, label, address or
+  password reached the package.
 - Smaller: `irondivi-cli --version` exits 1 with the usage text; the
   first divi-diag commit (d3502999) lacks its `Cargo.lock` entry, so
   `--locked` builds need c83a9dd4 or later; `diag --run` (B3) and the

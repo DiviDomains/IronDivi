@@ -259,6 +259,7 @@ pub fn why(collector: &str) -> String {
         "user" => "your own report (§8.1)".into(),
         "user-added" => "a file you added during the review".into(),
         "diag" => "diag's own summary and log".into(),
+        "attach" => "attached by you (B6.6)".into(),
         c => crate::collectors::ALL
             .iter()
             .find(|s| s.name == c)

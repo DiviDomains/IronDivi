@@ -240,6 +240,10 @@ struct Parent {
     scanned: bool,
     /// §8.1 answer 2, redacted, shown beside the run table
     reported_start: Option<String>,
+    /// B6.6: what each attached file became, for the summary
+    attached: Vec<crate::attach::Written>,
+    /// B6.6: values from attached files the final scan looks for
+    attach_secrets: Vec<scanner::Secret>,
 }
 
 /// R1 (a): the space a filesystem must keep free once diag writes to it
@@ -357,6 +361,9 @@ pub fn parent_main(o: Options) -> i32 {
         invoked_as: "irondivi-cli diag".into(),
         ..Default::default()
     };
+    // B6.6: the names in attached files are harvested before the redactor
+    // is built, so every file masks them
+    let attach = crate::attach::prepare(&o.attach, &mut ctx.known);
     let red = Arc::new(ctx.redactor());
     let id = local_id();
     let (out, tried) = match create_out(&o, &id, &ctx) {
@@ -381,7 +388,10 @@ pub fn parent_main(o: Options) -> i32 {
         left_out: Vec::new(),
         scanned: false,
         reported_start: None,
+        attached: Vec::new(),
+        attach_secrets: attach.secrets.clone(),
     };
+    p.notes.extend(attach.notes.iter().cloned());
     for t in &tried {
         p.notes.push(format!("output folder not used: {t}"));
     }
@@ -392,8 +402,8 @@ pub fn parent_main(o: Options) -> i32 {
         p.notes.push("no developer key is compiled into this build: the review can check the folder, but nothing can be sent (§8.4).".into());
     }
     p.notes.push(
-        "not asked (§8.2): own-invalid blocks (A13), --tx, the host package (B6.2), --rpc, the crash stack, \
-         and --attach are not in this version"
+        "not asked (§8.2): own-invalid blocks (A13), --tx, the host package (B6.2), --rpc and the crash stack \
+         are not in this version"
             .into(),
     );
     // §8.1: the user's own words, before anything is collected
@@ -471,6 +481,9 @@ pub fn parent_main(o: Options) -> i32 {
             p.write_summary();
         }
     }
+    if !STOP.load(Ordering::SeqCst) {
+        p.write_attached(&attach);
+    }
     if STOP.load(Ordering::SeqCst) {
         p.state = "interrupted";
         p.log.log(&format!("stopped by signal {}", STOP_SIG.load(Ordering::SeqCst)));
@@ -509,7 +522,28 @@ impl Parent {
         let confs: Vec<PathBuf> = self.ctx.datadirs.iter().filter_map(|d| d.conf.clone()).collect();
         let cookies: Vec<PathBuf> =
             self.ctx.datadirs.iter().flat_map(|d| [d.path.join(".cookie"), d.chain.join(".cookie")]).collect();
-        scanner::secrets_of(&confs, &cookies)
+        let mut s = scanner::secrets_of(&confs, &cookies);
+        for a in &self.attach_secrets {
+            if !s.iter().any(|x| x.value == a.value) {
+                s.push(scanner::Secret { value: a.value.clone(), label: a.label.clone() });
+            }
+        }
+        s
+    }
+
+    /// B6.6: every attached file, redacted, under `host/attached/`
+    fn write_attached(&mut self, a: &crate::attach::Prepared) {
+        for (rel, text, w) in crate::attach::render(a, &self.red) {
+            match open_in(&self.out, &rel).and_then(|mut f| f.write_all(text.as_bytes())) {
+                Ok(()) => {
+                    self.owners.lock().unwrap().insert(rel, "attach".into());
+                    self.log.log(&format!("attached {}: {}", w.rel, w.treatment));
+                    self.attached.push(w);
+                }
+                Err(e) => self.notes.push(format!("--attach: {rel} could not be written: {}", util::io_err(&e))),
+            }
+        }
+        self.write_summary();
     }
 
     fn final_scan(&mut self, salt: &[u8]) {
@@ -917,6 +951,15 @@ impl Parent {
         for l in self.discovery_lines() {
             s.push_str(&l);
             s.push('\n');
+        }
+        if !self.attached.is_empty() {
+            s.push_str("\n== Attached by you (B6.6) ==\n");
+            for w in &self.attached {
+                s.push_str(&format!("{}: {}\n", w.rel, r.scrub(&w.treatment)));
+                for a in &w.actions {
+                    s.push_str(&format!("    {}\n", r.scrub(a)));
+                }
+            }
         }
         let mut notes = self.notes.clone();
         for c in collectors::NOT_YET {
