@@ -2161,7 +2161,9 @@ async fn run_daemon(
             // -walletnotify, before the wallet catches up with the chain
             // (init.cpp:1199, before the rescan at :1242)
             if let Some(cmd) = config.walletnotify.clone() {
-                w.set_tx_listener(Arc::new(move |txid| run_notify(&cmd, &txid.to_string())));
+                w.set_tx_listener(Arc::new(move |txid| {
+                    run_notify("walletnotify", &cmd, &txid.to_string())
+                }));
             }
         }
 
@@ -2942,28 +2944,37 @@ fn webui_config(args: &Args, config: &NodeConfig) -> Result<Option<divi_webui::W
 
 /// Run a notify command as divid's runCommand: through the shell, `%s`
 /// replaced, not waited for
-fn run_notify(cmd: &str, value: &str) {
+fn run_notify(kind: &'static str, cmd: &str, value: &str) {
     let cmd = cmd.replace("%s", value);
     let started = tasks::thread("notify", tasks::Kind::Supervised, move || {
-        match std::process::Command::new("sh")
+        let ran = std::process::Command::new("sh")
             .arg("-c")
             .arg(&cmd)
-            .status()
-        {
-            Ok(status) if !status.success() => warn!("runCommand error: {} ({})", cmd, status),
+            .status();
+        match ran {
+            Ok(status) if !status.success() => warn!("{}", notify_failed(kind, status)),
             Ok(_) => {}
-            Err(e) => warn!("runCommand error: {} ({})", cmd, e),
+            Err(e) => warn!("{}", notify_failed(kind, e.kind())),
         }
     });
     if let Err(e) = started {
-        warn!("runCommand not started: {}", e);
+        warn!("runCommand not started: {} ({})", kind, e.kind());
     }
+}
+
+/// A failed notify command's line: its kind and the exit status or the
+/// error kind, never the command or the txid or hash it was given (A11
+/// "Notify commands"), so an own transaction's line is a peer block's
+fn notify_failed(kind: &str, why: impl std::fmt::Display) -> String {
+    format!("runCommand error: {} ({})", kind, why)
 }
 
 /// -blocknotify: run the command each time the best block changes, with the
 /// new tip's hash (divid's UpdatedBlockTip, init.cpp:113-117, :518-523)
 fn spawn_block_notify(chain: Arc<divi_storage::Chain>, cmd: String) {
-    chain.add_tip_listener(Arc::new(move |tip| run_notify(&cmd, &tip.hash.to_string())));
+    chain.add_tip_listener(Arc::new(move |tip| {
+        run_notify("blocknotify", &cmd, &tip.hash.to_string())
+    }));
 }
 
 /// The staker's settings. The minimum coin age is the network's (Divi Core
@@ -5341,6 +5352,23 @@ mod resubmit_tests {
         assert_eq!(
             resubmit_tx(orphan, &chain, &mempool),
             Err("inputs no longer available".to_string())
+        );
+    }
+}
+
+#[cfg(test)]
+mod notify_tests {
+    use super::notify_failed;
+
+    #[test]
+    fn a_failed_notify_line_holds_its_kind_and_status_only() {
+        assert_eq!(
+            notify_failed("walletnotify", "exit status: 1"),
+            "runCommand error: walletnotify (exit status: 1)"
+        );
+        assert_eq!(
+            notify_failed("blocknotify", std::io::ErrorKind::NotFound),
+            "runCommand error: blocknotify (entity not found)"
         );
     }
 }

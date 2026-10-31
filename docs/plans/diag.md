@@ -296,6 +296,22 @@ and are not re-based.
     leaves `start`, `phase:config`, `counts`, `exit` in `runs.log`
     (`tests/runs_log.rs` updated). The A17 lock-wait copy is not in it yet
     (A17 is not built).
+- A11 notify commands and canary (slices 6 and 7): a failed
+  `-walletnotify` / `-blocknotify` writes `runCommand error: <kind>
+  (<exit status | io error kind>)` (`notify_failed` in `main.rs`), and a
+  notify thread that cannot start writes `runCommand not started: <kind>
+  (<io error kind>)`. The command and the txid or block hash it was given
+  are never written, so an own transaction's failure line is the same as a
+  peer block's. `bin/irondivid/tests/a11_canary.rs` is a reduced canary:
+  a regtest node with a labelled address, 101 mined blocks, a payment of
+  1.23456789 DIVI, an RPC error naming the address and failing notify
+  commands holding a canary string; every log, `.txt`, `.tail` and
+  `diag/` file is scanned for the label, the notify string, the address,
+  the amount (both spellings) and the txid in both byte orders. A
+  directory holding RocksDB's `CURRENT` (the wallet and chain databases)
+  is skipped: its `*.log` files are write-ahead logs, not text. Still owed
+  by the full §10 item 5 canary: a stake, a masternode collateral, rescan,
+  lock and unlock, a supervised-task panic, a crash, and the diag package.
 
 Part B as built so far: B1 discovery, the B2 collectors (B2.0–B2.19),
 `contrib/diag.sh` (B1.4), `--import` (B6.4), the §6.2 redaction and §6.3
@@ -573,6 +589,18 @@ Tested on hp1, hp2 and hp3 as a user and as root; on macOS only
   `rpcpassword` reached the package (rerun on hp3: 7 samples, Ctrl+C
   kept 3, both packages clean). Not tested: the Mac paths
   (`sysctl vm.loadavg`, `ps` resident memory).
+- §9 receiver and §8.4 upload built (2026-10-31). Hosting decided:
+  `diag.irondivi.com` on dnsdivi (15.204.117.157), a plain OVH VM where
+  nginx terminates TLS itself, with no CDN, load balancer or provider
+  request log in front; modelled on `name.irondivi.com` (Let's Encrypt
+  webroot, ECDSA key). New binaries in `bin/irondivi-diag-receiver`:
+  `irondivi-diag-receiver` (axum on 127.0.0.1:8795 behind nginx, systemd
+  unit with its own user and `StateDirectory`) and `irondivi-diag-open`.
+  The client upload is `crates/divi-diag/src/upload.rs`; `consent.rs`
+  only gains the retention line in the prompt and the call after
+  sealing. What is still logged, and the deviations from §8.4/§9 (no
+  pin, no second receiver, `--send` exits 0 once sealed even if the
+  upload fails), are in §9 "As built".
 - Smaller: `irondivi-cli --version` exits 1 with the usage text; the
   first divi-diag commit (d3502999) lacks its `Cargo.lock` entry, so
   `--locked` builds need c83a9dd4 or later; `diag --run` (B3) and the
@@ -5552,13 +5580,27 @@ it reveals stated plainly; the default and the no-tty answer is no:
   chat attachment); it is safe to send through any channel because it is
   encrypted.
 - `--offline` skips the upload and only writes the encrypted file.
+- **As built (Revision 16)**, `crates/divi-diag/src/upload.rs`: one
+  receiver, `https://diag.irondivi.com/v1/upload`, Mozilla roots plus the
+  system store, `HTTPS_PROXY`/`NO_PROXY` honoured. **Not built:** the
+  public-key pin and the fallback address on separate hosting, so a TLS
+  failure is reported as `TLS failed` (it cannot tell interception from
+  other TLS errors without the pin). The send prompt names the host and
+  the 90-day retention before the `yes`. After the upload the receiver's
+  SHA-256 is compared with the local one (`damaged in transit` if they
+  differ). `diag.log` gains an `upload:` line after sealing, so the
+  folder's `diag.log` is longer than the packaged copy by that line.
+  `--send` exits 0 once the package is sealed, uploaded or not (the
+  sealed file is the deliverable; the fallback text says how to send
+  it). `IRONDIVI_DIAG_RECEIVER` overrides the address for tests (HTTPS,
+  or plain HTTP to loopback only).
 
 ---
 
 ## 9. Receiver
 
-A small HTTPS service the developer runs. Hosting and domain: **open
-decision** (the one question for the developer).
+A small HTTPS service the developer runs. Hosting and domain: **decided
+(Revision 16)**: `diag.irondivi.com` on dnsdivi, see "As built" below.
 
 - **Accepts** `PUT /v1/upload` with an `age`-encrypted body up to 100 MB
   (B6.1 captures may need the 200 MB raw cap; zstd brings them under it, and
@@ -5587,6 +5629,52 @@ decision** (the one question for the developer).
 - **No receiver available**: §8.4's fallback (send the encrypted file any
   other way) always works, so the receiver is a convenience, not a
   dependency.
+
+**As built (Revision 16, 2026-10-31).**
+
+- **Hosting**: `https://diag.irondivi.com` on dnsdivi (15.204.117.157), a
+  plain OVH VM shared with other sites (`name.irondivi.com` among them).
+  nginx terminates TLS itself; there is no CDN, load balancer or provider
+  request log in front. Certificate from Let's Encrypt by webroot
+  (`/var/www/acme`, ECDSA), as for `name.irondivi.com`. Host details:
+  `environment/docs/dnsdivi-diag-irondivi-2026-10-31.md`.
+- **Service**: `irondivi-diag-receiver` (`bin/irondivi-diag-receiver`)
+  listens on 127.0.0.1:8795 only, as the system user `irondivi-diag`
+  under a hardened systemd unit; packages live in
+  `/var/lib/irondivi-diag` (0700) as `<ticket>.age` plus `<ticket>.meta`
+  (size, SHA-256, arrival time; nothing else). It prints one line at
+  start-up and nothing per request; a panic prints only that it
+  happened. An hourly sweep deletes packages older than 90 days.
+- **Address handling**: nginx passes the peer address to the service in
+  one header; the service hashes it with a per-process random key, keeps
+  the hash only in memory for the rate limit (10 uploads an hour, 1 GB a
+  day) and drops it when the window passes or the service restarts.
+- **What is still logged**: the vhost has `access_log off;` and
+  `error_log … emerg;` (nginx writes per-connection errors at `crit` and
+  below, so none reach it). Still recorded: a connection that fails
+  before TLS picks the vhost (no SNI, garbled ClientHello) is handled by
+  the VM's default server and may appear in the shared
+  `/var/log/nginx/error.log` with its address, like a probe of any other
+  site there, and without a host name; the systemd journal holds the
+  service's start and stop lines only. What OVH's network equipment
+  records about traffic to the VM is outside this host and not known.
+- **Developer routes**: `GET /v1/dev` (list), `GET /v1/dev/<ticket>`
+  (download, with an `X-Diag-SHA256` header), `DELETE /v1/dev/<ticket>`
+  (close), all needing `Authorization: Bearer <token>`. The server keeps
+  only the token's SHA-256 (`LoadCredential=`), compared in constant
+  time. The token is in 1Password at
+  `op://global_secret_store/irondivi_diag_receiver/download_token`.
+- **`irondivi-diag-open`** `<ticket>` (or `--file X.age`, `--list`,
+  `--close <ticket>`) resolves the age identity
+  (`op://global_secret_store/irondivi_diag/age_identity`) and the token
+  through `secret get`, or reads them from stdin with `--secrets-stdin`
+  on a host without `secret`; checks the download's SHA-256 against the
+  receiver's record, decrypts, unpacks into a 0700 folder, checks every
+  manifest hash and reports matches, mismatches, files left out and
+  unlisted files. `irondivi-replay` does not exist yet; it is run when it
+  is on `PATH`, and otherwise the open says so.
+- **Not built**: the public-key pin and the second receiver on separate
+  hosting (§8.4); multi-part uploads for packages over 100 MB.
 
 ---
 
