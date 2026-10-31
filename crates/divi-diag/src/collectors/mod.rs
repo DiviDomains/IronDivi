@@ -22,6 +22,7 @@ pub mod components;
 pub mod files;
 pub mod live;
 pub mod logs;
+pub mod platform;
 pub mod probe;
 pub mod procs;
 pub mod storage;
@@ -44,6 +45,7 @@ pub static ALL: &[Spec] = &[
     Spec { id: "B2.1", name: "identity", secs: 30, what: "who and when" },
     Spec { id: "B2.2", name: "host", secs: 30, what: "host" },
     Spec { id: "B2.3", name: "container", secs: 30, what: "container and virtualisation" },
+    Spec { id: "B4", name: "platform", secs: 30, what: "platform backend" },
     Spec { id: "B2.4", name: "processes", secs: 30, what: "processes" },
     Spec { id: "B2.5", name: "services", secs: 30, what: "service managers" },
     Spec { id: "B2.6", name: "storage", secs: 60, what: "storage and fsync test" },
@@ -74,6 +76,7 @@ pub fn run(name: &str, ctx: &Ctx, o: &mut Out) -> bool {
         "identity" => sys::identity(ctx, o),
         "host" => sys::host(ctx, o),
         "container" => sys::container(ctx, o),
+        "platform" => platform::platform(ctx, o),
         "processes" => procs::processes(ctx, o),
         "services" => procs::services(ctx, o),
         "storage" => storage::storage(ctx, o),

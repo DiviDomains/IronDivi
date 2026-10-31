@@ -32,7 +32,7 @@ fn diag_dirs(d: &DataDir) -> Vec<PathBuf> {
     v
 }
 
-fn find_diag_file(d: &DataDir, name: &str) -> Option<PathBuf> {
+pub(crate) fn find_diag_file(d: &DataDir, name: &str) -> Option<PathBuf> {
     diag_dirs(d).into_iter().map(|p| p.join(name)).find(|p| p.exists())
 }
 

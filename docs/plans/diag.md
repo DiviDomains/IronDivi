@@ -234,6 +234,24 @@ Tested on hp1, hp2 and hp3 as a user and as root; on macOS only
 - Built bug found in testing: storage.txt read `statvfs` as (total, free)
   and printed more free than total, and the fsync-test skip rule sized
   itself on free space; fixed (bcc8d835).
+- B4: built as one collector, `platform` (`host/platform.txt`), for
+  what the B2 collectors did not already do: libc kind (glibc, musl or
+  static, from each binary's ELF interpreter), Alpine, BusyBox applets
+  (B4.1); Rosetta and TCC (B4.2; the rest of B4.2 was already in B2,
+  and `log show` matches amfid, sandbox and code-signing lines through
+  the node's name rather than by process); the ARM board checks (B4.3);
+  WSL (B4.4); Docker Desktop (B4.5). Decisions: the WSL distro name is
+  shown only when it is a stock Store name (`Ubuntu-22.04`), otherwise
+  as "(a custom name)", because a renamed distro may carry the user's
+  name; the SD card's CID serial is never read; WSL is detected from
+  `/proc/sys/kernel/osrelease` as well as `/proc/version`. Tested: run
+  for real on hp1 and hp2 (glibc, no BusyBox, not WSL, not ARM, Docker
+  Engine correctly not taken for Docker Desktop); Pi, WSL, Docker
+  Desktop, Alpine and macOS only through fixture tests of each parser,
+  as no such host was available (a musl build needs a musl C compiler
+  hp3 lacks, and the glibc build does not run under Alpine's gcompat).
+  The macOS branch is compiled and linted on Linux (no `cfg` gate) but
+  has not run on a Mac.
 - Smaller: `irondivi-cli --version` exits 1 with the usage text; the
   first divi-diag commit (d3502999) lacks its `Cargo.lock` entry, so
   `--locked` builds need c83a9dd4 or later; `diag --run` (B3) and the
