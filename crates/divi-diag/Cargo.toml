@@ -27,3 +27,5 @@ chaindb = ["dep:rocksdb"]
 [dev-dependencies]
 tempfile = { workspace = true }
 divi-storage = { workspace = true }
+# B2.15 constants and the version layout are checked against the node's
+divi-network = { workspace = true }

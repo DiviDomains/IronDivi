@@ -2812,6 +2812,7 @@ dependencies = [
 name = "divi-diag"
 version = "0.2.9"
 dependencies = [
+ "divi-network",
  "divi-primitives",
  "divi-storage",
  "hex",

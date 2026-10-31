@@ -20,6 +20,7 @@ use std::time::Duration;
 pub mod chain;
 pub mod files;
 pub mod logs;
+pub mod probe;
 pub mod procs;
 pub mod storage;
 pub mod sys;
@@ -53,13 +54,13 @@ pub static ALL: &[Spec] = &[
     Spec { id: "B2.11", name: "kernel", secs: 30, what: "kernel and system log" },
     Spec { id: "B2.12", name: "crashes", secs: 30, what: "core dumps and crash stores" },
     Spec { id: "B2.13", name: "network", secs: 30, what: "network" },
+    Spec { id: "B2.15", name: "probe", secs: 30, what: "network probe of the compiled-in seeds" },
     Spec { id: "B2.18", name: "seccomp", secs: 30, what: "seccomp and sandbox" },
     Spec { id: "B2.19", name: "install", secs: 30, what: "package and install" },
 ];
 
 /// B2 items this version does not collect; listed in the summary
 pub static NOT_YET: &[&str] = &[
-    "B2.15 network probe of the compiled-in seeds",
     "B2.16 live node (RPC, getdiaginfo, thread states)",
     "B2.17 Electrum, web UI, ZMQ and swap services",
 ];
@@ -84,6 +85,7 @@ pub fn run(name: &str, ctx: &Ctx, o: &mut Out) -> bool {
         "kernel" => logs::kernel(ctx, o),
         "crashes" => logs::crashes(ctx, o),
         "network" => sys::network(ctx, o),
+        "probe" => probe::probe(ctx, o),
         "seccomp" => sys::seccomp(ctx, o),
         "install" => files::install(ctx, o),
         _ => return false,
