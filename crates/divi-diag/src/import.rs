@@ -635,6 +635,11 @@ pub fn import_main(src: &str, o: &Options) -> i32 {
             if !rep.raw.is_empty() {
                 println!("irondivi-cli diag: {}", rep.raw);
             }
+            // §8.3: the same review as after a run; the import's salt is
+            // gone, so the send-time scan uses a fresh redactor
+            let red = crate::redact::Redactor::new(crate::redact::Redactor::new_salt(), &crate::discovery::known_values());
+            let scan = crate::consent::ScanCtx { red: &red, secrets: crate::consent::current_secrets(o), salt: Vec::new() };
+            crate::consent::after_collect(&rep.out, o, scan);
             0
         }
         Err(e) => {

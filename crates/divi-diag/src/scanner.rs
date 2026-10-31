@@ -56,9 +56,10 @@ pub struct Scanner<'a> {
 }
 
 /// Files the scanner does not read: the manifest is a list of hashes
-/// written after the scan, and dotfiles are diag's own temporaries
+/// written after the scan, `preview.ok` is the review's own record and is
+/// never sent, and dotfiles are diag's own temporaries
 fn skipped(rel: &str) -> bool {
-    rel == "02-manifest.txt" || rel.split('/').any(|c| c.starts_with('.'))
+    rel == "02-manifest.txt" || rel == "preview.ok" || rel.split('/').any(|c| c.starts_with('.'))
 }
 
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";

@@ -13,10 +13,13 @@
 //! before it reaches the package folder.
 //!
 //! `--import <folder|->` (B6.4, [`import`]) turns a contrib/diag.sh folder
-//! into a package. Not in this crate yet: B3 observed start (`--run`), §8
-//! preview, consent and sending (`--submit`) and the B6 recording modes.
+//! into a package. §8 ([`consent`]): the user's report, the review, and
+//! `--send <folder>`; this build has no developer key, so nothing is sent.
+//! Not in this crate yet: B3 observed start (`--run`) and the B6 recording
+//! modes.
 
 pub mod collectors;
+pub mod consent;
 pub mod ctx;
 pub mod discovery;
 pub mod frame;
@@ -57,11 +60,16 @@ pub struct Options {
     pub import: Option<String>,
     /// `--keep-raw`: an imported diag.sh folder is not deleted afterwards
     pub keep_raw: bool,
+    /// `--send <folder>`: review a kept folder again (§8.3, R2)
+    pub send: Option<std::path::PathBuf>,
+    /// `--report-file <path>`: the §8.1 answers, `## N` starts answer N
+    pub report_file: Option<std::path::PathBuf>,
 }
 
 const USAGE: &str = "usage: irondivi-cli diag [--datadir DIR] [--conf FILE] [--run|--no-run] \
-[--submit|--no-submit] [--out DIR] [--offline] [--no-fsync-test]\n       \
-irondivi-cli diag --import <folder|-> [--keep-raw] [--out DIR]";
+[--submit|--no-submit] [--out DIR] [--offline] [--no-fsync-test] [--report-file FILE]\n       \
+irondivi-cli diag --import <folder|-> [--keep-raw] [--out DIR] [--no-submit]\n       \
+irondivi-cli diag --send <folder>";
 
 pub fn parse_options(args: &[String]) -> Result<Options, String> {
     let mut o = Options::default();
@@ -92,6 +100,8 @@ pub fn parse_options(args: &[String]) -> Result<Options, String> {
             "--no-fsync-test" => o.fsync_test = Some(false),
             "--import" => o.import = Some(value(&mut i)?),
             "--keep-raw" => o.keep_raw = true,
+            "--send" => o.send = Some(value(&mut i)?.into()),
+            "--report-file" => o.report_file = Some(value(&mut i)?.into()),
             // R2: `--yes` is gone; it said yes to everything at once
             "--yes" | "-y" => {
                 return Err("--yes was removed: consent is given per step. Use --run or \
@@ -116,9 +126,14 @@ pub fn run(args: &[String]) -> i32 {
         };
     }
     match parse_options(args) {
-        Ok(o) => match o.import.clone() {
-            Some(src) => import::import_main(&src, &o),
-            None => runner::parent_main(o),
+        Ok(o) => match (o.import.clone(), o.send.clone()) {
+            (Some(_), Some(_)) => {
+                eprintln!("irondivi-cli diag: --import and --send cannot be used together\n{USAGE}");
+                EX_USAGE
+            }
+            (Some(src), None) => import::import_main(&src, &o),
+            (None, Some(folder)) => consent::send_main(&folder, &o),
+            (None, None) => runner::parent_main(o),
         },
         Err(e) => {
             if !e.is_empty() {

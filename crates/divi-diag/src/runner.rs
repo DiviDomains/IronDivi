@@ -7,6 +7,7 @@
 //! `diag.log`, `00-SUMMARY.txt` and `02-manifest.txt`.
 
 use crate::collectors::{self, Spec};
+use crate::consent;
 use crate::ctx::Ctx;
 use crate::discovery;
 use crate::frame::{read_frame, Frame, Out};
@@ -185,6 +186,8 @@ struct Parent {
     /// §6.3: (file, reason) for every file the final scan left out
     left_out: Vec<(String, String)>,
     scanned: bool,
+    /// §8.1 answer 2, redacted, shown beside the run table
+    reported_start: Option<String>,
 }
 
 /// R1 (a): the space a filesystem must keep free once diag writes to it
@@ -325,6 +328,7 @@ pub fn parent_main(o: Options) -> i32 {
         state: "in progress",
         left_out: Vec::new(),
         scanned: false,
+        reported_start: None,
     };
     for t in &tried {
         p.notes.push(format!("output folder not used: {t}"));
@@ -332,10 +336,23 @@ pub fn parent_main(o: Options) -> i32 {
     if o.run == Some(true) {
         p.notes.push("--run: the observed start (B3) is not in this version of diag; nothing was started.".into());
     }
-    if o.submit == Some(true) {
-        p.notes.push("--submit: preview, consent and sending (§8) are not in this version of diag; nothing was sent.".into());
-    } else if !util::is_tty() {
+    if !util::is_tty() {
         p.notes.push("no terminal: nothing is ever sent without one (R2).".into());
+    }
+    if consent::DEV_KEY.is_none() {
+        p.notes.push("no developer key is compiled into this build: the review can check the folder, but nothing can be sent (§8.4).".into());
+    }
+    p.notes.push(
+        "not asked (§8.2): own-invalid blocks (A13), --tx, the host package (B6.2), --rpc, the crash stack, \
+         --attach and the observed start (B3) are not in this version"
+            .into(),
+    );
+    // §8.1: the user's own words, before anything is collected
+    let report = consent::user_report(&o, &p.red);
+    p.reported_start = consent::reported_start(&report);
+    if let Ok(mut f) = open_in(&out, consent::REPORT) {
+        let _ = f.write_all(report.as_bytes());
+        p.owners.lock().unwrap().insert(consent::REPORT.into(), "user".into());
     }
     if o.offline {
         p.notes.push("--offline: the network probe (B2.15) was skipped.".into());
@@ -399,7 +416,11 @@ pub fn parent_main(o: Options) -> i32 {
     p.final_scan(&salt);
     p.write_manifest();
     eprintln!("irondivi-cli diag: {} — {}", p.state, p.out.display());
-    eprintln!("Nothing was sent. Read 00-SUMMARY.txt in that folder first.");
+    let secrets = p.secrets();
+    let scan = consent::ScanCtx { red: &p.red, secrets, salt: salt.to_vec() };
+    if !matches!(consent::after_collect(&p.out, &o, scan), consent::Outcome::Sealed(_)) {
+        eprintln!("Nothing was sent. Read 00-SUMMARY.txt in that folder first.");
+    }
     if p.state == "complete" {
         0
     } else {
@@ -410,11 +431,16 @@ pub fn parent_main(o: Options) -> i32 {
 impl Parent {
     /// §6.3: scan, leave out every file with a hit, rewrite the summary
     /// with the list, and scan again until nothing is found
-    fn final_scan(&mut self, salt: &[u8]) {
+    /// The values §6.3 searches for: this run's configs and cookies
+    fn secrets(&self) -> Vec<scanner::Secret> {
         let confs: Vec<PathBuf> = self.ctx.datadirs.iter().filter_map(|d| d.conf.clone()).collect();
         let cookies: Vec<PathBuf> =
             self.ctx.datadirs.iter().flat_map(|d| [d.path.join(".cookie"), d.chain.join(".cookie")]).collect();
-        let secrets = scanner::secrets_of(&confs, &cookies);
+        scanner::secrets_of(&confs, &cookies)
+    }
+
+    fn final_scan(&mut self, salt: &[u8]) {
+        let secrets = self.secrets();
         let sc = scanner::Scanner::new(&self.red, &secrets, salt);
         for round in 0..4 {
             let hits = sc.scan_folder(&self.out);
@@ -739,6 +765,10 @@ impl Parent {
         s.push_str(&format!("Started: {}   Status: {}\n\n", util::rfc3339(self.started), self.state));
 
         s.push_str("== Run table (B2.14) ==\n");
+        match &self.reported_start {
+            Some(t) => s.push_str(&format!("You said it started: {t}\n")),
+            None => s.push_str("You said it started: (no answer)\n"),
+        }
         let mut any = false;
         for d in &self.ctx.datadirs {
             let p = self.out.join(format!("datadir-{}/run-table.txt", d.n));
