@@ -626,16 +626,30 @@ pub fn discover(
                 }
                 continue;
             }
-            let network = match chain.strip_prefix(&base).ok().and_then(|r| r.to_str()) {
+            let mut network = match chain.strip_prefix(&base).ok().and_then(|r| r.to_str()) {
                 Some("") | None => "main",
                 Some(r) if r.ends_with("testnet") => "testnet",
                 Some(r) if r.ends_with("regtest") => "regtest",
                 Some(_) => "main",
             };
             let pd = chain.components().any(|c| c.as_os_str() == "privatedivi");
-            let conf = [base.join("irondivi.conf"), chain.join("irondivi.conf")]
+            // irondivid's own order (config_path): irondivi.conf, else
+            // divid's divi.conf, both in the data dir
+            let conf = [base.join("irondivi.conf"), base.join("divi.conf"), chain.join("irondivi.conf")]
                 .into_iter()
                 .find(|p| p.exists());
+            if chain == base {
+                // no network subdir: the config's testnet= or regtest= says
+                if let Some(t) = conf.as_deref().and_then(|c| crate::util::read_small(c, 1 << 20)) {
+                    let mut s = crate::settings::Settings::default();
+                    if s.read_config(&t).is_ok() {
+                        let (n, _, _) = network_of(&[], Some(&s));
+                        if n != "main" {
+                            network = if n == "testnet" { "testnet" } else { "regtest" };
+                        }
+                    }
+                }
+            }
             seen.push((key, dirs.len()));
             dirs.push(DataDir {
                 path: base.clone(),

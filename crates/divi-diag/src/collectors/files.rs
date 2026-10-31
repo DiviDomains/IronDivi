@@ -382,10 +382,10 @@ const SHOWN_KEYS: &[&str] = &[
     "electrumbind", "webui", "webuiport", "webuibind", "dbbackend", "storage",
 ];
 
-const HOST_KEYS: &[&str] = &["addnode", "connect", "seednode", "externalip", "proxy", "onion", "bind", "rpcbind", "masternodeaddr", "electrumbind", "webuibind"];
+const HOST_KEYS: &[&str] = &["addnode", "connect", "seednode", "externalip", "proxy", "onion", "bind", "rpcbind", "masternodeaddr", "electrumbind", "webuibind", "electrum", "electrumws", "electrumtls", "electrumwss"];
 const COMMAND_KEYS: &[&str] = &["alertnotify", "blocknotify", "walletnotify"];
 
-fn host_value(r: &Redactor, v: &str) -> String {
+pub(crate) fn host_value(r: &Redactor, v: &str) -> String {
     let host = v.rsplit_once(':').filter(|(h, p)| !h.ends_with(':') && p.chars().all(|c| c.is_ascii_digit())).map(|x| x.0).unwrap_or(v);
     let bare = host.trim_start_matches('[').trim_end_matches(']');
     if bare.parse::<std::net::IpAddr>().is_ok() || bare.is_empty() {
@@ -420,7 +420,7 @@ pub fn render_value(r: &Redactor, key: &str, value: &str) -> Option<String> {
 fn conf_files(ctx: &Ctx) -> Vec<(usize, PathBuf)> {
     let mut v: Vec<(usize, PathBuf)> = Vec::new();
     for d in &ctx.datadirs {
-        let mut cands: Vec<PathBuf> = vec![d.path.join("irondivi.conf"), d.chain.join("irondivi.conf"), d.path.join("masternode.conf"), d.chain.join("masternode.conf")];
+        let mut cands: Vec<PathBuf> = vec![d.path.join("irondivi.conf"), d.path.join("divi.conf"), d.chain.join("irondivi.conf"), d.path.join("masternode.conf"), d.chain.join("masternode.conf")];
         if let Some(c) = &d.conf {
             cands.insert(0, c.clone());
         }
@@ -444,7 +444,7 @@ pub fn config(ctx: &Ctx, o: &mut Out) {
     let files = conf_files(ctx);
     if files.is_empty() {
         o.file("diag.log");
-        outln!(o, "config: no irondivi.conf or masternode.conf found next to any data dir");
+        outln!(o, "config: no irondivi.conf, divi.conf or masternode.conf found next to any data dir");
     }
     for (n, p) in files {
         let name = p.file_name().map(|x| x.to_string_lossy().to_string()).unwrap_or_default();
@@ -551,7 +551,7 @@ pub fn wallet(ctx: &Ctx, o: &mut Out) {
     for d in &ctx.datadirs {
         o.file(&format!("datadir-{}/wallet-structure.txt", d.n));
         outln!(o, "Diag never opens the wallet store (§6.1). Facts from the config:");
-        let conf = d.conf.clone().or_else(|| [d.path.join("irondivi.conf"), d.chain.join("irondivi.conf")].into_iter().find(|p| p.is_file()));
+        let conf = d.conf.clone().or_else(|| [d.path.join("irondivi.conf"), d.path.join("divi.conf"), d.chain.join("irondivi.conf")].into_iter().find(|p| p.is_file()));
         let mut s = Settings::default();
         let mut node_args: Vec<String> = Vec::new();
         if let Some(n) = ctx.node_for(d) {
