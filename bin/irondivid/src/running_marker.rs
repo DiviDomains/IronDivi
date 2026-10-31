@@ -245,7 +245,7 @@ fn exit_recorded(runs_log: &Path, run: u64) -> bool {
 }
 
 /// `/proc/sys/kernel/random/boot_id` (Linux); "-" elsewhere
-fn boot_id() -> String {
+pub(crate) fn boot_id() -> String {
     std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|_| "-".into())

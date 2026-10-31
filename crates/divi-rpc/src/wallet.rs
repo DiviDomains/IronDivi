@@ -20,6 +20,7 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use bip39::Mnemonic;
 use divi_primitives::amount::Amount;
 use divi_primitives::constants::MAX_MONEY;
+use divi_primitives::counted::{self, Site};
 use divi_primitives::hash::{Hash160, Hash256};
 use divi_primitives::script::Script;
 use divi_primitives::serialize::{deserialize, serialize};
@@ -1926,12 +1927,7 @@ impl WalletRpc {
             );
         }
 
-        info!(
-            "Sent {} DIVI to {} (txid: {})",
-            send_amount.as_divi_f64(),
-            addr_str,
-            txid
-        );
+        counted::hit(Site::RpcSent);
 
         Ok(serde_json::json!(txid.to_string()))
     }
@@ -3171,12 +3167,7 @@ impl WalletRpc {
         };
         wallet.store_vault(metadata);
 
-        info!(
-            "Funded vault {} with {} DIVI (txid: {})",
-            vault_encoding,
-            send_amount.as_divi_f64(),
-            txid
-        );
+        counted::hit(Site::RpcVaultFunded);
 
         // rpcwallet.cpp:1059-1062
         Ok(serde_json::json!({
@@ -3563,11 +3554,7 @@ impl WalletRpc {
                 "Couldn't verify transaction has correct collateral",
             )
         })?;
-        info!(
-            "Allocated {} DIVI for masternode collateral (txid: {})",
-            collateral.as_divi_f64(),
-            txid
-        );
+        counted::hit(Site::RpcAllocated);
         Ok(serde_json::json!({ "txhash": txid.to_string(), "vout": vout }))
     }
 
@@ -4167,13 +4154,7 @@ impl WalletRpc {
             ]),
         );
 
-        info!(
-            "Sent {} DIVI from account '{}' to {} (txid: {})",
-            send_amount.as_divi_f64(),
-            account,
-            addr_str,
-            txid
-        );
+        counted::hit(Site::RpcSentFrom);
 
         Ok(serde_json::json!(txid.to_string()))
     }

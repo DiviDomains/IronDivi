@@ -337,7 +337,7 @@ fn boot_clock() -> Option<f64> {
 
 /// `yes`, `no` or `unknown`: a read-only `adjtimex` (modes 0, which needs
 /// no capability) says whether the kernel clock is synchronised
-fn clock_synced() -> &'static str {
+pub(crate) fn clock_synced() -> &'static str {
     #[cfg(target_os = "linux")]
     {
         let mut tx: libc::timex = unsafe { std::mem::zeroed() };

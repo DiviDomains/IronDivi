@@ -22,6 +22,7 @@ use divi_crypto::compute_block_hash;
 use divi_network::{BlockConnectedCallback, PeerManager};
 use divi_primitives::amount::Amount;
 use divi_primitives::block::{Block, BlockHeader};
+use divi_primitives::counted::{self, Site};
 use divi_primitives::hash::{Hash160, Hash256};
 use divi_primitives::script::Script;
 use divi_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut};
@@ -719,10 +720,7 @@ impl Staker {
                     reward,
                     ..
                 } => {
-                    info!(
-                        "Staked block {} at height {} (reward: {})",
-                        block_hash, height, reward
-                    );
+                    counted::hit(Site::StakerStaked);
                     *self.last_stake_time.write() = current_timestamp();
                     let _ = self.event_tx.send(StakerEvent::BlockFound {
                         hash: block_hash,
@@ -730,19 +728,8 @@ impl Staker {
                         reward,
                     });
                 }
-                StakeResult::NoStakeableUtxos => {
-                    static NO_UTXO_COUNT: std::sync::atomic::AtomicU32 =
-                        std::sync::atomic::AtomicU32::new(0);
-                    let count = NO_UTXO_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if count == 0 {
-                        info!("No stakeable UTXOs available (first occurrence)");
-                    } else {
-                        trace!("No stakeable UTXOs available");
-                    }
-                }
-                StakeResult::NoProofFound => {
-                    trace!("No valid proof found this round");
-                }
+                StakeResult::NoStakeableUtxos => counted::hit(Site::StakerNoUtxos),
+                StakeResult::NoProofFound => counted::hit(Site::StakerNoProof),
                 StakeResult::WalletLocked => {
                     // Already reported once by note_wallet_locked
                     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
@@ -750,21 +737,12 @@ impl Staker {
                 }
                 StakeResult::RateLimited => {
                     // Step 4: Sleep longer when rate-limited (22s wait needed, not 500ms)
-                    static RATE_LIMITED_COUNT: std::sync::atomic::AtomicU32 =
-                        std::sync::atomic::AtomicU32::new(0);
-                    let count =
-                        RATE_LIMITED_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if count == 0 {
-                        info!("Rate limited (first occurrence - waiting 22s since last attempt)");
-                    } else {
-                        trace!("Rate limited - sleeping 5s");
-                    }
+                    counted::hit(Site::StakerRateLimited);
                     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
                     continue; // Skip the default sleep at the end
                 }
-                StakeResult::Error(e) => {
-                    info!("Staking error: {}", e);
-                }
+                // Counted where it is made, by its closed reason code (A11)
+                StakeResult::Error(_) => {}
             }
 
             // Wait before next attempt
@@ -794,6 +772,7 @@ impl Staker {
         match self.chain.accept_block(block.clone()) {
             Ok(result) => {
                 if let Some(fork_height) = result.reorg_fork_height {
+                    counted::hit(Site::StakerSelfAcceptReorg);
                     // No line of its own: the chain's reorganisation lines
                     // are written for an own block as for a peer's (A11)
                     // Undo what the wallet recorded from the disconnected
@@ -822,6 +801,7 @@ impl Staker {
             Err(e) => {
                 let err_msg = format!("{}", e);
                 divi_network::log_block_connect_failed(&block_hash, &err_msg);
+                counted::hit(Site::StakerSelfAcceptFailed);
                 // If the failure is due to a phantom UTXO (spent on chain but
                 // still in wallet), evict the coinstake input to prevent the
                 // staker from repeatedly trying to use it.
@@ -837,19 +817,13 @@ impl Staker {
                                 let gone = matches!(self.chain.has_utxo(outpoint), Ok(false));
                                 if gone && self.wallet.has_utxo(outpoint) {
                                     self.wallet.spend_utxo(outpoint);
-                                    warn!(
-                                        "Evicted phantom UTXO {} from wallet after failed self-accept",
-                                        divi_primitives::redact::OwnOutpoint::of(outpoint)
-                                    );
+                                    counted::hit(Site::StakerPhantomEvicted);
                                 }
                             }
                         }
                         // Persist the eviction
-                        if let Err(save_err) = self.wallet.save_incremental() {
-                            warn!(
-                                "Failed to save wallet after phantom UTXO eviction: {}",
-                                save_err
-                            );
+                        if self.wallet.save_incremental().is_err() {
+                            counted::hit(Site::StakerPhantomSaveFailed);
                         }
                     }
                 }
@@ -1096,26 +1070,12 @@ impl Staker {
             let elapsed = current_time.saturating_sub(last_time);
             // Check if less than 22.5 seconds (hashingDelay/2) have passed
             if elapsed < HASHING_DELAY_SECONDS / 2 {
-                trace!(
-                    "Rate limiting: only {}s since last attempt at height {} (need {}s)",
-                    elapsed,
-                    current_height,
-                    HASHING_DELAY_SECONDS / 2
-                );
                 return true; // LIMIT staking
             } else {
-                info!(
-                    "Rate limit passed: {}s elapsed at height {} (need {}s) - proceeding with stake",
-                    elapsed,
-                    current_height,
-                    HASHING_DELAY_SECONDS / 2
-                );
+                counted::hit(Site::StakerRatePassed);
             }
         } else {
-            info!(
-                "No previous attempt at height {} - proceeding with stake",
-                current_height
-            );
+            counted::hit(Site::StakerFirstAtHeight);
         }
 
         false
@@ -1173,7 +1133,10 @@ impl Staker {
         // Get the current tip FIRST - this ensures all state is consistent
         let tip = match self.chain.tip() {
             Some(tip) => tip,
-            None => return StakeResult::Error("No chain tip".to_string()),
+            None => {
+                counted::hit(Site::StakerErrorNoTip);
+                return StakeResult::Error("No chain tip".to_string());
+            }
         };
 
         let current_height = tip.height;
@@ -1236,7 +1199,6 @@ impl Staker {
     /// pacing guards are the caller's.
     fn build_stake_block(&self, tip: &divi_storage::BlockIndex, current_time: u32) -> StakeResult {
         let current_height = tip.height;
-        let next_height = current_height + 1;
 
         // Compute the NEXT block's difficulty bits.
         // Each block has its own difficulty computed by get_next_work_required(),
@@ -1245,7 +1207,7 @@ impl Staker {
         let n_bits = match self.chain.get_next_bits(tip) {
             Ok(bits) => bits,
             Err(e) => {
-                debug!("Failed to compute next difficulty: {}", e);
+                counted::hit(Site::StakerErrorDifficulty);
                 return StakeResult::Error(format!("Difficulty computation failed: {}", e));
             }
         };
@@ -1303,20 +1265,7 @@ impl Staker {
 
         // No plain coin left is no reason to stop: vault coins are staked too
         if stakeable.is_empty() && reserve > 0 {
-            static RESERVE_LIMIT_COUNT: std::sync::atomic::AtomicU32 =
-                std::sync::atomic::AtomicU32::new(0);
-            let count = RESERVE_LIMIT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if count == 0 {
-                info!(
-                    "No stakeable UTXOs after applying reserve balance of {} DIVI (first occurrence)",
-                    reserve as f64 / 100_000_000.0
-                );
-            } else {
-                trace!(
-                    "No stakeable UTXOs after applying reserve balance of {} DIVI",
-                    reserve as f64 / 100_000_000.0
-                );
-            }
+            counted::hit(Site::StakerReserveLimited);
         }
 
         // Divi Core stakes and combines only coins of its stake set
@@ -1331,7 +1280,7 @@ impl Staker {
             .filter(|(utxo, _)| self.is_in_stake_set(utxo, current_height, current_time))
             .collect();
         if !vault_utxos.is_empty() {
-            info!("Found {} vault UTXOs for staking", vault_utxos.len());
+            counted::hit(Site::StakerVaultUtxos);
         }
         if stakeable.is_empty() && vault_utxos.is_empty() {
             return StakeResult::NoStakeableUtxos;
@@ -1358,15 +1307,7 @@ impl Staker {
             .sum();
         *self.stake_weight.write() = total_weight;
 
-        // Log staking attempt (every 60 iterations to avoid spam)
-        static ATTEMPT_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let count = ATTEMPT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if count.is_multiple_of(60) {
-            info!(
-                "Staking attempt #{}: {} UTXOs, total weight {} DIVI, tip height {}, current_time {}, n_bits=0x{:08x}, stake_modifier={}",
-                count, candidates.len(), total_weight as f64 / 100_000_000.0, next_height - 1, current_time, n_bits, tip.stake_modifier
-            );
-        }
+        counted::hit(Site::StakerAttempt);
 
         // Use per-tip cache to avoid repeated DB reads for stake_modifier and MTP.
         // Only recompute when the tip changes (~every 60s), saving ~1632 reads/attempt.
@@ -1379,10 +1320,7 @@ impl Staker {
 
                 let tip_cached_modifier = tip.stake_modifier;
                 if new_modifier != tip_cached_modifier {
-                    warn!(
-                        "MODIFIER MISMATCH: tip.stake_modifier=0x{:016x} vs db_walkback=0x{:016x} at height {} (generated={})",
-                        tip_cached_modifier, new_modifier, tip.height, tip.generated_stake_modifier
-                    );
+                    counted::hit(Site::StakerModifierMismatch);
                 }
 
                 cache.tip_hash = tip.hash;
@@ -1464,30 +1402,11 @@ impl Staker {
             }
 
             match &result {
-                HashproofResult::Success(ts) => {
-                    info!(
-                        "Hashproof SUCCESS for UTXO {}:{} value={}, timestamp={}",
-                        utxo.txid,
-                        utxo.vout,
-                        utxo.value.as_divi_f64(),
-                        ts
-                    );
+                HashproofResult::Success(_) => {
+                    counted::hit(Site::StakerHashproofOk);
                 }
                 HashproofResult::FailedGeneration => {
                     generation_failed_count += 1;
-                    // Diagnostic: log the first UTXO's details every 60 attempts
-                    if generation_failed_count == 1 && count.is_multiple_of(60) {
-                        let age = current_time.saturating_sub(block_time_of_first_confirmation);
-                        info!(
-                            "Sample UTXO {}:{} value={} age={}s ({:.1}h) block_time={}",
-                            utxo.txid,
-                            utxo.vout,
-                            utxo.value.as_divi_f64(),
-                            age,
-                            age as f64 / 3600.0,
-                            block_time_of_first_confirmation,
-                        );
-                    }
                 }
                 HashproofResult::FailedSetup => {
                     setup_failed_count += 1;
@@ -1499,21 +1418,11 @@ impl Staker {
                 // C++ validation requires: block.GetBlockTime() > pindexPrev->GetMedianTimePast()
                 // OPTIMIZATION: MTP is already cached above (same for all UTXOs)
                 if timestamp <= mtp {
-                    info!(
-                        "Skipping UTXO {}:{} - hashproof timestamp {} <= MTP {} (diff: {}s)",
-                        utxo.txid,
-                        utxo.vout,
-                        timestamp,
-                        mtp,
-                        mtp.saturating_sub(timestamp)
-                    );
+                    counted::hit(Site::StakerMtpSkip);
                     continue;
                 }
 
-                info!(
-                    "Found valid stake for UTXO {}:{} at timestamp {} (MTP={}, current_time={})",
-                    utxo.txid, utxo.vout, timestamp, mtp, current_time
-                );
+                counted::hit(Site::StakerStakeFound);
 
                 // Create the block
                 match self.create_stake_block(tip, candidate, timestamp, n_bits, &combine_pool) {
@@ -1530,24 +1439,16 @@ impl Staker {
                             reward,
                         };
                     }
-                    Err(e) => {
-                        debug!("Failed to create stake block: {}", e);
+                    Err(_) => {
+                        counted::hit(Site::StakerCreateFailed);
                         continue;
                     }
                 }
             }
         }
 
-        // Log attempt summary (every 60 attempts to avoid spam)
-        if count.is_multiple_of(60) {
-            info!(
-                "Staking attempt #{} summary: {} tried, {} no-proof, {} setup-failed, 0 success",
-                count,
-                candidates.len(),
-                generation_failed_count,
-                setup_failed_count
-            );
-        }
+        counted::add(Site::StakerUtxoNoProof, generation_failed_count as usize);
+        counted::add(Site::StakerUtxoSetupFailed, setup_failed_count as usize);
 
         StakeResult::NoProofFound
     }
@@ -1601,7 +1502,7 @@ impl Staker {
             let index = match self.chain.get_block_index(&current_hash) {
                 Ok(Some(idx)) => idx,
                 _ => {
-                    debug!("Could not find block index for {}", current_hash);
+                    counted::hit(Site::StakerNoBlockIndex);
                     return 0;
                 }
             };
@@ -1658,11 +1559,7 @@ impl Staker {
             let winners = &tip.lottery_winners;
 
             if !winners.coinstakes.is_empty() {
-                info!(
-                    "Creating lottery block {} with {} winners",
-                    height,
-                    winners.coinstakes.len()
-                );
+                counted::hit(Site::StakerLotteryBlock);
 
                 // Calculate lottery payments (50 DIVI per block × cycle = total lottery payout)
                 let lottery_reward_per_block = Amount::from_sat(50_00000000);
@@ -1674,7 +1571,7 @@ impl Staker {
 
                 Some(payments)
             } else {
-                warn!("Lottery block {} has no winners!", height);
+                counted::hit(Site::StakerLotteryNoWinners);
                 None
             }
         } else {
@@ -1700,7 +1597,7 @@ impl Staker {
         };
 
         let treasury_payments = if payout == divi_consensus::treasury::SuperblockPayout::Treasury {
-            info!("Creating treasury block {}", height);
+            counted::hit(Site::StakerTreasuryBlock);
 
             // Use transition-aware payment cycle and weighted calculation
             // matching C++ BlockSubsidyProvider::updateTreasuryReward
@@ -1720,13 +1617,6 @@ impl Staker {
                     payment_cycle,
                     halving_interval,
                 );
-
-            info!(
-                "Treasury block {} payments: {} DIVI treasury, {} DIVI charity",
-                height,
-                treasury_payment.as_divi_f64(),
-                charity_payment.as_divi_f64()
-            );
 
             let treasury_script = divi_consensus::treasury::get_treasury_script(is_mainnet);
             let charity_script = divi_consensus::treasury::get_charity_script(is_mainnet);
@@ -1847,13 +1737,7 @@ impl Staker {
         let sig_bytes = signature.to_compact_with_recovery();
 
         // Debug: log signature details
-        debug!(
-            "Block signature: hash={}, sig_len={}, recovery_byte={}, addr={}",
-            block_hash,
-            sig_bytes.len(),
-            sig_bytes[0],
-            stake_utxo.address
-        );
+        counted::hit(Site::StakerSign);
 
         // Verify the signature can be recovered
         let recovered_pubkey = signature.recover_from_hash(block_hash.as_bytes());
@@ -1861,13 +1745,12 @@ impl Staker {
             Ok(pk) => {
                 let recovered_hash = divi_crypto::hash160(&pk.to_bytes());
                 let matches = recovered_hash == addr.hash;
-                debug!("Block signature verification: pubkey_match={}", matches);
                 if !matches {
-                    warn!("Block signature: recovered pubkey doesn't match expected address!");
+                    counted::hit(Site::StakerSignMismatch);
                 }
             }
-            Err(e) => {
-                warn!("Failed to recover pubkey from signature: {}", e);
+            Err(_) => {
+                counted::hit(Site::StakerSignRecoverFailed);
             }
         }
 
@@ -1900,18 +1783,13 @@ impl Staker {
 
         let sig_bytes = signature.to_compact_with_recovery();
 
-        debug!(
-            "Vault block signature: hash={}, sig_len={}, manager_hash={:?}",
-            block_hash,
-            sig_bytes.len(),
-            manager_hash.as_bytes()
-        );
+        counted::hit(Site::StakerVaultSign);
 
         // Verify recovery
         if let Ok(pk) = signature.recover_from_hash(block_hash.as_bytes()) {
             let recovered_hash = divi_crypto::hash160(&pk.to_bytes());
             if recovered_hash != manager_hash {
-                warn!("Vault block signature: recovered pubkey doesn't match manager key!");
+                counted::hit(Site::StakerVaultSignMismatch);
             }
         }
 
@@ -1985,11 +1863,7 @@ impl Staker {
         divi_wallet::CoinstakeBuilder::sign_all_manager_path(&mut tx, &prev_scripts, secret)
             .map_err(|e| format!("Failed to sign vault coinstake: {}", e))?;
 
-        info!(
-            "Created vault coinstake: {} inputs, {} outputs",
-            tx.vin.len(),
-            tx.vout.len()
-        );
+        counted::hit(Site::StakerVaultCoinstake);
 
         Ok(tx)
     }
@@ -2120,11 +1994,7 @@ impl Staker {
         }
 
         if spent.len() > 1 || plan.stake_outputs.len() > 1 {
-            info!(
-                "Coinstake combines {} input(s) into {} stake output(s)",
-                spent.len(),
-                plan.stake_outputs.len()
-            );
+            counted::hit(Site::StakerCoinstakeCombine);
         }
 
         Ok(tx)
@@ -2161,13 +2031,7 @@ impl Staker {
         // C++ reference: BlockConnectionService.cpp lines 322-326
         let stake_reward = rewards.stake + rewards.masternode;
 
-        tracing::debug!(
-            "Block {} rewards: stake={} DIVI (incl. mn fold), treasury={} DIVI, lottery={} DIVI",
-            height,
-            stake_reward.as_divi_f64(),
-            rewards.treasury.as_divi_f64(),
-            rewards.lottery.as_divi_f64(),
-        );
+        counted::hit(Site::StakerBlockRewards);
 
         stake_reward
     }

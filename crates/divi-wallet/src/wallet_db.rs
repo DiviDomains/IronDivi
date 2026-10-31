@@ -24,6 +24,7 @@ use crate::persistence::{
 };
 
 use divi_primitives::amount::Amount;
+use divi_primitives::counted::{self, Site};
 use divi_primitives::hash::{Hash160, Hash256};
 use divi_primitives::redact::{OwnOutpoint, WalletAddress, WalletAmount, WalletTxid};
 use divi_primitives::script::Script;
@@ -35,7 +36,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, warn};
 use zeroize::Zeroizing;
 
 /// Wallet UTXO
@@ -1381,7 +1382,7 @@ impl WalletDb {
         self.dirty.write().clear();
         self.clear_pending_deletes(&pending);
 
-        debug!("Wallet incremental save complete");
+        counted::hit(Site::WalletSave);
         Ok(())
     }
 
@@ -1770,11 +1771,7 @@ impl WalletDb {
     /// Add a UTXO to the wallet
     pub fn add_utxo(&self, utxo: WalletUtxo) {
         let outpoint = utxo.outpoint();
-        debug!(
-            "Adding UTXO {} ({})",
-            OwnOutpoint(utxo.txid, utxo.vout),
-            WalletAmount(utxo.value.as_sat())
-        );
+        counted::hit(Site::WalletUtxoAdded);
         self.utxos.write().insert(outpoint, utxo);
         self.dirty.write().utxos = true;
     }
@@ -1792,7 +1789,7 @@ impl WalletDb {
     ) -> Option<WalletUtxo> {
         let utxo = self.utxos.write().remove(outpoint);
         if let Some(ref u) = utxo {
-            debug!("Spent UTXO {}", OwnOutpoint(outpoint.txid, outpoint.vout));
+            counted::hit(Site::WalletUtxoSpent);
             self.spent.write().insert(*outpoint);
             if let Some(h) = height {
                 self.spent_utxo_data
@@ -1800,8 +1797,8 @@ impl WalletDb {
                     .insert(*outpoint, (u.clone(), h));
                 // Persist to RocksDB so reorg recovery survives restart
                 if let Some(ref db) = self.db {
-                    if let Err(e) = db.store_spent_utxo_data(outpoint, u, h) {
-                        debug!("Failed to persist spent_utxo_data: {}", e);
+                    if db.store_spent_utxo_data(outpoint, u, h).is_err() {
+                        counted::hit(Site::WalletSpentPersistFailed);
                     }
                 }
             }
@@ -2186,7 +2183,7 @@ impl WalletDb {
 
     /// Add a transaction to history
     pub fn add_transaction(&self, tx: WalletTx) {
-        debug!("Adding transaction {} to history", WalletTxid(tx.txid));
+        counted::hit(Site::WalletTxAdded);
         let (txid, confirmed) = (tx.txid, tx.block_height.is_some());
         self.note_first_seen(&txid);
         self.transactions.write().insert(tx.txid, tx);
@@ -2869,12 +2866,7 @@ impl WalletDb {
                     self.mark_address_used(&address);
                 }
 
-                trace!(
-                    "Received {} to {} in tx {}",
-                    WalletAmount(output.value.as_sat()),
-                    WalletAddress(&address),
-                    WalletTxid::of(txid)
-                );
+                counted::hit(Site::WalletReceived);
             }
         }
 
@@ -2888,11 +2880,7 @@ impl WalletDb {
             if let Some(utxo) = self.spend_utxo_at_height(&outpoint, height) {
                 is_relevant = true;
                 sent += utxo.value;
-                trace!(
-                    "Spent {} from {}",
-                    WalletAmount(utxo.value.as_sat()),
-                    OwnOutpoint(outpoint.txid, outpoint.vout)
-                );
+                counted::hit(Site::WalletSpent);
             } else if let Some(value) = height.and_then(|h| {
                 // This block was scanned before and already spent the coin:
                 // count it again so the history entry comes out the same
@@ -2966,12 +2954,7 @@ impl WalletDb {
             };
 
             self.add_transaction(wallet_tx);
-            debug!(
-                "Wallet tx {} {} {}",
-                category,
-                WalletTxid::of(txid),
-                WalletAmount(net_amount.abs())
-            );
+            counted::hit(Site::WalletTx);
             self.tx_changed(&txid);
         }
 
@@ -3240,12 +3223,8 @@ impl WalletDb {
     fn forget_stored_unconfirmed(&self, txids: &[Hash256]) {
         if let Some(db) = &self.db {
             for txid in txids {
-                if let Err(e) = db.remove_unconfirmed_tx(txid) {
-                    tracing::warn!(
-                        "Failed to forget unconfirmed wallet tx {}: {}",
-                        WalletTxid::of(txid),
-                        e
-                    );
+                if db.remove_unconfirmed_tx(txid).is_err() {
+                    counted::hit(Site::WalletForgetFailed);
                 }
             }
         }
@@ -3300,11 +3279,7 @@ impl WalletDb {
             if let Some(entry) = overlay.remove(&id) {
                 forgotten.push(id);
                 conflicted.push((id, entry.record.timestamp, entry.tx));
-                info!(
-                    "Dropped mempool wallet tx {} (conflicts with {})",
-                    WalletTxid::of(id),
-                    WalletTxid::of(txid)
-                );
+                counted::hit(Site::WalletMempoolDropped);
                 doomed.extend(
                     overlay
                         .iter()
@@ -3351,7 +3326,7 @@ impl WalletDb {
         let in_range = |h: u32| h >= start && h <= stop;
         let mut pending = self.pending_deletes.write();
 
-        let removed_utxos = {
+        {
             let mut utxos = self.utxos.write();
             let gone: Vec<OutPoint> = utxos
                 .iter()
@@ -3362,11 +3337,10 @@ impl WalletDb {
                 utxos.remove(op);
                 pending.utxos.insert(*op);
             }
-            gone.len()
-        };
+        }
 
         let mut disconnected = Vec::new();
-        let removed_txs = {
+        {
             let mut txs = self.transactions.write();
             let gone: Vec<Hash256> = txs
                 .iter()
@@ -3379,14 +3353,12 @@ impl WalletDb {
                 }
                 pending.transactions.insert(*txid);
             }
-            gone.len()
-        };
+        }
 
         self.scanned_hashes
             .write()
             .retain(|height, _| !in_range(*height));
 
-        let mut restored = 0usize;
         {
             let mut spent_data = self.spent_utxo_data.write();
             let mut spent_set = self.spent.write();
@@ -3403,8 +3375,8 @@ impl WalletDb {
                 spent_set.remove(&outpoint);
                 pending.spent.insert(outpoint);
                 if let Some(ref db) = self.db {
-                    if let Err(e) = db.remove_spent_utxo_data(&outpoint) {
-                        debug!("Failed to remove spent_utxo_data from disk: {}", e);
+                    if db.remove_spent_utxo_data(&outpoint).is_err() {
+                        counted::hit(Site::WalletRollbackRemoveFailed);
                     }
                 }
                 if utxo.height.is_some_and(in_range) {
@@ -3412,21 +3384,13 @@ impl WalletDb {
                     pending.utxos.insert(outpoint);
                     continue;
                 }
-                info!(
-                    "Restoring UTXO {} ({}) spent at rolled-back height",
-                    OwnOutpoint(outpoint.txid, outpoint.vout),
-                    WalletAmount(utxo.value.as_sat())
-                );
+                counted::hit(Site::WalletRollbackRestored);
                 pending.utxos.remove(&outpoint);
                 utxos.insert(outpoint, utxo);
-                restored += 1;
             }
         }
 
-        info!(
-            "Rolled back heights {}..={}: removed {} UTXOs and {} transactions, restored {} spent UTXOs",
-            start, stop, removed_utxos, removed_txs, restored
-        );
+        counted::hit(Site::WalletRollbackHeights);
 
         {
             let mut dirty = self.dirty.write();
@@ -3470,10 +3434,7 @@ impl WalletDb {
             .find_fork(top, &hash_at)
             .or_else(|| (top < last).then_some(top));
         if let Some(fork) = fork {
-            info!(
-                "Wallet scanned blocks above {} that left the active chain; rolling back",
-                fork
-            );
+            counted::hit(Site::WalletRollback);
             self.rollback_heights(fork + 1, u32::MAX);
             self.set_last_scan_height(fork);
         }

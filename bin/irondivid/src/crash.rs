@@ -561,6 +561,10 @@ fn write_record(signo: i32, info: *mut libc::siginfo_t, ctx: *mut libc::c_void, 
             write_all(fd, b"\n");
         }
     });
+    // The open hour's counts, raw (A11)
+    crate::counts::raw_copy(|l| {
+        l.write_unsynced(fd);
+    });
     let mut end = RawLine::new("fatal-signal-end");
     end.text(" run=").num(crate::runs_log::run_number() as i64);
     end.write_to(fd);

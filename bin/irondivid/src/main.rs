@@ -22,6 +22,7 @@
 //!   irondivid --rpcuser=user --rpcpassword=pass
 
 mod core_files;
+mod counts;
 #[cfg(unix)]
 mod crash;
 mod events;
@@ -139,6 +140,9 @@ mod exit_code {
 /// `catch_unwind`. A test refuses any other exit call in this crate.
 fn die(code: i32, reason: std::fmt::Arguments<'_>) -> ! {
     let reason = reason.to_string();
+    // The open hour's counts, raw, ahead of the exit record (A11); like it,
+    // a no-op before runs.log is open
+    counts::raw_copy(|l| l.write());
     // Durable before anything else that could stall (A1); a no-op before
     // runs.log is open
     runs_log::exit(code, &reason);
@@ -2093,6 +2097,9 @@ async fn run_daemon(
     }
 
     info!("Node started, chain height: {}", node.chain().height());
+    // The hourly count lines of the counted sites (A11)
+    counts::init();
+    tasks::spawn_supervised("counts", counts::run());
     health::start(health::Handles {
         chain: node.chain().clone(),
         block_sync: node.block_sync().clone(),
@@ -3631,6 +3638,8 @@ fn exit_after_stop(runtime: tokio::runtime::Runtime, result: Result<()>) -> ! {
         // _exit: no atexit handlers or C++ static destructors either (RocksDB's
         // thread pools would be joined there)
         Ok(()) => {
+            // The partial hour's count lines (A11)
+            counts::flush();
             runs_log::exit(0, "stopped");
             flush_log();
             unsafe { libc::_exit(0) }

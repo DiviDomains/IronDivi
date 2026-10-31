@@ -2115,13 +2115,10 @@ pub fn update_mempool_after_reorg(
     let offered = disconnected.len();
     let mut returned = 0;
     for tx in disconnected {
-        let txid = tx.txid();
         match mempool.add(tx, divi_primitives::amount::Amount::ZERO) {
             Ok(_) => returned += 1,
-            Err(e) => tracing::debug!(
-                "Transaction {} of a disconnected block not returned to the mempool: {}",
-                txid,
-                e
+            Err(_) => divi_primitives::counted::hit(
+                divi_primitives::counted::Site::MempoolReorgNotReturned,
             ),
         }
     }

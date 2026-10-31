@@ -233,7 +233,12 @@ fn a_refused_option_is_recorded_as_exit_2() {
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
     let log = runs_log(dir.path());
-    assert_eq!(kinds(&log), ["start", "phase:config", "exit"], "{log}");
+    // die() copies the open hour's counts ahead of the exit record (A11)
+    assert_eq!(
+        kinds(&log),
+        ["start", "phase:config", "counts", "exit"],
+        "{log}"
+    );
     let exit = log.lines().last().unwrap();
     assert!(exit.contains(" exit code=2 "), "{log}");
     assert!(exit.contains("-onlynet"), "{log}");

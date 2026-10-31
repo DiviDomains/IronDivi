@@ -19,6 +19,7 @@ use crate::peer_manager::PeerManager;
 use crate::NetworkMessage;
 
 use divi_primitives::amount::Amount;
+use divi_primitives::counted::{self, Site};
 use divi_primitives::hash::Hash256;
 use divi_primitives::redact::WalletTxid;
 use divi_primitives::transaction::Transaction;
@@ -28,7 +29,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
-use tracing::{debug, trace, warn};
+use tracing::warn;
 
 /// Maximum transactions to track per peer
 const MAX_TX_PER_PEER: usize = 5000;
@@ -157,11 +158,7 @@ impl TxRelay {
             return;
         }
 
-        trace!(
-            "Received {} tx inv items from peer {}",
-            tx_items.len(),
-            peer_id
-        );
+        counted::hit(Site::RelayInv);
 
         let mut new_txs = Vec::new();
 
@@ -256,7 +253,7 @@ impl TxRelay {
             return;
         }
 
-        trace!("Requested tx {} from peer {}", txid, peer_id);
+        counted::hit(Site::RelayRequested);
 
         self.txs_in_flight.write().insert(
             txid,
@@ -278,7 +275,7 @@ impl TxRelay {
         // relayed again, so the node serves as a gateway for nodes behind it
         // (Divi Core main.cpp:794-799)
         if self.seen_txs.read().contains(&txid) {
-            trace!("Already have tx {}", txid);
+            counted::hit(Site::RelayAlreadyHave);
             if self.peer_manager.is_whitelisted(peer_id) {
                 self.relay_tx(txid, Some(peer_id)).await;
             }
@@ -315,10 +312,7 @@ impl TxRelay {
     ) {
         for item in items {
             if item.inv_type != InvType::Tx {
-                debug!(
-                    "getdata item type {:?} (not tx), skipping hash {}",
-                    item.inv_type, item.hash
-                );
+                counted::hit(Site::RelayGetdataNotTx);
                 continue;
             }
 
@@ -333,10 +327,7 @@ impl TxRelay {
                     );
                 }
             } else {
-                debug!(
-                    "getdata: tx {} not found in mempool for peer {}",
-                    item.hash, peer_id
-                );
+                counted::hit(Site::RelayGetdataMissing);
             }
         }
     }
@@ -391,8 +382,13 @@ impl TxRelay {
         let msg = NetworkMessage::Inv(inv);
 
         for peer_id in peers_to_notify {
-            if let Err(e) = self.peer_manager.send_to_peer(peer_id, msg.clone()).await {
-                trace!("Failed to relay tx inv to peer {}: {}", peer_id, e);
+            if self
+                .peer_manager
+                .send_to_peer(peer_id, msg.clone())
+                .await
+                .is_err()
+            {
+                counted::hit(Site::RelayInvSendFailed);
             }
         }
     }

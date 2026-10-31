@@ -257,6 +257,45 @@ and are not re-based.
   staker are given, rather than two closures sharing a format. The
   staker's phantom-UTXO eviction warning (failure-only) stays, with
   its outpoint masked as `OwnOutpoint`.
+- A11 counted sites (slice 5): the site list and its keys are the
+  `sites!` table in `divi-primitives/src/counted.rs` (`Site`, `KEYS`,
+  `Site::ALL`; one relaxed `AtomicU32` per site). A counted site writes
+  no line: its statement is replaced by `counted::hit(Site::X)` (or
+  `counted::add` for a batch count) in `staker.rs`, `wallet_db.rs`,
+  `mempool.rs`, `node.rs`, `relay.rs` and `divi-rpc` `wallet.rs`. The
+  old first-occurrence statics (`NO_UTXO_COUNT`, `RATE_LIMITED_COUNT`,
+  `RESERVE_LIMIT_COUNT`) go with their lines. Differences from the plan:
+  - Error-code granularity is one site per closed reason
+    (`staker.error.no-tip`, `staker.error.difficulty`, ...), counted where
+    the error is made; no `<variant>` suffix on a key, and
+    `StakeResult::Error(String)` keeps its type (the loop's arm is empty).
+  - Three staker lines are deleted with no counter of their own: the
+    "Rate limiting: only {}s since last attempt" line (the loop's
+    `RateLimited` arm counts `staker.rate-limited` once per attempt), the
+    treasury-payments line and the signature `pubkey_match` debug line.
+  - Network per-block lines (the shared connect lines of 314a2dc5) get no
+    counter; they are the same for own and peer blocks.
+  - Failure-only mempool listener lines stay as lines.
+  - `bin/irondivid/src/counts.rs` writes the hourly lines, one per site,
+    zeros included: `count site=<key> n=<n> start=<utc> end=<utc>
+    boot=<boot_id> synced=<yes|no|unknown>` at info, target
+    `irondivid::counts`. The hour is on CLOCK_BOOTTIME on Linux and
+    CLOCK_MONOTONIC elsewhere (macOS: assumed to count through sleep,
+    not measured); a 60 s `tokio::time::sleep` tick checks it (sleep,
+    not `interval`, so no burst of catch-up ticks after a suspend). The
+    boot id is `-` off Linux. Whether a window was stretched by a wall
+    clock step is not written; the reader computes it from `start` and
+    `end`. A clean stop writes the partial hour (`flush`).
+  - The abnormal-end copy: `die()` (before the exit record), a third stop
+    signal (before `raw_exit`) and the fatal-signal record (before
+    `fatal-signal-end`) write the open hour's **nonzero** counts as raw
+    `counts` records (`key=n` pairs, cut before 511 bytes, never splitting
+    a pair; one empty record when nothing was counted). The hours already
+    written as lines are not repeated. A task panic is covered by the
+    `die()` it ends in, not hooked separately. So a refused option now
+    leaves `start`, `phase:config`, `counts`, `exit` in `runs.log`
+    (`tests/runs_log.rs` updated). The A17 lock-wait copy is not in it yet
+    (A17 is not built).
 
 Part B as built so far: B1 discovery, the B2 collectors (B2.0–B2.19),
 `contrib/diag.sh` (B1.4), `--import` (B6.4), the §6.2 redaction and §6.3

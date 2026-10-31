@@ -357,6 +357,17 @@ impl RawLine {
         self
     }
 
+    /// Bytes still free before the cut
+    pub fn room(&self) -> usize {
+        self.buf.len() - 1 - self.len
+    }
+
+    /// The line so far
+    #[cfg(test)]
+    pub fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.buf[..self.len]).unwrap_or("")
+    }
+
     pub fn num(&mut self, v: i64) -> &mut RawLine {
         self.padded(v, 1)
     }
@@ -461,7 +472,7 @@ pub(crate) fn utc_now() -> String {
     format_utc(now.as_secs() as i64, now.subsec_micros())
 }
 
-fn format_utc(secs: i64, micros: u32) -> String {
+pub(crate) fn format_utc(secs: i64, micros: u32) -> String {
     let (year, month, day) = civil(secs.div_euclid(86_400));
     let rem = secs.rem_euclid(86_400);
     format!(

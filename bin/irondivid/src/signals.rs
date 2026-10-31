@@ -306,6 +306,8 @@ fn third_stop(signo: i32, code: i32, pid: i32, uid: u32, count: u32) -> ! {
         .text(" action=exit count=")
         .num(i64::from(count));
     line.write();
+    // The open hour's counts, raw (A11)
+    crate::counts::raw_copy(|l| l.write());
     let (sigpipes, epipes) = counts();
     crate::runs_log::raw_exit(10, "a third stop signal", sigpipes, epipes);
     unsafe { libc::_exit(10) }

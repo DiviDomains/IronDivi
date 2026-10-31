@@ -16,6 +16,7 @@
 use crate::config::MempoolConfig;
 use crate::error::{reject, NodeError};
 use divi_primitives::amount::Amount;
+use divi_primitives::counted::{self, Site};
 use divi_primitives::hash::Hash256;
 use divi_primitives::transaction::{OutPoint, Transaction};
 use parking_lot::RwLock;
@@ -438,12 +439,7 @@ impl Mempool {
             fee_rate: entry.fee_rate,
         });
 
-        tracing::debug!(
-            "Added tx {} to mempool (fee: {}, size: {})",
-            txid,
-            fee.as_sat(),
-            entry.size
-        );
+        counted::hit(Site::MempoolAdded);
 
         let listeners = self.on_added.read().clone();
         for listener in &listeners {
@@ -578,7 +574,7 @@ impl Mempool {
         // Update total size
         *self.total_size.write() -= entry.size;
 
-        tracing::debug!("Removed tx {} from mempool", txid);
+        counted::hit(Site::MempoolRemoved);
 
         let listener = self.on_removed.read().clone();
         if let Some(listener) = listener {
@@ -624,7 +620,7 @@ impl Mempool {
         }
 
         if removed > 0 {
-            tracing::info!("Removed {} non-final transaction(s) from mempool", removed);
+            counted::add(Site::MempoolNonFinal, removed);
         }
         removed
     }
@@ -659,10 +655,7 @@ impl Mempool {
             for txid in doomed {
                 if self.remove(&txid).is_some() {
                     removed += 1;
-                    tracing::info!(
-                        "Removed tx {} from mempool: inputs no longer spendable",
-                        txid
-                    );
+                    counted::hit(Site::MempoolUnspendable);
                 }
             }
         }
@@ -733,7 +726,7 @@ impl Mempool {
         while let Some(txid) = doomed.pop() {
             if let Some(entry) = self.remove(&txid) {
                 removed += 1;
-                tracing::info!("Removed tx {} from mempool: conflicts with a block", txid);
+                counted::hit(Site::MempoolConflict);
                 let spenders = self.spenders.read();
                 for vout in 0..entry.tx.vout.len() as u32 {
                     if let Some(child) = spenders.get(&(txid, vout)) {

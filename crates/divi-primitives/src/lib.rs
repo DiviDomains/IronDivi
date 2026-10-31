@@ -18,6 +18,7 @@ pub mod amount;
 pub mod block;
 pub mod clock;
 pub mod compact;
+pub mod counted;
 pub mod error;
 pub mod hash;
 pub mod lottery;
