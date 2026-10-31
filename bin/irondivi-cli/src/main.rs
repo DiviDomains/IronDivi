@@ -1053,6 +1053,10 @@ fn run(argv: &[String]) -> Result<Option<Vec<u8>>, CliError> {
 
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
+    // `irondivi-cli diag ...` (docs/plans/diag.md part B) is not an RPC call
+    if argv.first().map(String::as_str) == Some("diag") {
+        std::process::exit(divi_diag::run(&argv[1..]));
+    }
     let exit_code = match run(&argv) {
         Ok(output) => {
             if let Some(mut text) = output {

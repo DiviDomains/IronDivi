@@ -2809,6 +2809,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "divi-diag"
+version = "0.2.9"
+dependencies = [
+ "divi-primitives",
+ "hex",
+ "hmac 0.12.1",
+ "libc",
+ "rand 0.8.8",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "toml",
+]
+
+[[package]]
 name = "divi-electrum"
 version = "0.2.9"
 dependencies = [
@@ -4365,6 +4382,7 @@ version = "0.2.9"
 dependencies = [
  "anyhow",
  "dirs",
+ "divi-diag",
  "divi-test-support",
  "reqwest 0.12.28",
  "serde",
