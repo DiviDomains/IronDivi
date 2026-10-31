@@ -19,7 +19,8 @@ catch-up gate (8e4bfaca, `CAUGHT_UP_LAG`), the main-task panic exit
 way into Synced (73440b48), and the removal of the per-transaction
 relay and submit lines (09cb18e4, 6de594fb), and, in Revision 16, A1
 (ff299088), A2 (d34c0bac, 426dba00, 3309b5ad), A3 (4aea6299), A4
-(deb9295f) and the R3 usage-message fix (bcf713c8), as built, with the
+(deb9295f), the R3 usage-message fix (bcf713c8), and Part B's B1, B2, B6.4, §6 and
+§8.1–§8.3 (d3502999 … 29c7bbf8), as built, with the
 differences listed under "Revision 16 changes".
 Date: 2026-10-30; Revision 16 2026-10-31. Revision 1 is kept outside the repo for comparison.
 Line numbers are as of 6de594fb. Six files changed since f67b0984
@@ -121,6 +122,96 @@ and are not re-based.
 - `flush_log` cannot deadlock `die` when a critical panic is raised from
   inside logging: it takes a lock only it uses, drops the log writer's
   guard, and the stdout and stderr locks it then takes are reentrant.
+
+Part B as built so far: B1 discovery, the B2 collectors (B2.0–B2.19),
+`contrib/diag.sh` (B1.4), `--import` (B6.4), the §6.2 redaction and §6.3
+scanner, and §8.1–§8.3 with the §8.4 offline stop, in the crate
+`crates/divi-diag` behind `irondivi-cli diag` (d3502999, c83a9dd4,
+da960024, 27e50955 … 96554be4, 3016d799, 2bf873f4, 27d59aab, c23a0e76,
+ad0562c7) and the shared option parser `crates/divi-settings` (29c7bbf8).
+Tested on hp1, hp2 and hp3 as a user and as root; on macOS only
+`contrib/diag.sh` ran, since the Rust code is only cross-checked
+(`cargo check --target aarch64-apple-darwin` on hp3). Corrections:
+
+- B2.2, no nodename or user name anywhere: `diag.sh` printed `uname -a`
+  and `id`; it now prints `uname -srvm` and numeric ids only. On macOS it
+  uses `otool -L` where `ldd` is missing, `sw_vers` where
+  `/etc/os-release` is missing, and `log show` where `dmesg` is denied.
+- B1.4 / B6.4: `diag.sh` tells the user to run `irondivi-cli diag
+  --import <folder>`; that command now exists (27d59aab). It takes a
+  folder or a tar on stdin (`--import -`), redacts and scans as a direct
+  run does, writes a new package folder, and deletes the unredacted
+  input unless `--keep-raw`. `diag.sh --emit-shar` writes a shell
+  archive, which the user unpacks and imports as a folder; diag does not
+  read the shar itself. Bad input leaves no output folder.
+- B1.3, "parsed with the node's parser": the parser was compiled into
+  divi-diag from `bin/irondivid/src/settings.rs` by path, which tied it
+  to a file of the node's binary. It is now its own crate,
+  `crates/divi-settings`, used by both; `irondivid`'s `settings.rs` is a
+  one-line re-export.
+- B1, a data dir the user cannot look into (`/root/.irondivi` from a user
+  run, `EACCES` on the parent): the plan is silent. Diag reports "cannot
+  check, sudo can" and the `sudo` command, not an unreadable data dir.
+- B1 / B2.19 search places: the plan gives no list. Diag searches a fixed
+  set of system directories plus every home under `/home`, `/Users` and
+  `/root`, and each chain subdirectory (`testnet`, `regtest`,
+  `privatedivi`) of a base data dir. `diag.sh` skips the config file and
+  lists processes by name only.
+- Run table (B2.5): a run that ends on a "Daemon error" exit with no A1
+  `exit` record shows as "no clean shutdown line"; the A1/A9 exit records
+  settle it on a node that writes them.
+- §6.2 step 3, names that are ours: a folder or image the user named
+  `irondivi-<x>` or `divi-<x>` is user data and gets a placeholder. Only
+  the fixed names in "Paths" below stay readable; the earlier broad
+  `irondivi-`, `irondivid-` and `divi-` prefixes are gone (2bf873f4).
+  Locally built Docker image names are pseudonymised unless they are
+  `irondivi` or `irondivid`.
+- §6.2 step 3, kernel lines that quote a command line (`ptrace attach of
+  "python3 -I /x secret"[123]`, audit and OOM lines): the plan named no
+  rule. Each quoted command line followed by `[pid]` keeps only the
+  program's base name, as `"python3 <args>"[123]`; the rule is now in
+  §6.2 step 3.
+- §6.2 over-redaction left: mount points, Docker overlay hashes and
+  `/dev/mapper` names still become placeholders, which costs the
+  developer some disk context; they are kept hidden until a rule says
+  which are safe.
+- §6.3, canaries not yet testable: `--rpc`, the attach path (B6.2), A10
+  `known_values`, A11 counters, `crash.log` and the incident files come
+  from parts not built or not runnable on the test hosts; the scanner
+  runs over them when they exist, but no canary test covers them yet.
+- §8.1 `--report-file`: a plain text file; a line `## N` starts answer N
+  and text before the first heading is answer 1. It is capped at 1 MB and
+  passes the "Old-log lines" filter and §6.2 like the answers typed at
+  the terminal. With no terminal and no file the report says the
+  questions were skipped.
+- §8.2 is not asked in this version: the summary says which questions
+  were not asked, and that no developer key is compiled in.
+- §8.3 exclusions are non-destructive: an excluded file stays in the
+  folder and the exclusions are kept in `preview.ok` (mode 0600, never
+  sent), with a digest of every file; `--send` reads it, says which files
+  changed since the last review and keeps the exclusions. The packed
+  manifest names every excluded file and every file the scan left out at
+  send, as comment lines. A file added with `i` is listed with collector
+  `user-added`. `00-SUMMARY.txt` and `02-manifest.txt` can be excluded
+  like any other file.
+- §8.3 step 4, a file the send-time scan still matches is left out and
+  listed with the reason, not sent and not a refusal of the whole send.
+- §8.3 step 5 with R2: `--send <folder>` always runs the whole review
+  again (list, menu, final question), and with no terminal it refuses
+  (exit 1) rather than send unreviewed. It builds a fresh redactor from
+  the machine as it is now; the folder's own salt is not re-checked.
+- §8.4: no developer key exists yet, so `DEV_KEY` is empty and `seal()`
+  is a stub. After `yes` diag says plainly that nothing was packed,
+  written or sent and keeps the folder; nothing is ever written beside
+  the folder. The pack step (tar, mtime 0, each file's SHA-256 checked)
+  is built. No receiver address is compiled in (§9 hosting is open). To
+  finish: generate the `age` key, keep the private half in 1Password, put
+  the public key and fingerprint in `DEV_KEY`, add zstd and age, and
+  implement `seal()`.
+- Smaller: `irondivi-cli --version` exits 1 with the usage text; the
+  first divi-diag commit (d3502999) lacks its `Cargo.lock` entry, so
+  `--locked` builds need c83a9dd4 or later; `diag --run` (B3) and the
+  `irondivid --diag` alias are not built.
 
 ### Revision 15 changes
 
@@ -4661,12 +4752,21 @@ order:
      too.
    - A non-irondivi command line (an A3 sender that is not irondivi): the
      basename of argv[0], then `<arg>` for each further argument.
+   - Kernel and syslog lines that quote a command line (`ptrace attach of
+     "python3 -I /x secret"[123] was attempted by "cat …"[456]`, audit and
+     OOM lines): each quoted string followed by `[pid]` that holds a space
+     keeps only its program's base name, `"python3 <args>"[123]`.
    - Unit files, `docker inspect`, and attached `docker inspect`, `pct
      config`, `lxc config show` and `lxc-info` output (B6.6): `Environment*`,
      `Env`, `Labels` values and `ExecStart` values outside the allowlist
      are dropped; mount sources and paths are pseudonymised.
    - Paths: each component other than well-known system directories and
      irondivi's own fixed names is pseudonymised (`/home/u-3c1a/.irondivi`).
+     The fixed names are the binaries and data-dir names, `irondivi-diag`,
+     `irondivi-diag-*`, `.irondivi-diag-fsync-*`, `irondivi-replay` and
+     `/var/tmp/irondivi-<uid>`; a name the user chose that merely starts
+     with `irondivi-` or `divi-` (a folder, a Docker image) is user data
+     and is pseudonymised.
      This includes Windows and WSL forms in attached files:
      `C:\Users\<name>\…` (the user name component always, any case,
      either slash) and `\\wsl$\<distro>\…` / `\\wsl.localhost\…`
