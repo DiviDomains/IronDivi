@@ -128,7 +128,11 @@ pub fn open(data_dir: &Path, network: &str, daemon: bool) {
                 unsafe { libc::getpid() },
                 FIRST_PID.load(Ordering::Relaxed),
                 MIDDLE_PID.load(Ordering::Relaxed),
-                if threads < 0 { "-".to_string() } else { threads.to_string() },
+                if threads < 0 {
+                    "-".to_string()
+                } else {
+                    threads.to_string()
+                },
             ),
         );
     }
@@ -364,8 +368,14 @@ mod tests {
     fn utc_times_are_rfc3339_with_microseconds() {
         assert_eq!(format_utc(0, 0), "1970-01-01T00:00:00.000000Z");
         // 2000-02-29 (a leap day in a century year divisible by 400)
-        assert_eq!(format_utc(951_782_400 + 3661, 7), "2000-02-29T01:01:01.000007Z");
-        assert_eq!(format_utc(1_798_761_599, 999_999), "2026-12-31T23:59:59.999999Z");
+        assert_eq!(
+            format_utc(951_782_400 + 3661, 7),
+            "2000-02-29T01:01:01.000007Z"
+        );
+        assert_eq!(
+            format_utc(1_798_761_599, 999_999),
+            "2026-12-31T23:59:59.999999Z"
+        );
     }
 
     #[test]
