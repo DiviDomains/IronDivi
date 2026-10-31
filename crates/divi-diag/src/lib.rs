@@ -20,6 +20,7 @@ pub mod ctx;
 pub mod discovery;
 pub mod frame;
 pub mod mem;
+pub mod oldlog;
 pub mod redact;
 pub mod runner;
 pub mod util;

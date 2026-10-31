@@ -13,7 +13,9 @@
 use super::{cmd_block_t, head, LINUX};
 use crate::ctx::{Ctx, DataDir};
 use crate::frame::Out;
+use crate::oldlog;
 use crate::outln;
+use crate::redact::Redactor;
 use crate::util;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -266,7 +268,7 @@ fn or_dash(s: &str) -> &str {
 }
 
 /// debug.log and its rotations, oldest first (by mtime)
-fn debug_logs(d: &DataDir) -> Vec<PathBuf> {
+pub(crate) fn debug_logs(d: &DataDir) -> Vec<PathBuf> {
     let mut v: Vec<(i64, PathBuf)> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for dir in [&d.chain, &d.path] {
@@ -398,14 +400,14 @@ const NEVER: &[&str] = &["sent-txids"];
 const FULL_TAIL: u64 = 16 << 20;
 const REDUCED_CAP: usize = 8 << 20;
 
-fn copy_capped(o: &mut Out, rel: &str, p: &Path, cap: u64) {
+fn copy_capped(o: &mut Out, r: &Redactor, rel: &str, p: &Path, cap: u64) {
     match util::read_tail(p, cap) {
         Ok((b, cut)) => {
             o.file(rel);
             if cut {
                 outln!(o, "[first part cut: kept the last {}]", util::human(cap));
             }
-            o.write(util::escape_bytes(&b).as_bytes());
+            o.write(oldlog::filter(&util::escape_bytes(&b), r).render().as_bytes());
         }
         Err(e) => {
             o.file("logs-errors.txt");
@@ -420,7 +422,9 @@ fn is_problem_line(l: &str) -> bool {
 
 /// The reduced form of an old log: banners and warnings in full (capped),
 /// then a count of lines per hour
-fn reduce(text: &str, budget: &mut usize, o: &mut Out) {
+fn reduce(text: &str, r: &Redactor, budget: &mut usize, o: &mut Out) {
+    let f = oldlog::filter(text, r);
+    let text = f.text.as_str();
     let mut hours: BTreeMap<String, (u64, u64)> = BTreeMap::new();
     let mut kept = 0usize;
     let mut dropped = 0u64;
@@ -444,10 +448,12 @@ fn reduce(text: &str, budget: &mut usize, o: &mut Out) {
         }
     }
     outln!(o, "-- {kept} banner and WARN/ERROR lines kept{}", if dropped > 0 { format!(", {dropped} more over the cap") } else { String::new() });
-    outln!(o, "-- lines per hour (all, warn+error):");
+    outln!(o, "-- lines per hour (all kept, warn+error):");
     for (h, (n, w)) in hours {
         outln!(o, "{h}  {n:>8} {w:>6}");
     }
+    let removed = oldlog::Filtered { counts: f.counts, removed: f.removed, ..Default::default() };
+    o.write(removed.render().as_bytes());
 }
 
 /// B2.10
@@ -459,7 +465,9 @@ pub fn logs(ctx: &Ctx, o: &mut Out) {
         o.file(&format!("{base}/README.txt"));
         outln!(o, "debug.log: the last {} in full (debug.log), older parts and rotations reduced to", util::human(FULL_TAIL));
         outln!(o, "banners, warnings and errors plus a count per hour (debug-older.txt).");
-        outln!(o, "Lines from before A11 (no per-line source tags) are kept as the node wrote them.");
+        outln!(o, "Every copy went through the §6.2 old-log filter: per-block, staker and failure-only");
+        outln!(o, "lines are counted (weekly or daily, bucketed) instead of kept; wallet-module lines keep");
+        outln!(o, "their words only, each argument masked as <num>, <str>, <addr> or <arg>.");
         let mut versions: Vec<String> = Vec::new();
         let mut budget = REDUCED_CAP;
         let newest = logs.iter().rev().find(|p| p.file_name().map(|n| n == "debug.log").unwrap_or(false)).cloned();
@@ -486,18 +494,18 @@ pub fn logs(ctx: &Ctx, o: &mut Out) {
                     let cut = bytes[cut..].iter().position(|&b| b == b'\n').map(|x| cut + x + 1).unwrap_or(cut);
                     o.file(&format!("{base}/debug-older.txt"));
                     outln!(o, "=== debug.log, the first {} (before the full tail)", util::human(cut as u64));
-                    reduce(&String::from_utf8_lossy(&bytes[..cut]), &mut budget, o);
+                    reduce(&String::from_utf8_lossy(&bytes[..cut]), &r, &mut budget, o);
                     o.file(&format!("{base}/debug.log"));
                     outln!(o, "[first {} cut: in debug-older.txt reduced]", util::human(cut as u64));
-                    o.write(util::escape_bytes(&bytes[cut..]).as_bytes());
+                    o.write(oldlog::filter(&util::escape_bytes(&bytes[cut..]), &r).render().as_bytes());
                 } else {
                     o.file(&format!("{base}/debug.log"));
-                    o.write(util::escape_bytes(&bytes).as_bytes());
+                    o.write(oldlog::filter(&util::escape_bytes(&bytes), &r).render().as_bytes());
                 }
             } else {
                 o.file(&format!("{base}/debug-older.txt"));
                 outln!(o, "=== {name} ({})", util::human(bytes.len() as u64));
-                reduce(&text, &mut budget, o);
+                reduce(&text, &r, &mut budget, o);
             }
         }
         o.file(&format!("{base}/README.txt"));
@@ -516,7 +524,7 @@ pub fn logs(ctx: &Ctx, o: &mut Out) {
             for f in PART_A_FILES {
                 let p = dd.join(f);
                 if p.exists() {
-                    copy_capped(o, &format!("{base}/diag/{f}"), &p, 8 << 20);
+                    copy_capped(o, &r, &format!("{base}/diag/{f}"), &p, 8 << 20);
                 } else {
                     o.file(&format!("{base}/README.txt"));
                     outln!(o, "diag/{f}: absent");
@@ -533,12 +541,12 @@ pub fn logs(ctx: &Ctx, o: &mut Out) {
                     let p = dd.join(&n);
                     let rotated = PART_A_FILES.iter().any(|f| n.starts_with(&format!("{f}.")));
                     if p.is_file() && (rotated || n.starts_with("rpc-aggregate")) {
-                        copy_capped(o, &format!("{base}/diag/{n}"), &p, 4 << 20);
+                        copy_capped(o, &r, &format!("{base}/diag/{n}"), &p, 4 << 20);
                     }
                 }
             }
             for sub in PART_A_DIRS_COPY {
-                copy_dir(o, &dd.join(sub), &format!("{base}/diag/{sub}"), 16 << 20);
+                copy_dir(o, &r, &dd.join(sub), &format!("{base}/diag/{sub}"), 16 << 20);
             }
             for sub in PART_A_DIRS_LIST {
                 o.file(&format!("{base}/README.txt"));
@@ -572,7 +580,7 @@ pub fn logs(ctx: &Ctx, o: &mut Out) {
             outln!(o, "absent");
             continue;
         }
-        copy_dir(o, root, &rel, 16 << 20);
+        copy_dir(o, &r, root, &rel, 16 << 20);
     }
     if ctx.mirror_roots.is_empty() {
         o.file("mirrors/README.txt");
@@ -581,7 +589,7 @@ pub fn logs(ctx: &Ctx, o: &mut Out) {
 }
 
 /// Copy a folder's files (recursively, no symlinks), newest first up to `cap`
-fn copy_dir(o: &mut Out, dir: &Path, rel: &str, cap: u64) {
+fn copy_dir(o: &mut Out, r: &Redactor, dir: &Path, rel: &str, cap: u64) {
     let mut files: Vec<(i64, PathBuf, u64)> = Vec::new();
     collect_files(dir, &mut files, 0);
     if files.is_empty() {
@@ -601,7 +609,7 @@ fn copy_dir(o: &mut Out, dir: &Path, rel: &str, cap: u64) {
         }
         let take = len.min(cap - used).min(4 << 20);
         used += take;
-        copy_capped(o, &format!("{rel}/{sub}"), &p, take);
+        copy_capped(o, &r, &format!("{rel}/{sub}"), &p, take);
     }
 }
 

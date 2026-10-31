@@ -334,7 +334,7 @@ pub fn processes(ctx: &Ctx, o: &mut Out) {
 }
 
 /// The systemd unit running a pid, from its cgroup (`.../foo.service`)
-fn unit_of(pid: u32) -> Option<(String, bool)> {
+pub(crate) fn unit_of(pid: u32) -> Option<(String, bool)> {
     let cg = super::sys::cgroup_of(&pid.to_string());
     let user = cg.contains("/user@");
     cg.split('/').rev().find(|s| s.ends_with(".service") && !s.starts_with("user@")).map(|s| (s.to_string(), user))
@@ -342,7 +342,7 @@ fn unit_of(pid: u32) -> Option<(String, bool)> {
 
 const SHOW_PROPS: &str = "Id,LoadState,ActiveState,SubState,Result,NRestarts,ExecMainStatus,ExecMainCode,ExecMainStartTimestamp,ExecMainExitTimestamp,ActiveEnterTimestamp,InactiveEnterTimestamp,Restart,RestartUSec,TimeoutStopUSec,KillMode,MemoryMax,MemoryHigh,TasksMax,LimitNOFILE,User,ManagedOOMSwap,ManagedOOMMemoryPressure,OOMPolicy,WatchdogUSec";
 
-fn systemd_unit(o: &mut Out, unit: &str, user: bool) {
+fn systemd_unit(o: &mut Out, r: &crate::redact::Redactor, unit: &str, user: bool) {
     let u: &[&str] = if user { &["--user"] } else { &[] };
     head(o, &format!("systemd unit {unit}{}", if user { " (user)" } else { "" }));
     let mut a: Vec<&str> = u.to_vec();
@@ -368,13 +368,15 @@ fn systemd_unit(o: &mut Out, unit: &str, user: bool) {
     if !j.ok() {
         outln!(o, "  [{}]", j.status_line());
     }
+    let mut kept = String::new();
     for l in j.text().lines() {
         let mut it = l.splitn(3, ' ');
         match (it.next(), it.next(), it.next()) {
-            (Some(t), Some(_host), Some(rest)) if t.len() > 18 && t.as_bytes()[0].is_ascii_digit() => outln!(o, "{t} {rest}"),
-            _ => outln!(o, "{l}"),
+            (Some(t), Some(_host), Some(rest)) if t.len() > 18 && t.as_bytes()[0].is_ascii_digit() => kept.push_str(&format!("{t} {rest}\n")),
+            _ => kept.push_str(&format!("{l}\n")),
         }
     }
+    o.write(crate::oldlog::filter(&kept, r).render().as_bytes());
 }
 
 /// B2.5
@@ -410,7 +412,7 @@ pub fn services(ctx: &Ctx, o: &mut Out) {
             outln!(o, "no unit runs irondivid and none is named for it");
         }
         for (u, user) in &units {
-            systemd_unit(o, u, *user);
+            systemd_unit(o, &r, u, *user);
         }
     }
     if LINUX && util::which("rc-service").is_some() {
@@ -493,8 +495,8 @@ pub fn services(ctx: &Ctx, o: &mut Out) {
             o.write(i.text().as_bytes());
             let lg = util::run_cmd("docker", &["logs", "--tail", "200", "--timestamps", t[0]], Duration::from_secs(15), 4 << 20);
             outln!(o, "$ docker logs --tail 200 {name}");
-            o.write(lg.text().as_bytes());
-            o.write(util::escape_bytes(&lg.stderr).as_bytes());
+            o.write(crate::oldlog::filter(&lg.text(), &r).render().as_bytes());
+            o.write(crate::oldlog::filter(&util::escape_bytes(&lg.stderr), &r).render().as_bytes());
         }
         if n == 0 {
             outln!(o, "no irondivi container");

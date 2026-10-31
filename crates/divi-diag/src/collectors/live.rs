@@ -486,7 +486,7 @@ pub fn rpc_report(o: &mut Out, r: &Redactor, rpc: &Rpc, first: Duration) -> Resu
 
 // --------------------------------------------------------- credentials
 
-fn read_settings(d: &DataDir, node: Option<&Node>) -> crate::settings::Settings {
+pub(crate) fn read_settings(d: &DataDir, node: Option<&Node>) -> crate::settings::Settings {
     let mut s = node.map(|n| crate::settings::Settings::from_command_line(&n.argv)).unwrap_or_default();
     if let Some(c) = d.conf.as_ref().or(node.and_then(|n| n.conf.as_ref())) {
         if let Some(t) = util::read_small(c, 1 << 20) {
@@ -852,7 +852,7 @@ pub fn snapshot(o: &mut Out, ctx: &Ctx, d: &DataDir, node: &Node, base: &str) {
         match util::read_bytes_capped(f, 4 << 20) {
             Ok(b) => {
                 o.file(&format!("{base}/incidents/{name}"));
-                o.write(util::escape_bytes(&b).as_bytes());
+                o.write(crate::oldlog::filter(&util::escape_bytes(&b), &ctx.redactor()).render().as_bytes());
                 o.line("");
                 o.file(&format!("{base}/live-node.txt"));
             }
