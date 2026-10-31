@@ -51,7 +51,7 @@ pub static ALL: &[Spec] = &[
     Spec { id: "B2.5", name: "services", secs: 30, what: "service managers" },
     Spec { id: "B2.6", name: "storage", secs: 60, what: "storage and fsync test" },
     Spec { id: "B2.7", name: "inventory", secs: 30, what: "data dir inventory" },
-    Spec { id: "B2.8", name: "chaindb", secs: 90, what: "chain database, read-only secondary open" },
+    Spec { id: "B2.8", name: "chaindb", secs: 120, what: "chain database, read-only secondary open" },
     Spec { id: "B1.2", name: "binaries", secs: 30, what: "binaries" },
     Spec { id: "B1.3", name: "config", secs: 30, what: "configuration" },
     Spec { id: "B2.9", name: "wallet", secs: 60, what: "wallet, from the config" },

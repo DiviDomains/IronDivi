@@ -382,6 +382,23 @@ Tested on hp1, hp2 and hp3 as a user and as root; on macOS only
   file changed owner, rpcpassword in neither package. The overrun
   ladder (no running, snapshot, SIGTERM, SIGKILL) is tested only with
   stub nodes.
+- B5: the budgets, the 600 s total (collectors past it are listed as
+  SKIPPED), the progress line per collector on a terminal, and the
+  external-command rules (timeout, stdin closed, `LC_ALL=C`) were built
+  with B2; B2.8 had 90 s and now has the plan's 120 s. Added: each
+  collector runs in its own process group, so Ctrl+C reaches diag alone
+  and diag decides how each collector stops (a B2 collector is killed
+  with its whole group, so a hung command it started goes too; the B3
+  collector gets SIGTERM and stops the node by RPC); after any collector
+  that did not end cleanly diag removes the B2.8 secondary folders that
+  process left (R1 b), since a killed process never runs its cleanup.
+  An interrupted run is marked `interrupted`, exits 1, and still writes
+  the summary and the review. Tested for real on hp1: Ctrl+C 11 s into
+  the observed start stopped the node by RPC (runs.log
+  `stop-requested by=rpc`), left no node or diag process and no
+  temporary folder, and wrote the summary. Ctrl+C during a B2 collector
+  was not timed for real (each takes under 2 s on the test hosts); the
+  folder cleanup is covered by a unit test.
 - Smaller: `irondivi-cli --version` exits 1 with the usage text; the
   first divi-diag commit (d3502999) lacks its `Cargo.lock` entry, so
   `--locked` builds need c83a9dd4 or later; `diag --run` (B3) and the

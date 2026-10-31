@@ -114,6 +114,23 @@ pub fn secondary_prefix() -> PathBuf {
     std::env::temp_dir().join("irondivi-diag-secondary-")
 }
 
+/// Remove the secondary folders a killed collector process `pid` left in
+/// `tmp` (its Drop never ran); returns how many were removed (R1 b, B5)
+pub fn remove_leftover_secondary(tmp: &Path, pid: u32) -> usize {
+    let prefix = format!("irondivi-diag-secondary-{pid}-");
+    let mut n = 0;
+    if let Ok(rd) = std::fs::read_dir(tmp) {
+        for e in rd.flatten() {
+            let name = e.file_name();
+            let is_dir = e.file_type().map(|t| t.is_dir() && !t.is_symlink()).unwrap_or(false);
+            if is_dir && name.to_string_lossy().starts_with(&prefix) && std::fs::remove_dir_all(e.path()).is_ok() {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
 pub fn chaindb(ctx: &Ctx, o: &mut Out) {
     o.file("chaindb.txt");
     head(o, "B2.8 chain database (read-only secondary open)");
@@ -491,6 +508,23 @@ fn verify(db: &rocksdb::DB, bi: &rocksdb::ColumnFamily, tip: u32, prune: u32, o:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn leftover_secondary_only_for_that_pid() {
+        let t = tempfile::tempdir().unwrap();
+        let mine = t.path().join("irondivi-diag-secondary-4242-chainstate-1");
+        std::fs::create_dir_all(mine.join("sub")).unwrap();
+        std::fs::write(mine.join("sub/LOG"), "x").unwrap();
+        let other = t.path().join("irondivi-diag-secondary-42421-chainstate-1");
+        std::fs::create_dir(&other).unwrap();
+        let file = t.path().join("irondivi-diag-secondary-4242-file");
+        std::fs::write(&file, "").unwrap();
+        assert_eq!(remove_leftover_secondary(t.path(), 4242), 1);
+        assert!(!mine.exists());
+        assert!(other.exists());
+        assert!(file.exists());
+        assert_eq!(remove_leftover_secondary(t.path(), 4242), 0);
+    }
 
     #[test]
     fn leveldb_is_told_apart() {

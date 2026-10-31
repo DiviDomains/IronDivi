@@ -643,6 +643,13 @@ impl Parent {
             .env("MALLOC_ARENA_MAX", "2")
             .env("LC_ALL", "C")
             .env("LANG", "C");
+        // B5: its own process group, so Ctrl+C reaches diag alone (the
+        // parent decides how each collector stops) and a kill takes the
+        // collector's own commands with it
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
         match observed {
             // B3: the node's own memory is not diag's to cap
             Some(n) => {
@@ -753,6 +760,9 @@ impl Parent {
                 if !stop_seen {
                     stop_seen = true;
                     unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+                    if util::is_tty() {
+                        eprint!(" stopping the node (up to 200 s) ...");
+                    }
                     deadline = Instant::now() + Duration::from_secs(200);
                     self.log.log(&format!("{} {}: Ctrl+C; the collector stops the node (up to 200 s)", spec.id, spec.name));
                 } else if Instant::now() >= deadline {
@@ -778,7 +788,8 @@ impl Parent {
         let mut abandoned = None;
         if let Some(why) = &killed_for {
             self.log.log(why);
-            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+            // the whole group: the collector and any command it started
+            unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
             let t = Instant::now();
             loop {
                 if let Ok(Some(s)) = child.try_wait() {
@@ -790,6 +801,12 @@ impl Parent {
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+        if killed_for.is_some() || !matches!(status, Some(s) if s.success()) {
+            let n = collectors::chain::remove_leftover_secondary(&std::env::temp_dir(), pid);
+            if n > 0 {
+                self.log.log(&format!("{} {}: removed {n} secondary folder(s) it left (R1 b)", spec.id, spec.name));
             }
         }
         let wait = if abandoned.is_some() { Duration::from_millis(200) } else { Duration::from_secs(5) };
