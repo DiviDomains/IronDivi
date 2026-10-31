@@ -284,6 +284,7 @@ struct Walk {
 
 impl Walk {
     fn note(&mut self, path: &str, what: &str) {
+        let path = if path.is_empty() { "(answer)" } else { path };
         *self.actions.entry(format!("{what}: {path}")).or_default() += 1;
     }
 
@@ -407,9 +408,13 @@ impl Walk {
             // an address is masked here too, not only by §6.2's address check
             if k == "address" || k == "addresses" {
                 let nv = match v {
+                    Value::String(s) if s.starts_with("pub-") => Value::String(s),
                     Value::String(_) => {
                         self.note(&kp, "masked");
                         Value::from("<addr>")
+                    }
+                    Value::Array(a) if a.iter().all(|x| x.as_str().is_some_and(|s| s.starts_with("pub-"))) => {
+                        Value::Array(a)
                     }
                     Value::Array(a) if a.iter().all(Value::is_string) => {
                         self.note(&kp, "masked");
@@ -495,6 +500,37 @@ pub fn treat(v: Value, label: Option<&str>) -> Treated {
     Treated { json, treatment, actions: w.actions }
 }
 
+/// The treatment of the node's own answer to a `--rpc` call (B6.5): the
+/// method is known, so there is no label to distrust. Wallet methods get
+/// the wallet rules (a bare number is an A11 bucket), a public shape the
+/// public rules when the answer has that shape, everything else the
+/// key-name rule, where a block answer is reduced (every block is
+/// undecided here). The `getblockhash` answer, the hash itself, is
+/// dropped whole.
+pub fn treat_call(v: Value, method: &str) -> Treated {
+    let mut w = Walk { actions: BTreeMap::new() };
+    let treatment = format!("RPC answer: {method}");
+    if method == "getblockhash" {
+        w.note("(answer)", "dropped (the block hash names the block; own staked block undecided)");
+        return Treated { json: Value::Null, treatment, actions: w.actions };
+    }
+    let wallet = WALLET_METHODS.contains(&method) || method == "getcoinavailability";
+    let json = if wallet {
+        match v {
+            Value::Number(n) => {
+                w.note("(answer)", "bucketed (A11)");
+                Value::from(amount_bucket(to_sats("amount", n.as_f64().unwrap_or(0.0))))
+            }
+            other => w.value(other, "", true, false, false),
+        }
+    } else if is_public_shape(method) && shape(&v) == Some(method) {
+        w.value(v, "", false, true, false)
+    } else {
+        w.value(v, "", false, false, false)
+    };
+    Treated { json, treatment, actions: w.actions }
+}
+
 /// Parse an attached file as JSON: one document, or JSON lines (every
 /// non-empty line an object or array). `None` when it is not JSON.
 pub fn parse(data: &[u8]) -> Option<Vec<Value>> {
@@ -542,6 +578,28 @@ pub fn treat_file(docs: Vec<Value>, label: Option<&str>) -> (String, String, Vec
     }
     let t = Treated { actions, ..Default::default() };
     (text, treatment, t.action_lines())
+}
+
+#[cfg(test)]
+mod treat_call_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn call_answers() {
+        let t = treat_call(json!(1234.5), "getbalance");
+        assert!(t.json.is_string() || t.json.is_number());
+        assert_ne!(t.json, json!(1234.5));
+        let t = treat_call(json!("ab".repeat(32)), "getblockhash");
+        assert_eq!(t.json, Value::Null);
+        let h = "cd".repeat(32);
+        let blk = json!({"hash": h, "merkleroot": h, "version": 4, "size": 300, "tx": [h, h], "height": 5});
+        let t = treat_call(blk, "getblock");
+        assert_eq!(t.json, json!({"version": 4, "size_at_most": 512, "nTx": 2}));
+        let t = treat_call(json!([{"address": "pub-0123456789ab", "x": 1}]), "getmasternodewinners");
+        assert_eq!(t.json[0]["address"], "pub-0123456789ab");
+        assert_eq!(t.treatment, "RPC answer: getmasternodewinners");
+    }
 }
 
 #[cfg(test)]

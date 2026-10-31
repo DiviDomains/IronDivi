@@ -260,6 +260,8 @@ pub fn why(collector: &str) -> String {
         "user-added" => "a file you added during the review".into(),
         "diag" => "diag's own summary and log".into(),
         "attach" => "attached by you (B6.6)".into(),
+        "rpc" => "RPC calls you named (B6.5)".into(),
+        "observed" => "observed start of irondivid (B3)".into(),
         c => crate::collectors::ALL
             .iter()
             .find(|s| s.name == c)

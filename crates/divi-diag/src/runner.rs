@@ -364,6 +364,28 @@ pub fn parent_main(o: Options) -> i32 {
     // B6.6: the names in attached files are harvested before the redactor
     // is built, so every file masks them
     let attach = crate::attach::prepare(&o.attach, &mut ctx.known);
+    // B6.5: every --rpc call is checked before anything runs; the
+    // refusals and clamps are shown now and land in rpc/summary.txt
+    for (m, words) in &o.rpc {
+        match collectors::rpc::check(m, collectors::rpc::params_of(words)) {
+            Ok(r) => {
+                for c in &r.clamps {
+                    eprintln!("irondivi-cli diag: --rpc {m}: {c}");
+                }
+                ctx.rpc.push(r);
+            }
+            Err(why) => {
+                eprintln!("irondivi-cli diag: --rpc {m} refused: {why}");
+                ctx.rpc_refused.push(format!("{m} refused: {why}"));
+            }
+        }
+    }
+    if !o.rpc.is_empty() {
+        match observed_target(&ctx, &o) {
+            Ok(n) => ctx.rpc_datadir = Some(n),
+            Err(why) => ctx.rpc_refused.push(format!("no --rpc call made: {why}")),
+        }
+    }
     let red = Arc::new(ctx.redactor());
     let id = local_id();
     let (out, tried) = match create_out(&o, &id, &ctx) {
@@ -402,8 +424,8 @@ pub fn parent_main(o: Options) -> i32 {
         p.notes.push("no developer key is compiled into this build: the review can check the folder, but nothing can be sent (§8.4).".into());
     }
     p.notes.push(
-        "not asked (§8.2): own-invalid blocks (A13), --tx, the host package (B6.2), --rpc and the crash stack \
-         are not in this version"
+        "not asked (§8.2): own-invalid blocks (A13), --tx, the host package (B6.2), --rpc-clear and the crash \
+         stack are not in this version"
             .into(),
     );
     // §8.1: the user's own words, before anything is collected
@@ -470,6 +492,17 @@ pub fn parent_main(o: Options) -> i32 {
         p.run_one(spec, Duration::from_secs(spec.secs).min(left), None);
         if spec.name == "storage" {
             p.remove_fsync_files();
+        }
+        p.write_summary();
+    }
+    // B6.5 after collection, only for the calls the user named
+    if (!p.ctx.rpc.is_empty() || !p.ctx.rpc_refused.is_empty()) && !STOP.load(Ordering::SeqCst) {
+        let spec = &collectors::RPC;
+        p.run_one(spec, Duration::from_secs(spec.secs), None);
+        if let Ok(t) = fs::read_to_string(p.out.join("rpc/summary.txt")) {
+            for l in t.lines() {
+                p.log.log(&format!("rpc: {l}"));
+            }
         }
         p.write_summary();
     }
@@ -932,6 +965,11 @@ impl Parent {
             s.push_str("\n== Observed start (B3) ==\n");
             s.push_str(t.trim_end());
             s.push('\n');
+        }
+        if let Ok(t) = fs::read_to_string(self.out.join("rpc/summary.txt")) {
+            s.push_str("\n== RPC answers (B6.5) ==\n");
+            s.push_str(t.trim_end());
+            s.push_str("\nB6.3 (diag --tx) is the way to show one transaction in clear; it is not in this version.\n");
         }
 
         s.push_str("\n== Collectors (B2.20) ==\n");

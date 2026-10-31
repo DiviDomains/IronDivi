@@ -25,6 +25,7 @@ pub mod logs;
 pub mod observed;
 pub mod platform;
 pub mod probe;
+pub mod rpc;
 pub mod procs;
 pub mod storage;
 pub mod sys;
@@ -71,6 +72,10 @@ pub static ALL: &[Spec] = &[
 /// can take 300 + 120 + 120 + 5 s, so the parent allows 660)
 pub static OBSERVED: Spec = Spec { id: "B3", name: "observed", secs: 660, what: "observed start of irondivid" };
 
+/// B6.5 `--rpc`: not in [`ALL`]; run after the collection, only for the
+/// calls the user named; every call has 2 s, all of them 60 s together
+pub static RPC: Spec = Spec { id: "B6.5", name: "rpc", secs: 75, what: "RPC calls you named" };
+
 /// B2 items this version does not collect; listed in the summary
 pub static NOT_YET: &[&str] = &[];
 
@@ -101,6 +106,7 @@ pub fn run(name: &str, ctx: &Ctx, o: &mut Out) -> bool {
         "seccomp" => sys::seccomp(ctx, o),
         "install" => files::install(ctx, o),
         "observed" => observed::observed(ctx, o),
+        "rpc" => rpc::rpc(ctx, o),
         _ => return false,
     }
     true

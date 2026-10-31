@@ -452,6 +452,51 @@ Tested on hp1, hp2 and hp3 as a user and as root; on macOS only
   file, a listunspent and a gettxoutsetinfo answer, a docker events line
   and a conf file: no hostname, user, container name, label, address or
   password reached the package.
+- B6.5 `--rpc <method> [args...]` was built (crates/divi-diag/src/
+  collectors/rpc.rs, rpcjson.rs `treat_call`). Each `--rpc` takes the
+  words up to the next `--` option, parsed as `irondivi-cli` parses its
+  arguments. Every call is checked before anything runs: the 35-method
+  allowlist; `dump*`/`sign*`/`backup*`/private-key methods,
+  `getdiaginfo` with parameters, `mnsync` other than `status` and
+  `listsinceblock` without a hash are refused; `gettxoutsetinfo`,
+  `getaddressbalance` and `getaddressutxos` are refused with the
+  `--attach` command line to run instead. Clamps: `listtransactions`
+  count to 1000, `getblock` verbosity to 1 (a raw block, verbosity 0,
+  is never sent), `getblockheader` verbose to true,
+  `getmasternodewinners` blocks to 100. Before the call: `listunspent`
+  is refused over 10000 wallet transactions, `getrawmempool true` falls
+  back to `false` at 5000 entries, `listsinceblock` is refused more than
+  1000 blocks below the tip, and any call is refused under 512 MB free
+  memory. Each call has 2 s and all of them 60 s; the node and its
+  credentials come from the observed data dir. The block argument of
+  `getblock`, `getblockheader` and `getblockhash` is dropped from the
+  call line; the `getblockhash` answer is dropped; block answers are
+  reduced to version, size and nTx (own staked block undecided, so this
+  applies to every block); wallet answers get the A11 buckets and lose
+  heights, times and block references. Public lists (`listmasternodes`,
+  `getrawmempool`, `getmasternodewinners`, `getlotteryblockwinners`)
+  pseudonymise every 64-hex value or key and every address field for
+  every entry under a separate public-record salt. Each answer lands in
+  `rpc/<n>-<method>.json`; `rpc/summary.txt` (copied into diag.log and
+  the summary's "RPC answers" section) lists the call, clamps, timing,
+  treatment and every dropped, bucketed or masked path. Deviations:
+  `getblock` is not a public list here (it is always reduced); a refusal
+  does not stop the run; `getmasternodewinners` blocks is sent as a
+  string, since the node reads only a string (plain `irondivi-cli
+  getmasternodewinners 100` is refused by the node). Fixed on the way:
+  §6.2 wrote a secret-looking JSON key with a bare value
+  (`"keypoolsize": 1000`) as `<set>` without quotes, which left the file
+  invalid JSON; the mask is now quoted. Not built: `--rpc-clear`,
+  `--host`, `--tx` (B6.3), the own-staked-block lookup, the call-argument
+  own pseudonym (a `getreceivedbyaddress` address argument shows as
+  `<addr>`), and a preview before consent beyond the summary. Open: the
+  tip hash in `getblockchaininfo` keeps its `blk:` form, as it already
+  does in live-node.txt and chaindb.txt; the tip can be an own staked
+  block. Tested for real on hp1 on a regtest node with 50 mined blocks:
+  19 calls and 5 refusals, every answer valid JSON, and none of the 51
+  block hashes (other than the `blk:` tip), 100 txids, the addresses,
+  the hostname, the user, the home path or `rpcpassword` reached the
+  package.
 - Smaller: `irondivi-cli --version` exits 1 with the usage text; the
   first divi-diag commit (d3502999) lacks its `Cargo.lock` entry, so
   `--locked` builds need c83a9dd4 or later; `diag --run` (B3) and the

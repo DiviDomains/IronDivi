@@ -18,8 +18,10 @@
 //! B3 ([`collectors::observed`]): with consent, irondivid is started once
 //! and watched; `--exec-as` is its single-threaded id-switching helper.
 //! `--attach <file>` (B6.6, [`attach`]): a file the user names, redacted,
-//! JSON through the RPC answer layer ([`rpcjson`]). Not in this crate yet:
-//! the other B6 recording modes.
+//! JSON through the RPC answer layer ([`rpcjson`]). `--rpc <method>
+//! [args…]` (B6.5, [`collectors::rpc`]): one allowlisted, clamped call to
+//! the running node, its answer through the same layer. Not in this crate
+//! yet: `--capture`, `--tx`, `--rpc-clear` and the host package (B6.2).
 
 pub mod attach;
 pub mod collectors;
@@ -67,11 +69,14 @@ pub struct Options {
     pub report_file: Option<std::path::PathBuf>,
     /// `--attach <file>` with its `--attach-method <method>`, if any (B6.6)
     pub attach: Vec<(std::path::PathBuf, Option<String>)>,
+    /// `--rpc <method> [args…]`: the method, then every word up to the
+    /// next `--` option (B6.5)
+    pub rpc: Vec<(String, Vec<String>)>,
 }
 
 const USAGE: &str = "usage: irondivi-cli diag [--datadir DIR] [--conf FILE] [--run|--no-run] \
 [--submit|--no-submit] [--out DIR] [--offline] [--no-fsync-test] [--report-file FILE] \
-[--attach FILE [--attach-method METHOD]]...\n       \
+[--attach FILE [--attach-method METHOD]]... [--rpc METHOD [ARG...]]...\n       \
 irondivi-cli diag --import <folder|-> [--keep-raw] [--out DIR] [--no-submit]\n       \
 irondivi-cli diag --send <folder>";
 
@@ -107,6 +112,15 @@ pub fn parse_options(args: &[String]) -> Result<Options, String> {
             "--send" => o.send = Some(value(&mut i)?.into()),
             "--report-file" => o.report_file = Some(value(&mut i)?.into()),
             "--attach" => o.attach.push((value(&mut i)?.into(), None)),
+            "--rpc" => {
+                let m = value(&mut i)?;
+                let mut words = Vec::new();
+                while i + 1 < args.len() && !args[i + 1].starts_with("--") {
+                    i += 1;
+                    words.push(args[i].clone());
+                }
+                o.rpc.push((m, words));
+            }
             "--attach-method" => {
                 let m = value(&mut i)?;
                 match o.attach.last_mut() {
@@ -146,6 +160,10 @@ pub fn run(args: &[String]) -> i32 {
                 eprintln!("irondivi-cli diag: --import and --send cannot be used together\n{USAGE}");
                 EX_USAGE
             }
+            (i, s) if !o.rpc.is_empty() && (i.is_some() || s.is_some()) => {
+                eprintln!("irondivi-cli diag: --rpc is part of a collection run, not of --import or --send\n{USAGE}");
+                EX_USAGE
+            }
             (i, s) if !o.attach.is_empty() && (i.is_some() || s.is_some()) => {
                 eprintln!("irondivi-cli diag: --attach is part of a collection run, not of --import or --send\n{USAGE}");
                 EX_USAGE
@@ -180,6 +198,14 @@ mod tests {
     fn yes_is_refused_with_exit_64() {
         assert!(parse_options(&s(&["--yes"])).unwrap_err().contains("--submit"));
         assert_eq!(run(&s(&["--yes"])), EX_USAGE);
+    }
+
+    #[test]
+    fn rpc_options() {
+        let o = parse_options(&s(&["--rpc", "listtransactions", "*", "5000", "--rpc", "getblockcount", "--offline"])).unwrap();
+        assert_eq!(o.rpc, vec![("listtransactions".to_string(), s(&["*", "5000"])), ("getblockcount".to_string(), vec![])]);
+        assert!(o.offline);
+        assert!(parse_options(&s(&["--rpc"])).is_err());
     }
 
     #[test]

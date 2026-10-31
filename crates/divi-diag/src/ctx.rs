@@ -62,6 +62,12 @@ pub struct Ctx {
     pub allow_fsync: bool,
     pub cap_sys_ptrace: bool,
     pub invoked_as: String,
+    /// B6.5 `--rpc` calls, already checked by the parent
+    pub rpc: Vec<crate::collectors::rpc::Req>,
+    /// the refused `--rpc` calls, one line each, for rpc/summary.txt
+    pub rpc_refused: Vec<String>,
+    /// the data dir whose node answers them
+    pub rpc_datadir: Option<usize>,
 }
 
 impl Ctx {

@@ -309,6 +309,10 @@ impl Redactor {
             // `<set>`/`<unset>` and pseudonyms written by a collector stay
             if v.starts_with('<') || v == "yes" || v == "no" {
                 c[0].to_string()
+            } else if c[2].starts_with('"') && !c[2].ends_with('"') {
+                // a JSON key with a bare value (`"keypoolsize": 1000`):
+                // the mask is quoted so the file stays JSON
+                format!("{}{}\"<set>\"", &c[1], &c[2])
             } else {
                 format!("{}{}<set>", &c[1], &c[2])
             }
@@ -554,6 +558,18 @@ mod tests {
         assert!(s.contains("12:34:56"), "{s}");
         assert!(s.contains("divi_node::staker"), "{s}");
         assert!(s.contains("rpcpassword=<set>"));
+    }
+
+    #[test]
+    fn json_secret_values_stay_json() {
+        let r = r();
+        let j = "{\n  \"keypoolsize\": 1000,\n  \"rpcpassword\": \"hunter2\",\n  \"authkey\": true\n}";
+        let s = r.scrub(j);
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap_or_else(|e| panic!("{e}: {s}"));
+        assert_eq!(v["keypoolsize"], "<set>");
+        assert_eq!(v["rpcpassword"], "<set>");
+        assert_eq!(v["authkey"], "<set>");
+        assert_eq!(r.scrub(&s), s, "a second scrub changes nothing");
     }
 
     #[test]
