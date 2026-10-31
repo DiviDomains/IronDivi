@@ -58,14 +58,15 @@ const KEEP_COMPONENTS: &[&str] = &[
     "own-invalid", "irondivid.running", "running", "_unresolved", "snapshot-request", ".cookie",
     ".lock", "LOCK", "CURRENT", "IDENTITY", "LOG", "peers.dat", "banlist.dat", "mncache.dat",
     "mnpayments.dat", "fee_estimates.dat", "netfulfilled.dat", "sporks", "backups", "electrum",
-    "webui", "swap", "swaps", "irondivi-diag", ".local", ".config", ".cache", "irondivi.service",
+    "webui", "swap", "swaps", "irondivi-diag", "irondivi-replay", "divi-electrum", "divi-webui",
+    ".local", ".config", ".cache", "irondivi.service",
     "irondivid.service", "wallet.dat", "zmq", "certs", "tls", "txindex", ".dockerenv", ".containerenv", "swap.img", "swapfile",
     "nfsd", "snap", "core", "core18", "core20", "core22", "core24", "lxd", "snapd",
 ];
 
 const KEEP_PREFIXES: &[&str] = &[
     "debug.log.", "LOG.old.", "MANIFEST-", "OPTIONS-", "irondivi-diag-", ".irondivi-diag-fsync-",
-    "irondivi-", "irondivid-", "divi-", "libc", "libm", "libpthread", "libdl", "librt",
+    "libc", "libm", "libpthread", "libdl", "librt",
     "libgcc", "libstdc++", "ld-",
 ];
 
@@ -210,6 +211,8 @@ impl Redactor {
         if self.keep_comp.contains(c)
             || c.chars().all(|ch| ch.is_ascii_digit())
             || KEEP_PREFIXES.iter().any(|p| c.starts_with(p))
+            // the plan's /var/tmp/irondivi-<uid>/ diag root
+            || c.strip_prefix("irondivi-").is_some_and(|u| !u.is_empty() && u.bytes().all(|b| b.is_ascii_digit()))
             || self.re_dev.is_match(c)
             || is_rocksdb_file(c)
             || is_system_unit(c)
@@ -481,6 +484,26 @@ mod tests {
         let m = r.scrub("Recovered from manifest file:/home/alice/mynode/txindex/MANIFEST-000001 ok");
         assert!(!m.contains("alice") && !m.contains("mynode") && m.contains("/txindex/MANIFEST-000001"), "{m}");
         assert!(r.scrub("url http://127.0.0.1:8480/healthz").contains("http://127.0.0.1:8480/healthz"));
+    }
+
+    #[test]
+    fn user_chosen_irondivi_names_are_pseudonymised() {
+        // a folder the user named irondivi-<something> is user data (Revision 16)
+        let r = r();
+        for (p, gone) in [
+            ("/srv/irondivi-aliceshop/debug.log", "aliceshop"),
+            ("/data/irondivid-mainbox/blocks", "mainbox"),
+            ("/mnt/divi-secretvault/wallet.dat", "secretvault"),
+        ] {
+            let s = r.path(p);
+            assert!(!s.contains(gone), "{p} -> {s}");
+        }
+        // the plan's own names stay
+        assert_eq!(r.path("/var/tmp/irondivi-1000/diag"), "/var/tmp/irondivi-1000/diag");
+        assert_eq!(r.path("/usr/local/bin/irondivi-cli"), "/usr/local/bin/irondivi-cli");
+        assert_eq!(r.path("/usr/local/bin/irondivi-replay"), "/usr/local/bin/irondivi-replay");
+        let d = r.path("/var/tmp/irondivi-diag-20261031-1200");
+        assert_eq!(d, "/var/tmp/irondivi-diag-20261031-1200");
     }
 
     #[test]

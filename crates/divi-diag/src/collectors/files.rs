@@ -643,7 +643,14 @@ pub fn install(ctx: &Ctx, o: &mut Out) {
         let mut n = 0;
         for l in c.text().lines().filter(|l| l.to_ascii_lowercase().contains("divi")) {
             n += 1;
-            outln!(o, "{l}");
+            // a locally built image's repository name (a compose project,
+            // a folder) is the user's choice: keep only our own names
+            let (img, rest) = l.split_once(' ').unwrap_or((l, ""));
+            let (repo, tag) = img.rsplit_once(':').unwrap_or((img, ""));
+            let last = repo.rsplit('/').next().unwrap_or(repo);
+            let repo = if matches!(last, "irondivi" | "irondivid") { repo.to_string() } else { r.pseudonym("image", repo) };
+            let tag = if matches!(tag, "latest" | "<none>" | "") || tag.chars().all(|c| c.is_ascii_digit() || c == '.' || c == 'v') { tag.to_string() } else { r.pseudonym("tag", tag) };
+            outln!(o, "{repo}:{tag} {rest}");
         }
         if c.ok() && n == 0 {
             outln!(o, "no irondivi image");
