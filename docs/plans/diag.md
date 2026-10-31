@@ -89,34 +89,113 @@ and are not re-based.
   verdict rows describe A5's records, not A4's (`runs_log`
   `a_task_panic_is_recorded_and_a_main_panic_exits_101`,
   `a_critical_panic_ends_the_run_with_code_10`).
-- A3 as built: no A11, A17 or A6 parts yet (no counters in the third
-  signal's record, no health tick); no argv allowlist, the sender's
-  command line is masked by its own rule; HUP reopens `debug.log` only;
-  there is no 5 s window, every stop signal counts toward the three;
-  QUIT counts as a stop and records `dump=not-implemented`; USR1 records
-  "not implemented"; the sender is not read on macOS; a stop signal that
+- A3 as built: no A11 or A17 parts yet (no counters in the third
+  signal's record); no argv allowlist, the sender's command line is
+  masked by its own rule; HUP reopens `debug.log` only; QUIT counts as a
+  stop and records `dump=not-implemented`; USR1 records "not
+  implemented"; the sender is not read on macOS; a stop signal that
   arrives before the record sink is set is held and recorded when it is;
   a one-shot command (not the node) keeps the default action; the
   default-action group writes `exit code=128+N` and re-raises. The TSTP
   stop branch has no test. The SIGPIPE and EPIPE counts go in the exit
   record.
+- A3, the 5 s window (817b7013): a stop signal (TERM, INT or QUIT)
+  within 5 s of the last *counted* one is recorded as `ignored count=<n>
+  within=5s` and does not count. The window is measured from the last
+  counted signal and re-armed by each, so `_exit(10)` takes three
+  signals each more than 5 s after the one counted before it; the plan
+  speaks only of "a second one within 5 s", the third's timing is this
+  reading. A counted second signal is still recorded and ignored as
+  before (`ignored count=2`). Debug builds read
+  `IRONDIVI_TEST_STOP_WINDOW_MS`, so `a_third_stop_signal_ends_the_run_with_code_10`
+  can send all three at once with the window at 0;
+  `stop_signals_within_five_seconds_count_once` sends three at once with
+  the default window and expects exit 0 and two ignored records. That
+  test assumes the three handlers run one after another; two running at
+  once on different threads could both count, so a flake there would
+  point at that, not at the window.
 - A4 as built: the hook ends the node itself (`die(10, "Error: <name>
   panicked")` for a critical task or thread), with no supervisor between;
   the `panic` record in `runs.log` holds thread, task, location and
   `ends_node` only, and the message and a forced backtrace go to
-  `diag/crash.log` (mode 0600). The default hook still prints the message
-  to stderr, so it is kept out of `runs.log` only. No `events.log` record
-  or health count for a supervised panic, no A8 ring and no A11 counters
-  or wrapping yet. A critical task's panic ends the node; a critical
-  task that returns an error does not yet. irondivid starts every task
-  and thread through `tasks.rs` (`tasks_lint`
-  `irondivid_starts_tasks_only_through_tasks_rs`); the node crates are not
-  converted, and a ratchet keeps their spawn count from growing
-  (`the_node_crates_start_no_new_tasks`). `spawn_blocking` is matched by
-  neither: those calls (two in `main.rs`, and in the RPC server, web UI
-  and Electrum) are unnamed, and a panic in one records `task="-"`. The
-  test seam `IRONDIVI_TEST_PANIC` (regtest only) delays its critical
-  panics 2 s so the test sees RPC answer first.
+  `diag/crash.log` (mode 0600), followed by the A8 ring. The default hook
+  still prints the message to stderr, as A4 says ("Then the default hook
+  runs"); stderr is the console, or `/dev/null` under `-daemon`, so it is
+  kept out of `runs.log` only. A supervised panic is also a `task-failed`
+  record in `events.log` (name and place, no message), an incident, and
+  one more in health's `panics` count (194c97e6); a panic that ends the
+  node writes the crash and `runs.log` records only. A critical task that
+  returns an error ends the node through `die(10, "Error: <name>:
+  <error>")` (the plan's reason has no `Error: ` prefix; every `die`
+  reason has it, as the console line it also is); a supervised task's
+  error is a `task-failed cause=error` record with its name, the error
+  text going to `debug.log`. No A11 counters or wrapping yet. irondivid
+  starts every task and thread through `tasks.rs` (`tasks_lint`
+  `irondivid_starts_tasks_only_through_tasks_rs`); the node crates are
+  not converted, and a ratchet keeps their spawn count from growing
+  (`the_node_crates_start_no_new_tasks`). `spawn_blocking` goes through
+  `tasks::spawn_blocking(name, ...)` in irondivid (aa7bacb2), which runs
+  the work under its name, so its panic records `task=<name>`, critical
+  when the caller is; the lint refuses a bare `spawn_blocking` there. The
+  RPC server, web UI and Electrum crates still call it unnamed (counted by
+  the ratchet), and a panic in one records `task="-"`. The test seam
+  `IRONDIVI_TEST_PANIC` (regtest only) delays its critical panics 2 s so
+  the test sees RPC answer first.
+- A8 as built (c7c4985b): the ring is not redacted (A11 is not built);
+  it reaches only `crash.log` (0600, local), not yet `getdiaginfo` (A10).
+  It holds the node's own categories at debug and libraries at info (the
+  plan's "every category" read as ours); a ring line is cut at 320
+  bytes and carries no span fields. The delivery queue is bounded at
+  65536 lines (the plan gives no number); its drop path has no test.
+  Counted lines are filtered per layer; nothing disables them globally.
+  The `tracing-appender` dependency is left in `Cargo.toml`, unused.
+- A5 as built (2086651b): no `pthread_create` interposition, so a thread
+  the node does not start (RocksDB pools, blocking-pool threads not seen
+  by `on_thread_start`) has no alternate stack and no stack range; its
+  record says `thread=<comm> foreign=yes` and has no frame walk. No
+  filtered 16 KB raw stack dump (item 3) and no 32-bit `crash-stack.bin`;
+  no seccomp `si_syscall`/`si_arch`; on macOS no dyld image list or
+  registers (`pc=- sp=- fp=-` off Linux x86_64 and aarch64). No A11
+  counters. The sender is named by `si_pid`, `si_uid` and
+  `/proc/<pid>/comm` only, no command line or parent chain. No
+  `pthread_key` destructor: the guard that enters a thread
+  (`tasks::thread`, tokio's `on_thread_stop`) frees its alternate stack.
+  The 64 KB alternate stack's headroom is not measured. The `maps` copy
+  is refreshed at start and on each `dumpable-check` tick. The test seam
+  is `IRONDIVI_TEST_CRASH=segv|abort|overflow` (regtest and debug
+  builds) instead of a `crashtest` build feature. The aarch64 and macOS
+  branches are not compiled on hp3. A crash's verdict is `crash
+  signal=<S>` or `sent-by comm=<c> signal=<S>`; `crash_log=record|none`
+  replaces `not-read`; `kernel_log` is still `not-read`.
+- A6 as built (194c97e6, which also closed the A4 `events.log` and
+  health-count gaps): written as `n/a` for now are `rpc_calls`,
+  `lock_waits`, `stakes_30d`, `stake_ratio`, `masternode`, `mnsync`,
+  `allocator`, `rocksdb`, `future_headers_rejected` and every macOS-only
+  field; the staking group is `n/a` when the node runs without a staker.
+  Incidents carry no `getdiaginfo` output yet, and only the stall (over
+  600 s) and supervised-panic triggers are built. One stall incident per
+  stall, re-armed when the tip moves (consensus N-k); the stall uses the
+  boot clock, so time suspended counts as stall time (platforms R15-1),
+  and the stall record carries `clock_synced`. No integration test drives
+  a real stall; the latch is unit-tested. Start and stop stay in
+  `runs.log` only. Health reads chain state through the node's locks and
+  calls `get_status` on every tick. The dumpable check runs at the
+  health tick's rate (10 s for the first 10 minutes, then 60 s) on its
+  own `dumpable-check` thread; its value is in `health.log`, and a reset
+  is the `events.log` record `dumpable-reset was=<n> result=ok|error`
+  (the plan's text `dumpable restored (was <n>)` stays the `debug.log`
+  line).
+- A7 as built (2b8d663e, 56f98396): `diag/startup/<run>.txt`, mode 0600,
+  the last 20 kept, capped at 64 KB with `truncated=yes`. No pseudonyms:
+  a value is written as it is only for keys whose values are numbers,
+  switches or words, and every other value (secrets, addresses, paths,
+  commands, the `electrum*` bind addresses) is `<set>`; `HOME` is
+  `<set>`; `IRONDIVI_*` variables show a value only for the three the
+  node reads, others by name. The start directory is a class (`/`,
+  `datadir`, `inside-datadir`, `<other>`), not a path. `git=` is `-`
+  unless the build had a checkout or `IRONDIVID_GIT_SHA`; `features=`
+  names only `fault-injection`. The Linux-only fields (`/proc/self/status`,
+  `fs_type`, mount options) are `n/a` on macOS, which has not run it.
 - Crashes R15-2: the RocksDB close in an early panic's unwind is "bounded
   on a responsive disk", not bounded; A4 now says so.
 - `flush_log` cannot deadlock `die` when a critical panic is raised from
@@ -1153,7 +1232,7 @@ They ship in the first release of this work whether or not diag is done.
 | D2 | A closed stdout/stderr gives EPIPE (Rust ignores SIGPIPE), and `println!`/`eprintln!` panic on it. | all console writes | Same `console_line()`; SIGPIPE/EPIPE count kept (A3). |
 | D3 | `process::exit(1)` after a `run_daemon` error, the runtime builder's `?`, and the early exits do not flush the non-blocking log writer, so the error line can be lost — the friend's symptom. | `main.rs` about 3358; runtime builder; early exits about 3049–3105 | One `die(code, reason)` (A9). |
 | D4 | `-help` and `-version` exit 1 (divid compatibility), so 1 cannot mean "configuration error". | about `main.rs:3052` | Kept; the exit-code table (R3) gives 1 no other meaning. |
-| D5 | `disable_core_dumps()` set only `RLIMIT_CORE` to 0 (`private_files.rs:31`). A **piped** `core_pattern` handler is run whatever that limit says, and whether it stores a core is up to the handler. A core holds wallet keys. | `private_files.rs:31`, called at `main.rs:3039` | `disable_core_dumps()` also calls `prctl(PR_SET_DUMPABLE, 0)` on Linux, right after the `RLIMIT_CORE` call, at the start of `main()` (after the fd 0–2 reopen and the umask, before argument parsing, any thread or the wallet). The kernel does not hand a non-dumpable process to any core handler, piped or not. **Status:** done in bae9c769 (`private_files.rs:43-50`, with a `PR_GET_DUMPABLE` assertion in its unit test), together with `scripts/tests/core-dump-vm/`; hardened in b2dbea56: the `prctl` call now always runs, even when the `RLIMIT_CORE` call fails, and the first error is returned (`private_files.rs:31-56`). **Credential-call lint: done** in 97c4bceb (`bin/irondivid/tests/credential_calls_lint.rs`): it walks `bin/`, `crates/` and `tools/` and fails on any of the ten credential calls (`setuid`, `setgid`, `setresuid`, `setresgid`, `setreuid`, `setregid`, `setfsuid`, `setfsgid`, `capset`, `setgroups`, in their bare, `libc::` and `nix::unistd::` spellings) or `caps::set`, `caps::raise`, `caps::drop`, `caps::clear` that is not followed by `PR_SET_DUMPABLE` in the same function (the kernel resets the flag on a credential change); the file also holds a self-test of the matcher, and both tests pass on hp3 (as reported with the commit). **Per-tick re-check: done** in f5f3bce5 (`private_files::restore_non_dumpable`, which clears a non-zero `PR_GET_DUMPABLE` and logs `dumpable restored (was <n>)`; unit test `node10_reset_dumpable_flag_is_restored` passes on hp3 for that commit), and moved in 856f7376 off the tokio runtime onto a plain `std::thread` named `dumpable-check`, started in `main()` after the daemon forks and before the tokio runtime is built, so it runs before the wallet opens. It sleeps 60 s in a loop; `restore_non_dumpable()` returns `Option<(i32, io::Result<()>)>`; a reset logs `warn!` "dumpable restored (was <n>)", a failed reset logs `error!` "dumpable is <n> and could not be reset: <err>", and a thread that cannot start prints "Warning: could not start the core dump check: <err>" on the console. The unit test was updated in 856f7376; that the updated test passes is not yet reported. **Still open:** A6 sets the check's interval (10 s for the first 10 minutes, then 60 s) and its line goes to `events.log`; the check itself stays on the `dumpable-check` thread, so a stalled runtime cannot stop it. **Evidence 2026-10-30:** (1) hp3, apport pipe: `scripts/tests/core-dump.sh` passes; apport honours the zero limit. (2) hp1, Ubuntu 22.04 VM, systemd 249, as root: the systemd-coredump pattern is `\|/lib/systemd/systemd-coredump %P %u %g %s %t 9223372036854775808 %h %d`; its literal limit replaces ours, so a SIGSEGV'd irondivid at `RLIMIT_CORE` 0 **left a 1.2 MB core in `/var/lib/systemd/coredump`** — the old "limit 0 is enough" claim was false. A Python probe at `fs.suid_dumpable` 2 and 0: limit 0 alone stored 715 KB; limit 0 plus `coredump_filter` 0 still stored 3.9 KB (the filter is not enough); limit 0 plus `PR_SET_DUMPABLE` 0 stored **nothing**. (3) The plain `core` file pattern honours limit 0: no core (pass). (4) Runs as a non-root user (`probe`) stored no core in any case; the cause is **not confirmed** and nothing relies on it. (5) VM rerun with `PR_SET_DUMPABLE` 0 built in: the kernel never runs systemd-coredump for a non-dumpable process, so an irondivid crash leaves **no** `coredumpctl`/journal coredump entry at all, not only no file (an earlier "journal: present" was the previous run's entry); the control process was recorded and stored as usual. systemd-coredump (D5-A) and plain `core` (D5-B) **pass**; apport on hp3 still passes. **Consequence:** diag cannot see an irondivid crash through `coredumpctl`; crash evidence comes from the node's own records — A5 `crash.log`, the A9/A1 exit record in `runs.log`, the A2 marker verdict — and from the exit code or signal its parent or service manager saw (B2.5 `ExecMainCode`/`ExecMainStatus`, the unit's journal "Main process exited, code=killed, status=11/SEGV" line, Docker `ExitCode`). **Cost:** the files inside a non-dumpable process's `/proc/<pid>` are root-owned (the directory itself keeps the task's euid, measured on hp3, §10 item 1), and same-user ptrace and the ptrace-checked `/proc` reads are refused; how Part A and diag live with that is in A5 "Non-dumpable process". The release gate (§10 item 6) is `scripts/tests/core-dump-vm/vm.sh` (a throwaway Ubuntu 22.04 VM on a libvirt host, running `run.sh` under systemd-coredump and plain `core` patterns), plus `scripts/tests/core-dump.sh` for apport: a control process must leave a core and irondivid must leave none. Diag reports any irondivid core found (B2.12), by name, size and time only, and tells the user it may hold keys and how to delete it. |
+| D5 | `disable_core_dumps()` set only `RLIMIT_CORE` to 0 (`private_files.rs:31`). A **piped** `core_pattern` handler is run whatever that limit says, and whether it stores a core is up to the handler. A core holds wallet keys. | `private_files.rs:31`, called at `main.rs:3039` | `disable_core_dumps()` also calls `prctl(PR_SET_DUMPABLE, 0)` on Linux, right after the `RLIMIT_CORE` call, at the start of `main()` (after the fd 0–2 reopen and the umask, before argument parsing, any thread or the wallet). The kernel does not hand a non-dumpable process to any core handler, piped or not. **Status:** done in bae9c769 (`private_files.rs:43-50`, with a `PR_GET_DUMPABLE` assertion in its unit test), together with `scripts/tests/core-dump-vm/`; hardened in b2dbea56: the `prctl` call now always runs, even when the `RLIMIT_CORE` call fails, and the first error is returned (`private_files.rs:31-56`). **Credential-call lint: done** in 97c4bceb (`bin/irondivid/tests/credential_calls_lint.rs`): it walks `bin/`, `crates/` and `tools/` and fails on any of the ten credential calls (`setuid`, `setgid`, `setresuid`, `setresgid`, `setreuid`, `setregid`, `setfsuid`, `setfsgid`, `capset`, `setgroups`, in their bare, `libc::` and `nix::unistd::` spellings) or `caps::set`, `caps::raise`, `caps::drop`, `caps::clear` that is not followed by `PR_SET_DUMPABLE` in the same function (the kernel resets the flag on a credential change); the file also holds a self-test of the matcher, and both tests pass on hp3 (as reported with the commit). **Per-tick re-check: done** in f5f3bce5 (`private_files::restore_non_dumpable`, which clears a non-zero `PR_GET_DUMPABLE` and logs `dumpable restored (was <n>)`; unit test `node10_reset_dumpable_flag_is_restored` passes on hp3 for that commit), and moved in 856f7376 off the tokio runtime onto a plain `std::thread` named `dumpable-check`, started in `main()` after the daemon forks and before the tokio runtime is built, so it runs before the wallet opens. It sleeps 60 s in a loop; `restore_non_dumpable()` returns `Option<(i32, io::Result<()>)>`; a reset logs `warn!` "dumpable restored (was <n>)", a failed reset logs `error!` "dumpable is <n> and could not be reset: <err>", and a thread that cannot start prints "Warning: could not start the core dump check: <err>" on the console. The unit test was updated in 856f7376; that the updated test passes is not yet reported. **A6: done** in 194c97e6: the check runs at the health tick's rate (10 s for the first 10 minutes, then 60 s), still on the `dumpable-check` thread so a stalled runtime cannot stop it; `health.log` carries its value and a reset is the `events.log` record `dumpable-reset was=<n> result=ok|error` (Revision 16). **Evidence 2026-10-30:** (1) hp3, apport pipe: `scripts/tests/core-dump.sh` passes; apport honours the zero limit. (2) hp1, Ubuntu 22.04 VM, systemd 249, as root: the systemd-coredump pattern is `\|/lib/systemd/systemd-coredump %P %u %g %s %t 9223372036854775808 %h %d`; its literal limit replaces ours, so a SIGSEGV'd irondivid at `RLIMIT_CORE` 0 **left a 1.2 MB core in `/var/lib/systemd/coredump`** — the old "limit 0 is enough" claim was false. A Python probe at `fs.suid_dumpable` 2 and 0: limit 0 alone stored 715 KB; limit 0 plus `coredump_filter` 0 still stored 3.9 KB (the filter is not enough); limit 0 plus `PR_SET_DUMPABLE` 0 stored **nothing**. (3) The plain `core` file pattern honours limit 0: no core (pass). (4) Runs as a non-root user (`probe`) stored no core in any case; the cause is **not confirmed** and nothing relies on it. (5) VM rerun with `PR_SET_DUMPABLE` 0 built in: the kernel never runs systemd-coredump for a non-dumpable process, so an irondivid crash leaves **no** `coredumpctl`/journal coredump entry at all, not only no file (an earlier "journal: present" was the previous run's entry); the control process was recorded and stored as usual. systemd-coredump (D5-A) and plain `core` (D5-B) **pass**; apport on hp3 still passes. **Consequence:** diag cannot see an irondivid crash through `coredumpctl`; crash evidence comes from the node's own records — A5 `crash.log`, the A9/A1 exit record in `runs.log`, the A2 marker verdict — and from the exit code or signal its parent or service manager saw (B2.5 `ExecMainCode`/`ExecMainStatus`, the unit's journal "Main process exited, code=killed, status=11/SEGV" line, Docker `ExitCode`). **Cost:** the files inside a non-dumpable process's `/proc/<pid>` are root-owned (the directory itself keeps the task's euid, measured on hp3, §10 item 1), and same-user ptrace and the ptrace-checked `/proc` reads are refused; how Part A and diag live with that is in A5 "Non-dumpable process". The release gate (§10 item 6) is `scripts/tests/core-dump-vm/vm.sh` (a throwaway Ubuntu 22.04 VM on a libvirt host, running `run.sh` under systemd-coredump and plain `core` patterns), plus `scripts/tests/core-dump.sh` for apport: a control process must leave a core and irondivid must leave none. Diag reports any irondivid core found (B2.12), by name, size and time only, and tells the user it may hold keys and how to delete it. |
 | D6 | Default `debug.log` rotation (1 MB × 5) keeps minutes of history during sync. | `config.rs:846-849`, `main.rs:1290`-`:1295` (the size-rotated `debug.log` writer in `init_logging`, `:1250`) | Unchanged for `debug.log`; history moves to the Part A logs, which have their own budget (A14). |
 
 ---
