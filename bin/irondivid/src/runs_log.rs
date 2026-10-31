@@ -402,14 +402,20 @@ impl RawLine {
         self.write_to(RAW_FD.load(Ordering::Acquire));
     }
 
-    /// Append the line to `fd`, then fdatasync; a no-op when `fd` is -1
-    pub fn write_to(&mut self, fd: i32) {
+    /// Append the line to `fd` with no sync (a crash record's frame lines,
+    /// synced once at its end); whether it was written
+    pub fn write_unsynced(&mut self, fd: i32) -> bool {
         if fd < 0 {
-            return;
+            return false;
         }
         self.buf[self.len] = b'\n';
-        unsafe {
-            if libc::write(fd, self.buf.as_ptr().cast(), self.len + 1) > 0 {
+        unsafe { libc::write(fd, self.buf.as_ptr().cast(), self.len + 1) > 0 }
+    }
+
+    /// Append the line to `fd`, then fdatasync; a no-op when `fd` is -1
+    pub fn write_to(&mut self, fd: i32) {
+        if self.write_unsynced(fd) {
+            unsafe {
                 #[cfg(any(target_os = "linux", target_os = "android"))]
                 libc::fdatasync(fd);
                 #[cfg(not(any(target_os = "linux", target_os = "android")))]

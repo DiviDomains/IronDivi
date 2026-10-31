@@ -521,10 +521,12 @@ fn write_record(signo: i32, info: *mut libc::siginfo_t, ctx: *mut libc::c_void, 
         let hi = e.hi.load(Ordering::Relaxed);
         let mut l = RawLine::new("frames");
         l.text(" lo=").hex(lo as u64).text(" hi=").hex(hi as u64);
-        l.write_to(fd);
+        // Synced once, by the end line: a deep walk stays well inside the
+        // 2 s another faulting thread waits
+        l.write_unsynced(fd);
         let mut frame = RawLine::new("frame");
         frame.text(" #0 ").hex(pc);
-        frame.write_to(fd);
+        frame.write_unsynced(fd);
         let mut fp = fp as usize;
         for i in 1..128 {
             if lo == 0 || fp < lo || fp + 16 > hi || !fp.is_multiple_of(8) {
@@ -536,7 +538,7 @@ fn write_record(signo: i32, info: *mut libc::siginfo_t, ctx: *mut libc::c_void, 
             }
             let mut frame = RawLine::new("frame");
             frame.text(" #").num(i).text(" ").hex(ret as u64);
-            frame.write_to(fd);
+            frame.write_unsynced(fd);
             if next <= fp {
                 break;
             }

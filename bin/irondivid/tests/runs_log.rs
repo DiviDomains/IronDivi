@@ -598,3 +598,37 @@ fn a_fatal_signal_is_recorded_and_ends_the_run_by_that_signal() {
         assert!(unclean.contains(" crash_log=record "), "{what}: {log}");
     }
 }
+
+/// A5: a fatal signal another process sends is recorded with its sender,
+/// still ends the run by that signal, and the next run says who sent it
+#[test]
+fn a_fatal_signal_sent_by_another_process_names_the_sender() {
+    use std::os::unix::process::ExitStatusExt;
+    let dir = tempfile::tempdir().unwrap();
+    let (mut node, _) = start(dir.path());
+    assert_eq!(unsafe { libc::kill(node.0.id() as i32, libc::SIGSEGV) }, 0);
+    let status = wait_exit(&mut node);
+    assert_eq!(status.signal(), Some(libc::SIGSEGV), "{status:?}");
+    let crash = crash_log(dir.path());
+    let record = crash
+        .lines()
+        .find(|l| l.contains(" fatal-signal run=1 "))
+        .unwrap_or_else(|| panic!("{crash}"));
+    assert!(record.contains(" signal=SEGV "), "{crash}");
+    assert!(
+        record.contains(&format!(" sent=yes si_pid={} ", std::process::id())),
+        "{crash}"
+    );
+    assert!(crash.contains(" fatal-signal-end run=1"), "{crash}");
+
+    let (mut node, rpc_port) = start(dir.path());
+    rpc(rpc_port, "stop").expect("stop reply");
+    assert!(wait_exit(&mut node).success());
+    let log = runs_log(dir.path());
+    let unclean = log
+        .lines()
+        .find(|l| l.contains(" unclean-previous "))
+        .unwrap_or_else(|| panic!("{log}"));
+    assert!(unclean.contains(" verdict=sent-by comm="), "{log}");
+    assert!(unclean.contains(" crash_log=record "), "{log}");
+}
