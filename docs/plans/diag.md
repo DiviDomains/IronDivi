@@ -110,10 +110,14 @@ and are not re-based.
   `IRONDIVI_TEST_STOP_WINDOW_MS`, so `a_third_stop_signal_ends_the_run_with_code_10`
   can send all three at once with the window at 0;
   `stop_signals_within_five_seconds_count_once` sends three at once with
-  the default window and expects exit 0 and two ignored records. That
-  test assumes the three handlers run one after another; two running at
-  once on different threads could both count, so a flake there would
-  point at that, not at the window.
+  the default window and expects exit 0 and two ignored records. The
+  count and the time of the last counted signal share one atomic word
+  (count in the top 8 bits, monotonic ms below), and a signal counts
+  only when its compare-and-swap moves that word; a handler that loses
+  re-reads the winner's count and time and decides again (60e039d8). So
+  two handlers running at once on different threads cannot both count
+  inside one window, and the test no longer depends on their order. The
+  window is kept in whole milliseconds.
 - A4 as built: the hook ends the node itself (`die(10, "Error: <name>
   panicked")` for a critical task or thread), with no supervisor between;
   the `panic` record in `runs.log` holds thread, task, location and
@@ -138,7 +142,10 @@ and are not re-based.
   the work under its name, so its panic records `task=<name>`, critical
   when the caller is; the lint refuses a bare `spawn_blocking` there. The
   RPC server, web UI and Electrum crates still call it unnamed (counted by
-  the ratchet), and a panic in one records `task="-"`. The test seam
+  the ratchet), and a panic in one records `task="-"`. A4 converts
+  `tokio::spawn` and `std::thread::spawn` and does not name
+  `spawn_blocking`, and those crates cannot reach irondivid's `tasks.rs`,
+  so they stay unnamed and the ratchet stays as it is. The test seam
   `IRONDIVI_TEST_PANIC` (regtest only) delays its critical panics 2 s so
   the test sees RPC answer first.
 - A8 as built (c7c4985b): the ring is not redacted (A11 is not built);
