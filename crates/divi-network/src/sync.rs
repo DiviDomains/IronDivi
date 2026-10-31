@@ -1367,16 +1367,14 @@ impl BlockSync {
         // NotifyPeersOfNewChainTip net.cpp:1490-1497): the tip, not the block
         // that came, which may be one of several that connected at once. The
         // initial download is read after the tip moved, so the tip that ends
-        // it is announced
+        // it is announced. Only peers whose start height Divi Core accepts are
+        // told (crate::peer_manager::announces_new_tip_to)
         if let Some(tip) = self.chain.tip().filter(|t| Some(t.hash) != tip_before) {
             if !self.chain.is_initial_block_download() {
-                if tip.hash == hash {
-                    // The peer that sent it has it
-                    self.peer_manager
-                        .broadcast_block_inv_except(tip.hash, peer_id);
-                } else {
-                    self.peer_manager.broadcast_block_inv(tip.hash);
-                }
+                // The peer that sent it has it
+                let sender = (tip.hash == hash).then_some(peer_id);
+                self.peer_manager
+                    .announce_new_tip(tip.hash, tip.height, sender);
             }
         }
 
@@ -4483,6 +4481,122 @@ mod tests {
             vec![fresh_hash],
             "the tip that ends it"
         );
+    }
+
+    /// A regtest chain at genesis with peers 1 to `n`, each having named the
+    /// start height given for it in its version message
+    fn regtest_sync_with_start_heights(
+        heights: &[(PeerId, i64)],
+    ) -> (
+        Arc<BlockSync>,
+        HashMap<PeerId, tokio::sync::mpsc::Receiver<NetworkMessage>>,
+        tempfile::TempDir,
+    ) {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(ChainDatabase::open(dir.path()).unwrap());
+        let params = ChainParams::for_network(
+            divi_storage::NetworkType::Regtest,
+            divi_primitives::ChainMode::Divi,
+        );
+        let chain = Arc::new(Chain::new(db, params).unwrap());
+        let sync = BlockSync::new(chain, PeerManager::new(Default::default()));
+        let rxs = add_test_peers(&sync, heights.len() as u64);
+        for (id, height) in heights {
+            sync.peer_manager
+                .test_peer_stats(*id)
+                .unwrap()
+                .start_height
+                .store(*height, Ordering::Relaxed);
+        }
+        (sync, rxs, dir)
+    }
+
+    /// The next block on `chain`, dated now (or just after its tip), so it is
+    /// out of the initial download
+    fn fresh_next_block(chain: &Chain) -> Block {
+        let mut block = next_block(chain);
+        let now = divi_primitives::clock::now() as u32;
+        block.header.time = now.max(chain.tip().unwrap().time + 1);
+        block.header.nonce = 0;
+        let target = Hash256::from_compact(block.header.bits);
+        while compute_block_hash(&block.header) > target {
+            block.header.nonce += 1;
+        }
+        block
+    }
+
+    /// The block hashes `id` was sent in invs since the last call
+    fn invs_to(
+        rxs: &mut HashMap<PeerId, tokio::sync::mpsc::Receiver<NetworkMessage>>,
+        id: PeerId,
+    ) -> Vec<Hash256> {
+        let mut hashes = Vec::new();
+        while let Ok(msg) = rxs.get_mut(&id).unwrap().try_recv() {
+            if let NetworkMessage::Inv(items) = msg {
+                hashes.extend(items.into_iter().map(|i| i.hash));
+            }
+        }
+        hashes
+    }
+
+    /// Divi Core tells a peer of a new tip only when the tip is above the
+    /// height the peer started at less 2000 (NotifyPeersOfNewChainTip,
+    /// net.cpp:1491-1497): a peer that started far above the tip is not told
+    #[tokio::test]
+    async fn the_new_tip_is_not_announced_to_a_peer_that_started_far_above_it() {
+        // Peer 1 sends the block; peer 2 started 5000 above the new tip,
+        // peer 3 at the new tip
+        let (sync, mut rxs, _dir) = regtest_sync_with_start_heights(&[(1, 1), (2, 5001), (3, 1)]);
+        let block = fresh_next_block(&sync.chain);
+        let hash = compute_block_hash(&block.header);
+        sync.handle_block(1, block).await;
+        assert_eq!(sync.chain.tip().unwrap().hash, hash);
+        assert!(!sync.chain.is_initial_block_download());
+        assert_eq!(invs_to(&mut rxs, 2), vec![], "started far above the tip");
+        assert_eq!(invs_to(&mut rxs, 3), vec![hash], "started at the tip");
+    }
+
+    /// A peer that started exactly 2000 above the new tip is not told of it,
+    /// one that started 1999 above it is (net.cpp:1495, a strict comparison)
+    #[tokio::test]
+    async fn the_new_tip_is_announced_to_a_peer_that_started_less_than_2000_above_it() {
+        let (sync, mut rxs, _dir) =
+            regtest_sync_with_start_heights(&[(1, 1), (2, 2001), (3, 2000)]);
+        let block = fresh_next_block(&sync.chain);
+        let hash = compute_block_hash(&block.header);
+        sync.handle_block(1, block).await;
+        assert_eq!(sync.chain.tip().unwrap().height, 1);
+        assert_eq!(invs_to(&mut rxs, 2), vec![], "started 2000 above the tip");
+        assert_eq!(
+            invs_to(&mut rxs, 3),
+            vec![hash],
+            "started 1999 above the tip"
+        );
+    }
+
+    /// A peer whose version named no start height is not told of a new tip
+    /// up to height 100, the estimate Divi Core uses for it (init.cpp:117,
+    /// net.cpp:1495); a peer that started at 0 is told of each. Block 101 is a
+    /// stake block on regtest: the side above 100 is a network-time row
+    #[tokio::test]
+    async fn the_new_tip_is_not_announced_to_a_peer_with_no_start_height_up_to_100() {
+        let (sync, mut rxs, _dir) = regtest_sync_with_start_heights(&[(1, 1), (2, -1), (3, 0)]);
+        for height in 1..=100u32 {
+            let block = fresh_next_block(&sync.chain);
+            let hash = compute_block_hash(&block.header);
+            sync.handle_block(1, block).await;
+            assert_eq!(sync.chain.tip().unwrap().hash, hash, "height {height}");
+            assert_eq!(
+                invs_to(&mut rxs, 2),
+                vec![],
+                "no start height, tip {height}"
+            );
+            assert_eq!(
+                invs_to(&mut rxs, 3),
+                vec![hash],
+                "started at 0, tip {height}"
+            );
+        }
     }
 
     /// A block whose parent is not known gets the peer that sent it a getblocks

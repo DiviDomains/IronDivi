@@ -1643,6 +1643,39 @@ impl PeerManager {
         info!("Broadcast block inv {} to {} peers", block_hash, peer_count);
     }
 
+    /// Announce a new tip at `tip_height` with a block inv to the peers Divi
+    /// Core tells of it ([`announces_new_tip_to`]), all but `exclude`, the
+    /// peer it came from. A block this node made goes to every peer
+    /// ([`Self::broadcast_block_inv`]), as Divi Core sends its own block
+    /// (CoinMinter.cpp:119, PeerNotificationOfMintService.cpp:19-25)
+    pub fn announce_new_tip(&self, tip_hash: Hash256, tip_height: u32, exclude: Option<PeerId>) {
+        let msg = NetworkMessage::Inv(vec![InvItem::new(InvType::Block, tip_hash)]);
+        let peers = self.peers.read();
+        let mut sent_count = 0;
+        for (peer_id, handle) in peers.iter() {
+            if Some(*peer_id) == exclude
+                || !announces_new_tip_to(
+                    handle.stats.start_height.load(Ordering::Relaxed),
+                    tip_height,
+                )
+            {
+                continue;
+            }
+            if let Err(e) = handle.try_send(msg.clone()) {
+                debug!("Failed to send block inv to peer {}: {}", peer_id, e);
+            } else {
+                sent_count += 1;
+            }
+        }
+        info!(
+            "Announced new tip {} at height {} to {} of {} peers",
+            tip_hash,
+            tip_height,
+            sent_count,
+            peers.len()
+        );
+    }
+
     /// Broadcast a block inv to all connected peers except the one specified.
     ///
     /// Used when relaying a block received from a peer to all other peers.
@@ -2075,6 +2108,19 @@ pub fn testnet_peer_manager(listen_addr: Option<SocketAddr>) -> Arc<PeerManager>
         ..Default::default()
     };
     PeerManager::new(config)
+}
+
+/// Whether Divi Core tells a peer that named `start_height` in its version
+/// (-1: none) of a new tip at `tip_height`: when the tip is above the start
+/// height less 2000, or above 100 for a peer that named none
+/// (NotifyPeersOfNewChainTip net.cpp:1491-1497, the 100 from init.cpp:117)
+pub fn announces_new_tip_to(start_height: i64, tip_height: u32) -> bool {
+    let floor = if start_height != -1 {
+        start_height - 2000
+    } else {
+        100
+    };
+    i64::from(tip_height) > floor
 }
 
 /// Create a peer manager with regtest configuration

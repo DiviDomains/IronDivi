@@ -169,13 +169,16 @@ class Peer:
     with an inv and serves the header and the block when asked, and keeps the reject messages and the block invs it
     is sent"""
 
-    def __init__(self, node):
+    def __init__(self, node, start_height=0):
         self.s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.s.bind(("127.0.0.10", 0))
         self.s.settimeout(30)
         self.s.connect((HOST, node.p2p))
         version = (struct.pack("<iQq", 70915, 1, int(time.time())) + netaddr() + netaddr()
-                   + struct.pack("<Q", secrets.randbits(64)) + b"\x0f/network-time:1/" + struct.pack("<i", 0) + b"\x01")
+                   + struct.pack("<Q", secrets.randbits(64)) + b"\x10/network-time:1/")
+        # A start height of None names none: the version ends after the user agent (main.cpp:386-391)
+        if start_height is not None:
+            version += struct.pack("<i", start_height) + b"\x01"
         self.s.sendall(frame("version", version))
         self.offers = {}
         self.rejects = []
@@ -239,6 +242,10 @@ class Peer:
         inv_hash = bytes.fromhex(block_hash)[::-1]
         self.offers = {inv_hash: (raw[:80 + (32 if version > 3 else 0)], raw)}
         self.s.sendall(frame("inv", b"\x01" + struct.pack("<I", 2) + inv_hash))
+
+    def push(self, block_hex):
+        """Send the block unasked"""
+        self.s.sendall(frame("block", bytes.fromhex(block_hex)))
 
     def reject_reasons(self):
         out = []
@@ -512,6 +519,56 @@ try:
 finally:
     for w in watchers.values():
         w.close()
+    for n in (maker, core, iron):
+        if n:
+            n.stop()
+
+# --- part 3: the peers a new tip is announced to, by the start height of their version ---------------------------
+
+maker = core = iron = None
+watchers = {}
+try:
+    maker = Node("maker-3", DIVID, 5)
+    core = Node("divid-3", DIVID, 6)
+    iron = Node("irondivid-3", IRONDIVID, 7)
+    # Blocks on the system clock, so the first ends the initial block download
+    blocks = []
+    for _ in range(101):
+        if gen(maker)[0] != "ok":
+            raise RuntimeError("maker could not mine")
+        best = maker.rpc("getbestblockhash")
+        blocks.append((maker.rpc("getblock", best, False), best))
+    # divid tells a peer of a new tip when the tip is above its start height less 2000, or above 100 when it named
+    # none (NotifyPeersOfNewChainTip net.cpp:1491-1497, the 100 from init.cpp:117). Its own mined blocks go to every
+    # peer (CoinMinter.cpp:119), so these blocks come from a script peer
+    starts = (5000, 2001, 2000, 0, None)
+    watchers = {n.name: [Peer(n, h) for h in starts] for n in (core, iron)}
+
+    def invs_for(node, part):
+        """Send `part` of the blocks from a script peer; the node's height, and the block invs each watcher was sent"""
+        before = [len(w.block_invs()) for w in watchers[node.name]]
+        peer = Peer(node)
+        try:
+            # Sent unasked: irondivid, syncing headers from the peer that started at 5000, does not ask the
+            # offering peer for a block it announces
+            for h, b in part:
+                peer.push(h)
+                if not wait_for(lambda: node.call("getblock", b)[0] == "ok", 8):
+                    raise RuntimeError(f"{node.name} did not take {b}")
+        finally:
+            peer.close()
+        # The peer that started at 0 is told of every block by both; then a moment for any late inv
+        wait_for(lambda: len(watchers[node.name][3].block_invs()) - before[3] >= len(part), 30)
+        time.sleep(3)
+        return node.rpc("getblockcount"), [len(w.block_invs()) - b for w, b in zip(watchers[node.name], before)]
+    c, i = both(lambda n: invs_for(n, blocks[:1]))
+    row("new-tip invs for block 1 to peers that started at 5000, 2001, 2000, 0 and none", c, i)
+    c, i = both(lambda n: invs_for(n, blocks[1:]))
+    row("new-tip invs for blocks 2 to 101 to peers that started at 5000, 2001, 2000, 0 and none", c, i)
+finally:
+    for ws in watchers.values():
+        for w in ws:
+            w.close()
     for n in (maker, core, iron):
         if n:
             n.stop()
