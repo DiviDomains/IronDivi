@@ -15,8 +15,9 @@
 use std::path::{Path, PathBuf};
 
 /// The ways to start a task or a thread (split, so this file does not match)
-const SPAWNS: [&str; 4] = [
+const SPAWNS: [&str; 5] = [
     concat!("tokio::", "spawn("),
+    concat!("spawn_", "blocking("),
     concat!("thread::", "spawn("),
     concat!("task::", "spawn("),
     concat!("thread::Builder", "::new()"),
@@ -37,9 +38,11 @@ const NODE_CRATES: [&str; 10] = [
     "divi-electrum",
 ];
 
-/// Starts in the node crates when A4 landed; none may be added
-const CRATE_SPAWNS: [(&str, usize); 14] = [
-    ("divi-electrum/src/lib.rs", 3),
+/// Starts in the node crates when A4 landed (`spawn_blocking` counted
+/// since chunk 3); none may be added
+const CRATE_SPAWNS: [(&str, usize); 15] = [
+    ("divi-electrum/src/lib.rs", 4),
+    ("divi-electrum/src/session.rs", 1),
     ("divi-network/src/peer_manager.rs", 11),
     ("divi-network/src/socks5.rs", 3),
     ("divi-network/src/sync.rs", 1),
@@ -48,11 +51,11 @@ const CRATE_SPAWNS: [(&str, usize); 14] = [
     ("divi-node/src/zmq.rs", 5),
     ("divi-rpc/src/network.rs", 3),
     ("divi-rpc/src/rest.rs", 1),
-    ("divi-rpc/src/server.rs", 3),
+    ("divi-rpc/src/server.rs", 4),
     ("divi-storage/src/chain.rs", 2),
     ("divi-wallet/src/keystore.rs", 1),
     ("divi-wallet/src/wallet_db.rs", 1),
-    ("divi-webui/src/lib.rs", 1),
+    ("divi-webui/src/lib.rs", 5),
 ];
 
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -71,7 +74,9 @@ fn root() -> PathBuf {
 }
 
 fn spawns(text: &str) -> usize {
-    SPAWNS.iter().map(|s| text.matches(s).count()).sum()
+    // `tasks::spawn_blocking(` is the named form tasks.rs gives
+    let named = text.matches(concat!("tasks::spawn_", "blocking(")).count();
+    SPAWNS.iter().map(|s| text.matches(s).count()).sum::<usize>() - named
 }
 
 #[test]

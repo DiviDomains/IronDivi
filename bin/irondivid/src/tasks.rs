@@ -20,25 +20,46 @@
 //!   `catch_unwind` in the node (a test keeps it so), so a main-thread
 //!   panic always ends the node. Before that `catch_unwind` is entered, the
 //!   hook exits 101 itself;
-//! - any other task or thread: it ends, and the node goes on.
+//! - any other task or thread: it ends, and the node goes on. Its panic is
+//!   also a `task-failed` record in events.log (name and place, no
+//!   message), an incident (A12), and one more in health's `panics` count.
+//!
+//! A task started with the `_result` forms returns a `Result`: a critical
+//! task's error ends the node
+//! with `die(10, "Error: <name>: <error>")`; a supervised task's error is a
+//! `task-failed cause=error` record in events.log with its name, and the
+//! error text goes to debug.log through the logging layers.
+//!
+//! Blocking work goes through [`spawn_blocking`], which names it and keeps
+//! the caller's task name for its panics.
+//!
+//! The default hook's message to stderr stays: it is the panic text, which
+//! crash.log also holds, and stderr is the console (or /dev/null under
+//! -daemon), never a file the node shares.
 //!
 //! Each crash.log entry ends with the debug ring (A8).
 //!
-//! Not yet: the A11 counters in the crash record,
-//! A11's wrapping of wallet values in the message, and events.log and the
-//! health count for a supervised task. The node crates still start their
-//! own tasks; a test keeps their number from growing.
+//! Not yet: the A11 counters in the crash record, and A11's wrapping of
+//! wallet values in the message. The node crates still start their own
+//! tasks; a test keeps their number from growing.
 
 use std::cell::Cell;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 /// `<datadir>/diag/crash.log`, once the data directory is known
 static CRASH_LOG: OnceLock<PathBuf> = OnceLock::new();
 /// Main has entered its `catch_unwind`
 static MAIN_CAUGHT: AtomicBool = AtomicBool::new(false);
+/// Panics of supervised tasks and threads since start (health, A6)
+static PANICS: AtomicU64 = AtomicU64::new(0);
+
+/// Panics of supervised tasks and threads since start
+pub fn panics() -> u64 {
+    PANICS.load(Ordering::Relaxed)
+}
 
 thread_local! {
     /// The name of a critical thread, on that thread
@@ -109,6 +130,13 @@ fn record(info: &std::panic::PanicHookInfo<'_>, thread: &str, task: Option<&str>
         crate::runs_log::yes(ends)
     );
     crate::runs_log::record("panic", &fields);
+    if !ends {
+        PANICS.fetch_add(1, Ordering::Relaxed);
+        crate::events::event("task-failed", &format!("cause=panic {}", fields));
+        if let Some(n) = crate::incidents::write("panic", &fields) {
+            crate::events::event("incident", &format!("n={} kind=panic", n));
+        }
+    }
 
     let Some(path) = CRASH_LOG.get() else {
         return;
@@ -149,12 +177,62 @@ where
     tokio::spawn(TASK.scope((name, true), fut))
 }
 
+/// A critical task that can fail: its error ends the node like its panic,
+/// through `die(10, "Error: <name>: <error>")`
+pub fn spawn_critical_result<F, E>(name: &'static str, fut: F) -> tokio::task::JoinHandle<()>
+where
+    F: Future<Output = Result<(), E>> + Send + 'static,
+    E: std::fmt::Display,
+{
+    spawn_critical(name, async move {
+        if let Err(e) = fut.await {
+            crate::die(
+                crate::exit_code::FAILED,
+                format_args!("Error: {}: {}", name, e),
+            );
+        }
+    })
+}
+
 /// Start a task whose panic ends it alone
 pub fn spawn_supervised<F>(name: &'static str, fut: F) -> tokio::task::JoinHandle<()>
 where
     F: Future<Output = ()> + Send + 'static,
 {
     tokio::spawn(TASK.scope((name, false), fut))
+}
+
+/// A supervised task that can fail: its error ends it alone, and is
+/// recorded
+pub fn spawn_supervised_result<F, E>(name: &'static str, fut: F) -> tokio::task::JoinHandle<()>
+where
+    F: Future<Output = Result<(), E>> + Send + 'static,
+    E: std::fmt::Display,
+{
+    spawn_supervised(name, async move {
+        if let Err(e) = fut.await {
+            supervised_error(name, &e.to_string());
+        }
+    })
+}
+
+fn supervised_error(name: &str, error: &str) {
+    tracing::warn!("task {} failed: {}", name, error);
+    crate::events::event(
+        "task-failed",
+        &format!("cause=error task={}", crate::runs_log::quote(name)),
+    );
+}
+
+/// Run blocking work on tokio's blocking pool, named; a panic in it is
+/// reported under the calling task (or `name` outside one)
+pub fn spawn_blocking<F, R>(name: &'static str, f: F) -> tokio::task::JoinHandle<R>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    let task = TASK.try_with(|t| *t).unwrap_or((name, false));
+    tokio::task::spawn_blocking(move || TASK.sync_scope(task, f))
 }
 
 /// Start a named thread
@@ -180,7 +258,8 @@ where
 }
 
 /// Regtest only: `IRONDIVI_TEST_PANIC` lists the panics the A4 tests ask
-/// for (`task`, `critical-task`, `critical-thread`, `main`)
+/// for (`task`, `critical-task`, `critical-thread`, `main`), and the errors
+/// (`task-error`, `critical-error`)
 pub fn test_panic(regtest: bool, what: &str) -> bool {
     regtest && std::env::var("IRONDIVI_TEST_PANIC").is_ok_and(|v| v.split(',').any(|w| w == what))
 }
@@ -197,6 +276,17 @@ pub fn start_test_panics(regtest: bool) {
         spawn_critical("test-panic", async move {
             tokio::time::sleep(wait).await;
             panic!("{}", message)
+        });
+    }
+    if test_panic(regtest, "task-error") {
+        spawn_supervised_result("test-error", async move {
+            Err::<(), _>("test error: this text stays in debug.log")
+        });
+    }
+    if test_panic(regtest, "critical-error") {
+        spawn_critical_result("test-error", async move {
+            tokio::time::sleep(wait).await;
+            Err::<(), _>("test error")
         });
     }
     if test_panic(regtest, "critical-thread") {

@@ -189,6 +189,11 @@ fn last_run(path: &Path) -> u64 {
 }
 
 /// This run's number (`run=` of its start record); 0 before runs.log is open
+/// Time since `note_launch` (zero before it)
+pub(crate) fn since_launch() -> std::time::Duration {
+    LAUNCH.get().map_or(std::time::Duration::ZERO, |l| l.at.elapsed())
+}
+
 pub fn run_number() -> u64 {
     RUN.get().map_or(0, |r| r.0)
 }
@@ -487,7 +492,7 @@ fn civil(days: i64) -> (i64, i64, i64) {
 }
 
 /// The monotonic clock, seconds with microseconds
-fn mono_now() -> String {
+pub(crate) fn mono_now() -> String {
     let mut ts = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,

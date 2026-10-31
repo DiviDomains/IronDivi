@@ -24,6 +24,9 @@
 mod core_files;
 #[cfg(unix)]
 mod crash;
+mod events;
+mod health;
+mod incidents;
 mod interfaces;
 mod log_delivery;
 mod log_filter;
@@ -2077,6 +2080,13 @@ async fn run_daemon(
     }
 
     info!("Node started, chain height: {}", node.chain().height());
+    health::start(health::Handles {
+        chain: node.chain().clone(),
+        block_sync: node.block_sync().clone(),
+        peers: node.peer_manager().clone(),
+        mempool: node.mempool().clone(),
+        data_dir: config.data_dir.clone(),
+    });
 
     // Get chain and peer manager references for RPC server
     let chain = node.chain().clone();
@@ -2305,7 +2315,7 @@ async fn run_daemon(
                         daily.tick().await;
                         let wallet = Arc::clone(&wallet_for_backup);
                         let root = root.clone();
-                        let made = tokio::task::spawn_blocking(move || {
+                        let made = tasks::spawn_blocking("wallet-backup", move || {
                             divi_wallet::backup::monthly_backup(&wallet, &root)
                         })
                         .await;
@@ -2358,7 +2368,7 @@ async fn run_daemon(
                     .unwrap_or(0);
                 let chain = chain_for_prune.clone();
                 let res =
-                    tokio::task::spawn_blocking(move || chain.prune_expired(expire, floor, now))
+                    tasks::spawn_blocking("block-expiry", move || chain.prune_expired(expire, floor, now))
                         .await;
                 match res {
                     Ok(Ok(0)) => {}
@@ -2623,6 +2633,17 @@ async fn run_daemon(
                         let staker_for_status = Arc::clone(staker_arc);
                         let staker_for_control = Arc::clone(staker_arc);
                         let wallet_for_status = Arc::clone(&wallet_for_staking_status);
+                        let staker_for_health = Arc::clone(staker_arc);
+                        let wallet_for_health = Arc::clone(&wallet_for_staking_status);
+                        health::set_staking(Box::new(move || {
+                            let status = staker_for_health.get_status();
+                            health::Staking {
+                                enabled: status.enabled,
+                                mintable_coins: status.mintable_coins,
+                                wallet_locked: wallet_for_health.is_locked(),
+                                last_stake_time: status.last_stake_time,
+                            }
+                        }));
                         let chain_for_status = Arc::clone(&chain_for_staking_status);
                         let peers_for_status = Arc::clone(&peers_for_staking_status);
 
@@ -3533,18 +3554,28 @@ fn main() {
 
     // A credential change would make the process dumpable again, and a pipe core handler
     // would then store a core holding wallet keys (NODE-10). A plain thread, started after
-    // the forks and before the wallet opens, so a stalled runtime cannot stop it. Until the
-    // health log exists this is its own tick, at the health log's 60 s rate.
+    // the forks and before the wallet opens, so a stalled runtime cannot stop it. Its own
+    // thread at the health tick's rate (10 s for the first 10 minutes, then 60 s); health.log
+    // carries the value it read, and a reset is an events.log record.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     if let Err(e) = tasks::thread("dumpable-check", tasks::Kind::Supervised, || loop {
-            std::thread::sleep(std::time::Duration::from_secs(60));
+            use std::sync::atomic::Ordering;
+            match private_files::restore_non_dumpable() {
+                Some((was, reset)) => {
+                    health::DUMPABLE.store(was, Ordering::Relaxed);
+                    health::DUMPABLE_RESETS.fetch_add(1, Ordering::Relaxed);
+                    let result = if reset.is_ok() { "ok" } else { "error" };
+                    events::event("dumpable-reset", &format!("was={} result={}", was, result));
+                    match reset {
+                        Ok(()) => warn!("dumpable restored (was {})", was),
+                        Err(e) => error!("dumpable is {} and could not be reset: {}", was, e),
+                    }
+                }
+                None => health::DUMPABLE.store(0, Ordering::Relaxed),
+            }
             // The maps copy a crash record carries (A5)
             crash::refresh_maps();
-            match private_files::restore_non_dumpable() {
-                Some((was, Ok(()))) => warn!("dumpable restored (was {})", was),
-                Some((was, Err(e))) => error!("dumpable is {} and could not be reset: {}", was, e),
-                None => {}
-            }
+            std::thread::sleep(health::interval());
         })
     {
         console!("Warning: could not start the core dump check: {}", e);
@@ -3655,6 +3686,8 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
         let network = format!("{}/{:?}", network, args.chain_mode()).to_lowercase();
         runs_log::open(&data_dir, &network, cfg!(unix) && args.daemon);
         tasks::set_data_dir(&data_dir);
+        events::set_data_dir(&data_dir);
+        incidents::set_data_dir(&data_dir);
         #[cfg(unix)]
         {
             crash::open(&data_dir);

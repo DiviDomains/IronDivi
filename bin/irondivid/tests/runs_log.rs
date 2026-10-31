@@ -488,12 +488,31 @@ fn crash_log(dir: &Path) -> String {
 #[test]
 fn a_task_panic_is_recorded_and_a_main_panic_exits_101() {
     let dir = tempfile::tempdir().unwrap();
-    let (mut node, rpc_port) = start_with(dir.path(), &[("IRONDIVI_TEST_PANIC", "task,main")]);
+    let (mut node, rpc_port) = start_with(
+        dir.path(),
+        &[("IRONDIVI_TEST_PANIC", "task,task-error,main")],
+    );
     let log = wait_for(dir.path(), " task=\"test-panic\" ");
     let panic = log.lines().find(|l| l.contains(" panic ")).expect(&log);
     assert!(panic.ends_with(" ends_node=no"), "{log}");
     assert!(panic.contains("tasks.rs:"), "{log}");
     assert!(rpc(rpc_port, "getblockcount").is_some(), "the node stopped");
+
+    // events.log: the panic (no message) and the error, by name; the
+    // panic is an incident and one in health's count
+    let events = wait_for_file(dir.path(), "diag/events.log", "cause=error");
+    let failed = events
+        .lines()
+        .find(|l| l.contains(" task-failed ") && l.contains(" cause=panic "))
+        .unwrap_or_else(|| panic!("{events}"));
+    assert!(failed.contains(" task=\"test-panic\" "), "{events}");
+    assert!(events.contains(" cause=error task=\"test-error\""), "{events}");
+    assert!(!events.contains("stays in"), "{events}");
+    let info = std::fs::read_to_string(dir.path().join("diag/incidents/1/info.txt")).unwrap();
+    assert!(info.starts_with("kind=panic\n"), "{info}");
+    assert!(dir.path().join("diag/incidents/1/ring.txt").exists());
+    let health = wait_for_file(dir.path(), "diag/health.log", " panics=1 ");
+    assert!(!health.contains(" panics=2 "), "{health}");
 
     rpc(rpc_port, "stop").expect("stop reply");
     assert_eq!(wait_exit(&mut node).code(), Some(101));
@@ -521,6 +540,90 @@ fn a_task_panic_is_recorded_and_a_main_panic_exits_101() {
         std::fs::metadata(p).unwrap().permissions().mode() & 0o777
     };
     assert_eq!(mode, 0o600);
+}
+
+/// Wait for `what` in `<dir>/<name>`; returns the file
+fn wait_for_file(dir: &Path, name: &str, what: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let text = std::fs::read_to_string(dir.join(name)).unwrap_or_default();
+        if text.contains(what) {
+            return text;
+        }
+        assert!(Instant::now() < deadline, "no {what:?} in {name}:\n{text}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// A6: health.log gets a line at start and every 10 s, with every group of
+/// fields; the dumpable check's value is in it
+#[test]
+fn health_writes_a_line_with_each_group_of_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut node, rpc_port) = start(dir.path());
+    let health = wait_for_file(dir.path(), "diag/health.log", " health run=1 ");
+    let line = health.lines().next().unwrap();
+    for field in [
+        " rss_kb=",
+        " fds=",
+        " fd_source=",
+        " cpu_s=",
+        " io_blocks_in=",
+        " load=",
+        " disk_free_mb=",
+        " suspended_s=",
+        " clock_synced=",
+        " height=0 ",
+        " lag=0 ",
+        " peers_in=0 ",
+        " mempool_txs=0 ",
+        " staking=",
+        " panics=0 ",
+        " dropped_lines=",
+        " sigpipe=0 ",
+        " rpc_calls=n/a ",
+        " dumpable=",
+        " dumpable_resets=0",
+    ] {
+        assert!(line.contains(field), "{field}: {line}");
+    }
+    assert!(line.contains(" fd_source=fd/ "), "{line}");
+    // A second line, at the 10 s tick, reads the dumpable check's value
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let health = std::fs::read_to_string(dir.path().join("diag/health.log")).unwrap();
+        if health.lines().count() >= 2 {
+            let second = health.lines().nth(1).unwrap();
+            assert!(second.contains(" dumpable=0 "), "{second}");
+            break;
+        }
+        assert!(Instant::now() < deadline, "{health}");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let mode = {
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.path().join("diag/health.log");
+        std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+    };
+    assert_eq!(mode, 0o600);
+    rpc(rpc_port, "stop").expect("stop reply");
+    assert!(wait_exit(&mut node).success());
+}
+
+/// A4: a critical task that returns an error ends the node through die()
+/// with code 10, naming it and the error
+#[test]
+fn a_critical_task_error_ends_the_run_with_code_10() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = start_with(dir.path(), &[("IRONDIVI_TEST_PANIC", "critical-error")]).0;
+    assert_eq!(wait_exit(&mut node).code(), Some(10));
+    let log = runs_log(dir.path());
+    let exit = log.lines().find(|l| l.contains(" exit code=")).expect(&log);
+    assert!(
+        exit.contains(" reason=\"Error: test-error: test error\" "),
+        "{log}"
+    );
+    assert!(marker(dir.path()).is_none());
 }
 
 /// A4: a critical task's or thread's panic ends the node with code 10,

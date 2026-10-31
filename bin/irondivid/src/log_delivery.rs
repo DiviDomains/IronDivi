@@ -85,7 +85,6 @@ pub fn set_sink(w: Box<dyn Write + Send>) {
 }
 
 /// Lines dropped since start (health, A6)
-#[allow(dead_code)]
 pub fn dropped_total() -> u64 {
     DROPPED_TOTAL.load(Ordering::Relaxed)
 }
