@@ -366,9 +366,35 @@ fn re_hex64() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"(blk:|sha256:)?\b([0-9a-fA-F]{64})\b").unwrap())
 }
 
-/// (a), (c) and (d) on a line that is kept
+/// A6 `tip_moved_s=<N>` (health ticks, stall records and their incident
+/// copies): with the record's time it dates, to the second, when this node
+/// got its tip, and so the gap from that block's header time, which can tell
+/// an own stake (§6.2 (e), AB3). In the package it becomes a bucket; the
+/// tick's own time and height bound the arrival only to the tick, as A6
+/// allows for the height column.
+fn re_tip_moved() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"\btip_moved_s=(\d+(?:\.\d+)?)").unwrap())
+}
+
+pub fn tip_moved_bucket(secs: f64) -> &'static str {
+    if secs < 120.0 {
+        "<2m"
+    } else if secs < 600.0 {
+        "2-10m"
+    } else if secs < 3600.0 {
+        "10-60m"
+    } else {
+        ">60m"
+    }
+}
+
+/// (a), (c) and (d) on a line that is kept, and the A6 tip age bucket
 fn plain_rules(l: &str, r: &Redactor) -> String {
-    let t = re_hex64().replace_all(l, |c: &regex::Captures| {
+    let l = re_tip_moved().replace_all(l, |c: &regex::Captures| {
+        format!("tip_moved_s={}", tip_moved_bucket(c[1].parse().unwrap_or(f64::MAX)))
+    });
+    let t = re_hex64().replace_all(&l, |c: &regex::Captures| {
         if c.get(1).is_some() {
             c[0].to_string()
         } else {
@@ -493,6 +519,22 @@ mod tests {
 
     fn r() -> Redactor {
         Redactor::new([3; 32], &Known::default())
+    }
+
+    #[test]
+    fn tip_age_is_bucketed() {
+        let log = "\
+2026-10-30T10:00:07Z mono=99.1 health run=3 height=900 tip_moved_s=7 lag=0
+2026-10-30T10:02:07Z mono=219.1 stall run=3 height=900 lag=0 tip_moved_s=127 clock=boottime
+2026-10-30T11:02:07Z mono=3819.1 stall run=3 height=900 lag=0 tip_moved_s=3727.4
+";
+        let f = filter(log, &r());
+        assert!(f.text.contains("tip_moved_s=<2m lag=0"), "{}", f.text);
+        assert!(f.text.contains("tip_moved_s=2-10m clock"), "{}", f.text);
+        assert!(f.text.contains("tip_moved_s=>60m"), "{}", f.text);
+        for v in ["tip_moved_s=7 ", "=127", "3727"] {
+            assert!(!f.text.contains(v), "{}", f.text);
+        }
     }
 
     #[test]

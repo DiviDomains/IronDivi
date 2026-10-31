@@ -489,10 +489,20 @@ Tested on hp1, hp2 and hp3 as a user and as root; on macOS only
   invalid JSON; the mask is now quoted. Not built: `--rpc-clear`,
   `--host`, `--tx` (B6.3), the own-staked-block lookup, the call-argument
   own pseudonym (a `getreceivedbyaddress` address argument shows as
-  `<addr>`), and a preview before consent beyond the summary. Open: the
-  tip hash in `getblockchaininfo` keeps its `blk:` form, as it already
-  does in live-node.txt and chaindb.txt; the tip can be an own staked
-  block. Tested for real on hp1 on a regtest node with 50 mined blocks:
+  `<addr>`), and a preview before consent beyond the summary. The tip
+  hash in `getblockchaininfo` keeps its `blk:` form, as in live-node.txt
+  and chaindb.txt, and is public under A11 even when this wallet staked
+  it: every synced node reports the same tip, so a snapshot tip says
+  nothing about whose block it is. The own-stake rule forbids a
+  difference in timing, count or order, and one field gave timing: A6's
+  `tip_moved_s=<N>` (health ticks, stall records, incidents) with the
+  record time dated this node's arrival of the tip to the second, so the
+  gap from the header time. The §6.2 old-log filter now writes it as a
+  bucket (`<2m`, `2-10m`, `10-60m`, `>60m`); the tick time and height
+  still bound arrival to the 10 s or 60 s tick, which A6 allows. Checked
+  and left as they are: getblockchaininfo `mediantime` (public, header
+  based), getpeerinfo `lastrecv` (per peer, not per block), capture's 10 s
+  height column, and storage's mtimes (RocksDB files skipped). Tested for real on hp1 on a regtest node with 50 mined blocks:
   19 calls and 5 refusals, every answer valid JSON, and none of the 51
   block hashes (other than the `blk:` tip), 100 txids, the addresses,
   the hostname, the user, the home path or `rpcpassword` reached the
