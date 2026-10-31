@@ -23,6 +23,7 @@
 
 mod core_files;
 mod interfaces;
+mod log_delivery;
 mod log_filter;
 mod private_files;
 mod running_marker;
@@ -1476,15 +1477,26 @@ fn set_log_levels(spec: &str) -> std::result::Result<String, String> {
     Ok(levels.spec())
 }
 
-/// Initialize logging
+/// One layer of the logger, as the registry takes it
+type BoxLayer = Box<dyn tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync>;
+
+/// Initialize logging. Every layer has its own filter (A8): the configured
+/// levels govern debug.log and the console, the debug ring takes debug of
+/// our own code whatever they are and leaves counted lines out.
 fn init_logging(log_config: &LogConfig, levels: &log_filter::LogLevels, data_dir: &PathBuf) {
+    use tracing_subscriber::Layer as _;
     // RUST_LOG, when set, replaces -loglevel and -debug
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(levels.directives()));
-    // First on the registry, so the handle's type does not depend on the
-    // writer chosen below
     let (filter, handle) = tracing_subscriber::reload::Layer::new(filter);
     let _ = LOG_FILTER.set(handle);
+    let ring: BoxLayer = log_delivery::ring_layer(&log_delivery::RING).boxed();
+    let console = |filter: tracing_subscriber::reload::Layer<EnvFilter, tracing_subscriber::Registry>| -> BoxLayer {
+        fmt::layer()
+            .fmt_fields(log_delivery::Fields)
+            .with_filter(filter)
+            .boxed()
+    };
 
     // In daemon mode the console is debug.log itself, so it rotates like it
     let std_is_log = stderr_is_file(&data_dir.join("debug.log"));
@@ -1492,8 +1504,7 @@ fn init_logging(log_config: &LogConfig, levels: &log_filter::LogLevels, data_dir
     if log_config.print_to_console && !std_is_log {
         // Log to console only
         tracing_subscriber::registry()
-            .with(filter)
-            .with(fmt::layer())
+            .with(vec![console(filter), ring])
             .init();
     } else {
         // Log to file (debug.log in data directory) like C++ divid
@@ -1505,8 +1516,7 @@ fn init_logging(log_config: &LogConfig, levels: &log_filter::LogLevels, data_dir
             );
             // Fall back to console logging
             tracing_subscriber::registry()
-                .with(filter)
-                .with(fmt::layer())
+                .with(vec![console(filter), ring])
                 .init();
             return;
         }
@@ -1532,27 +1542,22 @@ fn init_logging(log_config: &LogConfig, levels: &log_filter::LogLevels, data_dir
                     e
                 );
                 tracing_subscriber::registry()
-                    .with(filter)
-                    .with(fmt::layer())
+                    .with(vec![console(filter), ring])
                     .init();
                 return;
             }
         };
 
-        // Create a non-blocking writer to avoid blocking the async runtime
-        let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
-
-        // Kept until the process exits, when `flush_log` writes out what it
-        // still holds
-        *LOG_GUARD.lock().unwrap_or_else(|e| e.into_inner()) = Some(_guard);
-
-        // Set up file logging with timestamps
-        tracing_subscriber::registry()
-            .with(filter)
-            .with(
-                fmt::layer().with_writer(non_blocking).with_ansi(false), // No ANSI colors in file
-            )
-            .init();
+        // Written on the caller's thread until the node runs, then by the
+        // writer thread with a 2 s bound (A8)
+        log_delivery::set_sink(Box::new(file_appender));
+        let file: BoxLayer = fmt::layer()
+            .fmt_fields(log_delivery::Fields)
+            .with_writer(log_delivery::DebugLog)
+            .with_ansi(false) // No ANSI colors in file
+            .with_filter(filter)
+            .boxed();
+        tracing_subscriber::registry().with(vec![file, ring]).init();
 
         console!("Logging to {:?}", data_dir.join("debug.log"));
         console!(
@@ -1570,15 +1575,9 @@ fn init_logging(log_config: &LogConfig, levels: &log_filter::LogLevels, data_dir
     }
 }
 
-/// The writer thread of debug.log (non-blocking): dropping its guard writes
-/// out the lines it still holds
-static LOG_GUARD: std::sync::Mutex<Option<tracing_appender::non_blocking::WorkerGuard>> =
-    std::sync::Mutex::new(None);
-
-/// Write out the log lines not yet in debug.log (waits a second at most)
+/// Write out the log lines not yet in debug.log (waits 2 s at most, A8)
 fn flush_log() {
-    let guard = LOG_GUARD.lock().unwrap_or_else(|e| e.into_inner()).take();
-    drop(guard);
+    log_delivery::flush(log_delivery::BOUND);
     use std::io::Write as _;
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
@@ -2493,6 +2492,8 @@ async fn run_daemon(
     info!("Starting RPC server on {}...", rpc_config.bind_address);
     // Start-up is done: say so, or a slow start and a running node look alike
     runs_log::phase("running");
+    // From here a slow disk holds the writer thread, not the node (A8)
+    log_delivery::start_writer();
     tasks::start_test_panics(config.network.network_type == NetworkType::Regtest);
     if !config.log.print_to_console {
         console!("IronDivi is running (chain height {}).", chain.height());

@@ -14,9 +14,9 @@
 //! monotonic clock in seconds), the record's kind and `key=value` fields.
 //! Every record is written by its caller with one `write` and then
 //! `fdatasync`; `die()` writes the `exit` record this way before it ends the
-//! process. (Interim: A8's writer thread and its `dropped` count are not
-//! built yet, and records made before the data directory is known go
-//! nowhere until A14's `_unresolved/` mirror exists.)
+//! process. A8's writer thread writes a `dropped` record when its queue
+//! drains after dropping lines. (Interim: records made before the data
+//! directory is known go nowhere until A14's `_unresolved/` mirror exists.)
 //!
 //! No record holds an option's value, an address or anything about a block
 //! or transaction: the lines are the same for every node.

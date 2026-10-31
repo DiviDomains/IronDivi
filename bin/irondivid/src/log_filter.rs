@@ -49,7 +49,7 @@ pub const CATEGORIES: &[(&str, &[&str])] = &[
 ];
 
 /// Every target of IronDivi's own code (`swap_` covers the swap-* crates)
-const OUR_TARGETS: &[&str] = &["divi_", "swap_", "zmq", "irondivid"];
+pub(crate) const OUR_TARGETS: &[&str] = &["divi_", "swap_", "zmq", "irondivid"];
 
 /// The level of everything that is not IronDivi's own code
 const LIBRARY_LEVEL: &str = "warn";

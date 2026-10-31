@@ -22,7 +22,9 @@
 //!   hook exits 101 itself;
 //! - any other task or thread: it ends, and the node goes on.
 //!
-//! Not yet: the debug ring (A8) and the A11 counters in the crash record,
+//! Each crash.log entry ends with the debug ring (A8).
+//!
+//! Not yet: the A11 counters in the crash record,
 //! A11's wrapping of wallet values in the message, and events.log and the
 //! health count for a supervised task. The node crates still start their
 //! own tasks; a test keeps their number from growing.
@@ -117,14 +119,16 @@ fn record(info: &std::panic::PanicHookInfo<'_>, thread: &str, task: Option<&str>
         .map(|s| s.to_string())
         .or_else(|| payload.downcast_ref::<String>().cloned())
         .unwrap_or_else(|| "(not text)".to_string());
-    let entry = format!(
-        "{} panic {} pid={}\nmessage: {}\nbacktrace:\n{}\n\n",
+    let mut entry = format!(
+        "{} panic {} pid={}\nmessage: {}\nbacktrace:\n{}\ndebug ring (A8, oldest first):\n",
         crate::runs_log::utc_now(),
         fields,
         std::process::id(),
         crate::runs_log::quote(&message),
         std::backtrace::Backtrace::force_capture()
     );
+    crate::log_delivery::RING.for_each(|l| entry.push_str(&String::from_utf8_lossy(l)));
+    entry.push('\n');
     let mut options = std::fs::OpenOptions::new();
     options.create(true).append(true);
     #[cfg(unix)]
