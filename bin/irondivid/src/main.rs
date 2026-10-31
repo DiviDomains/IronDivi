@@ -3050,11 +3050,17 @@ fn main() -> Result<()> {
     };
     // divid's AppInit: -?, -help and -version print and exit 1 (divid.cpp)
     if args.help || args.version {
-        print!(
-            "IronDivi Daemon version v{}\n{}",
-            env!("CARGO_PKG_VERSION"),
-            if args.help { USAGE } else { "" }
-        );
+        // Through console_out!: print! panics on EPIPE, and the exit code
+        // would be 101 (D2). Byte for byte what print! wrote.
+        if args.help {
+            console_out!(
+                "IronDivi Daemon version v{}\n{}",
+                env!("CARGO_PKG_VERSION"),
+                USAGE.strip_suffix('\n').unwrap_or(USAGE)
+            );
+        } else {
+            console_out!("IronDivi Daemon version v{}", env!("CARGO_PKG_VERSION"));
+        }
         std::process::exit(1);
     }
     // ... a -datadir that is not a directory is refused (divid.cpp)
