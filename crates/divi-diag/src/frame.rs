@@ -44,6 +44,8 @@ pub struct Out {
     w: std::io::Stdout,
     buf: Vec<u8>,
     open: bool,
+    /// tests: keep the frames' text here instead of writing stdout
+    cap: Option<Vec<u8>>,
 }
 
 impl Default for Out {
@@ -54,10 +56,31 @@ impl Default for Out {
 
 impl Out {
     pub fn new() -> Self {
-        Out { w: std::io::stdout(), buf: Vec::new(), open: false }
+        Out { w: std::io::stdout(), buf: Vec::new(), open: false, cap: None }
+    }
+
+    /// An `Out` that keeps everything in memory (`--- <file>` lines mark
+    /// file switches); read it back with [`Out::captured`]
+    pub fn capture() -> Self {
+        Out { w: std::io::stdout(), buf: Vec::new(), open: false, cap: Some(Vec::new()) }
+    }
+
+    pub fn captured(&mut self) -> String {
+        self.flush();
+        String::from_utf8_lossy(self.cap.as_deref().unwrap_or_default()).into_owned()
     }
 
     fn frame(&mut self, t: u8, body: &[u8]) {
+        if let Some(c) = self.cap.as_mut() {
+            if t == b'F' {
+                c.extend_from_slice(b"--- ");
+                c.extend_from_slice(body);
+                c.push(b'\n');
+            } else {
+                c.extend_from_slice(body);
+            }
+            return;
+        }
         let mut lock = self.w.lock();
         let _ = lock.write_all(&[t]);
         let _ = lock.write_all(&(body.len() as u32).to_le_bytes());

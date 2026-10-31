@@ -16,6 +16,14 @@ serde_json = { workspace = true }
 toml = { workspace = true }
 regex = "1.12"
 libc = "0.2"
+rocksdb = { workspace = true, optional = true }
+
+[features]
+# B2.8 opens the chain database as a RocksDB secondary. Off only for a
+# cross-check that cannot compile RocksDB's C++ (darwin from hp3).
+default = ["chaindb"]
+chaindb = ["dep:rocksdb"]
 
 [dev-dependencies]
 tempfile = { workspace = true }
+divi-storage = { workspace = true }

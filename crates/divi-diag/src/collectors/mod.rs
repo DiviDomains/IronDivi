@@ -17,6 +17,7 @@ use crate::util::{self, CmdOut};
 use std::path::Path;
 use std::time::Duration;
 
+pub mod chain;
 pub mod files;
 pub mod logs;
 pub mod procs;
@@ -44,6 +45,7 @@ pub static ALL: &[Spec] = &[
     Spec { id: "B2.5", name: "services", secs: 30, what: "service managers" },
     Spec { id: "B2.6", name: "storage", secs: 60, what: "storage and fsync test" },
     Spec { id: "B2.7", name: "inventory", secs: 30, what: "data dir inventory" },
+    Spec { id: "B2.8", name: "chaindb", secs: 90, what: "chain database, read-only secondary open" },
     Spec { id: "B1.2", name: "binaries", secs: 30, what: "binaries" },
     Spec { id: "B1.3", name: "config", secs: 30, what: "configuration" },
     Spec { id: "B2.9", name: "wallet", secs: 60, what: "wallet, from the config" },
@@ -57,7 +59,6 @@ pub static ALL: &[Spec] = &[
 
 /// B2 items this version does not collect; listed in the summary
 pub static NOT_YET: &[&str] = &[
-    "B2.8 chain database (read-only secondary open)",
     "B2.15 network probe of the compiled-in seeds",
     "B2.16 live node (RPC, getdiaginfo, thread states)",
     "B2.17 Electrum, web UI, ZMQ and swap services",
@@ -75,6 +76,7 @@ pub fn run(name: &str, ctx: &Ctx, o: &mut Out) -> bool {
         "services" => procs::services(ctx, o),
         "storage" => storage::storage(ctx, o),
         "inventory" => storage::inventory(ctx, o),
+        "chaindb" => chain::chaindb(ctx, o),
         "binaries" => files::binaries(ctx, o),
         "config" => files::config(ctx, o),
         "wallet" => files::wallet(ctx, o),

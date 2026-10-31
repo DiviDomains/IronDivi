@@ -2813,11 +2813,13 @@ name = "divi-diag"
 version = "0.2.9"
 dependencies = [
  "divi-primitives",
+ "divi-storage",
  "hex",
  "hmac 0.12.1",
  "libc",
  "rand 0.8.8",
  "regex",
+ "rocksdb",
  "serde",
  "serde_json",
  "sha2 0.10.9",
