@@ -1,7 +1,8 @@
 # Plan: `irondivi diag` and the node's own flight recorder
 
-Status: plan, Revision 15 (the fourteenth review round — consensus, crashes,
-platforms, privacy, adversarial — folded into the body; Revision 14 folded
+Status: plan, Revision 16 (the A1–A4 implementation's findings recorded
+against the plan; Revision 15 folded the fourteenth review round —
+consensus, crashes, platforms, privacy, adversarial — into the body; Revision 14 folded
 in the thirteenth round, Revision 13 the twelfth, Revision 12 the eleventh, Revision 11 the tenth, Revision 10 the ninth,
 Revision 9 the eighth,
 Revision 8 the seventh, Revision 7 the /proc facts measured on hp3 on
@@ -16,8 +17,11 @@ catch-up gate (8e4bfaca, `CAUGHT_UP_LAG`), the main-task panic exit
 (70cb5785), the removal of the per-transaction wallet mempool lines
 (f67b0984, bf6452fc), the "Header sync complete" gate and the single
 way into Synced (73440b48), and the removal of the per-transaction
-relay and submit lines (09cb18e4, 6de594fb).
-Date: 2026-10-30. Revision 1 is kept outside the repo for comparison.
+relay and submit lines (09cb18e4, 6de594fb), and, in Revision 16, A1
+(ff299088), A2 (d34c0bac, 426dba00, 3309b5ad), A3 (4aea6299), A4
+(deb9295f) and the R3 usage-message fix (bcf713c8), as built, with the
+differences listed under "Revision 16 changes".
+Date: 2026-10-30; Revision 16 2026-10-31. Revision 1 is kept outside the repo for comparison.
 Line numbers are as of 6de594fb. Six files changed since f67b0984
 (`git diff --stat f67b0984..6de594fb`): `bin/irondivid/src/main.rs`
 (one line removed at `:2345`), `crates/divi-network/src/relay.rs`,
@@ -34,6 +38,88 @@ are re-based throughout, the older change lists included, so every
 number in the plan, in any revision's list, points into 6de594fb,
 except the removed lines named as such. They
 drift, so each one also names the code it points at.
+
+### Revision 16 changes
+
+The first §10 item 2 parts are implemented: A1 `runs.log` (ff299088), A2
+the marker (d34c0bac, 426dba00, rustfmt 3309b5ad), A3 signals (4aea6299)
+and A4 panics and tasks (deb9295f), after the R3 usage-message fix
+(bcf713c8). This entry records where the code differs from the plan,
+found while building them. The tests named are the ones that hold each
+point; `main.rs` line numbers in older revisions predate these commits
+and are not re-based.
+
+- R3, code 2 never echoes a value (bcf713c8): every usage reason
+  (`-onlynet`, `-whitelist`, `-whitebind`, `-externalip`,
+  `-minrelaytxfee`, `-maxtxfee`, `-rpcbind`, `-rpcallowip`, the argument
+  parser's number parse, `-loglevel`, `-expire`, the Electrum and web UI
+  addresses, and the RPC access checks) names the option and why, never
+  the value given, as the `divi.conf` reasons already did; a repeated
+  option names its place ("value i of n"). `exit_codes.rs` passes a
+  sentinel value to each and checks it is absent from stderr and from
+  every log under the data directory.
+- R3, `divi.conf` values: a bad value read from `divi.conf` exits 2
+  (usage), not 3; code 3 is a file that cannot be read or a line that
+  does not parse. Several divid-style options still accept a bad value
+  and fall back to the default instead of refusing it; they are not yet
+  checked.
+- R3, code 7: a P2P listener that fails to start, and an RPC bind that
+  fails with `AddrInUse`, `AddrNotAvailable` or `PermissionDenied`, exit
+  7. An RPC address the access settings refuse (an `InvalidInput` error)
+  exits 2.
+- R3, code 9 is recognised by the error's text ("No space left on
+  device", "Read-only file system"), since RocksDB's errors reach the node
+  as text, as well as by `ENOSPC`/`EROFS` on the node's own writes.
+- R3, code 10 is also the generic code: a start-up error that maps to no
+  other code exits 10, not only a critical task. The third stop signal
+  (10) counts TERM, INT and QUIT alike (A3).
+- R3, code 101: the main thread's `catch_unwind` is the only one in
+  `irondivid` and the ten node crates (`tasks_lint`
+  `main_has_the_only_catch_unwind`), which holds Crashes R15-1 in place of
+  the line numbers `:3194`/`:3203`. A panic on the main thread before that
+  `catch_unwind` is entered also exits 101, from the hook.
+- A2, the marker after a panic: `die` and the main thread's catch write
+  the `exit` record and then remove the marker, so a panic that ends the
+  node (10 or 101) leaves no marker and the next start writes no
+  `unclean-previous`. Only an exit from the signal handler (the third stop
+  signal, and the default-action signals that exit 128+N) leaves the
+  marker, read next start as `verdict=exit-recorded`. The crash.log
+  verdict rows describe A5's records, not A4's (`runs_log`
+  `a_task_panic_is_recorded_and_a_main_panic_exits_101`,
+  `a_critical_panic_ends_the_run_with_code_10`).
+- A3 as built: no A11, A17 or A6 parts yet (no counters in the third
+  signal's record, no health tick); no argv allowlist, the sender's
+  command line is masked by its own rule; HUP reopens `debug.log` only;
+  there is no 5 s window, every stop signal counts toward the three;
+  QUIT counts as a stop and records `dump=not-implemented`; USR1 records
+  "not implemented"; the sender is not read on macOS; a stop signal that
+  arrives before the record sink is set is held and recorded when it is;
+  a one-shot command (not the node) keeps the default action; the
+  default-action group writes `exit code=128+N` and re-raises. The TSTP
+  stop branch has no test. The SIGPIPE and EPIPE counts go in the exit
+  record.
+- A4 as built: the hook ends the node itself (`die(10, "Error: <name>
+  panicked")` for a critical task or thread), with no supervisor between;
+  the `panic` record in `runs.log` holds thread, task, location and
+  `ends_node` only, and the message and a forced backtrace go to
+  `diag/crash.log` (mode 0600). The default hook still prints the message
+  to stderr, so it is kept out of `runs.log` only. No `events.log` record
+  or health count for a supervised panic, no A8 ring and no A11 counters
+  or wrapping yet. A critical task's panic ends the node; a critical
+  task that returns an error does not yet. irondivid starts every task
+  and thread through `tasks.rs` (`tasks_lint`
+  `irondivid_starts_tasks_only_through_tasks_rs`); the node crates are not
+  converted, and a ratchet keeps their spawn count from growing
+  (`the_node_crates_start_no_new_tasks`). `spawn_blocking` is matched by
+  neither: those calls (two in `main.rs`, and in the RPC server, web UI
+  and Electrum) are unnamed, and a panic in one records `task="-"`. The
+  test seam `IRONDIVI_TEST_PANIC` (regtest only) delays its critical
+  panics 2 s so the test sees RPC answer first.
+- Crashes R15-2: the RocksDB close in an early panic's unwind is "bounded
+  on a responsive disk", not bounded; A4 now says so.
+- `flush_log` cannot deadlock `die` when a critical panic is raised from
+  inside logging: it takes a lock only it uses, drops the log writer's
+  guard, and the stdout and stderr locks it then takes are reentrant.
 
 ### Revision 15 changes
 
@@ -1059,9 +1145,9 @@ stopped it and the exact command to run instead.
 | 7 | Bind error (P2P, RPC, Electrum, Web UI port in use or not permitted). |
 | 8 | Not used. (Revision 3 gave it to allocation failure, but Rust's `handle_alloc_error` aborts, so that ends as 134 SIGABRT; A5 links the abort to the allocator's own record. The number stays reserved so old notes are not misread.) |
 | 9 | Disk full or read-only filesystem on a required write, including the `-daemon` log-file open (about `main.rs:3150`) failing with `ENOSPC` or `EROFS`. |
-| 10 | A task the node cannot live without returned an error or panicked (A4), a third TERM/INT forced the stop (A3), or the A1 start-up bound ran out on a run started with an explicit `-startuptimeout=<s>` (A18; B3.2's observed start passes it). Without that flag the bound never stops the node. |
+| 10 | A task the node cannot live without returned an error or panicked (A4), a third stop signal (TERM, INT or QUIT) forced the stop (A3), any start-up error that maps to no other code, or the A1 start-up bound ran out on a run started with an explicit `-startuptimeout=<s>` (A18; B3.2's observed start passes it). Without that flag the bound never stops the node. |
 | 11 | `-daemon` could not fork or `setsid` (about `main.rs:3112`/`3115` first fork, `3122-3124` setsid, `3128`/`3131` second fork). |
-| 101 | Panic on the main thread: the node's own `_exit(101)` after `catch_unwind` (`main.rs:3203`, 70cb5785), the same number as Rust's, kept. |
+| 101 | Panic on the main thread: the node's own `_exit(101)` after `catch_unwind` (70cb5785; held by `tasks_lint`), or from the panic hook before that `catch_unwind` is entered, the same number as Rust's, kept. |
 | 128+N | Killed by signal N (the shell's convention). `docs/exit-codes.md` lists every N per architecture: 134 abort (including allocation failure and a stack overflow on a Rust thread, A5), 137 SIGKILL, 139 SIGSEGV (including a stack overflow on a RocksDB thread), 143 SIGTERM before handlers are installed, 152 SIGXCPU, 153 SIGXFSZ, 159 SIGSYS on x86_64/aarch64 (a seccomp `KILL_PROCESS`, A5), and SIGPWR, whose number differs by arch. |
 
 Codes 0 (stop during start-up only) and 1–11 go through `die(code, reason)`
@@ -1366,10 +1452,11 @@ is the commonest container case and is never written as "kernel".
   (A8), and the A11 node counters since the last hourly count line
   (crashes R12-1). Then the default hook runs.
 - Main-thread panic exits 101: `main()` runs `block_on` inside
-  `catch_unwind` (`main.rs:3194`-`:3196`, commit 70cb5785); after the hook
+  `catch_unwind` (commit 70cb5785; the only `catch_unwind` in the node,
+  held by `tasks_lint`); after the hook
   has written its record, the caught panic forgets the runtime without
   dropping it, writes "Error: the node's main task panicked", calls
-  `flush_log()` and `libc::_exit(101)` (`:3203`), so neither the runtime's
+  `flush_log()` and `libc::_exit(101)`, so neither the runtime's
   drop nor the C++ destructors can hang the exit. `catch_unwind` skips
   the runtime's drop but not the unwind of `async_main` (`:3237`) itself,
   which drops what that future owns before `catch_unwind` returns
@@ -1377,7 +1464,7 @@ is the commonest container case and is never written as "kernel".
   `Drop` in the tree waits, except in one case: a panic early in
   `async_main`, after the databases are open and before any task holds a
   clone, drops the block store, and the RocksDB close waits for its
-  running background jobs. That wait is bounded, so the exit is slow, not
+  running background jobs. That wait is bounded on a responsive disk, so the exit is slow, not
   hung, and the A4 record is already on disk. The choice: the hook does
   not flush and `_exit` on the main thread, because it cannot tell a
   panic that a `catch_unwind` on that thread will catch and handle
@@ -1390,7 +1477,8 @@ is the commonest container case and is never written as "kernel".
   `die(10, "<name>: <error>")`; or `spawn_supervised(name, fut)` — its error
   or panic is written to `events.log` with the name and counted in health.
   A lint test fails on a bare `tokio::spawn`/`std::thread::spawn` in node
-  crates.
+  crates. (As built, deb9295f: irondivid only; the node crates are held
+  by a ratchet, see Revision 16 changes.)
 
 ### A5. `crash.log` — fatal signals
 
