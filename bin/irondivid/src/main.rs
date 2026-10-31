@@ -83,6 +83,189 @@ macro_rules! console_out {
     ($($arg:tt)*) => { console_line(true, format_args!($($arg)*)) };
 }
 
+/// irondivid's exit codes (diag.md R3). 0 is a clean stop and 101 a panic on
+/// the main thread; 8 is unused.
+mod exit_code {
+    /// -help, -version (divid's AppInit)
+    pub const HELP: i32 = 1;
+    /// An option's value; the reason names the option
+    pub const USAGE: i32 = 2;
+    /// The config file; the reason names the file and the line, never its text
+    pub const CONFIG: i32 = 3;
+    /// The data directory (create, lock, permissions) and the daemon's log file
+    pub const DATADIR: i32 = 4;
+    pub const DATABASE: i32 = 5;
+    pub const WALLET: i32 = 6;
+    pub const BIND: i32 = 7;
+    /// No space left (ENOSPC) or a read-only file system (EROFS)
+    pub const DISK: i32 = 9;
+    /// A critical task failed, a third signal, a start-up timeout, and any
+    /// start-up error R3 has no row for
+    pub const FAILED: i32 = 10;
+    /// The -daemon fork or setsid failed
+    pub const DAEMON: i32 = 11;
+}
+
+/// End the process with `code`: the reason (when not empty) goes to
+/// debug.log and the console, the log writer is flushed, and the process
+/// ends with `_exit`, which runs no destructors: RocksDB's would join its
+/// thread pools. The only way irondivid exits with a code other than 0
+/// or 101 (A9, R3); a test refuses any other exit path in this crate.
+fn die(code: i32, reason: std::fmt::Arguments<'_>) -> ! {
+    let reason = reason.to_string();
+    if !reason.is_empty() {
+        // Before init_logging this goes nowhere; the console line is enough then
+        error!("{} (exit code {})", reason, code);
+        console!("{}", reason);
+    }
+    flush_log();
+    unsafe { libc::_exit(code) }
+}
+
+/// `die(code, format_args!(...))`
+macro_rules! die {
+    ($code:expr) => { die($code, format_args!("")) };
+    ($code:expr, $($arg:tt)*) => { die($code, format_args!($($arg)*)) };
+}
+
+/// An error that carries its exit code. Its text and its causes are the
+/// inner error's, so the line printed for it is the line printed before.
+#[derive(Debug)]
+struct Coded {
+    code: i32,
+    inner: anyhow::Error,
+}
+
+impl std::fmt::Display for Coded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.inner, f)
+    }
+}
+
+impl StdError for Coded {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        self.inner.source()
+    }
+}
+
+impl Coded {
+    fn error(code: i32, inner: impl Into<anyhow::Error>) -> anyhow::Error {
+        anyhow::Error::new(Coded {
+            code,
+            inner: inner.into(),
+        })
+    }
+}
+
+trait OrExit<T> {
+    /// Fail with exit code `code`, unless the cause is a full or read-only disk (9)
+    fn or_exit(self, code: i32) -> Result<T>;
+    /// Fail with 7 when the cause is an address in use or not available, else `code`
+    fn bind_or_exit(self, code: i32) -> Result<T>;
+}
+
+impl<T, E: Into<anyhow::Error>> OrExit<T> for std::result::Result<T, E> {
+    fn or_exit(self, code: i32) -> Result<T> {
+        self.map_err(|e| Coded::error(code, e))
+    }
+    fn bind_or_exit(self, code: i32) -> Result<T> {
+        self.map_err(|e| {
+            let e: anyhow::Error = e.into();
+            let code = if causes(as_dyn(&e)).into_iter().any(is_bind_error) {
+                exit_code::BIND
+            } else {
+                code
+            };
+            Coded::error(code, e)
+        })
+    }
+}
+
+/// `e` and every cause under it, a `Coded`'s inner error included
+fn causes<'a>(e: &'a (dyn StdError + 'static)) -> Vec<&'a (dyn StdError + 'static)> {
+    let mut all = Vec::new();
+    let mut next = Some(e);
+    while let Some(err) = next {
+        all.push(err);
+        next = match err.downcast_ref::<Coded>() {
+            Some(coded) => Some(as_dyn(&coded.inner)),
+            None => err.source(),
+        };
+    }
+    all
+}
+
+fn as_dyn(e: &anyhow::Error) -> &(dyn StdError + 'static) {
+    e.as_ref()
+}
+
+fn io_kind(e: &(dyn StdError + 'static)) -> Option<std::io::ErrorKind> {
+    e.downcast_ref::<std::io::Error>().map(|io| io.kind())
+}
+
+fn is_bind_error(e: &(dyn StdError + 'static)) -> bool {
+    matches!(
+        io_kind(e),
+        Some(std::io::ErrorKind::AddrInUse | std::io::ErrorKind::AddrNotAvailable)
+    )
+}
+
+/// ENOSPC or EROFS. RocksDB's errors reach us as text, with the OS's own
+/// words for the two in it.
+fn is_disk_error(e: &(dyn StdError + 'static)) -> bool {
+    use std::io::ErrorKind::{ReadOnlyFilesystem, StorageFull};
+    match io_kind(e) {
+        Some(kind) => matches!(kind, StorageFull | ReadOnlyFilesystem),
+        None => {
+            let text = e.to_string();
+            text.contains("No space left on device") || text.contains("Read-only file system")
+        }
+    }
+}
+
+/// The exit code for an error that stops irondivid (R3): a full or read-only
+/// disk first, wherever it is in the causes; else the outermost cause that
+/// names a code: a `Coded`, the config file, the wallet, the database, an
+/// address in use; else 10.
+fn exit_code_of(e: &anyhow::Error) -> i32 {
+    error_exit_code(as_dyn(e))
+}
+
+fn error_exit_code(e: &(dyn StdError + 'static)) -> i32 {
+    let all = causes(e);
+    if all.iter().any(|e| is_disk_error(*e)) {
+        return exit_code::DISK;
+    }
+    for err in all {
+        if let Some(coded) = err.downcast_ref::<Coded>() {
+            return coded.code;
+        }
+        if err.is::<ConfigFileError>() {
+            return exit_code::CONFIG;
+        }
+        if err.is::<divi_wallet::WalletError>() {
+            return exit_code::WALLET;
+        }
+        if err.is::<divi_storage::StorageError>() {
+            return exit_code::DATABASE;
+        }
+        if is_bind_error(err) {
+            return exit_code::BIND;
+        }
+    }
+    exit_code::FAILED
+}
+
+/// The exit code for an io error before the runtime starts: 9 for a full or
+/// read-only disk, else `code`
+fn io_exit_code(e: &std::io::Error, code: i32) -> i32 {
+    if is_disk_error(e) {
+        exit_code::DISK
+    } else {
+        code
+    }
+}
+
 /// irondivid's start-up options. They are read as Divi Core's divid reads
 /// its own (settings.rs): `-name=value` or `--name value` on the command line,
 /// then the config file, which fills only what the command line left unset.
@@ -184,10 +367,7 @@ impl Args {
         I: IntoIterator<Item = T>,
         T: Into<String>,
     {
-        Args::try_parse_from(argv).unwrap_or_else(|e| {
-            console!("Error: {:#}", e);
-            std::process::exit(1)
-        })
+        Args::try_parse_from(argv).unwrap_or_else(|e| panic!("{e:#}"))
     }
 
     /// Take the option values from the settings read so far
@@ -904,7 +1084,10 @@ fn white_bind_address(text: &str) -> Result<std::net::SocketAddr> {
 /// failed
 fn start_error(e: divi_node::NodeError) -> anyhow::Error {
     match e {
-        divi_node::NodeError::Init(reason) => anyhow::Error::msg(reason),
+        // The database and index checks of the start (node.rs)
+        divi_node::NodeError::Init(reason) => {
+            Coded::error(exit_code::DATABASE, anyhow::Error::msg(reason))
+        }
         e => anyhow::Error::new(e).context("Failed to initialize node"),
     }
 }
@@ -1765,18 +1948,25 @@ async fn run_daemon(
 ) -> Result<()> {
     // Create data directory if it doesn't exist
     private_files::ensure_private_dir(&config.data_dir, false)
-        .with_context(|| format!("Failed to create data directory: {:?}", config.data_dir))?;
+        .with_context(|| format!("Failed to create data directory: {:?}", config.data_dir))
+        .or_exit(exit_code::DATADIR)?;
     // One process per data directory, held until this one exits
     // (TryLockDataDirectory, init.cpp:850-862)
-    let _datadir_lock = lock_data_dir(&config.data_dir)?;
+    let _datadir_lock = lock_data_dir(&config.data_dir).or_exit(exit_code::DATADIR)?;
     // divid reads masternode.conf at every start and makes it when missing
     core_files::ensure_masternode_conf(&config.data_dir);
 
     // -webui: take its port now, so a port in use stops the start at once
-    let webui = webui.map(divi_webui::prepare).transpose()?;
+    let webui = webui
+        .map(divi_webui::prepare)
+        .transpose()
+        .bind_or_exit(exit_code::USAGE)?;
     let webui_shutdown = shutdown_tx.subscribe();
     // -electrum: the same, for the Electrum server's ports and certificate
-    let electrum = electrum.map(divi_electrum::prepare).transpose()?;
+    let electrum = electrum
+        .map(divi_electrum::prepare)
+        .transpose()
+        .bind_or_exit(exit_code::USAGE)?;
     let electrum_shutdown = shutdown_tx.subscribe();
 
     // Divi Core Discover: the interfaces' addresses (net.cpp:1385-1425)
@@ -1800,7 +1990,15 @@ async fn run_daemon(
     let _zmq = divi_node::zmq::ZmqNotifier::start(&config.zmq, node.chain(), node.mempool());
 
     // Start the node
-    node.start().await.with_context(|| "Failed to start node")?;
+    node.start().await.map_err(|e| match e {
+        // start()'s only Init: no P2P listener could be bound
+        // (bind_listeners); its io error is text by then (R3)
+        divi_node::NodeError::Init(_) => Coded::error(
+            exit_code::BIND,
+            anyhow::Error::new(e).context("Failed to start node"),
+        ),
+        e => anyhow::Error::new(e).context("Failed to start node"),
+    })?;
 
     // Divi Core's -stopafterblockimport: the import thread asks for shutdown
     // once it is done (init.cpp:724-727)
@@ -1857,7 +2055,8 @@ async fn run_daemon(
             config.network.chain_mode,
             wallet_seed,
             &wallet_options,
-        )?);
+        )
+        .or_exit(exit_code::WALLET)?);
         if let Some(ref w) = wallet {
             // Timed unlocks drop their keys when they run out (NODE-6)
             WalletDb::start_auto_lock(w);
@@ -2201,7 +2400,8 @@ async fn run_daemon(
         config.rpc.password.as_deref(),
         &config.data_dir,
     )
-    .with_context(|| format!("Failed to write RPC cookie in {:?}", config.data_dir))?;
+    .with_context(|| format!("Failed to write RPC cookie in {:?}", config.data_dir))
+    .or_exit(exit_code::DATADIR)?;
     match &_rpc_cookie {
         Some(cookie) => {
             if config.rpc.username.is_some() || config.rpc.password.is_some() {
@@ -2228,7 +2428,8 @@ async fn run_daemon(
             a.check_bind(rpc_config.bind_address)
                 .map_err(|e| anyhow::anyhow!(e))
         })
-        .context("Invalid RPC configuration")?;
+        .context("Invalid RPC configuration")
+        .or_exit(exit_code::USAGE)?;
 
     info!("Starting RPC server on {}...", rpc_config.bind_address);
     // Start-up is done: say so, or a slow start and a running node look alike
@@ -2429,7 +2630,7 @@ async fn run_daemon(
             ) => {
                 if let Err(e) = result {
                     error!("RPC server error: {}", e);
-                    rpc_error = Some(e.to_string());
+                    rpc_error = Some((e.to_string(), rpc_exit_code(&e)));
                 }
             }
             _ = shutdown_rx.recv() => {
@@ -2495,7 +2696,7 @@ async fn run_daemon(
             ) => {
                 if let Err(e) = result {
                     error!("RPC server error: {}", e);
-                    rpc_error = Some(e.to_string());
+                    rpc_error = Some((e.to_string(), rpc_exit_code(&e)));
                 }
             }
             _ = shutdown_rx.recv() => {
@@ -2532,9 +2733,31 @@ async fn run_daemon(
 
     info!("Node stopped");
     match rpc_error {
-        Some(e) => Err(anyhow::anyhow!("RPC server error: {}", e)),
+        Some((e, code)) => Err(Coded::error(code, anyhow::anyhow!("RPC server error: {}", e))),
         None => Ok(()),
     }
+}
+
+/// The exit code for the RPC server's error: its bind refused (7), its
+/// address refused by the access settings (2, an InvalidInput io error from
+/// serve), else as any other error
+fn rpc_exit_code(e: &(dyn StdError + 'static)) -> i32 {
+    let all = causes(e);
+    if all.iter().any(|e| is_disk_error(*e)) {
+        return exit_code::DISK;
+    }
+    for err in all {
+        match io_kind(err) {
+            Some(
+                std::io::ErrorKind::AddrInUse
+                | std::io::ErrorKind::AddrNotAvailable
+                | std::io::ErrorKind::PermissionDenied,
+            ) => return exit_code::BIND,
+            Some(std::io::ErrorKind::InvalidInput) => return exit_code::USAGE,
+            _ => {}
+        }
+    }
+    error_exit_code(e)
 }
 
 /// `-electrum`, `-electrumtls`, `-electrumws` and `-electrumwss`: the Electrum server's settings; None when
@@ -3017,7 +3240,7 @@ fn remove_pid_file(pid_file: &std::path::Path) {
     }
 }
 
-fn main() -> Result<()> {
+fn main() {
     // A closed stdin, stdout or stderr is reopened on /dev/null before any
     // file is opened: the next open() would take that number, and console
     // lines would be written into a database or the wallet (D2)
@@ -3043,10 +3266,7 @@ fn main() -> Result<()> {
     // Parse CLI arguments, completed from the config file where they are unset
     let args = match Args::try_parse_from(std::env::args()) {
         Ok(args) => args,
-        Err(e) => {
-            console!("Error: {:#}", e);
-            std::process::exit(1);
-        }
+        Err(e) => die!(exit_code::USAGE, "Error: {:#}", e),
     };
     // divid's AppInit: -?, -help and -version print and exit 1 (divid.cpp)
     if args.help || args.version {
@@ -3061,33 +3281,39 @@ fn main() -> Result<()> {
         } else {
             console_out!("IronDivi Daemon version v{}", env!("CARGO_PKG_VERSION"));
         }
-        std::process::exit(1);
+        die!(exit_code::HELP);
     }
     // ... a -datadir that is not a directory is refused (divid.cpp)
     if let Some(dir) = &args.datadir {
         if !dir.is_dir() {
-            console!(
+            die!(
+                exit_code::DATADIR,
                 "Error: Specified data directory \"{}\" does not exist.",
                 dir.display()
             );
-            std::process::exit(1);
         }
     }
     let args = match resolve_args(args) {
         Ok(args) => args,
         Err(e) => {
             // divid prints its config file errors under their own heading (divid.cpp:97-98)
+            // The file could not be read: 3, or 9 for a full or read-only disk
+            let code = match exit_code_of(&e) {
+                exit_code::FAILED if e.chain().any(|c| c.is::<std::io::Error>()) => {
+                    exit_code::CONFIG
+                }
+                exit_code::FAILED => exit_code::USAGE,
+                code => code,
+            };
             match e.downcast_ref::<ConfigFileError>() {
-                Some(c) => console!("Error reading configuration file: {}", c),
-                None => console!("Error: {:#}", e),
+                Some(c) => die!(code, "Error reading configuration file: {}", c),
+                None => die!(code, "Error: {:#}", e),
             }
-            std::process::exit(1);
         }
     };
     // ... and so are -testnet and -regtest together
     if args.testnet && args.regtest {
-        console!("Error: Invalid combination of -regtest and -testnet.");
-        std::process::exit(1);
+        die!(exit_code::USAGE, "Error: Invalid combination of -regtest and -testnet.");
     }
 
     // Compute data directory early (needed for daemonization and logging)
@@ -3095,8 +3321,7 @@ fn main() -> Result<()> {
     if let Err(e) =
         core_files::refuse_at_start(&data_dir, args.wallet.as_deref(), args.disablewallet)
     {
-        console!("Error: {:#}", e);
-        std::process::exit(1);
+        die!(exit_code::DATADIR, "Error: {:#}", e);
     }
 
     // Handle daemonization BEFORE initializing tokio runtime (Unix only)
@@ -3106,8 +3331,12 @@ fn main() -> Result<()> {
 
         // Ensure data directory exists before daemonizing
         if let Err(e) = private_files::ensure_private_dir(&data_dir, false) {
-            console!("Failed to create data directory {:?}: {}", data_dir, e);
-            std::process::exit(1);
+            die!(
+                io_exit_code(&e, exit_code::DATADIR),
+                "Failed to create data directory {:?}: {}",
+                data_dir,
+                e
+            );
         }
 
         let log_file = data_dir.join("debug.log");
@@ -3116,27 +3345,34 @@ fn main() -> Result<()> {
 
         // First fork
         match unsafe { libc::fork() } {
-            -1 => {
-                console!("Failed to fork: {}", std::io::Error::last_os_error());
-                std::process::exit(1);
-            }
-            pid if pid > 0 => std::process::exit(0), // Parent exits
+            -1 => die!(
+                exit_code::DAEMON,
+                "Failed to fork: {}",
+                std::io::Error::last_os_error()
+            ),
+            // The parent exits and writes nothing more
+            pid if pid > 0 => unsafe { libc::_exit(0) },
             _ => {}                                  // Child continues
         }
 
         // Create new session
         if unsafe { libc::setsid() } == -1 {
-            console!("Failed to setsid: {}", std::io::Error::last_os_error());
-            std::process::exit(1);
+            die!(
+                exit_code::DAEMON,
+                "Failed to setsid: {}",
+                std::io::Error::last_os_error()
+            );
         }
 
         // Second fork (prevent reacquiring a controlling terminal)
         match unsafe { libc::fork() } {
-            -1 => {
-                console!("Failed to fork: {}", std::io::Error::last_os_error());
-                std::process::exit(1);
-            }
-            pid if pid > 0 => std::process::exit(0), // Intermediate parent exits
+            -1 => die!(
+                exit_code::DAEMON,
+                "Failed to fork: {}",
+                std::io::Error::last_os_error()
+            ),
+            // The intermediate parent exits
+            pid if pid > 0 => unsafe { libc::_exit(0) },
             _ => {}                                  // Grandchild continues
         }
 
@@ -3152,8 +3388,11 @@ fn main() -> Result<()> {
             .mode(0o600)
             .open(&log_file)
             .unwrap_or_else(|e| {
-                console!("Failed to open log file: {}", e);
-                std::process::exit(1);
+                die!(
+                    io_exit_code(&e, exit_code::DATADIR),
+                    "Failed to open log file: {}",
+                    e
+                )
             });
         let log_fd = log.as_raw_fd();
         unsafe {
@@ -3192,7 +3431,7 @@ fn main() -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .context("Failed to build tokio runtime")?;
+        .unwrap_or_else(|e| die!(exit_code::FAILED, "Error: Failed to build tokio runtime: {}", e));
     // A panic on this thread would otherwise unwind through the runtime's drop,
     // which waits with no deadline, and then exit through the C++ destructors,
     // which join RocksDB's thread pools: the node could hang until the service
@@ -3221,23 +3460,20 @@ fn main() -> Result<()> {
 /// (init.cpp).
 fn exit_after_stop(runtime: tokio::runtime::Runtime, result: Result<()>) -> ! {
     let started = std::time::Instant::now();
-    let code = match &result {
-        Ok(()) => 0,
-        Err(e) => {
-            // In debug.log as well: on a -daemon node the console is that file,
-            // but a foreground node's only record would be a lost terminal (D3)
-            error!("Error: {:#}", e);
-            console!("Error: {:#}", e);
-            1
-        }
-    };
     // Let the runtime's threads go without waiting for them
     std::mem::forget(runtime);
     shutdown_stage("exit", started);
-    flush_log();
-    // _exit: no atexit handlers or C++ static destructors either (RocksDB's
-    // thread pools would be joined there)
-    unsafe { libc::_exit(code) }
+    match result {
+        // _exit: no atexit handlers or C++ static destructors either (RocksDB's
+        // thread pools would be joined there)
+        Ok(()) => {
+            flush_log();
+            unsafe { libc::_exit(0) }
+        }
+        // In debug.log as well: on a -daemon node the console is that file,
+        // but a foreground node's only record would be a lost terminal (D3)
+        Err(e) => die!(exit_code_of(&e), "Error: {:#}", e),
+    }
 }
 
 async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
@@ -3266,7 +3502,7 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
     info!("Log levels: {}", args.log_levels.spec());
 
     // Build configuration
-    let mut config = build_config(&args)?;
+    let mut config = build_config(&args).or_exit(exit_code::USAGE)?;
     let log_config_console = log_config.print_to_console;
     config.log = log_config;
 
@@ -3276,9 +3512,7 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
 
     // Check for conflicting network options
     if args.testnet && args.regtest {
-        error!("Cannot use both --testnet and --regtest");
-        flush_log();
-        std::process::exit(1);
+        die!(exit_code::USAGE, "Cannot use both --testnet and --regtest");
     }
 
     if args.export_snapshot.is_some()
@@ -3361,8 +3595,8 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
 
     let wallet_seed = WalletSeed::from_settings(&args.settings);
     let wallet_options = WalletOptions::from_settings(&args.settings);
-    let webui = webui_config(&args, &config)?;
-    let electrum = electrum_config(&args, &config)?;
+    let webui = webui_config(&args, &config).or_exit(exit_code::USAGE)?;
+    let electrum = electrum_config(&args, &config).or_exit(exit_code::USAGE)?;
 
     // Run the daemon
     if let Err(e) = run_daemon(
@@ -3378,22 +3612,10 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
     )
     .await
     {
-        error!("Daemon error: {:#}", e);
-        // Also on stderr, as Divi Core's InitError (noui.cpp:38-40): the log
-        // writer may not get to write the line before the process exits
-        {
-            use std::io::Write as _;
-            let _ = writeln!(std::io::stderr(), "Error: {:#}", e);
-        }
-        // Print the full error chain
-        let mut source: Option<&(dyn StdError + 'static)> = e.source();
-        while let Some(err) = source {
-            error!("  Caused by: {}", err);
-            source = err.source();
-        }
         remove_pid_file(&pid_file);
-        flush_log();
-        std::process::exit(1);
+        // On stderr as well, as Divi Core's InitError (noui.cpp:38-40); {:#}
+        // carries every cause
+        die!(exit_code_of(&e), "Error: {:#}", e);
     }
 
     remove_pid_file(&pid_file);

@@ -243,7 +243,8 @@ fn divid_command_line_starts_the_node() {
     assert_eq!(daemon.rpc("getblockcount", json!([])), json!(0));
 }
 
-/// divid's start-up refusals and -help / -version, exit code 1 (divid.cpp)
+/// divid's start-up refusals, with irondivid's exit codes (diag.md R3), and
+/// -help / -version, exit code 1 as divid's (divid.cpp)
 #[test]
 fn start_up_refusals_are_divid_s() {
     let bin = env!("CARGO_BIN_EXE_irondivid");
@@ -256,7 +257,8 @@ fn start_up_refusals_are_divid_s() {
             missing.display()
         )
     );
-    assert_eq!(out.status.code(), Some(1));
+    // The data directory (R3)
+    assert_eq!(out.status.code(), Some(4));
     assert!(!missing.exists(), "the data directory was created");
 
     let dir = tempfile::tempdir().unwrap();
@@ -269,7 +271,8 @@ fn start_up_refusals_are_divid_s() {
         String::from_utf8_lossy(&out.stderr),
         "Error: Invalid combination of -regtest and -testnet.\n"
     );
-    assert_eq!(out.status.code(), Some(1));
+    // Usage (R3)
+    assert_eq!(out.status.code(), Some(2));
 
     for flag in ["-help", "-?", "-version"] {
         let out = output_within(Command::new(bin).arg(flag));
@@ -338,7 +341,8 @@ fn refused_starts_print_divid_s_error_line() {
         errors(&out),
         ["Error: You need to rebuild the database using -reindex to change -txindex"]
     );
-    assert_eq!(out.status.code(), Some(1));
+    // The database (R3)
+    assert_eq!(out.status.code(), Some(5));
 
     // A key made here, in divi.conf: not regtest's spork key
     let key = divi_crypto::keys::SecretKey::new_random();
@@ -352,7 +356,8 @@ fn refused_starts_print_divid_s_error_line() {
         errors(&out),
         ["Error: Unable to sign spork message, wrong key?"]
     );
-    assert_eq!(out.status.code(), Some(1));
+    // An option's value (R3)
+    assert_eq!(out.status.code(), Some(2));
 }
 
 /// -server=0: the node runs, with no RPC server
@@ -562,7 +567,8 @@ fn upgradewallet_below_the_base_version_refuses_a_new_wallet() {
         errors,
         ["Error: Error loading wallet.dat: database load failure"]
     );
-    assert_eq!(out.status.code(), Some(1));
+    // The wallet (R3)
+    assert_eq!(out.status.code(), Some(6));
 
     for option in ["-upgradewallet=3000000", "-upgradewallet"] {
         let rpc_port = free_port();
