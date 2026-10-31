@@ -11,6 +11,7 @@ use crate::ctx::Ctx;
 use crate::discovery;
 use crate::frame::{read_frame, Frame, Out};
 use crate::redact::Redactor;
+use crate::scanner;
 use crate::util;
 use crate::Options;
 use std::collections::BTreeMap;
@@ -181,6 +182,9 @@ struct Parent {
     notes: Vec<String>,
     started: i64,
     state: &'static str,
+    /// §6.3: (file, reason) for every file the final scan left out
+    left_out: Vec<(String, String)>,
+    scanned: bool,
 }
 
 /// R1 (a): the space a filesystem must keep free once diag writes to it
@@ -319,6 +323,8 @@ pub fn parent_main(o: Options) -> i32 {
         notes: Vec::new(),
         started: util::now_secs(),
         state: "in progress",
+        left_out: Vec::new(),
+        scanned: false,
     };
     for t in &tried {
         p.notes.push(format!("output folder not used: {t}"));
@@ -382,9 +388,16 @@ pub fn parent_main(o: Options) -> i32 {
     } else if p.state == "in progress" {
         p.state = "complete";
     }
-    p.write_manifest();
+    // §6.3 finalize: diag.log closes first, then the scanner reads every
+    // file (summary included), and the manifest is written last so its
+    // hashes are those of the files that stay
+    p.log.log(&format!("collection done in {:.1} s; the final scan (§6.3) follows", t0.elapsed().as_secs_f64()));
+    p.log.f = None;
+    // the summary says the scan ran; a summary the scan fails is left out
+    p.scanned = true;
     p.write_summary();
-    p.log.log(&format!("done in {:.1} s", t0.elapsed().as_secs_f64()));
+    p.final_scan(&salt);
+    p.write_manifest();
     eprintln!("irondivi-cli diag: {} — {}", p.state, p.out.display());
     eprintln!("Nothing was sent. Read 00-SUMMARY.txt in that folder first.");
     if p.state == "complete" {
@@ -395,6 +408,30 @@ pub fn parent_main(o: Options) -> i32 {
 }
 
 impl Parent {
+    /// §6.3: scan, leave out every file with a hit, rewrite the summary
+    /// with the list, and scan again until nothing is found
+    fn final_scan(&mut self, salt: &[u8]) {
+        let confs: Vec<PathBuf> = self.ctx.datadirs.iter().filter_map(|d| d.conf.clone()).collect();
+        let cookies: Vec<PathBuf> =
+            self.ctx.datadirs.iter().flat_map(|d| [d.path.join(".cookie"), d.chain.join(".cookie")]).collect();
+        let secrets = scanner::secrets_of(&confs, &cookies);
+        let sc = scanner::Scanner::new(&self.red, &secrets, salt);
+        for round in 0..4 {
+            let hits = sc.scan_folder(&self.out);
+            if hits.is_empty() {
+                return;
+            }
+            for h in hits {
+                let _ = fs::remove_file(self.out.join(&h.file));
+                eprintln!("irondivi-cli diag: left out {} (line {}): {}", h.file, h.line, h.reason);
+                self.left_out.push((h.file, format!("line {}: {}", h.line, h.reason)));
+            }
+            if round < 3 {
+                self.write_summary();
+            }
+        }
+    }
+
     fn record(&mut self, spec: &'static Spec, status: String, secs: f64, bytes: u64) {
         self.log.log(&format!("{} {} {}: {status} ({secs:.1} s, {bytes} bytes)", spec.id, spec.name, if status == "ok" { "end" } else { "end" }));
         self.done.push(Done { spec, status, secs, bytes });
@@ -427,7 +464,7 @@ impl Parent {
                 r.path_of(&d.path),
                 if d.network.is_empty() { "unknown" } else { d.network.as_str() },
                 r.path_of(&d.chain),
-                d.found_by.join(", "),
+                r.scrub(&d.found_by.join(", ")),
                 if d.readable { String::new() } else { format!(", NOT READABLE: {}", d.read_error.clone().unwrap_or_default()) },
                 d.running_pid.map(|p| format!(", node pid {p}")).unwrap_or_default()
             ));
@@ -745,7 +782,17 @@ impl Parent {
             s.push_str(&r.scrub(n));
             s.push('\n');
         }
-        s.push_str("\nThis folder has been through diag's redaction (§6.2) and was not sent anywhere.\n");
+        if !self.left_out.is_empty() {
+            s.push_str("\n== Left out by the final scan (§6.3) ==\n");
+            for (f, why) in &self.left_out {
+                s.push_str(&format!("{f}: {why}\n"));
+            }
+        }
+        if self.scanned {
+            s.push_str("\nThis folder has been through diag's redaction (§6.2) and final scan (§6.3), and was not sent anywhere.\n");
+        } else {
+            s.push_str("\nThis folder has been through diag's redaction (§6.2) and was not sent anywhere.\n");
+        }
         // write-then-rename so a reader never sees half a summary
         let tmp = self.out.join(".00-SUMMARY.tmp");
         if let Ok(mut f) = OpenOptions::new().create(true).write(true).truncate(true).mode(0o600).open(&tmp) {
@@ -762,6 +809,9 @@ impl Parent {
         let owners = self.owners.lock().unwrap();
         let mut m = String::from("# path\tsize\tsha256\tcollector\n");
         m.push_str("# every file written by a collector went through the §6.2 step 1 scrub\n");
+        for (f, why) in &self.left_out {
+            m.push_str(&format!("# left out: {f} — {why}\n"));
+        }
         for rel in files {
             if rel == "02-manifest.txt" || rel.starts_with('.') {
                 continue;

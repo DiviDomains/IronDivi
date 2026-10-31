@@ -191,6 +191,12 @@ impl Redactor {
         format!("{}-{:02x}{:02x}", kind, out[0], out[1])
     }
 
+    /// The known values the pattern pass matches, after the length and
+    /// common-name rules (the §6.3 scanner searches for exactly these)
+    pub fn known_values(&self) -> impl Iterator<Item = (&str, &'static str)> {
+        self.known_kind.iter().map(|(v, k)| (v.as_str(), *k))
+    }
+
     /// A user name in a position that says it is one (owner column, `User=`)
     pub fn user(&self, name: &str) -> String {
         if name == "root" || name.is_empty() || name.chars().all(|c| c.is_ascii_digit()) && name == "0" {

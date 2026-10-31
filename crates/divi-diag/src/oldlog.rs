@@ -387,6 +387,33 @@ fn peer_of(msg: &str) -> Option<&str> {
     msg[i + 11..].split_whitespace().next().map(|p| p.trim_end_matches([',', ':', ')']))
 }
 
+/// §6.3: would the filter remove this line (a per-block, failure-only or
+/// staker line)? The filter's own count lines (`[week of …: …]`) are not.
+pub fn would_remove(raw: &str) -> Option<&'static str> {
+    let t = raw.trim();
+    if t.starts_with('[') && t.ends_with(']') {
+        return None;
+    }
+    let l = strip_ansi(raw);
+    let json = parse_json(&l);
+    let l: &str = json.as_ref().map(|j| j.0.as_str()).unwrap_or(&l);
+    let parsed = parse(l);
+    let msg = parsed.as_ref().map(|p| p.msg).unwrap_or(l).trim_start();
+    if let Some(w) = failure_only(msg).or_else(|| per_block(msg)) {
+        return Some(w);
+    }
+    if parsed.is_none() {
+        if let Some(w) = PER_BLOCK.iter().find(|p| l.contains(**p)) {
+            return Some(w);
+        }
+    }
+    let target = parsed.as_ref().map(|p| p.target).unwrap_or("");
+    if target.starts_with("divi_node::staker") || (parsed.is_none() && l.contains("divi_node::staker")) {
+        return Some("staker line");
+    }
+    None
+}
+
 /// The one filter (§6.2 "Old-log lines")
 pub fn filter(text: &str, r: &Redactor) -> Filtered {
     let mut f = Filtered::default();
