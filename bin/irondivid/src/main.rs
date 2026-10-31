@@ -1924,9 +1924,9 @@ async fn run_daemon(
                 let wallet_for_added = Arc::clone(wallet_arc);
                 node.mempool()
                     .add_added_listener(Arc::new(move |tx: &Transaction| {
-                        if wallet_for_added.add_mempool_tx(tx) {
-                            info!("Wallet sees unconfirmed tx {}", tx.txid());
-                        }
+                        // No log line: its time beside the relay lines would
+                        // pick out the wallet's own transactions in debug.log
+                        wallet_for_added.add_mempool_tx(tx);
                     }));
                 let wallet_for_removed = Arc::clone(wallet_arc);
                 node.mempool()
