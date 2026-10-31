@@ -1587,8 +1587,6 @@ impl BlockSync {
         }
     }
 
-    /// Whether the node is more than `CAUGHT_UP_LAG` blocks behind `target`;
-    /// remembers it for the next "Block sync complete"
     /// Enter Synced. True when this ends a real catch-up (the node had
     /// fallen more than CAUGHT_UP_LAG behind): only then may the caller write
     /// an info line. Every way into Synced goes through here, so the flag is
@@ -1603,6 +1601,8 @@ impl BlockSync {
         !was_synced && self.fell_behind.swap(false, Ordering::Relaxed)
     }
 
+    /// Whether the node is more than `CAUGHT_UP_LAG` blocks behind `target`;
+    /// remembers it for the next "Block sync complete"
     fn note_lag(&self, our_height: u32, target: u32) -> bool {
         let far = target.saturating_sub(our_height) > CAUGHT_UP_LAG;
         if far {
