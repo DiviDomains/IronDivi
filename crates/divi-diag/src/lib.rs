@@ -33,12 +33,8 @@ pub mod tar;
 pub mod util;
 
 /// The node's own configuration parser (B1.3: "parsed with the node's
-/// parser"). It lives in the irondivid binary crate and has no crate-local
-/// dependencies, so it is compiled in here from the same file rather than
-/// copied.
-#[path = "../../../bin/irondivid/src/settings.rs"]
-#[allow(dead_code, clippy::all)]
-pub mod settings;
+/// parser"), shared with irondivid through the `divi-settings` crate.
+pub use divi_settings as settings;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 

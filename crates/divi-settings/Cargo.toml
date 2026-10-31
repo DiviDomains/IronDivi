@@ -1,0 +1,9 @@
+[package]
+license = "AGPL-3.0-only"
+name = "divi-settings"
+version.workspace = true
+edition.workspace = true
+description = "Start-up options as Divi Core's divid reads them; shared by irondivid and divi-diag"
+
+[dependencies]
+toml = { workspace = true }

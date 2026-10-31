@@ -7,6 +7,7 @@ description = "IronDivi diagnostics: discovery and collectors for `irondivi-cli 
 
 [dependencies]
 divi-primitives = { workspace = true }
+divi-settings = { workspace = true }
 sha2 = { workspace = true }
 hmac = "0.12"
 hex = { workspace = true }

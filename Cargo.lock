@@ -2814,6 +2814,7 @@ version = "0.2.9"
 dependencies = [
  "divi-network",
  "divi-primitives",
+ "divi-settings",
  "divi-storage",
  "hex",
  "hmac 0.12.1",
@@ -2986,6 +2987,13 @@ dependencies = [
  "sha1",
  "sha2 0.10.9",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "divi-settings"
+version = "0.2.9"
+dependencies = [
+ "toml",
 ]
 
 [[package]]
@@ -4408,6 +4416,7 @@ dependencies = [
  "divi-node",
  "divi-primitives",
  "divi-rpc",
+ "divi-settings",
  "divi-storage",
  "divi-test-support",
  "divi-wallet",
