@@ -19,6 +19,7 @@
 
 use crate::{Hash256, OutPoint};
 use sha2::{Digest, Sha256};
+use std::borrow::Borrow;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
@@ -91,14 +92,23 @@ fn mac(tag: &str, data: &[u8]) -> [u8; 32] {
         .chain_update(data)
         .finalize();
     let mut out = [0u8; 32];
-    out.copy_from_slice(&Sha256::new().chain_update(opad).chain_update(inner).finalize());
+    out.copy_from_slice(
+        &Sha256::new()
+            .chain_update(opad)
+            .chain_update(inner)
+            .finalize(),
+    );
     out
 }
 
 /// `<prefix>-<8 hex>`: the first four bytes of the value's HMAC
 fn pseudonym(f: &mut fmt::Formatter<'_>, prefix: &str, data: &[u8]) -> fmt::Result {
     let m = mac(prefix, data);
-    write!(f, "{}-{:02x}{:02x}{:02x}{:02x}", prefix, m[0], m[1], m[2], m[3])
+    write!(
+        f,
+        "{}-{:02x}{:02x}{:02x}{:02x}",
+        prefix, m[0], m[1], m[2], m[3]
+    )
 }
 
 macro_rules! both {
@@ -121,6 +131,12 @@ macro_rules! both {
 /// A txid this wallet sent, received or holds: `wtx-xxxxxxxx`
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct WalletTxid(pub Hash256);
+
+impl WalletTxid {
+    pub fn of(h: impl Borrow<Hash256>) -> Self {
+        WalletTxid(*h.borrow())
+    }
+}
 
 impl fmt::Display for WalletTxid {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -206,6 +222,12 @@ both!(OwnOutpoint);
 /// `wblk-xxxxxxxx`. In a public record the same block is a `BlockHash`
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct OwnBlockHash(pub Hash256);
+
+impl OwnBlockHash {
+    pub fn of(h: impl Borrow<Hash256>) -> Self {
+        OwnBlockHash(*h.borrow())
+    }
+}
 
 impl fmt::Display for OwnBlockHash {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -308,9 +330,17 @@ mod tests {
                 ipad[i] ^= b;
                 opad[i] ^= b;
             }
-            let inner = Sha256::new().chain_update(ipad).chain_update(msg).finalize();
+            let inner = Sha256::new()
+                .chain_update(ipad)
+                .chain_update(msg)
+                .finalize();
             let mut out = [0u8; 32];
-            out.copy_from_slice(&Sha256::new().chain_update(opad).chain_update(inner).finalize());
+            out.copy_from_slice(
+                &Sha256::new()
+                    .chain_update(opad)
+                    .chain_update(inner)
+                    .finalize(),
+            );
             out
         }
         let m = hmac(b"Jefe", b"what do ya want for nothing?");

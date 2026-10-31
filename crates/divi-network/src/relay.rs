@@ -20,6 +20,7 @@ use crate::NetworkMessage;
 
 use divi_primitives::amount::Amount;
 use divi_primitives::hash::Hash256;
+use divi_primitives::redact::WalletTxid;
 use divi_primitives::transaction::Transaction;
 
 use parking_lot::RwLock;
@@ -246,7 +247,12 @@ impl TxRelay {
         let msg = NetworkMessage::GetData(inv);
 
         if let Err(e) = self.peer_manager.send_to_peer(peer_id, msg).await {
-            warn!("Failed to request tx {} from peer {}: {}", txid, peer_id, e);
+            warn!(
+                "Failed to request tx {} from peer {}: {}",
+                WalletTxid::of(txid),
+                peer_id,
+                e
+            );
             return;
         }
 
@@ -319,7 +325,12 @@ impl TxRelay {
             if let Some(tx) = get_tx(&item.hash) {
                 let msg = NetworkMessage::Tx(tx);
                 if let Err(e) = self.peer_manager.send_to_peer(peer_id, msg).await {
-                    warn!("Failed to send tx {} to peer {}: {}", item.hash, peer_id, e);
+                    warn!(
+                        "Failed to send tx {} to peer {}: {}",
+                        WalletTxid(item.hash),
+                        peer_id,
+                        e
+                    );
                 }
             } else {
                 debug!(
@@ -400,7 +411,11 @@ impl TxRelay {
         };
 
         for (txid, peer_id) in timed_out {
-            warn!("Tx {} request timed out from peer {}", txid, peer_id);
+            warn!(
+                "Tx {} request timed out from peer {}",
+                WalletTxid::of(txid),
+                peer_id
+            );
             self.txs_in_flight.write().remove(&txid);
 
             // Try to get from another peer

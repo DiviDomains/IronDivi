@@ -1969,7 +1969,8 @@ fn resubmit_wallet_txs(node: &Node, wallet: &Arc<WalletDb>) {
             Err(e) => {
                 warn!(
                     "Unconfirmed wallet tx {} cannot be resubmitted ({}); forgetting it",
-                    txid, e
+                    divi_primitives::redact::WalletTxid::of(txid),
+                    e
                 );
                 wallet.remove_mempool_tx(&txid);
             }

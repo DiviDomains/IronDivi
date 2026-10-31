@@ -25,6 +25,7 @@ use crate::persistence::{
 
 use divi_primitives::amount::Amount;
 use divi_primitives::hash::{Hash160, Hash256};
+use divi_primitives::redact::{OwnOutpoint, WalletAddress, WalletAmount, WalletTxid};
 use divi_primitives::script::Script;
 use divi_primitives::transaction::OutPoint;
 use divi_primitives::ChainMode;
@@ -540,7 +541,10 @@ impl WalletDb {
                 })
             };
             if orphaned || confirmed || conflicted || !self.track_mempool_tx(&tx, Some(timestamp)) {
-                debug!("Dropping stored unconfirmed wallet tx {}", txid);
+                debug!(
+                    "Dropping stored unconfirmed wallet tx {}",
+                    WalletTxid::of(txid)
+                );
                 db.remove_unconfirmed_tx(&txid)?;
                 if !confirmed {
                     // Its outputs never existed, so whatever spends them is void too
@@ -571,7 +575,11 @@ impl WalletDb {
                 match divi_primitives::deserialize(&raw) {
                     Ok(tx) => Some(tx),
                     Err(e) => {
-                        tracing::warn!("Skipping unreadable detached wallet tx {}: {}", txid, e);
+                        tracing::warn!(
+                            "Skipping unreadable detached wallet tx {}: {}",
+                            WalletTxid::of(txid),
+                            e
+                        );
                         continue;
                     }
                 }
@@ -614,7 +622,11 @@ impl WalletDb {
         }
         if let Some(ref db) = self.db {
             if let Err(e) = db.store_detached_tx(&txid, timestamp, &raw) {
-                tracing::warn!("Failed to store detached wallet tx {}: {}", txid, e);
+                tracing::warn!(
+                    "Failed to store detached wallet tx {}: {}",
+                    WalletTxid::of(txid),
+                    e
+                );
             }
         }
     }
@@ -624,7 +636,11 @@ impl WalletDb {
         if self.detached_txs.write().remove(txid).is_some() {
             if let Some(ref db) = self.db {
                 if let Err(e) = db.remove_detached_tx(txid) {
-                    tracing::warn!("Failed to forget detached wallet tx {}: {}", txid, e);
+                    tracing::warn!(
+                        "Failed to forget detached wallet tx {}: {}",
+                        WalletTxid::of(txid),
+                        e
+                    );
                 }
             }
         }
@@ -829,7 +845,11 @@ impl WalletDb {
                 Ok(notes) => {
                     self.tx_notes.write().insert(txid, notes);
                 }
-                Err(e) => debug!("Skipping unreadable notes of {}: {}", txid, e),
+                Err(e) => debug!(
+                    "Skipping unreadable notes of {}: {}",
+                    WalletTxid::of(txid),
+                    e
+                ),
             }
         }
 
@@ -992,7 +1012,7 @@ impl WalletDb {
             self.transactions.read().len(),
             self.accounts.read().len(),
             self.scripts.read().len(),
-            self.get_balance()
+            WalletAmount(self.get_balance().as_sat())
         );
 
         Ok(())
@@ -1574,7 +1594,11 @@ impl WalletDb {
         let addr = self.keystore.import_watch_only(pubkey, label);
         self.dirty.write().keys = true;
         if let Err(e) = self.persist_keys(&[addr.hash]) {
-            error!("Failed to store watch-only key {}: {}", addr, e);
+            error!(
+                "Failed to store watch-only key {}: {}",
+                WalletAddress(&addr.to_string()),
+                e
+            );
         }
         addr
     }
@@ -1746,7 +1770,11 @@ impl WalletDb {
     /// Add a UTXO to the wallet
     pub fn add_utxo(&self, utxo: WalletUtxo) {
         let outpoint = utxo.outpoint();
-        debug!("Adding UTXO {}:{} ({})", utxo.txid, utxo.vout, utxo.value);
+        debug!(
+            "Adding UTXO {} ({})",
+            OwnOutpoint(utxo.txid, utxo.vout),
+            WalletAmount(utxo.value.as_sat())
+        );
         self.utxos.write().insert(outpoint, utxo);
         self.dirty.write().utxos = true;
     }
@@ -1764,7 +1792,7 @@ impl WalletDb {
     ) -> Option<WalletUtxo> {
         let utxo = self.utxos.write().remove(outpoint);
         if let Some(ref u) = utxo {
-            debug!("Spent UTXO {}:{}", outpoint.txid, outpoint.vout);
+            debug!("Spent UTXO {}", OwnOutpoint(outpoint.txid, outpoint.vout));
             self.spent.write().insert(*outpoint);
             if let Some(h) = height {
                 self.spent_utxo_data
@@ -1948,8 +1976,10 @@ impl WalletDb {
             if !chain_has_utxo(outpoint) {
                 if let Some(utxo) = self.utxos.write().remove(outpoint) {
                     info!(
-                        "Reconciliation: removed phantom UTXO {}:{} ({} sat, addr={})",
-                        outpoint.txid, outpoint.vout, utxo.value, utxo.address
+                        "Reconciliation: removed phantom UTXO {} ({}, addr={})",
+                        OwnOutpoint(outpoint.txid, outpoint.vout),
+                        WalletAmount(utxo.value.as_sat()),
+                        WalletAddress(&utxo.address)
                     );
                     self.pending_deletes.write().utxos.insert(*outpoint);
                     removed += 1;
@@ -2156,7 +2186,7 @@ impl WalletDb {
 
     /// Add a transaction to history
     pub fn add_transaction(&self, tx: WalletTx) {
-        debug!("Adding transaction {} to history", tx.txid);
+        debug!("Adding transaction {} to history", WalletTxid(tx.txid));
         let (txid, confirmed) = (tx.txid, tx.block_height.is_some());
         self.note_first_seen(&txid);
         self.transactions.write().insert(tx.txid, tx);
@@ -2697,9 +2727,16 @@ impl WalletDb {
         self.dirty.write().keys = true;
         if let Err(e) = self.persist_keys(&[address.hash]) {
             // Still held in memory; save() and lock() retry the write
-            error!("Failed to store imported key {}: {}", address, e);
+            error!(
+                "Failed to store imported key {}: {}",
+                WalletAddress(&address.to_string()),
+                e
+            );
         }
-        info!("Imported key for address {}", address);
+        info!(
+            "Imported key for address {}",
+            WalletAddress(&address.to_string())
+        );
         address
     }
 
@@ -2832,7 +2869,12 @@ impl WalletDb {
                     self.mark_address_used(&address);
                 }
 
-                trace!("Received {} to {} in tx {}", output.value, address, txid);
+                trace!(
+                    "Received {} to {} in tx {}",
+                    WalletAmount(output.value.as_sat()),
+                    WalletAddress(&address),
+                    WalletTxid::of(txid)
+                );
             }
         }
 
@@ -2847,10 +2889,9 @@ impl WalletDb {
                 is_relevant = true;
                 sent += utxo.value;
                 trace!(
-                    "Spent {} from {}:{}",
-                    utxo.value,
-                    outpoint.txid,
-                    outpoint.vout
+                    "Spent {} from {}",
+                    WalletAmount(utxo.value.as_sat()),
+                    OwnOutpoint(outpoint.txid, outpoint.vout)
                 );
             } else if let Some(value) = height.and_then(|h| {
                 // This block was scanned before and already spent the coin:
@@ -2925,7 +2966,12 @@ impl WalletDb {
             };
 
             self.add_transaction(wallet_tx);
-            debug!("Wallet tx {} {} {} sats", category, txid, net_amount.abs());
+            debug!(
+                "Wallet tx {} {} {}",
+                category,
+                WalletTxid::of(txid),
+                WalletAmount(net_amount.abs())
+            );
             self.tx_changed(&txid);
         }
 
@@ -3116,7 +3162,11 @@ impl WalletDb {
                 if let Err(e) =
                     db.store_unconfirmed_tx(&txid, timestamp, &divi_primitives::serialize(tx))
                 {
-                    tracing::error!("Failed to store unconfirmed wallet tx {}: {}", txid, e);
+                    tracing::error!(
+                        "Failed to store unconfirmed wallet tx {}: {}",
+                        WalletTxid::of(txid),
+                        e
+                    );
                 }
             }
         }
@@ -3139,7 +3189,11 @@ impl WalletDb {
         };
         if let Some(db) = &self.db {
             if let Err(e) = db.store_tx_order(txid, position) {
-                tracing::warn!("Failed to store the position of {}: {}", txid, e);
+                tracing::warn!(
+                    "Failed to store the position of {}: {}",
+                    WalletTxid::of(txid),
+                    e
+                );
             }
         }
     }
@@ -3160,10 +3214,18 @@ impl WalletDb {
             match serde_json::to_vec(&notes) {
                 Ok(raw) => {
                     if let Err(e) = db.store_tx_notes(txid, &raw) {
-                        tracing::error!("Failed to store the notes of {}: {}", txid, e);
+                        tracing::error!(
+                            "Failed to store the notes of {}: {}",
+                            WalletTxid::of(txid),
+                            e
+                        );
                     }
                 }
-                Err(e) => tracing::error!("Failed to encode the notes of {}: {}", txid, e),
+                Err(e) => tracing::error!(
+                    "Failed to encode the notes of {}: {}",
+                    WalletTxid::of(txid),
+                    e
+                ),
             }
         }
         self.tx_notes.write().insert(*txid, notes);
@@ -3179,7 +3241,11 @@ impl WalletDb {
         if let Some(db) = &self.db {
             for txid in txids {
                 if let Err(e) = db.remove_unconfirmed_tx(txid) {
-                    tracing::warn!("Failed to forget unconfirmed wallet tx {}: {}", txid, e);
+                    tracing::warn!(
+                        "Failed to forget unconfirmed wallet tx {}: {}",
+                        WalletTxid::of(txid),
+                        e
+                    );
                 }
             }
         }
@@ -3234,7 +3300,11 @@ impl WalletDb {
             if let Some(entry) = overlay.remove(&id) {
                 forgotten.push(id);
                 conflicted.push((id, entry.record.timestamp, entry.tx));
-                info!("Dropped mempool wallet tx {} (conflicts with {})", id, txid);
+                info!(
+                    "Dropped mempool wallet tx {} (conflicts with {})",
+                    WalletTxid::of(id),
+                    WalletTxid::of(txid)
+                );
                 doomed.extend(
                     overlay
                         .iter()
@@ -3343,8 +3413,9 @@ impl WalletDb {
                     continue;
                 }
                 info!(
-                    "Restoring UTXO {}:{} ({}) spent at rolled-back height",
-                    outpoint.txid, outpoint.vout, utxo.value
+                    "Restoring UTXO {} ({}) spent at rolled-back height",
+                    OwnOutpoint(outpoint.txid, outpoint.vout),
+                    WalletAmount(utxo.value.as_sat())
                 );
                 pending.utxos.remove(&outpoint);
                 utxos.insert(outpoint, utxo);
@@ -3784,7 +3855,11 @@ impl WalletDb {
         if let Some(ref db) = self.db {
             for outpoint in &doomed {
                 if let Err(e) = db.remove_utxo(outpoint) {
-                    debug!("Failed to delete vault UTXO {:?}: {}", outpoint, e);
+                    debug!(
+                        "Failed to delete vault UTXO {}: {}",
+                        OwnOutpoint(outpoint.txid, outpoint.vout),
+                        e
+                    );
                 }
             }
         }

@@ -13,6 +13,7 @@
 
 use anyhow::{bail, Result};
 use divi_primitives::hash::Hash256;
+use divi_primitives::redact::{OwnOutpoint, WalletLabel, WalletValue};
 use divi_primitives::transaction::OutPoint;
 use divi_wallet::WalletDb;
 use std::io::Read;
@@ -138,15 +139,17 @@ pub fn lock_masternode_collateral(wallet: &WalletDb, data_dir: &Path) -> usize {
     info!("Locking Masternodes:");
     let mut locked = 0;
     for entry in entries {
-        info!("  {} {}", entry.tx_hash, entry.out_idx);
         match (Hash256::from_hex(&entry.tx_hash), entry.out_idx.parse::<u32>()) {
             (Ok(txid), Ok(vout)) => {
+                info!("  {}", OwnOutpoint(txid, vout));
                 wallet.set_coin_locked(OutPoint { txid, vout }, true);
                 locked += 1;
             }
             _ => warn!(
                 "masternode.conf entry {}: collateral {} {} is not a txid and output index; not locked",
-                entry.alias, entry.tx_hash, entry.out_idx
+                WalletLabel(&entry.alias),
+                WalletValue(&entry.tx_hash),
+                WalletValue(&entry.out_idx)
             ),
         }
     }

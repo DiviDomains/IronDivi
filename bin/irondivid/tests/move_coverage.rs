@@ -292,7 +292,7 @@ fn hdseed_option_makes_cores_wallet() {
 /// The masternode.conf collateral lock is always on: `-mnconflock=0` is
 /// named as not supported and the entry is still locked. A line with too
 /// few fields is skipped, a collateral that is not a txid is named in the
-/// log, and irondivid starts with the entries it can use.
+/// log (as a pseudonym), and irondivid starts with the entries it can use.
 #[test]
 fn masternode_conf_lock_is_always_on_and_unusable_lines_are_skipped() {
     let dir = tempfile::tempdir().unwrap();
@@ -323,10 +323,13 @@ fn masternode_conf_lock_is_always_on_and_unusable_lines_are_skipped() {
         log.contains("Option -mnconflock is not supported by irondivid; ignored"),
         "{log}"
     );
+    // The alias and collateral are wallet values: pseudonyms (A11)
+    assert!(log.contains("masternode.conf entry wlb-"), "{log}");
     assert!(
-        log.contains("masternode.conf entry mn2: collateral not-a-txid 0"),
+        log.contains("is not a txid and output index; not locked"),
         "{log}"
     );
+    assert!(!log.contains("not-a-txid") && !log.contains(txid), "{log}");
 }
 
 /// With no --datadir irondivid keeps to ~/.irondivi/<network>, and a Divi
