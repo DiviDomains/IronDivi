@@ -80,15 +80,15 @@ impl Default for LogLevels {
     }
 }
 
-fn level(value: &str, what: &str) -> Result<String, String> {
+/// A level name; a refusal names -loglevel and the allowed levels, never
+/// the value given (R3 code 2)
+fn level(value: &str) -> Result<String, String> {
     let v = value.trim().to_ascii_lowercase();
     if LEVELS.contains(&v.as_str()) {
         Ok(v)
     } else {
         Err(format!(
-            "invalid log level '{}' in {} (use one of {})",
-            value.trim(),
-            what,
+            "invalid log level in -loglevel (use one of {})",
             LEVELS.join(", ")
         ))
     }
@@ -116,10 +116,10 @@ impl LogLevels {
             }
             match item.split_once(':') {
                 Some((cat, lvl)) => {
-                    let lvl = level(lvl, &format!("-loglevel={}", item))?;
+                    let lvl = level(lvl)?;
                     out.set_category(&cat.trim().to_ascii_lowercase(), &lvl);
                 }
-                None => out.base = level(item, &format!("-loglevel={}", item))?,
+                None => out.base = level(item)?,
             }
         }
         Ok(out)

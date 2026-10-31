@@ -55,6 +55,76 @@ fn an_option_s_value_exits_2() {
     assert_eq!(out.status.code(), Some(2), "{}", String::from_utf8_lossy(&out.stderr));
 }
 
+/// Every `.log` file under `dir`, as one text
+fn logs_under(dir: &Path) -> String {
+    let mut text = String::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "log") {
+                text.push_str(&std::fs::read_to_string(&path).unwrap_or_default());
+            }
+        }
+    }
+    text
+}
+
+/// R3 code 2: the reason names the option and why, never the value given,
+/// on stderr or in any log (a value can be a password, an address or a
+/// network the owner keeps to themselves)
+#[test]
+fn a_refused_value_exits_2_naming_the_option_not_the_value() {
+    // Each value holds the sentinel; the option's name is what must show
+    let cases: &[(&str, &[&str])] = &[
+        ("-onlynet", &["-onlynet=zq7xsentinel"]),
+        ("-whitelist", &["-whitelist=zq7xsentinel"]),
+        ("-whitebind", &["-whitebind=zq7xsentinel"]),
+        // Numeric, so no name lookup: a documentation address, not valid
+        ("-externalip", &["-externalip=[2001:db8::7a7a]"]),
+        ("-minrelaytxfee", &["-minrelaytxfee=zq7xsentinel"]),
+        ("-maxtxfee", &["-maxtxfee=zq7xsentinel"]),
+        // -rpcbind is read only with -rpcallowip (rpcserver.cpp:685-703)
+        ("-rpcbind", &["-rpcallowip=127.0.0.1", "-rpcbind=zq7xsentinel"]),
+        ("-rpcallowip", &["-rpcallowip=zq7xsentinel"]),
+        ("--export-start", &["-export-start=zq7xsentinel"]),
+        ("--mode", &["-mode=zq7xsentinel"]),
+        ("-loglevel", &["-loglevel=zq7xsentinel"]),
+        ("-expire", &["-expire=zq7xsentinel"]),
+        ("-masternode", &["-masternode=zq7xsentinel"]),
+        ("rpcwhitelist", &["-rpcwhitelist=:zq7xsentinel"]),
+    ];
+    for (option, extra) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let mut args = vec![
+            datadir(dir.path()),
+            "-regtest".to_string(),
+            "-rpcuser=test".into(),
+            "-rpcpassword=test".into(),
+            format!("-rpcport={}", divi_test_support::free_port()),
+            format!("-port={}", divi_test_support::free_port()),
+            "-listen=0".into(),
+        ];
+        args.extend(extra.iter().map(|s| s.to_string()));
+        let out = run(&args);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let logs = logs_under(dir.path());
+        assert_eq!(out.status.code(), Some(2), "{option}: {stderr}");
+        assert!(stderr.contains(option), "{option} is named: {stderr}");
+        for (what, text) in [("stderr", stderr.as_ref()), ("a log", logs.as_str())] {
+            assert!(
+                !text.contains("zq7xsentinel") && !text.contains("2001:db8::7a7a"),
+                "{option}: the value is in {what}:\n{text}"
+            );
+        }
+    }
+}
+
 #[test]
 fn an_invalid_config_line_exits_3_without_its_text() {
     let dir = tempfile::tempdir().unwrap();

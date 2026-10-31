@@ -292,7 +292,8 @@ fn externalip_that_is_not_an_address_stops_the_start() {
     let log = std::fs::read_to_string(dir.path().join("debug.log")).unwrap_or_default();
     let text = format!("{}{}", String::from_utf8_lossy(&out.stderr), log);
     assert!(
-        text.contains("Cannot resolve -externalip address: '[2001:db8::1]'"),
+        text.contains("Cannot resolve -externalip address")
+            && !text.contains("2001:db8::1"),
         "{text}"
     );
 }

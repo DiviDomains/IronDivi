@@ -381,15 +381,14 @@ impl Args {
                 .map(|v| {
                     v.trim()
                         .parse::<u32>()
-                        .with_context(|| format!("invalid value '{}' for --{}", v, key))
+                        .with_context(|| format!("invalid value for --{}", key))
                 })
                 .transpose()
         };
         if let Some(mode) = s.get("mode") {
             if !matches!(mode, "divi" | "privatedivi") {
                 anyhow::bail!(
-                    "invalid value '{}' for '--mode <MODE>' [possible values: divi, privatedivi]",
-                    mode
+                    "invalid value for '--mode <MODE>' [possible values: divi, privatedivi]"
                 );
             }
         }
@@ -698,12 +697,12 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     // The RPC server listens on the loopback unless -rpcallowip lets others
     // in; then on -rpcbind, else on every interface (rpcserver.cpp:633-706)
     let allowed = s.get_multi("rpcallowip").to_vec();
-    for subnet in &allowed {
+    for (i, subnet) in allowed.iter().enumerate() {
         if divi_rpc::Subnet::parse(subnet).is_none() {
             anyhow::bail!(
-                "Invalid -rpcallowip subnet specification: {}. Valid are a single IP (e.g. 1.2.3.4), \
+                "Invalid -rpcallowip subnet specification{}. Valid are a single IP (e.g. 1.2.3.4), \
                  a network/netmask (e.g. 1.2.3.4/255.255.255.0) or a network/CIDR (e.g. 1.2.3.4/24).",
-                subnet
+                which(i, allowed.len())
             );
         }
     }
@@ -716,14 +715,17 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     } else if let Some(first) = rpcbind.first() {
         // Each must be a numeric address, with a port or not (ParseEndpoint,
         // rpcserver.cpp:623-629, :693-703)
-        for addr in rpcbind {
+        for (i, addr) in rpcbind.iter().enumerate() {
             let (host, _) = host_and_port(addr);
             if host
                 .trim_matches(['[', ']'])
                 .parse::<std::net::IpAddr>()
                 .is_err()
             {
-                anyhow::bail!("Could not parse -rpcbind value {} as network address", addr);
+                anyhow::bail!(
+                    "Could not parse -rpcbind value{} as network address",
+                    which(i, rpcbind.len())
+                );
             }
         }
         let (host, p) = host_and_port(first);
@@ -770,16 +772,24 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     }
     // -whitelist networks; one that is not a network stops the start
     // (net.cpp:1749-1755)
-    for net in s.get_multi("whitelist") {
+    let whitelist = s.get_multi("whitelist");
+    for (i, net) in whitelist.iter().enumerate() {
         if divi_network::Subnet::parse(net).is_none() {
-            anyhow::bail!("Invalid netmask specified in -whitelist: '{}'", net);
+            anyhow::bail!(
+                "Invalid netmask specified in -whitelist{}",
+                which(i, whitelist.len())
+            );
         }
         config.p2p.whitelist.push(net.clone());
     }
     // -whitebind: a numeric address with its port; with -whitebind and no
     // -bind, only the -whitebind addresses are listened on (net.cpp:1808-1823)
-    for raw in s.get_multi("whitebind") {
-        config.p2p.white_bind.push(white_bind_address(raw)?);
+    let whitebind = s.get_multi("whitebind");
+    for (i, raw) in whitebind.iter().enumerate() {
+        config
+            .p2p
+            .white_bind
+            .push(white_bind_address(raw, &which(i, whitebind.len()))?);
     }
     if s.is_set("whitebind") && !s.is_set("bind") {
         config.p2p.listen_on_addr = false;
@@ -819,10 +829,16 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     config.p2p.discover = s.get_bool("discover", true);
     // -externalip=<ip>[:port], the listen port when none is given; one that
     // does not resolve to a valid address stops the start (net.cpp:1834-1839)
-    for raw in s.get_multi("externalip") {
+    let externalip = s.get_multi("externalip");
+    for (i, raw) in externalip.iter().enumerate() {
         let addr = resolve_service(raw, config.p2p.port)
             .filter(|a| divi_network::local::is_valid(&a.ip()))
-            .ok_or_else(|| anyhow::anyhow!("Cannot resolve -externalip address: '{}'", raw))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Cannot resolve -externalip address{}",
+                    which(i, externalip.len())
+                )
+            })?;
         config.p2p.external_ips.push(addr);
     }
     // Divi Core SetProtocolVersion (init.cpp:1450-1452)
@@ -851,14 +867,14 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         // ParseMoney; refused unless it is an amount above zero, and kept in
         // satoshis per kB (init.cpp:823-829, FeeRate.cpp)
         let sat = parse_money(text).filter(|&sat| sat > 0).ok_or_else(|| {
-            anyhow::anyhow!("Invalid amount for -minrelaytxfee=<amount>: '{}'", text)
+            anyhow::anyhow!("Invalid amount for -minrelaytxfee=<amount> (an amount above zero)")
         })?;
         config.mempool.min_relay_fee_per_kb = sat;
     }
     // -maxtxfee: an amount ParseMoney reads, at least the relay fee for 1 kB;
     // above 10 DIVI a warning (init.cpp:831-845)
     if let Some(text) = s.get("maxtxfee") {
-        let invalid = || anyhow::anyhow!("Invalid amount for -maxtxfee=<amount>: '{}'", text);
+        let invalid = || anyhow::anyhow!("Invalid amount for -maxtxfee=<amount>");
         let max_fee = parse_money(text).ok_or_else(invalid)?;
         if max_fee > 10 * 100_000_000 {
             warn!("Warning: -maxtxfee is set very high! Fees this large could be paid on a single transaction.");
@@ -866,8 +882,7 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         let relay = config.mempool.min_relay_fee_per_kb;
         if max_fee < relay {
             anyhow::bail!(
-                "Invalid amount for -maxtxfee=<amount>: '{}' (must be at least the minrelay fee of {}.{:08} DIV/kB to prevent stuck transactions)",
-                text,
+                "Invalid amount for -maxtxfee=<amount> (must be at least the minrelay fee of {}.{:08} DIV/kB to prevent stuck transactions)",
                 relay / 100_000_000,
                 relay % 100_000_000
             );
@@ -876,12 +891,16 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     }
     // -onlynet: each one of Divi Core's network names (ParseNetwork,
     // netbase.cpp:70-77; init.cpp:1734-1740)
-    for net in s.get_multi("onlynet") {
+    let onlynet = s.get_multi("onlynet");
+    for (i, net) in onlynet.iter().enumerate() {
         if !matches!(
             net.to_lowercase().as_str(),
             "ipv4" | "ipv6" | "tor" | "onion"
         ) {
-            anyhow::bail!("Unknown network specified in -onlynet: '{}'", net);
+            anyhow::bail!(
+                "Unknown network specified in -onlynet{} (use ipv4, ipv6, onion or tor)",
+                which(i, onlynet.len())
+            );
         }
     }
     if let Some(wif) = s.get("sporkkey") {
@@ -939,7 +958,7 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     }
     if let Some(text) = s.get("expire") {
         config.expire = divi_storage::prune::Expire::parse(text)
-            .map_err(|e| anyhow::anyhow!("config file: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("-expire: {}", e))?;
     }
     config.blocknotify = s
         .get("blocknotify")
@@ -1037,8 +1056,7 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
                 // <alias> of masternode.conf" and refuses to start without it
                 // (MasternodeModule.cpp:163-190); irondivid cannot run as one
                 anyhow::bail!(
-                    "-masternode={}: irondivid does not run as a masternode; remove the masternode= line to start it",
-                    settings.get("masternode").unwrap_or("")
+                    "-masternode: irondivid does not run as a masternode; remove the masternode= line to start it"
                 );
             } else if k == "checklevel" {
                 // divid refuses any -checklevel: it always checks at level 4
@@ -1059,9 +1077,21 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     Ok(())
 }
 
+/// Which of a repeated option's values a refusal is about, as " (value 2
+/// of 3)", or nothing when there is one: an R3 code 2 reason names the
+/// option and the place, never the value (a value can be a password or an
+/// address the owner keeps to themselves)
+fn which(index: usize, count: usize) -> String {
+    if count > 1 {
+        format!(" (value {} of {})", index + 1, count)
+    } else {
+        String::new()
+    }
+}
+
 /// A -whitebind value as Divi Core's Lookup reads it without name lookup:
 /// `ip:port` or `[ipv6]:port`; the port must be given (net.cpp:1815-1821)
-fn white_bind_address(text: &str) -> Result<std::net::SocketAddr> {
+fn white_bind_address(text: &str, which: &str) -> Result<std::net::SocketAddr> {
     let text = text.trim();
     let addr = text.parse::<std::net::SocketAddr>().ok().or_else(|| {
         text.trim_matches(['[', ']'])
@@ -1070,9 +1100,9 @@ fn white_bind_address(text: &str) -> Result<std::net::SocketAddr> {
             .map(|ip| std::net::SocketAddr::new(ip, 0))
     });
     match addr {
-        None => anyhow::bail!("Cannot resolve -whitebind address: '{}'", text),
+        None => anyhow::bail!("Cannot resolve -whitebind address{}", which),
         Some(a) if a.port() == 0 => {
-            anyhow::bail!("Need to specify a port with -whitebind: '{}'", text)
+            anyhow::bail!("Need to specify a port with -whitebind{}", which)
         }
         Some(a) => Ok(a),
     }
@@ -2773,7 +2803,7 @@ fn electrum_config(
             Some(a) => a
                 .parse()
                 .map(Some)
-                .with_context(|| format!("Invalid -{name}: '{a}' (an address:port)")),
+                .with_context(|| format!("Invalid -{name} (an address:port)")),
         }
     };
     let tcp = addr("electrum")?;
@@ -2836,7 +2866,7 @@ fn webui_config(args: &Args, config: &NodeConfig) -> Result<Option<divi_webui::W
             .parse::<u16>()
             .ok()
             .filter(|p| *p != 0)
-            .with_context(|| format!("Invalid -webuiport: '{p}'"))?,
+            .with_context(|| "Invalid -webuiport (a port from 1 to 65535)")?,
         None => divi_webui::default_port(
             private,
             net == NetworkType::Testnet,
@@ -3965,7 +3995,7 @@ mod config_format_tests {
         let err = cfg("regtest=1\nwhitelist=not-a-net\n", &[]).unwrap_err();
         assert_eq!(
             format!("{:#}", err),
-            "Invalid netmask specified in -whitelist: 'not-a-net'"
+            "Invalid netmask specified in -whitelist"
         );
 
         let c = cfg(
@@ -3989,11 +4019,11 @@ mod config_format_tests {
         for (bad, why) in [
             (
                 "127.0.0.1",
-                "Need to specify a port with -whitebind: '127.0.0.1'",
+                "Need to specify a port with -whitebind",
             ),
             (
                 "localhost:53999",
-                "Cannot resolve -whitebind address: 'localhost:53999'",
+                "Cannot resolve -whitebind address",
             ),
         ] {
             let err = cfg(&format!("regtest=1\nwhitebind={bad}\n"), &[]).unwrap_err();
@@ -4172,7 +4202,8 @@ mod mode_tests {
         let err = Args::try_parse_from(["irondivid", "--mode", "irondivi"])
             .unwrap_err()
             .to_string();
-        assert!(err.contains("invalid value 'irondivi'"), "{err}");
+        assert!(err.contains("invalid value for '--mode"), "{err}");
+        assert!(!err.contains("irondivi'"), "the value is never echoed: {err}");
         assert!(
             err.contains("[possible values: divi, privatedivi]"),
             "{err}"
@@ -4846,7 +4877,7 @@ mod divid_option_tests {
             .map(|e| e.to_string());
             assert_eq!(
                 err.as_deref(),
-                Some(format!("Invalid amount for -minrelaytxfee=<amount>: '{zero}'").as_str())
+                Some("Invalid amount for -minrelaytxfee=<amount> (an amount above zero)")
             );
         }
     }
@@ -4985,12 +5016,12 @@ mod start_errors {
         for bad in ["abc", "-1", "99999999999", "1e3"] {
             assert_eq!(
                 refused(CONF, &[&format!("-maxtxfee={bad}")]),
-                format!("Invalid amount for -maxtxfee=<amount>: '{bad}'")
+                "Invalid amount for -maxtxfee=<amount>"
             );
         }
         assert_eq!(
             refused(CONF, &["-maxtxfee=0.00001", "-minrelaytxfee=0.0001"]),
-            "Invalid amount for -maxtxfee=<amount>: '0.00001' (must be at least the minrelay \
+            "Invalid amount for -maxtxfee=<amount> (must be at least the minrelay \
              fee of 0.00010000 DIV/kB to prevent stuck transactions)"
         );
         assert_eq!(
@@ -5012,7 +5043,7 @@ mod start_errors {
     fn onlynet_names_a_network_divid_knows() {
         assert_eq!(
             refused(CONF, &["-onlynet=bogus"]),
-            "Unknown network specified in -onlynet: 'bogus'"
+            "Unknown network specified in -onlynet (use ipv4, ipv6, onion or tor)"
         );
         for good in ["ipv4", "IPv6", "tor", "onion"] {
             assert!(
@@ -5028,7 +5059,7 @@ mod start_errors {
     fn rpcbind_must_be_a_numeric_address() {
         assert_eq!(
             refused(CONF, &["-rpcallowip=127.0.0.1", "-rpcbind=garbage"]),
-            "Could not parse -rpcbind value garbage as network address"
+            "Could not parse -rpcbind value as network address"
         );
         assert_eq!(
             refused(
@@ -5039,7 +5070,7 @@ mod start_errors {
                     "-rpcbind=localhost"
                 ]
             ),
-            "Could not parse -rpcbind value localhost as network address"
+            "Could not parse -rpcbind value (value 2 of 2) as network address"
         );
         assert!(
             start(CONF, &["-rpcbind=garbage"]).is_ok(),

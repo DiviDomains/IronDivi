@@ -198,11 +198,12 @@ impl RpcAccess {
         }
 
         let mut whitelists: HashMap<String, HashSet<String>> = HashMap::new();
-        for entry in &config.whitelist {
+        for (i, entry) in config.whitelist.iter().enumerate() {
             let (user, methods) = entry.split_once(':').unwrap_or((entry.as_str(), ""));
             let user = user.trim();
             if user.is_empty() {
-                return Err(format!("invalid rpcwhitelist entry {entry:?}: no user"));
+                // The place, never the entry: the reason is printed at exit
+                return Err(format!("invalid rpcwhitelist entry {}: no user", i + 1));
             }
             let methods: HashSet<String> = methods
                 .split(',')
@@ -222,7 +223,10 @@ impl RpcAccess {
         let allow_nets = config
             .allow_ips
             .iter()
-            .map(|s| IpNet::parse(s).ok_or_else(|| format!("invalid rpcallowip {s:?}")))
+            .enumerate()
+            .map(|(i, s)| {
+                IpNet::parse(s).ok_or_else(|| format!("invalid rpcallowip entry {}", i + 1))
+            })
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(RpcAccess {
@@ -271,16 +275,18 @@ impl RpcAccess {
             return Ok(());
         }
         if !self.has_explicit_credentials() {
-            return Err(format!(
-                "RPC bind address {bind} is not loopback: set rpcuser/rpcpassword or rpcauth \
+            return Err(
+                "RPC bind address is not loopback: set rpcuser/rpcpassword or rpcauth \
                  (the cookie is for local clients only) and rpcallowip"
-            ));
+                    .into(),
+            );
         }
         if !self.allows_remote_peers() {
-            return Err(format!(
-                "RPC bind address {bind} is not loopback: set rpcallowip to the addresses \
+            return Err(
+                "RPC bind address is not loopback: set rpcallowip to the addresses \
                  allowed to connect"
-            ));
+                    .into(),
+            );
         }
         Ok(())
     }
