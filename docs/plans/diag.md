@@ -208,6 +208,24 @@ and are not re-based.
 - `flush_log` cannot deadlock `die` when a critical panic is raised from
   inside logging: it takes a lock only it uses, drops the log writer's
   guard, and the stdout and stderr locks it then takes are reentrant.
+- A11 types and flag (f0ccd6b0): the wrappers live in
+  `divi_primitives::redact`, the one crate every node crate already
+  depends on, so no crate gains a dependency. The HMAC-SHA256 is built
+  there from `sha2` (no `hmac` crate; `rand` is a dev dependency only);
+  the key is 32 bytes from `/dev/urandom`, or, where that cannot be
+  read, a SHA-256 of a `RandomState` hash, the pid and the time. A
+  pseudonym is 8 hex digits (`wtx-3f2a91c0`), not the plan's 4: one run
+  can log tens of thousands of wallet values, and 4 digits collide
+  within a few hundred. Two types beyond the plan's list:
+  `WalletScripthash` (`wsh-`, the Electrum scripthashes the plan routes
+  "through the same wrapper") and `WalletValue` (`wal-`, any other
+  wallet value a line must name). `SwapId` exists but no swap line is
+  converted: `divi-swap` does not depend on `divi-primitives` and
+  `irondivid` does not link `divi-swap`, so its lines never reach a
+  node log. The `-logwalletdetail` start warning and the
+  `setlogconfig-refused` record (`option=logwalletdetail`) are as the
+  plan says; `logwalletdetail` is listed in the A7 record so diag can
+  read it there.
 
 Part B as built so far: B1 discovery, the B2 collectors (B2.0–B2.19),
 `contrib/diag.sh` (B1.4), `--import` (B6.4), the §6.2 redaction and §6.3
