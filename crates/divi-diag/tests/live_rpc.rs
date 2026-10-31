@@ -38,7 +38,7 @@ fn answer(method: &str) -> String {
             "netaddr":"203.0.113.77:51472","addr":"DHfrxHzGWW1fLVZ7RCeN1W2V8RANW3TUxr","status":4,"message":"Masternode successfully started"}"#.into(),
         "getwalletinfo" => r#"{"walletversion":61000,"balance":1234.56789,"txcount":3,"unlocked_until":0,"encryption_status":"locked"}"#.into(),
         "getdiaginfo" => r#"{"build":"x","diag_key":"abcdef","peers":[{"address":"198.51.100.23"}],"balance":1234.56789}"#.into(),
-        _ => return format!(r#"{{"result":null,"error":{{"code":-32601,"message":"Method not found"}},"id":"diag"}}"#),
+        _ => r#"{"result":null,"error":{"code":-32601,"message":"Method not found"},"id":"diag"}"#.to_string(),
     }
 }
 

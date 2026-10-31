@@ -339,9 +339,7 @@ pub fn mask_wallet_msg(msg: &str, r: &Redactor) -> String {
         } else if let Some((k, _)) = core.split_once('=') {
             let k = if k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') { k } else { "<arg>" };
             format!("{lead}{k}=<arg>{trail}")
-        } else if is_num(core) && (lower == "port" || (lower == "code" && core.starts_with('-'))) {
-            tok.to_string()
-        } else if is_word(core) {
+        } else if (is_num(core) && (lower == "port" || (lower == "code" && core.starts_with('-')))) || is_word(core) {
             tok.to_string()
         } else {
             format!("{lead}{}{trail}", kind(core, r))

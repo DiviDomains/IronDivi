@@ -15,8 +15,7 @@ use divi_storage::{BlockIndex, BlockStatus, ChainDatabase};
 fn chain_of(n: u32) -> Vec<BlockIndex> {
     let mut v: Vec<BlockIndex> = Vec::new();
     for h in 0..n {
-        let mut hd = BlockHeader::default();
-        hd.nonce = h + 1;
+        let mut hd = BlockHeader { nonce: h + 1, ..Default::default() };
         if let Some(p) = v.last() {
             hd.prev_block = p.hash;
         }
@@ -51,9 +50,7 @@ fn secondary_open_reports() {
         db.store_block_index(ix).unwrap();
     }
     // a failed side block at height 4
-    let mut hd = BlockHeader::default();
-    hd.nonce = 999;
-    hd.prev_block = c[3].hash;
+    let hd = BlockHeader { nonce: 999, prev_block: c[3].hash, ..Default::default() };
     let mut bad = BlockIndex::from_header(&hd, 4, Some(&c[3]));
     bad.hash = hd.hash();
     bad.status.insert(BlockStatus::VALID_HEADER);

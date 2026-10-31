@@ -46,29 +46,26 @@ pub fn cgroup_room(root: &Path, dir: &Path, v2: bool, notes: &mut Vec<String>) -
     let mut d: PathBuf = dir.to_path_buf();
     loop {
         if let Ok(l) = std::fs::read_to_string(d.join(lim)) {
-            match parse_limit(l.trim()) {
-                Some(limit) => {
-                    let used = std::fs::read_to_string(d.join(cur))
-                        .ok()
-                        .and_then(|u| u.trim().parse::<u64>().ok());
-                    match used {
-                        Some(u) => {
-                            let room = limit.saturating_sub(u);
-                            let lvl = d.strip_prefix(root).map(|p| p.display().to_string()).unwrap_or_default();
-                            notes.push(format!(
-                                "cgroup {} level /{}: limit {} MB, used {} MB, room {} MB",
-                                if v2 { "v2" } else { "v1" },
-                                lvl,
-                                limit >> 20,
-                                u >> 20,
-                                room >> 20
-                            ));
-                            best = Some(best.map_or(room, |b| b.min(room)));
-                        }
-                        None => notes.push(format!("cgroup level has a limit but {cur} is unreadable")),
+            if let Some(limit) = parse_limit(l.trim()) {
+                let used = std::fs::read_to_string(d.join(cur))
+                    .ok()
+                    .and_then(|u| u.trim().parse::<u64>().ok());
+                match used {
+                    Some(u) => {
+                        let room = limit.saturating_sub(u);
+                        let lvl = d.strip_prefix(root).map(|p| p.display().to_string()).unwrap_or_default();
+                        notes.push(format!(
+                            "cgroup {} level /{}: limit {} MB, used {} MB, room {} MB",
+                            if v2 { "v2" } else { "v1" },
+                            lvl,
+                            limit >> 20,
+                            u >> 20,
+                            room >> 20
+                        ));
+                        best = Some(best.map_or(room, |b| b.min(room)));
                     }
+                    None => notes.push(format!("cgroup level has a limit but {cur} is unreadable")),
                 }
-                None => {}
             }
         }
         if d == root || !d.starts_with(root) {

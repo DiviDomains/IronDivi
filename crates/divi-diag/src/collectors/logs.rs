@@ -595,7 +595,7 @@ fn copy_dir(o: &mut Out, r: &Redactor, dir: &Path, rel: &str, cap: u64) {
     if files.is_empty() {
         return;
     }
-    files.sort_by(|a, b| b.0.cmp(&a.0));
+    files.sort_by_key(|f| std::cmp::Reverse(f.0));
     let mut used = 0u64;
     for (_, p, len) in files {
         let sub = p.strip_prefix(dir).unwrap_or(&p).to_string_lossy().to_string();
@@ -609,7 +609,7 @@ fn copy_dir(o: &mut Out, r: &Redactor, dir: &Path, rel: &str, cap: u64) {
         }
         let take = len.min(cap - used).min(4 << 20);
         used += take;
-        copy_capped(o, &r, &format!("{rel}/{sub}"), &p, take);
+        copy_capped(o, r, &format!("{rel}/{sub}"), &p, take);
     }
 }
 

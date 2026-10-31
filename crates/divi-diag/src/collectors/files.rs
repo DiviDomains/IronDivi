@@ -557,7 +557,7 @@ pub fn wallet(ctx: &Ctx, o: &mut Out) {
         if let Some(n) = ctx.node_for(d) {
             node_args = n.argv.iter().skip(1).cloned().collect();
         }
-        match conf.as_ref().map(|c| std::fs::read_to_string(c)) {
+        match conf.as_ref().map(std::fs::read_to_string) {
             Some(Ok(t)) => {
                 if let Err(e) = s.read_config(&t) {
                     outln!(o, "config parse: {e}");

@@ -116,7 +116,7 @@ fn utf16le(v: &str) -> Vec<u8> {
 
 /// The reversed byte order of a hex string (hashes printed both ways)
 fn reversed_hex(v: &str) -> Option<String> {
-    if v.len() < 16 || v.len() % 2 != 0 {
+    if v.len() < 16 || !v.len().is_multiple_of(2) {
         return None;
     }
     let mut b = hex::decode(v).ok()?;

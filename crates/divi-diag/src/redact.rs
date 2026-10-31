@@ -130,7 +130,7 @@ impl Redactor {
         for m in &known.machine_ids {
             push(m, "mid");
         }
-        known_kind.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        known_kind.sort_by_key(|k| std::cmp::Reverse(k.0.len()));
         known_kind.dedup_by(|a, b| a.0 == b.0);
         let known_re = if known_kind.is_empty() {
             None

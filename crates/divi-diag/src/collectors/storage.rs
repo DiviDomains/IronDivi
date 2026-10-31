@@ -67,7 +67,7 @@ fn space_line(o: &mut Out, what: &str, p: &Path) {
             "{what}: {} free of {} ({}%), inodes {} free of {}",
             util::human(free),
             util::human(total),
-            if total > 0 { free * 100 / total } else { 0 },
+            (free * 100).checked_div(total).unwrap_or(0),
             ffree,
             files
         ),
@@ -407,7 +407,7 @@ pub fn inventory(ctx: &Ctx, o: &mut Out) {
             let Ok(rd) = std::fs::read_dir(&dir) else { continue };
             let mut names: Vec<String> = rd.flatten().map(|e| e.file_name().to_string_lossy().to_string()).collect();
             names.sort();
-            let newest_opts = names.iter().filter(|n| n.starts_with("OPTIONS-")).last().cloned();
+            let newest_opts = names.iter().rfind(|n| n.starts_with("OPTIONS-")).cloned();
             for n in names {
                 let p = dir.join(&n);
                 if Some(&n) == newest_opts.as_ref() {

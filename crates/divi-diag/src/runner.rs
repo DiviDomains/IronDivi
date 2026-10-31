@@ -459,7 +459,7 @@ impl Parent {
     }
 
     fn record(&mut self, spec: &'static Spec, status: String, secs: f64, bytes: u64) {
-        self.log.log(&format!("{} {} {}: {status} ({secs:.1} s, {bytes} bytes)", spec.id, spec.name, if status == "ok" { "end" } else { "end" }));
+        self.log.log(&format!("{} {} {}: {status} ({secs:.1} s, {bytes} bytes)", spec.id, spec.name, "end"));
         self.done.push(Done { spec, status, secs, bytes });
     }
 

@@ -40,7 +40,8 @@ const LOG_TAIL: usize = 1 << 20;
 const SCAN: u64 = 64 << 20;
 
 /// (file, what, does the target belong)
-const LOG_GROUPS: &[(&str, &str, fn(&str) -> bool)] = &[
+type LogGroup = (&'static str, &'static str, fn(&str) -> bool);
+const LOG_GROUPS: &[LogGroup] = &[
     ("electrum.log", "Electrum", |t| t.starts_with("divi_electrum")),
     ("webui.log", "web UI", |t| t.starts_with("divi_webui")),
     ("zmq.log", "ZMQ", |t| t == "zmq" || t.starts_with("zmq::") || t.ends_with("::zmq") || t.contains("::zmq::")),
