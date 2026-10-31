@@ -14,7 +14,7 @@
 //!
 //! `--import <folder|->` (B6.4, [`import`]) turns a contrib/diag.sh folder
 //! into a package. §8 ([`consent`]): the user's report, the review, and
-//! `--send <folder>`; this build has no developer key, so nothing is sent.
+//! `--send <folder>`, which seals the package to the developer key (§8.4).
 //! Not in this crate yet: B3 observed start (`--run`) and the B6 recording
 //! modes.
 
