@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 Bert Shuler
+// Copyright (C) 2026 human
 // IronDivi - https://github.com/DiviDomains/IronDivi
 //
 // This program is free software: you can redistribute it and/or modify
@@ -43,7 +43,8 @@ fn create_test_chain() -> (Chain, tempfile::TempDir) {
     (chain, dir)
 }
 
-/// Helper to create a child block at `height`
+/// Helper to create a child block at `height`: a version 4 block whose coinbase
+/// starts with the BIP34 height, as Divi Core requires after the genesis block
 fn create_child_block(
     height: u32,
     parent_hash: Hash256,
@@ -69,12 +70,16 @@ fn create_child_block(
     };
     block.transactions.push(coinbase);
     block.header.merkle_root = compute_merkle_root(&block.transactions);
-    // Proof of work for the block's bits
+    solve(&mut block);
+    block
+}
+
+/// Helper to find a nonce that meets the block's proof-of-work target
+fn solve(block: &mut Block) {
     let target = Hash256::from_compact(block.header.bits);
     while divi_crypto::compute_block_hash(&block.header) > target {
         block.header.nonce += 1;
     }
-    block
 }
 
 /// Helper to build a chain of blocks on top of the existing genesis
@@ -435,6 +440,7 @@ fn test_reject_block_with_future_timestamp() {
         .as_secs() as u32;
     future_block.header.time = now + 3 * 60 * 60;
     future_block.header.merkle_root = compute_merkle_root(&future_block.transactions);
+    solve(&mut future_block);
 
     let result = chain.accept_block(future_block);
     assert!(

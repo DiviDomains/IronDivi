@@ -1,7 +1,7 @@
 # Rules for multi-coin lanes running on hp2
 
 You are a lane of `docs/plans/swap-poc/multi-coin.md`, a Claude session on **hp2** (Linux,
-32 cores) in the checkout `~/swap-lanes/<coin>`. Bert watches you through an Avada pane on his
+32 cores) in the checkout `~/swap-lanes/<coin>`. Human watches you through an Avada pane on his
 Mac and may type into it; answer him, then carry on. Read `_common.md` too — its rules apply
 **except where this file overrides them** (rules 4 and 5 there).
 
@@ -29,10 +29,10 @@ Mac and may type into it; answer him, then carry on. Read `_common.md` too — i
    fails; do not edit check scripts). If everything left needs a human (testnet coins, a key),
    write `- parked: <what unblocks it>` and `- blocked-on-human: yes`.
 7. **Hard questions** (consensus/sighash doubts, a bug that survived two attempts) → the
-   `oracle` agent with the full problem in the prompt. Don't ask Bert; take the sane default and
+   `oracle` agent with the full problem in the prompt. Don't ask Human; take the sane default and
    record it under `- decisions:`.
 8. **Waiting:** background commands, never sleep loops in your context.
 9. Before writing chain code read `crates/swap-chain-btc/` (closest model: `tx.rs`, `client.rs`,
    `tests.rs`) and `crates/divi-swap/src/{backend,htlc,types}.rs`.
-10. Commits that eventually land are authored by Bert; never put AI attribution in code, docs or
+10. Commits that eventually land are authored by Human; never put AI attribution in code, docs or
     commit subjects.

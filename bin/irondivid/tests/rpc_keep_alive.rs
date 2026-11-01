@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 Bert Shuler
+// Copyright (C) 2026 human
 // IronDivi - https://github.com/DiviDomains/IronDivi
 //
 // This program is free software: you can redistribute it and/or modify
@@ -38,7 +38,7 @@ fn call(port: u16) -> Option<(String, bool)> {
         .ok()?;
     // test:test
     let request = format!(
-        "POST / HTTP/1.1\r\nHost: x\r\nAuthorization: Basic dGVzdDp0ZXN0\r\n\
+        "POST / HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic dGVzdDp0ZXN0\r\n\
          Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
         body.len()
     );

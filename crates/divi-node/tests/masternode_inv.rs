@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 Bert Shuler
+// Copyright (C) 2026 human
 // IronDivi - https://github.com/DiviDomains/IronDivi
 
 //! Masternode broadcasts and pings are announced by inv and fetched with

@@ -1,0 +1,42 @@
+[package]
+license = "AGPL-3.0-only"
+name = "swap-wasm"
+version.workspace = true
+edition.workspace = true
+description = "The atomic swap taker inside the IronDivi browser extension (wasm-bindgen)"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+divi-swap = { workspace = true }
+swap-chain-divi = { workspace = true }
+# Path, not workspace, deps: the workspace entries keep the C++ consensus self-checks on,
+# which do not build for wasm32.
+swap-chain-btc = { path = "../swap-chain-btc", default-features = false }
+swap-chain-ltc = { path = "../swap-chain-ltc", default-features = false }
+swap-keys = { workspace = true }
+divi-wallet = { workspace = true }
+divi-crypto = { workspace = true }
+parking_lot = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+sha2 = { workspace = true }
+zeroize = { workspace = true }
+reqwest = { workspace = true }
+hkdf = "0.12"
+chacha20poly1305 = "0.10"
+getrandom = "0.2"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true }
+
+# wasm32: only tokio's executor-agnostic Mutex, browser entropy, JS promises.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+tokio = { version = "1.35", default-features = false, features = ["sync"] }
+getrandom = { version = "0.2", features = ["js"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"

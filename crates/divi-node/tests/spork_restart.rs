@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 Bert Shuler
+// Copyright (C) 2026 human
 // IronDivi - https://github.com/DiviDomains/IronDivi
 
 //! Sporks survive a restart, as Divi Core's spork database keeps them

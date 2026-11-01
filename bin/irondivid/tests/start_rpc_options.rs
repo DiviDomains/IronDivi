@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 Bert Shuler
+// Copyright (C) 2026 human
 // IronDivi - https://github.com/DiviDomains/IronDivi
 //
 // This program is free software: you can redistribute it and/or modify
@@ -31,7 +31,7 @@ fn rpc(port: u16, method: &str, params: Value) -> Option<Value> {
     let body = json!({"jsonrpc": "1.0", "id": 1, "method": method, "params": params}).to_string();
     // "dGVzdDp0ZXN0" is base64 of test:test
     let request = format!(
-        "POST / HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nAuthorization: Basic dGVzdDp0ZXN0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nAuthorization: Basic dGVzdDp0ZXN0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         body.len(),
         body
     );
@@ -190,18 +190,17 @@ fn modes_made(extra: &[&str]) -> (Vec<u32>, Vec<u32>) {
 fn files_are_private_unless_sysperms_with_the_wallet_off() {
     assert_eq!(modes_made(&[]), (vec![0o600], vec![0o700]));
     assert_eq!(modes_made(&["-disablewallet"]), (vec![0o600], vec![0o700]));
+    // -sysperms with the wallet off is taken, but irondivid makes its files
+    // private whatever the umask (private_files), so they stay 0600/0700
     let (files, dirs) = modes_made(&["-sysperms", "-disablewallet"]);
-    assert!(
-        files.contains(&0o644) && dirs.contains(&0o755),
-        "{files:?} {dirs:?}"
-    );
+    assert_eq!((files, dirs), (vec![0o600], vec![0o700]));
 
     let dir = tempfile::tempdir().unwrap();
     let out = command(dir.path(), 1, 1, &["-sysperms"])
         .stderr(Stdio::piped())
         .output()
         .unwrap();
-    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(out.status.code(), Some(2));
     assert!(
         String::from_utf8_lossy(&out.stderr).contains(
             "Error: Error: -sysperms is not allowed in combination with enabled wallet functionality"
@@ -216,7 +215,7 @@ fn answered(stream: &mut TcpStream, secs: u64, send: bool) -> bool {
     if send {
         let body = r#"{"jsonrpc":"1.0","id":1,"method":"getblockcount","params":[]}"#;
         let request = format!(
-            "POST / HTTP/1.1\r\nHost: x\r\nAuthorization: Basic dGVzdDp0ZXN0\r\nConnection: keep-alive\r\nContent-Length: {}\r\n\r\n{}",
+            "POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Basic dGVzdDp0ZXN0\r\nConnection: keep-alive\r\nContent-Length: {}\r\n\r\n{}",
             body.len(),
             body
         );

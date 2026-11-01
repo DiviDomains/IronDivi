@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 Bert Shuler
+// Copyright (C) 2026 human
 // IronDivi - https://github.com/DiviDomains/IronDivi
 //
 // Portions derived from Divi Core (https://github.com/DiviProject/Divi)
@@ -77,7 +77,7 @@ fn request(method: &str, path: &str, auth: Option<&str>, body: &str, extra: &str
         .map(|a| format!("Authorization: {a}\r\n"))
         .unwrap_or_default();
     format!(
-        "{method} {path} HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n{auth}{extra}\
+        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n{auth}{extra}\
          Content-Length: {}\r\n\r\n{body}",
         body.len()
     )
@@ -347,7 +347,7 @@ fn bodies_up_to_divid_s_max_size() {
     assert!(r.status_line.contains(" 200 "), "{}", r.status_line);
 
     let too_big = format!(
-        "POST / HTTP/1.1\r\nHost: x\r\nAuthorization: {AUTH}\r\nContent-Length: {}\r\n\
+        "POST / HTTP/1.1\r\nHost: localhost\r\nAuthorization: {AUTH}\r\nContent-Length: {}\r\n\
          Connection: close\r\n\r\n",
         0x0200_0000 + 1
     );

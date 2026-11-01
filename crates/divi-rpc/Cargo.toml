@@ -23,17 +23,21 @@ tower = { workspace = true }
 hyper = { workspace = true, features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 chrono = { workspace = true }
+tower-http = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 hex = { workspace = true }
+sha2 = { workspace = true }
+hmac = "0.12"
 rand = { workspace = true }
 base64 = "0.22"
 bip39 = "2.0"
+zeroize = { workspace = true }
 futures = "0.3"
 
 [dev-dependencies]
-tracing-subscriber = { workspace = true }
 divi-test-support = { workspace = true }
 libc = "0.2"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tempfile = { workspace = true }
+tracing-subscriber = { workspace = true }

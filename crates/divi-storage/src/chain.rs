@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 Bert Shuler
+// Copyright (C) 2026 human
 // IronDivi - https://github.com/DiviDomains/IronDivi
 //
 // This program is free software: you can redistribute it and/or modify
@@ -2909,7 +2909,7 @@ impl Chain {
 
         // Disconnect blocks (in reverse order - from tip to ancestor)
         for (i, (block, index)) in blocks_to_disconnect.iter().enumerate() {
-            info!(
+            debug!(
                 "Disconnecting block {} ({}/{}): {}",
                 index.hash,
                 i + 1,
@@ -2932,7 +2932,7 @@ impl Chain {
 
         // Connect blocks (in order from ancestor to new tip)
         for (i, (block, index)) in blocks_to_connect.iter().enumerate() {
-            info!(
+            debug!(
                 "Connecting block {} ({}/{}): {}",
                 index.hash,
                 i + 1,
@@ -3460,7 +3460,7 @@ impl Chain {
 
     /// Disconnect a block from the chain (reverse UTXO changes)
     fn disconnect_block(&self, block: &Block, index: &mut BlockIndex) -> Result<(), StorageError> {
-        info!(
+        debug!(
             "Disconnecting block {} at height {}",
             index.hash, index.height
         );
@@ -3634,7 +3634,7 @@ impl Chain {
             self.db.store_block_index_entry(&parent)?;
         }
 
-        info!(
+        debug!(
             "Disconnected block {} at height {}",
             index.hash, index.height
         );
@@ -3806,7 +3806,7 @@ impl Chain {
                 height, hash, expected_hash
             )));
         }
-        warn!(
+        info!(
             "CHECKPOINT PASS: Block {} at height {} matches checkpoint",
             hash, height
         );
@@ -4516,7 +4516,7 @@ impl Chain {
         let tip = self.tip.read();
         match &*tip {
             None => {
-                info!("should_update_tip: No tip yet, returning true");
+                debug!("should_update_tip: No tip yet, returning true");
                 Ok(true)
             }
             Some(current_tip) => {
@@ -5063,7 +5063,7 @@ impl Chain {
                 // Debug: log specific UTXOs we're interested in
                 let txid_str = txid.to_string();
                 if txid_str.starts_with("95ef902f") || height == 144 {
-                    info!(
+                    debug!(
                         "  CREATED UTXO: {}:{} value={} at height {}",
                         txid, vout, output.value, height
                     );
@@ -5874,7 +5874,7 @@ impl Chain {
         let mut index = existing_index;
         match self.reorganize_chain(&block, &mut index, current_tip) {
             Ok(reorg) => {
-                info!("try_activate_block: Successfully activated block {}", hash);
+                debug!("try_activate_block: Successfully activated block {}", hash);
                 self.update_best_known_block(&index);
                 if self.db.has_utxo_cache() {
                     self.db.flush_utxo_cache()?;

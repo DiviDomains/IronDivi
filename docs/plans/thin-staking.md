@@ -1,7 +1,7 @@
 # Thin staking ("staking shim") — design
 
 Goal: a machine that keeps staking coins but does **not** carry gigabytes of blockchain.
-Testnet/stagenet only until Bert signs off. Nothing here has been deployed.
+Testnet/stagenet only until Human signs off. Nothing here has been deployed.
 
 ## 1. How IronDivi stakes today, and what it costs on disk
 
@@ -58,7 +58,7 @@ handling is limited to the headers it holds, no mempool/fee estimation locally.
    already merged, and keeps full validation. Add a `thin` convenience profile
    (`expire=0`, txindex/addressindex/spentindex off) and document real mainnet numbers.
 2. **Then B** to remove the multi-day first sync, which is the real pain on a thin machine.
-3. **D only if** A+B still leave Bert with a footprint he will not accept. It is a different
+3. **D only if** A+B still leave Human with a footprint he will not accept. It is a different
    product (a light client) with a different trust model and deserves its own review.
 
 This keeps the thinnest *reliable* option first and avoids building a light client until the cheap
@@ -81,11 +81,11 @@ route is measured and found short.
 3. Snapshot import (B): round-trip export/import on testnet, compare UTXO hash.
 4. Only on a go-ahead: shim prototype against one fleet node, read-only first (follows tip, no
    submit), then testnet staking.
-Hard limits: no mainnet, no deletes of chain data on live hosts, no deploys without Bert's go.
+Hard limits: no mainnet, no deletes of chain data on live hosts, no deploys without Human's go.
 
-## 7. Bert's direction (2026-10-14): `--expire 30d` as a trust window
+## 7. Human's direction (2026-10-14): `--expire 30d` as a trust window
 
-Bert's idea: give `--expire 30d` and the node stops validating ancient history. It accepts the chain
+Human's idea: give `--expire 30d` and the node stops validating ancient history. It accepts the chain
 the network gives it, as long as it holds 30 days of history that it can cross-check against other
 nodes. This is option **E** and replaces "B then D" as the leading design.
 
@@ -143,7 +143,7 @@ What this changes:
 
 Revised recommendation order: (1) investigate and shrink `block_index` (read the serialization in
 `divi-storage/src/block_index.rs`), (2) `thin` profile (expire + indexes off), (3) snapshot start.
-Held for Bert's pick of approach: snapshot export/import and any shim work.
+Held for Human's pick of approach: snapshot export/import and any shim work.
 
 ## 9. Why `block_index` is ~1 KB per block (investigated 2026-10-14)
 
@@ -199,7 +199,7 @@ Live run (hp1, copy of an unpruned testnet datadir at tip 349,676, `--testnet --
 Mainnet figures above remain estimates.
 
 ## 10. Thin staking nodes backed by full-history nodes (revised 2026-10-14)
-Direction from Bert: run one or more full nodes that keep all history, and make staking nodes thin.
+Direction from Human: run one or more full nodes that keep all history, and make staking nodes thin.
 The thin node still validates; the full node is a helper whose answers are checked, not a trusted oracle.
 
 ### Correction to the first draft of this section

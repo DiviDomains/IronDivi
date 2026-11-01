@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 Bert Shuler
+// Copyright (C) 2026 human
 // IronDivi - https://github.com/DiviDomains/IronDivi
 //
 // This program is free software: you can redistribute it and/or modify
@@ -47,25 +47,39 @@ macro_rules! stop_point {
 }
 
 pub mod address;
+#[cfg(not(target_arch = "wasm32"))]
+mod at_rest;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod backup;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod coin_selection;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod coinstake;
 pub mod error;
 #[cfg(test)]
 mod fault;
 pub mod hd;
 pub mod keystore;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod persistence;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod send;
 pub mod signer;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod wallet_db;
 
 pub use address::{decode_wif, encode_wif, Address, AddressType, Network, WifKey};
+#[cfg(not(target_arch = "wasm32"))]
 pub use coin_selection::{CoinSelector, SelectionResult};
+#[cfg(not(target_arch = "wasm32"))]
 pub use coinstake::CoinstakeBuilder;
 pub use error::WalletError;
 pub use hd::{core_coin_type, ExtendedPrivateKey, ExtendedPublicKey, HdWallet, DIVI_COIN_TYPE};
 pub use keystore::{HdPublicIds, KeyEntry, KeyStore, PoolState};
+#[cfg(not(target_arch = "wasm32"))]
 pub use persistence::WalletDatabase;
 pub use signer::{sighash, sign_input, TransactionBuilder, TransactionSigner};
-pub use wallet_db::{DetachedTx, Ownership, TxListener, WalletDb, WalletTx, WalletUtxo};
+#[cfg(not(target_arch = "wasm32"))]
+pub use wallet_db::{
+    DetachedTx, Ownership, TxListener, WalletDb, WalletTx, WalletUtxo, BACKUP_MARKER,
+};

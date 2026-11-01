@@ -1,0 +1,6 @@
+#cloud-config
+runcmd:
+  - [sh, -c, 'mkdir -p /mnt/t; for d in /dev/sr0 /dev/sr1; do mount -o ro $d /mnt/t 2>/dev/null && [ -f /mnt/t/run.sh ] && break; umount /mnt/t 2>/dev/null; done; ls /mnt/t > /dev/ttyS0']
+  - [sh, -c, 'cp /mnt/t/irondivid /mnt/t/run.sh /root/ && chmod +x /root/irondivid /root/run.sh']
+  - [sh, -c, 'DEBIAN_FRONTEND=noninteractive apt-get -qq update && DEBIAN_FRONTEND=noninteractive apt-get -qq install -y systemd-coredump > /dev/ttyS0 2>&1']
+  - [sh, -c, '/root/run.sh > /dev/ttyS0 2>&1; poweroff']

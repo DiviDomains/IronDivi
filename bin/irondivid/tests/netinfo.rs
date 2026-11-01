@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 Bert Shuler
+// Copyright (C) 2026 human
 // IronDivi - https://github.com/DiviDomains/IronDivi
 //
 // This program is free software: you can redistribute it and/or modify
@@ -32,7 +32,7 @@ fn try_rpc(port: u16, method: &str, params: Value) -> Option<Value> {
     s.set_read_timeout(Some(Duration::from_secs(30))).ok()?;
     let body = json!({"jsonrpc": "1.0", "id": 1, "method": method, "params": params}).to_string();
     let req = format!(
-        "POST / HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nAuthorization: Basic dGVzdDp0ZXN0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nAuthorization: Basic dGVzdDp0ZXN0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         body.len(),
         body
     );
@@ -294,7 +294,7 @@ fn externalip_that_is_not_an_address_stops_the_start() {
     let log = std::fs::read_to_string(dir.path().join("debug.log")).unwrap_or_default();
     let text = format!("{}{}", String::from_utf8_lossy(&out.stderr), log);
     assert!(
-        text.contains("Cannot resolve -externalip address: '[2001:db8::1]'"),
+        text.contains("Cannot resolve -externalip address") && !text.contains("2001:db8::1"),
         "{text}"
     );
 }

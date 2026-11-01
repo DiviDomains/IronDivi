@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 Bert Shuler
+// Copyright (C) 2026 human
 // IronDivi - https://github.com/DiviDomains/IronDivi
 //
 // This program is free software: you can redistribute it and/or modify
@@ -21,6 +21,8 @@ pub mod error;
 pub mod htlc;
 pub mod maker;
 pub mod mock;
+pub mod observer;
+pub mod rt;
 pub mod secrets;
 pub mod state;
 pub mod store;
@@ -33,7 +35,8 @@ pub use config::{ChainParams, Profile, SwapConfig};
 pub use error::{Result, SwapError};
 pub use htlc::HtlcParams;
 pub use maker::{Maker, OfferEngine};
+pub use observer::{ObservedLock, ObservedTx, Observer, TwoSource};
 pub use state::SwapState;
-pub use store::Store;
+pub use store::{MemoryBackend, Store, StoreBackend};
 pub use taker::{Taker, TakerState};
 pub use types::{Amount, Chain, Funding, LockedOutput, Outpoint, SignedTx, SpendInfo, Txid};

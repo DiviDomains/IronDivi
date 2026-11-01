@@ -17,9 +17,12 @@ divi-network = { workspace = true }
 divi-rpc = { workspace = true }
 divi-storage = { workspace = true }
 divi-primitives = { workspace = true }
+divi-settings = { workspace = true }
 divi-wallet = { workspace = true }
 divi-crypto = { workspace = true }
 divi-masternode = { workspace = true }
+divi-webui = { workspace = true }
+divi-electrum = { workspace = true }
 
 # CLI
 clap = { version = "4.4", features = ["derive"] }
@@ -33,10 +36,12 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tracing-appender = "0.2"
+tempfile = { workspace = true }
 
 # Daemonization (Unix only)
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+signal-hook-registry = "1.4.8"
 
 # Utilities
 dirs = "5.0"
@@ -52,3 +57,8 @@ fault-injection = ["divi-storage/fault-injection"]
 divi-test-support = { workspace = true }
 rocksdb = { workspace = true }
 tempfile = { workspace = true }
+# tests/electrum.rs: a TLS client and Electrum's script hash
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+sha2 = { workspace = true }
+# tests/electrum.rs: a WebSocket client
+tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }

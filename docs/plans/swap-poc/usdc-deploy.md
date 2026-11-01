@@ -1,6 +1,6 @@
 # USDC (Ethereum Sepolia) on dnsdivi's divi-swapd
 
-Bert deploys this from the Mac. Prepared by lane `usdc`; nothing here has been run on
+Human deploys this from the Mac. Prepared by lane `usdc`; nothing here has been run on
 dnsdivi. The config append (§2) is safe to do at any time — both offers start `enabled =
 false` and the placeholder htlc address is never dialed while they are. The contract deploy
 (§3) and anything after it is blocked on Sepolia ETH landing on the taker (§0).

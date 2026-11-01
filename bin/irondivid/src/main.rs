@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 Bert Shuler
+// Copyright (C) 2026 human
 // IronDivi - https://github.com/DiviDomains/IronDivi
 //
 // This program is free software: you can redistribute it and/or modify
@@ -22,10 +22,30 @@
 //!   irondivid --rpcuser=user --rpcpassword=pass
 
 mod core_files;
+mod counts;
+#[cfg(unix)]
+mod crash;
+mod events;
+mod health;
+mod incidents;
 mod interfaces;
+mod log_delivery;
+mod log_filter;
 mod masternode_options;
+mod private_files;
+mod running_marker;
+mod runs_log;
 mod settings;
+#[cfg(unix)]
+mod signals;
 mod snapshot_sig;
+mod startup;
+mod tasks;
+
+/// System's, with a crash.log line when an allocation fails (A5)
+#[cfg(unix)]
+#[global_allocator]
+static ALLOC: crash::Alloc = crash::Alloc;
 
 use anyhow::{Context, Result};
 use divi_crypto::compute_block_hash;
@@ -38,12 +58,240 @@ use divi_rpc::{start_server_with_wallet_peer_and_staker, RpcConfig};
 use divi_wallet::{HdWallet, Network as WalletNetwork, WalletDb};
 use settings::{atoi, Settings};
 use std::error::Error as StdError;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(not(unix))]
 use tokio::signal;
 use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+
+/// Set once a console write has failed (terminal gone after an SSH drop, or
+/// stdout/stderr closed): noted in debug.log the first time only
+static CONSOLE_LOST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Write one line to stderr (or stdout). `eprintln!` and `println!` panic when
+/// the write fails (EPIPE, EIO after the terminal is gone), which killed the
+/// task that made the call; a console line is never worth that (D1, D2)
+fn console_line(to_stdout: bool, line: std::fmt::Arguments<'_>) {
+    use std::io::Write as _;
+    let written = if to_stdout {
+        writeln!(std::io::stdout(), "{}", line)
+    } else {
+        writeln!(std::io::stderr(), "{}", line)
+    };
+    if let Err(e) = written {
+        #[cfg(unix)]
+        if e.kind() == std::io::ErrorKind::BrokenPipe {
+            signals::note_epipe();
+        }
+        if !CONSOLE_LOST.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            // The log line's own timestamp says when
+            warn!(
+                "{} lost: {}; console lines are dropped from now on",
+                if to_stdout { "stdout" } else { "stderr" },
+                e
+            );
+        }
+    }
+}
+
+/// `eprintln!` that never panics
+macro_rules! console {
+    ($($arg:tt)*) => { console_line(false, format_args!($($arg)*)) };
+}
+
+/// `println!` that never panics
+macro_rules! console_out {
+    ($($arg:tt)*) => { console_line(true, format_args!($($arg)*)) };
+}
+
+/// irondivid's exit codes (diag.md R3). 0 is a clean stop and 101 a panic on
+/// the main thread; 8 is unused.
+mod exit_code {
+    /// -help, -version (divid's AppInit)
+    pub const HELP: i32 = 1;
+    /// A start divid's AppInit2 ends with false and no InitError: a stop
+    /// asked for before the start was done, or -dbloadfailexit (divid.cpp:180)
+    pub const QUIET: i32 = 1;
+    /// An option's value; the reason names the option
+    pub const USAGE: i32 = 2;
+    /// The config file; the reason names the file and the line, never its text
+    pub const CONFIG: i32 = 3;
+    /// The data directory (create, lock, permissions) and the daemon's log file
+    pub const DATADIR: i32 = 4;
+    pub const DATABASE: i32 = 5;
+    pub const WALLET: i32 = 6;
+    pub const BIND: i32 = 7;
+    /// No space left (ENOSPC) or a read-only file system (EROFS)
+    pub const DISK: i32 = 9;
+    /// A critical task failed, a third signal, a start-up timeout, and any
+    /// start-up error R3 has no row for
+    pub const FAILED: i32 = 10;
+    /// The -daemon fork or setsid failed
+    pub const DAEMON: i32 = 11;
+}
+
+/// End the process with `code`: the reason (when not empty) goes to
+/// debug.log and the console, the log writer is flushed, and the process
+/// ends with `_exit`, which runs no destructors: RocksDB's would join its
+/// thread pools. The only way irondivid exits with a code other than 0
+/// or 101 (A9, R3), apart from signals.rs: a third stop signal (10) and a
+/// signal whose default action ends the process (128+N), which write their
+/// own exit records. The panic hook in tasks.rs calls it too: 10 for a
+/// critical task or thread, 101 for a main-thread panic before main's
+/// `catch_unwind`. A test refuses any other exit call in this crate.
+fn die(code: i32, reason: std::fmt::Arguments<'_>) -> ! {
+    let reason = reason.to_string();
+    // The open hour's counts, raw, ahead of the exit record (A11); like it,
+    // a no-op before runs.log is open
+    counts::raw_copy(|l| l.write());
+    // Durable before anything else that could stall (A1); a no-op before
+    // runs.log is open
+    runs_log::exit(code, &reason);
+    if !reason.is_empty() {
+        // Before init_logging this goes nowhere; the console line is enough then
+        error!("{} (exit code {})", reason, code);
+        console!("{}", reason);
+    }
+    flush_log();
+    unsafe { libc::_exit(code) }
+}
+
+/// `die(code, format_args!(...))`
+macro_rules! die {
+    ($code:expr) => { die($code, format_args!("")) };
+    ($code:expr, $($arg:tt)*) => { die($code, format_args!($($arg)*)) };
+}
+
+/// An error that carries its exit code. Its text and its causes are the
+/// inner error's, so the line printed for it is the line printed before.
+#[derive(Debug)]
+struct Coded {
+    code: i32,
+    inner: anyhow::Error,
+}
+
+impl std::fmt::Display for Coded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.inner, f)
+    }
+}
+
+impl StdError for Coded {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        self.inner.source()
+    }
+}
+
+impl Coded {
+    fn error(code: i32, inner: impl Into<anyhow::Error>) -> anyhow::Error {
+        anyhow::Error::new(Coded {
+            code,
+            inner: inner.into(),
+        })
+    }
+}
+
+trait OrExit<T> {
+    /// Fail with exit code `code`, unless the cause is a full or read-only disk (9)
+    fn or_exit(self, code: i32) -> Result<T>;
+    /// Fail with 7 when the cause is an address in use or not available, else `code`
+    fn bind_or_exit(self, code: i32) -> Result<T>;
+}
+
+impl<T, E: Into<anyhow::Error>> OrExit<T> for std::result::Result<T, E> {
+    fn or_exit(self, code: i32) -> Result<T> {
+        self.map_err(|e| Coded::error(code, e))
+    }
+    fn bind_or_exit(self, code: i32) -> Result<T> {
+        self.map_err(|e| {
+            let e: anyhow::Error = e.into();
+            let code = if causes(as_dyn(&e)).into_iter().any(is_bind_error) {
+                exit_code::BIND
+            } else {
+                code
+            };
+            Coded::error(code, e)
+        })
+    }
+}
+
+/// `e` and every cause under it, a `Coded`'s inner error included
+fn causes<'a>(e: &'a (dyn StdError + 'static)) -> Vec<&'a (dyn StdError + 'static)> {
+    let mut all = Vec::new();
+    let mut next = Some(e);
+    while let Some(err) = next {
+        all.push(err);
+        next = match err.downcast_ref::<Coded>() {
+            Some(coded) => Some(as_dyn(&coded.inner)),
+            None => err.source(),
+        };
+    }
+    all
+}
+
+fn as_dyn(e: &anyhow::Error) -> &(dyn StdError + 'static) {
+    e.as_ref()
+}
+
+fn io_kind(e: &(dyn StdError + 'static)) -> Option<std::io::ErrorKind> {
+    e.downcast_ref::<std::io::Error>().map(|io| io.kind())
+}
+
+fn is_bind_error(e: &(dyn StdError + 'static)) -> bool {
+    matches!(
+        io_kind(e),
+        Some(std::io::ErrorKind::AddrInUse | std::io::ErrorKind::AddrNotAvailable)
+    )
+}
+
+/// ENOSPC or EROFS. RocksDB's errors reach us as text, with the OS's own
+/// words for the two in it.
+fn is_disk_error(e: &(dyn StdError + 'static)) -> bool {
+    use std::io::ErrorKind::{ReadOnlyFilesystem, StorageFull};
+    match io_kind(e) {
+        Some(kind) => matches!(kind, StorageFull | ReadOnlyFilesystem),
+        None => {
+            let text = e.to_string();
+            text.contains("No space left on device") || text.contains("Read-only file system")
+        }
+    }
+}
+
+/// The exit code for an error that stops irondivid (R3): a full or read-only
+/// disk first, wherever it is in the causes; else the outermost cause that
+/// names a code: a `Coded`, the config file, the wallet, the database, an
+/// address in use; else 10.
+fn exit_code_of(e: &anyhow::Error) -> i32 {
+    error_exit_code(as_dyn(e))
+}
+
+fn error_exit_code(e: &(dyn StdError + 'static)) -> i32 {
+    let all = causes(e);
+    if all.iter().any(|e| is_disk_error(*e)) {
+        return exit_code::DISK;
+    }
+    for err in all {
+        if let Some(coded) = err.downcast_ref::<Coded>() {
+            return coded.code;
+        }
+        if err.is::<ConfigFileError>() {
+            return exit_code::CONFIG;
+        }
+        if err.is::<divi_wallet::WalletError>() {
+            return exit_code::WALLET;
+        }
+        if err.is::<divi_storage::StorageError>() {
+            return exit_code::DATABASE;
+        }
+        if is_bind_error(err) {
+            return exit_code::BIND;
+        }
+    }
+    exit_code::FAILED
+}
 
 /// irondivid's start-up options. They are read as Divi Core's divid reads
 /// its own (settings.rs): `-name=value` or `--name value` on the command line,
@@ -61,6 +309,10 @@ struct Args {
     logips: bool,
     logtimestamps: bool,
     shrinkdebugfile: bool,
+    /// -logwalletdetail: wallet values in clear in the logs (A11), start only
+    logwalletdetail: bool,
+    /// -loglevel and -debug: what is written to debug.log
+    log_levels: log_filter::LogLevels,
     wallet: Option<PathBuf>,
     disablewallet: bool,
     sysperms: bool,
@@ -93,11 +345,17 @@ Options are read as divid reads them: -name=value (or --name value), -noname\n\
 to turn an option off, then the config file (irondivi.conf, else divi.conf, in\n\
 the data directory) for whatever the command line left unset. Among them:\n  \
 -conf=<file> -datadir=<dir> -testnet -regtest -mode=<divi|privatedivi>\n  \
--daemon -pid=<file> -printtoconsole -debug -disablewallet -wallet=<name>\n  \
+-daemon -pid=<file> -printtoconsole -disablewallet -wallet=<name>\n  \
+-debug[=<category>] -loglevel=<level> -loglevel=<category>:<level>\n  \
+(levels: off error warn info debug trace; categories: net sync peers node\n  \
+mempool staking chain wallet masternode spork rpc electrum webui swap zmq\n  \
+daemon; the default is info; see docs/logging.md)\n  \
 -port=<port> -bind=<addr> -listen -connect=<ip> -addnode=<ip> -dnsseed\n  \
 -maxconnections=<n> -proxy=<ip:port> -banscore=<n> -bantime=<n> -timeout=<ms>\n  \
 -server -rpcbind=<addr> -rpcallowip=<ip> -rpcport=<port> -rpcuser=<user>\n  \
--rpcpassword=<pw> -txindex -addressindex -spentindex -checkblocks=<n>\n  \
+-rpcpassword=<pw> -rpcauth=<user:salt$hash> -rpcwhitelist=<user:methods>\n  \
+-rpcwhitelistdefault -rpcalloworigin=<origin> -rpcallowhost=<host>\n  \
+-txindex -addressindex -spentindex -checkblocks=<n>\n  \
 -maxreorg=<n> -maxorphantx=<n> -minrelaytxfee=<amt> -staking\n  \
 -blockmaxsize=<n> -blockprioritysize=<n> -blockminsize=<n>\n  \
 -blocknotify=<cmd> -walletnotify=<cmd> -alertnotify=<cmd>\n  \
@@ -105,6 +363,11 @@ the data directory) for whatever the command line left unset. Among them:\n  \
 -zmqpubrawblock=<address> -zmqpubrawtx=<address>\n\
 IronDivi's own: -fullnode=<ip> -stakeonstaletip -stakesplitthreshold=<n>\n  \
 -utxocachesize=<n> -expire=<age> -maxlogsize=<MB> -maxlogfiles=<n>\n  \
+-webui -webuiport=<port> -webuibind=<addr> -webuiallowhost=<host>\n  \
+-webuiallowremote (the web interface, off unless -webui is given)\n  \
+-electrum=<addr:port> -electrumtls=<addr:port> -electrumcert=<pem>\n  \
+-electrumkey=<pem> -electrumws=<addr:port> -electrumwss=<addr:port>\n  \
+(an Electrum server, TCP/TLS/WebSocket; needs -txindex -addressindex)\n  \
 --export-chain --export-start N --export-end N --export-output DIR\n  \
 --export-snapshot DIR --import-snapshot DIR [--snapshot-root HEX]\n  \
 --sign-snapshot DIR --verify-snapshot DIR --snapshot-signer ADDRESS\n";
@@ -137,10 +400,7 @@ impl Args {
         I: IntoIterator<Item = T>,
         T: Into<String>,
     {
-        Args::try_parse_from(argv).unwrap_or_else(|e| {
-            eprintln!("Error: {:#}", e);
-            std::process::exit(1)
-        })
+        Args::try_parse_from(argv).unwrap_or_else(|e| panic!("{e:#}"))
     }
 
     /// Take the option values from the settings read so far
@@ -154,15 +414,14 @@ impl Args {
                 .map(|v| {
                     v.trim()
                         .parse::<u32>()
-                        .with_context(|| format!("invalid value '{}' for --{}", v, key))
+                        .with_context(|| format!("invalid value for --{}", key))
                 })
                 .transpose()
         };
         if let Some(mode) = s.get("mode") {
             if !matches!(mode, "divi" | "privatedivi") {
                 anyhow::bail!(
-                    "invalid value '{}' for '--mode <MODE>' [possible values: divi, privatedivi]",
-                    mode
+                    "invalid value for '--mode <MODE>' [possible values: divi, privatedivi]"
                 );
             }
         }
@@ -173,9 +432,13 @@ impl Args {
         self.mode = s.get("mode").map(String::from);
         self.daemon = s.get_bool("daemon", false);
         self.printtoconsole = s.get_bool("printtoconsole", false);
-        // -debug=<category> may repeat; -debug=0 is no debugging
-        let debug = s.get_multi("debug");
-        self.debug = !debug.is_empty() && !debug.iter().any(|c| c == "0");
+        self.logwalletdetail = s.get_bool("logwalletdetail", false);
+        // -debug=<category> and -loglevel=<[category:]level> may repeat;
+        // -debug=0 is no debugging
+        self.log_levels =
+            log_filter::LogLevels::parse(s.get_multi("debug"), s.get_multi("loglevel"))
+                .map_err(anyhow::Error::msg)?;
+        self.debug = self.log_levels.is_debug();
         self.logips = s.get_bool("logips", false);
         self.logtimestamps = s.get_bool("logtimestamps", true);
         // Default: shrink unless debugging (Logging.cpp:204)
@@ -291,7 +554,7 @@ fn resolve_args(mut args: Args) -> Result<Args> {
             _ => args
                 .settings
                 .read_config(&content)
-                .map_err(ConfigFileError)?,
+                .map_err(|e| ConfigFileError(format!("{}: {}", path.display(), e)))?,
         }
     }
     args.refresh()?;
@@ -363,6 +626,13 @@ const NO_COUNTERPART: &[&str] = &[
 
 /// Options apply_settings reads
 const APPLIED: &[&str] = &[
+    // read by apply_settings and the RPC access settings
+    "logwalletdetail",
+    "rpcauth",
+    "rpcwhitelist",
+    "rpcwhitelistdefault",
+    "rpcalloworigin",
+    "rpcallowhost",
     // divid's -forcestart skips the checks it makes after a stop that was
     // not prepared: its best block in the block index, its coin database
     // at that block (BlockIndexLoading.cpp:267-285). irondivid writes each
@@ -482,6 +752,17 @@ const APPLIED: &[&str] = &[
 
 /// Options read elsewhere (before the node config is built, or by a command)
 const READ_ELSEWHERE: &[&str] = &[
+    "webui",
+    "webuiport",
+    "webuibind",
+    "webuiallowremote",
+    "webuiallowhost",
+    "electrum",
+    "electrumtls",
+    "electrumws",
+    "electrumwss",
+    "electrumcert",
+    "electrumkey",
     "conf",
     "hdseed",
     "mnemonic",
@@ -493,6 +774,7 @@ const READ_ELSEWHERE: &[&str] = &[
     "daemon",
     "printtoconsole",
     "debug",
+    "loglevel",
     "wallet",
     "disablewallet",
     "sysperms",
@@ -674,12 +956,12 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     // The RPC server listens on the loopback unless -rpcallowip lets others
     // in; then on -rpcbind, else on every interface (rpcserver.cpp:633-706)
     let allowed = s.get_multi("rpcallowip").to_vec();
-    for subnet in &allowed {
+    for (i, subnet) in allowed.iter().enumerate() {
         if divi_rpc::Subnet::parse(subnet).is_none() {
             anyhow::bail!(
-                "Invalid -rpcallowip subnet specification: {}. Valid are a single IP (e.g. 1.2.3.4), \
+                "Invalid -rpcallowip subnet specification{}. Valid are a single IP (e.g. 1.2.3.4), \
                  a network/netmask (e.g. 1.2.3.4/255.255.255.0) or a network/CIDR (e.g. 1.2.3.4/24).",
-                subnet
+                which(i, allowed.len())
             );
         }
     }
@@ -697,14 +979,17 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     } else if let Some(first) = rpcbind.first() {
         // Each must be a numeric address, with a port or not (ParseEndpoint,
         // rpcserver.cpp:623-629, :693-703)
-        for addr in rpcbind {
+        for (i, addr) in rpcbind.iter().enumerate() {
             let (host, _) = host_and_port(addr);
             if host
                 .trim_matches(['[', ']'])
                 .parse::<std::net::IpAddr>()
                 .is_err()
             {
-                anyhow::bail!("Could not parse -rpcbind value {} as network address", addr);
+                anyhow::bail!(
+                    "Could not parse -rpcbind value{} as network address",
+                    which(i, rpcbind.len())
+                );
             }
         }
         // Every -rpcbind is listened on, each without a port on -rpcport
@@ -730,10 +1015,20 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         config.rpc.listen_addr = "[::]".to_string();
         config.rpc.also_listen = Vec::new();
     }
-    config.rpc.allowed_ips = allowed;
+    config.rpc.allow_ips = allowed;
     // -rpckeepalive=0: each RPC connection is closed after its reply
     // (rpcserver.cpp:1014-1017)
     config.rpc.keep_alive = s.get_bool("rpckeepalive", true);
+    // RPC access control, each repeatable but -rpcwhitelistdefault: hashed
+    // credentials (`user:salt$hash`), the methods a user may call
+    // (`user:method,method`), browser origins and Host names to accept
+    config.rpc.rpcauth = s.get_multi("rpcauth").to_vec();
+    config.rpc.whitelist = s.get_multi("rpcwhitelist").to_vec();
+    if s.is_set("rpcwhitelistdefault") {
+        config.rpc.whitelist_default = Some(s.get_bool("rpcwhitelistdefault", true));
+    }
+    config.rpc.allow_origins = s.get_multi("rpcalloworigin").to_vec();
+    config.rpc.allow_hosts = s.get_multi("rpcallowhost").to_vec();
 
     if let Some(p) = port("port") {
         config.p2p.port = p;
@@ -763,16 +1058,24 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     }
     // -whitelist networks; one that is not a network stops the start
     // (net.cpp:1749-1755)
-    for net in s.get_multi("whitelist") {
+    let whitelist = s.get_multi("whitelist");
+    for (i, net) in whitelist.iter().enumerate() {
         if divi_network::Subnet::parse(net).is_none() {
-            anyhow::bail!("Invalid netmask specified in -whitelist: '{}'", net);
+            anyhow::bail!(
+                "Invalid netmask specified in -whitelist{}",
+                which(i, whitelist.len())
+            );
         }
         config.p2p.whitelist.push(net.clone());
     }
     // -whitebind: a numeric address with its port; with -whitebind and no
     // -bind, only the -whitebind addresses are listened on (net.cpp:1808-1823)
-    for raw in s.get_multi("whitebind") {
-        config.p2p.white_bind.push(white_bind_address(raw)?);
+    let whitebind = s.get_multi("whitebind");
+    for (i, raw) in whitebind.iter().enumerate() {
+        config
+            .p2p
+            .white_bind
+            .push(white_bind_address(raw, &which(i, whitebind.len()))?);
     }
     if s.is_set("whitebind") && !s.is_set("bind") {
         config.p2p.listen_on_addr = false;
@@ -838,10 +1141,16 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     config.p2p.peer_bloom_filters = s.get_bool("peerbloomfilters", true);
     // -externalip=<ip>[:port], the listen port when none is given; one that
     // does not resolve to a valid address stops the start (net.cpp:1834-1839)
-    for raw in s.get_multi("externalip") {
+    let externalip = s.get_multi("externalip");
+    for (i, raw) in externalip.iter().enumerate() {
         let addr = resolve_service(raw, config.p2p.port, config.p2p.name_lookup)
             .filter(|a| divi_network::local::is_valid(&a.ip()))
-            .ok_or_else(|| anyhow::anyhow!("Cannot resolve -externalip address: '{}'", raw))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Cannot resolve -externalip address{}",
+                    which(i, externalip.len())
+                )
+            })?;
         config.p2p.external_ips.push(addr);
     }
     // Divi Core SetProtocolVersion (init.cpp:1450-1452)
@@ -875,7 +1184,7 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         // ParseMoney; refused unless it is an amount above zero, and kept in
         // satoshis per kB (init.cpp:823-829, FeeRate.cpp)
         let sat = parse_money(text).filter(|&sat| sat > 0).ok_or_else(|| {
-            anyhow::anyhow!("Invalid amount for -minrelaytxfee=<amount>: '{}'", text)
+            anyhow::anyhow!("Invalid amount for -minrelaytxfee=<amount> (an amount above zero)")
         })?;
         config.mempool.min_relay_fee_per_kb = sat;
     }
@@ -899,7 +1208,7 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     // -maxtxfee: an amount ParseMoney reads, at least the relay fee for 1 kB;
     // above 10 DIVI a warning (init.cpp:831-845)
     if let Some(text) = s.get("maxtxfee") {
-        let invalid = || anyhow::anyhow!("Invalid amount for -maxtxfee=<amount>: '{}'", text);
+        let invalid = || anyhow::anyhow!("Invalid amount for -maxtxfee=<amount>");
         let max_fee = parse_money(text).ok_or_else(invalid)?;
         if max_fee > 10 * 100_000_000 {
             warn!("Warning: -maxtxfee is set very high! Fees this large could be paid on a single transaction.");
@@ -907,8 +1216,7 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         let relay = config.mempool.min_relay_fee_per_kb;
         if max_fee < relay {
             anyhow::bail!(
-                "Invalid amount for -maxtxfee=<amount>: '{}' (must be at least the minrelay fee of {}.{:08} DIV/kB to prevent stuck transactions)",
-                text,
+                "Invalid amount for -maxtxfee=<amount> (must be at least the minrelay fee of {}.{:08} DIV/kB to prevent stuck transactions)",
                 relay / 100_000_000,
                 relay % 100_000_000
             );
@@ -917,9 +1225,13 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     }
     // -onlynet: each one of Divi Core's network names (ParseNetwork,
     // netbase.cpp:70-77; init.cpp:1734-1740)
-    for net in s.get_multi("onlynet") {
+    let onlynet = s.get_multi("onlynet");
+    for (i, net) in onlynet.iter().enumerate() {
         if divi_network::local::Network::parse(net).is_none() {
-            anyhow::bail!("Unknown network specified in -onlynet: '{}'", net);
+            anyhow::bail!(
+                "Unknown network specified in -onlynet{} (use ipv4, ipv6, onion or tor)",
+                which(i, onlynet.len())
+            );
         }
         config.p2p.only_nets.push(net.to_lowercase());
     }
@@ -1009,7 +1321,7 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     }
     if let Some(text) = s.get("expire") {
         config.expire = divi_storage::prune::Expire::parse(text)
-            .map_err(|e| anyhow::anyhow!("config file: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("-expire: {}", e))?;
     }
     config.blocknotify = s
         .get("blocknotify")
@@ -1117,9 +1429,21 @@ fn bind_address(text: &str, port: u16) -> Result<std::net::SocketAddr> {
         .ok_or_else(|| anyhow::anyhow!("Cannot resolve -bind address: '{}'", text))
 }
 
+/// Which of a repeated option's values a refusal is about, as " (value 2
+/// of 3)", or nothing when there is one: an R3 code 2 reason names the
+/// option and the place, never the value (a value can be a password or an
+/// address the owner keeps to themselves)
+fn which(index: usize, count: usize) -> String {
+    if count > 1 {
+        format!(" (value {} of {})", index + 1, count)
+    } else {
+        String::new()
+    }
+}
+
 /// A -whitebind value as Divi Core's Lookup reads it without name lookup:
 /// `ip:port` or `[ipv6]:port`; the port must be given (net.cpp:1815-1821)
-fn white_bind_address(text: &str) -> Result<std::net::SocketAddr> {
+fn white_bind_address(text: &str, which: &str) -> Result<std::net::SocketAddr> {
     let text = text.trim();
     let addr = text.parse::<std::net::SocketAddr>().ok().or_else(|| {
         text.trim_matches(['[', ']'])
@@ -1128,9 +1452,9 @@ fn white_bind_address(text: &str) -> Result<std::net::SocketAddr> {
             .map(|ip| std::net::SocketAddr::new(ip, 0))
     });
     match addr {
-        None => anyhow::bail!("Cannot resolve -whitebind address: '{}'", text),
+        None => anyhow::bail!("Cannot resolve -whitebind address{}", which),
         Some(a) if a.port() == 0 => {
-            anyhow::bail!("Need to specify a port with -whitebind: '{}'", text)
+            anyhow::bail!("Need to specify a port with -whitebind{}", which)
         }
         Some(a) => Ok(a),
     }
@@ -1142,7 +1466,10 @@ fn white_bind_address(text: &str) -> Result<std::net::SocketAddr> {
 /// failed
 fn start_error(e: divi_node::NodeError) -> anyhow::Error {
     match e {
-        divi_node::NodeError::Init(reason) => anyhow::Error::msg(reason),
+        // The database and index checks of the start (node.rs)
+        divi_node::NodeError::Init(reason) => {
+            Coded::error(exit_code::DATABASE, anyhow::Error::msg(reason))
+        }
         e => anyhow::Error::new(e).context("Failed to initialize node"),
     }
 }
@@ -1216,6 +1543,24 @@ fn parse_money(text: &str) -> Option<i64> {
     Some(whole * 100_000_000 + frac)
 }
 
+/// Warn when a config file holding RPC credentials can be read by other users
+fn warn_if_conf_exposed(path: &std::path::Path, has_secret: bool) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(path) {
+            if has_secret && meta.permissions().mode() & 0o077 != 0 {
+                warn!(
+                    "{:?} holds RPC credentials and is readable by other users; run chmod 600 on it",
+                    path
+                );
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (path, has_secret);
+}
+
 /// Build node configuration from CLI args and config file
 fn build_config(args: &Args) -> Result<NodeConfig> {
     build_config_with_env(args, std::env::var("IRONDIVI_EXPIRE").ok())
@@ -1239,7 +1584,18 @@ fn build_config_with_env(args: &Args, env_expire: Option<String>) -> Result<Node
     if let Some(conf) = &args.conf {
         if conf.exists() {
             info!("Loaded config from {:?}", conf);
+            // The file holds RPC credentials when it sets what the command
+            // line did not
+            let from_file =
+                |key: &str| args.settings.get_multi(key).len() > args.cli.get_multi(key).len();
+            warn_if_conf_exposed(conf, from_file("rpcpassword") || from_file("rpcauth"));
         }
+    }
+    if args.cli.is_set("rpcpassword") {
+        warn!(
+            "-rpcpassword on the command line is visible to every user of this machine \
+             (ps, /proc); put it in the config file or use rpcauth instead"
+        );
     }
 
     // Everything from the command line and the file, the command line first;
@@ -1481,65 +1837,62 @@ fn stderr_is_file(_path: &std::path::Path) -> bool {
     false
 }
 
-/// Drop the writer's guard in `guard`: it hands the thread a shutdown behind
-/// the lines it holds and waits (up to about a second) until they are written
-fn flush_log_from(guard: &std::sync::Mutex<Option<tracing_appender::non_blocking::WorkerGuard>>) {
-    let guard = guard.lock().unwrap_or_else(|e| e.into_inner()).take();
-    drop(guard);
+/// The filter of the running logger, which `setlogconfig` replaces
+static LOG_FILTER: std::sync::OnceLock<
+    tracing_subscriber::reload::Handle<EnvFilter, tracing_subscriber::Registry>,
+> = std::sync::OnceLock::new();
+
+/// Change the log levels of the running node (the `setlogconfig` RPC);
+/// returns the levels now in force
+fn set_log_levels(spec: &str) -> std::result::Result<String, String> {
+    // Start only, so a run's A7 record is the whole truth about it (A11)
+    if spec.to_ascii_lowercase().contains("logwalletdetail") {
+        events::event("setlogconfig-refused", "option=logwalletdetail");
+        return Err("logwalletdetail can be set only at start".to_string());
+    }
+    let levels = log_filter::LogLevels::parse_spec(spec)?;
+    let handle = LOG_FILTER
+        .get()
+        .ok_or_else(|| "logging is not set up".to_string())?;
+    let filter = EnvFilter::try_new(levels.directives()).map_err(|e| e.to_string())?;
+    handle.reload(filter).map_err(|e| e.to_string())?;
+    if !levels.unknown.is_empty() {
+        warn!(
+            "Unknown log categories {:?} (known: {})",
+            levels.unknown,
+            log_filter::category_names()
+        );
+    }
+    info!("Log levels set to {}", levels.spec());
+    Ok(levels.spec())
 }
 
-#[cfg(test)]
-mod flush_log_tests {
-    use super::*;
-    use std::io::Write;
-    use std::sync::{Arc, Mutex};
+/// One layer of the logger, as the registry takes it
+type BoxLayer = Box<dyn tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync>;
 
-    /// A log file on a loaded host: each write takes a while
-    #[derive(Clone)]
-    struct SlowFile(Arc<Mutex<Vec<u8>>>);
-
-    impl Write for SlowFile {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    /// Lines handed to the writer just before the process ends are in the
-    /// file once `flush_log_from` returns, however slow the writer is
-    #[test]
-    fn flush_writes_out_every_line_the_writer_holds() {
-        let file = SlowFile(Arc::new(Mutex::new(Vec::new())));
-        let (mut writer, guard) = tracing_appender::non_blocking(file.clone());
-        let slot = std::sync::Mutex::new(Some(guard));
-        for i in 0..5 {
-            writer.write_all(format!("line {i}\n").as_bytes()).unwrap();
-        }
-        flush_log_from(&slot);
-        let text = String::from_utf8(file.0.lock().unwrap().clone()).unwrap();
-        assert_eq!(text.lines().count(), 5, "{text:?}");
-        assert!(slot.lock().unwrap().is_none());
-        // A second flush (the end of main after an exit path flushed) is a no-op
-        flush_log_from(&slot);
-    }
-}
-
-/// Initialize logging
-fn init_logging(log_config: &LogConfig, data_dir: &PathBuf) {
+/// Initialize logging. Every layer has its own filter (A8): the configured
+/// levels govern debug.log and the console, the debug ring takes debug of
+/// our own code whatever they are and leaves counted lines out.
+fn init_logging(log_config: &LogConfig, levels: &log_filter::LogLevels, data_dir: &PathBuf) {
+    use tracing_subscriber::Layer as _;
     // -logips: whether log lines name peers by address too (Logging.cpp:202)
     divi_network::peer_log::set_log_ips(log_config.log_ips);
-    // Use RUST_LOG if set, otherwise use default based on debug config
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        if log_config.debug {
-            EnvFilter::new("debug")
-        } else {
-            EnvFilter::new("info")
-        }
-    });
+    // RUST_LOG, when set, replaces -loglevel and -debug
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(levels.directives()));
+    let (filter, handle) = tracing_subscriber::reload::Layer::new(filter);
+    let _ = LOG_FILTER.set(handle);
+    let ring: BoxLayer = log_delivery::ring_layer(&log_delivery::RING).boxed();
+    let console = |filter: tracing_subscriber::reload::Layer<
+        EnvFilter,
+        tracing_subscriber::Registry,
+    >|
+     -> BoxLayer {
+        fmt::layer()
+            .fmt_fields(log_delivery::Fields)
+            .with_filter(filter)
+            .boxed()
+    };
 
     // In daemon mode the console is debug.log itself, so it rotates like it
     let std_is_log = stderr_is_file(&data_dir.join("debug.log"));
@@ -1547,23 +1900,28 @@ fn init_logging(log_config: &LogConfig, data_dir: &PathBuf) {
     if log_config.print_to_console && !std_is_log {
         // Log to console only
         tracing_subscriber::registry()
-            .with(fmt::layer())
-            .with(filter)
+            .with(vec![console(filter), ring])
             .init();
     } else {
         // Log to file (debug.log in data directory) like C++ divid
         // Create data directory if it doesn't exist
-        if let Err(e) = std::fs::create_dir_all(data_dir) {
-            eprintln!(
+        if let Err(e) = private_files::ensure_private_dir(data_dir, false) {
+            console!(
                 "Warning: Could not create data directory {:?}: {}",
-                data_dir, e
+                data_dir,
+                e
             );
             // Fall back to console logging
             tracing_subscriber::registry()
-                .with(fmt::layer())
-                .with(filter)
+                .with(vec![console(filter), ring])
                 .init();
             return;
+        }
+
+        // Logs written before the umask was set may be readable by others (NODE-4)
+        private_files::restrict_file(&data_dir.join("debug.log"));
+        for i in 1..log_config.max_files {
+            private_files::restrict_file(&data_dir.join(format!("debug.log.{}", i)));
         }
 
         // debug.log, rotated by size like C++ divid
@@ -1576,38 +1934,31 @@ fn init_logging(log_config: &LogConfig, data_dir: &PathBuf) {
         ) {
             Ok(log) => log,
             Err(e) => {
-                eprintln!(
+                console!(
                     "Warning: Could not open {:?}: {}",
                     data_dir.join("debug.log"),
                     e
                 );
                 tracing_subscriber::registry()
-                    .with(fmt::layer())
-                    .with(filter)
+                    .with(vec![console(filter), ring])
                     .init();
                 return;
             }
         };
 
-        // Create a non-blocking writer to avoid blocking the async runtime
-        let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
-
-        // Kept until the process exits, when `flush_log` writes out what it
-        // still holds
-        *LOG_GUARD.lock().unwrap_or_else(|e| e.into_inner()) = Some(_guard);
-
-        // Lines as divid writes them, without ANSI colours
-        tracing_subscriber::registry()
-            .with(
-                fmt::layer()
-                    .with_writer(non_blocking)
-                    .with_ansi(false)
-                    .event_format(DividLogFormat {
-                        timestamps: log_config.timestamps,
-                    }),
-            )
-            .with(filter)
-            .init();
+        // Written on the caller's thread until the node runs, then by the
+        // writer thread with a 2 s bound (A8); lines as divid writes them
+        log_delivery::set_sink(Box::new(file_appender));
+        let file: BoxLayer = fmt::layer()
+            .fmt_fields(log_delivery::Fields)
+            .event_format(DividLogFormat {
+                timestamps: log_config.timestamps,
+            })
+            .with_writer(log_delivery::DebugLog)
+            .with_ansi(false) // No ANSI colors in file
+            .with_filter(filter)
+            .boxed();
+        tracing_subscriber::registry().with(vec![file, ring]).init();
 
         // Nothing more on stderr: divid writes there only its warnings and
         // errors (InitWarning, InitError, noui.cpp:38-40), and a -daemon child
@@ -1651,18 +2002,13 @@ where
     }
 }
 
-/// The writer thread of debug.log (non-blocking): dropping its guard writes
-/// out the lines it still holds
-static LOG_GUARD: std::sync::Mutex<Option<tracing_appender::non_blocking::WorkerGuard>> =
-    std::sync::Mutex::new(None);
-
-/// Write out the log lines not yet in debug.log (waits a second at most).
-/// Neither `std::process::exit` nor the end of `main` drops a static, so every
+/// Write out the log lines not yet in debug.log (waits 2 s at most, A8).
+/// Neither a direct exit nor the end of `main` drops a static, so every
 /// way out of the process after logging starts calls this first: otherwise the
 /// last lines, a start-up error among them, are lost whenever the writer
 /// thread has not run yet (a loaded host).
 fn flush_log() {
-    flush_log_from(&LOG_GUARD);
+    log_delivery::flush(log_delivery::BOUND);
     use std::io::Write as _;
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
@@ -1727,6 +2073,13 @@ impl WalletSeed {
 /// asked for before the start was done)
 #[derive(Debug)]
 struct QuietExit;
+
+/// Whether `e` is a [`QuietExit`], bare or carried by a [`Coded`]
+fn is_quiet_exit(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<QuietExit>().is_some()
+        || e.downcast_ref::<Coded>()
+            .is_some_and(|c| c.inner.downcast_ref::<QuietExit>().is_some())
+}
 
 impl std::fmt::Display for QuietExit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -2045,6 +2398,10 @@ fn load_or_restore_wallet_with_seed(
     // Try to open existing wallet (backed up by `backup_wallet_at_start`)
     if wallet_path.exists() {
         info!("Loading wallet from {:?}", wallet_path);
+        // Only this user may read the wallet (NODE-3)
+        if let Err(e) = private_files::ensure_private_dir(wallet_path, true) {
+            warn!("Could not check the wallet directory permissions: {}", e);
+        }
         let wallet = match WalletDb::open(wallet_path, network) {
             // A key record that cannot be read: Divi Core's DB_CORRUPT, an
             // InitError (init.cpp:1153-1156, :1299-1305)
@@ -2095,6 +2452,7 @@ fn load_or_restore_wallet_with_seed(
 
         let (plaintext, encrypted, with_metadata) = wallet.load_counts();
         log_load_counts(plaintext, encrypted, with_metadata);
+        warn_if_unencrypted(&wallet);
         info!("Wallet loaded successfully");
         return Ok(Arc::new(wallet));
     }
@@ -2171,7 +2529,8 @@ fn load_or_restore_wallet_with_seed(
     // Divi Core loads the empty wallet file before it makes the keys
     log_load_counts(0, 0, 0);
     info!("Creating new wallet at {:?}", wallet_path);
-    std::fs::create_dir_all(wallet_path)
+    // Only this user may read the wallet (NODE-3)
+    private_files::ensure_private_dir(wallet_path, true)
         .with_context(|| format!("Failed to create wallet directory: {:?}", wallet_path))?;
 
     // Never log the mnemonic: logs go to journald and log files, which are
@@ -2209,8 +2568,42 @@ fn load_or_restore_wallet_with_seed(
     // Save immediately
     wallet.save().with_context(|| "Failed to save wallet")?;
 
+    warn_if_unencrypted(&wallet);
     info!("New wallet created successfully");
     Ok(Arc::new(wallet))
+}
+
+/// Say loudly that the seed and keys are stored in the clear (NODE-3). Staking keeps working
+/// on an encrypted wallet: `walletpassphrase <passphrase> 0 true` unlocks it for staking only.
+fn warn_if_unencrypted(wallet: &WalletDb) {
+    if !wallet.is_encrypted() {
+        warn!(
+            "The wallet is NOT encrypted: its seed and private keys are stored in the clear. \
+             Run encryptwallet, then walletpassphrase <passphrase> 0 true to keep staking."
+        );
+        console!(
+            "WARNING: the wallet is not encrypted; anyone who can read its files can spend \
+             its coins. Run the encryptwallet RPC."
+        );
+    }
+}
+
+/// Put one wallet transaction back in the mempool with its real fee (inputs -
+/// outputs), as a local RPC send does, so the relay fee check applies to it.
+fn resubmit_tx(
+    tx: Transaction,
+    chain: &Arc<divi_storage::Chain>,
+    mempool: &Arc<divi_node::Mempool>,
+) -> std::result::Result<divi_primitives::hash::Hash256, String> {
+    let inputs_available = tx.vin.iter().all(|input| {
+        mempool.contains(&input.prevout.txid)
+            || matches!(chain.get_utxo(&input.prevout), Ok(Some(_)))
+    });
+    if !inputs_available {
+        return Err("inputs no longer available".to_string());
+    }
+    let fee = Node::calculate_transaction_fee(&tx, chain, mempool).map_err(|e| e.to_string())?;
+    mempool.add(tx, fee).map_err(|e| e.to_string())
 }
 
 /// Put the wallet's unconfirmed transactions back into the mempool after a
@@ -2229,22 +2622,10 @@ fn resubmit_wallet_txs(node: &Node, wallet: &Arc<WalletDb>) {
     if txs.is_empty() {
         return;
     }
-    let chain = node.chain();
-    let mempool = node.mempool();
     let mut resubmitted = 0;
     for (tx, detached) in txs {
         let txid = tx.txid();
-        let inputs_available = tx.vin.iter().all(|input| {
-            mempool.contains(&input.prevout.txid)
-                || matches!(chain.get_utxo(&input.prevout), Ok(Some(_)))
-        });
-        // The mempool works out the fee itself (Node's validator)
-        let result = if inputs_available {
-            mempool.add(tx, Amount::ZERO).map_err(|e| e.to_string())
-        } else {
-            Err("inputs no longer available".to_string())
-        };
-        match result {
+        match resubmit_tx(tx, node.chain(), node.mempool()) {
             // Added to the mempool only, not announced: Divi Core's
             // SubmitTransactionToMempool runs AcceptToMemoryPool alone
             // (init.cpp:1272, txmempool.cpp:408-415); peers hear of the
@@ -2255,12 +2636,17 @@ fn resubmit_wallet_txs(node: &Node, wallet: &Arc<WalletDb>) {
             // A detached transaction the mempool refuses stays as it is, at
             // depth -1, as Divi Core's wallet keeps it
             Err(e) if detached => {
-                debug!("Detached wallet tx {} not resubmitted: {}", txid, e);
+                debug!(
+                    "Detached wallet tx {} not resubmitted: {}",
+                    divi_primitives::redact::WalletTxid::of(txid),
+                    e
+                );
             }
             Err(e) => {
                 warn!(
                     "Unconfirmed wallet tx {} cannot be resubmitted ({}); forgetting it",
-                    txid, e
+                    divi_primitives::redact::WalletTxid::of(txid),
+                    e
                 );
                 wallet.remove_mempool_tx(&txid);
             }
@@ -2315,13 +2701,20 @@ async fn run_daemon(
     shutdown_tx: broadcast::Sender<()>,
     shutdown_rx: broadcast::Receiver<()>,
     pid_file: PathBuf,
+    webui: Option<divi_webui::WebUiConfig>,
+    electrum: Option<divi_electrum::ElectrumConfig>,
 ) -> Result<()> {
+    runs_log::phase("datadir");
     // Create data directory if it doesn't exist
-    std::fs::create_dir_all(&config.data_dir)
-        .with_context(|| format!("Failed to create data directory: {:?}", config.data_dir))?;
+    private_files::ensure_private_dir(&config.data_dir, false)
+        .with_context(|| format!("Failed to create data directory: {:?}", config.data_dir))
+        .or_exit(exit_code::DATADIR)?;
     // One process per data directory, held until this one exits
     // (TryLockDataDirectory, init.cpp:850-862)
-    let _datadir_lock = lock_data_dir(&config.data_dir)?;
+    runs_log::phase("lock");
+    let _datadir_lock = lock_data_dir(&config.data_dir).or_exit(exit_code::DATADIR)?;
+    // Only the holder of the lock may read or replace the marker (A2)
+    runs_log::marker_create();
     // With -hdseed or -mnemonic the wallet there is moved out of the way once
     // the lock is held, before the pid file and before anything is opened, as
     // Divi Core's CheckWalletFileExists (init.cpp:1460-1467, :864-888)
@@ -2340,6 +2733,20 @@ async fn run_daemon(
     // Warnings::setMiscWarning puts it: getinfo's and getmininginfo's "errors"
     // (timedata.cpp:96-97)
     divi_network::timedata::on_clock_warning(divi_rpc::warnings::set_misc_warning);
+
+    // -webui: take its port now, so a port in use stops the start at once
+    let webui = webui
+        .map(divi_webui::prepare)
+        .transpose()
+        .bind_or_exit(exit_code::USAGE)?;
+    let webui_shutdown = shutdown_tx.subscribe();
+    // -electrum: the same, for the Electrum server's ports and certificate
+    let electrum = electrum
+        .map(divi_electrum::prepare)
+        .transpose()
+        .bind_or_exit(exit_code::USAGE)?;
+    let electrum_shutdown = shutdown_tx.subscribe();
+
     // Divi Core Discover: the interfaces' addresses (net.cpp:1385-1425)
     if config.p2p.discover {
         config.p2p.interface_ips = interfaces::addresses();
@@ -2347,6 +2754,9 @@ async fn run_daemon(
 
     // Initialize the node
     info!("Initializing node...");
+    // The databases open and the chain loads in Node::new (db-open and
+    // chain-load are one phase until divi-node reports the boundary)
+    runs_log::phase("db-open");
     // Never dropped: the process ends without running the destructors of the
     // node's state (databases, caches, mempool), see `exit_after_stop`
     let node = std::mem::ManuallyDrop::new(Node::new(config.clone()).map_err(start_error)?);
@@ -2382,7 +2792,16 @@ async fn run_daemon(
     }
 
     // Start the node
-    node.start().await.with_context(|| "Failed to start node")?;
+    runs_log::phase("network");
+    node.start().await.map_err(|e| match e {
+        // start()'s only Init: no P2P listener could be bound
+        // (bind_listeners); its io error is text by then (R3)
+        divi_node::NodeError::Init(_) => Coded::error(
+            exit_code::BIND,
+            anyhow::Error::new(e).context("Failed to start node"),
+        ),
+        e => anyhow::Error::new(e).context("Failed to start node"),
+    })?;
 
     // Divi Core's -stopafterblockimport: the import thread asks for shutdown
     // once it is done (init.cpp:724-727). divid starts that thread once its
@@ -2397,7 +2816,7 @@ async fn run_daemon(
         let chain = node.chain().clone();
         let tx = shutdown_tx.clone();
         let start_done = Arc::clone(&start_done);
-        tokio::spawn(async move {
+        tasks::spawn_supervised("stop-after-import", async move {
             while chain.is_importing() {
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             }
@@ -2406,16 +2825,28 @@ async fn run_daemon(
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
             let _ = tx.send(());
+            runs_log::stop_requested("stopafterblockimport");
         });
     }
 
     info!("Node started, chain height: {}", node.chain().height());
+    // The hourly count lines of the counted sites (A11)
+    counts::init();
+    tasks::spawn_supervised("counts", counts::run());
+    health::start(health::Handles {
+        chain: node.chain().clone(),
+        block_sync: node.block_sync().clone(),
+        peers: node.peer_manager().clone(),
+        mempool: node.mempool().clone(),
+        data_dir: config.data_dir.clone(),
+    });
 
     // Get chain and peer manager references for RPC server
     let chain = node.chain().clone();
     let peer_manager = node.peer_manager().clone();
 
     // Load or create wallet (unless disabled)
+    runs_log::phase("wallet-load");
     let wallet = if disable_wallet {
         info!("Wallet disabled!");
 
@@ -2443,13 +2874,16 @@ async fn run_daemon(
             NetworkType::Testnet => WalletNetwork::Testnet,
             NetworkType::Regtest => WalletNetwork::Regtest,
         };
-        let wallet = Some(load_or_create_wallet(
-            &wallet_dir,
-            wallet_network,
-            config.network.chain_mode,
-            wallet_seed,
-            &wallet_options,
-        )?);
+        let wallet = Some(
+            load_or_create_wallet(
+                &wallet_dir,
+                wallet_network,
+                config.network.chain_mode,
+                wallet_seed,
+                &wallet_options,
+            )
+            .or_exit(exit_code::WALLET)?,
+        );
         if let Some(ref w) = wallet {
             // Divi Core warns at every start of a wallet that is not locked,
             // unless -allowunencryptedwallet; not after the load's own warning,
@@ -2463,6 +2897,8 @@ async fn run_daemon(
                 warn!("Warning: {}", message);
                 eprintln!("Warning: {}", message);
             }
+            // Timed unlocks drop their keys when they run out (NODE-6)
+            WalletDb::start_auto_lock(w);
             w.set_vault_mode(config.vault);
             // Before the wallet catches up with the chain, as divid loads
             // them with the wallet (init.cpp:1201, :1242)
@@ -2488,52 +2924,23 @@ async fn run_daemon(
             // -walletnotify, before the wallet catches up with the chain
             // (init.cpp:1199, before the rescan at :1242)
             if let Some(cmd) = config.walletnotify.clone() {
-                w.set_tx_listener(Arc::new(move |txid| run_notify(&cmd, &txid.to_string())));
+                w.set_tx_listener(Arc::new(move |txid| {
+                    run_notify("walletnotify", &cmd, &txid.to_string())
+                }));
             }
         }
 
         // Register unified block-connected callback (mempool cleanup + fee estimation + wallet scan)
         if let Some(ref wallet_arc) = wallet {
-            let wallet_for_scan = Arc::clone(wallet_arc);
             let block_sync = node.block_sync();
-            let mempool_for_callback = node.mempool().clone();
-            let fee_estimator_for_callback = node.fee_estimator().clone();
-            let tx_relay_for_callback = node.tx_relay().clone();
-            let chain_for_scan = node.chain().clone();
-            block_sync.set_block_connected_callback(Arc::new(move |block, height| {
-                let block_hash = compute_block_hash(&block.header);
-
-                // 1. Bring the wallet up to the active tip (adds new UTXOs, removes spent
-                // ones). The block handed in may be one of several connected by a reorg,
-                // or a side-chain block, so scan the active chain itself, in order.
-                // This runs before the mempool cleanup below so the wallet's mempool
-                // entries for this block are replaced by confirmed records in one step;
-                // otherwise a send would briefly show its inputs as unspent again.
-                sync_wallet_to_tip(&wallet_for_scan, &chain_for_scan);
-
-                // 2. Calculate fees from mempool entries and clean mempool
-                let total_fees = mempool_block_connected(
-                    &mempool_for_callback,
-                    &chain_for_scan,
-                    |txid| tx_relay_for_callback.mark_seen(txid),
-                    &fee_estimator_for_callback,
-                    block,
-                    height,
-                );
-
-                // 3. Persist dirty wallet changes to database (incremental, not full rewrite)
-                if let Err(e) = wallet_for_scan.save_incremental() {
-                    error!("Failed to save wallet after block {}: {}", height, e);
-                }
-
-                debug!(
-                    "Block {} at height {} processed (fees: {}, mempool cleaned, wallet scanned)",
-                    block_hash,
-                    height,
-                    total_fees.as_sat()
-                );
-            }));
-            info!("Unified block callback registered (mempool + fees + wallet)");
+            block_sync.set_block_connected_callback(wallet_block_callback(
+                Arc::clone(wallet_arc),
+                node.mempool().clone(),
+                node.fee_estimator().clone(),
+                node.tx_relay().clone(),
+                node.chain().clone(),
+            ));
+            debug!("Unified block callback registered (mempool + fees + wallet)");
 
             // Mirror wallet-relevant mempool transactions into the wallet so
             // unconfirmed sends and receives show up immediately (0 confirmations).
@@ -2543,9 +2950,9 @@ async fn run_daemon(
                 let wallet_for_added = Arc::clone(wallet_arc);
                 node.mempool()
                     .add_added_listener(Arc::new(move |tx: &Transaction| {
-                        if wallet_for_added.add_mempool_tx(tx) {
-                            info!("Wallet sees unconfirmed tx {}", tx.txid());
-                        }
+                        // No log line: its time beside the relay lines would
+                        // pick out the wallet's own transactions in debug.log
+                        wallet_for_added.add_mempool_tx(tx);
                     }));
                 let wallet_for_removed = Arc::clone(wallet_arc);
                 node.mempool()
@@ -2589,7 +2996,7 @@ async fn run_daemon(
                     }
                 }));
             }
-            info!("Wallet reorg callback registered");
+            debug!("Wallet reorg callback registered");
 
             // Catch-up scan: process blocks between last_scan_height and current chain tip.
             // Block notifications may already be arriving; they share the wallet's scan
@@ -2702,7 +3109,7 @@ async fn run_daemon(
                 } else {
                     divi_primitives::clock::system_now
                 };
-                tokio::spawn(async move {
+                tasks::spawn_supervised("wallet-backup", async move {
                     let Some(root) = backup_root else { return };
                     const DAY: i64 = 24 * 3600;
                     let mut since = clock();
@@ -2713,7 +3120,7 @@ async fn run_daemon(
                         }
                         let wallet = Arc::clone(&wallet_for_backup);
                         let root = root.clone();
-                        let made = tokio::task::spawn_blocking(move || {
+                        let made = tasks::spawn_blocking("wallet-backup", move || {
                             divi_wallet::backup::monthly_backup(&wallet, &root, keep)
                         })
                         .await;
@@ -2766,7 +3173,7 @@ async fn run_daemon(
         let chain_for_prune = node.chain().clone();
         let wallet_for_prune = wallet.clone();
         info!("Block-expiry pruning enabled: expire={:?}", expire);
-        tokio::spawn(async move {
+        tasks::spawn_supervised("block-expiry", async move {
             loop {
                 let floor = wallet_for_prune.as_ref().map(|w| w.last_scan_height());
                 let now = std::time::SystemTime::now()
@@ -2774,9 +3181,10 @@ async fn run_daemon(
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
                 let chain = chain_for_prune.clone();
-                let res =
-                    tokio::task::spawn_blocking(move || chain.prune_expired(expire, floor, now))
-                        .await;
+                let res = tasks::spawn_blocking("block-expiry", move || {
+                    chain.prune_expired(expire, floor, now)
+                })
+                .await;
                 match res {
                     Ok(Ok(0)) => {}
                     Ok(Ok(n)) => info!(
@@ -2797,7 +3205,11 @@ async fn run_daemon(
     // the masternode's settings, then locks the collaterals masternode.conf
     // names (-mnconflock, default on), all before staking starts in step 11
     // (init.cpp:1594-1598, MasternodeModule.cpp:210-240, :454-466)
-    let mn_entries = mn_options.read_conf().map_err(|e| anyhow::anyhow!(e))?;
+    // masternode.conf is a config file (R3: 3); -masternode and the options
+    // it checks are option values (R3: 2)
+    let mn_entries = mn_options
+        .read_conf()
+        .map_err(|e| Coded::error(exit_code::CONFIG, anyhow::anyhow!(e)))?;
     let mn_network = match config.network.network_type {
         NetworkType::Mainnet => WalletNetwork::Mainnet,
         NetworkType::Testnet => WalletNetwork::Testnet,
@@ -2805,12 +3217,13 @@ async fn run_daemon(
     };
     mn_options
         .check_start(&mn_entries, config.index.txindex, mn_network)
-        .map_err(|e| anyhow::anyhow!(e))?;
+        .map_err(|e| Coded::error(exit_code::USAGE, anyhow::anyhow!(e)))?;
     if let (Some(w), true) = (wallet.as_ref(), mn_options.lock) {
         core_files::lock_masternode_collateral(w, &mn_options.conf_path);
     }
 
     // Start staker if wallet is available
+    runs_log::phase("staking");
     let staker = if let Some(ref wallet_opt) = wallet {
         let wallet_arc = wallet_opt.clone();
         let mempool = node.mempool().clone();
@@ -2837,42 +3250,16 @@ async fn run_daemon(
         // so that self-accepted staked blocks trigger wallet scanning, mempool
         // cleanup, and fee estimation without waiting for the P2P round-trip.
         {
-            let wallet_for_staker = Arc::clone(&wallet_arc);
-            let mempool_for_staker = node.mempool().clone();
-            let fee_estimator_for_staker = node.fee_estimator().clone();
-            let tx_relay_for_staker = node.tx_relay().clone();
-            let chain_for_staker_scan = node.chain().clone();
-            staker.set_block_connected_callback(Arc::new(move |block, height| {
-                let block_hash = compute_block_hash(&block.header);
-
-                // 1. Bring the wallet up to the active tip, before the mempool cleanup
-                // (see the block-connected callback for why)
-                sync_wallet_to_tip(&wallet_for_staker, &chain_for_staker_scan);
-
-                // 2. Clean the mempool and feed the fee estimator
-                mempool_block_connected(
-                    &mempool_for_staker,
-                    &chain_for_staker_scan,
-                    |txid| tx_relay_for_staker.mark_seen(txid),
-                    &fee_estimator_for_staker,
-                    block,
-                    height,
-                );
-
-                // 3. Persist wallet changes
-                if let Err(e) = wallet_for_staker.save_incremental() {
-                    error!(
-                        "Failed to save wallet after self-accepted block {}: {}",
-                        height, e
-                    );
-                }
-
-                debug!(
-                    "Self-accepted block {} at height {} processed (wallet + mempool + fees)",
-                    block_hash, height
-                );
-            }));
-            info!("Staker block callback registered (for self-accepted blocks)");
+            // The same callback, so an own block writes the lines a peer's
+            // does (A11 "Own blocks log like peer blocks" item 4)
+            staker.set_block_connected_callback(wallet_block_callback(
+                Arc::clone(&wallet_arc),
+                node.mempool().clone(),
+                node.fee_estimator().clone(),
+                node.tx_relay().clone(),
+                node.chain().clone(),
+            ));
+            debug!("Staker block callback registered (for self-accepted blocks)");
         }
 
         // Start the staking loop unless disabled (-staking=0)
@@ -2894,6 +3281,7 @@ async fn run_daemon(
     // while RPC answers, as Divi Core's (init.cpp:686-728, :1580, :1639)
     node.release_import();
 
+    runs_log::phase("rpc");
     // Start RPC server. RPC always requires authentication: without an
     // rpcpassword a random cookie is written to <datadir>/.cookie
     // (mode 0600) for local clients; `_rpc_cookie` removes it when we return.
@@ -2902,7 +3290,8 @@ async fn run_daemon(
         config.rpc.password.as_deref(),
         &config.data_dir,
     )
-    .with_context(|| format!("Failed to write RPC cookie in {:?}", config.data_dir))?;
+    .with_context(|| format!("Failed to write RPC cookie in {:?}", config.data_dir))
+    .or_exit(exit_code::DATADIR)?;
     match &_rpc_cookie {
         Some(cookie) => {
             if config.rpc.username.is_some() || config.rpc.password.is_some() {
@@ -2913,12 +3302,6 @@ async fn run_daemon(
         None => info!("RPC authentication: rpcuser/rpcpassword"),
     }
     let rpc_config = RpcConfig {
-        allowed: config
-            .rpc
-            .allowed_ips
-            .iter()
-            .filter_map(|a| divi_rpc::Subnet::parse(a))
-            .collect(),
         bind_address: config.rpc.socket_addr(),
         also_bind: config.rpc.also_listen.clone(),
         username: Some(rpc_user),
@@ -2926,9 +3309,43 @@ async fn run_daemon(
         keep_alive: config.rpc.keep_alive,
         rest: config.rpc.rest,
         threads: config.rpc.threads,
+        // -rpcallowip as Divi Core's CSubNet reads it, checked by build_config
+        allowed: config
+            .rpc
+            .allow_ips
+            .iter()
+            .filter_map(|a| divi_rpc::Subnet::parse(a))
+            .collect(),
+        access: divi_rpc::AccessConfig {
+            allow_ips: Vec::new(),
+            ..config.rpc.access()
+        },
+        max_request_size: config.rpc.max_request_size,
     };
+    // Fail at startup, not on the first request, on a bad rpcauth/rpcwhitelist
+    // entry or a non-loopback bind without rpcallowip.
+    divi_rpc::rpc_access(&rpc_config)
+        .map_err(anyhow::Error::from)
+        .and_then(|a| {
+            std::iter::once(rpc_config.bind_address)
+                .chain(rpc_config.also_bind.iter().copied())
+                .try_for_each(|addr| a.check_bind(addr))
+                .map_err(|e| anyhow::anyhow!(e))
+        })
+        .context("Invalid RPC configuration")
+        .or_exit(exit_code::USAGE)?;
 
     info!("Starting RPC server on {}...", rpc_config.bind_address);
+    // Start-up is done: say so, or a slow start and a running node look alike
+    runs_log::phase("running");
+    // From here a slow disk holds the writer thread, not the node (A8)
+    log_delivery::start_writer();
+    tasks::start_test_panics(config.network.network_type == NetworkType::Regtest);
+    #[cfg(unix)]
+    crash::start_test_crash(config.network.network_type == NetworkType::Regtest);
+    if !config.log.print_to_console {
+        console!("IronDivi is running (chain height {}).", chain.height());
+    }
 
     // Run RPC server with shutdown handling
     let mut shutdown_rx = shutdown_rx;
@@ -2939,8 +3356,9 @@ async fn run_daemon(
     // RPC `stop` takes the same path as SIGTERM. The short delay lets the
     // "DIVI server stopping" reply reach the client before the server is dropped.
     let rpc_stop: divi_rpc::ShutdownCallback = Arc::new(move || {
+        runs_log::stop_requested("rpc");
         let tx = shutdown_tx.clone();
-        tokio::spawn(async move {
+        tasks::spawn_supervised("rpc-stop", async move {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             let _ = tx.send(());
         });
@@ -2970,6 +3388,8 @@ async fn run_daemon(
         let peers_for_staking_status = Arc::clone(&peer_manager);
         let split_threshold_divi = config.staking.split_threshold as f64 / 100_000_000.0;
         let mempool_for_rpc = node.mempool().clone();
+        let mempool_for_electrum = node.mempool().clone();
+        let chain_for_electrum = Arc::clone(&chain);
         let reorg_hook_for_rpc = mempool_reorg_hook(&node, Some(Arc::clone(&wallet)));
         let spork_for_rpc = node.spork_manager().clone();
         let history_for_rpc = node.history_fetcher();
@@ -2988,6 +3408,7 @@ async fn run_daemon(
             max_file_size: config.log.max_file_size,
             max_files: config.log.max_files,
             debug: config.log.debug,
+            levels: config.log.levels.clone(),
             print_to_console: config.log.print_to_console,
         };
 
@@ -2998,6 +3419,17 @@ async fn run_daemon(
                 wallet,
                 peer_manager,
                 move |rpc_server| {
+                    if let Some(webui) = webui {
+                        webui.spawn(Arc::clone(rpc_server), webui_shutdown);
+                    }
+                    if let Some(electrum) = electrum {
+                        electrum.spawn(
+                            chain_for_electrum,
+                            mempool_for_electrum,
+                            Arc::clone(rpc_server),
+                            electrum_shutdown,
+                        );
+                    }
                     rpc_server.set_shutdown_callback(rpc_stop);
                     rpc_server.set_mempool(mempool_for_rpc);
                     rpc_server.set_reorg_hook(reorg_hook_for_rpc);
@@ -3005,6 +3437,7 @@ async fn run_daemon(
                     rpc_server.set_block_sync(block_sync_for_rpc);
                     rpc_server.set_spork_manager(spork_for_rpc);
                     rpc_server.set_log_config(log_config_for_rpc);
+                    rpc_server.set_log_levels_callback(Arc::new(set_log_levels));
 
                     // The masternode RPCs read the node's masternode list
                     rpc_server.set_masternode_manager(mn_for_rpc);
@@ -3039,19 +3472,29 @@ async fn run_daemon(
                         // Announce to peers (async, fire-and-forget)
                         let relay = tx_relay_for_submit.clone();
                         let txid_copy = txid;
-                        tokio::spawn(async move {
+                        tasks::spawn_supervised("tx-announce", async move {
                             relay.announce_tx(txid_copy).await;
                         });
 
-                        info!("Transaction {} submitted to mempool and announced to peers", txid);
                         Ok(txid)
                     }));
-                    info!("Transaction submission callback configured");
+                    debug!("Transaction submission callback configured");
 
                     if let Some(ref staker_arc) = staker_ref {
                         let staker_for_status = Arc::clone(staker_arc);
                         let staker_for_control = Arc::clone(staker_arc);
                         let wallet_for_status = Arc::clone(&wallet_for_staking_status);
+                        let staker_for_health = Arc::clone(staker_arc);
+                        let wallet_for_health = Arc::clone(&wallet_for_staking_status);
+                        health::set_staking(Box::new(move || {
+                            let status = staker_for_health.get_status();
+                            health::Staking {
+                                enabled: status.enabled,
+                                mintable_coins: status.mintable_coins,
+                                wallet_locked: wallet_for_health.is_locked(),
+                                last_stake_time: status.last_stake_time,
+                            }
+                        }));
                         let chain_for_status = Arc::clone(&chain_for_staking_status);
                         let peers_for_status = Arc::clone(&peers_for_staking_status);
                         let sync_for_status = Arc::clone(&mn_sync_for_rpc);
@@ -3073,7 +3516,7 @@ async fn run_daemon(
                         rpc_server.staking().set_staking_control(Arc::new(move |enable| {
                             if enable {
                                 let staker = Arc::clone(&staker_for_control);
-                                tokio::spawn(async move {
+                                tasks::spawn_critical("staker", async move {
                                     staker.start().await;
                                 });
                             } else {
@@ -3136,14 +3579,14 @@ async fn run_daemon(
                                     })
                             }));
 
-                        info!("Staking RPC callbacks registered");
+                        debug!("Staking RPC callbacks registered");
                     }
                 }
             ) => {
                 match result {
                     Err(e) => {
                         error!("RPC server error: {}", e);
-                        rpc_error = Some(e.to_string());
+                        rpc_error = Some((e.to_string(), rpc_exit_code(&e)));
                     }
                     // The server ends after an RPC stop, whose signal follows
                     Ok(()) => {
@@ -3158,6 +3601,8 @@ async fn run_daemon(
         }
     } else {
         let mempool_for_rpc = node.mempool().clone();
+        let mempool_for_electrum = node.mempool().clone();
+        let chain_for_electrum = Arc::clone(&chain);
         let reorg_hook_for_rpc = mempool_reorg_hook(&node, None);
         let spork_for_rpc = node.spork_manager().clone();
         let history_for_rpc = node.history_fetcher();
@@ -3174,6 +3619,7 @@ async fn run_daemon(
             max_file_size: config.log.max_file_size,
             max_files: config.log.max_files,
             debug: config.log.debug,
+            levels: config.log.levels.clone(),
             print_to_console: config.log.print_to_console,
         };
 
@@ -3183,6 +3629,17 @@ async fn run_daemon(
                 chain,
                 peer_manager,
                 move |rpc_server| {
+                    if let Some(webui) = webui {
+                        webui.spawn(Arc::clone(rpc_server), webui_shutdown);
+                    }
+                    if let Some(electrum) = electrum {
+                        electrum.spawn(
+                            chain_for_electrum,
+                            mempool_for_electrum,
+                            Arc::clone(rpc_server),
+                            electrum_shutdown,
+                        );
+                    }
                     rpc_server.set_shutdown_callback(rpc_stop);
                     rpc_server.set_mempool(mempool_for_rpc);
                     rpc_server.set_reorg_hook(reorg_hook_for_rpc);
@@ -3190,6 +3647,7 @@ async fn run_daemon(
                     rpc_server.set_block_sync(block_sync_for_rpc);
                     rpc_server.set_spork_manager(spork_for_rpc);
                     rpc_server.set_log_config(log_config_for_rpc);
+                    rpc_server.set_log_levels_callback(Arc::new(set_log_levels));
 
                     // The masternode RPCs read the node's masternode list
                     rpc_server.set_masternode_manager(mn_for_rpc);
@@ -3213,7 +3671,7 @@ async fn run_daemon(
                 match result {
                     Err(e) => {
                         error!("RPC server error: {}", e);
-                        rpc_error = Some(e.to_string());
+                        rpc_error = Some((e.to_string(), rpc_exit_code(&e)));
                     }
                     // The server ends after an RPC stop, whose signal follows
                     Ok(()) => {
@@ -3235,12 +3693,15 @@ async fn run_daemon(
     // (init.cpp:372-373, :381, :386): no block is staked while they are written
     if let Some(staker) = staker.clone() {
         let started = std::time::Instant::now();
-        let _ = tokio::task::spawn_blocking(move || staker.stop_and_wait()).await;
+        let _ = tasks::spawn_blocking("staker-stop", move || staker.stop_and_wait()).await;
         shutdown_stage("staking stopped", started);
     }
 
     // Stop the node
     info!("Stopping node...");
+    if tasks::test_panic(config.network.network_type == NetworkType::Regtest, "main") {
+        panic!("test panic: this text stays in crash.log");
+    }
     let started = std::time::Instant::now();
     node.stop().await.with_context(|| "Failed to stop node")?;
     shutdown_stage("node stopped", started);
@@ -3267,27 +3728,183 @@ async fn run_daemon(
 
     info!("Node stopped");
     match rpc_error {
-        Some(e) => Err(anyhow::anyhow!("RPC server error: {}", e)),
+        Some((e, code)) => Err(Coded::error(
+            code,
+            anyhow::anyhow!("RPC server error: {}", e),
+        )),
         None if stopped_during_start => Err(anyhow::Error::new(QuietExit)),
         None => Ok(()),
     }
 }
 
+/// The exit code for the RPC server's error: its bind refused (7), its
+/// address refused by the access settings (2, an InvalidInput io error from
+/// serve), else as any other error
+fn rpc_exit_code(e: &(dyn StdError + 'static)) -> i32 {
+    let all = causes(e);
+    if all.iter().any(|e| is_disk_error(*e)) {
+        return exit_code::DISK;
+    }
+    for err in all {
+        match io_kind(err) {
+            Some(
+                std::io::ErrorKind::AddrInUse
+                | std::io::ErrorKind::AddrNotAvailable
+                | std::io::ErrorKind::PermissionDenied,
+            ) => return exit_code::BIND,
+            Some(std::io::ErrorKind::InvalidInput) => return exit_code::USAGE,
+            _ => {}
+        }
+    }
+    error_exit_code(e)
+}
+
+/// `-electrum`, `-electrumtls`, `-electrumws` and `-electrumwss`: the Electrum server's settings; None when
+/// it is off
+fn electrum_config(
+    args: &Args,
+    config: &NodeConfig,
+) -> Result<Option<divi_electrum::ElectrumConfig>> {
+    let s = &args.settings;
+    let addr = |name: &str| -> Result<Option<SocketAddr>> {
+        match s.get(name).map(str::trim) {
+            None | Some("") => Ok(None),
+            Some(a) => a
+                .parse()
+                .map(Some)
+                .with_context(|| format!("Invalid -{name} (an address:port)")),
+        }
+    };
+    let tcp = addr("electrum")?;
+    let ws = addr("electrumws")?;
+    // -electrumtls and -electrumwss share -electrumcert and -electrumkey
+    let tls_for = |flag: &str| -> Result<Option<divi_electrum::TlsConfig>> {
+        let Some(bind) = addr(flag)? else {
+            return Ok(None);
+        };
+        let file = |name: &str| -> Result<PathBuf> {
+            match s.get(name).map(str::trim) {
+                Some(p) if !p.is_empty() => Ok(config.data_dir.join(p)),
+                _ => anyhow::bail!("-{flag} needs -{name}=<file.pem>"),
+            }
+        };
+        Ok(Some(divi_electrum::TlsConfig {
+            bind,
+            cert: file("electrumcert")?,
+            key: file("electrumkey")?,
+        }))
+    };
+    let tls = tls_for("electrumtls")?;
+    let wss = tls_for("electrumwss")?;
+    if tcp.is_none() && tls.is_none() && ws.is_none() && wss.is_none() {
+        return Ok(None);
+    }
+    if !config.index.txindex || !config.index.addressindex {
+        anyhow::bail!("-electrum needs -txindex=1 and -addressindex=1");
+    }
+    if !config.rpc.enabled {
+        anyhow::bail!(
+            "-electrum calls the daemon through its RPC server; it cannot run with -server=0"
+        );
+    }
+    Ok(Some(divi_electrum::ElectrumConfig {
+        tcp,
+        tls,
+        ws,
+        wss,
+        banner: format!("IronDivi {} Electrum server", env!("CARGO_PKG_VERSION")),
+    }))
+}
+
+/// `-webui`: the web interface's settings; None when it is off
+fn webui_config(args: &Args, config: &NodeConfig) -> Result<Option<divi_webui::WebUiConfig>> {
+    let s = &args.settings;
+    if !s.get_bool("webui", false) {
+        return Ok(None);
+    }
+    if !config.rpc.enabled {
+        anyhow::bail!(
+            "-webui calls the daemon through its RPC server; it cannot run with -server=0"
+        );
+    }
+    let private = config.network.chain_mode == ChainMode::PrivateDivi;
+    let net = config.network.network_type;
+    let port = match s.get("webuiport") {
+        Some(p) => p
+            .trim()
+            .parse::<u16>()
+            .ok()
+            .filter(|p| *p != 0)
+            .with_context(|| "Invalid -webuiport (a port from 1 to 65535)")?,
+        None => divi_webui::default_port(
+            private,
+            net == NetworkType::Testnet,
+            net == NetworkType::Regtest,
+        ),
+    };
+    let ip: std::net::IpAddr = match s.get("webuibind").map(str::trim) {
+        Some(b) if !b.is_empty() => b
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse()
+            .with_context(|| format!("Invalid -webuibind: '{b}' (an IP address)"))?,
+        _ => std::net::Ipv4Addr::LOCALHOST.into(),
+    };
+    let cli = args
+        .cli
+        .keys()
+        .map(|k| {
+            let all = args.cli.get_multi(k);
+            let values = if all.is_empty() {
+                args.cli.get(k).map(str::to_string).into_iter().collect()
+            } else {
+                all.to_vec()
+            };
+            (k.clone(), values)
+        })
+        .collect();
+    Ok(Some(divi_webui::WebUiConfig {
+        bind: SocketAddr::new(ip, port),
+        allow_remote: s.get_bool("webuiallowremote", false),
+        allow_hosts: s.get_multi("webuiallowhost").to_vec(),
+        data_dir: config.data_dir.clone(),
+        conf_path: config_path(args),
+        network: match net {
+            NetworkType::Mainnet => "main",
+            NetworkType::Testnet => "test",
+            NetworkType::Regtest => "regtest",
+        }
+        .into(),
+        chain_mode: if private { "privatedivi" } else { "divi" }.into(),
+        cli,
+    }))
+}
+
 /// Run a notify command as divid's runCommand: through the shell, `%s`
 /// replaced, not waited for
-fn run_notify(cmd: &str, value: &str) {
+fn run_notify(kind: &'static str, cmd: &str, value: &str) {
     let cmd = cmd.replace("%s", value);
-    std::thread::spawn(move || {
-        match std::process::Command::new("sh")
+    let started = tasks::thread("notify", tasks::Kind::Supervised, move || {
+        let ran = std::process::Command::new("sh")
             .arg("-c")
             .arg(&cmd)
-            .status()
-        {
-            Ok(status) if !status.success() => warn!("runCommand error: {} ({})", cmd, status),
+            .status();
+        match ran {
+            Ok(status) if !status.success() => warn!("{}", notify_failed(kind, status)),
             Ok(_) => {}
-            Err(e) => warn!("runCommand error: {} ({})", cmd, e),
+            Err(e) => warn!("{}", notify_failed(kind, e.kind())),
         }
     });
+    if let Err(e) = started {
+        warn!("runCommand not started: {} ({})", kind, e.kind());
+    }
+}
+
+/// A failed notify command's line: its kind and the exit status or the
+/// error kind, never the command or the txid or hash it was given (A11
+/// "Notify commands"), so an own transaction's line is a peer block's
+fn notify_failed(kind: &str, why: impl std::fmt::Display) -> String {
+    format!("runCommand error: {} ({})", kind, why)
 }
 
 /// -alertnotify: run the command with the warning's text, kept to Divi Core's
@@ -3296,7 +3913,7 @@ fn alert_notify(cmd: &str, message: &str) {
     const SAFE: &str =
         "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ01234567890 .,;_-/:?@()";
     let safe: String = message.chars().filter(|c| SAFE.contains(*c)).collect();
-    run_notify(cmd, &format!("'{safe}'"));
+    run_notify("alertnotify", cmd, &format!("'{safe}'"));
 }
 
 /// Divi Core's warning when most of the last 100 blocks are of a newer
@@ -3345,7 +3962,7 @@ fn spawn_block_notify(chain: Arc<divi_storage::Chain>, cmd: String) {
             .upgrade()
             .is_some_and(|c| !c.is_initial_block_download())
         {
-            run_notify(&cmd, &tip.hash.to_string());
+            run_notify("blocknotify", &cmd, &tip.hash.to_string());
         }
     }));
 }
@@ -3489,6 +4106,51 @@ fn mempool_reorg_hook(
 /// is. Blocks a reorganisation connected below the new tip are covered by
 /// `update_mempool_after_reorg`. Returns the fees of the block's transactions
 /// that were in the mempool.
+/// The block-connected callback of a node with a wallet. BlockSync runs it
+/// for peer blocks and the staker for own staked blocks, so both write the
+/// same lines (A11 "Own blocks log like peer blocks" item 4).
+fn wallet_block_callback(
+    wallet: Arc<WalletDb>,
+    mempool: Arc<divi_node::Mempool>,
+    fee_estimator: Arc<divi_node::FeeEstimator>,
+    tx_relay: Arc<divi_network::TxRelay>,
+    chain: Arc<divi_storage::Chain>,
+) -> divi_network::BlockConnectedCallback {
+    Arc::new(move |block, height| {
+        let block_hash = compute_block_hash(&block.header);
+
+        // 1. Bring the wallet up to the active tip (adds new UTXOs, removes spent
+        // ones). The block handed in may be one of several connected by a reorg,
+        // or a side-chain block, so scan the active chain itself, in order.
+        // This runs before the mempool cleanup below so the wallet's mempool
+        // entries for this block are replaced by confirmed records in one step;
+        // otherwise a send would briefly show its inputs as unspent again.
+        sync_wallet_to_tip(&wallet, &chain);
+
+        // 2. Calculate fees from mempool entries and clean mempool
+        let total_fees = mempool_block_connected(
+            &mempool,
+            &chain,
+            |txid| tx_relay.mark_seen(txid),
+            &fee_estimator,
+            block,
+            height,
+        );
+
+        // 3. Persist dirty wallet changes to database (incremental, not full rewrite)
+        if let Err(e) = wallet.save_incremental() {
+            error!("Failed to save wallet after block {}: {}", height, e);
+        }
+
+        debug!(
+            "Block {} at height {} processed (fees: {}, mempool cleaned, wallet scanned)",
+            block_hash,
+            height,
+            total_fees.as_sat()
+        );
+    })
+}
+
 fn mempool_block_connected(
     mempool: &divi_node::Mempool,
     chain: &divi_storage::Chain,
@@ -3553,7 +4215,7 @@ fn snapshot_command(config: &NodeConfig, args: &Args) -> Result<()> {
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         let sig = snapshot_sig::sign_root(&m, &key)?;
         snapshot_sig::write_sig(dir, &sig)?;
-        println!(
+        console_out!(
             "signed root_hash {} ({}) as {}\nwrote {}",
             m.root_hash,
             m.network,
@@ -3565,9 +4227,12 @@ fn snapshot_command(config: &NodeConfig, args: &Args) -> Result<()> {
     if let Some(dir) = &args.verify_snapshot {
         let signer = args.snapshot_signer.as_deref().unwrap_or_default();
         let m = snapshot_sig::verify_dir(dir, signer)?;
-        println!(
+        console_out!(
             "OK: root_hash {} ({}, tip {}) is signed by {}",
-            m.root_hash, m.network, m.tip_height, signer
+            m.root_hash,
+            m.network,
+            m.tip_height,
+            signer
         );
         return Ok(());
     }
@@ -3578,7 +4243,7 @@ fn snapshot_command(config: &NodeConfig, args: &Args) -> Result<()> {
             storage_params(config),
         )
         .context("snapshot export failed")?;
-        println!(
+        console_out!(
             "snapshot written to {:?}\nnetwork {} tip {} {}\nroot_hash {}\nstate_hash {}\n\
              Other nodes import it only once a release lists this state. If this node validated \
              the chain from genesis, the entry for divi_storage::snapshot::KNOWN_STATES is:\n  \
@@ -3599,9 +4264,10 @@ fn snapshot_command(config: &NodeConfig, args: &Args) -> Result<()> {
     } else if let Some(dir) = &args.import_snapshot {
         if let Some(signer) = &args.snapshot_signer {
             let signed = snapshot_sig::verify_dir(dir, signer)?;
-            println!(
+            console_out!(
                 "signature OK: root_hash {} signed by {}",
-                signed.root_hash, signer
+                signed.root_hash,
+                signer
             );
         }
         let m = divi_storage::snapshot::import_snapshot(
@@ -3611,7 +4277,7 @@ fn snapshot_command(config: &NodeConfig, args: &Args) -> Result<()> {
             args.snapshot_root.as_deref(),
         )
         .context("snapshot import failed")?;
-        println!(
+        console_out!(
             "snapshot installed at {:?}\nnetwork {} tip {} {}\nroot_hash {}\nthe chain state at the tip matches the one this release knows; history below it was not validated by this node\nstart the node with --expire so it stays thin; blocks after the tip are fully validated",
             config.chainstate_path(), m.network, m.tip_height, m.tip_hash, m.root_hash
         );
@@ -3669,8 +4335,14 @@ async fn export_chain_command(config: NodeConfig, args: &Args) -> Result<()> {
 }
 
 /// CreatePidFile: the process id and a newline (util.cpp:122-128)
+/// All at once and private, so a reader never sees a partial pid (NODE-23)
 fn write_pid_file(pid_file: &std::path::Path) {
-    let _ = std::fs::write(pid_file, format!("{}\n", std::process::id()));
+    if let Err(e) = private_files::write_private_atomic(
+        pid_file,
+        format!("{}\n", std::process::id()).as_bytes(),
+    ) {
+        warn!("Failed to write PID file {:?}: {}", pid_file, e);
+    }
 }
 
 /// -pid, default divid.pid, relative to the data directory (util.cpp:115-119)
@@ -3690,49 +4362,119 @@ fn remove_pid_file(pid_file: &std::path::Path) {
     }
 }
 
-fn main() -> Result<()> {
+#[cfg(unix)]
+thread_local! {
+    /// A runtime thread's entry in the crash handler's table (A5)
+    static CRASH_ENTRY: std::cell::RefCell<Option<crash::Entered>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// A runtime thread starts: enter it in the crash handler's table
+fn crash_enter() {
+    #[cfg(unix)]
+    {
+        let name = std::thread::current().name().unwrap_or("tokio").to_string();
+        let entered = crash::enter_thread(name.as_str());
+        let _ = CRASH_ENTRY.try_with(|e| *e.borrow_mut() = Some(entered));
+    }
+}
+
+/// A runtime thread ends: its entry and alternate stack go
+fn crash_leave() {
+    #[cfg(unix)]
+    let _ = CRASH_ENTRY.try_with(|e| e.borrow_mut().take());
+}
+
+fn main() {
+    // Every panic is recorded from here on (A4)
+    // Fatal signals to crash.log, before anything else can fault (A5)
+    #[cfg(unix)]
+    crash::install();
+    tasks::install_hook();
+    // A closed stdin, stdout or stderr is reopened on /dev/null before any
+    // file is opened: the next open() would take that number, and console
+    // lines would be written into a database or the wallet (D2)
+    #[cfg(unix)]
+    for fd in 0..=2 {
+        if unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1 {
+            let null = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDWR) };
+            if null >= 0 && null != fd {
+                unsafe {
+                    libc::dup2(null, fd);
+                    libc::close(null);
+                }
+            }
+        }
+    }
+    // Before the -daemon forks hide the parent and the terminal (A1)
+    runs_log::note_launch();
+    // The working directory, before -daemon moves it (A7)
+    startup::capture();
+    // Every signal is recorded from here on (A3); fds 0-2 are open, so the
+    // handler's pipe does not take one. Its thread starts after the forks.
+    #[cfg(unix)]
+    signals::install();
+    // Before anything is written: the datadir holds the wallet and the RPC cookie (NODE-3)
+    private_files::restrict_umask();
+    // A core dump would hold unlocked wallet keys (NODE-10)
+    if let Err(e) = private_files::disable_core_dumps() {
+        console!("Warning: could not disable core dumps: {}", e);
+    }
+
     // Parse CLI arguments, completed from the config file where they are unset
     let args = match Args::try_parse_from(std::env::args()) {
         Ok(args) => args,
-        Err(e) => {
-            eprintln!("Error: {:#}", e);
-            std::process::exit(1);
-        }
+        Err(e) => die!(exit_code::USAGE, "Error: {:#}", e),
     };
     // divid's AppInit: -?, -help and -version print and exit 1 (divid.cpp)
     if args.help || args.version {
-        print!(
-            "IronDivi Daemon version v{}\n{}",
-            env!("CARGO_PKG_VERSION"),
-            if args.help { USAGE } else { "" }
-        );
-        std::process::exit(1);
+        // Through console_out!: print! panics on EPIPE, and the exit code
+        // would be 101 (D2). Byte for byte what print! wrote.
+        if args.help {
+            console_out!(
+                "IronDivi Daemon version v{}\n{}",
+                env!("CARGO_PKG_VERSION"),
+                USAGE.strip_suffix('\n').unwrap_or(USAGE)
+            );
+        } else {
+            console_out!("IronDivi Daemon version v{}", env!("CARGO_PKG_VERSION"));
+        }
+        die!(exit_code::HELP);
     }
     // ... a -datadir that is not a directory is refused (divid.cpp)
     if let Some(dir) = &args.datadir {
         if !dir.is_dir() {
-            eprintln!(
+            die!(
+                exit_code::DATADIR,
                 "Error: Specified data directory \"{}\" does not exist.",
                 dir.display()
             );
-            std::process::exit(1);
         }
     }
     let args = match resolve_args(args) {
         Ok(args) => args,
         Err(e) => {
             // divid prints its config file errors under their own heading (divid.cpp:97-98)
+            // The file could not be read: 3, or 9 for a full or read-only disk
+            let code = match exit_code_of(&e) {
+                exit_code::FAILED if e.chain().any(|c| c.is::<std::io::Error>()) => {
+                    exit_code::CONFIG
+                }
+                exit_code::FAILED => exit_code::USAGE,
+                code => code,
+            };
             match e.downcast_ref::<ConfigFileError>() {
-                Some(c) => eprintln!("Error reading configuration file: {}", c),
-                None => eprintln!("Error: {:#}", e),
+                Some(c) => die!(code, "Error reading configuration file: {}", c),
+                None => die!(code, "Error: {:#}", e),
             }
-            std::process::exit(1);
         }
     };
     // ... and so are -testnet and -regtest together
     if args.testnet && args.regtest {
-        eprintln!("Error: Invalid combination of -regtest and -testnet.");
-        std::process::exit(1);
+        die!(
+            exit_code::USAGE,
+            "Error: Invalid combination of -regtest and -testnet."
+        );
     }
 
     // divid creates its files 0600 and its directories 0700 (umask 077), or
@@ -3743,10 +4485,10 @@ fn main() -> Result<()> {
         // SAFETY: umask(2) only sets this process's file-creation mask
         unsafe { libc::umask(0o077) };
     } else if !args.disablewallet {
-        eprintln!(
+        die!(
+            exit_code::USAGE,
             "Error: Error: -sysperms is not allowed in combination with enabled wallet functionality"
         );
-        std::process::exit(1);
     }
 
     // Compute data directory early (needed for daemonization and logging)
@@ -3754,8 +4496,7 @@ fn main() -> Result<()> {
     if let Err(e) =
         core_files::refuse_at_start(&data_dir, args.wallet.as_deref(), args.disablewallet)
     {
-        eprintln!("Error: {:#}", e);
-        std::process::exit(1);
+        die!(exit_code::DATADIR, "Error: {:#}", e);
     }
 
     // -daemon as Divi Core's AppInit does it, before the tokio runtime: the
@@ -3766,19 +4507,21 @@ fn main() -> Result<()> {
         println!("DIVI server starting");
         use std::io::Write as _;
         let _ = std::io::stdout().flush();
+        // No thread may exist before the fork (diag.md §3)
+        runs_log::note_first_fork();
         match unsafe { libc::fork() } {
-            -1 => {
-                eprintln!(
-                    "Error: fork() returned -1 errno {}",
-                    std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
-                );
-                std::process::exit(1);
-            }
-            pid if pid > 0 => std::process::exit(0), // the parent
-            _ => {}                                  // the child goes on
+            -1 => die!(
+                exit_code::DAEMON,
+                "Error: fork() returned -1 errno {}",
+                std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+            ),
+            // The parent exits and writes nothing more
+            pid if pid > 0 => unsafe { libc::_exit(0) },
+            _ => {} // the child goes on
         }
         if unsafe { libc::setsid() } == -1 {
-            eprintln!(
+            die!(
+                exit_code::DAEMON,
                 "Error: setsid() returned -1 errno {}",
                 std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
             );
@@ -3787,7 +4530,40 @@ fn main() -> Result<()> {
 
     #[cfg(not(unix))]
     if args.daemon {
-        eprintln!("Warning: Daemon mode is only supported on Unix systems, running in foreground");
+        console!("Warning: Daemon mode is only supported on Unix systems, running in foreground");
+    }
+
+    // The thread that records signals and acts on them (A3); those received
+    // before now wait in its pipe
+    #[cfg(unix)]
+    signals::start_writer();
+
+    // A credential change would make the process dumpable again, and a pipe core handler
+    // would then store a core holding wallet keys (NODE-10). A plain thread, started after
+    // the forks and before the wallet opens, so a stalled runtime cannot stop it. Its own
+    // thread at the health tick's rate (10 s for the first 10 minutes, then 60 s); health.log
+    // carries the value it read, and a reset is an events.log record.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if let Err(e) = tasks::thread("dumpable-check", tasks::Kind::Supervised, || loop {
+        use std::sync::atomic::Ordering;
+        match private_files::restore_non_dumpable() {
+            Some((was, reset)) => {
+                health::DUMPABLE.store(was, Ordering::Relaxed);
+                health::DUMPABLE_RESETS.fetch_add(1, Ordering::Relaxed);
+                let result = if reset.is_ok() { "ok" } else { "error" };
+                events::event("dumpable-reset", &format!("was={} result={}", was, result));
+                match reset {
+                    Ok(()) => warn!("dumpable restored (was {})", was),
+                    Err(e) => error!("dumpable is {} and could not be reset: {}", was, e),
+                }
+            }
+            None => health::DUMPABLE.store(0, Ordering::Relaxed),
+        }
+        // The maps copy a crash record carries (A5)
+        crash::refresh_maps();
+        std::thread::sleep(health::interval());
+    }) {
+        console!("Warning: could not start the core dump check: {}", e);
     }
 
     // -mocktime: the node's clock from here on, set as divid sets it after
@@ -3805,10 +4581,37 @@ fn main() -> Result<()> {
     // Now enter the tokio runtime (after daemonization)
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
+        // Each runtime thread in the crash handler's table, with its own
+        // alternate stack (A5)
+        .on_thread_start(crash_enter)
+        .on_thread_stop(crash_leave)
         .build()
-        .context("Failed to build tokio runtime")?;
-    let result = runtime.block_on(async_main(args, data_dir));
-    exit_after_stop(runtime, result)
+        .unwrap_or_else(|e| {
+            die!(
+                exit_code::FAILED,
+                "Error: Failed to build tokio runtime: {}",
+                e
+            )
+        });
+    // A panic on this thread would otherwise unwind through the runtime's drop,
+    // which waits with no deadline, and then exit through the C++ destructors,
+    // which join RocksDB's thread pools: the node could hang until the service
+    // manager killed it. The panic message is already written by then.
+    // The only catch_unwind in the node (A4; a test keeps it so)
+    tasks::main_caught();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        runtime.block_on(async_main(args, data_dir))
+    }));
+    match result {
+        Ok(result) => exit_after_stop(runtime, result),
+        Err(_) => {
+            std::mem::forget(runtime);
+            runs_log::exit(101, "Error: the node's main task panicked");
+            error!("Error: the node's main task panicked");
+            flush_log();
+            unsafe { libc::_exit(101) }
+        }
+    }
 }
 
 /// End the process once `async_main` has stopped the node and recorded the
@@ -3821,23 +4624,23 @@ fn main() -> Result<()> {
 /// (init.cpp).
 fn exit_after_stop(runtime: tokio::runtime::Runtime, result: Result<()>) -> ! {
     let started = std::time::Instant::now();
-    let code = match &result {
-        Ok(()) => 0,
-        Err(e) => {
-            // divid's InitError: the line on stderr and in debug.log
-            // (noui.cpp:38-40)
-            eprintln!("Error: {:#}", e);
-            info!("Error: {:#}", e);
-            1
-        }
-    };
     // Let the runtime's threads go without waiting for them
     std::mem::forget(runtime);
     shutdown_stage("exit", started);
-    flush_log();
-    // _exit: no atexit handlers or C++ static destructors either (RocksDB's
-    // thread pools would be joined there)
-    unsafe { libc::_exit(code) }
+    match result {
+        // _exit: no atexit handlers or C++ static destructors either (RocksDB's
+        // thread pools would be joined there)
+        Ok(()) => {
+            // The partial hour's count lines (A11)
+            counts::flush();
+            runs_log::exit(0, "stopped");
+            flush_log();
+            unsafe { libc::_exit(0) }
+        }
+        // In debug.log as well: on a -daemon node the console is that file,
+        // but a foreground node's only record would be a lost terminal (D3)
+        Err(e) => die!(exit_code_of(&e), "Error: {:#}", e),
+    }
 }
 
 async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
@@ -3852,15 +4655,76 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
         log_ips: args.logips,
         timestamps: args.logtimestamps,
         shrink: args.shrinkdebugfile,
+        levels: args.log_levels.spec(),
         // An export only reads the data directory: it logs to the console
         print_to_console: args.printtoconsole || args.export_chain,
     };
 
+    // Wallet values print as per-run pseudonyms unless -logwalletdetail=1
+    // (A11); set before the first line
+    divi_primitives::redact::set_wallet_detail(args.logwalletdetail);
+
     // Initialize logging (writes to debug.log in data_dir by default)
-    init_logging(&log_config, &data_dir);
+    init_logging(&log_config, &args.log_levels, &data_dir);
+    if args.logwalletdetail {
+        warn!(
+            "-logwalletdetail=1: wallet txids, addresses, amounts and labels are written \
+             in clear to the logs of this run; diag treats every file of this run as unredacted"
+        );
+    }
+    if !args.log_levels.unknown.is_empty() {
+        warn!(
+            "Unknown log categories {:?} in -debug/-loglevel (known: {})",
+            args.log_levels.unknown,
+            log_filter::category_names()
+        );
+    }
+    info!("Log levels: {}", args.log_levels.spec());
+
+    // diag/runs.log (A1); not for the snapshot and export commands, which
+    // only read the data directory
+    let one_shot = args.export_snapshot.is_some()
+        || args.import_snapshot.is_some()
+        || args.sign_snapshot.is_some()
+        || args.verify_snapshot.is_some()
+        || args.export_chain;
+    // A stop signal ends a one-shot command at once, as before A3
+    #[cfg(unix)]
+    if one_shot {
+        signals::one_shot();
+    }
+    if !one_shot {
+        let network = if args.regtest {
+            "regtest"
+        } else if args.testnet {
+            "testnet"
+        } else {
+            "main"
+        };
+        let network = format!("{}/{:?}", network, args.chain_mode()).to_lowercase();
+        runs_log::open(&data_dir, &network, cfg!(unix) && args.daemon);
+        tasks::set_data_dir(&data_dir);
+        events::set_data_dir(&data_dir);
+        incidents::set_data_dir(&data_dir);
+        #[cfg(unix)]
+        {
+            crash::open(&data_dir);
+            crash::refresh_maps();
+        }
+        startup::write(
+            &data_dir,
+            &startup::Options {
+                cli: &args.cli,
+                all: &args.settings,
+                known_keys: &[APPLIED, READ_ELSEWHERE, UNSUPPORTED_OPTIONS],
+            },
+        );
+        runs_log::phase("config");
+    }
 
     // Build configuration
-    let mut config = build_config(&args)?;
+    let mut config = build_config(&args).or_exit(exit_code::USAGE)?;
+    let log_config_console = log_config.print_to_console;
     config.log = log_config;
 
     // Print banner
@@ -3869,9 +4733,7 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
 
     // Check for conflicting network options
     if args.testnet && args.regtest {
-        error!("Cannot use both --testnet and --regtest");
-        flush_log();
-        std::process::exit(1);
+        die!(exit_code::USAGE, "Cannot use both --testnet and --regtest");
     }
 
     if args.export_snapshot.is_some()
@@ -3902,57 +4764,36 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
         let _ = abort_tx.send(());
     }));
 
-    // SIGHUP reopens debug.log and the node keeps running, as Divi Core does
-    // (init.cpp:513-516), so a logrotate postrotate line does not stop it
+    // Stop signals (TERM, INT, QUIT) reach the node from here; one received
+    // earlier is delivered now. SIGHUP reopens debug.log and the node keeps
+    // running, as Divi Core does (init.cpp:513-516). See signals.rs (A3).
     #[cfg(unix)]
+    signals::set_stop_sink(shutdown_tx.clone(), !log_config_console);
+    #[cfg(not(unix))]
     {
-        let mut hangup = signal::unix::signal(signal::unix::SignalKind::hangup())
-            .context("Failed to install SIGHUP handler")?;
-        tokio::spawn(async move {
-            while hangup.recv().await.is_some() {
-                REOPEN_LOG.store(true, std::sync::atomic::Ordering::Relaxed);
-                info!("Received SIGHUP, reopening debug.log");
+        let shutdown_tx_clone = shutdown_tx.clone();
+        let console = !log_config_console;
+        tasks::spawn_supervised("ctrl-c", async move {
+            if let Err(e) = signal::ctrl_c().await {
+                error!("Ctrl+C handler failed: {}", e);
+                return;
+            }
+            // The stop goes out before anything is written to the console (D1)
+            let _ = shutdown_tx_clone.send(());
+            runs_log::stop_requested("signal=INT");
+            info!("Received Ctrl+C, initiating shutdown...");
+            if console {
+                console!("Received Ctrl+C, stopping...");
             }
         });
     }
-
-    // SIGTERM and SIGINT stop the node. They are registered here, before the
-    // pid file is written, as Divi Core sets its handlers (init.cpp:1388-1394)
-    // before CreatePidFile (:1470): a signal sent once the pid file is there is
-    // always handled, never the default action that kills the process
-    #[cfg(unix)]
-    let mut terminate = signal::unix::signal(signal::unix::SignalKind::terminate())
-        .context("Failed to install SIGTERM handler")?;
-    #[cfg(unix)]
-    let mut interrupt = signal::unix::signal(signal::unix::SignalKind::interrupt())
-        .context("Failed to install SIGINT handler")?;
-    let shutdown_tx_clone = shutdown_tx.clone();
-    tokio::spawn(async move {
-        #[cfg(unix)]
-        tokio::select! {
-            _ = interrupt.recv() => {
-                info!("Received Ctrl+C, initiating shutdown...");
-            }
-            _ = terminate.recv() => {
-                info!("Received SIGTERM, initiating shutdown...");
-            }
-        }
-
-        #[cfg(not(unix))]
-        {
-            signal::ctrl_c()
-                .await
-                .expect("Failed to install Ctrl+C handler");
-            info!("Received Ctrl+C, initiating shutdown...");
-        }
-
-        let _ = shutdown_tx_clone.send(());
-    });
 
     let wallet_seed = WalletSeed::from_settings(&args.settings);
     let wallet_options = WalletOptions::from_settings(&args.settings);
     let mn_options =
         masternode_options::MasternodeOptions::from_settings(&args.settings, &config.data_dir);
+    let webui = webui_config(&args, &config).or_exit(exit_code::USAGE)?;
+    let electrum = electrum_config(&args, &config).or_exit(exit_code::USAGE)?;
 
     // Run the daemon
     if let Err(e) = run_daemon(
@@ -3965,31 +4806,21 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
         shutdown_tx,
         shutdown_rx,
         pid_file.clone(),
+        webui,
+        electrum,
     )
     .await
     {
         // A start stopped without an InitError (-dbloadfailexit) prints nothing
         // more (init.cpp:1307-1309)
-        if e.downcast_ref::<QuietExit>().is_some() {
+        if is_quiet_exit(&e) {
             remove_pid_file(&pid_file);
-            flush_log();
-            std::process::exit(1);
-        }
-        error!("Daemon error: {:#}", e);
-        // Also on stderr, as Divi Core's InitError (noui.cpp:38-40)
-        {
-            use std::io::Write as _;
-            let _ = writeln!(std::io::stderr(), "Error: {:#}", e);
-        }
-        // Print the full error chain
-        let mut source: Option<&(dyn StdError + 'static)> = e.source();
-        while let Some(err) = source {
-            error!("  Caused by: {}", err);
-            source = err.source();
+            die!(exit_code::QUIET);
         }
         remove_pid_file(&pid_file);
-        flush_log();
-        std::process::exit(1);
+        // On stderr as well, as Divi Core's InitError (noui.cpp:38-40); {:#}
+        // carries every cause
+        die!(exit_code_of(&e), "Error: {:#}", e);
     }
 
     remove_pid_file(&pid_file);
@@ -3997,6 +4828,9 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
     // Divi Core's last line, once its pid file is gone (MainShutdown, init.cpp:418)
     info!("MainShutdown: done");
     info!("IronDivi shutdown complete");
+    if !log_config_console {
+        console!("IronDivi stopped.");
+    }
     Ok(())
 }
 
@@ -4107,6 +4941,53 @@ mod config_format_tests {
         build_config(&Args::parse_from(argv))
     }
 
+    #[test]
+    fn node12_rpc_access_keys_from_file_and_cli() {
+        let c = cfg(
+            "rpcauth=bob:00ff$abcd\nrpcauth=carol:11ee$beef\nrpcwhitelist=bob:getinfo\n\
+             rpcwhitelistdefault=0\nrpcallowip=10.0.0.0/8\nrpcalloworigin=https://w.example\n\
+             rpcallowhost=node.lan\n",
+            &[
+                "--rpcallowip=192.168.1.5",
+                "-rpcwhitelist=carol:getblockcount",
+            ],
+        )
+        .unwrap();
+        // Repeated options keep every value, the command line's first
+        assert_eq!(c.rpc.rpcauth, ["bob:00ff$abcd", "carol:11ee$beef"]);
+        assert_eq!(c.rpc.whitelist, ["carol:getblockcount", "bob:getinfo"]);
+        assert_eq!(c.rpc.whitelist_default, Some(false));
+        assert_eq!(c.rpc.allow_ips, ["192.168.1.5", "10.0.0.0/8"]);
+        assert_eq!(c.rpc.allow_origins, ["https://w.example"]);
+        assert_eq!(c.rpc.allow_hosts, ["node.lan"]);
+        let access = c.rpc.access();
+        assert_eq!(access.allow_ips, c.rpc.allow_ips);
+
+        // Each in divid's -name=value form alone, and -rpcwhitelistdefault
+        // as a bare flag; none of them set means the defaults
+        let c = cfg(
+            "",
+            &[
+                "-rpcauth=dave:22dd$cafe",
+                "-rpcwhitelist=dave:getinfo",
+                "-rpcwhitelistdefault",
+                "-rpcalloworigin=https://x.example",
+                "-rpcallowhost=box.lan",
+            ],
+        )
+        .unwrap();
+        assert_eq!(c.rpc.rpcauth, ["dave:22dd$cafe"]);
+        assert_eq!(c.rpc.whitelist, ["dave:getinfo"]);
+        assert_eq!(c.rpc.whitelist_default, Some(true));
+        assert_eq!(c.rpc.allow_origins, ["https://x.example"]);
+        assert_eq!(c.rpc.allow_hosts, ["box.lan"]);
+        let c = cfg("rpcuser=u\nrpcpassword=p\n", &[]).unwrap();
+        assert!(c.rpc.rpcauth.is_empty() && c.rpc.whitelist.is_empty());
+        assert_eq!(c.rpc.whitelist_default, None);
+        assert!(c.rpc.allow_ips.is_empty() && c.rpc.allow_hosts.is_empty());
+        assert_eq!(c.rpc.listen_addr, "127.0.0.1");
+    }
+
     /// A Divi Core divi.conf used to stop irondivid ("Failed to parse config file"):
     /// the file was read only as TOML.
     #[test]
@@ -4190,6 +5071,47 @@ mod config_format_tests {
         let c = cfg("rpcuser=foo\n[test]\nrpcport=1\nrpcuser=bar\n", &[]).unwrap();
         assert_eq!(c.rpc.username.as_deref(), Some("foo"));
         assert_eq!(c.rpc.port, 1);
+    }
+
+    /// -debug and -loglevel, from the command line or the file, set the log
+    /// levels; nothing set is info, and a bad level stops the start
+    #[test]
+    fn log_levels_come_from_debug_and_loglevel() {
+        let dir = tempfile::tempdir().unwrap();
+        let dd = format!("--datadir={}", dir.path().display());
+        let levels = |extra: &[&str]| {
+            let mut argv = vec!["irondivid", dd.as_str()];
+            argv.extend(extra);
+            // try_parse_from: parse_from exits the test process on a bad level
+            Args::try_parse_from(argv)
+                .and_then(resolve_args)
+                .map(|a| (a.debug, a.log_levels.spec()))
+        };
+        assert_eq!(levels(&[]).unwrap(), (false, "info".to_string()));
+        assert_eq!(levels(&["-debug"]).unwrap(), (true, "debug".to_string()));
+        assert_eq!(
+            levels(&["-debug", "-nodebug"]).unwrap(),
+            (false, "info".to_string())
+        );
+        assert_eq!(
+            levels(&["-debug=sync", "-debug=rpc"]).unwrap(),
+            (true, "info,rpc:debug,sync:debug".to_string())
+        );
+        assert_eq!(
+            levels(&["-loglevel=warn", "-loglevel=peers:error"]).unwrap(),
+            (false, "warn,peers:error".to_string())
+        );
+        assert!(levels(&["-loglevel=sync:loud"]).is_err());
+
+        std::fs::write(
+            dir.path().join("irondivi.conf"),
+            "loglevel=warn\nloglevel=staking:trace\n",
+        )
+        .unwrap();
+        assert_eq!(
+            levels(&[]).unwrap(),
+            (true, "warn,staking:trace".to_string())
+        );
     }
 
     /// Log-file and console settings in the file reach the logger (they were overwritten
@@ -4277,7 +5199,7 @@ mod config_format_tests {
         let err = cfg("regtest=1\nwhitelist=not-a-net\n", &[]).unwrap_err();
         assert_eq!(
             format!("{:#}", err),
-            "Invalid netmask specified in -whitelist: 'not-a-net'"
+            "Invalid netmask specified in -whitelist"
         );
 
         let c = cfg(
@@ -4299,14 +5221,8 @@ mod config_format_tests {
         assert!(c.p2p.listen_on_addr);
 
         for (bad, why) in [
-            (
-                "127.0.0.1",
-                "Need to specify a port with -whitebind: '127.0.0.1'",
-            ),
-            (
-                "localhost:53999",
-                "Cannot resolve -whitebind address: 'localhost:53999'",
-            ),
+            ("127.0.0.1", "Need to specify a port with -whitebind"),
+            ("localhost:53999", "Cannot resolve -whitebind address"),
         ] {
             let err = cfg(&format!("regtest=1\nwhitebind={bad}\n"), &[]).unwrap_err();
             assert_eq!(format!("{:#}", err), why);
@@ -4587,7 +5503,11 @@ mod mode_tests {
         let err = Args::try_parse_from(["irondivid", "--mode", "irondivi"])
             .unwrap_err()
             .to_string();
-        assert!(err.contains("invalid value 'irondivi'"), "{err}");
+        assert!(err.contains("invalid value for '--mode"), "{err}");
+        assert!(
+            !err.contains("irondivi'"),
+            "the value is never echoed: {err}"
+        );
         assert!(
             err.contains("[possible values: divi, privatedivi]"),
             "{err}"
@@ -5416,7 +6336,7 @@ mod divid_option_tests {
             .map(|e| e.to_string());
             assert_eq!(
                 err.as_deref(),
-                Some(format!("Invalid amount for -minrelaytxfee=<amount>: '{zero}'").as_str())
+                Some("Invalid amount for -minrelaytxfee=<amount> (an amount above zero)")
             );
         }
     }
@@ -5624,12 +6544,12 @@ mod start_errors {
         for bad in ["abc", "-1", "99999999999", "1e3"] {
             assert_eq!(
                 refused(CONF, &[&format!("-maxtxfee={bad}")]),
-                format!("Invalid amount for -maxtxfee=<amount>: '{bad}'")
+                "Invalid amount for -maxtxfee=<amount>"
             );
         }
         assert_eq!(
             refused(CONF, &["-maxtxfee=0.00001", "-minrelaytxfee=0.0001"]),
-            "Invalid amount for -maxtxfee=<amount>: '0.00001' (must be at least the minrelay \
+            "Invalid amount for -maxtxfee=<amount> (must be at least the minrelay \
              fee of 0.00010000 DIV/kB to prevent stuck transactions)"
         );
         assert_eq!(
@@ -5651,7 +6571,7 @@ mod start_errors {
     fn onlynet_names_a_network_divid_knows() {
         assert_eq!(
             refused(CONF, &["-onlynet=bogus"]),
-            "Unknown network specified in -onlynet: 'bogus'"
+            "Unknown network specified in -onlynet (use ipv4, ipv6, onion or tor)"
         );
         for good in ["ipv4", "IPv6", "tor", "onion"] {
             assert!(
@@ -5667,7 +6587,7 @@ mod start_errors {
     fn rpcbind_must_be_a_numeric_address() {
         assert_eq!(
             refused(CONF, &["-rpcallowip=127.0.0.1", "-rpcbind=garbage"]),
-            "Could not parse -rpcbind value garbage as network address"
+            "Could not parse -rpcbind value as network address"
         );
         assert_eq!(
             refused(
@@ -5678,7 +6598,7 @@ mod start_errors {
                     "-rpcbind=localhost"
                 ]
             ),
-            "Could not parse -rpcbind value localhost as network address"
+            "Could not parse -rpcbind value (value 2 of 2) as network address"
         );
         assert!(
             start(CONF, &["-rpcbind=garbage"]).is_ok(),
@@ -5691,10 +6611,15 @@ mod start_errors {
     /// A divi.conf line with no "=" is boost's error (divid.cpp:95-99)
     #[test]
     fn config_line_without_a_value_stops_the_start() {
-        assert_eq!(
-            refused(&format!("{CONF}listen\n"), &[]),
-            "the options configuration file contains an invalid line 'listen'"
+        let refusal = refused(&format!("{CONF}listen\n"), &[]);
+        assert!(
+            refusal.ends_with(
+                "divi.conf: the options configuration file contains an invalid line (line 4)"
+            ),
+            "{refusal}"
         );
+        // The line itself is never shown: it may hold a password (R3, code 3)
+        assert!(!refused(&format!("{CONF}rpcpassword secret\n"), &[]).contains("secret"));
     }
 
     /// divid takes -? and -help, and -version; -h and -V are not its options
@@ -5714,14 +6639,15 @@ mod start_errors {
     fn the_data_directory_lock_is_waited_for() {
         let dir = tempfile::tempdir().unwrap();
         let first = lock_data_dir(dir.path()).unwrap();
-        let release = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_secs(1));
-            drop(first);
+        std::thread::scope(|s| {
+            s.spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                drop(first);
+            });
+            let started = std::time::Instant::now();
+            assert!(lock_data_dir(dir.path()).is_ok());
+            assert!(started.elapsed() >= std::time::Duration::from_millis(900));
         });
-        let started = std::time::Instant::now();
-        assert!(lock_data_dir(dir.path()).is_ok());
-        assert!(started.elapsed() >= std::time::Duration::from_millis(900));
-        release.join().unwrap();
     }
 
     /// One process per data directory, with divid's text (init.cpp:850-862)
@@ -5820,5 +6746,78 @@ mod proxy_tor_settings_tests {
         ]);
         assert_eq!(t.tor_control, "127.0.0.1:9999");
         assert_eq!(t.tor_password, "dummy-not-a-password");
+    }
+}
+
+#[cfg(test)]
+mod resubmit_tests {
+    use super::*;
+    use divi_primitives::hash::Hash256;
+    use divi_primitives::script::Script;
+    use divi_primitives::transaction::{OutPoint, TxIn, TxOut};
+    use divi_storage::{Chain, ChainDatabase, ChainParams, NetworkType as StorageNetwork};
+
+    fn spend(prev: Hash256, value: i64) -> Transaction {
+        let mut tx = Transaction::new();
+        tx.vin.push(TxIn::new(
+            OutPoint::new(prev, 0),
+            Script::from_bytes(vec![0x51]),
+            0xffff_ffff,
+        ));
+        tx.vout.push(TxOut::new(
+            Amount::from_sat(value),
+            Script::new_p2pkh(&[9u8; 20]),
+        ));
+        tx
+    }
+
+    /// A wallet transaction put back after a restart used to be charged a
+    /// made-up fee of 10,000 sat per byte, so one paying less than the relay
+    /// fee got past the mempool's fee check. It now pays what it really pays.
+    #[test]
+    fn node21_resubmit_uses_the_real_fee() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(ChainDatabase::open(dir.path()).unwrap());
+        let params = ChainParams::for_network(StorageNetwork::Regtest, ChainMode::Divi);
+        let chain = Arc::new(Chain::new(db, params).unwrap());
+        let mempool = Arc::new(divi_node::Mempool::new(Default::default()));
+
+        let parent = spend(Hash256::from_bytes([7u8; 32]), 5_000_000);
+        let parent_id = parent.txid();
+        mempool.add(parent, Amount::from_sat(1_000_000)).unwrap();
+
+        // 100 sat for a ~85 byte transaction is under 10 sat/byte
+        let cheap = spend(parent_id, 5_000_000 - 100);
+        let cheap_id = cheap.txid();
+        assert!(resubmit_tx(cheap, &chain, &mempool).is_err());
+        assert!(!mempool.contains(&cheap_id));
+
+        let paid = spend(parent_id, 5_000_000 - 100_000);
+        let paid_id = paid.txid();
+        assert_eq!(resubmit_tx(paid, &chain, &mempool), Ok(paid_id));
+
+        // Inputs that exist nowhere are reported, not added
+        let orphan = spend(Hash256::from_bytes([8u8; 32]), 1_000);
+        assert_eq!(
+            resubmit_tx(orphan, &chain, &mempool),
+            Err("inputs no longer available".to_string())
+        );
+    }
+}
+
+#[cfg(test)]
+mod notify_tests {
+    use super::notify_failed;
+
+    #[test]
+    fn a_failed_notify_line_holds_its_kind_and_status_only() {
+        assert_eq!(
+            notify_failed("walletnotify", "exit status: 1"),
+            "runCommand error: walletnotify (exit status: 1)"
+        );
+        assert_eq!(
+            notify_failed("blocknotify", std::io::ErrorKind::NotFound),
+            "runCommand error: blocknotify (entity not found)"
+        );
     }
 }

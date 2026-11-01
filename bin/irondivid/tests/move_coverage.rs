@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 Bert Shuler
+// Copyright (C) 2026 human
 // IronDivi - https://github.com/DiviDomains/IronDivi
 //
 // This program is free software: you can redistribute it and/or modify
@@ -290,9 +290,10 @@ fn hdseed_option_makes_cores_wallet() {
 }
 
 /// The masternode.conf collateral lock follows `-mnconflock` as in divid:
-/// on by default, with a collateral that is not a txid named in the log,
-/// and off with `-mnconflock=0`. A line with too few fields stops the start
-/// with divid's text (masternodeconfig.cpp:66-88, MasternodeModule.cpp:454-466)
+/// on by default, with a collateral that is not a txid named in the log (its
+/// alias and collateral as pseudonyms, A11), and off with `-mnconflock=0`. A
+/// line with too few fields stops the start with divid's text
+/// (masternodeconfig.cpp:66-88, MasternodeModule.cpp:454-466)
 #[test]
 fn masternode_conf_lock_follows_mnconflock_and_a_short_line_stops_the_start() {
     let txid = "52e93b7c00000000000000000000000000000000000000000000000000009434";
@@ -320,10 +321,17 @@ fn masternode_conf_lock_follows_mnconflock_and_a_short_line_stops_the_start() {
         let log = debug_log(datadir);
         assert!(!log.contains("-mnconflock is not supported"), "{log}");
         assert_eq!(
-            log.contains("masternode.conf entry mn2: collateral not-a-txid 0"),
+            log.contains("is not a txid and output index; not locked"),
             flag.is_none(),
             "{log}"
         );
+        // The alias and collateral are wallet values: pseudonyms (A11)
+        assert_eq!(
+            log.contains("masternode.conf entry wlb-"),
+            flag.is_none(),
+            "{log}"
+        );
+        assert!(!log.contains("not-a-txid") && !log.contains(txid), "{log}");
     }
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
@@ -333,7 +341,7 @@ fn masternode_conf_lock_follows_mnconflock_and_a_short_line_stops_the_start() {
     .unwrap();
     let out = run_to_exit(irondivid(Some(dir.path()), "--regtest", free_port()), 60)
         .expect("irondivid did not stop at the short line");
-    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(out.status.code(), Some(3));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains(

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 Bert Shuler
+// Copyright (C) 2026 human
 // IronDivi - https://github.com/DiviDomains/IronDivi
 //
 // This program is free software: you can redistribute it and/or modify
@@ -60,7 +60,7 @@ fn ceil_fee(sat_per_vb: u64, vsize: usize) -> u64 {
     sat_per_vb.max(1) * vsize as u64
 }
 
-fn p2wpkh_sign(
+pub(crate) fn p2wpkh_sign(
     secp: &Secp256k1<All>,
     sk: &SecretKey,
     tx: &Transaction,
@@ -84,6 +84,54 @@ fn input(outpoint: OutPoint, sequence: Sequence) -> TxIn {
     }
 }
 
+/// Select coins (confirmed first, then largest first) to cover `amount` paid to
+/// `primary_spk` plus fee, from `my_spk`'s coins. Returns the chosen coins, the change
+/// amount (`None` if it would be dust — folded into the fee instead), and the fee paid.
+pub(crate) fn select_coins(
+    coins: &[Coin],
+    primary_spk: &ScriptBuf,
+    amount: u64,
+    my_spk: &ScriptBuf,
+    pk: &CompressedPublicKey,
+    sat_per_vb: u64,
+) -> Result<(Vec<Coin>, Option<u64>, u64), SwapError> {
+    let mut sorted = coins.to_vec();
+    sorted.sort_by(|a, b| b.confirmed.cmp(&a.confirmed).then(b.value.cmp(&a.value)));
+
+    let mut chosen: Vec<Coin> = Vec::new();
+    let mut total = 0u64;
+    // Seeded from the zero-input skeleton so a coin list with no entries at all (a fresh,
+    // never-funded address) still reports InsufficientFunds instead of `needed` staying 0
+    // and `total < needed` wrongly passing.
+    let mut needed = amount
+        + ceil_fee(
+            sat_per_vb,
+            skeleton(&chosen, primary_spk, amount, Some(0), my_spk, pk).vsize(),
+        );
+    for c in sorted {
+        chosen.push(c);
+        total += c.value;
+        let probe = skeleton(&chosen, primary_spk, amount, Some(0), my_spk, pk);
+        needed = amount + ceil_fee(sat_per_vb, probe.vsize());
+        if total >= needed {
+            break;
+        }
+    }
+    if total < needed {
+        return Err(SwapError::InsufficientFunds(format!(
+            "have {total} sats, need {needed} (amount {amount} + fee)"
+        )));
+    }
+
+    let fee_with_change = needed - amount;
+    let change = total - needed;
+    if change >= DUST_SATS {
+        Ok((chosen, Some(change), fee_with_change))
+    } else {
+        Ok((chosen, None, total - amount))
+    }
+}
+
 /// Select coins (confirmed first, then largest first), pay `amount` to the HTLC, send
 /// change to `sk`'s P2WPKH address, and sign.
 pub fn build_funding_tx(
@@ -100,50 +148,18 @@ pub fn build_funding_tx(
     }
     let pk = CompressedPublicKey(sk.public_key(secp));
     let my_spk = ScriptBuf::new_p2wpkh(&pk.wpubkey_hash());
-    let mut sorted = coins.to_vec();
-    sorted.sort_by(|a, b| b.confirmed.cmp(&a.confirmed).then(b.value.cmp(&a.value)));
-
-    let mut chosen: Vec<Coin> = Vec::new();
-    let mut total = 0u64;
-    // Seeded from the zero-input skeleton so a coin list with no entries at all (a fresh,
-    // never-funded address) still reports InsufficientFunds instead of `needed` staying 0
-    // and `total < needed` wrongly passing.
-    let mut needed = amount
-        + ceil_fee(
-            sat_per_vb,
-            skeleton(&chosen, htlc, amount, Some(0), &my_spk, &pk).vsize(),
-        );
-    for c in sorted {
-        chosen.push(c);
-        total += c.value;
-        let probe = skeleton(&chosen, htlc, amount, Some(0), &my_spk, &pk);
-        needed = amount + ceil_fee(sat_per_vb, probe.vsize());
-        if total >= needed {
-            break;
-        }
-    }
-    if total < needed {
-        return Err(SwapError::InsufficientFunds(format!(
-            "have {total} sats, need {needed} (amount {amount} + fee)"
-        )));
-    }
-
-    let fee_with_change = needed - amount;
-    let change = total - needed;
-    let (change_opt, fee) = if change >= DUST_SATS {
-        (Some(change), fee_with_change)
-    } else {
-        (None, total - amount)
-    };
-    let mut tx = skeleton(&chosen, htlc, amount, change_opt, &my_spk, &pk);
+    let primary_spk = htlc_script_pubkey(htlc);
+    let (chosen, change_opt, fee) =
+        select_coins(coins, &primary_spk, amount, &my_spk, &pk, sat_per_vb)?;
+    let mut tx = skeleton(&chosen, &primary_spk, amount, change_opt, &my_spk, &pk);
     for (i, c) in chosen.iter().enumerate() {
         let sig = p2wpkh_sign(secp, sk, &tx, i, &my_spk, c.value)?;
         tx.input[i].witness = Witness::from_slice(&[sig, pk.to_bytes().to_vec()]);
     }
     let raw = serialize(&tx);
     for (i, c) in chosen.iter().enumerate() {
-        bitcoin::consensus::verify_script(&my_spk, i, Amount::from_sat(c.value), &raw)
-            .map_err(|e| SwapError::Other(format!("funding input {i} fails consensus: {e:?}")))?;
+        verify_input(&my_spk, i, c.value, &raw)
+            .map_err(|e| SwapError::Other(format!("funding input {i} fails consensus: {e}")))?;
     }
     Ok(BuiltFunding {
         tx,
@@ -152,10 +168,11 @@ pub fn build_funding_tx(
     })
 }
 
-/// Unsigned funding skeleton with dummy witnesses so `vsize()` is representative.
-fn skeleton(
+/// Unsigned skeleton (funding or a plain send) with dummy witnesses so `vsize()` is
+/// representative: pays `amount` to `primary_spk`, optional change to `my_spk`.
+pub(crate) fn skeleton(
     chosen: &[Coin],
-    htlc: &HtlcParams,
+    primary_spk: &ScriptBuf,
     amount: u64,
     change: Option<u64>,
     my_spk: &ScriptBuf,
@@ -163,7 +180,7 @@ fn skeleton(
 ) -> Transaction {
     let mut output = vec![TxOut {
         value: Amount::from_sat(amount),
-        script_pubkey: htlc_script_pubkey(htlc),
+        script_pubkey: primary_spk.clone(),
     }];
     if let Some(c) = change {
         output.push(TxOut {
@@ -271,11 +288,33 @@ pub fn verify_htlc_spend(
     htlc: &HtlcParams,
     amount: u64,
 ) -> Result<(), SwapError> {
-    bitcoin::consensus::verify_script(
-        &htlc_script_pubkey(htlc),
-        0,
-        Amount::from_sat(amount),
-        &serialize(tx),
-    )
-    .map_err(|e| SwapError::Rejected(format!("spend fails consensus verification: {e:?}")))
+    verify_input(&htlc_script_pubkey(htlc), 0, amount, &serialize(tx))
+        .map_err(|e| SwapError::Rejected(format!("spend fails consensus verification: {e}")))
+}
+
+/// Self-check input `i` of the just-signed `raw` against the output it spends, with
+/// libbitcoinconsensus. Only transactions this process built and signed come through
+/// here; counterparty outputs are validated structurally in `htlc_output`/`find_spend`.
+///
+/// Without the `consensus` feature (wasm32: libbitcoinconsensus is C++) this is a
+/// documented no-op, so a malformed spend would surface only at broadcast time.
+#[cfg(feature = "consensus")]
+pub(crate) fn verify_input(
+    spk: &ScriptBuf,
+    i: usize,
+    value: u64,
+    raw: &[u8],
+) -> Result<(), String> {
+    bitcoin::consensus::verify_script(spk, i, Amount::from_sat(value), raw)
+        .map_err(|e| format!("{e:?}"))
+}
+
+#[cfg(not(feature = "consensus"))]
+pub(crate) fn verify_input(
+    _spk: &ScriptBuf,
+    _i: usize,
+    _value: u64,
+    _raw: &[u8],
+) -> Result<(), String> {
+    Ok(())
 }

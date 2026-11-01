@@ -1,0 +1,29 @@
+[package]
+license = "AGPL-3.0-only"
+name = "divi-webui"
+version.workspace = true
+edition.workspace = true
+description = "IronDivi's optional web interface (-webui)"
+
+[dependencies]
+divi-rpc = { workspace = true }
+
+axum = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
+rand = { workspace = true }
+hex = { workspace = true }
+sha2 = { workspace = true }
+zeroize = { workspace = true }
+anyhow = { workspace = true }
+# The admin password's hash, as the wallet's passphrase key (raw Argon2id)
+argon2 = { version = "0.5", default-features = false, features = ["alloc", "zeroize"] }
+# The config file is edited in place, its comments and order kept
+toml_edit = "0.22"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

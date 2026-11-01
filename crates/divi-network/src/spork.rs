@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 Bert Shuler
+// Copyright (C) 2026 human
 // IronDivi - https://github.com/DiviDomains/IronDivi
 //
 // This program is free software: you can redistribute it and/or modify
@@ -249,7 +249,7 @@ impl SporkManager {
             };
             match stored {
                 Ok(spork) => {
-                    tracing::info!("Loaded spork {} with value {}", id, spork.value);
+                    tracing::debug!("Loaded spork {} with value {}", id, spork.value);
                     self.sporks.write().insert(spork.hash(), spork.clone());
                     self.add_active(spork);
                 }
@@ -326,7 +326,7 @@ impl SporkManager {
     pub async fn handle_sporkcount(&self, peer_id: PeerId, count: u32) {
         // The count is a signed 32-bit integer on the wire
         let count = if count > i32::MAX as u32 { 0 } else { count };
-        tracing::info!("Peer {} has {} sporks", peer_id, count);
+        tracing::debug!("Peer {} has {} sporks", peer_id, count);
 
         // Update peer state
         {
@@ -431,7 +431,7 @@ impl SporkManager {
             {
                 let new_received = received + 1;
                 if new_received >= expected {
-                    tracing::info!(
+                    tracing::debug!(
                         "Spork sync complete from peer {} ({} sporks)",
                         peer_id,
                         new_received

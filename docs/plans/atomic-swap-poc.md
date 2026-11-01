@@ -123,7 +123,7 @@ for the maker lock happens **only** on entering `MakerLocked` — that is the st
 **Mechanism:** one **Avada Terminal** tab, "Swap POC". The orchestrator (Opus) runs in its first
 pane; each lane is another pane in the same tab, in its own git worktree, running an interactive
 **Sonnet** session via the narrow profile (`context-budget.md` §2.5 rule 13), launched with
-`claude_auto` (`working-with-bert.md` §9). Bert can watch and type into any of them. The
+`claude_auto` (`working-with-human.md` §9). Human can watch and type into any of them. The
 orchestrator creates and waits on panes with `avada ctl` (exact commands:
 `docs/plans/swap-poc/orchestrator.md`).
 
@@ -134,7 +134,7 @@ Rules every lane follows:
   `Cargo.lock`, so lanes never touch either. A lane that needs a new dependency writes it to its
   status file; the orchestrator adds it.
 - **Lands on `main` at each verified seam:** `cargo fmt && cargo clippy -p <crate> -D warnings &&
-  cargo test -p <crate>` green → commit (as Bert, no AI attribution) → `git pull --rebase origin main`
+  cargo test -p <crate>` green → commit (as Human, no AI attribution) → `git pull --rebase origin main`
   → `git push origin HEAD:main`.
 - **Status file** `docs/plans/swap-poc/status/<lane>.md`: done / running / broken / left, last sha.
 - **Stop condition is a script, not a vibe.** `tools/swap-poc/check-<lane>.sh` exits 0 only when the
@@ -159,7 +159,7 @@ It waits on lanes with a Monitor on the status files, not by polling.
 | 0.2 | Write `divi-swap` types + `ChainBackend` trait + `HtlcParams` + state enum + config profiles (§3.1–3.2) | compiles; doc-tested script template |
 | 0.3 | **Live CLTV proof on Divi testnet** (go/no-go): build an HTLC P2SH with IronDivi crates, fund it from the testnet key, (a) claim with preimage, (b) second HTLC refunded after a 10 min locktime | both txids confirmed; recorded in RESULTS.md. If refund is rejected → stop, escalate to oracle (CLTV not active / sighash mismatch) |
 | 0.4 | Same on BTC signet with rust-bitcoin + mempool.space. Refund locktime **≥ 2 h** ahead of current MTP (signet MTP lags wall clock ~1 h; a 10 min lock is rejected for over an hour and looks like a CLTV bug). Run the refund wait in the background. | both txids confirmed |
-| 0.5 | Fund engine keys: testnet DIVI from the vps1 faucet (`:19150`, via tailnet or ssh) or the dnsdivi testnet node wallets; signet BTC from a public signet faucet | maker ≥ 5,000 tDIVI, taker ≥ 0.01 sBTC. **If no faucet dispenses, this is the one question for Bert** |
+| 0.5 | Fund engine keys: testnet DIVI from the vps1 faucet (`:19150`, via tailnet or ssh) or the dnsdivi testnet node wallets; signet BTC from a public signet faucet | maker ≥ 5,000 tDIVI, taker ≥ 0.01 sBTC. **If no faucet dispenses, this is the one question for Human** |
 | 0.6 | Store keys in 1Password (`IronDivi Swap POC` items), resolver in `divi-swap::secrets` | `op read` at runtime works; nothing on disk |
 | 0.7 | Write lane briefs `docs/plans/swap-poc/lanes/*.md` and `tools/swap-poc/check-*.sh` | each check script fails before work starts (proves it can fail) |
 
@@ -184,10 +184,10 @@ the gate is `cargo test --workspace` + clippy green on `main` and every check sc
 | **e2e-local** | Run maker `divi-swapd` and taker CLI **locally** against real testnet + signet. Happy path, case C, case D. Script: `tools/swap-poc/e2e.sh <scenario>`; runs in background with a Monitor on the swap DB state. | Three scenarios complete; txids in RESULTS.md. Case C takes ~6 h wall clock — runs in the background while the next item proceeds. |
 | **chaos** | Kill/restart `divi-swapd` at each state transition during real testnet swaps; proxy outage (block the RPC host) mid-swap; Esplora 429s. | Every run ends `Done` (claimed or refunded); no stuck funds. |
 
-### Wave 3 — deploy to dnsdivi and prove there (orchestrator; needs Bert present once)
+### Wave 3 — deploy to dnsdivi and prove there (orchestrator; needs Human present once)
 
 1. **Parked for a human turn:** SSH to dnsdivi uses the 1Password SSH agent key (`dnsdivi_ssh`);
-   service secret provisioning needs `op`. Batch both into one sitting (`working-with-bert.md` §8).
+   service secret provisioning needs `op`. Batch both into one sitting (`working-with-human.md` §8).
 2. `deploy.sh` → build release, install unit, start, `curl https://<host>/swap/healthz`.
 3. Rerun `e2e.sh happy` with the **deployed** maker; then case C in the background.
 4. Write RESULTS.md, update the promo page's "Status" line only if every §1 item is proven.
@@ -196,10 +196,10 @@ the gate is `cargo test --workspace` + clippy green on `main` and every check sc
 
 | Blocker | Handling |
 |---|---|
-| **Commit signing needs 1Password** (`op-ssh-sign`) | Launch lanes while Bert is present and 1Password is unlocked so the agent's approval is remembered. If a signing prompt can't be answered, the lane parks per `secret-management.md` §7.1: stage, write the message to `docs/plans/swap-poc/parked/<lane>-<n>.msg` (outside nothing secret), keep working, and leave one command (`git commit -F <file>`). Never `--no-gpg-sign`. |
+| **Commit signing needs 1Password** (`op-ssh-sign`) | Launch lanes while Human is present and 1Password is unlocked so the agent's approval is remembered. If a signing prompt can't be answered, the lane parks per `secret-management.md` §7.1: stage, write the message to `docs/plans/swap-poc/parked/<lane>-<n>.msg` (outside nothing secret), keep working, and leave one command (`git commit -F <file>`). Never `--no-gpg-sign`. |
 | **Push 403 / `Repository not found`** — default gh account is `bshuler`, repo needs `DiviDomains` | Already applied to this clone (2026-10-07), shared by every worktree: repo-local `credential.https://github.com.helper` that answers `username=DiviDomains` and `password=$(gh auth token -u DiviDomains)` (token from gh's keyring at call time; never on disk or argv). **Never `gh auth switch`** — it is global and races between lanes. Fresh clone: `git config --local --replace-all credential.https://github.com.helper ''` then `--add` the helper shown by `git config --local --get-all credential.https://github.com.helper` here. |
 | Testnet address/spent index missing | Block-scan design (§2); no dependency. |
-| No testnet DIVI | Wave 0.5; only legitimate question to Bert. |
+| No testnet DIVI | Wave 0.5; only legitimate question to Human. |
 | Signet faucets rate-limit | Try several in Wave 0.4; keep taker sats small (0.001 per swap) and reuse refunds. |
 | Divi sighash differs from Bitcoin legacy | Proven in 0.3 against the live chain before lanes start. |
 | services.divi.domains proxy blocks a needed method | Lane writes it to status; orchestrator adds it to the proxy allowlist (`~/code/divi-infrastructure/divi-rpc-proxy/`) or switches to the dnsdivi local testnet RPC (`51475`, localhost only). |

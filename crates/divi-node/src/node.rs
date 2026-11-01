@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 Bert Shuler
+// Copyright (C) 2026 human
 // IronDivi - https://github.com/DiviDomains/IronDivi
 //
 // This program is free software: you can redistribute it and/or modify
@@ -1596,7 +1596,7 @@ impl Node {
                         }
                     }
                     PeerEvent::Disconnected { peer_id, reason } => {
-                        tracing::warn!("Peer {} disconnected: {}", peer_id, reason);
+                        tracing::debug!("Peer {} disconnected: {}", peer_id, reason);
                         pending_getdata.remove(&peer_id);
                         block_sync.remove_peer(peer_id);
                         // The peers kept waiting while it was there are asked
@@ -1613,21 +1613,10 @@ impl Node {
                     PeerEvent::Message {
                         peer_id, message, ..
                     } => {
-                        // Log all message types at INFO for debugging sync issues
+                        // Per message, so DEBUG: at INFO, initial sync filled the
+                        // 1 MB debug.log in seconds (the "Sync progress" line reports it)
                         let cmd = message.command();
-                        if cmd == "block" || cmd == "notfound" {
-                            tracing::info!(
-                                "Received P2P message from peer {}: {} (size: {} bytes)",
-                                peer_id,
-                                cmd,
-                                match &message {
-                                    NetworkMessage::Block(b) => b.transactions.len() * 200, // rough estimate
-                                    _ => 0,
-                                }
-                            );
-                        } else {
-                            tracing::debug!("Received P2P message from peer {}: {}", peer_id, cmd);
-                        }
+                        tracing::debug!("Received P2P message from peer {}: {}", peer_id, cmd);
 
                         match message {
                             // Divi Core reads a headers message only with
@@ -2301,7 +2290,6 @@ impl Node {
                 }
                 match result {
                     Ok(txid) => {
-                        tracing::debug!("Added relayed tx {} to mempool", txid);
                         // Relayed once the mempool took it, and so is each
                         // orphan it lets in (Divi Core main.cpp:734, :763)
                         tx_relay_for_mempool.keep_relayed(event.tx.clone());
@@ -2631,12 +2619,7 @@ impl Node {
             self.mempool.remove_for_block(&txids);
             self.mempool.remove_conflicts(&block.transactions);
         }
-        if let Some(fork_height) = result.reorg_fork_height {
-            tracing::info!(
-                "Block {} reorganised the chain at height {}",
-                hash,
-                fork_height
-            );
+        if result.reorg_fork_height.is_some() {
             update_mempool_after_reorg(&self.chain, &self.mempool, result.orphaned_transactions);
         }
         for txid in &txids {
@@ -2645,7 +2628,8 @@ impl Node {
 
         let _ = self.event_tx.send(NodeEvent::BlockAccepted(hash));
 
-        tracing::info!("Accepted block {} at height {}", hash, self.chain.height());
+        // The line every connected block gets (A11)
+        divi_network::log_block_connected(&hash, self.chain.height());
         Ok(())
     }
 
@@ -2881,7 +2865,6 @@ impl Node {
             relay.announce_tx(txid).await;
         });
 
-        tracing::debug!("Accepted transaction {} to mempool", txid);
         Ok(txid)
     }
 
@@ -3103,7 +3086,7 @@ pub fn accept_relayed_transaction(
 ) -> Result<Hash256, NodeError> {
     let result = mempool.add_relayed(event.tx.clone(), divi_primitives::amount::Amount::ZERO);
     match &result {
-        Ok(txid) => tracing::debug!("Added relayed tx {} to mempool", txid),
+        Ok(_) => {}
         Err(e) => score_relayed_refusal(peers, event, e),
     }
     result
@@ -3253,7 +3236,6 @@ pub fn accept_orphans(
             }
             match mempool.add_relayed(tx, divi_primitives::amount::Amount::ZERO) {
                 Ok(_) => {
-                    tracing::debug!("   accepted orphan tx {}", orphan_id);
                     work.push(orphan_id);
                     accepted.push(orphan_id);
                     erase.push(orphan_id);
@@ -3317,13 +3299,10 @@ pub fn update_mempool_after_reorg(
     let offered = disconnected.len();
     let mut returned = 0;
     for tx in disconnected {
-        let txid = tx.txid();
         match mempool.add_from_disconnected_block(tx) {
             Ok(_) => returned += 1,
-            Err(e) => tracing::debug!(
-                "Transaction {} of a disconnected block not returned to the mempool: {}",
-                txid,
-                e
+            Err(_) => divi_primitives::counted::hit(
+                divi_primitives::counted::Site::MempoolReorgNotReturned,
             ),
         }
     }

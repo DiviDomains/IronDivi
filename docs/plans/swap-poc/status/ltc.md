@@ -645,7 +645,7 @@ on the same step is an "ask the oracle" or "flag to the orchestrator" situation,
 force-through.
 
 ### What I did not and will not do
-Did not commit or push this entry, and did not sign anything as Bert Shuler: `_hp2.md`
+Did not commit or push this entry, and did not sign anything as human: `_hp2.md`
 rule 4 is explicit ("Never `git commit`, never push — signing lives on the Mac") and that
 holds regardless of who is asking or why — hp2 has no signing key and this lane's binding
 rules don't carve out an exception for "authorized." Landing this (and the actual live

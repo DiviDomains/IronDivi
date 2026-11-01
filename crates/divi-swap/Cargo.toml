@@ -13,13 +13,24 @@ thiserror = { workspace = true }
 hex = { workspace = true }
 sha2 = { workspace = true }
 rand = { workspace = true }
-rusqlite = { workspace = true }
-tokio = { workspace = true }
 tracing = { workspace = true }
 zeroize = { workspace = true }
 uuid = { workspace = true }
 toml = { workspace = true }
 parking_lot = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rusqlite = { workspace = true }
+tokio = { workspace = true }
+
+# wasm32: the taker runs in the IronDivi browser extension. No tokio runtime (only its
+# executor-agnostic Mutex), browser entropy and clock, JS timers (see `rt`).
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+tokio = { version = "1.35", default-features = false, features = ["sync"] }
+getrandom = { version = "0.2", features = ["js"] }
+uuid = { workspace = true, features = ["js"] }
+gloo-timers = { version = "0.3", features = ["futures"] }
+js-sys = "0.3"
 
 [dev-dependencies]
 alloy = { version = "2.5.0", features = ["node-bindings"] }

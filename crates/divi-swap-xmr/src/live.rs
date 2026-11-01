@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 Bert Shuler
+// Copyright (C) 2026 human
 // IronDivi - https://github.com/DiviDomains/IronDivi
 //
 // This program is free software: you can redistribute it and/or modify
@@ -500,7 +500,7 @@ pub fn parse_network(s: &str) -> Result<Network> {
 /// The engine profile for a Monero network: [`crate::XmrConfig::testnet`] on stagenet and
 /// testnet, [`crate::XmrConfig::mainnet`] on mainnet. Mainnet moves real money, so it needs
 /// an explicit `allow_mainnet` that every binary keeps off by default (`xmr-mainnet-plan.md`
-/// phase D: only after the outside review, with Bert present).
+/// phase D: only after the outside review, with Human present).
 pub fn profile_for(network: Network, allow_mainnet: bool) -> Result<crate::XmrConfig> {
     match network {
         Network::Mainnet if !allow_mainnet => Err(SwapError::InvalidParams(

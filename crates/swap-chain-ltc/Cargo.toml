@@ -6,6 +6,9 @@ edition.workspace = true
 description = "Atomic swap ChainBackend for Litecoin (testnet) over Esplora HTTP"
 
 [features]
+default = ["consensus"]
+# libbitcoinconsensus self-checks of every signed spend (C++; off for wasm32)
+consensus = ["bitcoin/bitcoinconsensus"]
 # Integration tests against the live testnet (cargo test -p swap-chain-ltc --features live -- --ignored)
 live = []
 
@@ -21,10 +24,15 @@ thiserror = { workspace = true }
 hex = { workspace = true }
 sha2 = { workspace = true }
 rand = { workspace = true }
-tokio = { workspace = true }
 tracing = { workspace = true }
 zeroize = { workspace = true }
 parking_lot = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
 
 [dev-dependencies]
 wiremock = { workspace = true }

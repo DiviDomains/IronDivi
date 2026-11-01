@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 Bert Shuler
+// Copyright (C) 2026 human
 // IronDivi - https://github.com/DiviDomains/IronDivi
 //
 // This program is free software: you can redistribute it and/or modify
@@ -26,5 +26,5 @@ pub use config::{
     DaemonConfig, LtcSection, UsdcSection, XmrSection, ZecSection, MOCK_ONLY_CHAINS,
 };
 pub use routes::{router, router_with_xmr, AppState};
-pub use scan::{run_scan, ScanState, ScanStatus, WalletScan};
+pub use scan::{follow_once, follow_tip, run_scan, ScanState, ScanStatus, WalletScan};
 pub use scheduler::{spawn_gated_scheduler, spawn_scheduler};

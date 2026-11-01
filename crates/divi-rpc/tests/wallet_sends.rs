@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 Bert Shuler
+// Copyright (C) 2026 human
 // IronDivi - https://github.com/DiviDomains/IronDivi
 //
 // Portions derived from Divi Core (https://github.com/DiviProject/Divi)
@@ -630,6 +630,9 @@ fn logged<T>(f: impl FnOnce() -> T) -> (T, String) {
 /// primitives/transaction.cpp:51-63, :115-118, :261-280)
 #[test]
 fn a_send_logs_the_transaction_it_commits() {
+    // Divi Core's text is logged with -logwalletdetail; without it the same
+    // lines carry pseudonyms (A11)
+    divi_primitives::redact::set_wallet_detail(true);
     let net = Net::new();
     let funded = net.fund(&[10 * COIN]);
     let coin: Vec<_> = net
