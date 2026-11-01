@@ -433,6 +433,20 @@ try:
         return {"time - block": stake["time"] - b["time"], "timereceived - mock": stake["timereceived"] - ahead - 120}
     c, i = both(staked_tx_time)
     row("the coinstake of a block dated ahead of the system clock (wallet times)", c, i)
+
+    # unlocked_until is the node's clock plus the timeout (nWalletUnlockTime = GetTime() + timeout,
+    # rpcserver.cpp:1205, :1215). The passphrase is a fresh random value, sent only in the calls
+    phrase = secrets.token_hex(16)
+
+    def unlocked_until(node):
+        node.rpc("encryptwallet", phrase)
+        node.rpc("setmocktime", ahead + 600)
+        node.rpc("walletpassphrase", phrase, 60)
+        until = node.rpc("getwalletinfo")["unlocked_until"] - ahead - 600
+        node.rpc("walletlock")
+        return until
+    c, i = both(unlocked_until)
+    row("unlocked_until after walletpassphrase 60 on a clock 2 h ahead (- mock)", c, i)
 finally:
     for n in (core, iron):
         if n:
@@ -570,6 +584,31 @@ finally:
         for w in ws:
             w.close()
     for n in (maker, core, iron):
+        if n:
+            n.stop()
+
+# --- part 4: a wallet made on a mocked clock ----------------------------------------------------------------------
+
+core = iron = None
+try:
+    # Started with -mocktime two hours ahead of the system clock, so the new wallet's keys and keypool are made on it
+    ahead = int(time.time()) + 7200
+    core = Node("divid-4", DIVID, 8, [f"mocktime={ahead}"])
+    iron = Node("irondivid-4", IRONDIVID, 9, [f"mocktime={ahead}"])
+
+    # A keypool key's time is GetTime() (CKeyPool, wallet.cpp:2254-2262), as is a new key's (wallet.cpp:429-430).
+    # divid shows neither: its getwalletinfo has no keypoololdest (rpcwallet.cpp:2895-2907) and validateaddress no
+    # timestamp (rpcmisc.cpp:369-373, unknownKeyID is never cleared). irondivid's keypoololdest, one of its own
+    # members, is the oldest keypool key's time, so it is the mocked clock
+    def oldest(node):
+        node.rpc("getnewaddress")
+        v = node.rpc("getwalletinfo").get("keypoololdest")
+        return None if v is None else v - ahead
+    c, i = both(oldest)
+    row("keypoololdest of a wallet made on a clock 2 h ahead (- mock; divid sends none)", c, i,
+        same=c is None and i == 0)
+finally:
+    for n in (core, iron):
         if n:
             n.stop()
 

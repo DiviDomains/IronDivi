@@ -171,7 +171,9 @@ fn monthly_due(dir: &Path, wallet: &str, now: SystemTime) -> bool {
 /// backup is made and none removed (WalletBackupCreator.cpp:103-121).
 /// `wallet` must not be open.
 pub fn backup_at_start(wallet: &Path, data_dir: &Path, keep: usize) -> Result<(), WalletError> {
-    let now = SystemTime::now();
+    // The backup's name and the monthly backup's age are on GetTime
+    // (WalletBackupCreator.cpp:59, MonthlyWalletBackupCreator.cpp:27)
+    let now = node_now();
     info!("backing up wallet");
     // No wallet yet (a first start): each of the two backups says so and
     // makes nothing, not even its folder (WalletBackupFeatureContainer.cpp:24-33,
