@@ -395,6 +395,16 @@ pub fn exec_as(args: &[String]) -> i32 {
                 eprintln!("--exec-as: the id change did not hold");
                 return 126;
             }
+            // The id change reset the non-dumpable flag (D5); set it again before exec.
+            // SAFETY: PR_SET_DUMPABLE takes only integer arguments and changes only this process.
+            #[cfg(target_os = "linux")]
+            if libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) != 0 {
+                eprintln!(
+                    "--exec-as: PR_SET_DUMPABLE failed: {}",
+                    std::io::Error::last_os_error()
+                );
+                return 126;
+            }
         }
         libc::setsid();
     }
