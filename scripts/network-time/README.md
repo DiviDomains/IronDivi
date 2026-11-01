@@ -72,6 +72,12 @@ checks the script itself: every row passes.
    validateaddress no `timestamp`, rpcmisc.cpp:369-373) and Divi Core 3.0.0 has no dumpwallet, so the row checks
    irondivid's own `keypoololdest` against the mocked clock: it passes when divid sends none and irondivid's is the
    clock.
+9. **The mempool rebroadcast timer on a mocked clock** (PeriodicallyRebroadcastMempoolTxs, main.cpp:1280-1294, on
+   GetTime): each node mines 100 work blocks on the system clock and sends to itself; a script peer that connects
+   after the send is not told of the transaction. Then the clock is set 15, 30 and 45 minutes on (the peer pings after
+   each step, so it is not dropped as silent, Node.cpp:812-834): the first check after the start is due within
+   30 minutes of the node's clock, so the transaction is announced to the peer by the second step, while the system
+   clock has moved on less than a minute.
 
 What `net-time` covers is not repeated: the offset from peers' version messages, its cap and warning, and the
 2-hour limit on the network-adjusted clock.

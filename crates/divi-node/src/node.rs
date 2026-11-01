@@ -2178,9 +2178,7 @@ impl Node {
                                 if known.contains(&alert.hash()) {
                                     continue;
                                 }
-                                // GetAdjustedTime (alert.cpp:104)
-                                let now = divi_primitives::clock::adjusted_now();
-                                if alert.is_acceptable(key, now) {
+                                if alert_acceptable(&alert, key, Clocks::read()) {
                                     known.insert(alert.hash());
                                 } else {
                                     peer_manager.report_misbehavior_score(
@@ -2353,9 +2351,7 @@ impl Node {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
             loop {
                 interval.tick().await;
-                // GetTime: the node's clock, which setmocktime sets
-                // (main.cpp:1284-1291)
-                let now = divi_primitives::clock::now();
+                let now = rebroadcast_time(Clocks::read());
                 let current = chain_for_rebroadcast.tip().map(|t| t.hash);
                 if current != tip {
                     tip = current;
@@ -3666,6 +3662,50 @@ fn money_range(
     value >= divi_primitives::amount::Amount::ZERO && value <= max_money
 }
 
+/// The clocks the message loop's time checks read: the system clock, the
+/// time setmocktime set (0: none) and the network time offset
+#[derive(Debug, Clone, Copy)]
+struct Clocks {
+    system: i64,
+    mock: i64,
+    offset: i64,
+}
+
+impl Clocks {
+    fn read() -> Self {
+        Clocks {
+            system: divi_primitives::clock::system_now(),
+            mock: divi_primitives::clock::mock_time(),
+            offset: divi_primitives::clock::time_offset(),
+        }
+    }
+
+    /// GetTime: the mocked time when one is set (utiltime.cpp:24-29)
+    fn node(&self) -> i64 {
+        match self.mock {
+            0 => self.system,
+            mock => mock,
+        }
+    }
+
+    /// GetAdjustedTime: GetTime plus the network offset (timedata.cpp:35-38)
+    fn adjusted(&self) -> i64 {
+        self.node() + self.offset
+    }
+}
+
+/// Whether an alert from a peer is accepted: in effect until GetAdjustedTime
+/// reaches its expiry (alert.cpp:102-105, ProcessAlert :151-155)
+fn alert_acceptable(alert: &divi_network::alert::Alert, key: &[u8], clocks: Clocks) -> bool {
+    alert.is_acceptable(key, clocks.adjusted())
+}
+
+/// The mempool rebroadcast timer's clock: GetTime, which setmocktime sets
+/// (main.cpp:1284-1291)
+fn rebroadcast_time(clocks: Clocks) -> i64 {
+    clocks.node()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4129,5 +4169,131 @@ mod tests {
 
         let result = node.validate_transaction(&tx);
         assert!(matches!(result, Err(NodeError::MissingInputs)));
+    }
+
+    /// An `alert` signed by `kp` that expires at `expiration` (CUnsignedAlert
+    /// fields as alert.h serializes them)
+    fn expiring_alert(kp: &divi_crypto::KeyPair, expiration: i64) -> divi_network::alert::Alert {
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&1i32.to_le_bytes()); // nVersion
+        msg.extend_from_slice(&0i64.to_le_bytes()); // nRelayUntil
+        msg.extend_from_slice(&expiration.to_le_bytes());
+        msg.extend_from_slice(&7i32.to_le_bytes()); // nID
+        msg.extend_from_slice(&0i32.to_le_bytes()); // nCancel
+        msg.push(0); // setCancel
+        msg.extend_from_slice(&0i32.to_le_bytes()); // nMinVer
+        msg.extend_from_slice(&i32::MAX.to_le_bytes()); // nMaxVer
+        msg.push(0); // setSubVer
+        msg.extend_from_slice(&1i32.to_le_bytes()); // nPriority
+        msg.push(0); // strComment
+        msg.push(4);
+        msg.extend_from_slice(b"test"); // strStatusBar
+        msg.push(0); // strReserved
+        let hash = divi_crypto::double_sha256(&msg);
+        let sig = divi_crypto::sign_hash(kp.secret_key(), &hash)
+            .unwrap()
+            .to_der();
+        divi_network::alert::Alert { msg, sig }
+    }
+
+    /// Whether an alert expiring at `expiration` is accepted on `clocks`
+    fn alert_accepted_at(expiration: i64, clocks: Clocks) -> bool {
+        let kp = divi_crypto::KeyPair::new_random();
+        let key = kp.public_key().to_bytes();
+        alert_acceptable(&expiring_alert(&kp, expiration), &key, clocks)
+    }
+
+    const SYSTEM: i64 = 1_700_000_000;
+
+    #[test]
+    fn clock_alert_expiring_before_an_offset_ahead_of_the_system_clock_is_refused() {
+        // GetAdjustedTime is past the expiry, the system clock is not
+        let clocks = Clocks {
+            system: SYSTEM,
+            mock: 0,
+            offset: 60,
+        };
+        assert!(!alert_accepted_at(SYSTEM + 30, clocks));
+    }
+
+    #[test]
+    fn clock_alert_expiring_after_an_offset_behind_the_system_clock_is_accepted() {
+        // The system clock is past the expiry, GetAdjustedTime is not
+        let clocks = Clocks {
+            system: SYSTEM,
+            mock: 0,
+            offset: -60,
+        };
+        assert!(alert_accepted_at(SYSTEM - 30, clocks));
+    }
+
+    #[test]
+    fn clock_alert_expiring_before_a_mock_time_ahead_of_the_system_clock_is_refused() {
+        let clocks = Clocks {
+            system: SYSTEM,
+            mock: SYSTEM + 3600,
+            offset: 0,
+        };
+        assert!(!alert_accepted_at(SYSTEM + 1800, clocks));
+    }
+
+    #[test]
+    fn clock_alert_expiring_after_a_mock_time_behind_the_system_clock_is_accepted() {
+        let clocks = Clocks {
+            system: SYSTEM,
+            mock: SYSTEM - 3600,
+            offset: 0,
+        };
+        assert!(alert_accepted_at(SYSTEM - 1800, clocks));
+    }
+
+    /// The rebroadcast timer of the node loop: first checked at `start`, its
+    /// next check 600 s on, the tip moved at `tip_moved`; whether it
+    /// rebroadcasts on `at`
+    fn rebroadcast_due(start: Clocks, tip_moved: Clocks, at: Clocks) -> bool {
+        let mut timer = crate::rebroadcast::RebroadcastTimer::new();
+        assert!(!timer.due(rebroadcast_time(start), 0, || 600));
+        timer.due(rebroadcast_time(at), rebroadcast_time(tip_moved), || 600)
+    }
+
+    #[test]
+    fn clock_rebroadcast_due_by_the_mock_time_but_not_the_system_clock() {
+        let start = Clocks {
+            system: SYSTEM,
+            mock: 0,
+            offset: 0,
+        };
+        let tip_moved = Clocks {
+            system: SYSTEM + 10,
+            ..start
+        };
+        // setmocktime 20 minutes on, 20 s after the start by the system clock
+        let at = Clocks {
+            system: SYSTEM + 20,
+            mock: SYSTEM + 1200,
+            offset: 0,
+        };
+        assert!(rebroadcast_due(start, tip_moved, at));
+    }
+
+    #[test]
+    fn clock_rebroadcast_due_by_the_system_clock_but_not_the_mock_time() {
+        let start = Clocks {
+            system: SYSTEM,
+            mock: SYSTEM,
+            offset: 0,
+        };
+        let tip_moved = Clocks {
+            system: SYSTEM + 5,
+            mock: SYSTEM + 10,
+            offset: 0,
+        };
+        // 20 minutes on by the system clock, 20 s by the mocked one
+        let at = Clocks {
+            system: SYSTEM + 1200,
+            mock: SYSTEM + 20,
+            offset: 0,
+        };
+        assert!(!rebroadcast_due(start, tip_moved, at));
     }
 }

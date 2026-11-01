@@ -3,7 +3,8 @@
 # setmocktime, the blocks each makes on a mocked clock, the stake window when
 # the clock is behind the median time, sporks, wallet and mempool times, and
 # blocks offered just inside and past the future limits, and the peers a new
-# tip is announced to, and a wallet's times on a mocked clock. Prints
+# tip is announced to, a wallet's times and the mempool rebroadcast timer on a
+# mocked clock. Prints
 # PASS/KNOWN/FAIL per row; the exit code is the number of FAILs. See README.md.
 #
 #   run.sh <irondivid-bin-dir> <core-bin-dir> <port-base> [root]
