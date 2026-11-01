@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 Bert Shuler
+// Copyright (C) 2026 human
 // IronDivi - https://github.com/DiviDomains/IronDivi
 //
 // This program is free software: you can redistribute it and/or modify
@@ -26,7 +26,7 @@ mod live {
     const STAGENET_NODE: &str = "http://node.monerodevs.org:38089";
 
     /// The RPC client actually connects to a real public stagenet node and can read its
-    /// chain state — proof this crate is "live-ready" (Bert's phrase) for step 5b's
+    /// chain state — proof this crate is "live-ready" (Human's phrase) for step 5b's
     /// funding/spend work once that's scheduled, not just offline-mock-green.
     #[tokio::test]
     async fn connects_to_public_stagenet_node() {

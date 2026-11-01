@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 Bert Shuler
+// Copyright (C) 2026 human
 // IronDivi - https://github.com/DiviDomains/IronDivi
 //
 // This program is free software: you can redistribute it and/or modify
@@ -132,7 +132,7 @@ pub struct XmrSection {
     #[serde(default = "default_xmr_network")]
     pub network: String,
     /// Must be `true` for `network = "mainnet"`, which moves real money. Off by default;
-    /// set only at phase D of `xmr-mainnet-plan.md` (after the outside review, Bert present).
+    /// set only at phase D of `xmr-mainnet-plan.md` (after the outside review, Human present).
     #[serde(default)]
     pub allow_mainnet: bool,
     /// `monerod` RPC: scanning for the taker's lock, fees, relaying the sweep.

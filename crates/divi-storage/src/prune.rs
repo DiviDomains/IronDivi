@@ -37,7 +37,9 @@ impl Expire {
     /// Parse `-1`, `0`, or `<integer><unit>` with unit one of `s m h d w mo y`.
     pub fn parse(input: &str) -> Result<Expire, ExpireParseError> {
         let s = input.trim();
-        let err = |why: &str| ExpireParseError(format!("'{}': {}", input, why));
+        // The reason only, never the value: it reaches the node's exit
+        // reason (R3 code 2), which names the option and why
+        let err = |why: &str| ExpireParseError(why.to_string());
         if s == "-1" {
             return Ok(Expire::Never);
         }

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 Bert Shuler
+// Copyright (C) 2026 human
 // IronDivi - https://github.com/DiviDomains/IronDivi
 //
 // This program is free software: you can redistribute it and/or modify
@@ -232,7 +232,7 @@ fn an_unreadable_key_stops_the_start() {
     made(dir.path(), rpc_port, p2p_port, 0);
     damage(dir.path(), "wallet_keys", &[7u8; 20], &[0xff, 0x00, 0x01]);
     let (code, stderr) = run_to_exit(dir.path(), rpc_port, p2p_port, &[]);
-    assert_eq!(code, Some(1), "{stderr}");
+    assert_eq!(code, Some(6), "{stderr}");
     assert!(
         stderr.contains("Error: Error loading wallet.dat: Wallet corrupted"),
         "stderr: {stderr}"
@@ -343,7 +343,7 @@ fn a_refused_upgradewallet_is_logged() {
     let dir = tempfile::tempdir().unwrap();
     let (rpc_port, p2p_port) = (free_port(), free_port());
     let (code, stderr) = run_to_exit(dir.path(), rpc_port, p2p_port, &["-upgradewallet=1000"]);
-    assert_eq!(code, Some(1), "{stderr}");
+    assert_eq!(code, Some(6), "{stderr}");
     assert!(
         stderr.contains("Error: Error loading wallet.dat: database load failure"),
         "{stderr}"

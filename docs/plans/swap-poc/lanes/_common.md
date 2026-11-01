@@ -2,7 +2,7 @@
 
 You are a lane of `docs/plans/atomic-swap-poc.md`, running in your own git worktree
 (`~/code/IronDivi-swap-<lane>`, branch `swap/<lane>`) as a pane in the "Swap POC" Avada tab.
-The orchestrator is another pane. Bert may type into your pane; answer him, then carry on.
+The orchestrator is another pane. Human may type into your pane; answer him, then carry on.
 
 1. **Memory is your status file**, `docs/plans/swap-poc/status/<lane>.md`. Read it first: if it
    exists you are a restart — continue from it. Rewrite it at every seam with lines
@@ -24,7 +24,7 @@ The orchestrator is another pane. Bert may type into your pane; answer him, then
    for those (the Mac is swap-starved). `cargo fmt` and git stay local; commits stay local and signed.
    **Land on `main` at each verified seam:** `cargo fmt && remote-cargo clippy -p <crate> --all-targets
    --all-features -- -D warnings && remote-cargo test -p <crate>` green → `git commit` (author is
-   already Bert via git config; **no AI attribution, no Co-Authored-By**) →
+   already Human via git config; **no AI attribution, no Co-Authored-By**) →
    `git pull --rebase origin main` → `git push origin HEAD:main`. Never `--no-gpg-sign`, never
    `gh auth switch`. If signing or push blocks on 1Password, write the message to
    `docs/plans/swap-poc/parked/<lane>-<n>.msg`, add `- parked: git commit -F <that file>` to your
@@ -35,7 +35,7 @@ The orchestrator is another pane. Bert may type into your pane; answer him, then
 6. **Waiting** for blocks or timelocks: run the wait as a background command
    (`run_in_background: true`) or `Monitor`; never sleep-loop in your context.
 7. **Hard questions** (a bug that survived two attempts, a consensus/signing doubt) → the
-   `oracle` agent with the full problem in the prompt. Do not ask Bert; take the sane default,
+   `oracle` agent with the full problem in the prompt. Do not ask Human; take the sane default,
    note it under `- decisions:` in your status file.
 8. **Read the Wave 0 proofs** before writing chain code: `crates/swap-chain-*/examples/*_cltv_proof.rs`
    and the txids in `docs/plans/swap-poc/RESULTS.md` show the exact shapes the live chains accept.

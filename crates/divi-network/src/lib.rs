@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 Bert Shuler
+// Copyright (C) 2026 human
 // IronDivi - https://github.com/DiviDomains/IronDivi
 //
 // This program is free software: you can redistribute it and/or modify
@@ -112,5 +112,6 @@ pub use scoring::{BanEntry, Misbehavior, MisbehaviourOutcome, PeerScoring, PeerS
 pub use spork::{SporkManager, SporkSyncProgress, SporkSyncState};
 pub use subnet::Subnet;
 pub use sync::{
-    BlockConnectedCallback, BlockSync, ReorgCallback, SyncPeer, SyncProgress, SyncState,
+    log_block_connect_failed, log_block_connected, BlockConnectedCallback, BlockSync,
+    ReorgCallback, SyncPeer, SyncProgress, SyncState,
 };

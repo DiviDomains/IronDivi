@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 Bert Shuler
+// Copyright (C) 2026 human
 // IronDivi - https://github.com/DiviDomains/IronDivi
 //
 // This program is free software: you can redistribute it and/or modify
@@ -119,7 +119,7 @@ impl MasternodeHandler {
             }
             false
         } else {
-            info!(
+            debug!(
                 "Added masternode from broadcast: {} (tier: {:?})",
                 mnb.vin, mnb.tier
             );
@@ -190,7 +190,7 @@ impl MasternodeHandler {
             )));
         }
 
-        info!(
+        debug!(
             "Received masternode payment winner for height {} from peer {}",
             winner.block_height, peer_id
         );

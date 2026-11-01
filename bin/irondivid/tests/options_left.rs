@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 Bert Shuler
+// Copyright (C) 2026 human
 // IronDivi - https://github.com/DiviDomains/IronDivi
 //
 // This program is free software: you can redistribute it and/or modify
@@ -28,7 +28,7 @@ fn rpc(port: u16, method: &str, params: Value) -> Option<Value> {
     let body = json!({"jsonrpc": "1.0", "id": 1, "method": method, "params": params}).to_string();
     // "dGVzdDp0ZXN0" is base64 of test:test
     let request = format!(
-        "POST / HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nAuthorization: Basic dGVzdDp0ZXN0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nAuthorization: Basic dGVzdDp0ZXN0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         body.len(),
         body
     );
@@ -139,7 +139,7 @@ fn socks_and_a_true_tor_are_refused_as_divid_refuses_them() {
         let dir = tempfile::tempdir().unwrap();
         let out = run_to_exit(dir.path(), &[arg.to_string()]);
         assert_eq!(errors(&out), [line], "{arg}");
-        assert_eq!(out.status.code(), Some(1), "{arg}");
+        assert_eq!(out.status.code(), Some(2), "{arg}");
     }
     let dir = tempfile::tempdir().unwrap();
     let (_node, port) = start(dir.path(), &["-tor=0".into()]);
@@ -365,7 +365,8 @@ fn a_refused_start_writes_its_error_to_debug_log() {
     let log = debug_log(dir.path());
     let named: Vec<&str> = log.lines().filter(|l| l.contains("-checklevel")).collect();
     assert_eq!(named.len(), 1, "{log}");
-    assert!(named[0].ends_with(line), "{log}");
+    // die() adds the exit code after the reason (R3)
+    assert!(named[0].contains(line), "{log}");
 }
 
 /// The start's check of the last blocks finds one too far in the future of
@@ -392,5 +393,6 @@ fn the_start_check_refuses_blocks_from_the_future() {
         errors(&out)[..1],
         ["Error: Corrupted block database detected"]
     );
-    assert_eq!(out.status.code(), Some(1));
+    // The block database (R3: 5)
+    assert_eq!(out.status.code(), Some(5));
 }

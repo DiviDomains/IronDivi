@@ -1,13 +1,13 @@
 # C1 — Tx_cancel malleation: design of the fix (2026-10-14)
 
-Status: **reviewed 2026-10-15, Bert chose option A (see Ruling below). Built, gaps in §9 being closed.** Original status: design, awaiting review. Bert's rule (2026-10-14): a large protocol
+Status: **reviewed 2026-10-15, Human chose option A (see Ruling below). Built, gaps in §9 being closed.** Original status: design, awaiting review. Human's rule (2026-10-14): a large protocol
 change is written up and reviewed before code. This one is large: it changes `Tx_lock`'s script,
 adds a two-party signing component, and changes the wire messages of steps 2 and 3. Mainnet stays
 blocked (`xmr-mainnet-plan.md` C1) until this is implemented and passes the stagenet tests below.
 
-## Ruling (Bert, 2026-10-15): option A, the full C1 fix
+## Ruling (Human, 2026-10-15): option A, the full C1 fix
 
-Bert reviewed this document and chose **option A, the full C1 fix**. The A spec, as ruled:
+Human reviewed this document and chose **option A, the full C1 fix**. The A spec, as ruled:
 1. the interim hardening (§4.4) lands first;
 2. the joint cancel key J uses **Lindell-2017 2P-ECDSA**;
 3. presign is **exhaustive across all 120 staker variants** of `Tx_cancel` (§4.1).
@@ -189,7 +189,7 @@ Effect:
   the free price option of §1.
 - Staker malleation is unchanged.
 
-This narrows the risk but does not close it. Whether to ship it first is Bert's decision. It does
+This narrows the risk but does not close it. Whether to ship it first is Human's decision. It does
 not unblock mainnet on its own.
 
 ## 5. Requirements for the 2P-ECDSA component (no crate chosen)
@@ -264,7 +264,7 @@ said not to build interim-only, so it never shipped as its own step. Its two par
 
 Withholding `σ_J` instead would hurt the taker. Without it she cannot broadcast `Tx_cancel` from
 `t_cancel` on, which is her defence in §4.3. `σ_J`'s own variants are covered by G3 instead. No
-code change. Bert can overrule this and ask for the interim build as its own step.
+code change. Human can overrule this and ask for the interim build as its own step.
 
 **G2. `J` uses cggmp21, not Lindell 2017: CLOSED in code (2026-10-15), stagenet rerun pending.**
 `crates/divi-swap-xmr/src/jsig.rs` is now Lindell 2017 (malicious-secure with abort), wire scheme

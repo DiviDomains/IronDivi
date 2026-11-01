@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 Bert Shuler
+// Copyright (C) 2026 human
 // IronDivi - https://github.com/DiviDomains/IronDivi
 //
 // This program is free software: you can redistribute it and/or modify
@@ -67,10 +67,13 @@ const KEY_ENCRYPTED: &[u8] = b"encrypted";
 const KEY_RECEIVING_INDEX: &[u8] = b"receiving_index";
 const KEY_CHANGE_INDEX: &[u8] = b"change_index";
 const KEY_LAST_SCAN_HEIGHT: &[u8] = b"last_scan_height";
-const KEY_ENCRYPTION_SALT: &[u8] = b"encryption_salt";
-const KEY_ENCRYPTED_MASTER_KEY: &[u8] = b"encrypted_master_key";
+pub(crate) const KEY_ENCRYPTION_SALT: &[u8] = b"encryption_salt";
+pub(crate) const KEY_ENCRYPTED_MASTER_KEY: &[u8] = b"encrypted_master_key";
+/// Argon2id cost of the passphrase key; absent in wallets written by older
+/// builds, whose records use PBKDF2 and AES-256-CBC
+pub(crate) const KEY_KDF_PARAMS: &[u8] = b"kdf_params";
 const KEY_CHAIN_MODE: &[u8] = b"chain_mode";
-const KEY_ENCRYPTED_MNEMONIC: &[u8] = b"encrypted_mnemonic";
+pub(crate) const KEY_ENCRYPTED_MNEMONIC: &[u8] = b"encrypted_mnemonic";
 /// The seed of a wallet made from a seed, no words (Divi Core's -hdseed)
 pub(crate) const KEY_HD_SEED: &[u8] = b"hd_seed";
 pub(crate) const KEY_ENCRYPTED_HD_SEED: &[u8] = b"encrypted_hd_seed";
@@ -166,22 +169,11 @@ impl WalletDatabase {
         cf_opts.set_max_write_buffer_number(2);
         cf_opts.set_level_compaction_dynamic_level_bytes(true);
 
-        let cfs = vec![
-            ColumnFamilyDescriptor::new(CF_DEFAULT, cf_opts.clone()),
-            ColumnFamilyDescriptor::new(CF_METADATA, cf_opts.clone()),
-            ColumnFamilyDescriptor::new(CF_KEYS, cf_opts.clone()),
-            ColumnFamilyDescriptor::new(CF_UTXOS, cf_opts.clone()),
-            ColumnFamilyDescriptor::new(CF_SPENT, cf_opts.clone()),
-            ColumnFamilyDescriptor::new(CF_TRANSACTIONS, cf_opts.clone()),
-            ColumnFamilyDescriptor::new(CF_ADDRESSES, cf_opts.clone()),
-            ColumnFamilyDescriptor::new(CF_ACCOUNTS, cf_opts.clone()),
-            ColumnFamilyDescriptor::new(CF_SCRIPTS, cf_opts.clone()),
-            ColumnFamilyDescriptor::new(CF_VAULTS, cf_opts.clone()),
-            ColumnFamilyDescriptor::new(CF_SPENT_UTXO_DATA, cf_opts.clone()),
-            // Legacy column families for backward compatibility
-            ColumnFamilyDescriptor::new(CF_WATCH_ONLY_ADDRESSES, cf_opts.clone()),
-            ColumnFamilyDescriptor::new(CF_VAULTS_LEGACY, cf_opts),
-        ];
+        // The last two are legacy column families, kept for backward compatibility
+        let cfs: Vec<_> = ALL_CFS
+            .iter()
+            .map(|name| ColumnFamilyDescriptor::new(*name, cf_opts.clone()))
+            .collect();
 
         let db = DB::open_cf_descriptors(&opts, path, cfs)
             .map_err(|e| WalletError::Storage(e.to_string()))?;
@@ -237,12 +229,20 @@ impl WalletDatabase {
 
     /// Write a consistent copy of the open database into `dir`, which must not
     /// exist: a RocksDB checkpoint after the memtables are flushed, so writes
-    /// running meanwhile are either all in it or not at all
+    /// running meanwhile are either all in it or not at all. The copy is
+    /// readable by the owner only (0700 folder, 0600 files).
     pub fn checkpoint_to(&self, dir: &Path) -> Result<(), WalletError> {
+        if dir.exists() {
+            return Err(WalletError::Storage(format!(
+                "{} already exists",
+                dir.display()
+            )));
+        }
         self.db.flush().map_err(|e| self.storage_error(e))?;
         rocksdb::checkpoint::Checkpoint::new(&self.db)
             .and_then(|c| c.create_checkpoint(dir))
-            .map_err(|e| self.storage_error(e))
+            .map_err(|e| self.storage_error(e))?;
+        restrict_to_owner(dir).map_err(|e| WalletError::Storage(e.to_string()))
     }
 
     // ========== Metadata ==========
@@ -425,11 +425,25 @@ impl WalletDatabase {
 
     /// Force the metadata and key column families through compaction so that
     /// overwritten/deleted plaintext does not linger in old SST files.
+    ///
+    /// Every column family is flushed first: the write-ahead log is shared, and
+    /// a log file holding the old plaintext writes is kept until all column
+    /// families with data in it have been flushed.
     pub fn compact_secret_cfs(&self) {
+        for name in ALL_CFS {
+            if let Some(cf) = self.db.cf_handle(name) {
+                if let Err(e) = self.db.flush_cf(cf) {
+                    tracing::warn!("Wallet flush of {} failed: {}", name, e);
+                }
+            }
+        }
         for name in [CF_METADATA, CF_KEYS] {
             if let Some(cf) = self.db.cf_handle(name) {
                 self.db.compact_range_cf(cf, None::<&[u8]>, None::<&[u8]>);
             }
+        }
+        if let Err(e) = self.db.flush_wal(true) {
+            tracing::warn!("Wallet log sync failed: {}", e);
         }
     }
 
@@ -570,6 +584,16 @@ impl WalletDatabase {
         batch.put_cf(cf, KEY_ENCRYPTION_SALT, salt);
         batch.put_cf(cf, KEY_ENCRYPTED_MASTER_KEY, encrypted_master_key);
         self.write_batch_sync(batch)
+    }
+
+    /// The Argon2id cost of the passphrase key, or None for an older wallet
+    pub(crate) fn load_kdf_params(&self) -> Result<Option<crate::at_rest::KdfParams>, WalletError> {
+        let cf = self.db.cf_handle(CF_METADATA).unwrap();
+        self.db
+            .get_cf(cf, KEY_KDF_PARAMS)
+            .map_err(|e| WalletError::Storage(e.to_string()))?
+            .map(|data| crate::at_rest::KdfParams::decode(&data))
+            .transpose()
     }
 
     /// Load encryption metadata (salt and encrypted master key)
@@ -1915,6 +1939,28 @@ fn deserialize_vault_metadata(data: &[u8]) -> Result<crate::wallet_db::VaultMeta
         vault_script,
         funding_txid,
     })
+}
+
+/// Mode 0700 on `dir` and 0600 on the files in it. Checkpoint files may be
+/// hard links to the live database's, which get the same (stricter) mode.
+#[cfg(unix)]
+fn restrict_to_owner(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            restrict_to_owner(&path)?;
+        } else {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn restrict_to_owner(_dir: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]

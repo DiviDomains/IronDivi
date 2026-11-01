@@ -1,5 +1,5 @@
 #!/bin/bash
-# swap-watch.sh — Telegram DM to Bert when the swap maker (divi-swapd) is unhealthy or a swap is
+# swap-watch.sh — Telegram DM to Human when the swap maker (divi-swapd) is unhealthy or a swap is
 # stuck, and once when everything is healthy again. Run every 5 minutes by swap-watch.timer.
 # Modelled on fork-watch.sh (same bot, same send/repeat rules). Plan item B2 in
 # docs/plans/swap-poc/xmr-mainnet-plan.md.

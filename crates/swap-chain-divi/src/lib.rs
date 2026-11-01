@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 Bert Shuler
+// Copyright (C) 2026 human
 // IronDivi - https://github.com/DiviDomains/IronDivi
 //
 // This program is free software: you can redistribute it and/or modify
@@ -11,8 +11,11 @@
 //! Lane **divi** (docs/plans/swap-poc/lanes/divi.md) owns this crate. The Wave 0 live
 //! proof (`examples/*_cltv_proof.rs`) shows the transaction shapes that the chain accepts.
 
+mod observe;
 mod rpc;
 mod wallet;
+
+pub use observe::{CryptoidObserver, RpcObserver, CRYPTOID};
 
 pub use rpc::{classify_broadcast_error, BroadcastClass, RetryPolicy, RpcClient, RpcError};
 pub use wallet::{Utxo, Wallet};
@@ -42,6 +45,12 @@ use parking_lot::Mutex;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
+use std::sync::Arc;
+
+use divi_swap::observer::{Observer, TwoSource};
+
+/// Public RPC proxy for Divi mainnet (operator-run: pair it with a second source).
+pub const MAINNET_RPC: &str = "https://services.divi.domains/api/rpc/";
 
 /// Public RPC proxy for Divi testnet.
 pub const TESTNET_RPC: &str = "https://services.divi.domains/api/testnet/rpc/";
@@ -146,6 +155,14 @@ impl DiviBackend {
         })
     }
 
+    /// This backend with its trusted reads (maker lock, confirmations, MTP) also answered by
+    /// `second`, which must be a source the maker's operator does not run — on mainnet,
+    /// [`CryptoidObserver::mainnet`]. Signing and broadcasting stay here.
+    pub fn with_second_source(self, second: Arc<dyn Observer>) -> TwoSource<Self> {
+        let first = Arc::new(observe::RpcObserver::from_client(self.rpc.clone()));
+        TwoSource::new(self, first, second)
+    }
+
     /// The key's P2PKH address.
     pub fn address(&self) -> String {
         Address::p2pkh(&self.key.public_key(), self.network).to_string()
@@ -169,6 +186,21 @@ impl DiviBackend {
             .call_ok("getrawtransaction", json!([txid.to_rpc_hex(), 1]))
             .await?;
         self.wallet.lock().apply_tx(&tx, &self.spk.to_hex())
+    }
+
+    /// Sync the spendable coins with an address index's view (see [`Wallet::sync_coins`]).
+    pub fn sync_coins(&self, observed: &[Utxo]) -> Result<usize> {
+        self.wallet.lock().sync_coins(observed)
+    }
+
+    /// The wallet's persisted form (public data only).
+    pub fn wallet_json(&self) -> Result<String> {
+        self.wallet.lock().to_json()
+    }
+
+    /// Restore the wallet from [`wallet_json`](Self::wallet_json) output.
+    pub fn load_wallet_json(&self, text: &str) -> Result<()> {
+        self.wallet.lock().load_json(text)
     }
 
     /// Next block height a scan should start at, as persisted with the wallet.
@@ -308,7 +340,8 @@ impl DiviBackend {
     }
 }
 
-#[async_trait]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl ChainBackend for DiviBackend {
     fn chain(&self) -> Chain {
         Chain::Divi
@@ -331,24 +364,7 @@ impl ChainBackend for DiviBackend {
     }
 
     async fn median_time_past(&self) -> Result<u32> {
-        // The node reports `mediantime: null`, so take the median of the last 11 block times.
-        let tip = self.tip_height().await?;
-        let mut hash = self.rpc.call_ok("getblockhash", json!([tip])).await?;
-        let mut times = Vec::with_capacity(11);
-        for _ in 0..11 {
-            let block = self.rpc.call_ok("getblock", json!([hash, true])).await?;
-            times.push(block["time"].as_u64().ok_or_else(|| {
-                // A real block always has a time; its absence means a proxy-fronted
-                // node behind the one that reported this hash hasn't indexed it yet.
-                SwapError::Transient("block without time (still indexing?)".into())
-            })?);
-            match block.get("previousblockhash").filter(|p| p.is_string()) {
-                Some(prev) => hash = prev.clone(),
-                None => break,
-            }
-        }
-        times.sort_unstable();
-        Ok(times[times.len() / 2] as u32)
+        observe::rpc_median_time_past(&self.rpc).await
     }
 
     async fn build_funding(&self, htlc: &HtlcParams, amount: Amount) -> Result<Funding> {
@@ -485,7 +501,7 @@ impl ChainBackend for DiviBackend {
                         if known {
                             break;
                         }
-                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        divi_swap::rt::sleep(Duration::from_millis(500)).await;
                         known = self.get_tx_opt(&tx.txid).await?.is_some();
                     }
                     if !known {
@@ -531,23 +547,12 @@ impl ChainBackend for DiviBackend {
         let Some(tx) = self.get_tx_opt(&at.txid).await? else {
             return Ok(None);
         };
-        let Some(out) = tx["vout"]
-            .as_array()
-            .and_then(|a| a.iter().find(|o| o["n"].as_u64() == Some(at.vout as u64)))
-        else {
-            return Ok(None);
-        };
-        if out["scriptPubKey"]["hex"].as_str() != Some(htlc_script_pubkey(htlc).to_hex().as_str()) {
-            return Ok(None);
-        }
-        let sat = out["valueSat"]
-            .as_u64()
-            .or_else(|| out["value"].as_f64().map(|v| (v * 1e8).round() as u64))
-            .ok_or_else(|| SwapError::Other("output without value".into()))?;
-        Ok(Some(LockedOutput {
-            amount: Amount(sat),
-            confirmations: tx["confirmations"].as_u64().unwrap_or(0) as u32,
-        }))
+        Ok(
+            observe::observed_lock(&tx, htlc, at.vout)?.map(|l| LockedOutput {
+                amount: l.amount,
+                confirmations: l.tx.confirmations,
+            }),
+        )
     }
 
     async fn find_spend(&self, outpoint: &Outpoint, from_height: u64) -> Result<Option<SpendInfo>> {

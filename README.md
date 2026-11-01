@@ -100,6 +100,13 @@ Binaries are written to `target/release/irondivid` (full node) and `target/relea
 ./target/release/irondivid --mode privatedivi --testnet
 ```
 
+### Wallet Encryption
+
+`encryptwallet` keeps the wallet's existing seed; it does not make a new one.
+Versions up to and including v0.2.6 left the HD seed in plaintext on disk even after
+`encryptwallet`, so a datadir copy made with one of those versions may expose it. See
+[docs/wallet-encryption.md](docs/wallet-encryption.md).
+
 ### RPC Example
 
 Query the node via JSON-RPC (default port 51473 for Divi mainnet):
@@ -136,6 +143,10 @@ cargo fmt --all -- --check
 # Run lints
 cargo clippy --workspace -- -D warnings
 ```
+
+### Releasing
+
+Run `tools/release-check.sh` in the tree being released before building any tarball. It fails on a known vulnerability in a shipped binary (`irondivid`, `irondivi-cli`; checked with `cargo deny` and `cargo audit`) or a disallowed license or source anywhere in the workspace, and a failing tree is not released. Advisories for crates that only the swap tools use are printed but do not fail it.
 
 ## RPC Compatibility
 

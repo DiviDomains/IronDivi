@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 Bert Shuler
+// Copyright (C) 2026 human
 // IronDivi - https://github.com/DiviDomains/IronDivi
 //
 // This program is free software: you can redistribute it and/or modify
@@ -20,6 +20,7 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use bip39::Mnemonic;
 use divi_primitives::amount::Amount;
 use divi_primitives::constants::MAX_MONEY;
+use divi_primitives::counted::{self, Site};
 use divi_primitives::hash::{Hash160, Hash256};
 use divi_primitives::script::Script;
 use divi_primitives::serialize::{deserialize, serialize};
@@ -89,7 +90,13 @@ fn send_error(e: SendError) -> Error {
 /// total of 0 or less is -8 "Invalid amount", more than `available` (the
 /// spendable, account or vaulted balance) is -6 with both totals in satoshis
 fn check_send_total(payees: &[TxOut], available: Amount) -> Result<(), Error> {
-    let total: i64 = payees.iter().map(|o| o.value.as_sat()).sum();
+    // A total past MAX_MONEY (many outputs, or repetitions) is refused before
+    // it can overflow (NODE-17)
+    let total = payees
+        .iter()
+        .try_fold(0i64, |t, o| t.checked_add(o.value.as_sat()))
+        .filter(|t| *t <= MAX_MONEY.as_sat())
+        .ok_or_else(|| RpcError::new(codes::TYPE_ERROR, "Invalid amount"))?;
     if total <= 0 {
         return Err(RpcError::new(codes::INVALID_PARAMETER, "Invalid amount").into());
     }
@@ -784,29 +791,50 @@ fn send_notes(pairs: &[(&str, Option<&str>)]) -> std::collections::BTreeMap<Stri
 /// 24 characters, each output's value and scriptPubKey cut at 30
 /// (primitives/transaction.cpp:51-63, :115-118, :261-280; OutPoint.cpp:29-32)
 pub(crate) fn core_tx_string(tx: &Transaction) -> String {
+    use divi_primitives::redact::{
+        wallet_detail, OwnOutpoint, WalletAmount, WalletTxid, WalletValue,
+    };
+    // Without -logwalletdetail the wallet's values stay out of the log (A11):
+    // the same lines, with pseudonyms for the txid, the outpoints, the
+    // scripts and the values
+    let clear = wallet_detail();
     let cut = |text: String, n: usize| text.chars().take(n).collect::<String>();
-    let txid = tx.txid().to_string();
+    let txid = tx.txid();
+    let shown_txid = if clear {
+        txid.to_string()[..10].to_string()
+    } else {
+        WalletTxid(txid).to_string()
+    };
     let mut out = format!(
         "CTransaction({}, ver={}, vin.size={}, vout.size={}, nLockTime={})\n",
-        &txid[..10],
+        shown_txid,
         tx.version,
         tx.vin.len(),
         tx.vout.len(),
         tx.lock_time
     );
     for input in &tx.vin {
-        let mut line = format!(
-            "CTxIn(COutPoint({}, {})",
-            input.prevout.txid, input.prevout.vout
-        );
+        let mut line = if clear || input.prevout.is_null() {
+            format!(
+                "CTxIn(COutPoint({}, {})",
+                input.prevout.txid, input.prevout.vout
+            )
+        } else {
+            format!("CTxIn({}", OwnOutpoint::of(&input.prevout))
+        };
         if input.prevout.is_null() {
             line.push_str(&format!(
                 ", coinbase {}",
                 hex::encode(input.script_sig.as_bytes())
             ));
         } else {
-            let asm = divi_script::asm::to_asm(input.script_sig.as_bytes());
-            line.push_str(&format!(", scriptSig={}", cut(asm, 24)));
+            let asm = cut(divi_script::asm::to_asm(input.script_sig.as_bytes()), 24);
+            let asm = if clear {
+                asm
+            } else {
+                WalletValue(&asm).to_string()
+            };
+            line.push_str(&format!(", scriptSig={}", asm));
         }
         if input.sequence != u32::MAX {
             line.push_str(&format!(", nSequence={}", input.sequence));
@@ -815,13 +843,24 @@ pub(crate) fn core_tx_string(tx: &Transaction) -> String {
     }
     for output in &tx.vout {
         let sat = output.value.as_sat();
-        let asm = divi_script::asm::to_asm(output.script_pubkey.as_bytes());
-        out.push_str(&format!(
-            "    CTxOut(nValue={}.{:08}, scriptPubKey={})\n",
-            sat / 100_000_000,
-            sat % 100_000_000,
-            cut(asm, 30)
-        ));
+        let asm = cut(
+            divi_script::asm::to_asm(output.script_pubkey.as_bytes()),
+            30,
+        );
+        if clear {
+            out.push_str(&format!(
+                "    CTxOut(nValue={}.{:08}, scriptPubKey={})\n",
+                sat / 100_000_000,
+                sat % 100_000_000,
+                asm
+            ));
+        } else {
+            out.push_str(&format!(
+                "    CTxOut(nValue={}, scriptPubKey={})\n",
+                WalletAmount(sat),
+                WalletValue(&asm)
+            ));
+        }
     }
     out
 }
@@ -1718,7 +1757,7 @@ impl WalletRpc {
 
         let secret = key_entry.secret.as_ref().ok_or_else(not_known)?;
         let key_bytes = secret.as_bytes();
-        let mut key_array = [0u8; 32];
+        let mut key_array = zeroize::Zeroizing::new([0u8; 32]);
         key_array.copy_from_slice(key_bytes);
         let wif = encode_wif(&key_array, key_entry.compressed, network);
 
@@ -2182,12 +2221,7 @@ impl WalletRpc {
             );
         }
 
-        info!(
-            "Sent {} DIVI to {} (txid: {})",
-            send_amount.as_divi_f64(),
-            addr_str,
-            txid
-        );
+        counted::hit(Site::RpcSent);
 
         Ok(serde_json::json!(txid.to_string()))
     }
@@ -2596,22 +2630,34 @@ impl WalletRpc {
                 RpcError::new(codes::MISC_ERROR, "GetKey: DecryptHDChainSeed failed").into(),
             );
         }
+        // A wallet unlocked for staking only signs nothing else (NODE-5)
+        ensure_fully_unlocked(&wallet)?;
+        if input_index < 0 || input_index as usize >= tx.vin.len() {
+            return Err(unable().into());
+        }
+        // SIGHASH_SINGLE with no output at the input's index hashes to the
+        // constant 1, so that signature would spend any coin of this key.
+        // Divi Core signs it; IronDivi refuses (NODE-5).
+        if input_index as usize >= tx.vout.len() {
+            return Err(RpcError::new(
+                codes::INVALID_PARAMETER,
+                "Invalid parameter, SIGHASH_SINGLE needs an output at the input's index",
+            )
+            .into());
+        }
         let secret = entry
             .secret
             .as_ref()
             .filter(|_| !entry.is_watch_only)
             .ok_or_else(unable)?;
-        if input_index < 0 || input_index as usize >= tx.vin.len() {
-            return Err(unable().into());
-        }
         let mut dummy = vec![];
         let pk = entry.pubkey_bytes();
         dummy.push(pk.len() as u8);
         dummy.extend_from_slice(&pk);
         dummy.push(0xac); // OP_CHECKSIG
         let script_code = Script::from_bytes(dummy);
-        // Core's SignatureHash, which for SIGHASH_SINGLE on an input without
-        // an output of its index hashes the value 1 (SignatureCheckers.cpp)
+        // Core's SignatureHash; an input without an output of its index, which
+        // would hash the value 1 (SignatureCheckers.cpp), was refused above
         const SIGHASH_SINGLE: i32 = 3;
         let hash = divi_script::checker::signature_hash(
             &script_code,
@@ -2724,8 +2770,6 @@ impl WalletRpc {
 
         // Submit to mempool and broadcast
         self.submit_transaction(tx)?;
-
-        info!("Broadcasted transaction {}", txid);
 
         Ok(serde_json::json!(txid.to_string()))
     }
@@ -3511,14 +3555,12 @@ impl WalletRpc {
         )?;
         let txid = self.sign_and_submit(&wallet, &plan, ChangeTo::NewKey)?;
 
-        // Register each vault in the wallet so it can be tracked for staking/reclaiming
+        // Register each vault in the wallet so it can be tracked for staking/reclaiming.
+        // No addresses in the log (A11): the counted site records the funding
         for mut metadata in vaults {
             metadata.funding_txid = *txid.as_bytes();
-            info!(
-                "Funded vault {}:{} (txid: {})",
-                metadata.owner_address, metadata.manager_address, txid
-            );
             wallet.store_vault(metadata);
+            counted::hit(Site::RpcVaultFunded);
         }
 
         // rpcwallet.cpp:1059-1062
@@ -3720,7 +3762,7 @@ impl WalletRpc {
             )
         })?;
         let key_bytes = secret.as_bytes();
-        let mut key_array = [0u8; 32];
+        let mut key_array = zeroize::Zeroizing::new([0u8; 32]);
         key_array.copy_from_slice(key_bytes);
 
         // Encrypt using BIP38 in the key's own form (as PIVX's bip38encrypt, which this
@@ -3752,7 +3794,7 @@ impl WalletRpc {
 
         let secret = divi_crypto::keys::SecretKey::new_random();
         let address = Address::p2pkh(&secret.public_key(), network).to_base58();
-        let mut key_array = [0u8; 32];
+        let mut key_array = zeroize::Zeroizing::new([0u8; 32]);
         key_array.copy_from_slice(secret.as_bytes());
 
         let encrypted =
@@ -3785,7 +3827,8 @@ impl WalletRpc {
             Self::bip38_version(wallet.network()),
         )
         .map_err(|_| failed("Failed To Decrypt"))?;
-        let secret = divi_crypto::keys::SecretKey::from_bytes(&private_key)
+        let private_key = zeroize::Zeroizing::new(private_key);
+        let secret = divi_crypto::keys::SecretKey::from_bytes(&*private_key)
             .map_err(|_| failed("Private Key Not Valid"))?;
 
         let address =
@@ -3913,11 +3956,7 @@ impl WalletRpc {
                 "Couldn't verify transaction has correct collateral",
             )
         })?;
-        info!(
-            "Allocated {} DIVI for masternode collateral (txid: {})",
-            collateral.as_divi_f64(),
-            txid
-        );
+        counted::hit(Site::RpcAllocated);
         Ok(serde_json::json!({ "txhash": txid.to_string(), "vout": vout }))
     }
 
@@ -4121,8 +4160,6 @@ impl WalletRpc {
                 ("comment", params.get_str(2)),
             ]),
         );
-
-        info!("Sent {} outputs (txid: {})", plan.outputs.len(), txid);
 
         Ok(serde_json::json!(txid.to_string()))
     }
@@ -4577,13 +4614,7 @@ impl WalletRpc {
             ]),
         );
 
-        info!(
-            "Sent {} DIVI from account '{}' to {} (txid: {})",
-            send_amount.as_divi_f64(),
-            account,
-            addr_str,
-            txid
-        );
+        counted::hit(Site::RpcSentFrom);
 
         Ok(serde_json::json!(txid.to_string()))
     }
@@ -4736,6 +4767,11 @@ impl WalletRpc {
     }
 
     /// backupwallet - write a consistent copy of the wallet to destination
+    ///
+    /// As in C++ Divi, a destination that is a directory gets the backup inside
+    /// it and an earlier backup is replaced. Unlike C++, only a backup that
+    /// irondivid wrote is ever replaced (never the open wallet or another
+    /// database), and the copy is a RocksDB checkpoint readable by the owner only.
     pub fn backup_wallet(&self, params: &Params) -> Result<serde_json::Value, Error> {
         let destination = spirit_str(params, 0)?;
 
@@ -5336,6 +5372,35 @@ mod tests {
         assert_eq!(
             rpc_code(rpc.sign_transaction_with_address_key(&oob).unwrap_err()),
             codes::WALLET_ERROR
+        );
+    }
+
+    /// NODE-5: SIGHASH_SINGLE on an input with no output at its index signs the
+    /// constant hash 1, which would let anyone spend every coin of the key
+    #[test]
+    fn node05_signtransactionwithaddresskey_refuses_hash_one() {
+        use divi_primitives::transaction::{TxIn, TxOut};
+        let rpc = create_test_wallet_rpc();
+        let addr = rpc.get_new_address(&Params::None).unwrap();
+        let input = |n| {
+            TxIn::new(
+                OutPoint::new(Hash256::from_bytes([n; 32]), 0),
+                Script::new(),
+                0xffff_ffff,
+            )
+        };
+        let tx = Transaction {
+            version: 1,
+            vin: vec![input(1), input(2)],
+            vout: vec![TxOut::new(Amount::from_sat(1000), Script::new())],
+            lock_time: 0,
+        };
+        let hex = hex::encode(serialize(&tx));
+        let at = |i: i64| Params::Array(vec![json!(hex), addr.clone(), json!(i)]);
+        assert!(rpc.sign_transaction_with_address_key(&at(0)).is_ok());
+        assert_eq!(
+            rpc_code(rpc.sign_transaction_with_address_key(&at(1)).unwrap_err()),
+            codes::INVALID_PARAMETER
         );
     }
 
@@ -6350,6 +6415,162 @@ mod send_unlock_regression {
                 out.value.as_sat()
             );
         }
+    }
+
+    /// NODE-5: signtransactionwithaddresskey needs a full unlock like every
+    /// other signing call. Locked, an HD key gets divid's GetKey error; unlocked
+    /// for staking only it is refused as needing the passphrase.
+    #[test]
+    fn node05_signtransactionwithaddresskey_needs_full_unlock() {
+        use divi_primitives::transaction::{TxIn, TxOut};
+        let (_dir, rpc, db, _) = encrypted_rpc();
+        unlock(&rpc, 0, false).unwrap();
+        let addr = rpc.get_new_address(&Params::None).unwrap();
+        db.lock();
+        let tx = Transaction {
+            version: 1,
+            vin: vec![TxIn::new(
+                OutPoint::new(Hash256::from_bytes([7; 32]), 0),
+                Script::new(),
+                0xffff_ffff,
+            )],
+            vout: vec![TxOut::new(Amount::from_sat(1000), Script::new())],
+            lock_time: 0,
+        };
+        let params = p(vec![json!(hex::encode(serialize(&tx))), addr, json!(0)]);
+        assert_eq!(
+            err(rpc.sign_transaction_with_address_key(&params)).0,
+            codes::MISC_ERROR
+        );
+        unlock(&rpc, 0, true).unwrap();
+        assert_eq!(
+            err(rpc.sign_transaction_with_address_key(&params)).0,
+            codes::WALLET_UNLOCK_NEEDED
+        );
+        db.lock();
+        unlock(&rpc, 0, false).unwrap();
+        assert!(rpc.sign_transaction_with_address_key(&params).is_ok());
+    }
+
+    /// NODE-14: backupwallet writes a consistent, owner-only checkpoint that
+    /// opens as a wallet. It replaces an earlier backup it wrote (as Divi Core
+    /// overwrites its backup file) but never the open wallet nor any other
+    /// database.
+    #[test]
+    fn node14_backupwallet_checkpoint_is_private_and_replaces_only_a_backup() {
+        let (dir, rpc, db, _) = encrypted_rpc();
+        let out = tempfile::tempdir().unwrap();
+        let dst = out.path().join("bk");
+        let arg = |path: &std::path::Path| p(vec![json!(path.to_str().unwrap())]);
+        rpc.backup_wallet(&arg(&dst)).unwrap();
+        assert!(dst.join(divi_wallet::BACKUP_MARKER).is_file());
+        // An earlier backup is replaced
+        rpc.backup_wallet(&arg(&dst)).unwrap();
+        // A directory destination gets the backup inside it, and again
+        rpc.backup_wallet(&arg(out.path())).unwrap();
+        let inside = out.path().join(db.database_path().file_name().unwrap());
+        assert!(inside.join(divi_wallet::BACKUP_MARKER).is_file());
+        rpc.backup_wallet(&arg(out.path())).unwrap();
+
+        // Another database (here the chain's, or any RocksDB) is never replaced
+        let foreign = out.path().join("chain");
+        std::fs::create_dir(&foreign).unwrap();
+        std::fs::write(foreign.join("CURRENT"), b"MANIFEST-000001\n").unwrap();
+        assert!(rpc.backup_wallet(&arg(&foreign)).is_err());
+        assert!(foreign.join("CURRENT").is_file());
+        // Nor the open wallet, nor the folder that holds it
+        assert!(rpc.backup_wallet(&arg(&db.database_path())).is_err());
+        assert!(rpc.backup_wallet(&arg(dir.path())).is_err());
+        assert!(db.database_path().join("CURRENT").is_file());
+        // Nor a file
+        let file = out.path().join("file");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(rpc.backup_wallet(&arg(&file)).is_err());
+        assert_eq!(std::fs::read(&file).unwrap(), b"x");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode();
+            assert_eq!(mode(&dst) & 0o777, 0o700);
+            for entry in std::fs::read_dir(&dst).unwrap() {
+                assert_eq!(mode(&entry.unwrap().path()) & 0o077, 0);
+            }
+        }
+        let restored = WalletDb::open(&dst, Network::Testnet).unwrap();
+        assert!(restored.is_encrypted());
+        let sorted = |w: &WalletDb| {
+            let mut a: Vec<String> = w.get_addresses().iter().map(|a| a.to_string()).collect();
+            a.sort();
+            a
+        };
+        assert_eq!(sorted(&restored), sorted(&db));
+    }
+
+    /// NODE-11: a timeout past u32 seconds must not wrap to a short unlock or to
+    /// 0 (unlimited by accident); it is capped
+    #[test]
+    fn node11_huge_unlock_timeout_does_not_wrap() {
+        let (_dir, rpc, db, _) = encrypted_rpc();
+        // 2^32 would wrap to 0, 2^32 + 1 to one second
+        unlock(&rpc, (1u64 << 32) + 1, false).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        assert!(!db.is_locked());
+        assert!(db.unlocked_until() > 0, "capped, not unlimited");
+    }
+
+    /// NODE-18: a send whose change would be dust (or nothing) takes no change
+    /// key; one with real change takes exactly one
+    #[test]
+    fn node18_send_without_change_takes_no_change_key() {
+        let to = address(8, Network::Testnet);
+        let mut no_change = 0;
+        // Divi Core's selection needs room for non-dust change, so less left
+        // over is refused; 7,380 sat just fits and its dust change goes to the
+        // fee (see change_below_dust_goes_to_fee)
+        for left in [3000i64, 6000, 7_380, 1_000_000] {
+            let (rpc, db, sent) = funded_rpc();
+            let (_, before) = db.keystore().get_indices();
+            let amount = (1_000_000_000i64 - left) as f64 / 100_000_000.0;
+            if rpc
+                .send_to_address(&p(vec![json!(to), json!(amount)]))
+                .is_err()
+            {
+                continue; // the fee is more than was left
+            }
+            let outputs = sent.lock()[0].vout.len();
+            if outputs == 1 {
+                no_change += 1;
+            }
+            assert_eq!(
+                db.keystore().get_indices().1,
+                before + (outputs as u32 - 1),
+                "left {}",
+                left
+            );
+        }
+        assert!(no_change > 0, "no send without change was tried");
+        // With real change a change key is still taken
+        let (rpc, db, sent) = funded_rpc();
+        let (_, before) = db.keystore().get_indices();
+        rpc.send_to_address(&p(vec![json!(to), json!(1.0)]))
+            .unwrap();
+        assert_eq!(sent.lock()[0].vout.len(), 2);
+        assert_eq!(db.keystore().get_indices().1, before + 1);
+    }
+
+    /// NODE-17: a sendmany total above MAX_MONEY is refused, not summed past it
+    #[test]
+    fn node17_sendmany_total_above_max_money_is_refused() {
+        let (rpc, _, sent) = funded_rpc();
+        let mut outputs = serde_json::Map::new();
+        outputs.insert(address(8, Network::Testnet), json!(MAX_MONEY.as_divi()));
+        outputs.insert(address(9, Network::Testnet), json!(MAX_MONEY.as_divi()));
+        assert_eq!(
+            err(rpc.send_many(&p(vec![json!(""), serde_json::Value::Object(outputs)]))),
+            (codes::TYPE_ERROR, "Invalid amount".to_string())
+        );
+        assert!(sent.lock().is_empty());
     }
 
     #[test]

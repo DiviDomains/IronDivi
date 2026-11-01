@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 Bert Shuler
+// Copyright (C) 2026 human
 // IronDivi - https://github.com/DiviDomains/IronDivi
 //
 // This program is free software: you can redistribute it and/or modify
@@ -71,6 +71,13 @@ impl SecretKey {
     /// Get the inner secp256k1 secret key
     pub(crate) fn inner(&self) -> &secp256k1::SecretKey {
         &self.inner
+    }
+}
+
+impl Drop for SecretKey {
+    fn drop(&mut self) {
+        // Overwrite the key bytes so they do not linger in freed memory
+        self.inner.non_secure_erase();
     }
 }
 
@@ -226,6 +233,18 @@ pub fn message_hash(data: &[u8]) -> Message {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// NODE-10: dropping a secret key overwrites its bytes.
+    #[test]
+    fn node10_dropped_secret_key_is_erased() {
+        assert_eq!(std::mem::size_of::<SecretKey>(), 32);
+        let mut slot = std::mem::MaybeUninit::new(SecretKey::from_bytes(&[7u8; 32]).unwrap());
+        let before = unsafe { std::ptr::read(slot.as_ptr() as *const [u8; 32]) };
+        assert_eq!(before, [7u8; 32]);
+        unsafe { slot.assume_init_drop() };
+        let after = unsafe { std::ptr::read(slot.as_ptr() as *const [u8; 32]) };
+        assert_ne!(after, [7u8; 32]);
+    }
 
     #[test]
     fn test_secret_key_generation() {

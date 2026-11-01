@@ -1,0 +1,37 @@
+[package]
+license = "AGPL-3.0-only"
+name = "divi-diag"
+version.workspace = true
+edition.workspace = true
+description = "IronDivi diagnostics: discovery and collectors for `irondivi-cli diag`"
+
+[dependencies]
+divi-primitives = { workspace = true }
+divi-settings = { workspace = true }
+sha2 = { workspace = true }
+hmac = "0.12"
+hex = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+regex = "1.12"
+libc = "0.2"
+# §8.4: the package is zstd-compressed, then encrypted with age
+age = "=0.11.1"
+zstd = "=0.13.3"
+# §8.4 upload to the §9 receiver: Mozilla roots built in, plus the system store
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "rustls-tls-native-roots"] }
+rocksdb = { workspace = true, optional = true }
+
+[features]
+# B2.8 opens the chain database as a RocksDB secondary. Off only for a
+# cross-check that cannot compile RocksDB's C++ (darwin from hp3).
+default = ["chaindb"]
+chaindb = ["dep:rocksdb"]
+
+[dev-dependencies]
+tempfile = { workspace = true }
+divi-storage = { workspace = true }
+# B2.15 constants and the version layout are checked against the node's
+divi-network = { workspace = true }

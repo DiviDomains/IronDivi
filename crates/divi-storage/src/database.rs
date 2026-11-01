@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 Bert Shuler
+// Copyright (C) 2026 human
 // IronDivi - https://github.com/DiviDomains/IronDivi
 //
 // This program is free software: you can redistribute it and/or modify
@@ -216,6 +216,7 @@ impl ChainDatabase {
                 crate::search_index::CF_ADDRESS_UNSPENT,
                 Options::default(),
             ),
+            ColumnFamilyDescriptor::new(crate::search_index::CF_SCRIPTHASH, Options::default()),
         ];
 
         tracing::info!(

@@ -20,7 +20,7 @@ the script's own header comment for the exact rule, and `tools/swap-poc/test-ver
 5. Staking claim — no DIVI coin selection before `TakerLockConfirmed` (engine test + live corroboration).
 6. CI green on `main` (CI section).
 
-Plan Wave 3 step 4's promo-page "Status" line: not applicable — no promo page exists (Bert, 2026-10-10).
+Plan Wave 3 step 4's promo-page "Status" line: not applicable — no promo page exists (Human, 2026-10-10).
 
 ## Wave 0
 
@@ -36,7 +36,7 @@ Plan Wave 3 step 4's promo-page "Status" line: not applicable — no promo page 
 
 ### 0.5 Funding
 - maker-divi ← 20,000 tDIVI from dnsdivi `/opt/divi-testnet/node5`: txid `ac3c1522c0a1af87a140808be8d0ec8eec3d3bac8bc0512334188986c4a7d72a`
-- taker-btc ← signet: parked (faucet CAPTCHA, PARKED.md #1), then resolved on **testnet3** (DECISIONS #8): Bert sent 197,253 sats to `tb1qa826ffe73xnqsm64x6fvln7sl0zp3rgfdq3hpg`, tx `f5ee5dc8…206a`. Leftovers return to `tb1qerzrlxcfu24davlur5sqmgzzgsal6wusda40er`.
+- taker-btc ← signet: parked (faucet CAPTCHA, PARKED.md #1), then resolved on **testnet3** (DECISIONS #8): Human sent 197,253 sats to `tb1qa826ffe73xnqsm64x6fvln7sl0zp3rgfdq3hpg`, tx `f5ee5dc8…206a`. Leftovers return to `tb1qerzrlxcfu24davlur5sqmgzzgsal6wusda40er`.
 
 ### 0.3 Live CLTV proof, Divi testnet (`divi_cltv_proof`)
 - HTLC P2SH addresses computed by IronDivi match the node's `decodescript`: A `8pVwcRdSJKWN4ci1dPkVYSHkyigaB4RaDr`, B `8iZ67sZkYbXNwgDnbLP88W8m4426pNUAN2`
@@ -115,7 +115,7 @@ Plan Wave 3 step 4's promo-page "Status" line: not applicable — no promo page 
   Returned 188,399 of 197,253 sats; the rest went to testnet fees over ~20 swaps and proofs.
 
 ## Reverse direction — taker sells DIVI for BTC (offer `btc-divi-testnet`), done 2026-10-10
-Bert, 2026-10-10: "add the reverse direction, sell divi for btc". Plan `reverse-direction.md`; `Direction::TakerPaysDivi`,
+Human, 2026-10-10: "add the reverse direction, sell divi for btc". Plan `reverse-direction.md`; `Direction::TakerPaysDivi`,
 same timeout profile (DECISIONS #9): taker DIVI leg 6 h, maker BTC leg 3 h.
 - Lanes rev-engine, rev-cli, rev-tools landed on `main` (`4ae2ed8`); `check-rev-{engine,cli,tools}.sh` PASS; CI green
   on `4ae2ed8`, `161c761`, `2cab93b`.
@@ -151,7 +151,7 @@ same timeout profile (DECISIONS #9): taker DIVI leg 6 h, maker BTC leg 3 h.
     refund (harmless: the refund check runs first). 6037821 makes it a one-time decline.
   - A parked crash-test swap `f4140a43…` (600 tDIVI, lock `3efc7375…`) was refunded afterwards:
     `df49a3e742375332dbdaaaabcd85cbbcbd544abb96694acd0de8e5cfdd94cac7`.
-- Balances kept for reuse (no sweeps — Bert 2026-10-10: "keep all our testnet coind so i dont need to get more"):
+- Balances kept for reuse (no sweeps — Human 2026-10-10: "keep all our testnet coind so i dont need to get more"):
   maker BTC `tb1quqkt7c06svzt68f2y9uwf2jzgpd48k6ku45zrt` 121,266 sats; taker BTC `tb1qa826ffe73xnqsm64x6fvln7sl0zp3rgfdq3hpg`
   9,722 sats; taker DIVI `xy2MorbDhp35NxBHytHjv3LQo7fvHE4y3b` 1,699.99273 tDIVI.
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-only
-# Copyright (C) 2026 Bert Shuler
+# Copyright (C) 2026 human
 # IronDivi - https://github.com/DiviDomains/IronDivi
 #
 # Regtest check of irondivid next to Divi Core: every node starts from its

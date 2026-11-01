@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 Bert Shuler
+// Copyright (C) 2026 human
 // IronDivi - https://github.com/DiviDomains/IronDivi
 //
 // This program is free software: you can redistribute it and/or modify
@@ -85,8 +85,10 @@ impl EsploraClient {
         if endpoints.is_empty() {
             return Err(SwapError::InvalidParams("no Esplora endpoints".into()));
         }
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(20))
+        let builder = reqwest::Client::builder();
+        #[cfg(not(target_arch = "wasm32"))]
+        let builder = builder.timeout(Duration::from_secs(20));
+        let http = builder
             .build()
             .map_err(|e| SwapError::Other(format!("http client: {e}")))?;
         let endpoints = endpoints
@@ -166,7 +168,7 @@ impl EsploraClient {
                 };
                 if attempt < self.retry.attempts.max(1) {
                     tracing::debug!(%last, attempt, "esplora retry");
-                    tokio::time::sleep(wait.min(self.retry.max_delay)).await;
+                    divi_swap::rt::sleep(wait.min(self.retry.max_delay)).await;
                     delay = (delay * 2).min(self.retry.max_delay);
                 }
             }

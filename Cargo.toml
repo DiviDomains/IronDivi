@@ -12,8 +12,13 @@ members = [
     "crates/divi-node",
     "crates/divi-masternode",
     "crates/divi-test-support",
+    "crates/divi-webui",
+    "crates/divi-electrum",
+    "crates/divi-diag",
+    "crates/divi-settings",
     "bin/irondivid",
     "bin/irondivi-cli",
+    "bin/irondivi-diag-receiver",
     "crates/divi-swap",
     "crates/swap-chain-divi",
     "crates/swap-chain-btc",
@@ -22,6 +27,8 @@ members = [
     "crates/swap-chain-evm",
     "crates/swap-adaptor",
     "crates/swap-chain-xmr",
+    "crates/swap-keys",
+    "crates/swap-wasm",
     "bin/divi-swapd",
     "bin/divi-swap",
     "tests/integration-tests",
@@ -31,7 +38,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.6"
+version = "0.2.9"
 edition = "2021"
 license = "AGPL-3.0-only"
 repository = "https://github.com/DiviDomains/IronDivi"
@@ -39,6 +46,8 @@ repository = "https://github.com/DiviDomains/IronDivi"
 [workspace.dependencies]
 # Internal crates
 divi-primitives = { path = "crates/divi-primitives" }
+divi-diag = { path = "crates/divi-diag" }
+divi-settings = { path = "crates/divi-settings" }
 divi-crypto = { path = "crates/divi-crypto" }
 divi-script = { path = "crates/divi-script" }
 divi-consensus = { path = "crates/divi-consensus" }
@@ -49,12 +58,15 @@ divi-rpc = { path = "crates/divi-rpc" }
 divi-node = { path = "crates/divi-node" }
 divi-masternode = { path = "crates/divi-masternode" }
 divi-test-support = { path = "crates/divi-test-support" }
+divi-webui = { path = "crates/divi-webui" }
+divi-electrum = { path = "crates/divi-electrum" }
 divi-swap = { path = "crates/divi-swap" }
 swap-chain-divi = { path = "crates/swap-chain-divi" }
 swap-chain-btc = { path = "crates/swap-chain-btc" }
 swap-chain-ltc = { path = "crates/swap-chain-ltc" }
 swap-chain-zec = { path = "crates/swap-chain-zec" }
 swap-chain-evm = { path = "crates/swap-chain-evm" }
+swap-keys = { path = "crates/swap-keys" }
 
 # Crypto
 secp256k1 = { version = "0.29", features = ["recovery", "rand-std"] }
@@ -82,7 +94,7 @@ rocksdb = "0.22"
 # Web API
 axum = "0.7"
 tower = "0.4"
-tower-http = { version = "0.5", features = ["trace"] }
+tower-http = { version = "0.5", features = ["cors", "trace"] }
 hyper = "1.1"
 
 # Utilities
@@ -98,7 +110,7 @@ byteorder = "1.5"
 chrono = "0.4"
 
 # Atomic swap POC (docs/plans/atomic-swap-poc.md) — lanes must not edit these; ask the orchestrator
-bitcoin = { version = "0.32", features = ["serde", "rand-std", "bitcoinconsensus"] }
+bitcoin = { version = "0.32", features = ["serde", "rand-std"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 async-trait = "0.1"
@@ -120,3 +132,11 @@ codegen-units = 1
 
 [profile.dev]
 opt-level = 1
+
+# The wallet's passphrase key costs 64 MiB of Argon2id; unoptimised it takes
+# seconds, and the tests unlock wallets many times
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3

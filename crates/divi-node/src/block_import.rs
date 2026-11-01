@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 Bert Shuler
+// Copyright (C) 2026 human
 // IronDivi - https://github.com/DiviDomains/IronDivi
 //
 // This program is free software: you can redistribute it and/or modify
@@ -222,7 +222,11 @@ fn import_opened(
             }
         }
         match chain.accept_block(block) {
-            Ok(_) => result.loaded += 1,
+            Ok(_) => {
+                result.loaded += 1;
+                // The line every connected block gets (A11)
+                divi_network::log_block_connected(&hash, chain.height());
+            }
             Err(e) if is_system_error(&e) => {
                 tracing::error!(
                     "Block import of {} stopped at block {}: {}",

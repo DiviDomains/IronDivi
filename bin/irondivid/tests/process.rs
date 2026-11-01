@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 Bert Shuler
+// Copyright (C) 2026 human
 // IronDivi - https://github.com/DiviDomains/IronDivi
 //
 // This program is free software: you can redistribute it and/or modify
@@ -130,7 +130,7 @@ fn second_start_leaves_the_running_nodes_pid_file() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    assert_eq!(wait_exit(&mut second, 60), Some(1));
+    assert_eq!(wait_exit(&mut second, 60), Some(4));
     let mut err = String::new();
     second
         .stderr
@@ -243,19 +243,29 @@ fn daemon_child_keeps_its_directory_and_streams() {
     let cwd = tempfile::tempdir().unwrap();
     let (code, _, child, rpc_port) = start_daemon(dir.path(), cwd.path());
     let pid = child.expect("the child answered and wrote its pid file");
-    let where_ = std::fs::read_link(format!("/proc/{pid}/cwd")).ok();
-    let stdout = std::fs::read_link(format!("/proc/{pid}/fd/1")).ok();
+    let where_ = std::fs::read_link(format!("/proc/{pid}/cwd"));
+    let stdout = std::fs::read_link(format!("/proc/{pid}/fd/1"));
     stop_daemon(child, rpc_port);
     assert_eq!(code, Some(0));
-    assert_eq!(where_, Some(cwd.path().to_path_buf()));
-    assert_eq!(stdout, Some(cwd.path().join("out")));
+    // The node makes itself non-dumpable (NODE-10), and then /proc keeps its
+    // links from other processes of the same user: only a link that can be
+    // read is checked
+    for (link, want) in [
+        (where_, cwd.path().to_path_buf()),
+        (stdout, cwd.path().join("out")),
+    ] {
+        match link {
+            Ok(path) => assert_eq!(path, want),
+            Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{e}"),
+        }
+    }
 }
 
-/// A start and a clean stop write on stderr only what divid writes there:
-/// its warnings and errors (InitWarning, InitError, noui.cpp:38-40), here the
-/// warning about an unencrypted wallet it gives at every start (init.cpp:1227-1232)
+/// A start and a clean stop write on stderr divid's warning about an
+/// unencrypted wallet, given at every start (InitWarning, noui.cpp:38-40,
+/// init.cpp:1227-1232), and irondivid's own console lines
 #[test]
-fn a_start_and_a_stop_write_only_divids_warning_on_stderr() {
+fn a_start_and_a_stop_write_divids_warning_on_stderr() {
     let dir = tempfile::tempdir().unwrap();
     let rpc_port = free_port();
     let err = dir.path().join("stderr");
@@ -273,9 +283,14 @@ fn a_start_and_a_stop_write_only_divids_warning_on_stderr() {
     let _ = child.kill();
     let _ = child.wait();
     assert_eq!(code, Some(0));
+    // divid's warning, with irondivid's own console lines: its warning about
+    // the unencrypted wallet and the running and stopped lines
     assert_eq!(
         std::fs::read_to_string(&err).unwrap(),
-        "Warning: Make sure to encrypt your wallet and delete all non-encrypted backups after you verified that wallet works!\n"
+        "WARNING: the wallet is not encrypted; anyone who can read its files can spend its coins. Run the encryptwallet RPC.\n\
+         Warning: Make sure to encrypt your wallet and delete all non-encrypted backups after you verified that wallet works!\n\
+         IronDivi is running (chain height 0).\n\
+         IronDivi stopped.\n"
     );
 }
 
@@ -510,7 +525,7 @@ fn a_damaged_mncache_stops_the_start() {
         .unwrap()
         .read_to_string(&mut stderr)
         .unwrap();
-    assert_eq!(code, Some(1), "{stderr}");
+    assert_eq!(code, Some(5), "{stderr}");
     assert!(
         stderr.contains("Failed to load masternode cache from"),
         "{stderr}"
@@ -559,7 +574,7 @@ fn a_damaged_netfulfilled_stops_the_start() {
         .unwrap()
         .read_to_string(&mut stderr)
         .unwrap();
-    assert_eq!(code, Some(1), "{stderr}");
+    assert_eq!(code, Some(5), "{stderr}");
     assert!(
         stderr.contains("Failed to load fulfilled requests cache from"),
         "{stderr}"

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 Bert Shuler
+// Copyright (C) 2026 human
 // IronDivi - https://github.com/DiviDomains/IronDivi
 //
 // This program is free software: you can redistribute it and/or modify
@@ -45,7 +45,7 @@ fn http_rpc(ip: IpAddr, port: u16, method: &str, params: &Value) -> Option<(u16,
     let body = json!({"jsonrpc": "1.0", "id": 1, "method": method, "params": params}).to_string();
     // "dGVzdDp0ZXN0" is base64 of test:test
     let request = format!(
-        "POST / HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nAuthorization: Basic dGVzdDp0ZXN0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nAuthorization: Basic dGVzdDp0ZXN0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         body.len(),
         body
     );
@@ -242,7 +242,8 @@ fn divid_command_line_starts_the_node() {
     assert_eq!(daemon.rpc("getblockcount", json!([])), json!(0));
 }
 
-/// divid's start-up refusals and -help / -version, exit code 1 (divid.cpp)
+/// divid's start-up refusals, with irondivid's exit codes (diag.md R3), and
+/// -help / -version, exit code 1 as divid's (divid.cpp)
 #[test]
 fn start_up_refusals_are_divid_s() {
     let bin = env!("CARGO_BIN_EXE_irondivid");
@@ -255,7 +256,8 @@ fn start_up_refusals_are_divid_s() {
             missing.display()
         )
     );
-    assert_eq!(out.status.code(), Some(1));
+    // The data directory (R3)
+    assert_eq!(out.status.code(), Some(4));
     assert!(!missing.exists(), "the data directory was created");
 
     let dir = tempfile::tempdir().unwrap();
@@ -268,7 +270,8 @@ fn start_up_refusals_are_divid_s() {
         String::from_utf8_lossy(&out.stderr),
         "Error: Invalid combination of -regtest and -testnet.\n"
     );
-    assert_eq!(out.status.code(), Some(1));
+    // Usage (R3)
+    assert_eq!(out.status.code(), Some(2));
 
     for flag in ["-help", "-?", "-version"] {
         let out = output_within(Command::new(bin).arg(flag));
@@ -337,7 +340,8 @@ fn refused_starts_print_divid_s_error_line() {
         errors(&out),
         ["Error: You need to rebuild the database using -reindex to change -txindex"]
     );
-    assert_eq!(out.status.code(), Some(1));
+    // The database (R3)
+    assert_eq!(out.status.code(), Some(5));
 
     // A key made here, in divi.conf: not regtest's spork key
     let key = divi_crypto::keys::SecretKey::new_random();
@@ -351,7 +355,8 @@ fn refused_starts_print_divid_s_error_line() {
         errors(&out),
         ["Error: Unable to sign spork message, wrong key?"]
     );
-    assert_eq!(out.status.code(), Some(1));
+    // An option's value (R3)
+    assert_eq!(out.status.code(), Some(2));
 }
 
 /// A spend of the node's first coin to one OP_TRUE output, which is not
@@ -690,7 +695,8 @@ fn upgradewallet_below_the_base_version_refuses_a_new_wallet() {
         errors,
         ["Error: Error loading wallet.dat: database load failure"]
     );
-    assert_eq!(out.status.code(), Some(1));
+    // The wallet (R3)
+    assert_eq!(out.status.code(), Some(6));
 
     for option in ["-upgradewallet=3000000", "-upgradewallet"] {
         let rpc_port = free_port();

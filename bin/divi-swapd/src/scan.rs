@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 Bert Shuler
+// Copyright (C) 2026 human
 // IronDivi - https://github.com/DiviDomains/IronDivi
 //
 // This program is free software: you can redistribute it and/or modify
@@ -138,6 +138,48 @@ pub async fn run_scan<S: WalletScan>(
             }
         }
     }
+}
+
+/// After [`run_scan`]: keep the saved cursor within `lag` blocks of the tip, checking every
+/// `every`, so a restart only rescans what arrived since. Status stays `Done` throughout and
+/// a failure is only logged; the next round resumes from the saved cursor.
+///
+/// The wallet has no reorg handling, so the lag is the whole defence against learning a
+/// coin from a block that is later orphaned. Re-applying a known transaction is harmless
+/// (`apply_tx` dedups by outpoint and keeps spent tombstones), so this may run beside the
+/// scheduler.
+pub async fn follow_tip<S: WalletScan>(
+    s: &S,
+    status: &ScanStatus,
+    chunk: u64,
+    lag: u64,
+    every: Duration,
+) {
+    loop {
+        tokio::time::sleep(every).await;
+        if let Err(e) = follow_once(s, status, chunk.max(1), lag).await {
+            tracing::warn!(error = %e, "divi wallet follow scan failed; will retry");
+        }
+    }
+}
+
+/// One round of [`follow_tip`]: scan the saved cursor up to `tip - lag`.
+pub async fn follow_once<S: WalletScan>(
+    s: &S,
+    status: &ScanStatus,
+    chunk: u64,
+    lag: u64,
+) -> Result<(), String> {
+    let Some(mut next) = s.scanned_height() else {
+        return Ok(());
+    };
+    let target = s.tip().await?.saturating_sub(lag);
+    while next <= target {
+        let to = (next + chunk - 1).min(target);
+        next = s.scan_range(next, to).await?;
+        status.set(ScanState::Done, next, target, None);
+    }
+    Ok(())
 }
 
 async fn scan_pass<S: WalletScan>(

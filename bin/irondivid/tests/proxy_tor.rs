@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 Bert Shuler
+// Copyright (C) 2026 human
 // IronDivi - https://github.com/DiviDomains/IronDivi
 //
 // This program is free software: you can redistribute it and/or modify
@@ -344,7 +344,8 @@ fn dns_off_refuses_host_names_at_start() {
     let dir = tempfile::tempdir().unwrap();
     let text = exit_text(dir.path(), &["-dns=0", "-externalip=localhost"]);
     assert!(
-        text.contains("Cannot resolve -externalip address: 'localhost'"),
+        // The refusal names the option, not its value (R3)
+        text.contains("Cannot resolve -externalip address"),
         "{text}"
     );
 }

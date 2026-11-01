@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 Bert Shuler
+// Copyright (C) 2026 human
 // IronDivi - https://github.com/DiviDomains/IronDivi
 //
 // This program is free software: you can redistribute it and/or modify
@@ -137,7 +137,7 @@ fn a_seed_restore_moves_the_wallet_before_the_chain_is_opened() {
     )
     .unwrap();
     let (code, err) = failed_start(&mut irondivid(dir.path(), free_port()));
-    assert_eq!(code, Some(1), "{err}");
+    assert_eq!(code, Some(5), "{err}");
     let names = names(dir.path());
     assert!(
         names
@@ -159,7 +159,7 @@ fn the_wallet_is_backed_up_before_the_chain_is_opened() {
     let before = names(&backups).len();
     damage_chain(dir.path());
     let (code, err) = failed_start(&mut irondivid(dir.path(), free_port()));
-    assert_eq!(code, Some(1), "{err}");
+    assert_eq!(code, Some(5), "{err}");
     assert_eq!(names(&backups).len(), before + 1, "{:?}", names(&backups));
 }
 
@@ -175,7 +175,7 @@ fn masternode_conf_is_not_made_by_a_start_that_fails_at_the_chain() {
     std::fs::remove_file(&conf).unwrap();
     damage_chain(dir.path());
     let (code, err) = failed_start(&mut irondivid(dir.path(), free_port()));
-    assert_eq!(code, Some(1), "{err}");
+    assert_eq!(code, Some(5), "{err}");
     assert!(!conf.exists(), "{:?}", names(dir.path()));
 }
 
@@ -185,7 +185,7 @@ fn masternode_conf_is_not_made_by_a_start_that_fails_at_the_chain() {
 fn the_masternode_check_comes_after_the_wallet_is_made() {
     let dir = tempfile::tempdir().unwrap();
     let (code, err) = failed_start(irondivid(dir.path(), free_port()).arg("-masternode=1"));
-    assert_eq!(code, Some(1), "{err}");
+    assert_eq!(code, Some(2), "{err}");
     assert!(
         err.lines()
             .any(|l| l == "Error: Unknown masternode configuration for masternode=<alias>."),
@@ -214,7 +214,7 @@ fn a_first_bind_that_is_no_address_stops_the_start_with_divid_s_error() {
         .env("WALLET_MNEMONIC", WALLET_MNEMONIC)
         .env("WALLET_LOOKAHEAD", "5");
     let (code, err) = failed_start(&mut cmd);
-    assert_eq!(code, Some(1), "{err}");
+    assert_eq!(code, Some(2), "{err}");
     assert_eq!(
         err.lines().find(|l| l.starts_with("Error")),
         Some("Error: Cannot resolve -bind address: 'garbage'"),

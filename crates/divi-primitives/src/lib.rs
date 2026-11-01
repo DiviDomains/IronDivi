@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 Bert Shuler
+// Copyright (C) 2026 human
 // IronDivi - https://github.com/DiviDomains/IronDivi
 //
 // This program is free software: you can redistribute it and/or modify
@@ -18,9 +18,11 @@ pub mod amount;
 pub mod block;
 pub mod clock;
 pub mod compact;
+pub mod counted;
 pub mod error;
 pub mod hash;
 pub mod lottery;
+pub mod redact;
 pub mod script;
 pub mod serialize;
 pub mod test_vectors;

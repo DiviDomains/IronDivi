@@ -13,7 +13,7 @@ child, and a cross-group DLEQ proof tying each party's secp256k1 adaptor point t
 spend-key share. The design write-up is `docs/plans/swap-poc/xmr-design.md`.
 
 **Gate C** (`xmr-mainnet-plan.md:54-58`): every finding is fixed or accepted in writing by
-Bert. No mainnet or real-funds swap runs before then (`xmr-mainnet-plan.md:72-74`).
+Human. No mainnet or real-funds swap runs before then (`xmr-mainnet-plan.md:72-74`).
 
 | In scope | Out of scope |
 |---|---|
@@ -362,5 +362,5 @@ exercises a malleated Tx_cancel or a Tx_cancel with a reduced output value.
 | Commit under review | `e6a6fad` (on `main`): the first commit with this brief and the corrected `xmr-design.md` malleability note. The Rust tree is unchanged since `99e8864` (`ab36dbc` plus the swap-view `t_cancel`/`t_punish` fields and swap-watch alerting) |
 | Repository access | GitHub `DiviDomains/IronDivi` (`git remote -v`), read access _TBD_ |
 | Findings format | one entry per finding: severity, `path:line`, scenario, suggested fix |
-| Findings go to | Bert; each closed as fixed (commit) or accepted in writing, recorded in `xmr-mainnet-plan.md` decision log |
+| Findings go to | Human; each closed as fixed (commit) or accepted in writing, recorded in `xmr-mainnet-plan.md` decision log |
 | Deadline for Gate C | _TBD_ |

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 Bert Shuler
+// Copyright (C) 2026 human
 // IronDivi - https://github.com/DiviDomains/IronDivi
 //
 // This program is free software: you can redistribute it and/or modify
@@ -35,7 +35,7 @@ use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::timeout;
 use tokio_util::codec::FramedRead;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 /// Timeout for connection establishment in milliseconds: Divi Core's
 /// -timeout, default 5000 (net.cpp DEFAULT_CONNECT_TIMEOUT)
@@ -140,7 +140,7 @@ impl Connection {
         // connection when the proxy fails
         let stream = match proxy {
             Some(proxy) => {
-                info!(
+                debug!(
                     "Connecting to {} via proxy {}",
                     crate::peer_log::address(addr),
                     proxy.addr
@@ -150,7 +150,7 @@ impl Connection {
                     .map_err(|_| NetworkError::Timeout)??
             }
             None => {
-                info!("Connecting to {}", crate::peer_log::address(addr));
+                debug!("Connecting to {}", crate::peer_log::address(addr));
                 timeout(connect_timeout(), TcpStream::connect(addr))
                     .await
                     .map_err(|_| NetworkError::Timeout)?
@@ -197,7 +197,7 @@ impl Connection {
         } else {
             "a peer".to_string()
         };
-        info!("Connecting to {} via proxy {}", dest, proxy.addr);
+        debug!("Connecting to {} via proxy {}", dest, proxy.addr);
         let stream = timeout(
             connect_timeout(),
             crate::socks5::connect_to_name(proxy, host, port),
@@ -289,7 +289,7 @@ impl Connection {
         local: Arc<crate::local::LocalAddresses>,
     ) -> Result<(Self, PeerHandle), NetworkError> {
         let addr = stream.peer_addr()?;
-        info!(
+        debug!(
             "Accepting connection from {}",
             crate::peer_log::address(addr)
         );
@@ -370,7 +370,7 @@ impl Connection {
             _ = stop.recv() => Err(NetworkError::Connection("the node is stopping".into())),
         };
         if let Err(e) = handshake {
-            error!(
+            debug!(
                 "Handshake failed with {}: {}",
                 crate::peer_log::peer(self.peer_id, self.info.addr),
                 e
@@ -464,7 +464,7 @@ impl Connection {
 
         // Divi Core IsSelfConnection: our own version came back
         if self.local_nonces.lock().contains(&their_version.nonce) {
-            info!(
+            debug!(
                 "Connected to self at {}, disconnecting",
                 crate::peer_log::peer(self.peer_id, self.info.addr)
             );
@@ -624,7 +624,7 @@ impl Connection {
             let deadline = handshake_deadline(&self.info);
             let now = self.info.clock.now();
             if now >= deadline {
-                info!(
+                debug!(
                     "{} sent no version in time ({} bytes in, {} out), disconnecting",
                     crate::peer_log::peer(self.peer_id, self.info.addr),
                     self.info.bytes_recv,
@@ -743,7 +743,7 @@ impl Connection {
             )
             .await
             {
-                error!(
+                debug!(
                     "Failed to send keepalive ping to {}: {}",
                     crate::peer_log::peer(peer_id, info.addr),
                     e
@@ -765,7 +765,7 @@ impl Connection {
 
                 // Check for shutdown signal (highest priority)
                 _ = shutdown_rx.recv() => {
-                    info!("Shutdown signal received, disconnecting from {}", crate::peer_log::peer(peer_id, info.addr));
+                    debug!("Shutdown signal received, disconnecting from {}", crate::peer_log::peer(peer_id, info.addr));
                     break;
                 }
 
@@ -773,11 +773,11 @@ impl Connection {
                 // manager drops this peer (disconnect, ban): end the connection.
                 msg = outbound_rx.recv() => {
                     let Some(msg) = msg else {
-                        info!("Disconnecting from {} (dropped by the peer manager)", crate::peer_log::peer(peer_id, info.addr));
+                        debug!("Disconnecting from {} (dropped by the peer manager)", crate::peer_log::peer(peer_id, info.addr));
                         break;
                     };
                     if let Err(e) = Self::write_queued(&mut writer, &mut info, magic, &total_bytes_sent, &stats, &mut last_ping_sent, msg).await {
-                        error!("Failed to send message to {}: {}", crate::peer_log::peer(peer_id, info.addr), e);
+                        debug!("Failed to send message to {}: {}", crate::peer_log::peer(peer_id, info.addr), e);
                         break;
                     }
                 }
@@ -785,7 +785,7 @@ impl Connection {
                 // Proactive keepalive ping
                 _ = ping_timer.tick() => {
                     if inactivity_exceeded(info.last_send, last_bytes_in(&info, framed.decoder()), info.ping_time, info.clock.now()) {
-                        info!("{} inactive for {:?}, disconnecting", crate::peer_log::peer(peer_id, info.addr), TIMEOUT_INTERVAL);
+                        debug!("{} inactive for {:?}, disconnecting", crate::peer_log::peer(peer_id, info.addr), TIMEOUT_INTERVAL);
                         break;
                     }
                     let now = info.clock.now();
@@ -798,7 +798,7 @@ impl Connection {
                         info.ping_time = Some(now);
                         last_ping_sent = Some(now);
                         if let Err(e) = Self::write_message(&mut writer, &mut info, magic, &total_bytes_sent, NetworkMessage::Ping(nonce)).await {
-                            error!("Failed to send keepalive ping to {}: {}", crate::peer_log::peer(peer_id, info.addr), e);
+                            debug!("Failed to send keepalive ping to {}: {}", crate::peer_log::peer(peer_id, info.addr), e);
                             break;
                         }
                     }
@@ -808,7 +808,7 @@ impl Connection {
                 // write the answers whose turn has come
                 _ = stats.recv_space.notified(), if !can_receive || !waiting.is_empty() => {
                     if let Err(e) = Self::write_turns(&mut writer, &mut info, magic, &total_bytes_sent, &stats, &mut last_ping_sent, &mut outbound_rx, &mut waiting).await {
-                        error!("Failed to send message to {}: {}", crate::peer_log::peer(peer_id, info.addr), e);
+                        debug!("Failed to send message to {}: {}", crate::peer_log::peer(peer_id, info.addr), e);
                         break;
                     }
                 }
@@ -822,7 +822,7 @@ impl Connection {
                             total_bytes_recv.fetch_add(bytes_received, Ordering::Relaxed);
                             Self::answer_in_turn(&stats, &mut waiting, duplicate_version_reject());
                             if let Err(e) = Self::write_turns(&mut writer, &mut info, magic, &total_bytes_sent, &stats, &mut last_ping_sent, &mut outbound_rx, &mut waiting).await {
-                                error!("Failed to send reject to {}: {}", crate::peer_log::peer(peer_id, info.addr), e);
+                                debug!("Failed to send reject to {}: {}", crate::peer_log::peer(peer_id, info.addr), e);
                                 break;
                             }
                             let _ = event_tx.send(duplicate_version(peer_id));
@@ -844,7 +844,7 @@ impl Connection {
                             if let Some(answer) = malformed_reject(&command) {
                                 Self::answer_in_turn(&stats, &mut waiting, answer);
                                 if let Err(e) = Self::write_turns(&mut writer, &mut info, magic, &total_bytes_sent, &stats, &mut last_ping_sent, &mut outbound_rx, &mut waiting).await {
-                                    error!("Failed to send reject to {}: {}", crate::peer_log::peer(peer_id, info.addr), e);
+                                    debug!("Failed to send reject to {}: {}", crate::peer_log::peer(peer_id, info.addr), e);
                                     break;
                                 }
                             }
@@ -870,19 +870,19 @@ impl Connection {
                             }
                         }
                         Ok(Some(Err(e))) => {
-                            error!("Error reading from {}: {}", crate::peer_log::peer(peer_id, info.addr), e);
+                            debug!("Error reading from {}: {}", crate::peer_log::peer(peer_id, info.addr), e);
                             break;
                         }
                         Ok(None) => {
                             // Stream ended (connection closed)
-                            info!("Connection closed by {}", crate::peer_log::peer(peer_id, info.addr));
+                            debug!("Connection closed by {}", crate::peer_log::peer(peer_id, info.addr));
                             break;
                         }
                         Err(_) => {
                             // A quiet peer gets no extra ping: the keepalive above
                             // runs on its own interval, as in Divi Core
                             if inactivity_exceeded(info.last_send, last_bytes_in(&info, framed.decoder()), info.ping_time, info.clock.now()) {
-                                info!("{} inactive for {:?}, disconnecting", crate::peer_log::peer(peer_id, info.addr), TIMEOUT_INTERVAL);
+                                debug!("{} inactive for {:?}, disconnecting", crate::peer_log::peer(peer_id, info.addr), TIMEOUT_INTERVAL);
                                 break;
                             }
                         }

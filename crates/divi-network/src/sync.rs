@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 Bert Shuler
+// Copyright (C) 2026 human
 // IronDivi - https://github.com/DiviDomains/IronDivi
 //
 // This program is free software: you can redistribute it and/or modify
@@ -26,7 +26,7 @@ use divi_storage::{Chain, StorageError};
 
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
@@ -69,6 +69,13 @@ const LAST_POW_BLOCK: u32 = 100;
 
 /// Maximum time to keep an orphan block before discarding
 const ORPHAN_BLOCK_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// How far behind the best peer the node may be and still count as caught up
+/// for the sync lines at info. A synced node trails its peers by a block or
+/// two while a peer's block is in flight; writing "Block sync complete" or
+/// "Sync progress" then would mark peer blocks and leave out own staked blocks
+/// (which never pass through the sync), naming them in default logs.
+const CAUGHT_UP_LAG: u32 = 6;
 
 /// Result of header validation
 #[derive(Debug)]
@@ -317,6 +324,27 @@ struct OrphanBlock {
 /// Callback for when a block is connected to the chain
 pub type BlockConnectedCallback = Arc<dyn Fn(&Block, u32) + Send + Sync>;
 
+/// The one "Connected block" line. Every path that connects a block writes
+/// it: a peer's block, an orphan, an own staked block, the node API and the
+/// bootstrap import, so an own block logs like a peer's (A11 "Own blocks
+/// log like peer blocks" item 1). The explicit target lets the `net` and
+/// `sync` debug categories select it whichever module calls it.
+pub fn log_block_connected(hash: &Hash256, height: u32) {
+    debug!(
+        target: "divi_network::sync",
+        "Connected block {} at height {}", hash, height
+    );
+}
+
+/// The one line for a block that does not connect, with its error (A11
+/// "Own blocks log like peer blocks" item 2)
+pub fn log_block_connect_failed(hash: &Hash256, err: &dyn std::fmt::Display) {
+    error!(
+        target: "divi_network::sync",
+        "Failed to connect block {}: {}", hash, err
+    );
+}
+
 /// Callback for when a chain reorganization occurs (parameter is fork height)
 pub type ReorgCallback = Arc<dyn Fn(u32) + Send + Sync>;
 
@@ -381,6 +409,9 @@ pub struct BlockSync {
     /// A growing side chain counts as progress: while a deep fork is fetched the
     /// main-chain height stays put for many rounds.
     stall_counter: RwLock<((u32, u32), u32)>,
+    /// The node was more than `CAUGHT_UP_LAG` blocks behind since it last
+    /// wrote "Block sync complete" (true until the first sync completes)
+    fell_behind: AtomicBool,
     /// Sync peers that stalled since the chain last moved: the next sync peer
     /// is one not in here, until every peer has had its turn
     stalled_sync_peers: RwLock<HashSet<PeerId>>,
@@ -464,6 +495,7 @@ impl BlockSync {
             reorg_callback: RwLock::new(None),
             orphaned_tx_callback: RwLock::new(None),
             stall_counter: RwLock::new(((0, 0), 0)),
+            fell_behind: AtomicBool::new(true),
             stalled_sync_peers: RwLock::new(HashSet::new()),
             side_chain_tip: RwLock::new(None),
             sync_started_peers: RwLock::new(HashSet::new()),
@@ -549,7 +581,7 @@ impl BlockSync {
     pub fn update_peer_height(&self, peer_id: PeerId, height: u32) {
         self.peer_heights.write().insert(peer_id, height);
         let total_peers = self.peer_heights.read().len();
-        info!(
+        debug!(
             "Added peer {} with height {}, now have {} peers",
             peer_id, height, total_peers
         );
@@ -559,7 +591,7 @@ impl BlockSync {
         let old_best = *best;
         if height > *best {
             *best = height;
-            info!("New best peer height: {} (peer {})", height, peer_id);
+            debug!("New best peer height: {} (peer {})", height, peer_id);
         }
         drop(best); // Release lock before checking sync state
 
@@ -585,7 +617,7 @@ impl BlockSync {
                     "Already synced (height {} >= best peer {}), exiting IBD mode",
                     our_height, best
                 );
-                *self.state.write() = SyncState::Synced;
+                self.enter_synced();
                 self.chain.set_ibd_mode(false);
             }
         }
@@ -651,7 +683,7 @@ impl BlockSync {
         for peer_id in due {
             let locator = self.build_block_locator();
             let msg = NetworkMessage::GetBlocks(GetHeadersMessage::new(locator, Hash256::zero()));
-            info!(
+            debug!(
                 "Sending getblocks to peer {} from height {} (start of sync)",
                 peer_id,
                 self.chain.height()
@@ -680,7 +712,7 @@ impl BlockSync {
         let remaining_peers = self.peer_heights.read().len();
 
         if let Some(height) = removed_height {
-            info!(
+            debug!(
                 "Removed peer {} (was at height {}), {} peers remaining",
                 peer_id, height, remaining_peers
             );
@@ -767,7 +799,7 @@ impl BlockSync {
 
         if our_height >= best_height {
             info!("Chain is up to date (height {})", our_height);
-            *self.state.write() = SyncState::Synced;
+            self.enter_synced();
             return;
         }
 
@@ -809,7 +841,7 @@ impl BlockSync {
             NetworkMessage::GetBlocks(GetHeadersMessage::new(locator.clone(), Hash256::zero()));
 
         let locator_tip = locator.first().map(|h| h.to_string()).unwrap_or_default();
-        info!(
+        debug!(
             "Sending getblocks to peer {} from height {} (locator tip: {}...)",
             peer_id,
             self.chain.height(),
@@ -1014,7 +1046,7 @@ impl BlockSync {
             }
         } else {
             let genesis_hash = self.chain.genesis_hash();
-            info!(
+            debug!(
                 "Empty chain - using genesis hash in locator: {}",
                 genesis_hash
             );
@@ -1035,14 +1067,19 @@ impl BlockSync {
                 *self.state.write() = SyncState::BlockDownload;
                 self.request_blocks().await;
             } else {
-                // We're synced
-                *self.state.write() = SyncState::Synced;
-                info!("Header sync complete");
+                // We're synced. Logged at info only after a real catch-up:
+                // near the tip this fires about once per peer block, and
+                // never for an own block (see CAUGHT_UP_LAG)
+                if self.enter_synced() {
+                    info!("Header sync complete");
+                } else {
+                    debug!("Header sync complete");
+                }
             }
             return;
         }
 
-        info!(
+        debug!(
             "Received {} headers from peer {} (first: {})",
             headers.len(),
             peer_id,
@@ -1116,7 +1153,7 @@ impl BlockSync {
             self.request_headers().await;
         } else {
             // Switch to block download
-            info!(
+            debug!(
                 "Header sync complete, {} headers pending",
                 self.pending_headers.read().len()
             );
@@ -1446,7 +1483,7 @@ impl BlockSync {
                     self.note_block_accepted(&hash);
                     // Remove from pending headers
                     self.pending_headers.write().pop_front();
-                    debug!("Connected block {} at height {}", hash, height);
+                    log_block_connected(&hash, height);
 
                     // Call block connected callback if set
                     if let Some(callback) = self.block_connected_callback.read().as_ref() {
@@ -1454,7 +1491,7 @@ impl BlockSync {
                     }
                 }
                 Err(e) => {
-                    error!("Failed to connect block {}: {}", hash, e);
+                    log_block_connect_failed(&hash, &e);
                     self.note_block_rejected(&hash, &e);
                     break;
                 }
@@ -1483,16 +1520,22 @@ impl BlockSync {
             let best_height = *self.best_peer_height.read();
 
             if our_height >= best_height {
-                info!("Block sync complete at height {}", our_height);
-                *self.state.write() = SyncState::Synced;
+                // Log only on the transition into Synced after a real catch-up.
+                // Writing this per peer block would leave a height gap at every
+                // own staked block (own blocks never pass through here), naming
+                // them in default logs; see CAUGHT_UP_LAG.
+                if self.enter_synced() {
+                    info!("Block sync complete at height {}", our_height);
+                }
                 // Disable IBD mode — enable full PoS and script validation for new blocks
                 if self.chain.is_ibd() {
                     info!("Exiting IBD mode — full validation enabled for new blocks");
                     self.chain.set_ibd_mode(false);
                 }
             } else {
+                self.note_lag(our_height, best_height);
                 // Need to sync more - request next batch of block hashes
-                info!(
+                debug!(
                     "All queues empty, requesting more blocks (at height {}, target {})",
                     our_height, best_height
                 );
@@ -1534,7 +1577,7 @@ impl BlockSync {
                         .take(3)
                         .map(|b| format!("{}", b.header.prev_block))
                         .collect();
-                    info!(
+                    debug!(
                         "try_connect_blocks_by_prev: tip={}, downloaded={} blocks, sample prev_blocks: {:?}",
                         tip_hash, downloaded.len(), sample_prev
                     );
@@ -1564,7 +1607,7 @@ impl BlockSync {
                     }
                     let height = self.chain.height();
                     self.note_block_accepted(&hash);
-                    debug!("Connected block {} at height {}", hash, height);
+                    log_block_connected(&hash, height);
                     self.stats.write().blocks_connected += 1;
 
                     // Call block connected callback if set
@@ -1573,7 +1616,7 @@ impl BlockSync {
                     }
                 }
                 Err(e) => {
-                    error!("Failed to connect block {}: {}", hash, e);
+                    log_block_connect_failed(&hash, &e);
                     self.note_block_rejected(&hash, &e);
                     break;
                 }
@@ -1617,10 +1660,7 @@ impl BlockSync {
                         // Check if our height changed (reorg happened)
                         let new_height = self.chain.height();
                         if new_height > initial_height {
-                            info!(
-                                "Chain reorganized! Height changed from {} to {} after accepting block {}",
-                                initial_height, new_height, hash
-                            );
+                            log_block_connected(&hash, new_height);
 
                             // Call block connected callback if set
                             if let Some(callback) = self.block_connected_callback.read().as_ref() {
@@ -1708,6 +1748,30 @@ impl BlockSync {
         }
     }
 
+    /// Enter Synced. True when this ends a real catch-up (the node had
+    /// fallen more than CAUGHT_UP_LAG behind): only then may the caller write
+    /// an info line. Every way into Synced goes through here, so the flag is
+    /// cleared by whichever path first reaches the tip
+    fn enter_synced(&self) -> bool {
+        let was_synced = {
+            let mut state = self.state.write();
+            let was = *state == SyncState::Synced;
+            *state = SyncState::Synced;
+            was
+        };
+        !was_synced && self.fell_behind.swap(false, Ordering::Relaxed)
+    }
+
+    /// Whether the node is more than `CAUGHT_UP_LAG` blocks behind `target`;
+    /// remembers it for the next "Block sync complete"
+    fn note_lag(&self, our_height: u32, target: u32) -> bool {
+        let far = target.saturating_sub(our_height) > CAUGHT_UP_LAG;
+        if far {
+            self.fell_behind.store(true, Ordering::Relaxed);
+        }
+        far
+    }
+
     /// Check for stalled downloads and retry
     pub async fn check_timeouts(&self) {
         let now = Instant::now();
@@ -1719,7 +1783,9 @@ impl BlockSync {
         let in_flight = self.blocks_in_flight.read().len();
         let queued = self.pending_block_requests.read().len();
 
-        if state != SyncState::Synced && state != SyncState::Idle {
+        // Within CAUGHT_UP_LAG the node is only waiting on a peer's block
+        let far_behind = self.note_lag(our_height, target_height);
+        if state != SyncState::Synced && state != SyncState::Idle && far_behind {
             info!(
                 "Sync progress: height {}/{}, state {:?}, in_flight={}, queued={}",
                 our_height, target_height, state, in_flight, queued
@@ -1736,10 +1802,17 @@ impl BlockSync {
             if stall.0 == progress && state != SyncState::Synced && state != SyncState::Idle {
                 stall.1 += 1;
                 if stall.1 >= 3 {
-                    warn!(
-                        "Sync stalled at height {} for {} cycles, rotating sync peer",
-                        our_height, stall.1
-                    );
+                    if far_behind {
+                        warn!(
+                            "Sync stalled at height {} for {} cycles, rotating sync peer",
+                            our_height, stall.1
+                        );
+                    } else {
+                        debug!(
+                            "Sync stalled at height {} for {} cycles, rotating sync peer",
+                            our_height, stall.1
+                        );
+                    }
                     stall.1 = 0;
                     true
                 } else {
@@ -1835,7 +1908,7 @@ impl BlockSync {
                     let downloaded = self.downloaded_blocks.write();
                     let now = Instant::now();
 
-                    info!(
+                    debug!(
                         "Moving {} downloaded blocks to orphan storage (can't connect to tip {} at height {})",
                         remaining_count, tip_hash, our_height
                     );
@@ -1894,7 +1967,7 @@ impl BlockSync {
             let peer_count = self.peer_heights.read().len();
             if peer_count > 0 && target_height > our_height {
                 // We have peers and they're ahead - try to sync
-                info!(
+                debug!(
                     "Peers available with higher height ({} vs {}), requesting headers",
                     target_height, our_height
                 );
@@ -1965,7 +2038,7 @@ impl BlockSync {
         }
 
         if block_count > 0 {
-            info!(
+            debug!(
                 "Received inv with {} block hashes from peer {}",
                 block_count, peer_id
             );
@@ -1999,13 +2072,13 @@ impl BlockSync {
                         let has_index =
                             self.chain.get_block_index(&hash).is_ok_and(|o| o.is_some());
                         let has_full = self.chain.has_full_block(&hash).unwrap_or(false);
-                        info!(
+                        debug!(
                             "First inv block: hash={}, has_index={}, has_full_block={}",
                             hash, has_index, has_full
                         );
                         if has_index {
                             if let Ok(Some(index)) = self.chain.get_block_index(&hash) {
-                                info!(
+                                debug!(
                                     "  Block index exists: height={}, on_main_chain={}",
                                     index.height,
                                     index.is_on_main_chain()
@@ -2102,14 +2175,14 @@ impl BlockSync {
         }
 
         if block_count > 0 {
-            info!(
+            debug!(
                 "Inventory result: queued={}, already_have={}, already_downloading={}",
                 queued, already_have, already_downloading
             );
         }
         if known_side_chain > 0 {
             let side = *self.side_chain_tip.read();
-            info!(
+            debug!(
                 "{} inv blocks are already stored on a side chain (side-chain tip {:?}, main tip height {}); \
                  waiting for that fork to out-work the tip",
                 known_side_chain,
@@ -2125,7 +2198,7 @@ impl BlockSync {
         if let Some(locator) =
             self.inv_continuation_locator(block_count, queued, already_downloading, last_block_hash)
         {
-            info!(
+            debug!(
                 "All {} inv blocks already known; continuing getblocks from {} (long side chain)",
                 block_count, locator[0]
             );
@@ -2150,7 +2223,7 @@ impl BlockSync {
             let new_estimated_height = our_height + queued as u32;
             let current_best = *self.best_peer_height.read();
             if new_estimated_height > current_best {
-                info!(
+                debug!(
                     "Updating best_peer_height from {} to {} based on inv announcements",
                     current_best, new_estimated_height
                 );
@@ -2377,7 +2450,7 @@ impl BlockSync {
         };
 
         if attempts >= MAX_BLOCK_REQUEST_ATTEMPTS {
-            info!(
+            debug!(
                 "Giving up on block {} after {} failed requests (last: peer {} {}); \
                  will retry if a new peer announces it or after {}s",
                 hash,
@@ -2478,7 +2551,7 @@ impl BlockSync {
                             self.fire_reorg_callbacks(fork_height, result.orphaned_transactions);
                         }
                         let height = self.chain.height();
-                        info!("Connected orphan block {} at height {}", hash, height);
+                        log_block_connected(&hash, height);
 
                         // Remove from orphans
                         self.orphan_blocks.write().remove(&hash);
@@ -2533,7 +2606,7 @@ impl BlockSync {
             orphans.len()
         };
 
-        info!(
+        debug!(
             "Requesting blocks to fill gap at height {} for {} orphans",
             our_height, orphan_count
         );
@@ -2557,7 +2630,7 @@ impl BlockSync {
 
         if let Some(peer) = alt_peer {
             *self.sync_peer.write() = Some(peer);
-            info!(
+            debug!(
                 "Switching to alternative peer {} for gap fill (was {:?})",
                 peer, current_sync
             );
@@ -2623,6 +2696,46 @@ mod tests {
             sync.inv_continuation_locator(500, 0, 0, Some(unknown)),
             None
         );
+    }
+
+    /// A synced node trailing its peers by a block (a peer's block announced
+    /// and not yet connected) must not write "Block sync complete" again when
+    /// it catches up: that line would mark peer blocks and skip own stakes
+    #[tokio::test]
+    async fn short_lag_does_not_rearm_sync_complete() {
+        let (sync, _dir) = create_test_sync();
+        let our = sync.chain.height();
+
+        // First catch-up: written
+        sync.try_connect_blocks().await;
+        assert_eq!(sync.state(), SyncState::Synced);
+        assert!(!sync.fell_behind.load(Ordering::Relaxed));
+
+        // One block behind, queues empty: leaves Synced, but not "behind"
+        *sync.best_peer_height.write() = our + 1;
+        sync.try_connect_blocks().await;
+        assert_eq!(sync.state(), SyncState::HeaderSync);
+        assert!(!sync.fell_behind.load(Ordering::Relaxed));
+        sync.check_timeouts().await;
+        assert!(!sync.fell_behind.load(Ordering::Relaxed));
+
+        // Caught up again: Synced, with no line to write
+        *sync.best_peer_height.write() = our;
+        sync.try_connect_blocks().await;
+        assert_eq!(sync.state(), SyncState::Synced);
+        assert!(!sync.fell_behind.load(Ordering::Relaxed));
+
+        // Far behind: the next catch-up is written
+        *sync.best_peer_height.write() = our + CAUGHT_UP_LAG + 1;
+        sync.try_connect_blocks().await;
+        assert!(sync.fell_behind.load(Ordering::Relaxed));
+
+        // Any way into Synced ends the catch-up: an empty headers reply
+        // clears the flag, so no stray line follows on a later peer block
+        *sync.best_peer_height.write() = our;
+        sync.handle_headers(1, Vec::new()).await;
+        assert_eq!(sync.state(), SyncState::Synced);
+        assert!(!sync.fell_behind.load(Ordering::Relaxed));
     }
 
     #[test]

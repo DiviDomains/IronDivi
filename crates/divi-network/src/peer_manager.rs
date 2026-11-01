@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 Bert Shuler
+// Copyright (C) 2026 human
 // IronDivi - https://github.com/DiviDomains/IronDivi
 //
 // This program is free software: you can redistribute it and/or modify
@@ -1133,7 +1133,7 @@ impl PeerManager {
                             {
                                 continue;
                             }
-                            info!("Discovered peer: {}", crate::peer_log::address(addr));
+                            debug!("Discovered peer: {}", crate::peer_log::address(addr));
                             let self_clone = Arc::clone(&self);
                             self.spawn_task(format!("dial of seed address {addr}"), async move {
                                 if let Err(e) = self_clone.connect_to_peer(addr).await {
@@ -1189,7 +1189,10 @@ impl PeerManager {
                                 drop(stream);
                                 break;
                             }
-                            info!("Accepted connection from {}", crate::peer_log::address(peer_addr));
+                            debug!(
+                                "Accepted connection from {}",
+                                crate::peer_log::address(peer_addr)
+                            );
 
                             // Divi Core counts every inbound connection, handshake
                             // done or not, against -maxconnections less the outbound
@@ -1633,14 +1636,13 @@ impl PeerManager {
     pub fn broadcast_block_inv(&self, block_hash: Hash256) {
         let inv_item = InvItem::new(InvType::Block, block_hash);
         let msg = NetworkMessage::Inv(vec![inv_item]);
+        // No per-block line: an announce line would mark own blocks (A11)
         let peers = self.peers.read();
-        let peer_count = peers.len();
         for (peer_id, handle) in peers.iter() {
             if let Err(e) = handle.try_send(msg.clone()) {
                 debug!("Failed to send block inv to peer {}: {}", peer_id, e);
             }
         }
-        info!("Broadcast block inv {} to {} peers", block_hash, peer_count);
     }
 
     /// Announce a new tip at `tip_height` with a block inv to the peers Divi
@@ -1650,8 +1652,8 @@ impl PeerManager {
     /// (CoinMinter.cpp:119, PeerNotificationOfMintService.cpp:19-25)
     pub fn announce_new_tip(&self, tip_hash: Hash256, tip_height: u32, exclude: Option<PeerId>) {
         let msg = NetworkMessage::Inv(vec![InvItem::new(InvType::Block, tip_hash)]);
+        // No per-block line, as for broadcast_block_inv (A11)
         let peers = self.peers.read();
-        let mut sent_count = 0;
         for (peer_id, handle) in peers.iter() {
             if Some(*peer_id) == exclude
                 || !announces_new_tip_to(
@@ -1663,17 +1665,8 @@ impl PeerManager {
             }
             if let Err(e) = handle.try_send(msg.clone()) {
                 debug!("Failed to send block inv to peer {}: {}", peer_id, e);
-            } else {
-                sent_count += 1;
             }
         }
-        info!(
-            "Announced new tip {} at height {} to {} of {} peers",
-            tip_hash,
-            tip_height,
-            sent_count,
-            peers.len()
-        );
     }
 
     /// Broadcast a block inv to all connected peers except the one specified.
@@ -1682,21 +1675,15 @@ impl PeerManager {
     pub fn broadcast_block_inv_except(&self, block_hash: Hash256, exclude: PeerId) {
         let inv_item = InvItem::new(InvType::Block, block_hash);
         let msg = NetworkMessage::Inv(vec![inv_item]);
+        // No per-block line, as for broadcast_block_inv (A11)
         let peers = self.peers.read();
-        let mut sent_count = 0;
         for (peer_id, handle) in peers.iter() {
             if *peer_id != exclude {
                 if let Err(e) = handle.try_send(msg.clone()) {
                     debug!("Failed to send block inv to peer {}: {}", peer_id, e);
-                } else {
-                    sent_count += 1;
                 }
             }
         }
-        debug!(
-            "Relayed block inv {} to {} peers (excluding {})",
-            block_hash, sent_count, exclude
-        );
     }
 
     /// The node took a message of `size` bytes from `peer_id`: that peer may
@@ -1967,7 +1954,7 @@ impl PeerManager {
                     continue;
                 }
                 if !self.is_banned(&addr.ip()) && self.claim_dial(addr, DialRule::ByAddress) {
-                    info!(
+                    debug!(
                         "Reconnecting to added node: {}",
                         crate::peer_log::address(addr)
                     );
@@ -2019,7 +2006,7 @@ impl PeerManager {
                 continue;
             }
 
-            info!(
+            debug!(
                 "Peer maintenance: {}/{} outbound peers, attempting reconnection",
                 outbound, target
             );
@@ -2043,7 +2030,7 @@ impl PeerManager {
                     if !self.claim_dial(addr, rule) {
                         continue;
                     }
-                    info!(
+                    debug!(
                         "Reconnecting to static peer: {}",
                         crate::peer_log::address(addr)
                     );
@@ -2075,7 +2062,7 @@ impl PeerManager {
                 && !self.config.connect_only
                 && !self.config.dns_seeds.is_empty()
             {
-                info!("Re-querying DNS seeds for peers");
+                debug!("Re-querying DNS seeds for peers");
                 Arc::clone(&self).discover_peers().await;
             }
         }

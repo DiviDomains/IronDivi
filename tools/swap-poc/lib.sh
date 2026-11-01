@@ -6,7 +6,7 @@ export PATH="$HOME/.local/bin:/opt/homebrew/opt/rustup/bin:$HOME/.cargo/bin:/opt
 ROOT="$(git rev-parse --show-toplevel)"
 cd "$ROOT" || exit 2
 FAILS=0
-# Heavy cargo (clippy, test, run) goes to hp2 via remote-cargo: the Mac is swap-starved (Bert, 2026-10-10).
+# Heavy cargo (clippy, test, run) goes to hp2 via remote-cargo: the Mac is swap-starved (Human, 2026-10-10).
 rcargo() { if command -v remote-cargo >/dev/null 2>&1; then remote-cargo "$@"; else cargo "$@"; fi; }
 fail() { echo "FAIL: $*"; FAILS=$((FAILS + 1)); }
 pass() { echo "ok:   $*"; }
