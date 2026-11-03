@@ -239,6 +239,35 @@ impl fmt::Display for OwnBlockHash {
 }
 both!(OwnBlockHash);
 
+/// A block hash in a public record (A12 tip and reorg lines, A13 bundles):
+/// `blk:<hex>` in clear, whoever staked the block, so ownership never
+/// changes how the entry reads
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct BlockHash(pub Hash256);
+
+impl fmt::Display for BlockHash {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "blk:{}", self.0)
+    }
+}
+both!(BlockHash);
+
+/// A peer's address in a diag record (A12 "peer pseudonym"): always
+/// `peer-xxxxxxxx`, `-logwalletdetail` or not, since it is not a wallet
+/// value; the same address reads the same within one run
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct PeerAddr(pub std::net::IpAddr);
+
+impl fmt::Display for PeerAddr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            std::net::IpAddr::V4(a) => pseudonym(f, "peer", &a.octets()),
+            std::net::IpAddr::V6(a) => pseudonym(f, "peer", &a.octets()),
+        }
+    }
+}
+both!(PeerAddr);
+
 /// A swap identifier: `swp-xxxxxxxx`
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct SwapId<'a>(pub &'a str);
@@ -307,6 +336,23 @@ mod tests {
         assert!(addr.starts_with("wad-") && !addr.contains("CANARY"));
         let label = format!("{:?}", WalletLabel("CANARY-LABEL-7f3e"));
         assert!(label.starts_with("wlb-") && !label.contains("CANARY"));
+    }
+
+    #[test]
+    fn a_peer_address_is_a_pseudonym() {
+        let ip: std::net::IpAddr = "203.0.113.77".parse().unwrap();
+        let p = PeerAddr(ip).to_string();
+        assert!(p.starts_with("peer-") && p.len() == 13, "{}", p);
+        assert!(!p.contains("203") && !p.contains("113"));
+        assert_eq!(p, format!("{:?}", PeerAddr(ip)));
+        assert_ne!(p, PeerAddr("203.0.113.78".parse().unwrap()).to_string());
+    }
+
+    #[test]
+    fn a_public_block_hash_is_in_clear_with_its_prefix() {
+        let h = Hash256::from_bytes([0xab; 32]);
+        assert_eq!(BlockHash(h).to_string(), format!("blk:{}", h));
+        assert_eq!(format!("{:?}", BlockHash(h)), format!("blk:{}", h));
     }
 
     #[test]

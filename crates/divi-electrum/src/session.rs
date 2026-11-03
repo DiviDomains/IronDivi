@@ -33,6 +33,11 @@ pub fn server_version() -> String {
     format!("IronDivi {}", env!("CARGO_PKG_VERSION"))
 }
 
+tokio::task_local! {
+    /// The connection's peer address, for `rpc-methods.log` (diag A15)
+    pub(crate) static PEER: std::net::IpAddr;
+}
+
 struct Session {
     backend: Arc<Backend>,
     banner: Arc<String>,
@@ -213,8 +218,15 @@ impl Session {
             }
             "blockchain.transaction.broadcast" => {
                 let raw = str_arg(params, 0, "raw_tx")?.to_string();
+                // diag A15: only a loopback client's broadcast is the user's
+                let local = PEER.try_with(|ip| ip.is_loopback()).unwrap_or(true);
                 blocking(&self.backend, move |b| {
-                    b.rpc("sendrawtransaction", vec![json!(raw)])
+                    let send = || b.rpc("sendrawtransaction", vec![json!(raw)]);
+                    if local {
+                        send()
+                    } else {
+                        divi_primitives::diag_rpc::as_remote(send)
+                    }
                 })
                 .await
             }
@@ -253,7 +265,16 @@ impl Session {
             ));
         };
         let params = object.get("params").cloned().unwrap_or(json!([]));
+        let transport = divi_primitives::diag_rpc::Transport::Electrum;
+        let call = divi_primitives::diag_rpc::begin(method, transport);
         let result = self.call(method, &params).await;
+        call.finish(
+            method,
+            transport,
+            PEER.try_with(|ip| *ip).ok(),
+            false,
+            result.as_ref().err().map(|e| (e.code, e.message.as_str())),
+        );
         let id = id?;
         Some(match result {
             Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),

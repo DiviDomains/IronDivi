@@ -990,7 +990,10 @@ pub fn mirror_dir(ctx: &Ctx, d: &DataDir) -> Option<PathBuf> {
 }
 
 /// Run `f` on a detached thread; None when it did not return in `secs`
-fn bounded<T: Send + 'static>(secs: u64, f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+pub(crate) fn bounded<T: Send + 'static>(
+    secs: u64,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let _ = tx.send(f());

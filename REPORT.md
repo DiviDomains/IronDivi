@@ -345,3 +345,25 @@ This replaces the release-gate bullet under **Recommendation 21** above.
 - The cggmp21 ignore is removed (deny.toml, and `.cargo/audit.toml` deleted), because scoping makes it unnecessary. If a shipped binary ever links cggmp21, the gate fails.
 - On hp1 the gate passes (rc=0). It reports 0387 (crypto-bigint 0.5.5) and 2025-0127 (cggmp21) as "not in a shipped binary". A copy of the gate that also counts divi-swapd as shipped fails both cargo deny and cargo audit (rc=1). So a vulnerable crate in a shipped binary still stops a release.
 - The release is unblocked.
+
+## NEEDS HUMAN — diag tool (2026-10-31)
+
+1Password is locked on the Mac. `git commit-tree -S` fails with "1Password: agent returned an error". `secret-broker status` shows pending=2.
+
+- **Unlock 1Password, then run `secret-broker slate`** and approve the two queued saves:
+  - #104: diag developer age identity → `op://global_secret_store/irondivi_diag/age_identity`
+  - #105: receiver download token → `op://global_secret_store/irondivi_diag_receiver/download_token`
+- After that, the agent lands the parked work: run `bash /private/tmp/claude-501/-Users-bshuler-code/ac7e31fd-cb8f-4ef4-998f-31442d34e06e/scratchpad/land-all.sh`. It first lands the writer lane's 8 signed commits (A12–A18 trees on e024ba84), then makes the 10 signed Part B commits in order (including --host for Docker and LXD/LXC/Proxmox, the crash-case fixes, and the PR_SET_DUMPABLE fix for --exec-as), then pushes.
+- Then follow the DNS (diag.irondivi.com → dnsdivi), certbot, HTTPS nginx and HTTPS end-to-end steps in `~/code/environment/docs/dnsdivi-diag-irondivi-2026-10-31.md`.
+- The working-tree changes (42 entries) are tested but uncommitted, because commits are never made unsigned.
+
+## diag tool — open agent work (2026-10-31)
+
+Full workspace tests pass on hp3 with the stacked tree (58 suites ok, credential_calls_lint 2/2). Still open:
+- §10 canary (own vs peer tx/block log symmetry on regtest, 3+ peers, default/-debug/-debug=net).
+- manager.rs and backup.rs not converted to the diag log path.
+- A15 panic hook and A10 RPC need server.rs changes; rpc_calls reads n/a in the health test.
+- macOS boot clock and LC_UUID unverified; frame pointers off; non-glibc targets keep no symbols.
+- `--host` untested live on Proxmox, plain LXC, Incus, cgroup v1, memory.peak (fixtures only).
+- A plain `cargo test` writes to ~/.local/state/irondivi; budget tests carry flake risk.
+- hp3 disk at 97%: the irondivi-diag cargo cache (~87 GB) is the first thing to delete.

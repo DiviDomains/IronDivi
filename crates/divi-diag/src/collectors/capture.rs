@@ -10,6 +10,15 @@
 //! Each sample, after the R1 (a) free-space check: the node's process
 //! (alive, resident memory), `getblockcount` and `getconnectioncount`, the
 //! load average, PSI (Linux) and free memory. No `getpeerinfo` detail.
+//!
+//! The `fork`, `ban` and `incident` events compare against what was there
+//! when the capture started, so an old fork, ban or incident never fires:
+//! `fork` is a new `getchaintips` tip off the best chain (a `valid-fork` or
+//! `invalid` tip, or headers that leave the best chain below its tip; the
+//! headers of a peer just ahead are not a fork); `ban` is a new
+//! `listbanned` entry; `incident` is a new entry in the A12 incident
+//! folders (`<datadir>/diag/incidents/`, and the A14 mirror's). Event lines
+//! carry heights, counts, a status and a kind, never a hash or an address.
 
 use super::live::{self, CallError};
 use crate::ctx::Ctx;
@@ -17,6 +26,8 @@ use crate::frame::Out;
 use crate::outln;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeSet;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 /// At most 7 days
@@ -27,8 +38,6 @@ const EVERY: Duration = Duration::from_secs(10);
 pub const STALL_SECS: u64 = 600;
 /// Output cap; a 10 s sample line over 7 days stays far below it
 const CAP_BYTES: u64 = 200 << 20;
-/// The B6.1 events this version does not watch
-const NOT_BUILT: &[&str] = &["fork", "ban", "incident"];
 
 /// One `--until` event
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -41,9 +50,16 @@ pub enum Until {
     RssOver(u64),
     /// fewer than N connections
     PeersUnder(u64),
+    /// a new chain tip off the best chain
+    Fork,
+    /// a new entry in the node's ban list
+    Ban,
+    /// a new A12 incident
+    Incident,
 }
 
-/// Parse one `--until` word: `exit`, `stall`, `rss>N` (MB), `peers<N`
+/// Parse one `--until` word: `exit`, `stall`, `fork`, `ban`, `incident`,
+/// `rss>N` (MB), `peers<N`
 pub fn parse_until(w: &str) -> Result<Until, String> {
     let w = w.trim();
     let num = |s: &str| {
@@ -55,19 +71,21 @@ pub fn parse_until(w: &str) -> Result<Until, String> {
         Ok(Until::Exit)
     } else if w == "stall" {
         Ok(Until::Stall)
+    } else if w == "fork" {
+        Ok(Until::Fork)
+    } else if w == "ban" {
+        Ok(Until::Ban)
+    } else if w == "incident" {
+        Ok(Until::Incident)
     } else if let Some(n) = w.strip_prefix("rss>") {
         Ok(Until::RssOver(num(
             n.trim_end_matches(['M', 'B', 'm', 'b'])
         )?))
     } else if let Some(n) = w.strip_prefix("peers<") {
         Ok(Until::PeersUnder(num(n)?))
-    } else if NOT_BUILT.contains(&w) {
-        Err(format!(
-            "--until {w} is not in this version (exit, stall, rss>N, peers<N are)"
-        ))
     } else {
         Err(format!(
-            "--until {w}: unknown event (exit, stall, rss>N in MB, peers<N)"
+            "--until {w}: unknown event (exit, stall, fork, ban, incident, rss>N in MB, peers<N)"
         ))
     }
 }
@@ -184,6 +202,195 @@ pub fn fired(
     None
 }
 
+/// The non-active tips of a `getchaintips` answer, by hash
+pub fn side_tips(tips: &Value) -> BTreeSet<String> {
+    tips.as_array()
+        .into_iter()
+        .flatten()
+        .filter(|t| t["status"].as_str() != Some("active"))
+        .filter_map(|t| t["hash"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// A tip in `tips` that was not in `start` and is a fork: `valid-fork` or
+/// `invalid`, or any other status whose branch leaves the best chain below
+/// the best tip (headers that only extend the best chain are a peer ahead)
+pub fn new_fork(start: &BTreeSet<String>, tips: &Value) -> Option<String> {
+    let all = tips.as_array()?;
+    let best = all
+        .iter()
+        .find(|t| t["status"].as_str() == Some("active"))?["height"]
+        .as_u64()?;
+    for t in all {
+        let (Some(h), Some(st)) = (t["hash"].as_str(), t["status"].as_str()) else {
+            continue;
+        };
+        if st == "active" || start.contains(h) {
+            continue;
+        }
+        let height = t["height"].as_u64().unwrap_or(0);
+        let len = t["branchlen"].as_u64().unwrap_or(0);
+        let from = height.saturating_sub(len);
+        if st == "valid-fork" || st == "invalid" || from < best {
+            return Some(format!(
+                "fork: a new {st} tip of {len} block(s) leaves the best chain at height {from} (best chain at {best})"
+            ));
+        }
+    }
+    None
+}
+
+/// The entries of a `listbanned` answer, as address and creation time
+pub fn bans(list: &Value) -> BTreeSet<String> {
+    list.as_array()
+        .into_iter()
+        .flatten()
+        .map(|b| {
+            format!(
+                "{} {}",
+                b["address"].as_str().unwrap_or("?"),
+                b["ban_created"]
+            )
+        })
+        .collect()
+}
+
+/// New bans in `list` since `start`: the count and their reasons, never
+/// the address
+pub fn new_bans(start: &BTreeSet<String>, list: &Value) -> Option<String> {
+    let new: Vec<&Value> = list
+        .as_array()?
+        .iter()
+        .filter(|b| {
+            !start.contains(&format!(
+                "{} {}",
+                b["address"].as_str().unwrap_or("?"),
+                b["ban_created"]
+            ))
+        })
+        .collect();
+    if new.is_empty() {
+        return None;
+    }
+    let mut why: Vec<String> = new
+        .iter()
+        .map(|b| {
+            b["ban_reason"]
+                .as_str()
+                .filter(|r| !r.is_empty())
+                .unwrap_or("no reason given")
+                .to_string()
+        })
+        .collect();
+    why.sort();
+    why.dedup();
+    Some(format!(
+        "ban: {} new ban(s) (reason: {})",
+        new.len(),
+        why.join("; ")
+    ))
+}
+
+/// The A12 incident folders of the watched data dir
+fn incident_dirs(ctx: &Ctx, d: &crate::ctx::DataDir) -> Vec<PathBuf> {
+    let mut v = vec![
+        d.chain.join("diag/incidents"),
+        d.path.join("diag/incidents"),
+    ];
+    if let Some(m) = live::mirror_dir(ctx, d) {
+        v.push(m.join("incidents"));
+        v.push(m.join("diag/incidents"));
+    }
+    v.dedup();
+    v
+}
+
+/// The entries of the incident folders, each as `<folder n>/<name>`; None
+/// when no folder could be listed in 1 s (a hung disk)
+fn incident_entries(dirs: &[PathBuf]) -> Option<(BTreeSet<String>, usize)> {
+    let dirs = dirs.to_vec();
+    live::bounded(1, move || {
+        let mut seen = BTreeSet::new();
+        let mut readable = 0;
+        for (i, d) in dirs.iter().enumerate() {
+            if let Ok(rd) = std::fs::read_dir(d) {
+                readable += 1;
+                for e in rd.flatten() {
+                    seen.insert(format!("{i}/{}", e.file_name().to_string_lossy()));
+                }
+            }
+        }
+        (seen, readable)
+    })
+}
+
+/// The `kind=` of a new incident (A12 `info.txt`), when it can be read
+fn incident_kind(dirs: &[PathBuf], entry: &str) -> String {
+    let Some((i, name)) = entry.split_once('/') else {
+        return "kind unknown".into();
+    };
+    let Some(d) = i.parse::<usize>().ok().and_then(|i| dirs.get(i)) else {
+        return "kind unknown".into();
+    };
+    let p = d.join(name).join("info.txt");
+    live::bounded(1, move || crate::util::read_small(&p, 4096))
+        .flatten()
+        .and_then(|t| {
+            t.lines()
+                .find_map(|l| l.strip_prefix("kind=").map(|k| k.trim().to_string()))
+        })
+        .filter(|k| {
+            !k.is_empty()
+                && k.len() <= 32
+                && k.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        })
+        .map(|k| format!("kind {k}"))
+        .unwrap_or_else(|| "kind unknown".into())
+}
+
+/// What the `fork`, `ban` and `incident` events compare against
+struct Watch {
+    tips: Option<BTreeSet<String>>,
+    bans: Option<BTreeSet<String>>,
+    incidents: Option<BTreeSet<String>>,
+    dirs: Vec<PathBuf>,
+}
+
+/// The `fork`, `ban` or `incident` event this sample fires, if any; a
+/// call that fails or times out fires nothing
+fn watch_fired(w: &Watch, rpc: Option<&live::Rpc>, t: Duration) -> Option<String> {
+    if let (Some(start), Some(r)) = (&w.tips, rpc) {
+        if let Some(e) = live::call(r, "getchaintips", Value::Array(vec![]), t)
+            .ok()
+            .and_then(|v| new_fork(start, &v))
+        {
+            return Some(e);
+        }
+    }
+    if let (Some(start), Some(r)) = (&w.bans, rpc) {
+        if let Some(e) = live::call(r, "listbanned", Value::Array(vec![]), t)
+            .ok()
+            .and_then(|v| new_bans(start, &v))
+        {
+            return Some(e);
+        }
+    }
+    if let Some(start) = &w.incidents {
+        if let Some((now, _)) = incident_entries(&w.dirs) {
+            let new: Vec<&String> = now.difference(start).collect();
+            if let Some(first) = new.first() {
+                return Some(format!(
+                    "incident: {} new A12 incident(s), the first {}",
+                    new.len(),
+                    incident_kind(&w.dirs, first)
+                ));
+            }
+        }
+    }
+    None
+}
+
 pub fn capture(ctx: &Ctx, o: &mut Out) {
     o.file("capture/samples.txt");
     let plan = &ctx.capture;
@@ -207,6 +414,9 @@ pub fn capture(ctx: &Ctx, o: &mut Out) {
             Until::Stall => format!("stall ({STALL_SECS} s)"),
             Until::RssOver(n) => format!("rss>{n} MB"),
             Until::PeersUnder(n) => format!("peers<{n}"),
+            Until::Fork => "fork".to_string(),
+            Until::Ban => "ban".to_string(),
+            Until::Incident => "incident".to_string(),
         })
         .collect();
     outln!(
@@ -227,6 +437,70 @@ pub fn capture(ctx: &Ctx, o: &mut Out) {
             "no credentials"
         }
     );
+    let two = Duration::from_secs(2);
+    let mut watch = Watch {
+        tips: None,
+        bans: None,
+        incidents: None,
+        dirs: incident_dirs(ctx, d),
+    };
+    for u in &plan.until {
+        match (u, &rpc) {
+            (Until::Fork, Some(r)) => {
+                match live::call(r, "getchaintips", Value::Array(vec![]), two) {
+                    Ok(v) => {
+                        let t = side_tips(&v);
+                        outln!(
+                            o,
+                            "fork watch: {} tip(s) off the best chain at the start (not events)",
+                            t.len()
+                        );
+                        watch.tips = Some(t);
+                    }
+                    Err(e) => outln!(
+                        o,
+                        "fork watch: not watched: getchaintips failed ({})",
+                        num(Err(e)).unwrap_err()
+                    ),
+                }
+            }
+            (Until::Ban, Some(r)) => match live::call(r, "listbanned", Value::Array(vec![]), two) {
+                Ok(v) => {
+                    let b = bans(&v);
+                    outln!(o, "ban watch: {} ban(s) at the start (not events)", b.len());
+                    watch.bans = Some(b);
+                }
+                Err(e) => outln!(
+                    o,
+                    "ban watch: not watched: listbanned failed ({})",
+                    num(Err(e)).unwrap_err()
+                ),
+            },
+            (Until::Fork | Until::Ban, None) => {
+                outln!(
+                    o,
+                    "{} watch: not watched: no RPC credentials",
+                    if *u == Until::Fork { "fork" } else { "ban" }
+                )
+            }
+            (Until::Incident, _) => match incident_entries(&watch.dirs) {
+                Some((e, readable)) => {
+                    outln!(
+                        o,
+                        "incident watch: {} incident(s) at the start (not events) in {readable} of {} folder(s) that exist and can be read",
+                        e.len(),
+                        watch.dirs.len()
+                    );
+                    watch.incidents = Some(e);
+                }
+                None => outln!(
+                    o,
+                    "incident watch: not watched: the incident folders did not list in 1 s"
+                ),
+            },
+            _ => {}
+        }
+    }
     outln!(o, "columns: time (UTC), seconds since start, node, rss MB, height, peers, load avg, free memory MB, PSI some avg10");
     let start = Instant::now();
     let total = Duration::from_secs(plan.minutes * 60);
@@ -297,7 +571,13 @@ pub fn capture(ctx: &Ctx, o: &mut Out) {
         outln!(o, "{line}");
         // each sample reaches the package now: Ctrl+C kills this collector
         o.flush();
-        if let Some(e) = fired(&plan.until, up, rss, peers.ok(), tip_since.elapsed()) {
+        let mut event = fired(&plan.until, up, rss, peers.ok(), tip_since.elapsed());
+        if event.is_none() && up {
+            event = watch_fired(&watch, rpc.as_ref(), two);
+        }
+        if let Some(e) = event {
+            outln!(o, "event {e}");
+            o.flush();
             why_end = format!("event {e}");
             break;
         }
@@ -333,11 +613,96 @@ mod tests {
         assert_eq!(parse_until("rss>4000"), Ok(Until::RssOver(4000)));
         assert_eq!(parse_until("rss>4000MB"), Ok(Until::RssOver(4000)));
         assert_eq!(parse_until("peers<3"), Ok(Until::PeersUnder(3)));
-        assert!(parse_until("fork")
-            .unwrap_err()
-            .contains("not in this version"));
+        assert_eq!(parse_until("fork"), Ok(Until::Fork));
+        assert_eq!(parse_until("ban"), Ok(Until::Ban));
+        assert_eq!(parse_until("incident"), Ok(Until::Incident));
         assert!(parse_until("rss>lots").is_err());
         assert!(parse_until("crash").is_err());
+    }
+
+    #[test]
+    fn only_a_new_tip_off_the_best_chain_is_a_fork() {
+        let tip = |h: u64, hash: &str, len: u64, st: &str| serde_json::json!({"height": h, "hash": hash, "branchlen": len, "status": st});
+        let old = Value::Array(vec![
+            tip(100, "a", 0, "active"),
+            tip(50, "old", 1, "valid-fork"),
+        ]);
+        let start = side_tips(&old);
+        assert_eq!(start.len(), 1);
+        assert_eq!(new_fork(&start, &old), None);
+        // a peer's headers just ahead of the best tip
+        let ahead = Value::Array(vec![
+            tip(100, "a", 0, "active"),
+            tip(103, "h", 3, "headers-only"),
+        ]);
+        assert_eq!(new_fork(&start, &ahead), None);
+        // headers that leave the best chain below its tip
+        let side = Value::Array(vec![
+            tip(100, "a", 0, "active"),
+            tip(101, "s", 3, "valid-headers"),
+        ]);
+        assert!(new_fork(&start, &side).unwrap().contains("at height 98"));
+        // a reorg: the old tip is now a valid-fork tip
+        let reorg = Value::Array(vec![
+            tip(101, "b", 0, "active"),
+            tip(100, "feedface", 1, "valid-fork"),
+        ]);
+        let e = new_fork(&start, &reorg).unwrap();
+        assert!(
+            e.starts_with(
+                "fork: a new valid-fork tip of 1 block(s) leaves the best chain at height 99"
+            ),
+            "{e}"
+        );
+        assert!(!e.contains("feedface"));
+        // an invalid block at the tip
+        let inv = Value::Array(vec![tip(99, "p", 0, "active"), tip(100, "a", 1, "invalid")]);
+        assert!(new_fork(&start, &inv).unwrap().contains("invalid"));
+    }
+
+    #[test]
+    fn only_a_new_ban_fires_and_never_names_the_address() {
+        let b = |a: &str, t: u64, r: &str| serde_json::json!({"address": a, "ban_created": t, "banned_until": t + 86400, "ban_reason": r});
+        let old = Value::Array(vec![b("10.0.0.1", 5, "manually added")]);
+        let start = bans(&old);
+        assert_eq!(new_bans(&start, &old), None);
+        let now = Value::Array(vec![
+            b("10.0.0.1", 5, "manually added"),
+            b("10.9.8.7", 9, "node misbehaving"),
+        ]);
+        let e = new_bans(&start, &now).unwrap();
+        assert_eq!(e, "ban: 1 new ban(s) (reason: node misbehaving)");
+        assert!(!e.contains("10.9.8.7"));
+    }
+
+    #[test]
+    fn a_new_incident_folder_fires_with_its_kind() {
+        let root = std::env::temp_dir().join(format!("diag-cap-inc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("1")).unwrap();
+        let dirs = vec![root.clone(), root.join("absent")];
+        let w = Watch {
+            tips: None,
+            bans: None,
+            incidents: incident_entries(&dirs).map(|e| e.0),
+            dirs: dirs.clone(),
+        };
+        assert_eq!(incident_entries(&dirs).unwrap().1, 1);
+        assert_eq!(watch_fired(&w, None, Duration::from_secs(1)), None);
+        std::fs::create_dir_all(root.join("2")).unwrap();
+        std::fs::write(root.join("2/info.txt"), "kind=stall\nrun=3\n").unwrap();
+        assert_eq!(
+            watch_fired(&w, None, Duration::from_secs(1)).as_deref(),
+            Some("incident: 1 new A12 incident(s), the first kind stall")
+        );
+        std::fs::create_dir_all(root.join("3")).unwrap();
+        std::fs::write(root.join("3/info.txt"), "kind=../../x y\n").unwrap();
+        let _ = std::fs::remove_dir_all(root.join("2"));
+        assert_eq!(
+            watch_fired(&w, None, Duration::from_secs(1)).as_deref(),
+            Some("incident: 1 new A12 incident(s), the first kind unknown")
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

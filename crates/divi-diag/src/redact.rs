@@ -400,8 +400,9 @@ impl Redactor {
             None
         } else {
             let alts: Vec<String> = known_kind.iter().map(|(v, _)| regex::escape(v)).collect();
+            // '-' is a boundary: macOS writes paths as "-Users-alice-code"
             Regex::new(&format!(
-                r"(^|[^A-Za-z0-9_.-])({})($|[^A-Za-z0-9_-])",
+                r"(^|[^A-Za-z0-9_.])({})($|[^A-Za-z0-9_])",
                 alts.join("|")
             ))
             .ok()
@@ -416,7 +417,7 @@ impl Redactor {
             re_pem: Regex::new(r"-----BEGIN [A-Z0-9 ]+-----[\s\S]*?(-----END [A-Z0-9 ]+-----|$)").unwrap(),
             re_header: Regex::new(r"(?i)\b(authorization|cookie|set-cookie|proxy-authorization)(\s*:\s*)[^\r\n]*").unwrap(),
             re_secret_kv: Regex::new(
-                r#"(?i)([A-Za-z0-9_.-]*(?:pass|secret|token|key|auth|rpcuser|cookie|seed|mnemonic)[A-Za-z0-9_.-]*)("?\s*[=:]\s*"?)([^\s",}\]]+)"#,
+                r#"(?i)([A-Za-z0-9_.-]*(?:pass|secret|token|key|auth|rpcuser|cookie|seed|mnemonic)[A-Za-z0-9_.-]*)("?\s*[=:]\s*"?)([^\s",}\]{\[][^\s",}\]]*)"#,
             )
             .unwrap(),
             re_urluser: Regex::new(r"([A-Za-z][A-Za-z0-9+.-]*://)[^/@\s]+@").unwrap(),
@@ -596,6 +597,31 @@ impl Redactor {
 
     /// The whole §6.2 pass this step implements, over one block of text
     pub fn scrub(&self, text: &str) -> String {
+        self.scrub_with(text, false)
+    }
+
+    /// The pass for an answer the user agreed to send in clear (`--rpc-clear`,
+    /// `--tx`): transaction and block ids and addresses stay as they are,
+    /// everything else (secrets, keys, public keys, hosts, IPs, paths, user
+    /// names, known values) is still masked
+    pub fn scrub_clear(&self, text: &str) -> String {
+        self.scrub_with(text, true)
+    }
+
+    /// The scrub's own rule for "this is a Divi address": base58 with
+    /// digits and lower case letters, or bech32
+    pub fn is_address(&self, s: &str) -> bool {
+        let whole = |re: &Regex| {
+            re.find(s)
+                .is_some_and(|m| m.start() == 0 && m.end() == s.len())
+        };
+        (whole(&self.re_divi_addr)
+            && s.chars().any(|ch| ch.is_ascii_digit())
+            && s.chars().any(|ch| ch.is_ascii_lowercase()))
+            || whole(&self.re_bech32)
+    }
+
+    fn scrub_with(&self, text: &str, clear: bool) -> String {
         let t = self.re_pem.replace_all(text, "<pem block removed>");
         let t = self.re_header.replace_all(&t, "$1$2<set>");
         let t = self.re_urluser.replace_all(&t, "$1<set>@");
@@ -616,7 +642,7 @@ impl Redactor {
         let t = self.re_xkey.replace_all(&t, "<xkey>");
         let t = self.re_hexpub.replace_all(&t, "<pubkey-hex>");
         let t = self.re_hex64.replace_all(&t, |c: &Captures| {
-            if c.get(1).is_some() {
+            if clear || c.get(1).is_some() {
                 c[0].to_string()
             } else {
                 self.pseudonym("h64", &c[2].to_ascii_lowercase())
@@ -626,7 +652,8 @@ impl Redactor {
         let t = self.re_divi_addr.replace_all(&t, |c: &Captures| {
             let s = &c[0];
             // a base58 address has digits and both cases
-            if s.chars().any(|ch| ch.is_ascii_digit())
+            if !clear
+                && s.chars().any(|ch| ch.is_ascii_digit())
                 && s.chars().any(|ch| ch.is_ascii_lowercase())
             {
                 "<addr>".to_string()
@@ -634,7 +661,11 @@ impl Redactor {
                 s.to_string()
             }
         });
-        let t = self.re_bech32.replace_all(&t, "<addr>");
+        let t = if clear {
+            t
+        } else {
+            self.re_bech32.replace_all(&t, "<addr>")
+        };
         // a 64-hex value that survived the step above was marked public
         let t = self.re_b64.replace_all(&t, |c: &Captures| {
             let s = &c[0];
@@ -1028,6 +1059,15 @@ mod tests {
         assert_eq!(v["rpcpassword"], "<set>");
         assert_eq!(v["authkey"], "<set>");
         assert_eq!(r.scrub(&s), s, "a second scrub changes nothing");
+        // an object or array under such a key is not a value: its own
+        // members are scrubbed, and the file stays JSON
+        let j = "{\n  \"scriptPubKey\": {\n    \"type\": \"pubkeyhash\"\n  },\n  \"pubkeys\": [\n    1\n  ],\n  \"privkey\": \"x\"\n}";
+        for s in [r.scrub(j), r.scrub_clear(j)] {
+            let v: serde_json::Value =
+                serde_json::from_str(&s).unwrap_or_else(|e| panic!("{e}: {s}"));
+            assert_eq!(v["scriptPubKey"]["type"], "pubkeyhash");
+            assert_eq!(v["privkey"], "<set>");
+        }
     }
 
     #[test]
@@ -1043,5 +1083,22 @@ mod tests {
         let h = "a".repeat(64);
         assert!(r.scrub(&format!("sha256:{h}")).contains(&h));
         assert!(!r.scrub(&format!("tx {h}")).contains(&h));
+    }
+    #[test]
+    fn known_user_between_hyphens_is_masked() {
+        // macOS `log show` writes paths as "-Users-alice-code-x" (seen on a real Mac run)
+        let r = r();
+        // outside a path (the path pass would hide it anyway)
+        let t = r.scrub("sandbox: deny file-read -Users-alice-code-divi-games state");
+        assert!(!t.contains("alice"), "{t}");
+        assert!(t.contains(&r.pseudonym("u", "alice")), "{t}");
+        let t = r.scrub("open /tmp/claude/-Users-alice-code-divi-games/x.json failed");
+        assert!(!t.contains("alice"), "{t}");
+        let t = r.scrub("myhostname-wifi");
+        assert!(!t.contains("myhostname"), "{t}");
+        // not inside a longer word
+        assert!(r
+            .scrub("malice and alicetown")
+            .contains("malice and alicetown"));
     }
 }

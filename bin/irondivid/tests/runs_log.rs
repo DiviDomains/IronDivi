@@ -160,6 +160,21 @@ fn each_run_records_its_start_phases_stop_and_exit() {
     assert!(lines[13].contains(" start run=2 "), "{log}");
     assert!(lines[0].contains(" network=regtest/divi "), "{log}");
     assert!(lines[0].contains(" daemon=no "), "{log}");
+    // A16: the binary's build-id, never `-` on Linux
+    #[cfg(target_os = "linux")]
+    {
+        let id = lines[0]
+            .split(" build-id=")
+            .nth(1)
+            .unwrap()
+            .split(' ')
+            .next()
+            .unwrap();
+        assert!(
+            id.len() >= 32 && id.bytes().all(|b| b.is_ascii_hexdigit()),
+            "{log}"
+        );
+    }
     // The sender: this test process, its command line masked
     let me = std::process::id();
     let uid = unsafe { libc::getuid() };

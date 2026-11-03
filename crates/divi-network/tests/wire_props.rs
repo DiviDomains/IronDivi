@@ -108,7 +108,7 @@ fn decode_one(bytes: &[u8]) -> NetworkMessage {
     assert_eq!(items.len(), 1);
     match items.pop().unwrap() {
         Decoded::Message(m) => m,
-        Decoded::Malformed { command, error } => panic!("{} did not parse: {}", command, error),
+        Decoded::Malformed { command, error, .. } => panic!("{} did not parse: {}", command, error),
     }
 }
 
@@ -419,7 +419,7 @@ proptest! {
         for (item, m) in items.iter().zip(&msgs) {
             match item {
                 Decoded::Message(back) => prop_assert_eq!(format!("{:?}", back), format!("{:?}", m)),
-                Decoded::Malformed { command, error } => {
+                Decoded::Malformed { command, error, .. } => {
                     return Err(TestCaseError::fail(format!("{}: {}", command, error)))
                 }
             }

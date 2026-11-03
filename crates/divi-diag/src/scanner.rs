@@ -58,6 +58,11 @@ pub struct Scanner<'a> {
 /// Files the scanner does not read: the manifest is a list of hashes
 /// written after the scan, `preview.ok` is the review's own record and is
 /// never sent, and dotfiles are diag's own temporaries
+/// The folders that hold what the user agreed to send in clear
+pub fn is_clear_path(rel: &str) -> bool {
+    rel.starts_with("rpc/clear/") || rel.starts_with("tx/")
+}
+
 fn skipped(rel: &str) -> bool {
     rel == "02-manifest.txt" || rel == "preview.ok" || rel.split('/').any(|c| c.starts_with('.'))
 }
@@ -254,10 +259,10 @@ impl<'a> Scanner<'a> {
                 let n = &self.needles[m.as_bytes()];
                 let before = m.start().checked_sub(1).map(|i| data[i]);
                 let after = data.get(m.end()).copied();
+                // '-' is a boundary, as in the redactor ("-Users-alice-code")
                 let left_ok =
-                    before.is_none_or(|b| !(b.is_ascii_alphanumeric() || b"_.-".contains(&b)));
-                let right_ok =
-                    after.is_none_or(|b| !(b.is_ascii_alphanumeric() || b"_-".contains(&b)));
+                    before.is_none_or(|b| !(b.is_ascii_alphanumeric() || b"_.".contains(&b)));
+                let right_ok = after.is_none_or(|b| !(b.is_ascii_alphanumeric() || b == b'_'));
                 if !n.word || (left_ok && right_ok) {
                     return hit(
                         line_of(m.start()),
@@ -278,8 +283,27 @@ impl<'a> Scanner<'a> {
                 );
             }
         }
+        // an answer the user agreed to send in clear keeps its ids and
+        // addresses; it is held to the clear pass instead, and must carry
+        // none of the keys a clear answer never keeps (scripts, raw data,
+        // labels)
+        let in_clear = is_clear_path(rel);
+        if in_clear {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                if crate::rpcjson::clear(v).1 > 0 {
+                    return hit(
+                        1,
+                        "an answer sent in clear still holds a script, raw data or a label".into(),
+                    );
+                }
+            }
+        }
         // 1: the redaction pass would still change it
-        let scrubbed = self.red.scrub(&text);
+        let scrubbed = if in_clear {
+            self.red.scrub_clear(&text)
+        } else {
+            self.red.scrub(&text)
+        };
         if scrubbed != text {
             let (a, b): (Vec<&str>, Vec<&str>) =
                 (text.split('\n').collect(), scrubbed.split('\n').collect());
@@ -510,6 +534,44 @@ mod tests {
     }
 
     #[test]
+    fn clear_folders_keep_ids_and_addresses_only() {
+        let (r, salt) = setup();
+        let s = Scanner::new(&r, &secrets(), &salt);
+        let txid = "ab".repeat(32);
+        let body = format!(
+            "[{{\"txid\": \"{txid}\", \"address\": \"DFvLxvYDRB3X6ZqXrkLBkMxSvp7SkYBTGe\", \"amount\": 1.5}}]\n"
+        );
+        assert!(r.is_address("DFvLxvYDRB3X6ZqXrkLBkMxSvp7SkYBTGe"));
+        assert_eq!(
+            s.scan_bytes("rpc/clear/1-listunspent.json", body.as_bytes()),
+            None
+        );
+        assert_eq!(s.scan_bytes("tx/transaction.json", body.as_bytes()), None);
+        // the same file anywhere else is a leak
+        assert!(s
+            .scan_bytes("rpc/1-listunspent.json", body.as_bytes())
+            .is_some());
+        // a script, raw data or a label is never in a clear file
+        for k in ["hex", "label", "scriptPubKey", "asm"] {
+            let b = format!("{{\"txid\": \"{txid}\", \"{k}\": \"x\"}}");
+            let h = s
+                .scan_bytes("rpc/clear/1-gettransaction.json", b.as_bytes())
+                .expect(k);
+            assert!(h.reason.contains("in clear"), "{}", h.reason);
+        }
+        // secrets, host names and paths are still hits there
+        assert!(s
+            .scan_bytes("tx/t.json", b"{\"x\": \"Sup3rS3cretPw\"}")
+            .is_some());
+        assert!(s
+            .scan_bytes("tx/t.json", b"{\"x\": \"canaryhost7\"}")
+            .is_some());
+        assert!(s
+            .scan_bytes("rpc/clear/1-x.json", b"{\"x\": \"/home/carolcanary/w\"}")
+            .is_some());
+    }
+
+    #[test]
     fn clean_scrubbed_text_passes() {
         let (r, _) = setup();
         let t = r.scrub(
@@ -606,6 +668,20 @@ mod tests {
         assert!(hit("Computer: canaryhost7").is_some());
         assert!(hit("Name: canaryhost7").is_some());
         assert!(hit("Oct 30 12:00:00 canaryhost7 kernel: x").is_some());
+    }
+
+    #[test]
+    fn known_user_between_hyphens_is_a_hit() {
+        let (r, salt) = setup();
+        let s = Scanner::new(&r, &[], &salt);
+        let h = s
+            .scan_bytes("k.txt", b"x\n/tmp/-Users-carolcanary-code-x/y\n")
+            .unwrap();
+        assert_eq!(h.line, 2);
+        assert!(h.reason.contains("user"), "{}", h.reason);
+        assert!(s
+            .scan_bytes("k.txt", b"xcarolcanaryx carolcanary_1\n")
+            .is_none());
     }
 
     #[test]

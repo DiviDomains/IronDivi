@@ -12,7 +12,6 @@ use crate::outln;
 use crate::redact::Redactor;
 use crate::settings::Settings;
 use crate::util;
-use sha2::{Digest, Sha256};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -311,14 +310,17 @@ fn describe(o: &mut Out, r: &Redactor, p: &Path, why: &str) -> Option<String> {
         md.mode() & 0o7777,
         owner_name(r, md.uid())
     );
-    let bytes = match util::read_bytes_capped(p, 512 << 20) {
-        Ok(b) => b,
+    // streamed: a whole binary held in memory is killed in a small container
+    // (a 436 MB debug build under a 512 MB limit, hp1 2026-10-31)
+    let sum = match util::sha256_file(p) {
+        Ok(s) => s,
         Err(e) => {
             outln!(o, "read: {}", util::io_err(&e));
             return None;
         }
     };
-    let sum = hex::encode(Sha256::digest(&bytes));
+    // the headers, interpreter and build-id note sit at the front
+    let bytes = util::read_bytes_capped(p, 8 << 20).unwrap_or_default();
     outln!(o, "sha256:{sum}");
     match bin_info(&bytes) {
         Some(i) => {
@@ -420,9 +422,7 @@ pub fn binaries(ctx: &Ctx, o: &mut Out) {
         let link = PathBuf::from(format!("/proc/{}/exe", n.pid));
         let target = std::fs::read_link(&link).ok();
         let running = if LINUX {
-            util::read_bytes_capped(&link, 512 << 20)
-                .ok()
-                .map(|b| hex::encode(Sha256::digest(&b)))
+            util::sha256_file(&link).ok()
         } else {
             None
         };

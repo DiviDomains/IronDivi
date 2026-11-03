@@ -99,6 +99,11 @@ pub fn capture() {
     let _ = START_CWD.set(cwd);
 }
 
+/// The working directory at start, as `capture` saw it (A14's path record)
+pub fn start_cwd() -> Option<&'static str> {
+    START_CWD.get().map(String::as_str)
+}
+
 /// The configuration as the record needs it
 pub struct Options<'a> {
     /// The command line alone
@@ -112,7 +117,8 @@ pub struct Options<'a> {
 /// Write this run's record; nothing when runs.log is not kept
 pub fn write(data_dir: &Path, options: &Options) {
     let run = crate::runs_log::run_number();
-    if run == 0 {
+    // A14: not while the low-disk pause is on
+    if run == 0 || crate::budget::paused() {
         return;
     }
     let dir = data_dir.join("diag").join("startup");

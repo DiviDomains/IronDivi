@@ -878,6 +878,9 @@ pub struct WalletRpc {
     block_fetcher: RwLock<Option<Arc<dyn crate::blockchain::BlockFetcher>>>,
     /// Node mempool: unconfirmed spends, and `getrawtransaction` for pool transactions
     mempool: RwLock<Option<Arc<dyn crate::blockchain::MempoolProvider>>>,
+    /// false with -walletbroadcast=0: the wallet's sends are kept, not
+    /// relayed (diag plan A18)
+    broadcast: std::sync::atomic::AtomicBool,
 }
 
 /// Position the wallet's scan for a start (see [`WalletDb::resume_scan`])
@@ -933,6 +936,7 @@ impl WalletRpc {
             tx_submit: RwLock::new(None),
             block_fetcher: RwLock::new(None),
             mempool: RwLock::new(None),
+            broadcast: std::sync::atomic::AtomicBool::new(true),
             chain: None,
         }
     }
@@ -970,6 +974,7 @@ impl WalletRpc {
             tx_submit: RwLock::new(None),
             block_fetcher: RwLock::new(None),
             mempool: RwLock::new(None),
+            broadcast: std::sync::atomic::AtomicBool::new(true),
             chain: None,
         }
     }
@@ -982,6 +987,7 @@ impl WalletRpc {
             tx_submit: RwLock::new(None),
             block_fetcher: RwLock::new(None),
             mempool: RwLock::new(None),
+            broadcast: std::sync::atomic::AtomicBool::new(true),
             chain: Some(chain),
         }
     }
@@ -994,6 +1000,7 @@ impl WalletRpc {
             tx_submit: RwLock::new(None),
             block_fetcher: RwLock::new(None),
             mempool: RwLock::new(None),
+            broadcast: std::sync::atomic::AtomicBool::new(true),
             chain: Some(chain),
         }
     }
@@ -1011,6 +1018,14 @@ impl WalletRpc {
     /// Set the transaction submission callback
     pub fn set_tx_submit(&self, callback: TxSubmitCallback) {
         *self.tx_submit.write() = Some(callback);
+    }
+
+    /// -walletbroadcast: off keeps the wallet's own sends in the wallet,
+    /// unconfirmed, without the submission callback (`sendrawtransaction`
+    /// still relays, as in Divi Core)
+    pub fn set_broadcast(&self, on: bool) {
+        self.broadcast
+            .store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The loaded wallet, if any
@@ -2160,6 +2175,10 @@ impl WalletRpc {
             wallet.keep_change_address(address);
         }
         wallet.note_committed(&tx.txid());
+        if !self.broadcast.load(std::sync::atomic::Ordering::Relaxed) {
+            wallet.add_mempool_tx(&tx);
+            return Ok(tx.txid());
+        }
         let callback = self.tx_submit.read();
         let callback = callback.as_ref().ok_or_else(|| {
             RpcError::new(codes::MISC_ERROR, "Transaction submission not configured")
@@ -2693,8 +2712,40 @@ impl WalletRpc {
         let tx: Transaction = deserialize(&tx_bytes).map_err(|_| decode_failed())?;
 
         let txid = tx.txid();
+        // diag A15: sent from here, whether it is accepted or not
+        divi_primitives::diag_rpc::sent(&txid);
         let allow_high_fees = params.get_bool(1).unwrap_or(false);
+        // diag A13: a transaction sent from here that the node refuses is
+        // the user's own, kept in own-invalid/ (not in rejected-tx/)
+        let kept = tx.clone();
+        match self.check_and_submit(tx, txid, allow_high_fees) {
+            Ok(()) => Ok(serde_json::json!(txid.to_string())),
+            Err(e) => {
+                let in_chain =
+                    matches!(&e, Error::Rpc(r) if r.code == codes::VERIFY_ALREADY_IN_CHAIN);
+                // a public Electrum client's transaction is not ours
+                if !in_chain && !divi_primitives::diag_rpc::is_remote() {
+                    divi_primitives::diag_events::emit(
+                        &divi_primitives::diag_events::Event::OwnTxRejected {
+                            txid,
+                            tx: &kept,
+                            reason: &e.to_string(),
+                        },
+                    );
+                }
+                Err(e)
+            }
+        }
+    }
 
+    /// sendrawtransaction's checks before the mempool (Divi Core's
+    /// rpcrawtransaction.cpp), then the submission
+    fn check_and_submit(
+        &self,
+        tx: Transaction,
+        txid: Hash256,
+        allow_high_fees: bool,
+    ) -> Result<(), Error> {
         if let Some(ref chain) = self.chain {
             // Divi Core: an output of the txid in the UTXO set means it is
             // already confirmed
@@ -2774,8 +2825,7 @@ impl WalletRpc {
 
         // Submit to mempool and broadcast
         self.submit_transaction(tx)?;
-
-        Ok(serde_json::json!(txid.to_string()))
+        Ok(())
     }
 
     /// getrawtransaction - Get raw transaction data

@@ -869,6 +869,14 @@ impl Staker {
                 let err_msg = format!("{}", e);
                 divi_network::log_block_connect_failed(&block_hash, &err_msg);
                 counted::hit(Site::StakerSelfAcceptFailed);
+                // A13 own-invalid bundle; no log line beyond the one above
+                divi_primitives::diag_events::emit(
+                    &divi_primitives::diag_events::Event::OwnBlockRejected {
+                        block,
+                        reason: &err_msg,
+                        code: divi_primitives::diag_events::code_of(&format!("{:?}", e)),
+                    },
+                );
                 // If the failure is due to a phantom UTXO (spent on chain but
                 // still in wallet), evict the coinstake input to prevent the
                 // staker from repeatedly trying to use it.

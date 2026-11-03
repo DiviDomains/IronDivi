@@ -311,6 +311,26 @@ pub struct Mempool {
 }
 
 impl Mempool {
+    /// `txs` for reading, timed (diag A17)
+    fn txs_r(&self) -> parking_lot::RwLockReadGuard<'_, HashMap<Hash256, MempoolEntry>> {
+        divi_primitives::diag_lock::timed(
+            divi_primitives::diag_lock::Lock::Mempool,
+            || self.txs.try_read(),
+            || self.txs.read(),
+        )
+    }
+
+    /// `txs` for writing, timed (diag A17)
+    fn txs_w(&self) -> parking_lot::RwLockWriteGuard<'_, HashMap<Hash256, MempoolEntry>> {
+        divi_primitives::diag_lock::timed(
+            divi_primitives::diag_lock::Lock::Mempool,
+            || self.txs.try_write(),
+            || self.txs.write(),
+        )
+    }
+}
+
+impl Mempool {
     /// Create a new mempool
     pub fn new(config: MempoolConfig) -> Self {
         Mempool {
@@ -372,22 +392,22 @@ impl Mempool {
 
     /// Check if a transaction is in the mempool
     pub fn contains(&self, txid: &Hash256) -> bool {
-        self.txs.read().contains_key(txid)
+        self.txs_r().contains_key(txid)
     }
 
     /// Get a transaction from the mempool
     pub fn get(&self, txid: &Hash256) -> Option<MempoolEntry> {
-        self.txs.read().get(txid).cloned()
+        self.txs_r().get(txid).cloned()
     }
 
     /// Get all transaction IDs in the mempool
     pub fn get_txids(&self) -> Vec<Hash256> {
-        self.txs.read().keys().cloned().collect()
+        self.txs_r().keys().cloned().collect()
     }
 
     /// Get transaction count
     pub fn size(&self) -> usize {
-        self.txs.read().len()
+        self.txs_r().len()
     }
 
     /// Get total bytes of all transactions
@@ -447,7 +467,7 @@ impl Mempool {
 
         // Add to mempool
         {
-            let mut txs = self.txs.write();
+            let mut txs = self.txs_w();
             let mut spenders = self.spenders.write();
             let mut total_size = self.total_size.write();
 
@@ -641,7 +661,7 @@ impl Mempool {
 
     /// Remove a transaction from the mempool
     pub fn remove(&self, txid: &Hash256) -> Option<MempoolEntry> {
-        let entry = self.txs.write().remove(txid)?;
+        let entry = self.txs_w().remove(txid)?;
 
         // Remove from spenders
         {
@@ -689,7 +709,7 @@ impl Mempool {
         let mut removed = 0;
         loop {
             let doomed: Vec<Hash256> = {
-                let txs = self.txs.read();
+                let txs = self.txs_r();
                 txs.values()
                     .filter(|entry| {
                         entry.tx.vin.iter().any(|input| {
@@ -725,7 +745,7 @@ impl Mempool {
     /// same coin and then its descendants breadth first
     /// (txmempool.cpp:91-178)
     pub fn conflicts_with(&self, block_txs: &[Transaction]) -> Vec<Transaction> {
-        let txs = self.txs.read();
+        let txs = self.txs_r();
         let spenders = self.spenders.read();
         let mut listed = HashSet::new();
         let mut out = Vec::new();
@@ -794,7 +814,7 @@ impl Mempool {
 
     /// Get transactions for a new block, sorted by fee rate
     pub fn get_block_txs(&self, max_size: usize) -> Vec<Transaction> {
-        let txs = self.txs.read();
+        let txs = self.txs_r();
         let mut result = Vec::new();
         let mut total_size = 0;
 
@@ -819,7 +839,7 @@ impl Mempool {
 
     /// Every pool transaction weighed for a block at `height`, in no order
     pub fn block_candidates(&self, height: u32) -> Vec<BlockCandidate> {
-        let txs = self.txs.read();
+        let txs = self.txs_r();
         let deltas = self.priority_deltas.read();
         txs.values()
             .map(|e| {
@@ -867,7 +887,7 @@ impl Mempool {
         let expiry = Duration::from_secs(self.config.expiry_time);
         let mut to_remove = Vec::new();
 
-        for (txid, entry) in self.txs.read().iter() {
+        for (txid, entry) in self.txs_r().iter() {
             if entry.age() > expiry {
                 to_remove.push(*txid);
             }
@@ -898,7 +918,7 @@ impl Mempool {
             return Ok(());
         }
         let doomed = {
-            let txs = self.txs.read();
+            let txs = self.txs_r();
             let spenders = self.spenders.read();
 
             let mut ancestors = HashSet::new();
@@ -962,7 +982,7 @@ impl Mempool {
 
     /// Get mempool statistics
     pub fn stats(&self) -> MempoolStats {
-        let txs = self.txs.read();
+        let txs = self.txs_r();
         let total_fee: i64 = txs.values().map(|e| e.fee.as_sat()).sum();
 
         MempoolStats {
@@ -997,7 +1017,7 @@ impl Mempool {
 
     /// Clear all transactions from mempool
     pub fn clear(&self) {
-        let removed: Vec<MempoolEntry> = self.txs.write().drain().map(|(_, e)| e).collect();
+        let removed: Vec<MempoolEntry> = self.txs_w().drain().map(|(_, e)| e).collect();
         self.spenders.write().clear();
         self.priority_queue.write().clear();
         *self.total_size.write() = 0;
@@ -1053,7 +1073,7 @@ impl divi_rpc::blockchain::MempoolProvider for Mempool {
 
     fn get_tx_infos(&self) -> Vec<divi_rpc::blockchain::MempoolTxInfo> {
         let tip_height = self.tip_height();
-        let txs = self.txs.read();
+        let txs = self.txs_r();
         txs.values()
             .map(|e| divi_rpc::blockchain::MempoolTxInfo {
                 txid: e.txid,
@@ -1097,7 +1117,7 @@ impl divi_rpc::blockchain::MempoolProvider for Mempool {
     fn estimate_fee(&self, conf_target: u32) -> f64 {
         // Use mempool-based fee estimation
         // Look at fee rates in current mempool
-        let txs = self.txs.read();
+        let txs = self.txs_r();
         if txs.is_empty() {
             return self.relay_floor_divi_per_kb();
         }

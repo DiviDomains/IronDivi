@@ -616,6 +616,17 @@ pub struct HeightIndexAudit {
 }
 
 impl Chain {
+    /// `chain_lock`, timed (diag A17)
+    fn chain_lock_guard(&self) -> parking_lot::MutexGuard<'_, ()> {
+        divi_primitives::diag_lock::timed(
+            divi_primitives::diag_lock::Lock::Chain,
+            || self.chain_lock.try_lock(),
+            || self.chain_lock.lock(),
+        )
+    }
+}
+
+impl Chain {
     /// Create a new chain with the given database and parameters
     pub fn new(db: Arc<ChainDatabase>, params: ChainParams) -> Result<Self, StorageError> {
         Self::load(db, params, true)
@@ -2323,7 +2334,7 @@ impl Chain {
     fn accept_block_unnotified(&self, block: Block) -> Result<AcceptBlockResult, StorageError> {
         // Acquire exclusive lock for chain state modifications
         trace!("accept_block: Waiting for chain lock...");
-        let _chain_guard = self.chain_lock.lock();
+        let _chain_guard = self.chain_lock_guard();
         trace!("accept_block: Chain lock acquired");
 
         // 1. Compute block hash
@@ -3165,7 +3176,7 @@ impl Chain {
         hash: &Hash256,
         activate: bool,
     ) -> Result<Vec<Transaction>, StorageError> {
-        let _chain_guard = self.chain_lock.lock();
+        let _chain_guard = self.chain_lock_guard();
         let target = self
             .db
             .get_block_index(hash)?
@@ -3268,7 +3279,7 @@ impl Chain {
         let Some(raw) = self.db.get_metadata(REORG_TARGET_KEY)? else {
             return Ok(None);
         };
-        let _chain_guard = self.chain_lock.lock();
+        let _chain_guard = self.chain_lock_guard();
         let target = match <[u8; 32]>::try_from(raw.as_slice()) {
             Ok(bytes) => self.db.get_block_index(&Hash256::from_bytes(bytes))?,
             Err(_) => None,
@@ -3316,7 +3327,7 @@ impl Chain {
         &self,
         hash: &Hash256,
     ) -> Result<Vec<Transaction>, StorageError> {
-        let _chain_guard = self.chain_lock.lock();
+        let _chain_guard = self.chain_lock_guard();
         self.clear_failed_marks(hash)?;
         self.activate_best_valid_chain()
     }
@@ -3349,7 +3360,7 @@ impl Chain {
                 *hash
             };
             let disconnected = self.invalidate_block_unnotified(&first, false)?;
-            let _chain_guard = self.chain_lock.lock();
+            let _chain_guard = self.chain_lock_guard();
             self.clear_failed_marks(&first)?;
             Ok(disconnected)
         })
@@ -4618,7 +4629,7 @@ impl Chain {
     /// lock-free version used by `accept_block`, see `activate_best_chain_inner`.
     pub fn activate_best_chain(&self) -> Result<Option<(u32, Vec<Transaction>)>, StorageError> {
         abort_on_write_failure(self.notifying_tip(|| {
-            let _chain_guard = self.chain_lock.lock();
+            let _chain_guard = self.chain_lock_guard();
             self.activate_best_chain_inner()
         }))
     }
@@ -5806,7 +5817,7 @@ impl Chain {
     ) -> Result<Option<(u32, Vec<Transaction>)>, StorageError> {
         // Acquire exclusive lock for chain state modifications
         debug!("try_activate_block: Waiting for chain lock...");
-        let _chain_guard = self.chain_lock.lock();
+        let _chain_guard = self.chain_lock_guard();
         debug!("try_activate_block: Chain lock acquired");
 
         // Get the block index

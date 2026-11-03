@@ -570,6 +570,7 @@ struct RpcBody {
 
 async fn api_rpc(
     State(s): State<Arc<Shared>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(body): Json<RpcBody>,
 ) -> ApiResult {
@@ -577,7 +578,18 @@ async fn api_rpc(
     let method = body.method.trim().to_string();
     gate::check(&method, &body.params, wallet_status(&s))
         .map_err(|e| ApiError(StatusCode::FORBIDDEN, e))?;
-    Ok(match call(&s, &method, body.params).await {
+    // diag A15: the call, never its parameters
+    let transport = divi_rpc::diag_rpc::Transport::WebUi;
+    let watch = divi_rpc::diag_rpc::begin(&method, transport);
+    let result = call(&s, &method, body.params).await;
+    watch.finish(
+        &method,
+        transport,
+        Some(peer.ip()),
+        true,
+        result.as_ref().err().map(|(c, m)| (*c, m.as_str())),
+    );
+    Ok(match result {
         Ok(result) => Json(json!({ "result": result })),
         Err((code, message)) => Json(json!({ "error": { "code": code, "message": message } })),
     }

@@ -298,6 +298,26 @@ pub struct PeerManager {
 }
 
 impl PeerManager {
+    /// `peers` for reading, timed (diag A17)
+    fn peers_r(&self) -> parking_lot::RwLockReadGuard<'_, HashMap<PeerId, PeerHandle>> {
+        divi_primitives::diag_lock::timed(
+            divi_primitives::diag_lock::Lock::Peers,
+            || self.peers.try_read(),
+            || self.peers.read(),
+        )
+    }
+
+    /// `peers` for writing, timed (diag A17)
+    fn peers_w(&self) -> parking_lot::RwLockWriteGuard<'_, HashMap<PeerId, PeerHandle>> {
+        divi_primitives::diag_lock::timed(
+            divi_primitives::diag_lock::Lock::Peers,
+            || self.peers.try_write(),
+            || self.peers.write(),
+        )
+    }
+}
+
+impl PeerManager {
     /// Create a new peer manager
     pub fn new(config: PeerManagerConfig) -> Arc<Self> {
         Self::with_clock(config, crate::peer_clock::PeerClock::system())
@@ -380,7 +400,7 @@ impl PeerManager {
     /// first ping goes now, before what the node sends it next (Divi Core pings
     /// before SendMessages, net.cpp:871-893)
     pub fn sporks_arrived(&self, peer_id: PeerId) {
-        if let Some(handle) = self.peers.read().get(&peer_id) {
+        if let Some(handle) = self.peers_r().get(&peer_id) {
             if handle.stats.sporks_arrived() {
                 let _ = handle.try_send(NetworkMessage::Ping(0));
             }
@@ -391,7 +411,7 @@ impl PeerManager {
     /// sync is started with it, as Divi Core's SendMessages asks for blocks before it
     /// sends the inventory it kept (main.cpp:1304-1330)
     pub fn release_held(&self, peer_id: PeerId) {
-        if let Some(handle) = self.peers.read().get(&peer_id) {
+        if let Some(handle) = self.peers_r().get(&peer_id) {
             if handle.stats.sporks_wait.load(Ordering::Acquire) {
                 return;
             }
@@ -571,6 +591,11 @@ impl PeerManager {
     }
 
     /// Ban an IP address
+    /// The address a peer connected from, while its score is still held
+    pub fn peer_ip(&self, peer_id: PeerId) -> Option<std::net::IpAddr> {
+        self.scoring.get_stats(peer_id).map(|s| s.ip)
+    }
+
     pub fn ban_ip(&self, ip: std::net::IpAddr, duration: Duration, reason: impl Into<String>) {
         self.scoring.ban_ip(ip, duration, reason);
         self.disconnect_ip(ip);
@@ -679,17 +704,17 @@ impl PeerManager {
 
     /// Get current peer count
     pub fn peer_count(&self) -> usize {
-        self.peers.read().len()
+        self.peers_r().len()
     }
 
     /// Get list of connected peer addresses
     pub fn peer_addresses(&self) -> Vec<SocketAddr> {
-        self.peers.read().values().map(|p| p.addr).collect()
+        self.peers_r().values().map(|p| p.addr).collect()
     }
 
     /// Get list of connected peer IDs
     pub fn connected_peers(&self) -> Vec<PeerId> {
-        self.peers.read().keys().copied().collect()
+        self.peers_r().keys().copied().collect()
     }
 
     /// Peer IDs of all connected peers whose remote IP equals `ip` (any port)
@@ -713,12 +738,12 @@ impl PeerManager {
 
     /// Check if a specific peer is currently connected
     pub fn is_peer_connected(&self, peer_id: PeerId) -> bool {
-        self.peers.read().contains_key(&peer_id)
+        self.peers_r().contains_key(&peer_id)
     }
 
     /// The address of a connected peer
     pub fn peer_addr(&self, peer_id: PeerId) -> Option<SocketAddr> {
-        self.peers.read().get(&peer_id).map(|p| p.addr)
+        self.peers_r().get(&peer_id).map(|p| p.addr)
     }
 
     /// A connected peer's live stats, with its bloom filter
@@ -731,7 +756,7 @@ impl PeerManager {
 
     /// Whether a connected peer dialled us
     pub fn is_inbound(&self, peer_id: PeerId) -> bool {
-        self.peers.read().get(&peer_id).is_some_and(|p| p.inbound)
+        self.peers_r().get(&peer_id).is_some_and(|p| p.inbound)
     }
 
     /// Get peer info for RPC (address and inbound status)
@@ -769,13 +794,13 @@ impl PeerManager {
 
     /// Check if we have room for more outbound connections
     pub fn can_connect_outbound(&self) -> bool {
-        let outbound_count = self.peers.read().values().filter(|p| !p.inbound).count();
+        let outbound_count = self.peers_r().values().filter(|p| !p.inbound).count();
         outbound_count < self.config.max_outbound
     }
 
     /// Get count of inbound connections
     pub fn inbound_count(&self) -> usize {
-        self.peers.read().values().filter(|p| p.inbound).count()
+        self.peers_r().values().filter(|p| p.inbound).count()
     }
 
     /// Whether another inbound connection may be taken: fewer inbound peers,
@@ -787,7 +812,7 @@ impl PeerManager {
 
     /// Get count of outbound connections
     pub fn outbound_count(&self) -> usize {
-        self.peers.read().values().filter(|p| !p.inbound).count()
+        self.peers_r().values().filter(|p| !p.inbound).count()
     }
 
     /// The network's P2P port, used for an address given without one
@@ -848,7 +873,7 @@ impl PeerManager {
         let added = self.added_nodes.read();
         // the dialled set before the peers, as claim_dial takes them
         let connecting = self.connecting_addrs.read();
-        let peers = self.peers.read();
+        let peers = self.peers_r();
 
         let connected_addrs: HashSet<_> = peers.values().map(|p| p.addr).collect();
 
@@ -1379,7 +1404,7 @@ impl PeerManager {
         self.scoring.reset_connection_failures(peer_id);
 
         // Store the handle, then stop counting the address as being dialled
-        self.peers.write().insert(peer_id, handle);
+        self.peers_w().insert(peer_id, handle);
         if one_shot {
             self.one_shot_peers.write().insert(peer_id);
         }
@@ -1426,7 +1451,7 @@ impl PeerManager {
                 .named_connected
                 .read()
                 .get(&key)
-                .is_some_and(|id| self.peers.read().contains_key(id));
+                .is_some_and(|id| self.peers_r().contains_key(id));
             if connected || !self.named_dialling.write().insert(key.clone()) {
                 continue;
             }
@@ -1477,7 +1502,7 @@ impl PeerManager {
         let addr = handle.addr;
         self.scoring.register_peer(peer_id, addr.ip());
         self.scoring.reset_connection_failures(peer_id);
-        self.peers.write().insert(peer_id, handle);
+        self.peers_w().insert(peer_id, handle);
         self.named_connected
             .write()
             .insert(format!("{host}:{port}"), peer_id);
@@ -1553,7 +1578,7 @@ impl PeerManager {
         }
 
         // Store the handle
-        self.peers.write().insert(peer_id, handle);
+        self.peers_w().insert(peer_id, handle);
 
         // Run the connection handler
         let self_clone = Arc::clone(&self);
@@ -1573,19 +1598,19 @@ impl PeerManager {
     /// Register a peer handle directly (tests capture its outbound messages).
     #[cfg(test)]
     pub(crate) fn insert_test_peer(&self, handle: PeerHandle) {
-        self.peers.write().insert(handle.id, handle);
+        self.peers_w().insert(handle.id, handle);
     }
 
     /// Drop a test peer, as a disconnect does
     #[cfg(test)]
     pub(crate) fn remove_test_peer(&self, id: PeerId) {
-        self.peers.write().remove(&id);
+        self.peers_w().remove(&id);
     }
 
     /// The live stats of a test peer (tests set its services)
     #[cfg(test)]
     pub(crate) fn test_peer_stats(&self, id: PeerId) -> Option<Arc<crate::peer::LivePeerStats>> {
-        self.peers.read().get(&id).map(|p| Arc::clone(&p.stats))
+        self.peers_r().get(&id).map(|p| Arc::clone(&p.stats))
     }
 
     /// Send a message to a specific peer
@@ -1594,7 +1619,7 @@ impl PeerManager {
         peer_id: PeerId,
         msg: NetworkMessage,
     ) -> Result<(), NetworkError> {
-        let handle = self.peers.read().get(&peer_id).cloned();
+        let handle = self.peers_r().get(&peer_id).cloned();
 
         if let Some(handle) = handle {
             handle
@@ -1609,7 +1634,7 @@ impl PeerManager {
 
     /// Broadcast a message to all connected peers
     pub fn broadcast(&self, msg: NetworkMessage) {
-        let peers = self.peers.read();
+        let peers = self.peers_r();
         for (peer_id, handle) in peers.iter() {
             if let Err(e) = handle.try_send(msg.clone()) {
                 debug!("Failed to broadcast to peer {}: {}", peer_id, e);
@@ -1637,7 +1662,7 @@ impl PeerManager {
         let inv_item = InvItem::new(InvType::Block, block_hash);
         let msg = NetworkMessage::Inv(vec![inv_item]);
         // No per-block line: an announce line would mark own blocks (A11)
-        let peers = self.peers.read();
+        let peers = self.peers_r();
         for (peer_id, handle) in peers.iter() {
             if let Err(e) = handle.try_send(msg.clone()) {
                 debug!("Failed to send block inv to peer {}: {}", peer_id, e);
@@ -1653,7 +1678,7 @@ impl PeerManager {
     pub fn announce_new_tip(&self, tip_hash: Hash256, tip_height: u32, exclude: Option<PeerId>) {
         let msg = NetworkMessage::Inv(vec![InvItem::new(InvType::Block, tip_hash)]);
         // No per-block line, as for broadcast_block_inv (A11)
-        let peers = self.peers.read();
+        let peers = self.peers_r();
         for (peer_id, handle) in peers.iter() {
             if Some(*peer_id) == exclude
                 || !announces_new_tip_to(
@@ -1676,7 +1701,7 @@ impl PeerManager {
         let inv_item = InvItem::new(InvType::Block, block_hash);
         let msg = NetworkMessage::Inv(vec![inv_item]);
         // No per-block line, as for broadcast_block_inv (A11)
-        let peers = self.peers.read();
+        let peers = self.peers_r();
         for (peer_id, handle) in peers.iter() {
             if *peer_id != exclude {
                 if let Err(e) = handle.try_send(msg.clone()) {
@@ -1689,7 +1714,7 @@ impl PeerManager {
     /// The node took a message of `size` bytes from `peer_id`: that peer may
     /// be read again once it is within the receive limits
     pub fn message_taken(&self, peer_id: PeerId, size: u64) {
-        if let Some(handle) = self.peers.read().get(&peer_id) {
+        if let Some(handle) = self.peers_r().get(&peer_id) {
             handle.stats.message_taken(size);
         }
     }
@@ -1704,7 +1729,7 @@ impl PeerManager {
 
     /// Queue a message for `peer_id` without waiting
     pub fn try_send_to_peer(&self, peer_id: PeerId, msg: NetworkMessage) -> TrySend {
-        let Some(handle) = self.peers.read().get(&peer_id).cloned() else {
+        let Some(handle) = self.peers_r().get(&peer_id).cloned() else {
             return TrySend::Gone;
         };
         match handle.try_send(msg) {
@@ -1718,14 +1743,14 @@ impl PeerManager {
 
     /// The node missed messages it cannot count: every peer may be read again
     pub fn clear_receive_queues(&self) {
-        for handle in self.peers.read().values() {
+        for handle in self.peers_r().values() {
             handle.stats.clear_queued();
         }
     }
 
     /// Broadcast a message to all peers except one
     pub fn broadcast_except(&self, msg: NetworkMessage, exclude: PeerId) {
-        let peers = self.peers.read();
+        let peers = self.peers_r();
         for (peer_id, handle) in peers.iter() {
             if *peer_id != exclude {
                 if let Err(e) = handle.try_send(msg.clone()) {
@@ -1737,7 +1762,7 @@ impl PeerManager {
 
     /// Disconnect a peer
     pub fn disconnect(&self, peer_id: PeerId) {
-        if self.peers.write().remove(&peer_id).is_some() {
+        if self.peers_w().remove(&peer_id).is_some() {
             debug!("Disconnected peer {}", peer_id);
         }
     }
@@ -1818,7 +1843,7 @@ impl PeerManager {
     /// Disconnect all peers
     pub fn disconnect_all(&self) {
         let _ = self.shutdown_tx.send(());
-        self.peers.write().clear();
+        self.peers_w().clear();
     }
 
     /// Get network traffic totals across all peers
@@ -1842,7 +1867,7 @@ impl PeerManager {
 
     /// Get set of currently connected peer addresses
     pub fn connected_addresses(&self) -> HashSet<SocketAddr> {
-        self.peers.read().values().map(|p| p.addr).collect()
+        self.peers_r().values().map(|p| p.addr).collect()
     }
 
     /// Compute exponential backoff duration for a given consecutive failure count.
@@ -1950,7 +1975,7 @@ impl PeerManager {
             }
             for addr in added {
                 // A connected node is not in divid's list for the round
-                if self.peers.read().values().any(|p| p.addr == addr) {
+                if self.peers_r().values().any(|p| p.addr == addr) {
                     continue;
                 }
                 if !self.is_banned(&addr.ip()) && self.claim_dial(addr, DialRule::ByAddress) {

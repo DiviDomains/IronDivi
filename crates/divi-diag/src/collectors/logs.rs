@@ -96,10 +96,13 @@ pub fn parse_record(line: &str) -> Option<Record> {
         time: t[0].clone(),
         ..Default::default()
     };
-    let mut rest = &t[2..];
-    if t[1].contains('=') {
-        // no monotonic field
-        rest = &t[1..];
+    // the monotonic field: bare (`123.456`) or, as the node writes it, `mono=123.456`
+    let mut rest = &t[1..];
+    if !t[1].contains('=') && t[1].parse::<f64>().is_ok() {
+        rest = &t[2..];
+    } else if let Some(m) = t[1].strip_prefix("mono=") {
+        r.fields.insert("mono".into(), m.to_string());
+        rest = &t[2..];
     }
     if let Some(first) = rest.first() {
         if !first.contains('=') {
@@ -121,6 +124,7 @@ pub fn parse_record(line: &str) -> Option<Record> {
 #[derive(Debug, Default, Clone)]
 pub struct Run {
     pub start: String,
+    pub run: String,
     pub pid: String,
     pub version: String,
     pub sha: String,
@@ -135,6 +139,12 @@ pub struct Run {
     pub uptime: String,
     pub peak_rss: String,
     pub notes: Vec<String>,
+    /// A `panic` record with ends_node=yes, as text: the cause of the end
+    pub ending_panic: String,
+    /// The marker's cgroup oom_kill count was read and had not risen
+    pub oom_unchanged: bool,
+    /// The marker was written on another boot: the host restarted since
+    pub rebooted: bool,
 }
 
 fn short(s: &str, n: usize) -> String {
@@ -151,6 +161,7 @@ pub fn runs_from_records(recs: &[Record]) -> Vec<Run> {
             "start" => {
                 runs.push(Run {
                     start: r.time.clone(),
+                    run: r.get(&["run"]).unwrap_or("").into(),
                     pid: r.get(&["pid"]).unwrap_or("").into(),
                     version: r.get(&["version", "ver"]).unwrap_or("").into(),
                     sha: short(
@@ -196,6 +207,36 @@ pub fn runs_from_records(recs: &[Record]) -> Vec<Run> {
                     }
                 }
             }
+            "panic" => {
+                if let Some(run) = runs.last_mut() {
+                    let task = r.get(&["task"]).unwrap_or("-");
+                    let desc = format!(
+                        "panic{} on thread {} at {}",
+                        if task == "-" {
+                            String::new()
+                        } else {
+                            format!(" in task {task}")
+                        },
+                        r.get(&["thread"]).unwrap_or("?"),
+                        r.get(&["at"]).unwrap_or("?")
+                    );
+                    if r.get(&["ends_node"]) == Some("yes") {
+                        run.ending_panic = desc;
+                    } else {
+                        run.notes.push(format!("{desc} (the node went on)"));
+                    }
+                }
+            }
+            "signal" => {
+                if let Some(run) = runs.last_mut() {
+                    if r.get(&["sender"]) == Some("outside-pid-namespace") {
+                        run.notes.push(format!(
+                            "signal {} from outside the pid namespace (container runtime or host)",
+                            r.get(&["signo", "signal"]).unwrap_or("?")
+                        ));
+                    }
+                }
+            }
             "stop-requested" => {
                 if let Some(run) = runs.last_mut() {
                     run.notes.push(format!(
@@ -216,9 +257,12 @@ pub fn runs_from_records(recs: &[Record]) -> Vec<Run> {
                         ),
                         _ => "exit".into(),
                     };
-                    run.uptime = r.get(&["uptime"]).unwrap_or("").into();
+                    if !run.ending_panic.is_empty() {
+                        run.end = format!("{}, after {}", run.end, run.ending_panic);
+                    }
+                    run.uptime = r.get(&["uptime_s", "uptime"]).unwrap_or("").into();
                     run.peak_rss = r
-                        .get(&["peak_rss", "rss_peak", "maxrss"])
+                        .get(&["peak_rss_kb", "peak_rss", "rss_peak", "maxrss"])
                         .unwrap_or("")
                         .into();
                 }
@@ -249,6 +293,210 @@ pub fn runs_from_records(recs: &[Record]) -> Vec<Run> {
     runs
 }
 
+/// A run with no exit record and no `unclean-previous` yet (the node has not
+/// started again): crash.log's `fatal-signal` record for that run names the
+/// cause, as A2 does at the next start; with none, the end stays unknown.
+/// The last run is skipped when the node is running.
+pub fn ends_from_crash_log(runs: &mut [Run], crash_log: &str, running: bool) {
+    // fatal-signal records in order, each with the `alloc-null` size of the
+    // same entry when one came just before it (the Rust allocation-failure
+    // handler writes it, then aborts)
+    let mut fatal: Vec<(Record, Option<String>)> = Vec::new();
+    let mut alloc: Option<String> = None;
+    for r in crash_log.lines().filter_map(parse_record) {
+        match r.kind.as_str() {
+            "alloc-null" => alloc = r.get(&["size"]).map(str::to_string),
+            "fatal-signal" => {
+                let a = alloc.take();
+                fatal.push((r, a));
+            }
+            "fatal-signal-end" | "panic" => alloc = None,
+            _ => {}
+        }
+    }
+    let n = runs.len();
+    for (i, run) in runs.iter_mut().enumerate() {
+        if !run.end.is_empty() || run.run.is_empty() || (running && i + 1 == n) {
+            continue;
+        }
+        let Some((rec, alloc)) = fatal
+            .iter()
+            .rev()
+            .find(|(r, _)| r.get(&["run"]) == Some(run.run.as_str()))
+        else {
+            continue;
+        };
+        run.end = fatal_end(rec, alloc.as_deref());
+    }
+}
+
+/// The end of a run from its crash.log `fatal-signal` record
+fn fatal_end(rec: &Record, alloc: Option<&str>) -> String {
+    let sig = rec.get(&["signal"]).unwrap_or("?");
+    if rec.get(&["sent"]) == Some("yes") {
+        return format!(
+            "signal {sig} sent by {} (crash.log)",
+            rec.get(&["comm"]).unwrap_or("?")
+        );
+    }
+    let thread = match (rec.get(&["thread"]), rec.get(&["foreign"])) {
+        (_, Some("yes")) => Some(" on a thread the node did not start".to_string()),
+        (Some(t), _) => Some(format!(" on thread {t}")),
+        _ => None,
+    };
+    let Some(thread) = thread else {
+        return format!("crash, signal {sig} (crash.log)");
+    };
+    if let Some(size) = alloc {
+        return format!("allocation of {size} bytes failed, then abort{thread} (crash.log)");
+    }
+    let addr = match (sig, rec.get(&["addr"])) {
+        ("SEGV" | "BUS" | "ILL" | "FPE", Some(a)) => format!(" at address {a}"),
+        _ => String::new(),
+    };
+    format!("crash, signal {sig}{addr}{thread} (crash.log)")
+}
+
+/// An abort (SIGABRT) the node wrote no cause for, under an address-space
+/// or data limit: C and C++ code (RocksDB) aborts on a failed allocation
+/// without a Rust record. `startup(run)` reads `diag/startup/<run>.txt`,
+/// whose `[rlimits]` section the node writes at start.
+pub fn abort_under_limit(runs: &mut [Run], startup: impl Fn(&str) -> Option<String>) {
+    for run in runs.iter_mut() {
+        if !run.end.starts_with("crash, signal ABRT") || run.run.is_empty() {
+            continue;
+        }
+        let Some(text) = startup(&run.run) else {
+            continue;
+        };
+        let mut limits = Vec::new();
+        for (name, what) in [
+            ("as", "an address-space limit (ulimit -v)"),
+            ("data", "a data limit (ulimit -d)"),
+        ] {
+            let soft = text.lines().find_map(|l| {
+                let rest = l.trim().strip_prefix(name)?.strip_prefix(' ')?;
+                rest.split_whitespace()
+                    .find_map(|kv| kv.strip_prefix("soft="))
+            });
+            if let Some(v) = soft.and_then(|v| v.parse::<u64>().ok()) {
+                limits.push(format!("{what} of {} MB", v >> 20));
+            }
+        }
+        if !limits.is_empty() {
+            run.end = format!(
+                "{}; under {}: a failed allocation is probable (C/C++ code such as RocksDB aborts without a Rust record)",
+                run.end,
+                limits.join(" and ")
+            );
+        }
+    }
+}
+
+/// The node's start marker (diag/irondivid.running) outlives a run the
+/// kernel killed. A2's rule, applied without a next start: when the marker
+/// is the last run's, the boot is the same, and the same cgroup's
+/// `memory.events` oom_kill rose since the marker was written, the run was
+/// probably killed at the memory limit. `oom_kill_now` reads that count for
+/// a marker `cgroup` value; None (unknown) leaves the end unknown.
+///
+/// A cgroup root (`v2:/`) is the node's own private cgroup namespace. It is
+/// this one only when PID 1 is the same process as at the node's start
+/// (`pid1_start`, its start time in ticks): a new container on the same
+/// data, or a restarted one, has its own root and its own counts.
+/// `pid1_start_now` is "-" when unknown.
+pub fn end_from_marker(
+    runs: &mut [Run],
+    marker: &str,
+    boot_now: &str,
+    pid1_start_now: &str,
+    oom_kill_now: impl Fn(&str) -> Option<u64>,
+) {
+    let Some(last) = runs.last_mut() else { return };
+    if !last.end.is_empty() || last.run.is_empty() {
+        return;
+    }
+    let m: BTreeMap<&str, &str> = marker.lines().filter_map(|l| l.split_once('=')).collect();
+    if m.get("run").copied() != Some(last.run.as_str()) || boot_now == "-" {
+        return;
+    }
+    match m.get("boot_id").copied() {
+        Some(b) if b != boot_now => {
+            last.rebooted = true;
+            return;
+        }
+        Some(_) => {}
+        None => return,
+    }
+    let (Some(cg), Some(before)) = (
+        m.get("cgroup").copied(),
+        m.get("memory.events.oom_kill")
+            .and_then(|s| s.parse::<u64>().ok()),
+    ) else {
+        return;
+    };
+    if matches!(cg, "v2:/" | "v1:/") {
+        if let Some(then) = m.get("pid1_start") {
+            if pid1_start_now == "-" || *then != pid1_start_now {
+                return;
+            }
+        }
+    }
+    if let Some(after) = oom_kill_now(cg) {
+        if after > before {
+            last.end = format!(
+                "memory limit kill probable (cgroup oom_kill {before}->{after} since start, marker)"
+            );
+        } else {
+            last.oom_unchanged = true;
+        }
+    }
+}
+
+/// PID 1's start time in clock ticks (/proc/1/stat field 22), "-" unknown
+fn pid1_start_now() -> String {
+    std::fs::read_to_string("/proc/1/stat")
+        .ok()
+        .and_then(|s| {
+            // the command name is in parentheses and can hold spaces
+            let after = &s[s.rfind(')')? + 1..];
+            after.split_whitespace().nth(19).map(str::to_string)
+        })
+        .unwrap_or_else(|| "-".into())
+}
+
+fn boot_id_now() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| "-".into())
+}
+
+/// The oom_kill count of a marker `cgroup` value (`v2:/path`, `v1:/path`),
+/// read now. A container's private cgroup namespace names its own root
+/// `/`, so a root path is read only from inside that namespace (diag run in
+/// the container); from outside it is unknown.
+fn cgroup_oom_kill(cg: &str) -> Option<u64> {
+    let own = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let file = if let Some(p) = cg.strip_prefix("v2:") {
+        let own_path = own.lines().find_map(|l| l.strip_prefix("0::"))?;
+        if p == "/" && own_path != "/" {
+            return None;
+        }
+        Path::new("/sys/fs/cgroup")
+            .join(p.trim_start_matches('/'))
+            .join("memory.events")
+    } else {
+        let p = cg.strip_prefix("v1:")?;
+        Path::new("/sys/fs/cgroup/memory")
+            .join(p.trim_start_matches('/'))
+            .join("memory.oom_control")
+    };
+    let text = std::fs::read_to_string(file).ok()?;
+    text.lines()
+        .find_map(|l| l.strip_prefix("oom_kill "))
+        .and_then(|v| v.trim().parse().ok())
+}
+
 fn table(runs: &[Run], running_pid: Option<u32>) -> Vec<String> {
     let mut out = vec![format!(
         "{:<27} {:<10} {:<10} {:<14} {:<12} {:<30} {:<10} {:<9} notes",
@@ -276,6 +524,22 @@ fn table(runs: &[Run], running_pid: Option<u32>) -> Vec<String> {
             r.end.clone()
         } else if i == last && running_pid.is_some() {
             "running".into()
+        } else if i == last {
+            // A2 writes the verdict at the next start (B3 makes one)
+            let mut e = "no exit record, no crash record: ended by something the node cannot catch (SIGKILL, a seccomp kill, a host crash)".to_string();
+            if r.rebooted {
+                e.push_str("; the host restarted since (power loss, reboot or kernel crash)");
+            } else if r.oom_unchanged {
+                e.push_str("; not a memory-limit kill (cgroup oom_kill unchanged)");
+            } else {
+                e.push_str("; a memory-limit kill is not ruled out from here");
+            }
+            if r.how == "container" {
+                e.push_str(
+                    "; run `irondivi-cli diag --host <container>` on the host for the cause",
+                );
+            }
+            e
         } else {
             "no exit record".into()
         };
@@ -382,7 +646,33 @@ pub fn runs(ctx: &Ctx, o: &mut Out) {
                 };
                 let text = util::escape_bytes(&bytes);
                 let recs: Vec<Record> = text.lines().filter_map(parse_record).collect();
-                let runs = runs_from_records(&recs);
+                let mut runs = runs_from_records(&recs);
+                if let Some(c) = find_diag_file(d, "crash.log") {
+                    if let Ok((b, _)) = util::read_tail(&c, 4 << 20) {
+                        ends_from_crash_log(
+                            &mut runs,
+                            &util::escape_bytes(&b),
+                            d.running_pid.is_some(),
+                        );
+                    }
+                }
+                abort_under_limit(&mut runs, |run| {
+                    let dir = find_diag_file(d, "startup")?;
+                    std::fs::read_to_string(dir.join(format!("{run}.txt"))).ok()
+                });
+                if d.running_pid.is_none() {
+                    if let Some(m) = find_diag_file(d, "irondivid.running") {
+                        if let Ok(t) = std::fs::read_to_string(&m) {
+                            end_from_marker(
+                                &mut runs,
+                                &t,
+                                &boot_id_now(),
+                                &pid1_start_now(),
+                                cgroup_oom_kill,
+                            );
+                        }
+                    }
+                }
                 outln!(
                     o,
                     "source: runs.log ({} records{})",
@@ -1413,6 +1703,179 @@ mod tests {
         assert_eq!(r.kind, "exit");
         assert_eq!(r.get(&["reason"]), Some("stopped by rpc"));
         assert!(parse_record("garbage").is_none());
+    }
+
+    #[test]
+    fn node_records_with_mono_field() {
+        // the format irondivid writes (runs_log.rs record())
+        let text = "2026-10-31T09:04:38.591491Z mono=141606.646960 start run=1 pid=706245 version=0.2.9 how=terminal kernel=\"5.15\"\n\
+                    2026-10-31T09:04:40.529490Z mono=141608.584958 phase name=running prev=rpc prev_ms=0 tid=706245\n\
+                    2026-10-31T09:10:00.000000Z mono=141900.0 start run=2 pid=9 version=0.2.9 how=systemd\n\
+                    2026-10-31T09:20:00.000000Z mono=142500.0 exit code=0 run=2 pid=9 uptime_s=600.000 peak_rss_kb=26900 reason=\"stopped\"\n\
+                    2026-10-31T09:30:00.000000Z mono=143100.0 start run=3 pid=11 version=0.2.9 how=terminal\n";
+        let recs: Vec<Record> = text.lines().filter_map(parse_record).collect();
+        assert_eq!(recs[0].kind, "start");
+        assert_eq!(recs[0].get(&["mono"]), Some("141606.646960"));
+        let mut runs = runs_from_records(&recs);
+        assert_eq!(runs.len(), 3);
+        assert_eq!(runs[0].last_phase, "running");
+        assert_eq!(runs[1].end, "exit 0 (stopped)");
+        assert_eq!(runs[1].uptime, "600.000");
+        assert_eq!(runs[1].peak_rss, "26900");
+        let crash = "2026-10-31T09:04:42.530817Z mono=141610.586289 fatal-signal run=1 pid=706245 signal=SEGV code=1 addr=0x0 sent=no\n\
+                     2026-10-31T09:31:00.000000Z mono=143160.0 fatal-signal run=3 pid=11 signal=TERM code=0 comm=\"kill\" sent=yes\n";
+        ends_from_crash_log(&mut runs, crash, false);
+        assert_eq!(runs[0].end, "crash, signal SEGV (crash.log)");
+        assert_eq!(runs[2].end, "signal TERM sent by kill (crash.log)");
+        // a running node's last run is never given an end
+        let mut runs = runs_from_records(&recs);
+        ends_from_crash_log(&mut runs, crash, true);
+        assert!(runs[2].end.is_empty());
+        let t = table(&runs, Some(11));
+        assert!(t[3].contains("running"));
+        // no crash record: the last run says so, without a guess
+        let mut runs = runs_from_records(&recs[..2]);
+        ends_from_crash_log(&mut runs, "", false);
+        assert!(table(&runs, None)[1].contains("no exit record, no crash record"));
+    }
+
+    #[test]
+    fn memory_limit_kill_from_marker() {
+        let text = "2026-10-31T09:02:52Z mono=1.0 start run=1 pid=7 version=0.2.9 how=terminal\n";
+        let recs: Vec<Record> = text.lines().filter_map(parse_record).collect();
+        let marker = "boot_id=b1\ncgroup=v2:/\nmemory.events.oom_kill=0\npid=7\nrun=1\n";
+        let at = |n: u64| move |cg: &str| (cg == "v2:/").then_some(n);
+        let mut runs = runs_from_records(&recs);
+        end_from_marker(&mut runs, marker, "b1", "-", at(2));
+        assert_eq!(
+            runs[0].end,
+            "memory limit kill probable (cgroup oom_kill 0->2 since start, marker)"
+        );
+        // no rise, another boot, another run, an unknown cgroup: no guess
+        for (boot, n, m) in [
+            ("b1", 0, marker),
+            ("b2", 2, marker),
+            ("b1", 2, &marker.replace("run=1", "run=2")),
+        ] {
+            let mut runs = runs_from_records(&recs);
+            end_from_marker(&mut runs, m, boot, "-", at(n));
+            assert!(runs[0].end.is_empty());
+        }
+        let mut runs = runs_from_records(&recs);
+        end_from_marker(&mut runs, marker, "b1", "-", |_| None);
+        assert!(table(&runs, None)[1].contains("no exit record, no crash record"));
+        // a crash.log end is kept
+        let mut runs = runs_from_records(&recs);
+        runs[0].end = "crash, signal SEGV (crash.log)".into();
+        end_from_marker(&mut runs, marker, "b1", "-", at(2));
+        assert_eq!(runs[0].end, "crash, signal SEGV (crash.log)");
+        // no rise: the table rules the memory limit out; another boot: says so
+        let mut runs = runs_from_records(&recs);
+        end_from_marker(&mut runs, marker, "b1", "-", at(0));
+        assert!(runs[0].oom_unchanged);
+        assert!(
+            table(&runs, None)[1].contains("not a memory-limit kill (cgroup oom_kill unchanged)")
+        );
+        let mut runs = runs_from_records(&recs);
+        end_from_marker(&mut runs, marker, "b2", "-", at(0));
+        assert!(table(&runs, None)[1].contains("the host restarted since"));
+        // a cgroup root read from another PID 1 (a second container on the
+        // same data) is another cgroup: its counts say nothing
+        let m = format!("{marker}pid1_start=100\n");
+        for now in ["200", "-"] {
+            let mut runs = runs_from_records(&recs);
+            end_from_marker(&mut runs, &m, "b1", now, at(2));
+            assert!(runs[0].end.is_empty() && !runs[0].oom_unchanged);
+            assert!(
+                table(&runs, None)[1].contains("a memory-limit kill is not ruled out from here")
+            );
+        }
+        let mut runs = runs_from_records(&recs);
+        end_from_marker(&mut runs, &m, "b1", "100", at(2));
+        assert!(runs[0].end.starts_with("memory limit kill probable"));
+    }
+
+    #[test]
+    fn panic_records_name_the_cause() {
+        let text = "2026-10-31T09:00:00Z mono=1.0 start run=1 pid=7 version=0.2.9 how=terminal\n\
+                    2026-10-31T09:00:02Z mono=3.0 panic thread=\"tokio-rt-worker\" task=\"test-panic\" at=\"bin/irondivid/src/tasks.rs:309\" ends_node=yes\n\
+                    2026-10-31T09:00:02Z mono=3.1 exit code=10 run=1 pid=7 reason=\"Error: test-panic panicked\"\n\
+                    2026-10-31T09:01:00Z mono=1.0 start run=2 pid=8 version=0.2.9 how=terminal\n\
+                    2026-10-31T09:01:02Z mono=3.0 panic thread=\"main\" task=\"-\" at=\"bin/irondivid/src/main.rs:5\" ends_node=yes\n\
+                    2026-10-31T09:01:02Z mono=3.1 exit code=101 run=2 pid=8\n\
+                    2026-10-31T09:02:00Z mono=1.0 start run=3 pid=9 version=0.2.9 how=container\n\
+                    2026-10-31T09:02:01Z mono=2.0 panic thread=\"tokio-rt-worker\" task=\"test-panic\" at=\"t.rs:1\" ends_node=no\n\
+                    2026-10-31T09:02:09Z mono=10.0 signal signo=TERM code=SI_USER pid=0 uid=0 sender=outside-pid-namespace action=stop count=1\n\
+                    2026-10-31T09:02:10Z mono=11.0 exit code=0 run=3 pid=9 reason=\"stopped\"\n";
+        let recs: Vec<Record> = text.lines().filter_map(parse_record).collect();
+        let runs = runs_from_records(&recs);
+        assert_eq!(
+            runs[0].end,
+            "exit 10 (Error: test-panic panicked), after panic in task test-panic on thread tokio-rt-worker at bin/irondivid/src/tasks.rs:309"
+        );
+        assert_eq!(
+            runs[1].end,
+            "exit 101, after panic on thread main at bin/irondivid/src/main.rs:5"
+        );
+        assert_eq!(runs[2].end, "exit 0 (stopped)");
+        assert!(runs[2].notes.iter().any(|n| n
+            == "panic in task test-panic on thread tokio-rt-worker at t.rs:1 (the node went on)"));
+        assert!(
+            runs[2]
+                .notes
+                .iter()
+                .any(|n| n
+                    == "signal TERM from outside the pid namespace (container runtime or host)")
+        );
+    }
+
+    #[test]
+    fn crash_records_name_thread_address_and_allocation() {
+        let text = "2026-10-31T09:00:00Z mono=1.0 start run=1 pid=7 version=0.2.9 how=terminal\n\
+                    2026-10-31T09:01:00Z mono=1.0 start run=2 pid=8 version=0.2.9 how=terminal\n\
+                    2026-10-31T09:02:00Z mono=1.0 start run=3 pid=9 version=0.2.9 how=terminal\n\
+                    2026-10-31T09:03:00Z mono=1.0 start run=4 pid=10 version=0.2.9 how=terminal\n";
+        let recs: Vec<Record> = text.lines().filter_map(parse_record).collect();
+        let crash = "2026-10-31T09:00:01Z mono=2.0 fatal-signal run=1 pid=7 signal=SEGV code=1 addr=0x0 tid=8 thread=\"tokio-rt-worker\" pc=0x1 sent=no\n\
+                     2026-10-31T09:00:01Z mono=2.0 fatal-signal-end run=1\n\
+                     2026-10-31T09:01:01Z mono=2.0 alloc-null size=1152921504606846976\n\
+                     2026-10-31T09:01:01Z mono=2.0 fatal-signal run=2 pid=8 signal=ABRT code=-6 tid=9 thread=\"main\" sent=no\n\
+                     2026-10-31T09:01:01Z mono=2.0 fatal-signal-end run=2\n\
+                     2026-10-31T09:02:01Z mono=2.0 fatal-signal run=3 pid=9 signal=ABRT code=-6 tid=9 thread=\"main\" sent=no\n\
+                     2026-10-31T09:03:01Z mono=2.0 fatal-signal run=4 pid=10 signal=SEGV code=1 addr=0x8 tid=11 thread=\"rocksdb:low\" foreign=yes sent=no\n";
+        let mut runs = runs_from_records(&recs);
+        ends_from_crash_log(&mut runs, crash, false);
+        assert_eq!(
+            runs[0].end,
+            "crash, signal SEGV at address 0x0 on thread tokio-rt-worker (crash.log)"
+        );
+        assert_eq!(
+            runs[1].end,
+            "allocation of 1152921504606846976 bytes failed, then abort on thread main (crash.log)"
+        );
+        assert_eq!(runs[2].end, "crash, signal ABRT on thread main (crash.log)");
+        assert_eq!(
+            runs[3].end,
+            "crash, signal SEGV at address 0x8 on a thread the node did not start (crash.log)"
+        );
+        // an abort with no Rust record under ulimit -v: a failed allocation in C/C++
+        let startup =
+            "[rlimits]\nas soft=1536000000 hard=1536000000\ndata soft=unlimited hard=unlimited\n";
+        abort_under_limit(&mut runs, |run| {
+            (run == "3" || run == "2").then(|| startup.to_string())
+        });
+        assert_eq!(
+            runs[2].end,
+            "crash, signal ABRT on thread main (crash.log); under an address-space limit (ulimit -v) of 1464 MB: a failed allocation is probable (C/C++ code such as RocksDB aborts without a Rust record)"
+        );
+        assert!(runs[1].end.starts_with("allocation of"));
+        assert!(!runs[1].end.contains("ulimit"));
+        let mut runs = runs_from_records(&recs);
+        ends_from_crash_log(&mut runs, crash, false);
+        abort_under_limit(&mut runs, |_| {
+            Some("[rlimits]\nas soft=unlimited hard=unlimited\n".into())
+        });
+        assert_eq!(runs[2].end, "crash, signal ABRT on thread main (crash.log)");
     }
 
     #[test]

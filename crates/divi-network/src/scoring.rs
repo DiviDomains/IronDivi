@@ -412,6 +412,15 @@ impl PeerScoring {
             }
             (peer_stats.ip, crossed, peer_stats.whitelisted)
         };
+        // A13 `bad-messages/`: the score and its cause; the message's bytes
+        // are not held here
+        divi_primitives::diag_events::emit(&divi_primitives::diag_events::Event::BadMessage {
+            peer: Some(ip),
+            command: "",
+            head: &[],
+            error: cause,
+            score: score as u32,
+        });
         if !crossed {
             return MisbehaviourOutcome::Scored;
         }
@@ -508,6 +517,10 @@ impl PeerScoring {
     pub fn ban_ip(&self, ip: IpAddr, duration: Duration, reason: impl Into<String>) {
         let reason = reason.into();
         info!("Banning IP {} for {:?}: {}", ip, duration, reason);
+        divi_primitives::diag_events::emit(&divi_primitives::diag_events::Event::Ban {
+            ip,
+            reason: &reason,
+        });
         // A ban is only ever made longer (PeerBanningService.cpp:56-62)
         let entry = BanEntry::at(self.clock.time(), ip, duration, reason);
         let mut bans = self.bans.write();

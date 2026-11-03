@@ -158,6 +158,13 @@ static SIGPIPES: AtomicU64 = AtomicU64::new(0);
 static EPIPES: AtomicU64 = AtomicU64::new(0);
 /// The monotonic time of the TSTP that stopped the process (0: none)
 static STOPPED_AT: AtomicU64 = AtomicU64::new(0);
+/// The monotonic time of the last SIGCONT (0: none), for the A17 watchdog
+static CONT_AT: AtomicU64 = AtomicU64::new(0);
+
+/// The last SIGCONT on CLOCK_MONOTONIC, in ms (0: none)
+pub(crate) fn cont_at_ms() -> u64 {
+    CONT_AT.load(Ordering::Relaxed) / 1_000_000
+}
 
 /// Where a stop goes, and whether the console gets a line for it
 static SINK: OnceLock<(broadcast::Sender<()>, bool)> = OnceLock::new();
@@ -575,6 +582,7 @@ fn act(raw: &Raw, detail: &str) {
             }
         }
         libc::SIGCONT => {
+            CONT_AT.store(raw.mono_ns, Ordering::Relaxed);
             let at = STOPPED_AT.swap(0, Ordering::Relaxed);
             if at == 0 || raw.mono_ns < at {
                 record("resume stopped_s=-");

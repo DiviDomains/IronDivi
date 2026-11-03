@@ -21,10 +21,14 @@
 //!   irondivid --testnet --datadir=/path/to/data
 //!   irondivid --rpcuser=user --rpcpassword=pass
 
+mod budget;
+mod build_id;
+mod chain_events;
 mod core_files;
 mod counts;
 #[cfg(unix)]
 mod crash;
+mod diaginfo;
 mod events;
 mod health;
 mod incidents;
@@ -32,7 +36,10 @@ mod interfaces;
 mod log_delivery;
 mod log_filter;
 mod masternode_options;
+mod mirror;
 mod private_files;
+mod replay;
+mod rpc_log;
 mod running_marker;
 mod runs_log;
 mod settings;
@@ -40,7 +47,11 @@ mod settings;
 mod signals;
 mod snapshot_sig;
 mod startup;
+#[cfg(unix)]
+mod startup_bound;
 mod tasks;
+#[cfg(unix)]
+mod watchdog;
 
 /// System's, with a crash.log line when an allocation fails (A5)
 #[cfg(unix)]
@@ -87,6 +98,14 @@ fn console_line(to_stdout: bool, line: std::fmt::Arguments<'_>) {
             signals::note_epipe();
         }
         if !CONSOLE_LOST.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            events::event(
+                "console-lost",
+                if to_stdout {
+                    "stream=stdout"
+                } else {
+                    "stream=stderr"
+                },
+            );
             // The log line's own timestamp says when
             warn!(
                 "{} lost: {}; console lines are dropped from now on",
@@ -641,6 +660,7 @@ const APPLIED: &[&str] = &[
     "forcestart",
     "rpcthreads",
     "alerts",
+    "walletbroadcast",
     "vault",
     // read by masternode_options
     "masternode",
@@ -752,6 +772,7 @@ const APPLIED: &[&str] = &[
 
 /// Options read elsewhere (before the node config is built, or by a command)
 const READ_ELSEWHERE: &[&str] = &[
+    "startuptimeout",
     "webui",
     "webuiport",
     "webuibind",
@@ -2167,6 +2188,9 @@ struct WalletOptions {
     /// -prunewalletconfs, read as a number: wallet transactions spent that
     /// deep are left out of memory at the start (init.cpp:1574-1577)
     prune_wallet_confs: Option<i64>,
+    /// -walletbroadcast=0 (A18): the wallet's own transactions are neither
+    /// relayed nor resubmitted; they stay in the wallet, unconfirmed
+    skip_broadcast: bool,
 }
 
 /// Divi Core's LoadWallet lines (walletdb.cpp:529-537): the file version a
@@ -2253,6 +2277,7 @@ impl WalletOptions {
                 .map(|v| parse_hex_prefix(v))
                 .collect(),
             prune_wallet_confs: settings.get("prunewalletconfs").map(atoi),
+            skip_broadcast: !settings.get_bool("walletbroadcast", true),
         }
     }
 
@@ -2765,6 +2790,31 @@ async fn run_daemon(
     // after the node starts, so the thread waits until then (below)
     node.hold_import();
 
+    // A12: chain-events.log, before any block or peer comes in
+    chain_events::install();
+    chain_events::watch_tip(node.chain());
+    // A13: replay bundles, written off the event path
+    replay::start(config.data_dir.as_path());
+    let sporks = node.spork_manager().clone();
+    replay::set_sources(
+        node.chain(),
+        Box::new(move || {
+            sporks
+                .active_sporks()
+                .iter()
+                .map(|m| {
+                    format!(
+                        "{} {} {} {}",
+                        m.spork_id,
+                        m.value,
+                        m.time_signed,
+                        hex::encode(m.signature.as_slice())
+                    )
+                })
+                .collect()
+        }),
+    );
+
     // -blocknotify, before any block comes in (init.cpp:1563-1564)
     if let Some(cmd) = config.blocknotify.clone() {
         spawn_block_notify(node.chain().clone(), cmd);
@@ -2838,8 +2888,12 @@ async fn run_daemon(
         block_sync: node.block_sync().clone(),
         peers: node.peer_manager().clone(),
         mempool: node.mempool().clone(),
+        sporks: node.spork_manager().clone(),
         data_dir: config.data_dir.clone(),
     });
+    // A17: hangs, stuck calls, lock waits and snapshot requests
+    #[cfg(unix)]
+    watchdog::start(config.data_dir.clone());
 
     // Get chain and peer manager references for RPC server
     let chain = node.chain().clone();
@@ -2849,6 +2903,9 @@ async fn run_daemon(
     runs_log::phase("wallet-load");
     let wallet = if disable_wallet {
         info!("Wallet disabled!");
+        // A12: no transaction is the wallet's, so every refusal is recorded
+        // unless a local caller sent it (A15)
+        chain_events::set_wallet_check(Box::new(|txid, _| rpc_log::is_sent(txid)));
 
         // Still need mempool cleanup + fee estimation callback even without wallet
         let block_sync = node.block_sync();
@@ -2897,6 +2954,21 @@ async fn run_daemon(
                 warn!("Warning: {}", message);
                 eprintln!("Warning: {}", message);
             }
+            // A12: a refused transaction the wallet knows, pays or spends
+            // from is never recorded (nor is any once the wallet is gone)
+            let own = Arc::downgrade(w);
+            chain_events::set_wallet_check(Box::new(move |txid, tx| {
+                let Some(w) = own.upgrade() else {
+                    return true;
+                };
+                rpc_log::is_sent(txid)
+                    || w.get_transaction(txid).is_some()
+                    || tx.vout.iter().any(|o| w.is_mine_script(&o.script_pubkey))
+                    || tx
+                        .vin
+                        .iter()
+                        .any(|i| w.get_transaction(&i.prevout.txid).is_some())
+            }));
             // Timed unlocks drop their keys when they run out (NODE-6)
             WalletDb::start_auto_lock(w);
             w.set_vault_mode(config.vault);
@@ -3075,7 +3147,10 @@ async fn run_daemon(
                 }
             }
 
-            resubmit_wallet_txs(&node, wallet_arc);
+            // -walletbroadcast=0: nothing of ours goes out (A18)
+            if !wallet_options.skip_broadcast {
+                resubmit_wallet_txs(&node, wallet_arc);
+            }
 
             // -prunewalletconfs, at least 20, once the wallet has caught up
             // with the chain (wallet.cpp:1162-1240, init.cpp:1574-1577)
@@ -3479,6 +3554,10 @@ async fn run_daemon(
                         Ok(txid)
                     }));
                     debug!("Transaction submission callback configured");
+                    // -walletbroadcast=0: the wallet's sends stay in the wallet (A18)
+                    rpc_server
+                        .wallet()
+                        .set_broadcast(!wallet_options.skip_broadcast);
 
                     if let Some(ref staker_arc) = staker_ref {
                         let staker_for_status = Arc::clone(staker_arc);
@@ -4386,6 +4465,9 @@ fn crash_leave() {
 }
 
 fn main() {
+    // The build-id every crash.log entry names (A16), read before the
+    // handlers that write them
+    build_id::init();
     // Every panic is recorded from here on (A4)
     // Fatal signals to crash.log, before anything else can fault (A5)
     #[cfg(unix)]
@@ -4633,6 +4715,7 @@ fn exit_after_stop(runtime: tokio::runtime::Runtime, result: Result<()>) -> ! {
         Ok(()) => {
             // The partial hour's count lines (A11)
             counts::flush();
+            events::event("stop", "clean=yes");
             runs_log::exit(0, "stopped");
             flush_log();
             unsafe { libc::_exit(0) }
@@ -4702,10 +4785,23 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
             "main"
         };
         let network = format!("{}/{:?}", network, args.chain_mode()).to_lowercase();
+        // A14: the mirror is chosen before runs.log opens, which names it
+        mirror::open(&data_dir, &config_path(&args));
         runs_log::open(&data_dir, &network, cfg!(unix) && args.daemon);
+        budget::sample_dir(&data_dir);
         tasks::set_data_dir(&data_dir);
         events::set_data_dir(&data_dir);
+        rpc_log::install(&data_dir);
         incidents::set_data_dir(&data_dir);
+        // A17: a lock wait of 1 s or more is an events.log line
+        #[cfg(unix)]
+        watchdog::install_lock_sink();
+        // A12
+        events::event(
+            "start",
+            &format!("version={} network={}", env!("CARGO_PKG_VERSION"), network),
+        );
+        events::note_config(&data_dir, &config_path(&args));
         #[cfg(unix)]
         {
             crash::open(&data_dir);
@@ -4720,6 +4816,13 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
             },
         );
         runs_log::phase("config");
+        // A1's start-up bound; it ends the run only with -startuptimeout (A18)
+        #[cfg(unix)]
+        startup_bound::start(
+            number_option(&args.settings, "startuptimeout", 1..=i64::from(u32::MAX))
+                .map(|s| s as u64),
+            args.regtest,
+        );
     }
 
     // Build configuration

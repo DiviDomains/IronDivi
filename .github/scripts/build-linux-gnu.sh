@@ -45,6 +45,9 @@ if [ -n "$TRIPLE" ]; then
   export BINDGEN_EXTRA_CLANG_ARGS="--target=$TRIPLE --sysroot=/usr/$TRIPLE"
 fi
 
+# A16: an explicit build-id, and line tables in the copy kept unstripped
+export RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=-Wl,--build-id=sha1"
+export CARGO_PROFILE_RELEASE_DEBUG=line-tables-only
 cargo build --release --locked --target "$TARGET" --bin irondivid --bin irondivi-cli
 
 # Refuse a binary that needs a newer glibc than the build system's
@@ -57,3 +60,10 @@ for bin in irondivid irondivi-cli; do
     exit 1
   fi
 done
+
+# A16: keep the unstripped binaries under their build-id, ship stripped
+# copies from release/ship/ (the release uploads release/symbols/ to the
+# private release storage)
+OUT="${CARGO_TARGET_DIR:-target}/$TARGET/release"
+STRIP="${TRIPLE:+$TRIPLE-}strip" "$(dirname "$0")/../../tools/release-symbols.sh" \
+  keep "$OUT" "$OUT/symbols" "$OUT/ship"

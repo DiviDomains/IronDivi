@@ -160,7 +160,8 @@ fn unclean_previous(text: &str, diag_dir: &Path) -> String {
     // An exit on record means the run was already ending: no kill verdict
     // A fatal signal's record in crash.log names the cause (A5)
     #[cfg(unix)]
-    let crash = crate::crash::verdict_for(&diag_dir.join("crash.log"), run);
+    let crash = crate::crash::verdict_for(&diag_dir.join("crash.log"), run)
+        .or_else(|| crate::crash::verdict_for(&diag_dir.join("crash.log.1"), run));
     #[cfg(not(unix))]
     let crash: Option<String> = None;
     let verdict = if exited {
@@ -224,7 +225,8 @@ const OOM_KILL: &str = "memory.events.oom_kill";
 /// died between that record and removing the marker). An exit record names
 /// its run; one that does not (older) counts for the last `start` before it.
 fn exit_recorded(runs_log: &Path, run: u64) -> bool {
-    let text = std::fs::read_to_string(runs_log).unwrap_or_default();
+    // runs.log may have just moved to runs.log.1 (A14)
+    let text = crate::runs_log::read_with_previous(runs_log);
     let start = format!(" start run={} ", run);
     let own = format!(" run={} ", run);
     let mut inside = false;

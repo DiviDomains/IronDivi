@@ -48,6 +48,8 @@
 //! let _ = std::fs::remove_dir_all(&temp_dir);
 //! ```
 
+/// The call recorder (diag A15), for the transports built on this crate
+pub use divi_primitives::diag_rpc;
 pub mod access;
 pub mod auth_cookie;
 pub mod blockchain;
