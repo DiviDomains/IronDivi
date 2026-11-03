@@ -64,6 +64,7 @@ fn start(dir: &Path, data: &Path, args: &[&str], env: &[(&str, &str)]) -> KillOn
         // The A14 mirror under the test's own directory
         .env("HOME", dir)
         .env("XDG_STATE_HOME", &state)
+        .env("IRONDIVI_TEST_MIRROR_ROOT", state.join("irondivi"))
         .envs(env.iter().copied())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -104,7 +105,7 @@ fn find_runs_logs(dir: &Path, out: &mut Vec<PathBuf>) {
 fn startuptimeout_ends_a_stalled_start_with_code_10() {
     let dir = tempfile::tempdir().unwrap();
     let data = stalling_datadir(dir.path());
-    let mut node = start(dir.path(), &data, &["-startuptimeout=2"], &[]);
+    let mut node = start(dir.path(), &data, &["-startuptimeout=3"], &[]);
     let deadline = Instant::now() + Duration::from_secs(60);
     let status = loop {
         if let Some(status) = node.0.try_wait().unwrap() {
@@ -137,7 +138,7 @@ fn startuptimeout_ends_a_stalled_start_with_code_10() {
     assert!(info.contains("phase=db-open"), "{info}");
     assert!(info.contains("exit=yes"), "{info}");
     let events = std::fs::read_to_string(data.join("diag/events.log")).unwrap();
-    assert!(events.contains(" phase db-open running 2 s"), "{events}");
+    assert!(events.contains(" phase db-open running 3 s"), "{events}");
 }
 
 #[test]
@@ -148,9 +149,9 @@ fn without_startuptimeout_a_stall_is_written_down_and_the_node_waits() {
         dir.path(),
         &data,
         &[],
-        &[("IRONDIVI_TEST_STARTUP_BOUND_S", "2")],
+        &[("IRONDIVI_TEST_STARTUP_BOUND_S", "3")],
     );
-    let events = wait_for_file(&data.join("diag/events.log"), " phase db-open running 2 s");
+    let events = wait_for_file(&data.join("diag/events.log"), " phase db-open running 3 s");
     assert!(events.contains("kind=startup-stall"), "{events}");
     let info = wait_for_file(&data.join("diag/incidents/1/info.txt"), "phase=db-open");
     assert!(info.contains("exit=no"), "{info}");

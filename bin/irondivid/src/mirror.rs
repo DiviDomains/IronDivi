@@ -87,8 +87,36 @@ pub fn id_of(data_dir: &Path) -> String {
     hex::encode(divi_crypto::sha256(canon.as_os_str().as_bytes()))[..16].to_string()
 }
 
-fn candidates() -> Vec<PathBuf> {
+fn is_temp_datadir(data_dir: &Path) -> bool {
+    let canon = std::fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
+    let tmp = std::env::temp_dir();
+    let tmp_canon = std::fs::canonicalize(&tmp).unwrap_or_else(|_| tmp.clone());
+    for p in [data_dir, canon.as_path()] {
+        if p.starts_with(&tmp)
+            || p.starts_with(&tmp_canon)
+            || p.starts_with("/tmp")
+            || p.starts_with("/private/tmp")
+            || p.starts_with("/var/tmp")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn candidates(data_dir: &Path) -> Vec<PathBuf> {
+    if let Some(root) = std::env::var_os("IRONDIVI_TEST_MIRROR_ROOT").filter(|p| !p.is_empty()) {
+        return vec![PathBuf::from(root)];
+    }
     let uid = unsafe { libc::getuid() };
+    if std::env::var_os("CARGO").is_some() && is_temp_datadir(data_dir) {
+        if let Some(xdg) = std::env::var_os("XDG_STATE_HOME")
+            .filter(|x| Path::new(x).is_absolute() && is_temp_datadir(Path::new(x)))
+        {
+            return vec![PathBuf::from(xdg).join("irondivi")];
+        }
+        return vec![std::env::temp_dir().join(format!("irondivi-test-mirror-{}", uid))];
+    }
     let home = std::env::var_os("HOME")
         .filter(|h| !h.is_empty())
         .map(PathBuf::from);
@@ -152,7 +180,7 @@ fn choose_and_create(data_dir: &Path) -> Status {
     let Ok(data_dev) = std::fs::metadata(data_dir).map(|m| m.dev()) else {
         return Status::Unavailable;
     };
-    let roots = candidates();
+    let roots = candidates(data_dir);
     let mut devs: Vec<Option<u64>> = roots.iter().map(|r| probe(r)).collect();
     let id = id_of(data_dir);
     while let Some((i, same_fs)) = choose(&devs, data_dev) {
@@ -363,5 +391,20 @@ mod tests {
     fn the_start_is_stat_field_22() {
         let line = "42 (a b) c) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 777 19";
         assert_eq!(stat_start(line).as_deref(), Some("777"));
+    }
+
+    #[test]
+    fn cargo_test_temp_datadir_isolates_mirror_outside_user_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let roots = candidates(dir.path());
+        assert_eq!(roots.len(), 1, "{roots:?}");
+        assert!(
+            is_temp_datadir(&roots[0]),
+            "expected temp mirror root under cargo test, got {roots:?}"
+        );
+        assert!(
+            !roots[0].to_string_lossy().contains(".local/state/irondivi"),
+            "{roots:?}"
+        );
     }
 }

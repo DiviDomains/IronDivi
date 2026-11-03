@@ -365,5 +365,4 @@ Full workspace tests pass on hp3 with the stacked tree (58 suites ok, credential
 - A15 panic hook and A10 RPC need server.rs changes; rpc_calls reads n/a in the health test.
 - macOS boot clock and LC_UUID unverified; frame pointers off; non-glibc targets keep no symbols.
 - `--host` untested live on Proxmox, plain LXC, Incus, cgroup v1, memory.peak (fixtures only).
-- A plain `cargo test` writes to ~/.local/state/irondivi; budget tests carry flake risk.
 - hp3 disk at 97%: the irondivi-diag cargo cache (~87 GB) is the first thing to delete.

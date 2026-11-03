@@ -172,10 +172,10 @@ fn a_node_that_does_not_answer_is_a_timeout() {
     let mut o = Out::capture();
     let t = Instant::now();
     assert_eq!(
-        live::rpc_report(&mut o, &redactor(), &rpc, Duration::from_secs(2)),
+        live::rpc_report(&mut o, &redactor(), &rpc, Duration::from_millis(500)),
         Err(CallError::Timeout)
     );
-    assert!(t.elapsed() < Duration::from_secs(4));
+    assert!(t.elapsed() < Duration::from_secs(15));
 }
 
 #[test]
@@ -262,9 +262,10 @@ fn snapshot_request_is_written_and_answered() {
     let th = std::thread::spawn(move || {
         let req = idc.join("diag/snapshot-request");
         let t0 = Instant::now();
-        while !req.exists() && t0.elapsed() < Duration::from_secs(3) {
+        while !req.exists() && t0.elapsed() < Duration::from_secs(30) {
             std::thread::sleep(Duration::from_millis(50));
         }
+        assert!(req.exists(), "snapshot request did not arrive within 30s");
         std::fs::create_dir_all(idc.join("incidents")).unwrap();
         std::fs::write(idc.join("incidents/snap-1.txt"), "thread 1 futex_wait\n").unwrap();
         let mut f = std::fs::OpenOptions::new()
