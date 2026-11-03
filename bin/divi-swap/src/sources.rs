@@ -84,3 +84,42 @@ pub fn check_divi(
          lying or broken endpoint is trusted for HTLC, confirmation and spend reads"
     )))
 }
+
+/// The XMR taker's DIVI source (`--xmr-divi-rpc-url`): a warning on mainnet when `rpc_url` is
+/// the `default` proxy or under its operator, naming `--xmr-divi-rpc-url` and the risk.
+pub fn xmr_divi_warning(mainnet: bool, default: &str, rpc_url: &str) -> Option<String> {
+    if !mainnet || !operator::same_operator(rpc_url, default) {
+        return None;
+    }
+    Some(format!(
+        "DIVI: the DIVI source of this XMR taker ({rpc_url}) is the default proxy {default} or \
+         under its operator, which by its hostname is the project that runs the reference maker: \
+         one operator can then show this taker a maker DIVI lock that does not exist before the \
+         taker locks XMR, or report a false median time (colluding-operators.md L2, L4). Set \
+         --xmr-divi-rpc-url to an own DIVI node or an independent operator's."
+    ))
+}
+
+/// The XMR taker's DIVI start rule on mainnet: where [`xmr_divi_warning`] fires, `Err` refuses
+/// the start unless `allow_single_source`, and with it `Ok(Some(warning))`, to be printed at
+/// every start; `Ok(None)` otherwise.
+pub fn check_xmr_divi(
+    mainnet: bool,
+    allow_single_source: bool,
+    default: &str,
+    rpc_url: &str,
+) -> Result<Option<String>, String> {
+    let Some(w) = xmr_divi_warning(mainnet, default, rpc_url) else {
+        return Ok(None);
+    };
+    if !allow_single_source {
+        return Err(format!(
+            "{w} A mainnet XMR taker needs an independent DIVI source; set --xmr-divi-rpc-url \
+             to an own DIVI node, or pass --allow-single-source to run on one source deliberately"
+        ));
+    }
+    Ok(Some(format!(
+        "{w} This mainnet XMR taker runs on a single DIVI operator (--allow-single-source): one \
+         lying or broken endpoint is trusted for DIVI lock, confirmation and spend reads"
+    )))
+}

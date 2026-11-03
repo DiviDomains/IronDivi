@@ -29,8 +29,8 @@ pub fn spawn_scheduler(maker: Arc<Maker>, every: Duration) -> JoinHandle<()> {
     spawn_gated_scheduler(maker, every, ScanStatus::done())
 }
 
-/// As [`spawn_scheduler`], but ticks (which may need wallet coins) are deferred until `scan`
-/// is done.
+/// As [`spawn_scheduler`], gating only DIVI maker-leg coin selection until `scan` is done so
+/// in-flight claims, refunds, and counter-chain locks continue during wallet catch-up.
 pub fn spawn_gated_scheduler(
     maker: Arc<Maker>,
     every: Duration,
@@ -41,11 +41,7 @@ pub fn spawn_gated_scheduler(
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
-            if !scan.is_done() {
-                tracing::debug!("wallet scan in progress; tick deferred");
-                continue;
-            }
-            if let Err(e) = maker.tick().await {
+            if let Err(e) = maker.tick_with_divi_ready(scan.is_done()).await {
                 tracing::warn!(error = %e, "scheduler tick failed");
             }
         }

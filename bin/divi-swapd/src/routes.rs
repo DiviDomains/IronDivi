@@ -713,7 +713,11 @@ async fn lock(
     Path(id): Path<String>,
     Json(notice): Json<LockNotice>,
 ) -> Result<Json<SwapView>, ApiError> {
-    Ok(Json(s.maker.notify_lock(&id, notice).await?))
+    Ok(Json(
+        s.maker
+            .notify_lock_with_divi_ready(&id, notice, s.scan.is_done())
+            .await?,
+    ))
 }
 
 async fn xmr_setup(

@@ -186,3 +186,162 @@ async fn follow_keeps_the_cursor_behind_the_tip_and_stays_done() {
     assert!(scan.is_done());
     assert_eq!(fake.scanned_height(), Some(1_015));
 }
+
+#[tokio::test]
+async fn claims_and_refunds_complete_during_wallet_scan_while_divi_funding_waits() {
+    use divi_swap::SwapState;
+    use divi_swapd::{router_with_auth, spawn_gated_scheduler, HashlockAuth, ProxyTrust};
+
+    let w = World::new();
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("m.db")).unwrap();
+    let maker = w.maker(store.clone());
+    let taker = w.taker(&dir.path().join("t.db"));
+
+    // 1. `claim_mid`: both legs locked and confirmed, then taker claims DIVI (revealing preimage)
+    //    before the daemon restarts into scan catch-up.
+    let q1 = maker.quote(OFFER_ID, BTC_SATS).await.unwrap();
+    let (tid1, req1) = taker.prepare(&q1).await.unwrap();
+    let v1 = maker.accept(req1).await.unwrap();
+    taker.accepted(&tid1, &v1).await.unwrap();
+    let n1 = taker.lock(&tid1).await.unwrap();
+    let claim_mid = maker.notify_lock(&v1.id, n1).await.unwrap().id;
+    for _ in 0..15 {
+        w.divi.mine(1);
+        w.btc.mine(1);
+        maker.tick().await.unwrap();
+        if maker.view(&claim_mid).unwrap().unwrap().state == SwapState::MakerLockConfirmed {
+            break;
+        }
+    }
+    assert_eq!(
+        maker.view(&claim_mid).unwrap().unwrap().state,
+        SwapState::MakerLockConfirmed
+    );
+    let view1 = maker.view(&claim_mid).unwrap();
+    taker.step(&tid1, view1.as_ref()).await.unwrap();
+    w.divi.mine(1);
+
+    // 2. `refund_mid`: both legs locked and confirmed; we will advance DIVI past the maker-leg
+    //    locktime once the third swap is staged so `refund_mid` refunds during scan catch-up.
+    let q2 = maker.quote(OFFER_ID, BTC_SATS).await.unwrap();
+    let (tid2, req2) = taker.prepare(&q2).await.unwrap();
+    let v2 = maker.accept(req2).await.unwrap();
+    taker.accepted(&tid2, &v2).await.unwrap();
+    let n2 = taker.lock(&tid2).await.unwrap();
+    let refund_mid = maker.notify_lock(&v2.id, n2).await.unwrap().id;
+    for _ in 0..15 {
+        w.divi.mine(1);
+        w.btc.mine(1);
+        if maker.step(&refund_mid).await.unwrap() == SwapState::MakerLockConfirmed {
+            break;
+        }
+    }
+    assert_eq!(
+        maker.view(&refund_mid).unwrap().unwrap().state,
+        SwapState::MakerLockConfirmed
+    );
+
+    // 3. `fund_mid`: accepted before scan, taker locks BTC and confirms it, but maker has not
+    //    been notified or selected a DIVI coin yet.
+    let q3 = maker.quote(OFFER_ID, BTC_SATS).await.unwrap();
+    let (tid3, req3) = taker.prepare(&q3).await.unwrap();
+    let v3 = maker.accept(req3).await.unwrap();
+    taker.accepted(&tid3, &v3).await.unwrap();
+    let n3 = taker.lock(&tid3).await.unwrap();
+    w.btc.mine(6);
+    let fund_mid = v3.id.clone();
+
+    // Advance DIVI past `refund_mid`'s maker-leg locktime so its refund is final now.
+    let refund_locktime = store
+        .get_maker_swap(&refund_mid)
+        .unwrap()
+        .unwrap()
+        .maker_leg_htlc
+        .unwrap()
+        .locktime;
+    let delta = refund_locktime.saturating_sub(w.divi.mtp()) + 60;
+    w.divi.advance_time(delta);
+
+    let divi_fundings_before = w.maker_divi.funding_calls();
+
+    // Start the HTTP server and gated scheduler while the DIVI wallet scan is still in progress.
+    let scan = ScanStatus::scanning();
+    let sched = spawn_gated_scheduler(maker.clone(), Duration::from_millis(15), scan.clone());
+    let state = AppState {
+        maker: maker.clone(),
+        divi: Arc::new(w.maker_divi.clone()),
+        btc: Arc::new(w.maker_btc.clone()),
+        scan: scan.clone(),
+    };
+    let auth = HashlockAuth::new(store.clone()).allow_tokenless(true);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = router_with_auth(state, None, "/swap", ProxyTrust::off(), auth);
+    let srv = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let base = format!("http://{addr}/swap");
+
+    // Notify `/lock` for `fund_mid` during the scan: must verify the BTC lock without selecting DIVI coins.
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/swaps/{fund_mid}/lock"))
+        .json(&n3)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+
+    for _ in 0..80 {
+        w.divi.mine(1);
+        w.btc.mine(1);
+        let s1 = maker.view(&claim_mid).unwrap().unwrap().state;
+        let s2 = maker.view(&refund_mid).unwrap().unwrap().state;
+        if s1 == SwapState::Done && s2 == SwapState::Done {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(15)).await;
+    }
+    assert!(!scan.is_done(), "scan is still running");
+    assert_eq!(
+        maker.view(&claim_mid).unwrap().unwrap().state,
+        SwapState::Done,
+        "maker claim must finish while DIVI wallet scan is running"
+    );
+    assert_eq!(
+        maker.view(&refund_mid).unwrap().unwrap().state,
+        SwapState::Done,
+        "maker refund must finish while DIVI wallet scan is running"
+    );
+    assert_eq!(
+        maker.view(&fund_mid).unwrap().unwrap().state,
+        SwapState::TakerLockConfirmed,
+        "DIVI maker-leg funding must wait in TakerLockConfirmed until scan finishes"
+    );
+    assert_eq!(
+        w.maker_divi.funding_calls(),
+        divi_fundings_before,
+        "zero DIVI coin selections while scan is running"
+    );
+
+    // Finish the scan: `fund_mid` now selects a DIVI coin and locks.
+    let fake = Fake::new(None, 100);
+    run_scan(&fake, 0, &scan, 500, Duration::from_millis(1)).await;
+    assert!(scan.is_done());
+    for _ in 0..80 {
+        w.divi.mine(1);
+        w.btc.mine(1);
+        if maker.view(&fund_mid).unwrap().unwrap().state == SwapState::MakerLockConfirmed {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(15)).await;
+    }
+    assert_eq!(
+        maker.view(&fund_mid).unwrap().unwrap().state,
+        SwapState::MakerLockConfirmed
+    );
+    assert_eq!(w.maker_divi.funding_calls(), divi_fundings_before + 1);
+
+    sched.abort();
+    srv.abort();
+}

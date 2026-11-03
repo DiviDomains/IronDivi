@@ -102,6 +102,8 @@ pub struct Maker {
     /// Per-chain fee escalations of taker-leg claims replacing
     /// [`FeeEscalation::builtin`] (`None`: off).
     fee_escalations: BTreeMap<Chain, Option<FeeEscalation>>,
+    /// Whether the DIVI wallet is ready for new coin selection (e.g. startup scan finished).
+    divi_ready: Arc<dyn Fn() -> bool + Send + Sync>,
 }
 
 impl Maker {
@@ -182,7 +184,17 @@ impl Maker {
             gate_bound: Duration::from_secs(GATE_BOUND_SECS),
             engines: Vec::new(),
             fee_escalations: BTreeMap::new(),
+            divi_ready: Arc::new(|| true),
         })
+    }
+
+    /// Gate DIVI maker-leg coin selection (`TakerLockConfirmed -> MakerLocked` when the maker
+    /// leg is on DIVI) on `ready()` returning `true` (e.g. `ScanStatus::is_done` while the DIVI
+    /// wallet catches up on startup). Refunds, claims, taker-window aborts, and counter-chain
+    /// maker locks proceed without waiting on `ready`.
+    pub fn with_divi_ready(mut self, ready: Arc<dyn Fn() -> bool + Send + Sync>) -> Self {
+        self.divi_ready = ready;
+        self
     }
 
     /// Use `escalation` instead of [`FeeEscalation::builtin`] for claims of taker legs on
@@ -454,6 +466,17 @@ impl Maker {
 
     /// The taker says it funded the taker-leg HTLC at `lock.outpoint`.
     pub async fn notify_lock(&self, swap_id: &str, lock: LockNotice) -> Result<SwapView> {
+        self.notify_lock_with_divi_ready(swap_id, lock, (self.divi_ready)())
+            .await
+    }
+
+    /// As [`Self::notify_lock`], passing whether the DIVI wallet is ready for coin selection.
+    pub async fn notify_lock_with_divi_ready(
+        &self,
+        swap_id: &str,
+        lock: LockNotice,
+        divi_ready: bool,
+    ) -> Result<SwapView> {
         {
             let _g = self.gate_bounded("notify_lock").await?;
             let mut rec = self.load(swap_id)?;
@@ -482,7 +505,7 @@ impl Maker {
         // do not make the caller wait out another swap's chain calls.
         if let Ok(g) = self.gate_bounded("notify_lock").await {
             drop(g);
-            let _ = self.step(swap_id).await;
+            let _ = self.step_inner(swap_id, divi_ready).await;
         }
         self.view(swap_id)?
             .ok_or_else(|| SwapError::Other("swap vanished".into()))
@@ -522,6 +545,11 @@ impl Maker {
 
     /// Advance one swap as far as it can go right now. Idempotent; safe after restart.
     pub async fn step(&self, swap_id: &str) -> Result<SwapState> {
+        self.step_inner(swap_id, (self.divi_ready)()).await
+    }
+
+    async fn step_inner(&self, swap_id: &str, divi_ready: bool) -> Result<SwapState> {
+        let ready = divi_ready && (self.divi_ready)();
         let _g = self.gate.lock().await;
         let mut rec = self.load(swap_id)?;
         if rec.state.is_terminal() {
@@ -529,7 +557,7 @@ impl Maker {
         }
         let had_error = rec.last_error.take().is_some();
         for _ in 0..MAX_TRANSITIONS_PER_STEP {
-            match self.advance(&mut rec).await {
+            match self.advance(&mut rec, ready).await {
                 Ok(Flow::Moved) => {}
                 Ok(Flow::Idle | Flow::Halted) => break,
                 Err(e) => {
@@ -548,9 +576,16 @@ impl Maker {
     /// `step` every non-terminal swap; errors are recorded on the swap, not returned.
     /// The daemon's scheduler calls this every few seconds and once at startup.
     pub async fn tick(&self) -> Result<()> {
+        self.tick_with_divi_ready((self.divi_ready)()).await
+    }
+
+    /// As [`Self::tick`], gating only DIVI maker-leg coin selection on `divi_ready` so claims,
+    /// refunds, and counter-chain locks proceed while the DIVI wallet catches up on startup.
+    pub async fn tick_with_divi_ready(&self, divi_ready: bool) -> Result<()> {
+        let ready = divi_ready && (self.divi_ready)();
         for rec in self.store.list_maker_swaps()? {
             if !rec.state.is_terminal() {
-                let _ = self.step(&rec.id).await;
+                let _ = self.step_inner(&rec.id, ready).await;
             }
         }
         for e in &self.engines {
@@ -593,11 +628,11 @@ impl Maker {
         self.enter(r, SwapState::Aborted)
     }
 
-    async fn advance(&self, r: &mut MakerRecord) -> Result<Flow> {
+    async fn advance(&self, r: &mut MakerRecord, divi_ready: bool) -> Result<Flow> {
         match r.state {
             SwapState::Accepted => self.on_accepted(r).await,
             SwapState::TakerLockSeen => self.on_taker_lock_seen(r).await,
-            SwapState::TakerLockConfirmed => self.on_taker_lock_confirmed(r).await,
+            SwapState::TakerLockConfirmed => self.on_taker_lock_confirmed(r, divi_ready).await,
             SwapState::MakerLocked => self.on_maker_locked(r).await,
             SwapState::MakerLockConfirmed => self.on_maker_lock_confirmed(r).await,
             SwapState::MakerRefundable => self.on_maker_refundable(r).await,
@@ -746,7 +781,7 @@ impl Maker {
     }
 
     /// The staking edge: the only place the maker selects coins (on the maker-leg chain).
-    async fn on_taker_lock_confirmed(&self, r: &mut MakerRecord) -> Result<Flow> {
+    async fn on_taker_lock_confirmed(&self, r: &mut MakerRecord, divi_ready: bool) -> Result<Flow> {
         let taker_amount = r.quote.taker_leg_amount();
         let op = self.taker_leg_outpoint(r)?;
         let read = match self.tk(r)?.htlc_output(&r.taker_leg_htlc, &op).await {
@@ -762,6 +797,9 @@ impl Maker {
         }
         if self.taker_window_too_short(r).await? {
             return self.abort(r, "taker-leg window too short to lock safely");
+        }
+        if r.quote.maker_chain() == Chain::Divi && !divi_ready {
+            return Ok(Flow::Idle);
         }
         let mb = self.mk(r)?.clone();
         let mtp = mb.median_time_past().await?;

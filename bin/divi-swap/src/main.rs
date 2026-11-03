@@ -642,10 +642,10 @@ fn divi_rpc_url(cli: &Cli, network: divi_wallet::address::Network) -> String {
 }
 
 /// The start checks of who runs the taker's read sources, on a mainnet profile only
-/// ([`divi_swap_cli::sources`]): every DIVI source on the default proxy's operator is
-/// refused (`Err`) unless `--allow-single-source`, and then warned; (with `--counter-chain
-/// zec`) one lightwalletd operator with no `--zec-crosscheck-url` is warned. At most one
-/// warning per chain. The xmr arm's DIVI side is not covered.
+/// ([`divi_swap_cli::sources`]): every DIVI source on the default proxy's operator (including
+/// the xmr arm's `--xmr-divi-rpc-url`) is refused (`Err`) unless `--allow-single-source`, and
+/// then warned; (with `--counter-chain zec`) one lightwalletd operator with no
+/// `--zec-crosscheck-url` is warned. At most one warning per chain.
 fn taker_source_warnings(cli: &Cli) -> Result<Vec<String>> {
     let mainnet = cli.profile == divi_swap::Profile::Mainnet;
     let mut out = Vec::new();
@@ -660,7 +660,24 @@ fn taker_source_warnings(cli: &Cli) -> Result<Vec<String>> {
             }
         }
     }
-    if cli.counter_chain != Chain::Xmr {
+    if cli.counter_chain == Chain::Xmr {
+        if let Some(url) = cli
+            .xmr_divi_rpc_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+        {
+            out.extend(
+                divi_swap_cli::sources::check_xmr_divi(
+                    mainnet,
+                    cli.allow_single_source,
+                    swap_chain_divi::MAINNET_RPC,
+                    url,
+                )
+                .map_err(|e| anyhow::anyhow!("{e}"))?,
+            );
+        }
+    } else {
         let network = if cli.divi_network == "mainnet" {
             divi_wallet::address::Network::Mainnet
         } else {
@@ -1506,6 +1523,9 @@ async fn live_xmr_taker(cli: &Cli) -> Result<divi_swap_xmr::XmrTaker> {
         }
         (None, _) => "https://services.divi.domains/api/testnet/rpc/".to_string(),
     };
+    for w in taker_source_warnings(cli)? {
+        tracing::warn!("{w}");
+    }
     let need = |v: &Option<String>, flag: &str| {
         v.clone()
             .with_context(|| format!("live --counter-chain xmr needs {flag}"))
@@ -4065,5 +4085,58 @@ mod tests {
                 assert!(divi_warnings(&c).is_empty(), "{argv:?}");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn mainnet_xmr_taker_on_the_default_divi_operator_requires_own_node_or_opt_in() {
+        let xmr_mainnet = |extra: &[&str]| {
+            let mut argv = vec!["--xmr-network", "mainnet", "--xmr-allow-mainnet"];
+            argv.extend_from_slice(extra);
+            mainnet_cli("xmr", &argv)
+        };
+        for url in [
+            swap_chain_divi::MAINNET_RPC,
+            "https://other.services.divi.domains/rpc/",
+        ] {
+            let refused = xmr_mainnet(&["--xmr-divi-rpc-url", url]);
+            let err = match live_xmr_taker(&refused).await {
+                Ok(_) => panic!("started xmr mainnet taker without sweep address"),
+                Err(e) => e.to_string(),
+            };
+            assert!(
+                err.contains("--xmr-divi-rpc-url")
+                    && err.contains("--allow-single-source")
+                    && !err.contains("--xmr-sweep-address"),
+                "{url}: {err}"
+            );
+
+            let opted_in = xmr_mainnet(&["--xmr-divi-rpc-url", url, "--allow-single-source"]);
+            let err = match live_xmr_taker(&opted_in).await {
+                Ok(_) => panic!("started xmr mainnet taker without sweep address"),
+                Err(e) => e.to_string(),
+            };
+            assert!(err.contains("--xmr-sweep-address"), "{url}: {err}");
+            let w = divi_warnings(&opted_in);
+            assert_eq!(w.len(), 1, "{url}: {w:?}");
+            assert!(
+                w[0].contains(url)
+                    && w[0].contains("--xmr-divi-rpc-url")
+                    && w[0].contains("--allow-single-source"),
+                "{url}: {}",
+                w[0]
+            );
+        }
+
+        let own = xmr_mainnet(&["--xmr-divi-rpc-url", "https://divi.own-node.example:51473"]);
+        assert!(divi_warnings(&own).is_empty());
+        let err = match live_xmr_taker(&own).await {
+            Ok(_) => panic!("started xmr mainnet taker without sweep address"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("--xmr-sweep-address"), "{err}");
+
+        assert!(taker_source_warnings(&cli(&["--counter-chain", "xmr"]))
+            .unwrap()
+            .is_empty());
     }
 }

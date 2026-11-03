@@ -984,7 +984,11 @@ async fn main() -> Result<()> {
         )?),
     };
     let mut maker =
-        Maker::with_counters(cfg.swap_config()?, divi.clone(), counters, store, offers)?;
+        Maker::with_counters(cfg.swap_config()?, divi.clone(), counters, store, offers)?
+            .with_divi_ready(Arc::new({
+                let s = scan.clone();
+                move || s.is_done()
+            }));
     maker = with_claim_fees(maker, &args)?;
     if let Some(x) = &xmr {
         maker = maker.with_engine(x.clone())?;
