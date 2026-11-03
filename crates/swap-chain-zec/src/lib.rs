@@ -726,6 +726,7 @@ impl ZecBackend {
         tx_of: impl FnOnce(&T) -> &tx::ZecTx,
     ) -> Result<T> {
         let mut spent = self.spent_by_built.lock().expect("spent_by_built");
+        spent.retain(|op, _| coins.iter().any(|c| c.outpoint == *op));
         let free: Vec<tx::Coin> = coins
             .into_iter()
             .filter(|c| !spent.contains_key(&c.outpoint))
@@ -910,14 +911,8 @@ impl ChainBackend for ZecBackend {
     }
 
     async fn spendable(&self) -> Result<Option<Amount>> {
-        let coins = self.my_coins().await?;
-        let spent = self.spent_by_built.lock().expect("spent_by_built");
         Ok(Some(Amount(
-            coins
-                .iter()
-                .filter(|c| !spent.contains_key(&c.outpoint))
-                .map(|c| c.value)
-                .sum(),
+            self.my_coins().await?.iter().map(|c| c.value).sum(),
         )))
     }
 
@@ -1126,6 +1121,30 @@ impl ChainBackend for ZecBackend {
 
     fn lock_finished(&self, at: &Outpoint) {
         self.forget_agreed(at);
+    }
+
+    fn restore_built_funding(&self, signed_tx: &SignedTx) -> Result<()> {
+        let parsed = tx::ParsedTx::parse(&signed_tx.raw)?;
+        let own_p2pkh = |i: &tx::TxIn| {
+            let s = &i.script_sig;
+            s.len() > 34 && s[s.len() - 34] == 0x21 && s[s.len() - 33..] == self.pubkey
+        };
+        if parsed.vin.is_empty() || !parsed.vin.iter().all(own_p2pkh) {
+            return Ok(());
+        }
+        self.spent_by_built
+            .lock()
+            .expect("spent_by_built")
+            .extend(parsed.vin.iter().map(|i| (i.prevout, signed_tx.txid)));
+        Ok(())
+    }
+
+    fn release_built_funding(&self, signed_tx: &SignedTx) -> Result<()> {
+        self.spent_by_built
+            .lock()
+            .expect("spent_by_built")
+            .retain(|_, id| *id != signed_tx.txid);
+        Ok(())
     }
 
     async fn find_spend(&self, outpoint: &Outpoint, from_height: u64) -> Result<Option<SpendInfo>> {
@@ -1902,10 +1921,9 @@ mod tests {
         let (a, c) = (input(&f1.unwrap()), input(&f2.unwrap()));
         assert_ne!(a, c, "two fundings spend the same coin");
 
-        // Both coins are taken: a third funding finds none, and spendable reflects the free set.
+        // Both coins are taken: a third funding finds none.
         let err = b.build_funding(&h1, amount).await.unwrap_err();
         assert!(matches!(err, SwapError::InsufficientFunds(_)), "{err:?}");
-        assert_eq!(b.spendable().await.unwrap(), Some(Amount(0)));
 
         // The first funding was broadcast (its coin left GetAddressUtxos) and a new coin arrived:
         // the new coin is free, the second funding's coin stays reserved in memory.
@@ -1913,5 +1931,35 @@ mod tests {
         lwd.set_utxos(vec![coin(listed), coin(3)]);
         let f3 = b.build_funding(&h1, amount).await.unwrap();
         assert_eq!(input(&f3).txid, [3; 32]);
+
+        // Startup restore & multi-input release on a fresh backend instance:
+        lwd.set_utxos(vec![coin(4), coin(5), coin(6)]);
+        let b_multi = lwd.backend();
+        let f_multi = b_multi
+            .build_funding(&h1, Amount::from_sat(300_000))
+            .await
+            .unwrap();
+        let parsed_multi = tx::ParsedTx::parse(&f_multi.tx.raw).unwrap();
+        assert_eq!(parsed_multi.vin.len(), 2);
+
+        let restarted = lwd.backend();
+        restarted.restore_built_funding(&f_multi.tx).unwrap();
+        let f_single = restarted.build_funding(&h2, amount).await.unwrap();
+        let taken: Vec<[u8; 32]> = parsed_multi.vin.iter().map(|i| i.prevout.txid).collect();
+        assert!(!taken.contains(&input(&f_single).txid));
+        // All 3 coins (4, 5, 6) are now held in memory: a 300k build fails until f_multi releases.
+        assert!(matches!(
+            restarted
+                .build_funding(&h1, Amount::from_sat(300_000))
+                .await
+                .unwrap_err(),
+            SwapError::InsufficientFunds(_)
+        ));
+        restarted.release_built_funding(&f_multi.tx).unwrap();
+        let f_rebuilt = restarted
+            .build_funding(&h1, Amount::from_sat(300_000))
+            .await
+            .unwrap();
+        assert_eq!(tx::ParsedTx::parse(&f_rebuilt.tx.raw).unwrap().vin.len(), 2);
     }
 }

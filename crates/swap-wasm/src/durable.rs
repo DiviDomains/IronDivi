@@ -192,6 +192,14 @@ impl ChainBackend for Durable {
         self.inner.lock_finished(at);
     }
 
+    fn restore_built_funding(&self, tx: &SignedTx) -> Result<()> {
+        self.inner.restore_built_funding(tx)
+    }
+
+    fn release_built_funding(&self, tx: &SignedTx) -> Result<()> {
+        self.inner.release_built_funding(tx)
+    }
+
     async fn release_dead_lock(&self, lock: &SignedTx) -> Result<bool> {
         self.inner.release_dead_lock(lock).await
     }

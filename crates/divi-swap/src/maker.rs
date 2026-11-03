@@ -152,6 +152,23 @@ impl Maker {
                 )));
             }
         }
+        // Re-reserve the inputs of every unbroadcast `MakerLocked` funding in memory before
+        // any concurrent build or tick can pick the same coin (`maker_lock_sent` swaps already
+        // have their SQLite `InputReservations` row).
+        for s in store.list_maker_swaps()? {
+            if s.state == SwapState::MakerLocked && !s.maker_lock_sent {
+                if let Some(f) = &s.maker_leg_funding {
+                    let mb = if s.quote.maker_chain() == Chain::Divi {
+                        Some(&divi)
+                    } else {
+                        by_chain.get(&s.quote.maker_chain())
+                    };
+                    if let Some(mb) = mb {
+                        mb.restore_built_funding(&f.tx)?;
+                    }
+                }
+            }
+        }
         Ok(Maker {
             cfg,
             divi,
@@ -837,6 +854,7 @@ impl Maker {
             return Ok(Some(Flow::Idle));
         }
         tracing::warn!(swap = %r.id, txid = %funding.tx.txid, "maker lock lost the coin race, unsent: {why}");
+        let _ = self.mk(r)?.release_built_funding(&funding.tx);
         r.maker_leg_htlc = None;
         r.maker_leg_funding = None;
         r.maker_mtp_at_lock = None;

@@ -401,6 +401,78 @@ async fn a_dropped_confirmed_lock_refused_by_the_table_is_not_reselected(dir: Di
     assert_eq!(w.mk.funding_calls(), 1, "never re-selected");
 }
 
+/// After a restart, a `MakerLocked` swap whose funding was persisted but not yet broadcast has
+/// no row in `InputReservations` yet. Starting a fresh `Maker` on the store must re-reserve its
+/// inputs in memory immediately so a second swap locking first (newest-first in `tick`, or via
+/// `notify_lock`) selects another coin instead of building a double spend.
+async fn restart_rereserves_unsent_maker_locked_coin_before_a_second_swap_locks(dir: Direction) {
+    let w = locked_unsent(dir).await;
+    let first_funding = w.funding();
+    assert_eq!(inputs_of(&first_funding.tx), vec![COINS[0]]);
+    assert!(
+        rows(&w, maker_chain(dir)).is_empty(),
+        "unsent MakerLocked swap has no SQLite reservation row yet"
+    );
+
+    // Simulate a daemon restart: fresh backend instances (empty in-memory state) over the same
+    // chains, reservation table, and persistent store.
+    let (rdivi, rbtc) = (
+        w.divi.backend(1, w.divi.balance(&w.mk.pubkey())),
+        w.btc.backend(1, w.btc.balance(&w.mk.pubkey())),
+    );
+    let (rdivi, rbtc) = match dir {
+        Direction::TakerPaysBtc => (rdivi.with_input_reservations(w.res.clone(), &COINS), rbtc),
+        Direction::TakerPaysDivi => (rdivi, rbtc.with_input_reservations(w.res.clone(), &COINS)),
+    };
+    let restarted = Maker::new(
+        SwapConfig::profile(Profile::Testnet),
+        Arc::new(rdivi),
+        Arc::new(rbtc),
+        w.store.clone(),
+        vec![Offer {
+            id: "o".into(),
+            direction: dir,
+            counter_chain: Chain::Btc,
+            divi_sats_per_btc: 50_000_000_000,
+            min_btc_sats: 10_000,
+            max_btc_sats: 5_000_000,
+        }],
+    )
+    .unwrap();
+
+    // A second swap locks and confirms on the taker leg, then steps BEFORE the first swap
+    // broadcasts (e.g. via `notify_lock` or newest-first ordering in `list_maker_swaps`).
+    let q2 = restarted.quote("o", 1_000_000).await.unwrap();
+    let (tid2, req2) = w.taker.prepare(&q2).await.unwrap();
+    let v2 = restarted.accept(req2).await.unwrap();
+    w.taker.accepted(&tid2, &v2).await.unwrap();
+    let notice2 = w.taker.lock(&tid2).await.unwrap();
+    let mid2 = restarted.notify_lock(&v2.id, notice2).await.unwrap().id;
+    for _ in 0..20 {
+        w.mine();
+        let st = restarted.step(&mid2).await.unwrap();
+        if matches!(st, SwapState::MakerLocked | SwapState::MakerLockConfirmed) {
+            break;
+        }
+    }
+    let second_rec = w.store.get_maker_swap(&mid2).unwrap().unwrap();
+    let second_funding = second_rec
+        .maker_leg_funding
+        .expect("second swap built funding");
+    assert_eq!(
+        inputs_of(&second_funding.tx),
+        vec![COINS[1]],
+        "restarted maker must not reuse the unsent MakerLocked swap's coin"
+    );
+
+    // Now the first swap broadcasts cleanly with its original COINS[0] funding — no coin race!
+    restarted.step(&w.mid).await.unwrap();
+    let first_after = w.rec();
+    assert_eq!(first_after.maker_leg_funding.unwrap(), first_funding);
+    assert!(w.ml(dir).contains(&first_funding.tx.txid));
+    assert!(w.ml(dir).contains(&second_funding.tx.txid));
+}
+
 macro_rules! on_both_chains {
     ($divi:ident, $btc:ident, $body:ident) => {
         #[tokio::test]
@@ -443,4 +515,9 @@ on_both_chains!(
     divi_a_dropped_confirmed_lock_refused_by_the_table_is_not_reselected,
     btc_a_dropped_confirmed_lock_refused_by_the_table_is_not_reselected,
     a_dropped_confirmed_lock_refused_by_the_table_is_not_reselected
+);
+on_both_chains!(
+    divi_restart_rereserves_unsent_maker_locked_coin_before_a_second_swap_locks,
+    btc_restart_rereserves_unsent_maker_locked_coin_before_a_second_swap_locks,
+    restart_rereserves_unsent_maker_locked_coin_before_a_second_swap_locks
 );

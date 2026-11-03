@@ -197,6 +197,19 @@ pub trait ChainBackend: Send + Sync {
     /// anything (its agreed-lock cache, FB); the default keeps nothing.
     fn lock_finished(&self, _at: &Outpoint) {}
 
+    /// Re-establish in-memory coin reservations for `tx`, an unbroadcast funding transaction
+    /// persisted in `MakerLocked` before a daemon restart, so a concurrent `build_funding`
+    /// cannot pick its coins before `on_maker_locked` broadcasts it.
+    fn restore_built_funding(&self, _tx: &SignedTx) -> Result<()> {
+        Ok(())
+    }
+
+    /// Release in-memory coin reservations held for `tx`, an unbroadcast funding transaction
+    /// that will never be sent (e.g. a coin-race loser or a permanently rejected unsent lock).
+    fn release_built_funding(&self, _tx: &SignedTx) -> Result<()> {
+        Ok(())
+    }
+
     /// `lock` (a funding transaction this backend built and broadcast) can never confirm:
     /// give back what the wallet booked for it. Returns `true` if anything was released.
     ///

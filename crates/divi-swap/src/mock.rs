@@ -940,6 +940,7 @@ impl MockChain {
             mtp_lead: Arc::new(AtomicU32::new(0)),
             reservations: None,
             coins: Arc::default(),
+            spent_by_built: Arc::default(),
             primary_only: false,
         }
     }
@@ -958,6 +959,7 @@ pub struct MockBackend {
     mtp_lead: Arc<AtomicU32>,
     reservations: Option<InputReservations>,
     coins: Arc<Vec<Outpoint>>,
+    spent_by_built: Arc<Mutex<HashMap<Outpoint, Txid>>>,
     /// A [`ChainBackend::primary_only`] view: never held by [`MockChain::hold_spends`] or
     /// [`MockChain::hold_reads`].
     primary_only: bool,
@@ -1268,15 +1270,21 @@ impl ChainBackend for MockBackend {
                 "have {have}, need {amount} + fee"
             )));
         }
+        let mut spent_guard = self.spent_by_built.lock();
         let inputs = match &self.reservations {
             None => Vec::new(),
             Some(res) => {
                 let held = res.reserved(self.chain.chain)?;
                 let s = self.chain.state.lock();
+                spent_guard.retain(|op, _| !s.spends.contains_key(op));
                 let coin = self
                     .coins
                     .iter()
-                    .find(|c| !held.contains(c) && !s.spends.contains_key(c))
+                    .find(|c| {
+                        !held.contains(c)
+                            && !spent_guard.contains_key(c)
+                            && !s.spends.contains_key(c)
+                    })
                     .ok_or_else(|| SwapError::InsufficientFunds("no unreserved coin".into()))?;
                 vec![*coin]
             }
@@ -1286,8 +1294,10 @@ impl ChainBackend for MockBackend {
             htlc: *htlc,
             amount,
             nonce: self.nonce.fetch_add(1, Ordering::SeqCst),
-            inputs,
+            inputs: inputs.clone(),
         });
+        spent_guard.extend(inputs.into_iter().map(|c| (c, tx.txid)));
+        drop(spent_guard);
         Ok(Funding {
             outpoint: Outpoint {
                 txid: tx.txid,
@@ -1473,7 +1483,13 @@ impl ChainBackend for MockBackend {
         if let (Some(res), MockTx::Fund { inputs, .. }) = (&self.reservations, &parsed) {
             if !inputs.is_empty() {
                 // Before the chain sees anything, as the live backends reserve.
-                res.reserve(self.chain.chain, &tx.txid, inputs)?;
+                match res.reserve(self.chain.chain, &tx.txid, inputs) {
+                    Err(e @ SwapError::InputsHeld(_)) => {
+                        self.spent_by_built.lock().retain(|_, id| *id != tx.txid);
+                        return Err(e);
+                    }
+                    other => other?,
+                }
             }
         }
         let mut s = self.chain.state.lock();
@@ -1605,6 +1621,22 @@ impl ChainBackend for MockBackend {
         Ok(true)
     }
 
+    fn restore_built_funding(&self, tx: &SignedTx) -> Result<()> {
+        let parsed: MockTx = serde_json::from_slice(&tx.raw)
+            .map_err(|e| SwapError::Other(format!("decode: {e}")))?;
+        if let MockTx::Fund { inputs, .. } = parsed {
+            self.spent_by_built
+                .lock()
+                .extend(inputs.into_iter().map(|c| (c, tx.txid)));
+        }
+        Ok(())
+    }
+
+    fn release_built_funding(&self, tx: &SignedTx) -> Result<()> {
+        self.spent_by_built.lock().retain(|_, id| *id != tx.txid);
+        Ok(())
+    }
+
     async fn confirmations(&self, txid: &Txid) -> Result<Option<u32>> {
         self.check_online()?;
         self.check_read("confirmations", false)?;
@@ -1617,6 +1649,9 @@ impl ChainBackend for MockBackend {
             None => 0,
         });
         drop(s);
+        if matches!(confs, Some(1..)) {
+            self.spent_by_built.lock().retain(|_, id| id != txid);
+        }
         if let (Some(res), Some(1..)) = (&self.reservations, confs) {
             // On chain: its inputs are spent, the reservation has done its job.
             res.release_tx(self.chain.chain, txid)?;

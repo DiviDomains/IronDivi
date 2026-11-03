@@ -768,6 +768,30 @@ impl ChainBackend for DiviBackend {
         Ok(booked || reserved > 0)
     }
 
+    fn restore_built_funding(&self, tx: &SignedTx) -> Result<()> {
+        let parsed: Transaction = divi_primitives::serialize::deserialize(&tx.raw)
+            .map_err(|e| SwapError::InvalidParams(format!("undecodable transaction: {e}")))?;
+        if parsed.vin.is_empty() || !parsed.vin.iter().all(|i| self.spends_own_p2pkh(i)) {
+            return Ok(());
+        }
+        let wanted: Vec<Outpoint> = parsed.vin.iter().map(prevout).collect();
+        let mut wallet = self.wallet.lock();
+        wallet.refresh();
+        let to_reserve: Vec<Utxo> = wallet
+            .available()
+            .into_iter()
+            .filter(|c| wanted.contains(&c.outpoint))
+            .collect();
+        if !to_reserve.is_empty() {
+            wallet.reserve(&to_reserve, tx.txid)?;
+        }
+        Ok(())
+    }
+
+    fn release_built_funding(&self, tx: &SignedTx) -> Result<()> {
+        self.wallet.lock().release(&tx.txid)
+    }
+
     async fn confirmations(&self, txid: &Txid) -> Result<Option<u32>> {
         let confs = match &self.fallback {
             None => confirmations_on(&self.rpc, txid).await?,

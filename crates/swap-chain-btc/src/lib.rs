@@ -708,6 +708,28 @@ impl ChainBackend for BtcBackend {
         )))
     }
 
+    fn restore_built_funding(&self, tx: &SignedTx) -> Result<()> {
+        let parsed: bitcoin::Transaction =
+            bitcoin::consensus::deserialize(&tx.raw).map_err(|e| {
+                SwapError::Other(format!("cannot read own transaction to restore: {e}"))
+            })?;
+        let ours = self.pubkey.to_bytes();
+        let own_p2wpkh =
+            |i: &bitcoin::TxIn| i.witness.len() == 2 && i.witness.last() == Some(ours.as_slice());
+        if parsed.input.is_empty() || !parsed.input.iter().all(own_p2wpkh) {
+            return Ok(());
+        }
+        self.spent_by_built
+            .lock()
+            .extend(parsed.input.iter().map(|i| (i.previous_output, tx.txid)));
+        Ok(())
+    }
+
+    fn release_built_funding(&self, tx: &SignedTx) -> Result<()> {
+        self.spent_by_built.lock().retain(|_, id| *id != tx.txid);
+        Ok(())
+    }
+
     async fn build_funding(&self, htlc: &HtlcParams, amount: Amount) -> Result<Funding> {
         let fee_rate = self.sat_per_vb().await;
         let coins = self.my_utxos().await?;
