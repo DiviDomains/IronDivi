@@ -395,3 +395,56 @@ fn a_damaged_imported_key_is_a_wrong_passphrase_or_logged_as_corruption() {
         );
     }
 }
+
+/// As Divi Core's CCryptoKeyStore::Unlock (crypter.cpp:225-250): derived HD
+/// keys in `mapCryptedKeys` are checked in the same CKeyID order and return
+/// WrongPassphrase (-14 over RPC) rather than a raw Storage error when a key
+/// record is damaged or mismatched, logging corruption if an earlier key
+/// decrypted.
+#[test]
+fn a_damaged_hd_key_is_a_wrong_passphrase_or_logged_as_corruption() {
+    const CORRUPT: &str = "The wallet is probably corrupted: Some keys decrypt but not all.";
+    for damaged in [0, 1] {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("w_hd");
+        let mut hashes = {
+            let wallet = new_wallet(&path);
+            let a = wallet.new_receiving_address().unwrap();
+            let b = wallet.new_receiving_address().unwrap();
+            wallet.encrypt_wallet("pw").unwrap();
+            drop(wallet);
+            let cfs = rocksdb::DB::list_cf(&rocksdb::Options::default(), &path).unwrap();
+            let db = rocksdb::DB::open_cf(&rocksdb::Options::default(), &path, &cfs).unwrap();
+            let cf = db.cf_handle("wallet_keys").unwrap();
+            let mut all_hashes: Vec<Vec<u8>> = db
+                .iterator_cf(cf, rocksdb::IteratorMode::Start)
+                .map(|r| r.unwrap().0.to_vec())
+                .filter(|k| k.len() == 21 && k[20] == 0x01)
+                .map(|k| k[..20].to_vec())
+                .collect();
+            all_hashes.sort_by_key(|h| h.iter().rev().copied().collect::<Vec<u8>>());
+            assert!(
+                all_hashes.contains(&a.hash.as_bytes().to_vec())
+                    && all_hashes.contains(&b.hash.as_bytes().to_vec()),
+                "derived HD keys must be stored encrypted"
+            );
+            assert!(all_hashes.len() >= 2);
+            all_hashes
+        };
+        let target = hashes.remove(damaged);
+        damage_encrypted_secret(&path, &target);
+
+        let wallet = WalletDb::open(&path, Network::Testnet).unwrap();
+        let (unlocked, log) = logged(|| wallet.unlock("pw", 60));
+        assert!(
+            matches!(unlocked, Err(WalletError::WrongPassphrase)),
+            "damaged HD key {damaged}: {unlocked:?}"
+        );
+        assert!(wallet.is_locked());
+        assert_eq!(
+            log.contains(CORRUPT),
+            damaged == 1,
+            "damaged HD key {damaged}: {log}"
+        );
+    }
+}

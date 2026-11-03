@@ -2964,11 +2964,12 @@ impl WalletDb {
                 None => None,
             },
         };
-        // Divi Core's CCryptoKeyStore::Unlock (crypter.cpp:225-250) decrypts the
-        // imported keys in CKeyID order, each checked against its public key: a
-        // key that fails first is a wrong passphrase; one that fails after
-        // another decrypted means the wallet is corrupted, which divid logs (and
-        // then stops on an assert). A CKeyID compares as a little-endian number
+        // Divi Core's CCryptoKeyStore::Unlock (crypter.cpp:225-250) decrypts
+        // encrypted keys in CKeyID order, each checked against its public key:
+        // a key that fails first is reported as a wrong passphrase (-14 over
+        // RPC); one that fails after an earlier key decrypted means the wallet
+        // is corrupted, which divid logs (and then stops on an assert; irondivid
+        // stays up and locked). A CKeyID compares as a little-endian number
         // (uint256.cpp CompareTo), so by its bytes from the last.
         let mut stored = db.load_encrypted_secrets()?;
         stored.sort_by_key(|(hash, _)| {
@@ -2976,44 +2977,33 @@ impl WalletDb {
             bytes.reverse();
             bytes
         });
-        let is_imported = |hash: &Hash160| {
-            self.keystore
-                .get_key(hash)
-                .is_some_and(|e| e.hd_path.is_none())
-        };
-        // HD keys first (irondivid keeps them derivable from the seed, unlike
-        // divid): a record that does not open, or that holds a secret stored for
-        // another address, is a damaged wallet, never a wrong passphrase, and a
-        // secret for the wrong key would sign for the wrong key
-        for (hash, blob) in stored.iter().filter(|(hash, _)| !is_imported(hash)) {
-            let secret = open_secret(&master, hash, blob)?;
-            if let Some(entry) = self.keystore.get_key(hash) {
-                if secret.public_key() != entry.public {
-                    return Err(WalletError::Storage(format!(
-                        "the encrypted private key for {} does not match its public key",
-                        hex::encode(hash.as_bytes())
-                    )));
-                }
-            }
-            records.secrets.push((*hash, secret));
-        }
-        // Then the imported keys, as divid's Unlock walks them
+        let mut hd_decrypted = false;
         let mut imported_decrypted = false;
-        for (hash, blob) in stored.iter().filter(|(hash, _)| is_imported(hash)) {
-            let entry = self.keystore.get_key(hash);
-            let secret = open_secret(&master, hash, blob).ok().filter(|secret| {
+        for (hash, blob) in stored {
+            let entry = self.keystore.get_key(&hash);
+            let imported = entry.as_ref().is_some_and(|e| e.hd_path.is_none());
+            let secret = open_secret(&master, &hash, &blob).ok().filter(|secret| {
                 entry
                     .as_ref()
                     .is_none_or(|e| secret.public_key() == e.public)
             });
             let Some(secret) = secret else {
-                if imported_decrypted {
+                let prior = if imported {
+                    imported_decrypted
+                } else {
+                    hd_decrypted
+                };
+                if prior {
                     error!("The wallet is probably corrupted: Some keys decrypt but not all.");
                 }
                 return Err(WalletError::WrongPassphrase);
             };
-            imported_decrypted = true;
-            records.secrets.push((*hash, secret));
+            if imported {
+                imported_decrypted = true;
+            } else {
+                hd_decrypted = true;
+            }
+            records.secrets.push((hash, secret));
         }
 
         // Wallets from older builds move to Argon2id and authenticated records
@@ -7822,7 +7812,7 @@ mod tests {
         });
         assert!(matches!(
             wallet.unlock("pw", 0),
-            Err(WalletError::Storage(_))
+            Err(WalletError::WrongPassphrase)
         ));
         assert!(wallet.is_locked());
 
@@ -7831,8 +7821,9 @@ mod tests {
         rewrite_secret_blobs(&wallet, |i, blobs| blobs[(i + 1) % blobs.len()].clone());
         assert!(matches!(
             wallet.unlock("pw", 0),
-            Err(WalletError::Storage(_))
+            Err(WalletError::WrongPassphrase)
         ));
+        assert!(wallet.is_locked());
 
         // The mnemonic changed, or moved into a key's record
         restore(&wallet);
@@ -7868,19 +7859,15 @@ mod tests {
     #[test]
     fn node19_secret_under_another_address_is_refused() {
         // The old format has no authentication, so swapped records decrypt;
-        // the public key check is what catches them
+        // the public key check is what catches them, returning WrongPassphrase
+        // (-14 over RPC) as Divi Core's CCryptoKeyStore::Unlock does
         let (_dir, path) = legacy_wallet();
         let wallet = WalletDb::open(&path, Network::Testnet).unwrap();
         rewrite_secret_blobs(&wallet, |i, blobs| blobs[(i + 1) % blobs.len()].clone());
-        match wallet.unlock(LEGACY_PASSPHRASE, 0) {
-            Err(WalletError::Storage(message)) => {
-                assert!(
-                    message.contains("does not match its public key"),
-                    "{message}"
-                )
-            }
-            other => panic!("expected a storage error, got {:?}", other.err()),
-        }
+        assert!(matches!(
+            wallet.unlock(LEGACY_PASSPHRASE, 0),
+            Err(WalletError::WrongPassphrase)
+        ));
         assert!(wallet.is_locked());
         // Nothing was migrated from the bad records
         assert_eq!(wallet.db().unwrap().load_kdf_params().unwrap(), None);
