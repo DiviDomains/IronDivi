@@ -1874,6 +1874,10 @@ impl WalletRpc {
                 "Block at height {} not available, stopping rescan (total scanned: {})",
                 height, scanned
             );
+        } else if stop_height >= current_height {
+            wallet.reconcile_utxos(current_height, |outpoint| {
+                chain.get_utxo(outpoint).ok().flatten().is_some()
+            });
         }
 
         info!("Rescan complete: scanned {} blocks", scanned);

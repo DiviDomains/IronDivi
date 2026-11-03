@@ -1453,9 +1453,11 @@ impl WalletDb {
             batch.put_cf(db.cf_spent(), &key, [1]);
         }
 
-        // Then save current (unspent) UTXOs
+        // Then save current (unspent) UTXOs, clearing any stale spent row on disk
         for (outpoint, utxo) in self.utxos.read().iter() {
-            batch.put_cf(db.cf_utxos(), outpoint_key(outpoint), serialize_utxo(utxo));
+            let key = outpoint_key(outpoint);
+            batch.delete_cf(db.cf_spent(), &key);
+            batch.put_cf(db.cf_utxos(), &key, serialize_utxo(utxo));
         }
 
         // Save transactions
@@ -1608,11 +1610,12 @@ impl WalletDb {
                 batch.put_cf(db.cf_spent(), &key, [1]);
             }
 
-            // Write current UTXOs (only if utxos dirty)
+            // Write current UTXOs (only if utxos dirty), clearing any stale spent row on disk
             if flags.utxos {
                 for (outpoint, utxo) in self.utxos.read().iter() {
                     let key = outpoint_key(outpoint);
                     let value = serialize_utxo(utxo);
+                    batch.delete_cf(db.cf_spent(), &key);
                     batch.put_cf(db.cf_utxos(), &key, &value);
                 }
             }
@@ -2209,8 +2212,30 @@ impl WalletDb {
     pub fn add_utxo(&self, utxo: WalletUtxo) {
         let outpoint = utxo.outpoint();
         counted::hit(Site::WalletUtxoAdded);
-        self.utxos.write().insert(outpoint, utxo);
-        self.dirty.write().utxos = true;
+        let cleared_spent = {
+            let mut pending = self.pending_deletes.write();
+            let mut spent_data = self.spent_utxo_data.write();
+            let mut spent = self.spent.write();
+            let mut utxos = self.utxos.write();
+            pending.utxos.remove(&outpoint);
+            let had_data = spent_data.remove(&outpoint).is_some();
+            let had_spent = spent.remove(&outpoint);
+            if had_spent || had_data {
+                pending.spent.insert(outpoint);
+            }
+            utxos.insert(outpoint, utxo);
+            if had_data {
+                if let Some(ref db) = self.db() {
+                    let _ = db.remove_spent_utxo_data(&outpoint);
+                }
+            }
+            had_spent || had_data
+        };
+        let mut dirty = self.dirty.write();
+        dirty.utxos = true;
+        if cleared_spent {
+            dirty.spent = true;
+        }
     }
 
     /// Remove a UTXO (mark as spent)
@@ -2492,7 +2517,8 @@ impl WalletDb {
         F: Fn(&OutPoint) -> bool,
     {
         let _scan = self.scan_lock.lock();
-        let checked_to = chain_height.min(self.last_scan_height());
+        let last_scan = self.last_scan_height();
+        let checked_to = chain_height.min(last_scan);
         let outpoints: Vec<OutPoint> = self
             .utxos
             .read()
@@ -2515,11 +2541,77 @@ impl WalletDb {
                 }
             }
         }
-        if removed > 0 {
-            self.dirty.write().utxos = true;
+
+        // Clear stale spent-set entries when the chain UTXO set proves an
+        // output is unspent (e.g. an earlier false phantom eviction or an
+        // orphaned spend whose height record was lost). When the chain is
+        // still rebuilding below `last_scan`, only spends recorded at or below
+        // `checked_to` can be ruled out.
+        let spent_candidates: Vec<OutPoint> = if chain_height >= last_scan {
+            self.spent.read().iter().copied().collect()
+        } else {
+            self.spent_utxo_data
+                .read()
+                .iter()
+                .filter(|(_, (_, spent_h))| *spent_h <= checked_to)
+                .map(|(op, _)| *op)
+                .collect()
+        };
+        let unspent_on_chain: Vec<OutPoint> = spent_candidates
+            .into_iter()
+            .filter(|op| chain_has_utxo(op))
+            .collect();
+
+        let mut cleared_spent = 0u32;
+        let mut restored_utxos = 0u32;
+        if !unspent_on_chain.is_empty() {
+            let mut pending = self.pending_deletes.write();
+            let mut spent_data = self.spent_utxo_data.write();
+            let mut spent = self.spent.write();
+            let mut utxos = self.utxos.write();
+            for outpoint in unspent_on_chain {
+                let restored = spent_data.remove(&outpoint).map(|(u, _)| u);
+                let was_spent = spent.remove(&outpoint);
+                if was_spent || restored.is_some() {
+                    pending.spent.insert(outpoint);
+                    cleared_spent += 1;
+                    if let Some(utxo) = restored {
+                        if let Some(ref db) = self.db() {
+                            let _ = db.remove_spent_utxo_data(&outpoint);
+                        }
+                        info!(
+                            "Reconciliation: restored unspent UTXO {} ({}, addr={}) from stale spent set",
+                            OwnOutpoint(outpoint.txid, outpoint.vout),
+                            WalletAmount(utxo.value.as_sat()),
+                            WalletAddress(&utxo.address)
+                        );
+                        pending.utxos.remove(&outpoint);
+                        utxos.insert(outpoint, utxo);
+                        restored_utxos += 1;
+                    } else {
+                        info!(
+                            "Reconciliation: cleared stale spent mark for unspent chain UTXO {}",
+                            OwnOutpoint(outpoint.txid, outpoint.vout)
+                        );
+                    }
+                }
+            }
+        }
+
+        let total_changes = removed + cleared_spent;
+        if total_changes > 0 {
+            let mut dirty = self.dirty.write();
+            if removed > 0 || restored_utxos > 0 {
+                dirty.utxos = true;
+            }
+            if cleared_spent > 0 {
+                dirty.spent = true;
+            }
             info!(
-                "UTXO reconciliation complete: removed {} phantom UTXOs, {} remaining",
+                "UTXO reconciliation complete: removed {} phantom UTXOs, cleared {} stale spent marks ({} UTXOs restored), {} live UTXOs",
                 removed,
+                cleared_spent,
+                restored_utxos,
                 self.utxos.read().len()
             );
         } else {
@@ -2529,7 +2621,7 @@ impl WalletDb {
                 checked_to
             );
         }
-        removed
+        total_changes
     }
 
     /// Select UTXOs for a transaction using coin selection algorithm
@@ -4383,7 +4475,8 @@ impl WalletDb {
         if full {
             self.clear_transactions_and_utxos();
         } else {
-            self.rollback_heights(start, stop);
+            let rollback_to = if stop >= tip_height { u32::MAX } else { stop };
+            self.rollback_heights(start, rollback_to);
         }
 
         // A coin marked spent without a recorded spending block (dropped as
@@ -7027,6 +7120,110 @@ mod tests {
             wallet.spend_utxo(&OutPoint::new(send.txid(), 1));
             wallet.rescan(2, 2, 3, |h| chain.block_at(h));
             assert!(outpoints(&wallet).is_empty());
+        }
+
+        #[test]
+        fn reconcile_clears_stale_on_disk_spent_entries_and_persists_across_restart() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("wallet");
+            let hd = HdWallet::from_mnemonic(TEST_MNEMONIC, None, ChainMode::Divi).unwrap();
+            let wallet = WalletDb::create_persistent(&path, Network::Regtest, hd).unwrap();
+            let (fund, send) = fixture(&wallet);
+            let chain = TestChain::new(
+                0,
+                &[
+                    std::slice::from_ref(&fund),
+                    std::slice::from_ref(&send),
+                    &[],
+                ],
+            );
+            chain.sync(&wallet);
+            let change = OutPoint::new(send.txid(), 1);
+            assert_eq!(wallet.get_balance().as_sat(), CHANGE);
+
+            // Case 1: coin falsely marked spent at an orphaned/stale height with spent_utxo_data
+            wallet.spend_utxo_at_height(&change, Some(3)).unwrap();
+            wallet.save_incremental().unwrap();
+            drop(wallet);
+
+            let reloaded = WalletDb::open(&path, Network::Regtest).unwrap();
+            assert_eq!(reloaded.get_balance().as_sat(), 0);
+            assert!(reloaded.spent.read().contains(&change));
+
+            // Chain UTXO verification proves `change` is unspent at tip height 3
+            let fixed = reloaded.reconcile_utxos(3, |op| *op == change);
+            assert_eq!(fixed, 1);
+            assert_eq!(reloaded.get_balance().as_sat(), CHANGE);
+            assert!(!reloaded.spent.read().contains(&change));
+            reloaded.save_incremental().unwrap();
+            drop(reloaded);
+
+            // Must survive a subsequent restart without "Removed 1 stale UTXOs that were in spent set"
+            let after_restart = WalletDb::open(&path, Network::Regtest).unwrap();
+            assert_eq!(after_restart.get_balance().as_sat(), CHANGE);
+            assert!(!after_restart.spent.read().contains(&change));
+
+            // Case 2: coin evicted without height (spend_utxo, Defect B), persisted to cf_spent
+            after_restart.spend_utxo(&change).unwrap();
+            after_restart.save_incremental().unwrap();
+            drop(after_restart);
+
+            let evicted_reload = WalletDb::open(&path, Network::Regtest).unwrap();
+            assert!(evicted_reload.spent.read().contains(&change));
+            let cleared = evicted_reload.reconcile_utxos(3, |op| *op == change);
+            assert_eq!(cleared, 1);
+            assert!(!evicted_reload.spent.read().contains(&change));
+            evicted_reload.save_incremental().unwrap();
+            drop(evicted_reload);
+
+            // Even a single-block partial rescan below tip now finds the coin and persists it cleanly
+            let clean_reload = WalletDb::open(&path, Network::Regtest).unwrap();
+            assert!(!clean_reload.spent.read().contains(&change));
+            clean_reload.rescan(2, 2, 3, |h| chain.block_at(h));
+            clean_reload.save_incremental().unwrap();
+            drop(clean_reload);
+
+            let final_reload = WalletDb::open(&path, Network::Regtest).unwrap();
+            assert_eq!(final_reload.get_balance().as_sat(), CHANGE);
+            assert!(final_reload.has_utxo(&change));
+        }
+
+        #[test]
+        fn save_clears_stale_on_disk_spent_row_when_utxo_is_unspent() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("wallet");
+            let hd = HdWallet::from_mnemonic(TEST_MNEMONIC, None, ChainMode::Divi).unwrap();
+            let wallet = WalletDb::create_persistent(&path, Network::Regtest, hd).unwrap();
+            let addr = wallet.new_receiving_address().unwrap();
+            let outpoint = OutPoint::new(Hash256::from_bytes([0x5a; 32]), 0);
+            let utxo = WalletUtxo::new(
+                outpoint.txid,
+                outpoint.vout,
+                Amount::from_sat(100 * COIN),
+                mine(&addr),
+                addr.to_string(),
+            );
+
+            // Persist `outpoint` into cf_spent on disk
+            wallet.add_utxo(utxo.clone());
+            wallet.spend_utxo(&outpoint).unwrap();
+            wallet.save().unwrap();
+
+            // Simulate a stale cf_spent row left behind when `outpoint` is restored to utxos
+            wallet.spent.write().clear();
+            wallet.pending_deletes.write().spent.clear();
+            wallet.utxos.write().insert(outpoint, utxo);
+            wallet.dirty.write().utxos = true;
+            wallet.save_incremental().unwrap();
+            drop(wallet);
+
+            // Reload must NOT drop the UTXO due to a leftover cf_spent row
+            let reloaded = WalletDb::open(&path, Network::Regtest).unwrap();
+            assert!(
+                reloaded.has_utxo(&outpoint),
+                "stale cf_spent row must be deleted when saving an unspent UTXO"
+            );
+            assert!(!reloaded.spent.read().contains(&outpoint));
         }
     }
 
