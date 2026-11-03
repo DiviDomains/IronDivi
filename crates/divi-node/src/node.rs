@@ -2341,10 +2341,13 @@ impl Node {
                 interval.tick().await;
                 let now = rebroadcast_time(Clocks::read());
                 let current = chain_for_rebroadcast.tip().map(|t| t.hash);
-                if current != tip {
-                    tip = current;
-                    last_tip_update = now;
-                }
+                note_rebroadcast_tip(
+                    &mut tip,
+                    &mut last_tip_update,
+                    current,
+                    chain_for_rebroadcast.is_initial_block_download(),
+                    now,
+                );
                 if timer.due(now, last_tip_update, || {
                     rand::thread_rng().gen_range(0..MAX_WAIT_SECS)
                 }) {
@@ -3685,6 +3688,25 @@ fn rebroadcast_time(clocks: Clocks) -> i64 {
     clocks.node()
 }
 
+/// Update the mempool rebroadcast loop's tracked tip and `last_tip_update`.
+/// Divi Core updates `timeOfLastChainTipUpdate` only in
+/// `P2PNotifications::UpdatedBlockTip` (`init.cpp:113-119`), which
+/// `ChainExtensionService.cpp:563-566` skips while `IsInitialBlockDownload` is true.
+fn note_rebroadcast_tip(
+    tip: &mut Option<Hash256>,
+    last_tip_update: &mut i64,
+    current: Option<Hash256>,
+    initial_block_download: bool,
+    now: i64,
+) {
+    if current != *tip {
+        *tip = current;
+        if !initial_block_download {
+            *last_tip_update = now;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4274,5 +4296,37 @@ mod tests {
             offset: 0,
         };
         assert!(!rebroadcast_due(start, tip_moved, at));
+    }
+
+    /// Divi Core records `timeOfLastChainTipUpdate` only via
+    /// `P2PNotifications::UpdatedBlockTip` (`init.cpp:113-119`), which
+    /// `ChainExtensionService.cpp:563-566` skips while `IsInitialBlockDownload`
+    /// is true. Tip advances during IBD must not arm the mempool rebroadcast timer.
+    #[test]
+    fn rebroadcast_tip_update_skips_initial_block_download() {
+        let h0 = Some(Hash256::from_bytes([0x10; 32]));
+        let h1 = Some(Hash256::from_bytes([0x20; 32]));
+        let h2 = Some(Hash256::from_bytes([0x30; 32]));
+
+        let mut tip = h0;
+        let mut last_tip_update = 0i64;
+        let mut timer = crate::rebroadcast::RebroadcastTimer::new();
+        assert!(!timer.due(SYSTEM, last_tip_update, || 600));
+
+        // Tip advances while still in IBD: tracked tip moves, but last_tip_update stays 0
+        note_rebroadcast_tip(&mut tip, &mut last_tip_update, h1, true, SYSTEM + 100);
+        assert_eq!(tip, h1);
+        assert_eq!(last_tip_update, 0);
+        assert!(!timer.due(SYSTEM + 1200, last_tip_update, || 600));
+
+        // Leaving IBD without a new tip still keeps last_tip_update at 0
+        note_rebroadcast_tip(&mut tip, &mut last_tip_update, h1, false, SYSTEM + 1250);
+        assert_eq!(last_tip_update, 0);
+
+        // First post-IBD tip advance records last_tip_update and arms rebroadcast
+        note_rebroadcast_tip(&mut tip, &mut last_tip_update, h2, false, SYSTEM + 1300);
+        assert_eq!(tip, h2);
+        assert_eq!(last_tip_update, SYSTEM + 1300);
+        assert!(timer.due(SYSTEM + 2000, last_tip_update, || 600));
     }
 }
