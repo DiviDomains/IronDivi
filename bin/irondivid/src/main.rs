@@ -2422,7 +2422,10 @@ fn load_or_restore_wallet_with_seed(
 ) -> Result<Arc<WalletDb>> {
     // Try to open existing wallet (backed up by `backup_wallet_at_start`)
     if wallet_path.exists() {
-        info!("Loading wallet from {:?}", wallet_path);
+        info!(
+            "Loading wallet from {}",
+            divi_primitives::redact::WalletValue(&wallet_path.to_string_lossy())
+        );
         // Only this user may read the wallet (NODE-3)
         if let Err(e) = private_files::ensure_private_dir(wallet_path, true) {
             warn!("Could not check the wallet directory permissions: {}", e);
@@ -2553,7 +2556,10 @@ fn load_or_restore_wallet_with_seed(
 
     // Divi Core loads the empty wallet file before it makes the keys
     log_load_counts(0, 0, 0);
-    info!("Creating new wallet at {:?}", wallet_path);
+    info!(
+        "Creating new wallet at {}",
+        divi_primitives::redact::WalletValue(&wallet_path.to_string_lossy())
+    );
     // Only this user may read the wallet (NODE-3)
     private_files::ensure_private_dir(wallet_path, true)
         .with_context(|| format!("Failed to create wallet directory: {:?}", wallet_path))?;
@@ -3513,6 +3519,9 @@ async fn run_daemon(
                     rpc_server.set_spork_manager(spork_for_rpc);
                     rpc_server.set_log_config(log_config_for_rpc);
                     rpc_server.set_log_levels_callback(Arc::new(set_log_levels));
+                    rpc_server.set_diag_info_callback(Arc::new(|| {
+                        (crate::diaginfo::build(), crate::rpc_log::sent_txids())
+                    }));
 
                     // The masternode RPCs read the node's masternode list
                     rpc_server.set_masternode_manager(mn_for_rpc);
@@ -3727,6 +3736,9 @@ async fn run_daemon(
                     rpc_server.set_spork_manager(spork_for_rpc);
                     rpc_server.set_log_config(log_config_for_rpc);
                     rpc_server.set_log_levels_callback(Arc::new(set_log_levels));
+                    rpc_server.set_diag_info_callback(Arc::new(|| {
+                        (crate::diaginfo::build(), crate::rpc_log::sent_txids())
+                    }));
 
                     // The masternode RPCs read the node's masternode list
                     rpc_server.set_masternode_manager(mn_for_rpc);

@@ -1181,7 +1181,10 @@ impl WalletRpc {
             RpcError::new(codes::WALLET_ERROR, format!("Failed to store label: {}", e))
         })?;
 
-        debug!("Generated new address: {}", address);
+        debug!(
+            "Generated new address: {}",
+            divi_primitives::redact::WalletAddress(&address.to_string())
+        );
         Ok(serde_json::json!(address.to_string()))
     }
 
@@ -1195,7 +1198,10 @@ impl WalletRpc {
             .new_change_address()
             .map_err(|e| new_key_error(&wallet, e))?;
 
-        debug!("Generated new change address: {}", address);
+        debug!(
+            "Generated new change address: {}",
+            divi_primitives::redact::WalletAddress(&address.to_string())
+        );
         Ok(serde_json::json!(address.to_string()))
     }
 
@@ -1823,7 +1829,10 @@ impl WalletRpc {
         let held = wallet.is_mine(&address) && !wallet.is_watch_only(&address);
         if !held {
             wallet.import_key_with_compression(secret, wif_key.compressed, label.clone());
-            info!("Imported private key for address: {}", address);
+            info!(
+                "Imported private key for address: {}",
+                divi_primitives::redact::WalletAddress(&address.to_string())
+            );
         }
         wallet
             .set_label(&address, label.as_deref().unwrap_or(""))
@@ -2188,7 +2197,11 @@ impl WalletRpc {
         // answers -4 (rpcwallet.cpp:774-782, wallet.cpp:1866-1878)
         let txid = tx.txid();
         if let Err(e) = callback(tx.clone()) {
-            debug!("The mempool refused wallet send {}: {:?}", txid, e);
+            debug!(
+                "The mempool refused wallet send {}: {:?}",
+                divi_primitives::redact::WalletTxid::of(txid),
+                e
+            );
             info!("SendMoney -> CommitTransaction() : Error: Transaction not valid");
             wallet.keep_refused_send(&tx);
             return Err(RpcError::new(
@@ -3270,7 +3283,10 @@ impl WalletRpc {
                 .map(|idx| idx.height);
 
             if height.is_none() {
-                tracing::warn!("Could not determine height for funding tx {}, vault UTXOs may not be stakeable until next rescan", funding_tx);
+                tracing::warn!(
+                    "Could not determine height for funding tx {}, vault UTXOs may not be stakeable until next rescan",
+                    divi_primitives::redact::WalletTxid::of(funding_txid)
+                );
             }
 
             wallet.scan_transaction(&fund_tx, Some(location.block_hash), height, None);
@@ -3281,13 +3297,13 @@ impl WalletRpc {
             }
             tracing::info!(
                 "Scanned funding tx {} at height {:?} for vault UTXOs",
-                funding_tx,
+                divi_primitives::redact::WalletTxid::of(funding_txid),
                 height
             );
         } else {
             tracing::warn!(
                 "Could not find funding tx {} with location for vault rescan",
-                funding_tx
+                divi_primitives::redact::WalletTxid::of(funding_txid)
             );
         }
 
@@ -3894,7 +3910,10 @@ impl WalletRpc {
             return Err(failed("Key already held by wallet").into());
         }
         wallet.import_key_with_compression(secret, compressed, Some(String::new()));
-        info!("Imported BIP38 key for address: {}", address);
+        info!(
+            "Imported BIP38 key for address: {}",
+            divi_primitives::redact::WalletAddress(&address.to_string())
+        );
         wallet.save().map_err(|e| {
             RpcError::new(codes::WALLET_ERROR, format!("Failed to save wallet: {}", e))
         })?;
@@ -4445,7 +4464,10 @@ impl WalletRpc {
                 )
             })?;
 
-        info!("Imported watch-only address: {}", addr);
+        info!(
+            "Imported watch-only address: {}",
+            divi_primitives::redact::WalletAddress(&addr.to_string())
+        );
         if from_address {
             wallet.set_label(&addr, label.unwrap_or("")).map_err(|e| {
                 RpcError::new(codes::WALLET_ERROR, format!("Failed to store label: {}", e))
@@ -4526,7 +4548,7 @@ impl WalletRpc {
 
         info!(
             "Created multisig address {} and stored redeem script",
-            p2sh_addr.to_base58()
+            divi_primitives::redact::WalletAddress(&p2sh_addr.to_base58())
         );
 
         // Divi Core answers the address alone (rpcwallet.cpp:1736-1781)
@@ -4945,7 +4967,10 @@ impl WalletRpc {
         }
         let sig_b64 = STANDARD.encode(sig_bytes);
 
-        debug!("Signed message with address {}", address_str);
+        debug!(
+            "Signed message with address {}",
+            divi_primitives::redact::WalletAddress(address_str)
+        );
         // Return as plain string, not wrapped in json!()
         Ok(serde_json::Value::String(sig_b64))
     }
@@ -5004,7 +5029,8 @@ impl WalletRpc {
 
         debug!(
             "Verified message signature: address={}, valid={}",
-            address_str, valid
+            divi_primitives::redact::WalletAddress(address_str),
+            valid
         );
         Ok(serde_json::Value::Bool(valid))
     }

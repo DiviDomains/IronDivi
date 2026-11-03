@@ -552,9 +552,11 @@ async fn call(s: &Arc<Shared>, method: &str, params: Vec<Value>) -> Result<Value
         params: Params::Array(params),
     };
     let rpc = Arc::clone(&s.rpc);
-    let response = tokio::task::spawn_blocking(move || rpc.handle_request(request))
-        .await
-        .map_err(|_| (-1, "the call failed".to_string()))?;
+    let response = tokio::task::spawn_blocking(move || {
+        rpc.handle_request_from(request, divi_rpc::Caller::webui())
+    })
+    .await
+    .map_err(|_| (-1, "the call failed".to_string()))?;
     match response.error {
         Some(e) => Err((e.code as i64, e.message)),
         None => Ok(response.result.unwrap_or(Value::Null)),

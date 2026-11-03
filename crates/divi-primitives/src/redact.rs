@@ -111,6 +111,82 @@ fn pseudonym(f: &mut fmt::Formatter<'_>, prefix: &str, data: &[u8]) -> fmt::Resu
     )
 }
 
+const MAX_PSEUDONYMS: usize = 16_384;
+
+static PSEUDONYMS: OnceLock<std::sync::Mutex<std::collections::HashMap<String, String>>> =
+    OnceLock::new();
+
+fn pseudonym_str(prefix: &str, data: &[u8]) -> String {
+    let m = mac(prefix, data);
+    format!(
+        "{}-{:02x}{:02x}{:02x}{:02x}",
+        prefix, m[0], m[1], m[2], m[3]
+    )
+}
+
+/// Record a wallet pseudonym emitted during this run (non-blocking `try_lock`
+/// so log formatting and panic hooks never stall).
+fn wallet_pseudonym(
+    f: &mut fmt::Formatter<'_>,
+    prefix: &str,
+    data: &[u8],
+    canonical: &str,
+) -> fmt::Result {
+    let p = pseudonym_str(prefix, data);
+    let table = PSEUDONYMS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    if let Ok(mut map) = table.try_lock() {
+        if map.contains_key(&p) || map.len() < MAX_PSEUDONYMS {
+            map.entry(p.clone())
+                .or_insert_with(|| canonical.to_string());
+        }
+    }
+    f.write_str(&p)
+}
+
+/// RFC 2104 HMAC-SHA256 under a 32-byte key
+pub fn hmac_sha256(key: &[u8; 32], data: &[u8]) -> [u8; 32] {
+    let mut ipad = [0x36u8; 64];
+    let mut opad = [0x5cu8; 64];
+    for (i, b) in key.iter().enumerate() {
+        ipad[i] ^= b;
+        opad[i] ^= b;
+    }
+    let inner = Sha256::new()
+        .chain_update(ipad)
+        .chain_update(data)
+        .finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(
+        &Sha256::new()
+            .chain_update(opad)
+            .chain_update(inner)
+            .finalize(),
+    );
+    out
+}
+
+/// For `getdiaginfo {"diag_key": k}` (A10/A11): returns `(node_pseudonym -> hex(HMAC(k, value)))`
+/// for every wallet pseudonym formatted in this run, without blocking (`None` if busy).
+pub fn pseudonym_hmacs(diag_key: &[u8; 32]) -> Option<std::collections::BTreeMap<String, String>> {
+    let table = PSEUDONYMS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let guard = match table.try_lock() {
+        Ok(g) => g,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return None,
+    };
+    Some(
+        guard
+            .iter()
+            .map(|(pseudo, val)| {
+                (
+                    pseudo.clone(),
+                    hex::encode(hmac_sha256(diag_key, val.as_bytes())),
+                )
+            })
+            .collect(),
+    )
+}
+
 macro_rules! both {
     ($t:ident < $l:lifetime >) => {
         impl<$l> fmt::Debug for $t<$l> {
@@ -143,7 +219,7 @@ impl fmt::Display for WalletTxid {
         if wallet_detail() {
             return fmt::Display::fmt(&self.0, f);
         }
-        pseudonym(f, "wtx", self.0.as_bytes())
+        wallet_pseudonym(f, "wtx", self.0.as_bytes(), &self.0.to_string())
     }
 }
 both!(WalletTxid);
@@ -157,7 +233,7 @@ impl fmt::Display for WalletAddress<'_> {
         if wallet_detail() {
             return f.write_str(self.0);
         }
-        pseudonym(f, "wad", self.0.as_bytes())
+        wallet_pseudonym(f, "wad", self.0.as_bytes(), self.0)
     }
 }
 both!(WalletAddress<'a>);
@@ -171,7 +247,7 @@ impl fmt::Display for WalletLabel<'_> {
         if wallet_detail() {
             return f.write_str(self.0);
         }
-        pseudonym(f, "wlb", self.0.as_bytes())
+        wallet_pseudonym(f, "wlb", self.0.as_bytes(), self.0)
     }
 }
 both!(WalletLabel<'a>);
@@ -213,7 +289,7 @@ impl fmt::Display for OwnOutpoint {
         let mut data = [0u8; 36];
         data[..32].copy_from_slice(self.0.as_bytes());
         data[32..].copy_from_slice(&self.1.to_le_bytes());
-        pseudonym(f, "wout", &data)
+        wallet_pseudonym(f, "wout", &data, &format!("{}:{}", self.0, self.1))
     }
 }
 both!(OwnOutpoint);
@@ -234,7 +310,7 @@ impl fmt::Display for OwnBlockHash {
         if wallet_detail() {
             return fmt::Display::fmt(&self.0, f);
         }
-        pseudonym(f, "wblk", self.0.as_bytes())
+        wallet_pseudonym(f, "wblk", self.0.as_bytes(), &self.0.to_string())
     }
 }
 both!(OwnBlockHash);
@@ -277,7 +353,7 @@ impl fmt::Display for SwapId<'_> {
         if wallet_detail() {
             return f.write_str(self.0);
         }
-        pseudonym(f, "swp", self.0.as_bytes())
+        wallet_pseudonym(f, "swp", self.0.as_bytes(), self.0)
     }
 }
 both!(SwapId<'a>);
@@ -292,7 +368,7 @@ impl fmt::Display for WalletScripthash<'_> {
         if wallet_detail() {
             return f.write_str(self.0);
         }
-        pseudonym(f, "wsh", self.0.as_bytes())
+        wallet_pseudonym(f, "wsh", self.0.as_bytes(), self.0)
     }
 }
 both!(WalletScripthash<'a>);
@@ -307,7 +383,7 @@ impl fmt::Display for WalletValue<'_> {
         if wallet_detail() {
             return f.write_str(self.0);
         }
-        pseudonym(f, "wal", self.0.as_bytes())
+        wallet_pseudonym(f, "wal", self.0.as_bytes(), self.0)
     }
 }
 both!(WalletValue<'a>);

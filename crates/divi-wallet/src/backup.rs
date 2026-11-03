@@ -13,6 +13,7 @@
 //! folder too.
 
 use crate::error::WalletError;
+use divi_primitives::redact::WalletValue;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 use tracing::{info, warn};
@@ -119,8 +120,15 @@ fn prune(dir: &Path, wallet: &str, keep: usize) {
             std::fs::remove_file(&path)
         };
         match removed {
-            Ok(()) => info!("Old backup deleted: {}", path.display()),
-            Err(e) => warn!("Failed to delete backup {}: {}", path.display(), e),
+            Ok(()) => info!(
+                "Old backup deleted: {}",
+                WalletValue(&path.to_string_lossy())
+            ),
+            Err(e) => warn!(
+                "Failed to delete backup {}: {}",
+                WalletValue(&path.to_string_lossy()),
+                e
+            ),
         }
     }
 }
@@ -160,8 +168,8 @@ fn backup_closed(
         })?;
         info!(
             "Creating backup of {} -> {}",
-            wallet.display(),
-            target.display()
+            WalletValue(&wallet.to_string_lossy()),
+            WalletValue(&target.to_string_lossy())
         );
         Some(target)
     };
@@ -196,7 +204,7 @@ pub fn backup_at_start(wallet: &Path, data_dir: &Path, keep: usize) -> Result<()
         for _ in 0..2 {
             info!(
                 "Wallet file not found at {}. Skipping backup...",
-                wallet.display()
+                WalletValue(&wallet.to_string_lossy())
             );
         }
         return Ok(());

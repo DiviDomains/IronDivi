@@ -357,12 +357,14 @@ This replaces the release-gate bullet under **Recommendation 21** above.
 - Then follow the DNS (diag.irondivi.com → dnsdivi), certbot, HTTPS nginx and HTTPS end-to-end steps in `~/code/environment/docs/dnsdivi-diag-irondivi-2026-10-31.md`.
 - The working-tree changes (42 entries) are tested but uncommitted, because commits are never made unsigned.
 
-## diag tool — open agent work (2026-10-31)
+## diag tool — agent work update (2026-11-03)
 
-Full workspace tests pass on hp3 with the stacked tree (58 suites ok, credential_calls_lint 2/2). Still open:
-- §10 canary (own vs peer tx/block log symmetry on regtest, 3+ peers, default/-debug/-debug=net).
-- manager.rs and backup.rs not converted to the diag log path.
-- A15 panic hook and A10 RPC need server.rs changes; rpc_calls reads n/a in the health test.
+Completed and verified green on `hp1` (`diag/part-b-rebased`):
+- **§10 canary (`bin/irondivid/tests/regtest_log_symmetry_canary.rs`)**: 4-node regtest own-vs-peer tx and PoS block log symmetry + sync-state release gate + R14-1/R13-1 tx relay & pseudonym non-linkage + live `SIGUSR1` incident (`signals.rs` + `health::wake()`) + `getdiaginfo` (`diag_key` HMACs & paginated `known_values`) + live `divi_diag::run` packaging (`oldlog.rs` Divi Core targetless line masking & wallet-commit bucketing) passing across `default`, `-debug=net`, and `-debug`.
+- **Structured wallet/masternode/RPC/storage log redaction**: `crates/divi-wallet/src/{manager.rs,backup.rs,wallet_db.rs}`, `crates/divi-masternode/src/manager.rs`, `crates/divi-rpc/src/wallet.rs`, `crates/divi-node/src/mempool.rs`, `crates/divi-storage/src/chain.rs`, and `bin/irondivid/src/main.rs` converted to `divi-diag` redaction wrappers (`WalletLabel`, `WalletValue`, `WalletTxid`, `WalletAddress`, `OwnOutpoint`), covered by `crates/divi-wallet/tests/diag_log_redaction.rs` and `credential_calls_lint`.
+- **A15 HTTP RPC call recording, A10 `getdiaginfo` RPC & numeric `rpc_calls`**: `diag_rpc::calls()` wired into `bin/irondivid/src/health.rs` and `runs_log.rs`; JSON-RPC HTTP `diag_rpc::begin`/`finish` + panic-hook visibility + `Caller` transport/proxy isolation wired in `crates/divi-rpc/src/server.rs`, `divi-webui`, and `divi-electrum`; full `getdiaginfo` RPC (`Caller::allows_known_values()`, `Zeroizing` `diag_key`, A11 `pseudonym_map`, paginated `known_values`, N1 16-bit SipHash env tags, and `oldlog::filter` over `health`/`debug_ring`) verified in `crates/divi-rpc/tests/diag_rpc_and_info.rs`.
+
+Remaining platform / live-environment items:
 - macOS boot clock and LC_UUID unverified; frame pointers off; non-glibc targets keep no symbols.
 - `--host` untested live on Proxmox, plain LXC, Incus, cgroup v1, memory.peak (fixtures only).
 - hp3 disk at 97%: the irondivi-diag cargo cache (~87 GB) is the first thing to delete.

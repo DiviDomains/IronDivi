@@ -26,7 +26,7 @@ use crate::persistence::{
 use divi_primitives::amount::Amount;
 use divi_primitives::counted::{self, Site};
 use divi_primitives::hash::{Hash160, Hash256};
-use divi_primitives::redact::{OwnOutpoint, WalletAddress, WalletAmount, WalletTxid};
+use divi_primitives::redact::{OwnOutpoint, WalletAddress, WalletAmount, WalletTxid, WalletValue};
 use divi_primitives::script::Script;
 use divi_primitives::transaction::OutPoint;
 use divi_primitives::ChainMode;
@@ -1850,7 +1850,10 @@ impl WalletDb {
             let _ = std::fs::remove_dir_all(&staging);
         }
         result?;
-        info!("Wallet backed up to {}", target.display());
+        info!(
+            "Wallet backed up to {}",
+            WalletValue(&target.to_string_lossy())
+        );
         Ok(target)
     }
 
@@ -4121,7 +4124,11 @@ impl WalletDb {
         self.tx_times.write().insert(*txid, (received, smart));
         if let Some(db) = &self.db() {
             if let Err(e) = db.store_tx_times(txid, received, smart) {
-                tracing::warn!("Failed to store the times of {}: {}", txid, e);
+                tracing::warn!(
+                    "Failed to store the times of {}: {}",
+                    WalletTxid::of(txid),
+                    e
+                );
             }
         }
     }
@@ -4637,7 +4644,11 @@ impl WalletDb {
             Some(db) => db,
             None => {
                 if let Err(e) = self.closed_database() {
-                    warn!("Failed to store the label of {}: {}", address, e);
+                    warn!(
+                        "Failed to store the label of {}: {}",
+                        WalletAddress(&address.to_string()),
+                        e
+                    );
                 }
                 return Ok(());
             }
@@ -4667,7 +4678,11 @@ impl WalletDb {
         // (rpcwallet.cpp:310, :361, :616; rpcdump.cpp:85, :152): the label is
         // kept in memory and the next save writes it
         if let Err(e) = db.write_batch_sync(batch) {
-            warn!("Failed to store the label of {}: {}", address, e);
+            warn!(
+                "Failed to store the label of {}: {}",
+                WalletAddress(&address.to_string()),
+                e
+            );
         }
         Ok(())
     }

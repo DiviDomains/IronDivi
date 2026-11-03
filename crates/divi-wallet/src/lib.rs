@@ -61,6 +61,8 @@ mod fault;
 pub mod hd;
 pub mod keystore;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod manager;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod persistence;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod send;
@@ -76,6 +78,8 @@ pub use coinstake::CoinstakeBuilder;
 pub use error::WalletError;
 pub use hd::{core_coin_type, ExtendedPrivateKey, ExtendedPublicKey, HdWallet, DIVI_COIN_TYPE};
 pub use keystore::{HdPublicIds, KeyEntry, KeyStore, PoolState};
+#[cfg(not(target_arch = "wasm32"))]
+pub use manager::WalletManager;
 #[cfg(not(target_arch = "wasm32"))]
 pub use persistence::WalletDatabase;
 pub use signer::{sighash, sign_input, TransactionBuilder, TransactionSigner};

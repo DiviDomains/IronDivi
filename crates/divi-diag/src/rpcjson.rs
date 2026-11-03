@@ -603,6 +603,36 @@ impl Walk {
                     continue;
                 }
             }
+            if k == "health" {
+                if let Value::String(s) = &v {
+                    let red = crate::redact::Redactor::new([0; 32], &Default::default());
+                    let filtered = crate::oldlog::filter(s, &red).render();
+                    let trimmed = filtered.trim_end().to_string();
+                    if trimmed != *s {
+                        self.note(&kp, "bucketed (A6)");
+                    }
+                    out.insert(backstop(&k), Value::String(backstop(&trimmed)));
+                    continue;
+                }
+            }
+            if k == "debug_ring" {
+                if let Value::Array(lines) = v {
+                    let red = crate::redact::Redactor::new([0; 32], &Default::default());
+                    let joined = lines
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let filtered: Vec<Value> = crate::oldlog::filter(&joined, &red)
+                        .render()
+                        .lines()
+                        .map(|l| Value::String(backstop(l)))
+                        .collect();
+                    self.note(&kp, "filtered (§6.2)");
+                    out.insert(backstop(&k), Value::Array(filtered));
+                    continue;
+                }
+            }
             let nv = self.value(v, &kp, wallet, false, false);
             out.insert(backstop(&k), nv);
         }

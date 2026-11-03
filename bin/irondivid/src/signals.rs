@@ -566,7 +566,16 @@ fn act(raw: &Raw, detail: &str) {
             crate::REOPEN_LOG.store(true, Ordering::Relaxed);
             tracing::info!("Received SIG{}, reopening debug.log", name(signo));
         }
-        libc::SIGUSR1 => record("none health=not-implemented incident=not-implemented"),
+        libc::SIGUSR1 => {
+            crate::health::wake();
+            match crate::incidents::write("usr1", "signal=USR1") {
+                Some(n) => {
+                    crate::events::event("incident", &format!("n={} kind=usr1", n));
+                    record(&format!("incident n={}", n));
+                }
+                None => record("incident=skipped"),
+            }
+        }
         libc::SIGTSTP | libc::SIGTTIN | libc::SIGTTOU => {
             let ppid = unsafe { libc::getppid() };
             if ppid != 1 && has_terminal() {

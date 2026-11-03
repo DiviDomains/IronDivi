@@ -77,6 +77,26 @@ pub enum WalletError {
     #[error("invalid passphrase")]
     InvalidPassphrase,
 
+    /// Wallet already loaded in manager
+    #[error("wallet already loaded: {0}")]
+    WalletAlreadyLoaded(String),
+
+    /// Wallet file not found on disk
+    #[error("wallet not found: {0}")]
+    WalletNotFound(String),
+
+    /// Wallet is not currently loaded in manager
+    #[error("wallet not loaded: {0}")]
+    WalletNotLoaded(String),
+
+    /// Wallet file already exists on disk
+    #[error("wallet already exists: {0}")]
+    WalletAlreadyExists(String),
+
+    /// No default wallet is currently loaded
+    #[error("no default wallet loaded")]
+    NoDefaultWallet,
+
     /// Storage error
     #[error("storage error: {0}")]
     Storage(String),

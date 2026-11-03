@@ -707,6 +707,22 @@ pub fn is_sent(txid: &divi_primitives::hash::Hash256) -> bool {
         .is_some_and(|s| s.contains(txid))
 }
 
+/// Txids submitted locally from `diag/sent-txids` (`getdiaginfo` A10 `known_values`);
+/// non-blocking so it never stalls when the store lock is contended.
+pub fn sent_txids() -> Vec<String> {
+    let guard = match sent_store().try_lock() {
+        Ok(g) => g,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return Vec::new(),
+    };
+    let Some(sent) = guard.as_ref() else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = sent.set.iter().map(|h| h.to_hex()).collect();
+    out.sort();
+    out
+}
+
 /// The logs go into `<data_dir>/diag`, and the sink is installed
 pub fn install(data_dir: &Path) {
     let diag = data_dir.join("diag");

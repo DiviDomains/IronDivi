@@ -172,8 +172,17 @@ pub fn name<'a>(method: &'a str, error: Option<(i64, &str)>) -> &'a str {
     }
 }
 
+/// Total calls started across all transports since process start
+static CALLS: AtomicU64 = AtomicU64::new(0);
+
+/// Number of calls started across all transports since process start (A6 `rpc_calls`)
+pub fn calls() -> u64 {
+    CALLS.load(Ordering::Relaxed)
+}
+
 /// A call starts
 pub fn begin(method: &str, transport: Transport) -> Call {
+    CALLS.fetch_add(1, Ordering::Relaxed);
     let method = name(method, None);
     let started = Instant::now();
     let mut slot = None;

@@ -441,12 +441,15 @@ impl Backend {
 
     /// Calls a node RPC method and returns its result
     pub fn rpc(&self, method: &str, params: Vec<Value>) -> Result<Value> {
-        let response = self.rpc.handle_request(Request {
-            jsonrpc: "2.0".into(),
-            id: RequestId::Number(1),
-            method: method.into(),
-            params: Params::Array(params),
-        });
+        let response = self.rpc.handle_request_from(
+            Request {
+                jsonrpc: "2.0".into(),
+                id: RequestId::Number(1),
+                method: method.into(),
+                params: Params::Array(params),
+            },
+            divi_rpc::Caller::electrum(),
+        );
         if let Some(error) = response.error {
             return Err(ElectrumError::bad_request(error.message));
         }

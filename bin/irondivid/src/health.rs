@@ -50,6 +50,15 @@ type StakingFn = Box<dyn Fn() -> Staking + Send + Sync>;
 static STAKING: Mutex<Option<StakingFn>> = Mutex::new(None);
 /// The last line written, for incidents
 static LAST: Mutex<String> = Mutex::new(String::new());
+/// Wakes the `health` thread to write an immediate health record (e.g. SIGUSR1)
+static WAKE: (Mutex<bool>, std::sync::Condvar) = (Mutex::new(false), std::sync::Condvar::new());
+
+pub fn wake() {
+    if let Ok(mut w) = WAKE.0.try_lock() {
+        *w = true;
+        WAKE.1.notify_all();
+    }
+}
 
 pub fn set_staking(f: StakingFn) {
     *STAKING.lock().unwrap_or_else(|e| e.into_inner()) = Some(f);
@@ -109,7 +118,12 @@ pub fn start(h: Handles) {
             crate::rpc_log::tick();
             #[cfg(unix)]
             crate::watchdog::beat_health();
-            std::thread::sleep(interval());
+            let guard = WAKE.0.lock().unwrap_or_else(|e| e.into_inner());
+            let (mut guard, _) = WAKE
+                .1
+                .wait_timeout_while(guard, interval(), |w| !*w)
+                .unwrap_or_else(|e| e.into_inner());
+            *guard = false;
         }
     });
     if let Err(e) = started {
@@ -439,7 +453,7 @@ fn counters(f: &mut Fields) {
         .map(|w| w.1)
         .sum();
     f.put("lock_waits", waits.to_string());
-    f.na("rpc_calls");
+    f.put("rpc_calls", divi_primitives::diag_rpc::calls().to_string());
     match DUMPABLE.load(Ordering::Relaxed) {
         -1 if cfg!(target_os = "linux") => f.put("dumpable", "not-yet"),
         -1 => f.na_mac("dumpable"),

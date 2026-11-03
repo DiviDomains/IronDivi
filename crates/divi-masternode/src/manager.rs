@@ -664,7 +664,11 @@ impl MasternodeManager {
                 }
                 Err(e) => {
                     // Database error - log but don't mark as spent
-                    error!("Error checking UTXO for masternode {}: {}", outpoint, e);
+                    error!(
+                        "Error checking UTXO for masternode {}: {}",
+                        divi_primitives::redact::OwnOutpoint::of(outpoint),
+                        e
+                    );
                 }
             }
         }

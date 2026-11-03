@@ -5070,15 +5070,6 @@ impl Chain {
                 // Queue UTXO addition in batch
                 utxo_batch.add(outpoint, utxo);
                 utxos_created += 1;
-
-                // Debug: log specific UTXOs we're interested in
-                let txid_str = txid.to_string();
-                if txid_str.starts_with("95ef902f") || height == 144 {
-                    debug!(
-                        "  CREATED UTXO: {}:{} value={} at height {}",
-                        txid, vout, output.value, height
-                    );
-                }
             }
 
             if utxos_created > 0 {

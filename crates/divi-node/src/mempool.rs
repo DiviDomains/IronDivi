@@ -974,7 +974,10 @@ impl Mempool {
 
         for txid in &doomed {
             if self.remove(txid).is_some() {
-                tracing::info!("Removed tx {} from mempool: mempool full", txid);
+                tracing::info!(
+                    "Removed tx {} from mempool: mempool full",
+                    divi_primitives::redact::WalletTxid::of(txid)
+                );
             }
         }
         Ok(())

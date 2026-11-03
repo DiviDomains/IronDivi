@@ -326,6 +326,25 @@ fn per_block(msg: &str) -> Option<&'static str> {
     if msg.starts_with("Received ") && msg.contains(" in tx ") {
         return Some("Received … in tx …");
     }
+    // R14-1 own-only Divi Core wallet-send / keypool lines (`divi-rpc/src/wallet.rs`
+    // and `divi-wallet/src/keystore.rs`, written without a module target in `debug.log`):
+    // removed in place and weekly-bucketed so own sends never stand in the package
+    // or leak `<txid[..10]>: Relaying wtx ...` prefixes.
+    if msg.starts_with("CommitTransaction:") {
+        return Some("CommitTransaction");
+    }
+    if msg.starts_with("CTransaction(") || msg.starts_with("CTxIn(") || msg.starts_with("CTxOut(") {
+        return Some("CommitTransaction body");
+    }
+    if msg.starts_with("keypool ") {
+        return Some("keypool");
+    }
+    if msg.contains(": Relaying wtx ") {
+        return Some("Relaying wtx");
+    }
+    if msg.starts_with("SendMoney -> CommitTransaction()") {
+        return Some("SendMoney -> CommitTransaction()");
+    }
     None
 }
 
@@ -504,6 +523,26 @@ fn peer_of(msg: &str) -> Option<&str> {
         .map(|p| p.trim_end_matches([',', ':', ')']))
 }
 
+/// Divi Core `debug.log` timestamp prefix (`YYYY-MM-DD HH:MM:SS <msg>`, with
+/// `-logtimestamps=1` and no tracing level/module target).
+fn parse_divid(l: &str) -> Option<(&str, &str)> {
+    let b = l.as_bytes();
+    if b.len() > 20
+        && b[..19].iter().enumerate().all(|(i, c)| match i {
+            4 | 7 => *c == b'-',
+            10 => *c == b' ',
+            13 | 16 => *c == b':',
+            _ => c.is_ascii_digit(),
+        })
+        && b[19] == b' '
+        && date_of(&l[..10]).is_some()
+    {
+        Some((&l[..19], &l[20..]))
+    } else {
+        None
+    }
+}
+
 /// §6.3: would the filter remove this line (a per-block, failure-only or
 /// staker line)? The filter's own count lines (`[week of …: …]`) are not.
 pub fn would_remove(raw: &str) -> Option<&'static str> {
@@ -515,9 +554,26 @@ pub fn would_remove(raw: &str) -> Option<&'static str> {
     let json = parse_json(&l);
     let l: &str = json.as_ref().map(|j| j.0.as_str()).unwrap_or(&l);
     let parsed = parse(l);
-    let msg = parsed.as_ref().map(|p| p.msg).unwrap_or(l).trim_start();
-    if let Some(w) = failure_only(msg).or_else(|| per_block(msg)) {
+    let divid = if parsed.is_none() {
+        parse_divid(l)
+    } else {
+        None
+    };
+    let msg = parsed
+        .as_ref()
+        .map(|p| p.msg)
+        .or_else(|| divid.map(|(_, m)| m))
+        .unwrap_or(l)
+        .trim_start();
+    let msg_clean = msg
+        .strip_prefix("WARNING: ")
+        .or_else(|| msg.strip_prefix("ERROR: "))
+        .unwrap_or(msg);
+    if let Some(w) = failure_only(msg_clean).or_else(|| per_block(msg_clean)) {
         return Some(w);
+    }
+    if msg.starts_with("ThreadRPCServer method=") && msg != "ThreadRPCServer method=<arg>" {
+        return Some("unmasked ThreadRPCServer method");
     }
     if parsed.is_none() {
         if let Some(w) = PER_BLOCK.iter().find(|p| l.contains(**p)) {
@@ -542,22 +598,32 @@ pub fn filter(text: &str, r: &Redactor) -> Filtered {
         let l: &str = json.as_ref().map(|j| j.0.as_str()).unwrap_or(&l);
         let extra = json.as_ref().map(|j| j.1.as_str()).unwrap_or("");
         let parsed = parse(l);
-        let (ts, msg) = match &parsed {
-            Some(p) => (p.ts, p.msg),
-            None => (l.split_whitespace().next().unwrap_or(""), l),
+        let divid = if parsed.is_none() {
+            parse_divid(l)
+        } else {
+            None
+        };
+        let (ts, msg) = match (&parsed, divid) {
+            (Some(p), _) => (p.ts, p.msg),
+            (None, Some((dts, dmsg))) => (dts, dmsg),
+            (None, None) => (l.split_whitespace().next().unwrap_or(""), l),
         };
         let target = parsed.as_ref().map(|p| p.target).unwrap_or("");
 
         // (e) per-block lines, any module
         let msg_for_match = msg.trim_start();
-        if let Some(what) = failure_only(msg_for_match) {
+        let msg_clean = msg_for_match
+            .strip_prefix("WARNING: ")
+            .or_else(|| msg_for_match.strip_prefix("ERROR: "))
+            .unwrap_or(msg_for_match);
+        if let Some(what) = failure_only(msg_clean) {
             f.removed += 1;
             *f.counts
                 .entry((period(ts, true), what.to_string()))
                 .or_default() += 1;
             continue;
         }
-        if let Some(what) = per_block(msg_for_match).or_else(|| {
+        if let Some(what) = per_block(msg_clean).or_else(|| {
             // an unparsed line (a journal prefix, a ring copy): matched anywhere
             if parsed.is_none() {
                 PER_BLOCK.iter().find(|p| l.contains(**p)).copied()
@@ -624,6 +690,24 @@ pub fn filter(text: &str, r: &Redactor) -> Filtered {
                 module,
                 mask_wallet_msg(msg, r)
             ));
+            continue;
+        } else if msg_for_match.starts_with("ThreadRPCServer ")
+            || msg_clean.starts_with("copied wallet.dat to ")
+            || msg_clean.starts_with("backupwallet to ")
+        {
+            // Divi Core-format RPC dispatch / backupwallet lines (`divi_rpc` without a
+            // module target in `debug.log`): apply rule (b) so send/wallet RPC
+            // method names and paths never reach the package in clear (R14-1).
+            f.masked += 1;
+            if let Some((dts, _)) = divid {
+                f.text.push_str(&format!(
+                    "{dts} {}{extra}\n",
+                    mask_wallet_msg(msg_for_match, r)
+                ));
+            } else {
+                f.text
+                    .push_str(&format!("{}{extra}\n", mask_wallet_msg(msg_for_match, r)));
+            }
             continue;
         }
         f.text.push_str(&plain_rules(l, r));
@@ -777,5 +861,39 @@ mod tests {
             .unwrap();
         assert_eq!(p.target, "divi_wallet::db");
         assert_eq!(p.msg, "Sent 5 to x");
+    }
+
+    #[test]
+    fn divid_format_masks_rpc_methods_and_buckets_per_block_and_failures() {
+        let log = "\
+2026-10-27 01:00:01 Connected block abc at height 105
+2026-10-27 01:00:02 Dropped invalid block def: bad signature
+2026-10-27 01:00:03 ThreadRPCServer method=sendtoaddress
+2026-10-27 01:00:04 ThreadRPCServer method=sendrawtransaction
+";
+        let red = r();
+        let out = filter(log, &red).render();
+        assert!(!out.contains("sendtoaddress"), "{out}");
+        assert!(!out.contains("sendrawtransaction"), "{out}");
+        assert!(
+            out.contains("2026-10-27 01:00:03 ThreadRPCServer method=<arg>"),
+            "{out}"
+        );
+        assert!(
+            out.contains("[week of 2026-10-26: Connected block: 1-3]"),
+            "{out}"
+        );
+        assert!(
+            out.contains("[day 2026-10-27: Dropped invalid block: 1-3]"),
+            "{out}"
+        );
+        assert_eq!(
+            would_remove("2026-10-27 01:00:03 ThreadRPCServer method=sendtoaddress"),
+            Some("unmasked ThreadRPCServer method")
+        );
+        assert_eq!(
+            would_remove("2026-10-27 01:00:03 ThreadRPCServer method=<arg>"),
+            None
+        );
     }
 }
