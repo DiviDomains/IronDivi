@@ -76,6 +76,7 @@ const SHOWN: &[&str] = &[
     "utxocachesize",
     "vault",
     "webui",
+    "webuiopen",
     "webuiport",
 ];
 

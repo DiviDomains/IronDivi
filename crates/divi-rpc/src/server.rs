@@ -577,53 +577,136 @@ impl RpcServer {
     /// Get current log configuration
     fn get_log_config(&self, _params: &Params) -> Result<serde_json::Value, Error> {
         let config = self.log_config.read();
-        match &*config {
-            Some(c) => Ok(serde_json::json!({
-                "max_file_size": c.max_file_size,
-                "max_file_size_mb": c.max_file_size / 1_048_576,
-                "max_files": c.max_files,
-                "debug": c.debug,
-                "levels": c.levels,
-                "print_to_console": c.print_to_console
-            })),
-            None => Ok(serde_json::json!({
+        let Some(c) = &*config else {
+            return Ok(serde_json::json!({
                 "error": "Log configuration not available"
-            })),
+            }));
+        };
+        let mut out = serde_json::json!({
+            "max_file_size": c.max_file_size,
+            "max_file_size_mb": c.max_file_size / 1_048_576,
+            "max_files": c.max_files,
+            "debug": c.debug,
+            "levels": c.levels,
+            "print_to_console": c.print_to_console
+        });
+        if let Some(live) = crate::logctl::control() {
+            let st = live.state();
+            let spec = st.spec();
+            let debug = !st.categories.is_empty() || st.level == "debug" || st.level == "trace";
+            out["debug"] = serde_json::json!(debug);
+            // Keep `c.levels` when it holds per-category non-debug levels set via
+            // 1-arg `setlogconfig`; otherwise reflect live WebUI updates too
+            if !c.levels.contains(':') || st.categories.iter().any(|cat| !c.levels.contains(cat)) {
+                out["levels"] = serde_json::json!(spec);
+            }
+            out["level"] = serde_json::json!(st.level);
+            out["categories"] = serde_json::json!(st.categories);
+            out["env_override"] = serde_json::json!(st.env_override);
         }
+        Ok(out)
     }
 
     /// Change the log levels of the running node: `true` is every category
-    /// at debug, `false` the start-up default, a string a `loglevel` value
+    /// at debug, `false` the start-up default, a single string is a `loglevel`
+    /// value (`"default"`, `"info,sync:debug"`), or `"<level>" ["<category>",...]`
+    /// sets the overall level and debug categories (a list or comma-separated string).
     fn set_log_config_rpc(&self, params: &Params) -> Result<serde_json::Value, Error> {
-        let spec = match (params.get_bool(0), params.get_str(0)) {
-            (Some(true), _) => "debug".to_string(),
-            (Some(false), _) => "default".to_string(),
-            (None, Some(s)) => s.to_string(),
-            (None, None) => return Err(RpcError::invalid_params(
-                "setlogconfig needs true, false or a loglevel value such as \"info,sync:debug\"",
-            )
-            .into()),
+        let usage = || {
+            Error::from(RpcError::invalid_params(
+                "setlogconfig needs true, false, a loglevel value such as \"info,sync:debug\", or \"<level>\" [\"<category>\",...]",
+            ))
         };
-        let callback = self.log_levels.read().clone();
-        let Some(callback) = callback else {
-            return Err(
-                RpcError::internal_error("log levels cannot be changed in this node").into(),
-            );
+        let two_arg_cats: Option<Vec<String>> = match params.get(1) {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::Array(a)) => Some(
+                a.iter()
+                    .map(|v| v.as_str().map(str::to_string).ok_or_else(usage))
+                    .collect::<Result<_, _>>()?,
+            ),
+            Some(serde_json::Value::String(c)) => Some(
+                c.split(',')
+                    .map(|x| x.trim().to_string())
+                    .filter(|x| !x.is_empty())
+                    .collect(),
+            ),
+            _ => return Err(usage()),
         };
-        let levels = callback(&spec).map_err(RpcError::invalid_params)?;
-        let debug = levels.split(',').any(|l| {
-            let lvl = l.rsplit(':').next().unwrap_or(l);
-            lvl == "debug" || lvl == "trace"
-        });
-        if let Some(c) = self.log_config.write().as_mut() {
-            c.levels = levels.clone();
-            c.debug = debug;
+
+        let spec = match (params.get_bool(0), params.get_str(0), &two_arg_cats) {
+            (Some(true), _, None) => "debug".to_string(),
+            (Some(false), _, None) => "default".to_string(),
+            (None, Some(level), Some(cats)) => {
+                let norm = crate::logctl::normalize(cats);
+                if norm.iter().any(|c| c == "all") {
+                    "debug".to_string()
+                } else if norm.is_empty() {
+                    level.trim().to_string()
+                } else {
+                    let mut s = level.trim().to_string();
+                    for c in &norm {
+                        s.push(',');
+                        s.push_str(c);
+                        s.push_str(":debug");
+                    }
+                    s
+                }
+            }
+            (None, Some(s), None) => s.to_string(),
+            _ => return Err(usage()),
+        };
+
+        if let Some(callback) = self.log_levels.read().clone() {
+            let levels = callback(&spec).map_err(RpcError::invalid_params)?;
+            let debug = levels.split(',').any(|l| {
+                let lvl = l.rsplit(':').next().unwrap_or(l);
+                lvl == "debug" || lvl == "trace"
+            });
+            if let Some(c) = self.log_config.write().as_mut() {
+                c.levels = levels.clone();
+                c.debug = debug;
+            }
+            let mut out = serde_json::json!({
+                "success": true,
+                "message": "Log filter changed. File size and count settings require restart.",
+                "levels": levels,
+                "debug": debug,
+            });
+            if let Some(live) = crate::logctl::control() {
+                let st = live.state();
+                out["level"] = serde_json::json!(st.level);
+                out["categories"] = serde_json::json!(st.categories);
+            }
+            return Ok(out);
         }
-        Ok(serde_json::json!({
-            "success": true,
-            "levels": levels,
-            "debug": debug
-        }))
+
+        if let Some(live) = crate::logctl::control() {
+            let (lvl, cats) = match (params.get_bool(0), params.get_str(0)) {
+                (Some(on), _) => (None, Some(vec![if on { "all" } else { "0" }.to_string()])),
+                (None, Some("default")) => (Some("info"), Some(vec!["0".to_string()])),
+                (None, Some(s)) => (Some(s), two_arg_cats),
+                _ => return Err(usage()),
+            };
+            let st = live
+                .set(lvl, cats.as_deref())
+                .map_err(RpcError::invalid_params)?;
+            let debug = !st.categories.is_empty() || st.level == "debug" || st.level == "trace";
+            let levels = st.spec();
+            if let Some(c) = self.log_config.write().as_mut() {
+                c.levels = levels.clone();
+                c.debug = debug;
+            }
+            return Ok(serde_json::json!({
+                "success": true,
+                "message": "Log filter changed. File size and count settings require restart.",
+                "levels": levels,
+                "debug": debug,
+                "level": st.level,
+                "categories": st.categories,
+            }));
+        }
+
+        Err(RpcError::internal_error("log levels cannot be changed in this node").into())
     }
 
     /// Composite getinfo handler that pulls data from all subsystems.
@@ -1195,8 +1278,8 @@ impl RpcServer {
                 "debitvaultbyname" => "debitvaultbyname vault-encoding destination amount (feeMode)\n\nWithdraw an amount from a specific vaults to a destination address. The amount is a real and is rounded to the nearest 0.00000001\n\nRequires wallet passphrase to be set with walletpassphrase call.\nArguments:\n1. \"vault-encoding\"  (string, required) The vault encoding to withdraw from.\n2. \"diviaddress\"  (string, required) The divi address of your choosing to send to.\n3. \"amount\"      (numeric, required) The amount in DIVI to move. eg 0.1\n4. \"fee mode\"      (string, optional) The fee + change output calculation mode\n\nResult:\n\"transactionid\"  (string) The transaction id.",
                 "reclaimvaultfunds" => "reclaimvaultfunds destination amount (feeMode|metadata) ( \"comment\" \"comment-to\" )\n\nWithdraw an amount from your vaults into a separate address. The amount is a real and is rounded to the nearest 0.00000001\n\nRequires wallet passphrase to be set with walletpassphrase call.\nArguments:\n1. \"diviaddress\"  (string, required) The divi address of your choosing to send to.\n2. \"amount\"      (numeric, required) The amount in DIVI to move. eg 0.1\n\nResult:\n\"transactionid\"  (string) The transaction id.",
                 // Logging
-                "getlogconfig" => "getlogconfig\n\nReturns the current logging configuration.\n\nResult:\n{\n  \"max_file_size\": n,      (numeric) Maximum log file size in bytes\n  \"max_file_size_mb\": n,   (numeric) Maximum log file size in MB\n  \"max_files\": n,          (numeric) Number of log files to keep\n  \"debug\": true|false,     (boolean) Whether any category writes debug lines\n  \"levels\": \"...\",       (string) The log levels, as a loglevel value\n  \"print_to_console\": true|false  (boolean) Whether logging to console\n}",
-                "setlogconfig" => "setlogconfig levels\n\nChanges the log levels of the running node until it stops (the config file's\nloglevel= and debug= apply again at the next start). File size and count\nneed a restart.\n\nArguments:\n1. levels   (string or boolean, required) A loglevel value: a level for all of\n            IronDivi (off, error, warn, info, debug, trace) and/or\n            category:level pairs, separated by commas; \"default\" for the\n            start-up default. true is every category at debug, false the default.\n            Categories: net, sync, peers, node, mempool, staking, chain, wallet,\n            masternode, spork, rpc, electrum, webui, swap, zmq, daemon\n\nResult:\n{\n  \"success\": true,\n  \"levels\": \"...\",   (string) The levels now in force\n  \"debug\": true|false\n}\n\nExamples:\n> irondivi-cli setlogconfig \"info,sync:debug\"\n> irondivi-cli setlogconfig default",
+                "getlogconfig" => "getlogconfig\n\nReturns the current logging configuration.\n\nResult:\n{\n  \"max_file_size\": n,      (numeric) Maximum log file size in bytes\n  \"max_file_size_mb\": n,   (numeric) Maximum log file size in MB\n  \"max_files\": n,          (numeric) Number of log files to keep\n  \"debug\": true|false,     (boolean) Whether any category writes debug lines\n  \"levels\": \"...\",       (string) The log levels, as a loglevel value\n  \"level\": \"...\",        (string, optional) Overall base log level\n  \"categories\": [...],     (array, optional) Active debug categories\n  \"env_override\": true|false, (boolean, optional) Whether RUST_LOG overrides live changes\n  \"print_to_console\": true|false  (boolean) Whether logging to console\n}",
+                "setlogconfig" => "setlogconfig levels | setlogconfig \"level\" ( [\"category\",...] )\n\nChanges the log levels of the running node until it stops (the config file's\nloglevel= and debug= apply again at the next start). File size and count\nneed a restart.\n\nArguments:\n1. levels   (string or boolean, required) A loglevel value: a level for all of\n            IronDivi (off, error, warn, info, debug, trace) and/or\n            category:level pairs, separated by commas; \"default\" for the\n            start-up default. true is every category at debug, false the default.\n            Alternatively, pass \"level\" as argument 1 and an array or\n            comma-separated string of debug categories as argument 2.\n\nResult:\n{\n  \"success\": true,\n  \"message\": \"...\",\n  \"levels\": \"...\",   (string) The levels now in force\n  \"debug\": true|false\n}\n\nExamples:\n> irondivi-cli setlogconfig \"info,sync:debug\"\n> irondivi-cli setlogconfig default",
                 // Control
                 "help" => "help ( \"command\" )\n\nList all commands, or get help for a specified command.",
                 "stop" => "stop\n\nStop Divi server.",

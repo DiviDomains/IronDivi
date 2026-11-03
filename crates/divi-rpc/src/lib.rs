@@ -57,6 +57,7 @@ mod flat_file;
 pub mod http;
 pub mod json_spirit_text;
 pub mod lite_wallet;
+pub mod logctl;
 pub mod masternode;
 pub mod mn_broadcast;
 pub mod mn_list;

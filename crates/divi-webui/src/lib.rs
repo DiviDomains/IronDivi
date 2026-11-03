@@ -14,22 +14,25 @@
 //! but reads until the wallet is encrypted.
 
 pub mod auth;
+pub mod chainview;
 pub mod conffile;
 pub mod gate;
+pub mod launch;
 pub mod schema;
+pub mod wallets;
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context;
-use axum::extract::{ConnectInfo, DefaultBodyLimit, Request, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Query, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use divi_rpc::{Params, RequestId, RpcServer};
+use divi_rpc::{logctl, Params, RequestId, RpcServer};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, Semaphore};
@@ -67,6 +70,9 @@ pub struct WebUiConfig {
     pub chain_mode: String,
     /// The values the command line gave, which win over the file
     pub cli: conffile::Values,
+    /// `-webuiopen`: open the browser at start, signed in, when someone is
+    /// at the screen
+    pub open_browser: bool,
 }
 
 /// The interface with its port taken, before the daemon's RPC server exists
@@ -74,6 +80,7 @@ pub struct Prepared {
     listener: std::net::TcpListener,
     config: WebUiConfig,
     auth: AuthStore,
+    sidechains: Option<Router>,
 }
 
 /// Take the port and read the password file. Run before the node starts, so
@@ -109,6 +116,7 @@ pub fn prepare(config: WebUiConfig) -> anyhow::Result<Prepared> {
         listener,
         config,
         auth,
+        sidechains: None,
     })
 }
 
@@ -130,28 +138,49 @@ struct Shared {
     /// Host header values accepted, lowercase
     hosts: Vec<String>,
     rpc: Arc<RpcServer>,
+    launch: launch::LaunchToken,
+    wallets: wallets::WalletStore,
+    /// The node's Electrum backend, which the wallets read; None without
+    /// txindex and addressindex
+    electrum: Option<Arc<divi_electrum::Backend>>,
 }
 
 impl Prepared {
+    /// Serve the sidechain market's API under `/api/sidechains`. Its paths are
+    /// relative to that prefix; the interface adds sign-in and its guard.
+    pub fn with_sidechains(mut self, api: Router) -> Self {
+        self.sidechains = Some(api);
+        self
+    }
+
     /// Serve until the daemon shuts down
     pub fn spawn(
         self,
         rpc: Arc<RpcServer>,
+        electrum: Option<Arc<divi_electrum::Backend>>,
         mut shutdown: broadcast::Receiver<()>,
     ) -> tokio::task::JoinHandle<()> {
         let Prepared {
             listener,
             config,
             auth,
+            sidechains,
         } = self;
         let shared = Arc::new(Shared {
             hosts: allowed_hosts(&config),
+            wallets: wallets::WalletStore::new(
+                &config.data_dir,
+                &config.network,
+                &config.chain_mode,
+            ),
             config,
             auth,
             sessions: Sessions::default(),
             limiter: LoginLimiter::default(),
             hashing: Semaphore::new(2),
             rpc,
+            launch: launch::LaunchToken::default(),
+            electrum,
         });
         tokio::spawn(async move {
             let listener = match tokio::net::TcpListener::from_std(listener) {
@@ -161,7 +190,20 @@ impl Prepared {
                     return;
                 }
             };
-            let app = router(shared);
+            if shared.config.open_browser && launch::desktop_session() {
+                // The URL carries the token: it goes to the opener, never the log
+                let url = format!(
+                    "http://{}/launch?t={}",
+                    display_host(&shared.config.bind),
+                    shared.launch.issue()
+                );
+                if launch::open_browser(&url) {
+                    info!("Web interface: opened the browser");
+                } else {
+                    info!("Web interface: no browser to open; sign in at the address above");
+                }
+            }
+            let app = router(shared, sidechains.unwrap_or_else(no_sidechains));
             let served = axum::serve(
                 listener,
                 app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -203,7 +245,29 @@ fn allowed_hosts(config: &WebUiConfig) -> Vec<String> {
     hosts
 }
 
-fn router(shared: Arc<Shared>) -> Router {
+/// What `/api/sidechains` answers when the node has no sidechain market
+fn no_sidechains() -> Router {
+    Router::new().fallback(|| async {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "the sidechain market is not installed in this node",
+                "code": "not_installed",
+            })),
+        )
+    })
+}
+
+/// Sidechain API calls need a session; anything but a read also its CSRF token
+async fn sidechains_signed_in(State(s): State<Arc<Shared>>, req: Request, next: Next) -> Response {
+    let write = req.method() != Method::GET && req.method() != Method::HEAD;
+    match signed_in(&s, req.headers(), write) {
+        Ok(_) => next.run(req).await,
+        Err(e) => e.into_response(),
+    }
+}
+
+fn router(shared: Arc<Shared>, sidechains: Router) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/app.js", get(|| js(include_str!("../static/app.js"))))
@@ -213,7 +277,21 @@ fn router(shared: Arc<Shared>) -> Router {
             get(|| js(include_str!("../static/qrcode.js"))),
         )
         .route("/jsqr.js", get(|| js(include_str!("../static/jsqr.js"))))
+        .route("/nft.js", get(|| js(include_str!("../static/nft.js"))))
+        .route(
+            "/nftkit.js",
+            get(|| js(include_str!("../static/nftkit.js"))),
+        )
+        .route(
+            "/wallets.js",
+            get(|| js(include_str!("../static/wallets.js"))),
+        )
+        .route(
+            "/sidechains.js",
+            get(|| js(include_str!("../static/sidechains.js"))),
+        )
         .route("/app.css", get(app_css))
+        .route("/launch", get(launch_in))
         .route("/api/state", get(api_state))
         .route("/api/setup", post(api_setup))
         .route("/api/login", post(api_login))
@@ -221,6 +299,21 @@ fn router(shared: Arc<Shared>) -> Router {
         .route("/api/password", post(api_password))
         .route("/api/rpc", post(api_rpc))
         .route("/api/settings", get(api_settings).post(api_save_settings))
+        .route("/api/logs", get(api_logs).post(api_log_filter))
+        .route("/api/wallets", get(api_wallets))
+        .route("/api/wallets/create", post(api_wallet_create))
+        .route("/api/wallets/import", post(api_wallet_import))
+        .route("/api/wallets/:id", get(api_wallet_show))
+        .route("/api/wallets/:id/backup", get(api_wallet_backup))
+        .route("/api/wallets/:id/:action", post(api_wallet_action))
+        .route("/api/nft/*path", get(api_nft).post(api_nft))
+        .nest_service(
+            "/api/sidechains",
+            sidechains.layer(axum::middleware::from_fn_with_state(
+                shared.clone(),
+                sidechains_signed_in,
+            )),
+        )
         .layer(axum::middleware::from_fn_with_state(shared.clone(), guard))
         .layer(DefaultBodyLimit::max(1 << 20))
         .with_state(shared)
@@ -229,7 +322,7 @@ fn router(shared: Arc<Shared>) -> Router {
 const CSP: &str = "default-src 'self'; frame-ancestors 'none'; base-uri 'none'; \
                    form-action 'self'; object-src 'none'";
 
-/// Every request: a known Host (no DNS rebinding), a same-origin JSON POST,
+/// Every request: a known Host (no DNS rebinding), a same-origin JSON POST or PUT,
 /// and headers that keep the page out of frames and caches
 async fn guard(State(s): State<Arc<Shared>>, req: Request, next: Next) -> Response {
     let host = req
@@ -244,7 +337,7 @@ async fn guard(State(s): State<Arc<Shared>>, req: Request, next: Next) -> Respon
         )
             .into_response();
     };
-    if req.method() == Method::POST {
+    if req.method() == Method::POST || req.method() == Method::PUT {
         let origin = req
             .headers()
             .get(header::ORIGIN)
@@ -261,7 +354,7 @@ async fn guard(State(s): State<Arc<Shared>>, req: Request, next: Next) -> Respon
             .get(header::CONTENT_TYPE)
             .and_then(|h| h.to_str().ok())
             .is_some_and(|c| c.starts_with("application/json"));
-        if !json {
+        if !json && !raw_upload(req.method(), req.uri().path()) {
             return (StatusCode::UNSUPPORTED_MEDIA_TYPE, "expected JSON").into_response();
         }
     } else if req.method() != Method::GET && req.method() != Method::HEAD {
@@ -288,6 +381,113 @@ async fn guard(State(s): State<Arc<Shared>>, req: Request, next: Next) -> Respon
         HeaderValue::from_static(if api { "no-store" } else { "no-cache" }),
     );
     res
+}
+
+/// The NFT service the NFT page's kit calls through `/api/nft/`. Testnet
+/// only: on any other network the proxy answers 404.
+const NFT_API_TESTNET: &str = "https://nft-testnet.irondivi.com/nft/api/";
+/// The service's own cap on a pinned image, plus room for nothing else
+const NFT_FILE_LIMIT: usize = 8 << 20;
+/// The largest answer passed back to the page
+const NFT_REPLY_LIMIT: usize = 16 << 20;
+
+/// The one POST that is not JSON: an image sent to be pinned, as raw bytes
+/// with its own type. Same origin, session and CSRF token still apply.
+fn raw_upload(method: &Method, path: &str) -> bool {
+    method == Method::POST && path == "/api/nft/ipfs/file"
+}
+
+/// The service URL for `/api/nft/<path>?<query>`, or `None` off testnet or
+/// for a path that could step outside the service's API
+fn nft_upstream(network: &str, path: &str, query: Option<&str>) -> Option<String> {
+    if network != "test" || path.is_empty() || path.starts_with('/') {
+        return None;
+    }
+    let safe = |c: char| c.is_ascii_alphanumeric() || "/_-.".contains(c);
+    if !path.chars().all(safe)
+        || path
+            .split('/')
+            .any(|seg| seg.is_empty() || seg == "." || seg == "..")
+    {
+        return None;
+    }
+    let mut url = format!("{NFT_API_TESTNET}{path}");
+    if let Some(q) = query.filter(|q| !q.is_empty()) {
+        if !q.chars().all(|c| c.is_ascii_graphic() && c != '#') {
+            return None;
+        }
+        url.push('?');
+        url.push_str(q);
+    }
+    Some(url)
+}
+
+fn nft_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .expect("TLS client")
+    })
+}
+
+/// `/api/nft/*`: the NFT page's kit reaching the testnet NFT service. A read
+/// needs the session, a write also its CSRF token. Only the body, its type
+/// and the service's own bearer token go upstream; never the session cookie.
+async fn api_nft(State(s): State<Arc<Shared>>, req: Request) -> ApiResult {
+    let write = req.method() != Method::GET && req.method() != Method::HEAD;
+    signed_in(&s, req.headers(), write)?;
+    let path = req.uri().path().strip_prefix("/api/nft/").unwrap_or("");
+    let Some(url) = nft_upstream(&s.config.network, path, req.uri().query()) else {
+        return Err(ApiError(
+            StatusCode::NOT_FOUND,
+            "the NFT service is reached on testnet only".into(),
+        ));
+    };
+    let mut up = nft_client().request(req.method().clone(), url);
+    for name in [header::CONTENT_TYPE, header::AUTHORIZATION, header::ACCEPT] {
+        if let Some(v) = req.headers().get(&name) {
+            up = up.header(name, v.clone());
+        }
+    }
+    if write {
+        let body = axum::body::to_bytes(req.into_body(), NFT_FILE_LIMIT + 4096)
+            .await
+            .map_err(|_| ApiError(StatusCode::PAYLOAD_TOO_LARGE, "over 8 MiB".into()))?;
+        up = up.body(body);
+    }
+    let gone = |_| {
+        ApiError(
+            StatusCode::BAD_GATEWAY,
+            "the NFT service did not answer".into(),
+        )
+    };
+    let res = up.send().await.map_err(gone)?;
+    let status = res.status();
+    let kind = res.headers().get(header::CONTENT_TYPE).cloned();
+    if res
+        .content_length()
+        .is_some_and(|n| n > NFT_REPLY_LIMIT as u64)
+    {
+        return Err(ApiError(
+            StatusCode::BAD_GATEWAY,
+            "the NFT service answered too much".into(),
+        ));
+    }
+    let body = res.bytes().await.map_err(gone)?;
+    if body.len() > NFT_REPLY_LIMIT {
+        return Err(ApiError(
+            StatusCode::BAD_GATEWAY,
+            "the NFT service answered too much".into(),
+        ));
+    }
+    let mut out = (status, body).into_response();
+    if let Some(kind) = kind {
+        out.headers_mut().insert(header::CONTENT_TYPE, kind);
+    }
+    Ok(out)
 }
 
 async fn index() -> impl IntoResponse {
@@ -374,6 +574,25 @@ fn started(s: &Shared) -> Response {
     res
 }
 
+#[derive(Deserialize)]
+struct LaunchQuery {
+    #[serde(default)]
+    t: String,
+}
+
+/// `/launch?t=<token>`: the browser the daemon opened signs in. A spent or
+/// wrong token (a prefetch, a reload) lands on the sign-in page instead.
+async fn launch_in(State(s): State<Arc<Shared>>, Query(q): Query<LaunchQuery>) -> Response {
+    let mut res = (StatusCode::SEE_OTHER, [(header::LOCATION, "/")]).into_response();
+    if s.launch.redeem(&q.t) {
+        let session = s.sessions.create();
+        res.headers_mut()
+            .insert(header::SET_COOKIE, session_cookie(&session.cookie));
+        info!("Web interface: signed in the browser it opened");
+    }
+    res
+}
+
 /// The wallet's `encryption_status`; None without a wallet
 fn wallet_status(s: &Shared) -> Option<&'static str> {
     s.rpc.wallet().wallet_db().map(|w| w.encryption_status())
@@ -398,6 +617,13 @@ async fn api_state(State(s): State<Arc<Shared>>, headers: HeaderMap) -> Response
     Json(state).into_response()
 }
 
+/// Run blocking work off the async worker threads
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, tokio::task::JoinError> {
+    tokio::task::spawn_blocking(work).await
+}
+
 /// Run a password hash off the async threads, two at a time
 async fn hashing<T: Send + 'static>(
     s: &Arc<Shared>,
@@ -409,7 +635,7 @@ async fn hashing<T: Send + 'static>(
         .await
         .map_err(|_| ApiError(StatusCode::SERVICE_UNAVAILABLE, "shutting down".into()))?;
     let shared = Arc::clone(s);
-    tokio::task::spawn_blocking(move || work(&shared.auth))
+    blocking(move || work(&shared.auth))
         .await
         .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "hashing failed".into()))
 }
@@ -426,6 +652,7 @@ fn throttle(s: &Shared, ip: IpAddr) -> Result<(), ApiError> {
 
 #[derive(Deserialize)]
 struct SetupBody {
+    #[serde(default)]
     token: String,
     password: String,
 }
@@ -433,6 +660,7 @@ struct SetupBody {
 async fn api_setup(
     State(s): State<Arc<Shared>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(body): Json<SetupBody>,
 ) -> ApiResult {
     if !s.auth.setup_required() {
@@ -442,7 +670,9 @@ async fn api_setup(
         ));
     }
     throttle(&s, peer.ip())?;
-    if !s.auth.check_setup_token(body.token.trim()) {
+    // The browser the daemon opened is already as trusted as the token
+    let launched = signed_in(&s, &headers, true).ok();
+    if launched.is_none() && !s.auth.check_setup_token(body.token.trim()) {
         s.limiter.failed(peer.ip());
         return Err(ApiError(
             StatusCode::UNAUTHORIZED,
@@ -460,6 +690,9 @@ async fn api_setup(
         .map_err(|e| bad(e.to_string()))?;
     s.limiter.succeeded(peer.ip());
     info!("Web interface password set");
+    if let Some(cookie) = launched {
+        s.sessions.remove(&cookie);
+    }
     Ok(started(&s))
 }
 
@@ -552,7 +785,7 @@ async fn call(s: &Arc<Shared>, method: &str, params: Vec<Value>) -> Result<Value
         params: Params::Array(params),
     };
     let rpc = Arc::clone(&s.rpc);
-    let response = tokio::task::spawn_blocking(move || rpc.handle_request(request))
+    let response = blocking(move || rpc.handle_request(request))
         .await
         .map_err(|_| (-1, "the call failed".to_string()))?;
     match response.error {
@@ -605,7 +838,7 @@ fn visible(values: &conffile::Values) -> Value {
 async fn api_settings(State(s): State<Arc<Shared>>, headers: HeaderMap) -> ApiResult {
     signed_in(&s, &headers, false)?;
     let path = s.config.conf_path.clone();
-    let (file, format) = tokio::task::spawn_blocking(move || {
+    let (file, format) = blocking(move || {
         let text = std::fs::read_to_string(&path).ok();
         let format = conffile::format_of(&path, text.as_deref());
         (conffile::read_file(&path), format)
@@ -690,10 +923,14 @@ async fn api_save_settings(
     }
     let path = s.config.conf_path.clone();
     let to_write = changes.clone();
-    tokio::task::spawn_blocking(move || conffile::apply(&path, &to_write))
-        .await
-        .map_err(|_| bad("cannot write the config file"))?
-        .map_err(bad)?;
+    // What the file held, to tell the daemon which peers came and went
+    let before = blocking(move || {
+        let before = conffile::read_file(&path).unwrap_or_default();
+        conffile::apply(&path, &to_write).map(|()| before)
+    })
+    .await
+    .map_err(|_| bad("cannot write the config file"))?
+    .map_err(bad)?;
     info!(
         "Web interface changed {} in {}",
         changes
@@ -714,6 +951,30 @@ async fn api_save_settings(
             .find(|(k, _)| *k == c.key)
             .map(|(_, m)| *m);
         match (method, &c.values, overridden) {
+            (Some(_), values, false) if c.key == "debug" || c.key == "loglevel" => {
+                let outcome = set_log_filter(&c.key, values.as_deref());
+                live.push(json!({ "key": c.key, "ok": outcome.is_ok(), "error": outcome.err() }));
+            }
+            (Some(_), values, false) if c.key == "addnode" => {
+                let was: Vec<String> = before.get("addnode").cloned().unwrap_or_default();
+                let now: Vec<String> = values.clone().unwrap_or_default();
+                let mut errors = Vec::new();
+                for (peer, how) in was
+                    .iter()
+                    .filter(|p| !now.contains(p))
+                    .map(|p| (p, "remove"))
+                    .chain(now.iter().filter(|p| !was.contains(p)).map(|p| (p, "add")))
+                {
+                    if let Err((_, m)) = call(&s, "addnode", vec![json!(peer), json!(how)]).await {
+                        errors.push(format!("{peer}: {m}"));
+                    }
+                }
+                live.push(json!({
+                    "key": c.key,
+                    "ok": errors.is_empty(),
+                    "error": (!errors.is_empty()).then(|| errors.join("; ")),
+                }));
+            }
             (Some(method), Some(values), false) => {
                 let param = match c.toml {
                     conffile::TomlType::Bool => json!(values[0] == "1"),
@@ -743,6 +1004,397 @@ async fn api_save_settings(
     .into_response())
 }
 
+/// Apply a saved -debug or -loglevel to the running daemon's log filter
+fn set_log_filter(key: &str, values: Option<&[String]>) -> Result<(), String> {
+    let control = logctl::control().ok_or("the log filter cannot change in this process")?;
+    if key == "loglevel" {
+        let level = values
+            .and_then(|v| v.first())
+            .map(String::as_str)
+            .unwrap_or("info");
+        control.set(Some(level), None)
+    } else {
+        control.set(None, Some(values.unwrap_or(&[])))
+    }
+    .map(|_| ())
+}
+
+#[derive(Deserialize)]
+struct LogsQuery {
+    #[serde(default)]
+    after: u64,
+}
+
+/// The log lines kept in memory after `after`, the filter now in force and
+/// the categories there are
+async fn api_logs(
+    State(s): State<Arc<Shared>>,
+    headers: HeaderMap,
+    Query(q): Query<LogsQuery>,
+) -> ApiResult {
+    signed_in(&s, &headers, false)?;
+    let control = logctl::control().ok_or_else(|| bad("no log view in this process"))?;
+    let (lines, next) = control.lines_after(q.after, 500);
+    Ok(Json(json!({
+        "lines": lines,
+        "next": next,
+        "state": control.state(),
+        "levels": logctl::LEVELS,
+        "categories": logctl::CATEGORIES.iter().map(|(c, _)| *c).collect::<Vec<_>>(),
+    }))
+    .into_response())
+}
+
+#[derive(Deserialize)]
+struct LogFilterBody {
+    level: Option<String>,
+    categories: Option<Vec<String>>,
+}
+
+/// Change the log filter now, without touching the config file
+async fn api_log_filter(
+    State(s): State<Arc<Shared>>,
+    headers: HeaderMap,
+    Json(body): Json<LogFilterBody>,
+) -> ApiResult {
+    signed_in(&s, &headers, true)?;
+    let control =
+        logctl::control().ok_or_else(|| bad("the log filter cannot change in this process"))?;
+    let state = control
+        .set(body.level.as_deref(), body.categories.as_deref())
+        .map_err(bad)?;
+    info!(
+        "Web interface set the log filter: level {}, debug {}",
+        state.level,
+        if state.categories.is_empty() {
+            "none".into()
+        } else {
+            state.categories.join(",")
+        }
+    );
+    Ok(Json(json!({ "state": state })).into_response())
+}
+
+/// Run a wallet's key derivation (64 MiB) off the async threads, two at a time
+async fn sealed<T: Send + 'static>(
+    s: &Arc<Shared>,
+    work: impl FnOnce(&wallets::WalletStore) -> wallets::Result<T> + Send + 'static,
+) -> Result<T, ApiError> {
+    let _permit = s
+        .hashing
+        .acquire()
+        .await
+        .map_err(|_| ApiError(StatusCode::SERVICE_UNAVAILABLE, "shutting down".into()))?;
+    let shared = Arc::clone(s);
+    blocking(move || work(&shared.wallets))
+        .await
+        .map_err(|_| {
+            ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the wallet task failed".into(),
+            )
+        })?
+        .map_err(bad)
+}
+
+/// A wallet as the page sees it: never its sealed words
+fn wallet_json(w: &wallets::WalletFile, active: Option<&str>) -> Value {
+    json!({
+        "id": w.id,
+        "name": w.name,
+        "created": w.created,
+        "network": w.network,
+        "active": active == Some(w.id.as_str()),
+        "receive": w.receive.iter().take(w.next_receive as usize).collect::<Vec<_>>(),
+        "derived": w.receive.len() + w.change.len(),
+    })
+}
+
+const NO_INDEX: &str =
+    "the wallets read the node's Electrum backend: set txindex=1 and addressindex=1 and restart the node";
+
+/// The wallet's balance, coins and history through the Electrum backend
+async fn chain_view(s: &Shared, w: &wallets::WalletFile) -> Result<chainview::View, ApiError> {
+    let backend = s.electrum.clone().ok_or_else(|| bad(NO_INDEX))?;
+    let addresses = wallets::WalletStore::watched(w);
+    let network = wallets::network_of(&s.config.network);
+    blocking(move || chainview::read(&backend, &addresses, network))
+        .await
+        .map_err(|e| bad(e.to_string()))?
+        .map_err(|e| {
+            if e.contains("ddress index is off") {
+                bad(NO_INDEX)
+            } else {
+                bad(e)
+            }
+        })
+}
+
+async fn api_wallets(State(s): State<Arc<Shared>>, headers: HeaderMap) -> ApiResult {
+    signed_in(&s, &headers, false)?;
+    let active = s.wallets.active();
+    let list: Vec<Value> = s
+        .wallets
+        .list()
+        .iter()
+        .map(|w| wallet_json(w, active.as_deref()))
+        .collect();
+    Ok(
+        Json(json!({ "wallets": list, "active": active, "network": s.config.network }))
+            .into_response(),
+    )
+}
+
+#[derive(Deserialize)]
+struct WalletCreateBody {
+    name: String,
+    passphrase: String,
+    /// Restore these words rather than make new ones
+    #[serde(default)]
+    words: Option<String>,
+    #[serde(default)]
+    bip39_passphrase: Option<String>,
+}
+
+/// Make or restore a wallet; new words are in the answer this once, to write down
+async fn api_wallet_create(
+    State(s): State<Arc<Shared>>,
+    headers: HeaderMap,
+    Json(body): Json<WalletCreateBody>,
+) -> ApiResult {
+    signed_in(&s, &headers, true)?;
+    let restoring = body.words.is_some();
+    let (w, words) = sealed(&s, move |store| {
+        store.create(
+            &body.name,
+            &body.passphrase,
+            body.words.as_deref(),
+            body.bip39_passphrase.as_deref(),
+        )
+    })
+    .await?;
+    info!(
+        "Web interface {} wallet {}",
+        if restoring { "restored" } else { "created" },
+        w.id
+    );
+    let active = s.wallets.active();
+    let mut out = json!({ "wallet": wallet_json(&w, active.as_deref()) });
+    if !restoring {
+        out["words"] = json!(words.as_str());
+    }
+    Ok(Json(out).into_response())
+}
+
+#[derive(Deserialize)]
+struct WalletImportBody {
+    /// The backup file's text
+    backup: String,
+    passphrase: String,
+}
+
+async fn api_wallet_import(
+    State(s): State<Arc<Shared>>,
+    headers: HeaderMap,
+    Json(body): Json<WalletImportBody>,
+) -> ApiResult {
+    signed_in(&s, &headers, true)?;
+    let w = sealed(&s, move |store| {
+        store.import(body.backup.as_bytes(), &body.passphrase)
+    })
+    .await?;
+    info!("Web interface imported wallet {}", w.id);
+    let active = s.wallets.active();
+    Ok(Json(json!({ "wallet": wallet_json(&w, active.as_deref()) })).into_response())
+}
+
+/// A wallet's balance, coins and history, mempool included
+async fn api_wallet_show(
+    State(s): State<Arc<Shared>>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> ApiResult {
+    signed_in(&s, &headers, false)?;
+    let w = s.wallets.get(&id).map_err(bad)?;
+    let view = chain_view(&s, &w).await?;
+    let history: Vec<Value> = view
+        .history
+        .iter()
+        .map(|l| json!({ "txid": l.txid, "height": l.height, "satoshis": l.satoshis }))
+        .collect();
+    let active = s.wallets.active();
+    Ok(Json(json!({
+        "wallet": wallet_json(&w, active.as_deref()),
+        "balance": { "confirmed": view.confirmed, "pending": view.pending },
+        "coins": view.coins.len(),
+        "history": history,
+    }))
+    .into_response())
+}
+
+/// The backup file: the wallet with its words sealed under its passphrase
+async fn api_wallet_backup(
+    State(s): State<Arc<Shared>>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> ApiResult {
+    signed_in(&s, &headers, false)?;
+    let w = s.wallets.get(&id).map_err(bad)?;
+    let file = s.wallets.backup(&id).map_err(bad)?;
+    let name: String = w
+        .name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let disposition = format!(
+        "attachment; filename=\"irondivi-wallet-{name}-{}.json\"",
+        w.network
+    );
+    Ok((
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            ),
+            (
+                header::CONTENT_DISPOSITION,
+                HeaderValue::from_str(&disposition).map_err(|_| bad("bad wallet name"))?,
+            ),
+        ],
+        file,
+    )
+        .into_response())
+}
+
+#[derive(Deserialize, Default)]
+struct WalletActionBody {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    passphrase: Option<String>,
+    #[serde(default)]
+    to: Option<String>,
+    /// DIVI, as a decimal string
+    #[serde(default)]
+    amount: Option<String>,
+    #[serde(default)]
+    fee_from_amount: bool,
+}
+
+/// DIVI as a decimal string to satoshis
+fn parse_divi(text: &str) -> Option<i64> {
+    let text = text.trim();
+    let (whole, frac) = text.split_once('.').unwrap_or((text, ""));
+    if whole.is_empty() && frac.is_empty()
+        || frac.len() > 8
+        || !whole
+            .bytes()
+            .chain(frac.bytes())
+            .all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let whole: i64 = if whole.is_empty() {
+        0
+    } else {
+        whole.parse().ok()?
+    };
+    let frac: i64 = format!("{frac:0<8}").parse().ok()?;
+    whole
+        .checked_mul(100_000_000)?
+        .checked_add(frac)
+        .filter(|v| *v > 0)
+}
+
+/// rename, switch, delete, words, address and send
+async fn api_wallet_action(
+    State(s): State<Arc<Shared>>,
+    headers: HeaderMap,
+    axum::extract::Path((id, action)): axum::extract::Path<(String, String)>,
+    Json(body): Json<WalletActionBody>,
+) -> ApiResult {
+    signed_in(&s, &headers, true)?;
+    let pass = body.passphrase.clone().unwrap_or_default();
+    let out = match action.as_str() {
+        "rename" => {
+            let w = s
+                .wallets
+                .rename(&id, body.name.as_deref().unwrap_or_default())
+                .map_err(bad)?;
+            json!({ "wallet": wallet_json(&w, s.wallets.active().as_deref()) })
+        }
+        "switch" => {
+            s.wallets.set_active(&id).map_err(bad)?;
+            json!({ "active": id })
+        }
+        "delete" => {
+            let gone = id.clone();
+            sealed(&s, move |store| store.delete(&gone, &pass)).await?;
+            info!("Web interface deleted wallet {}", id);
+            json!({ "ok": true })
+        }
+        "words" => {
+            let words = sealed(&s, move |store| store.words(&id, &pass)).await?;
+            json!({ "words": words.as_str() })
+        }
+        "address" => {
+            let pass = body.passphrase.clone();
+            let address = sealed(&s, move |store| store.next_address(&id, pass.as_deref())).await?;
+            json!({ "address": address })
+        }
+        "send" => {
+            let to = body
+                .to
+                .clone()
+                .ok_or_else(|| bad("send to which address?"))?;
+            let amount = body
+                .amount
+                .as_deref()
+                .and_then(parse_divi)
+                .ok_or_else(|| bad("the amount is DIVI, more than 0, at most 8 decimals"))?;
+            let w = s.wallets.get(&id).map_err(bad)?;
+            let coins = chain_view(&s, &w).await?.coins;
+            let tip = call(&s, "getblockcount", vec![])
+                .await
+                .map_err(|(c, m)| bad(format!("{m} ({c})")))?;
+            let tip = tip.as_u64().unwrap_or(0) as u32;
+            let fee_from_amount = body.fee_from_amount;
+            let (hex, txid, fee) = sealed(&s, move |store| {
+                store.sign_send(
+                    &id,
+                    &pass,
+                    &coins,
+                    tip,
+                    wallets::SendRequest {
+                        to: &to,
+                        amount: divi_primitives::amount::Amount::from_sat(amount),
+                        fee_from_amount,
+                        policy: Default::default(),
+                    },
+                )
+            })
+            .await?;
+            let sent = call(&s, "sendrawtransaction", vec![json!(hex)])
+                .await
+                .map_err(|(c, m)| bad(format!("the node refused the transaction: {m} ({c})")))?;
+            json!({ "txid": sent.as_str().unwrap_or(&txid), "fee": fee })
+        }
+        _ => {
+            return Err(ApiError(
+                StatusCode::NOT_FOUND,
+                "no such wallet action".into(),
+            ))
+        }
+    };
+    Ok(Json(out).into_response())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -757,6 +1409,7 @@ mod tests {
             network: "regtest".into(),
             chain_mode: "divi".into(),
             cli: Default::default(),
+            open_browser: false,
         }
     }
 
@@ -795,9 +1448,57 @@ mod tests {
         v.insert("rpcpassword".into(), vec!["hunter2".into()]);
         v.insert("port".into(), vec!["1".into()]);
         v.insert("masternodeprivkey".into(), vec!["k".into()]);
+        v.insert("unknowncustomkey".into(), vec!["u".into()]);
         let shown = visible(&v).to_string();
         assert!(!shown.contains("hunter2"));
         assert!(!shown.contains("\"k\""));
+        assert!(!shown.contains("\"u\""));
         assert!(shown.contains("rpcpassword"));
+    }
+
+    #[test]
+    fn the_nft_proxy_is_testnet_only_and_stays_in_the_api() {
+        let base = NFT_API_TESTNET;
+        assert_eq!(
+            nft_upstream("test", "status", None),
+            Some(format!("{base}status"))
+        );
+        assert_eq!(
+            nft_upstream("test", "address/yAbc/utxos", Some("x=1")),
+            Some(format!("{base}address/yAbc/utxos?x=1"))
+        );
+        assert_eq!(nft_upstream("main", "status", None), None);
+        assert_eq!(nft_upstream("regtest", "status", None), None);
+        for bad in [
+            "", "/status", "../x", "a/../b", "a//b", "a/./b", "a b", "a%2f..", "a\\b",
+        ] {
+            assert_eq!(nft_upstream("test", bad, None), None, "{bad:?}");
+        }
+        assert_eq!(nft_upstream("test", "status", Some("a#b")), None);
+        assert!(raw_upload(&Method::POST, "/api/nft/ipfs/file"));
+        assert!(!raw_upload(&Method::POST, "/api/nft/ipfs/json"));
+        assert!(!raw_upload(&Method::PUT, "/api/nft/ipfs/file"));
+        assert!(!raw_upload(&Method::POST, "/api/rpc"));
+    }
+
+    #[test]
+    fn divi_amounts_parse_exactly() {
+        assert_eq!(parse_divi("1"), Some(100_000_000));
+        assert_eq!(parse_divi(" 0.5 "), Some(50_000_000));
+        assert_eq!(parse_divi(".00000001"), Some(1));
+        assert_eq!(parse_divi("12.3456789"), Some(1_234_567_890));
+        for bad in [
+            "",
+            ".",
+            "0",
+            "0.0",
+            "-1",
+            "1e3",
+            "1.000000001",
+            "1,5",
+            "99999999999999999999",
+        ] {
+            assert_eq!(parse_divi(bad), None, "{bad:?}");
+        }
     }
 }

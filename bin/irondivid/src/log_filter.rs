@@ -24,8 +24,13 @@ pub const CATEGORIES: &[(&str, &[&str])] = &[
             "divi_network::addrbook",
         ],
     ),
+    (
+        "addrman",
+        &["divi_network::addrbook", "divi_network::peer_manager"],
+    ),
     ("node", &["divi_node"]),
     ("mempool", &["divi_node::mempool"]),
+    ("estimatefee", &["divi_node::fee_estimator"]),
     (
         "staking",
         &["divi_node::staker", "divi_storage::stake_modifier"],
@@ -35,12 +40,17 @@ pub const CATEGORIES: &[(&str, &[&str])] = &[
         &["divi_storage", "divi_consensus", "divi_node::block_import"],
     ),
     ("wallet", &["divi_wallet"]),
+    ("selectcoins", &["divi_wallet::coin_selection"]),
     (
         "masternode",
         &["divi_masternode", "divi_network::masternode_handler"],
     ),
     ("spork", &["divi_network::spork", "divi_storage::spork"]),
     ("rpc", &["divi_rpc"]),
+    ("http", &["divi_rpc::http", "divi_rpc::rest"]),
+    ("db", &["divi_storage"]),
+    ("reindex", &["divi_node::block_import", "divi_storage"]),
+    ("validation", &["divi_consensus", "divi_node::node"]),
     ("electrum", &["divi_electrum"]),
     ("webui", &["divi_webui"]),
     ("swap", &["divi_swap", "swap_"]),
@@ -148,6 +158,18 @@ impl LogLevels {
     pub fn is_debug(&self) -> bool {
         let verbose = |l: &str| l == "debug" || l == "trace";
         verbose(&self.base) || self.categories.values().any(|l| verbose(l))
+    }
+
+    /// The WebUI debug category list corresponding to these levels
+    pub fn webui_categories(&self) -> Vec<String> {
+        if (self.base == "debug" || self.base == "trace") && self.categories.is_empty() {
+            return vec!["all".to_string()];
+        }
+        self.categories
+            .iter()
+            .filter(|(_, l)| *l == "debug" || *l == "trace")
+            .map(|(c, _)| c.clone())
+            .collect()
     }
 
     /// The `loglevel` value that means these levels (shown by getlogconfig)
