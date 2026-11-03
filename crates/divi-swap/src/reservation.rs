@@ -850,7 +850,7 @@ mod native {
                 out.push(SwapLock {
                     tx: f.tx.clone(),
                     locktime: s.maker_leg_htlc.map(|h| h.locktime),
-                    finished: s.state.is_terminal(),
+                    finished: matches!(s.state, crate::SwapState::Done | crate::SwapState::Lost),
                 });
             }
         }
@@ -886,12 +886,13 @@ mod native {
                 .collect())
         }
 
-        /// Release the reservations held by the lock on `chain` of every terminal swap in
-        /// `store` (maker or taker); returns how many inputs were released. A finished swap's
-        /// lock is on chain (a claim or its refund spent it), so its inputs can never be
-        /// selected again anyway. Only rows still held are touched: running it again, or after a
-        /// restart, releases nothing twice, and a swap that is not finished keeps its
-        /// reservation however often it runs.
+        /// Release the reservations held by the lock on `chain` of every finished swap (`Done`
+        /// or `Lost`) in `store` (maker or taker); returns how many inputs were released. A
+        /// finished swap's lock is on chain (a claim or its refund spent it), so its inputs can
+        /// never be selected again anyway; an `Aborted` maker swap whose unsent lock was rejected
+        /// keeps its row for [`Self::release_expired_swaps_and_bookings`]'s absence check. Only
+        /// rows still held are touched: running it again, or after a restart, releases nothing
+        /// twice, and a swap that is not finished keeps its reservation however often it runs.
         pub fn release_finished_swaps(&self, store: &Store, chain: Chain) -> Result<usize> {
             let held = self.holders(chain)?;
             if held.is_empty() {

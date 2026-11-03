@@ -791,26 +791,50 @@ impl Maker {
             .clone()
             .ok_or_else(|| SwapError::Other("MakerLocked without a funding tx".into()))?;
         // Idempotent: a tx the chain already has is Ok.
-        match self.mk(r)?.broadcast(&funding.tx).await {
-            Ok(_) => {}
+        let rejected = match self.mk(r)?.broadcast(&funding.tx).await {
+            Ok(_) => {
+                self.mark_lock_sent(r)?;
+                None
+            }
             Err(SwapError::InputsHeld(why)) => {
                 if let Some(flow) = self.lost_coin_race(r, &funding, &why).await? {
                     return Ok(flow);
                 }
+                self.mark_lock_sent(r)?;
+                None
             }
+            Err(SwapError::Rejected(why)) => Some(why),
             Err(e) => return Err(e),
-        }
-        self.mark_lock_sent(r)?;
+        };
         let at = self.maker_refund_read(r)?;
         let what = "refund: maker-lock confirmation read";
-        let confs = hold::confirmations(self.mk(r)?.as_ref(), &funding.tx.txid, &at, what)
-            .await?
-            .unwrap_or(0);
+        let confs_opt =
+            hold::confirmations(self.mk(r)?.as_ref(), &funding.tx.txid, &at, what).await?;
+        if confs_opt.is_some() {
+            self.mark_lock_sent(r)?;
+        }
+        let confs = confs_opt.unwrap_or(0);
         let spent_already = confs >= 1 && self.revealed_preimage(r).await?.is_some();
         if confs >= self.maker_leg_confs(r) || spent_already {
             return self.enter(r, SwapState::MakerLockConfirmed);
         }
-        if self.maker_leg_timed_out(r).await? {
+        let timed_out = self.maker_leg_timed_out(r).await?;
+        if let Some(why) = rejected {
+            if !timed_out {
+                return Err(SwapError::Rejected(why));
+            }
+            if !r.maker_lock_sent && confs_opt.is_none() {
+                let _ = self.mk(r)?.release_built_funding(&funding.tx);
+                tracing::warn!(
+                    swap = %r.id,
+                    txid = %funding.tx.txid,
+                    "maker lock broadcast rejected past its locktime; aborting: {why}"
+                );
+                return self.abort(r, &format!("maker lock broadcast rejected: {why}"));
+            }
+            return self.enter(r, SwapState::MakerRefundable);
+        }
+        if timed_out {
             return self.enter(r, SwapState::MakerRefundable);
         }
         Ok(Flow::Idle)

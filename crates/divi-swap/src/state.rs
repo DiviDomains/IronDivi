@@ -11,7 +11,7 @@
 //! ```text
 //! Quoted → Accepted → TakerLockSeen → TakerLockConfirmed → MakerLocked → MakerLockConfirmed →
 //!   { TakerClaimed → MakerClaimed → Done | MakerRefundable → MakerRefunded → Done }
-//! Quoted / Accepted / TakerLockSeen → Aborted   (taker never locked, or lock invalid)
+//! Quoted / Accepted / TakerLockSeen / TakerLockConfirmed / MakerLocked → Aborted
 //! TakerClaimed / MakerClaimed → Lost            (taker refunded the taker leg first)
 //! ```
 //! `MakerLocked` means "funding tx built and persisted"; broadcast follows (write-ahead).
@@ -44,7 +44,7 @@ pub enum SwapState {
     MakerRefundable,
     /// Maker's refund confirmed.
     MakerRefunded,
-    /// Ended before the maker locked anything. Terminal.
+    /// Ended without a maker lock reaching the chain. Terminal.
     Aborted,
     /// Finished (claimed or refunded). Terminal.
     Done,
@@ -109,6 +109,7 @@ impl SwapState {
                 | (MakerLocked, TakerLockConfirmed)
                 | (MakerLocked, MakerLockConfirmed)
                 | (MakerLocked, MakerRefundable)
+                | (MakerLocked, Aborted)
                 | (MakerLockConfirmed, TakerClaimed)
                 | (MakerLockConfirmed, MakerRefundable)
                 | (MakerRefundable, TakerClaimed)

@@ -473,6 +473,109 @@ async fn restart_rereserves_unsent_maker_locked_coin_before_a_second_swap_locks(
     assert!(w.ml(dir).contains(&second_funding.tx.txid));
 }
 
+/// Gate G4 (`ded2768f`): an unsent `MakerLocked` swap whose broadcast is rejected by the chain
+/// stays `MakerLocked` inside its window, then aborts once its maker-leg locktime passes instead
+/// of looping on `broadcast` forever. Its SQLite input reservation is kept until the 6-block
+/// expiry sweep proves the lock absent, while the taker refunds cleanly.
+async fn a_rejected_unsent_maker_lock_aborts_once_its_timeout_passes(dir: Direction) {
+    let w = locked_unsent(dir).await;
+    let persisted = w.funding();
+    let locktime = w.rec().maker_leg_htlc.unwrap().locktime;
+    let outside = w.daemon(dir, InputReservations::in_memory().unwrap(), &COINS[..1]);
+    other_lock(&w, &outside).await;
+
+    // Inside the window: kept in MakerLocked with the rejection recorded.
+    w.mine();
+    w.maker.tick().await.unwrap();
+    assert_eq!(w.rec().state, SwapState::MakerLocked);
+    assert!(w
+        .rec()
+        .last_error
+        .unwrap_or_default()
+        .contains("missingorspent"));
+
+    // Advance the maker leg past its HTLC locktime: the next tick aborts instead of wedging.
+    let delta = locktime.saturating_sub(w.ml(dir).mtp()) + 60;
+    w.ml(dir).advance_time(delta);
+    w.maker.tick().await.unwrap();
+    let r = w.rec();
+    assert_eq!(r.state, SwapState::Aborted, "{:?}", r.last_error);
+    let err = r.last_error.clone().unwrap_or_default();
+    assert!(
+        err.starts_with("aborted: maker lock broadcast rejected:")
+            && err.contains("missingorspent"),
+        "{err}"
+    );
+    assert_eq!(w.mk.funding_calls(), 1, "never re-selected");
+
+    // Further ticks are a no-op (no infinite error loop).
+    for _ in 0..3 {
+        w.mine();
+        w.maker.tick().await.unwrap();
+        assert!(w.rec() == r, "unchanged");
+    }
+
+    // `release_finished_swaps` does NOT drop the reservation without the 6-block absence proof;
+    // `release_expired_swaps_and_bookings` releases it once EXPIRY_ABSENT_BLOCKS blocks pass.
+    let chain = maker_chain(dir);
+    assert_eq!(w.res.release_finished_swaps(&w.store, chain).unwrap(), 0);
+    assert_eq!(rows(&w, chain), vec![(COINS[0], persisted.tx.txid)]);
+    let start = divi_swap::reservation::ExpiryStart::Tip;
+    assert_eq!(
+        w.res
+            .release_expired_swaps_and_bookings(&w.store, &w.mk, w.ml(dir).mtp(), start)
+            .await
+            .unwrap(),
+        0
+    );
+    w.ml(dir).mine(divi_swap::reservation::EXPIRY_ABSENT_BLOCKS);
+    assert_eq!(
+        w.res
+            .release_expired_swaps_and_bookings(&w.store, &w.mk, w.ml(dir).mtp(), start)
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(rows(&w, chain).is_empty());
+
+    // The taker refunds its lock once its taker-leg timeout passes.
+    w.tl(dir).advance_time(7 * 3600);
+    for _ in 0..30 {
+        w.round().await;
+        if w.store.get_taker_swap(&w.tid).unwrap().unwrap().state == TakerState::Done {
+            break;
+        }
+    }
+    let t = w.store.get_taker_swap(&w.tid).unwrap().unwrap();
+    assert_eq!(t.state, TakerState::Done);
+    assert!(t.taker_leg_refund.is_some() && t.maker_leg_claim.is_none());
+}
+
+/// A transient broadcast failure past the maker-leg timeout neither aborts nor enters
+/// `MakerRefundable` before the node answers; once the node answers again, the lock lands and the
+/// maker refunds cleanly to `Done`.
+async fn an_unknown_send_outcome_past_timeout_waits_for_the_node_then_refunds(dir: Direction) {
+    let w = locked_unsent(dir).await;
+    let persisted = w.funding();
+    let locktime = w.rec().maker_leg_htlc.unwrap().locktime;
+    w.ml(dir)
+        .fail_broadcasts_with(Some(SwapError::Transient("timeout".into())));
+    let delta = locktime.saturating_sub(w.ml(dir).mtp()) + 60;
+    w.ml(dir).advance_time(delta);
+    for _ in 0..3 {
+        w.maker.tick().await.unwrap();
+        let r = w.rec();
+        assert_eq!(r.state, SwapState::MakerLocked);
+        assert_eq!(r.maker_leg_funding.as_ref(), Some(&persisted));
+    }
+    w.ml(dir).fail_broadcasts_with(None);
+    w.tl(dir).advance_time(7 * 3600);
+    w.run_to_done().await;
+    let r = w.rec();
+    assert_eq!(r.state, SwapState::Done);
+    assert!(r.maker_leg_refund.is_some());
+}
+
 macro_rules! on_both_chains {
     ($divi:ident, $btc:ident, $body:ident) => {
         #[tokio::test]
@@ -520,4 +623,14 @@ on_both_chains!(
     divi_restart_rereserves_unsent_maker_locked_coin_before_a_second_swap_locks,
     btc_restart_rereserves_unsent_maker_locked_coin_before_a_second_swap_locks,
     restart_rereserves_unsent_maker_locked_coin_before_a_second_swap_locks
+);
+on_both_chains!(
+    divi_a_rejected_unsent_maker_lock_aborts_once_its_timeout_passes,
+    btc_a_rejected_unsent_maker_lock_aborts_once_its_timeout_passes,
+    a_rejected_unsent_maker_lock_aborts_once_its_timeout_passes
+);
+on_both_chains!(
+    divi_an_unknown_send_outcome_past_timeout_waits_for_the_node_then_refunds,
+    btc_an_unknown_send_outcome_past_timeout_waits_for_the_node_then_refunds,
+    an_unknown_send_outcome_past_timeout_waits_for_the_node_then_refunds
 );
