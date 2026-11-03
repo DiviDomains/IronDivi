@@ -1125,6 +1125,7 @@ impl Staker {
         if from_seed {
             StakeResult::LockedHdKey
         } else {
+            counted::hit(Site::StakerErrorSign);
             StakeResult::Error("CreateCoinStake : failed to sign coinstake".to_string())
         }
     }
@@ -4453,5 +4454,44 @@ mod tests {
         );
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].txid(), under.txid());
+    }
+
+    #[test]
+    fn locked_imported_kernel_counts_staker_error_sign() {
+        let (dir, chain, _hd_wallet, _blocks) = chain_with_unscanned_coin();
+        let wallet_path = dir.path().join("locked_imported_wallet");
+        let hd = divi_wallet::HdWallet::new(divi_primitives::ChainMode::Divi).unwrap();
+        let wallet = Arc::new(
+            WalletDb::create_persistent(&wallet_path, divi_wallet::Network::Regtest, hd).unwrap(),
+        );
+        let imported = divi_crypto::keys::SecretKey::new_random();
+        let imported_addr = wallet.import_key(imported, None);
+        wallet.encrypt_wallet("test-passphrase").unwrap();
+        assert!(wallet.is_locked());
+
+        let staker = stake_test_staker(&chain, &wallet);
+        let utxo = divi_wallet::WalletUtxo::new(
+            Hash256::from_bytes([0x77; 32]),
+            0,
+            Amount::from_divi(10_000),
+            imported_addr.script_pubkey(),
+            imported_addr.to_string(),
+        );
+        let candidate = StakeCandidate::Regular(&utxo);
+
+        let before = divi_primitives::counted::COUNTERS.load(Site::StakerErrorSign as usize);
+        let res = staker.locked_kernel(&candidate);
+        let after = divi_primitives::counted::COUNTERS.load(Site::StakerErrorSign as usize);
+
+        assert!(
+            matches!(res, StakeResult::Error(ref msg) if msg == "CreateCoinStake : failed to sign coinstake"),
+            "expected coinstake signing error on locked imported key"
+        );
+        assert!(
+            after > before,
+            "expected StakerErrorSign counter to increment (before={}, after={})",
+            before,
+            after
+        );
     }
 }

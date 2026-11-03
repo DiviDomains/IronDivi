@@ -40,6 +40,7 @@ sites! {
     StakerFirstAtHeight = "staker.first-at-height",
     StakerErrorNoTip = "staker.error.no-tip",
     StakerErrorDifficulty = "staker.error.difficulty",
+    StakerErrorSign = "staker.error.sign",
     StakerSelfAcceptFailed = "staker.self-accept.failed",
     StakerSelfAcceptReorg = "staker.self-accept.reorg",
     StakerPhantomEvicted = "staker.phantom-evicted",
