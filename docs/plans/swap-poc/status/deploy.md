@@ -3,5 +3,5 @@
 - broken: nothing
 - left: Wave 3 live run (needs human for ssh/op)
 - decisions: build on dnsdivi (rsync + cargo, no cross); port 127.0.0.1:18480; secrets via LoadCredential maker-divi/maker-btc; deploy.sh is bash 3.2 compatible
-- needs: daemon lane to accept `--config <toml>` and honor `listen`, `/healthz`; config keys in divi-swapd.toml.example (profile, listen, db_path, [divi], [btc]) are my proposal and must match the daemon's real config schema; dnsdivi needs rustup for user ubuntu and passwordless sudo
+- needs: nothing on the daemon-code side — verified 2026-10-21 (builder L): `--config <toml>` (`bin/divi-swapd/src/main.rs:44-45`), `cfg.listen` bound at startup (`main.rs:520-522`), `/healthz` route (`bin/divi-swapd/src/routes.rs:73`), and `profile`/`db_path`/`[divi]`/`[btc]` are all real `DaemonConfig` fields the daemon actually reads (`bin/divi-swapd/src/config.rs:336-372`) — divi-swapd.toml.example matches the daemon's real schema, not a proposal. The dnsdivi rustup-for-ubuntu/passwordless-sudo item is host provisioning, not code; this lane (hp3, no dnsdivi access) cannot verify it — still open if not already done
 - last_sha: see git log

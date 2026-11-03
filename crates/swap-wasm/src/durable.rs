@@ -17,10 +17,11 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use divi_swap::backend::TipHeader;
 use divi_swap::store::{StoreBackend, Table};
 use divi_swap::{
-    Amount, Chain, ChainBackend, Funding, HtlcParams, LockedOutput, Outpoint, Result, SignedTx,
-    SpendInfo, SwapError, Txid,
+    Amount, Chain, ChainBackend, ClaimSizes, FeeBump, Funding, HtlcParams, LockedOutput, Outpoint,
+    Result, SignedTx, SpendInfo, SwapError, Txid,
 };
 use parking_lot::Mutex;
 use swap_chain_divi::DiviBackend;
@@ -120,8 +121,28 @@ impl ChainBackend for Durable {
         self.inner.tip_height().await
     }
 
+    async fn tip_hash(&self) -> Result<String> {
+        self.inner.tip_hash().await
+    }
+
     async fn median_time_past(&self) -> Result<u32> {
         self.inner.median_time_past().await
+    }
+
+    fn refund_final(&self, mtp: u32, locktime: u32) -> bool {
+        self.inner.refund_final(mtp, locktime)
+    }
+
+    async fn tip_header(&self) -> Result<TipHeader> {
+        self.inner.tip_header().await
+    }
+
+    async fn in_best_chain(&self, height: u64, hash: &str) -> Result<bool> {
+        self.inner.in_best_chain(height, hash).await
+    }
+
+    fn target_block_secs(&self) -> Option<u32> {
+        self.inner.target_block_secs()
     }
 
     async fn build_funding(&self, htlc: &HtlcParams, amount: Amount) -> Result<Funding> {
@@ -165,5 +186,68 @@ impl ChainBackend for Durable {
 
     async fn find_spend(&self, outpoint: &Outpoint, from_height: u64) -> Result<Option<SpendInfo>> {
         self.inner.find_spend(outpoint, from_height).await
+    }
+
+    fn lock_finished(&self, at: &Outpoint) {
+        self.inner.lock_finished(at);
+    }
+
+    async fn release_dead_lock(&self, lock: &SignedTx) -> Result<bool> {
+        self.inner.release_dead_lock(lock).await
+    }
+
+    async fn spendable(&self) -> Result<Option<Amount>> {
+        self.inner.spendable().await
+    }
+
+    fn fee_bump(&self) -> FeeBump {
+        self.inner.fee_bump()
+    }
+
+    async fn claim_feerate(&self) -> Result<Option<u64>> {
+        self.inner.claim_feerate().await
+    }
+
+    fn claim_sizes(&self, htlc: &HtlcParams) -> Option<ClaimSizes> {
+        self.inner.claim_sizes(htlc)
+    }
+
+    async fn build_claim_at(
+        &self,
+        htlc: &HtlcParams,
+        at: &Outpoint,
+        amount: Amount,
+        preimage: &[u8; 32],
+        feerate: u64,
+    ) -> Result<SignedTx> {
+        self.inner
+            .build_claim_at(htlc, at, amount, preimage, feerate)
+            .await
+    }
+
+    async fn build_cpfp(
+        &self,
+        package: &[SignedTx],
+        htlc_amount: Amount,
+        feerate: u64,
+    ) -> Result<SignedTx> {
+        self.inner.build_cpfp(package, htlc_amount, feerate).await
+    }
+
+    async fn build_claim_replacement(
+        &self,
+        prev: &SignedTx,
+        feerate: u64,
+        price_bump_pct: u64,
+    ) -> Result<Option<SignedTx>> {
+        self.inner
+            .build_claim_replacement(prev, feerate, price_bump_pct)
+            .await
+    }
+
+    fn primary_only(&self) -> Option<Arc<dyn ChainBackend>> {
+        self.inner.primary_only().map(|p| {
+            Arc::new(Durable::new(p, Arc::clone(&self.persister))) as Arc<dyn ChainBackend>
+        })
     }
 }

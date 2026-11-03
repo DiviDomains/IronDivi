@@ -2,38 +2,79 @@
 # Install as /etc/divi-swapd/divi-swapd.toml (root:divi-swapd 0640).
 profile = "testnet"          # 6h/3h timeouts, 1 BTC / 3 DIVI confirmations
 listen = "127.0.0.1:18480"   # loopback only; takers use an SSH tunnel (nginx /swap/ is opt-in: deploy.sh NGINX=1, DECISIONS #7)
+# trust_proxy_headers = true  # rate-limit on the LAST X-Forwarded-For entry (else X-Real-IP); ONLY behind a proxy you control that sets it (nginx-swap.conf sets $remote_addr) (default false)
+# trusted_proxies = ["127.0.0.1/32", "::1/128"]  # peers whose proxy headers count when trust_proxy_headers is on; any other peer is keyed on its own address. Addresses or CIDR networks; on with an empty list is refused at start (default: loopback)
 db_path = "/var/lib/divi-swapd/swaps.db"
+# operator_token_file = "/etc/divi-swapd/operator.token"  # root:divi-swapd 0640, one random line. GET /swaps (the full listing) needs this value in X-Operator-Token; UNSET = the listing is a 404 for everyone, and swap-watch/redeploy-maker cannot read it. Create it BEFORE installing this version.
+# allow_tokenless_swaps = true  # default false. false: a taker that does not send X-Swap-Token-Support: 1 gets 426 on accept (old takers must upgrade). true: it gets a swap with no token, open by id like before (weak)
 tick_secs = 10               # scheduler interval for Maker::tick
 
 [divi]
+network = "testnet"        # or "mainnet"; "mainnet" needs allow_mainnet = true and profile = "mainnet"
+# allow_mainnet = false     # default; mainnet moves real money — off until a reviewed mainnet cutover
+# rpc_url is optional: unset, it defaults per network (testnet .../api/testnet/rpc/, mainnet .../api/rpc/)
 rpc_url = "https://services.divi.domains/api/testnet/rpc/"
+# fallback_rpc_url is a second DIVI RPC, ideally your own node. When set, every swap read (confirmations, HTLC output,
+# find-spend, MTP) is made on both endpoints; any disagreement is Transient (retried), never a decision, and a broadcast
+# goes to both. Must differ from rpc_url. Optional on testnet (unset = single source); required on mainnet: a
+# profile = "mainnet" config without it refuses to start, unless allow_single_source = true below.
+# fallback_rpc_url = "http://127.0.0.1:51473"
+# allow_single_source = false  # default; true lets a mainnet config start without fallback_rpc_url (one endpoint is
+#                              # trusted for every swap read) and logs a warning at every start. Waives [divi] only.
+# expiry_start = "tip"   # default; "mtp" waits for median time past before counting a dropped lock (~5 more blocks per release)
 key = "credential:maker-divi"   # systemd LoadCredential, see divi-swapd.service
 wallet_path = "/var/lib/divi-swapd/divi-wallet.json"  # known UTXOs (public data only)
 scan_from_height = 339800
 
 [btc]
-network = "signet"
+network = "signet"         # or "testnet"; "mainnet" needs allow_mainnet = true and profile = "mainnet"
+# allow_mainnet = false     # default; mainnet moves real money — off until a reviewed mainnet cutover
 esplora_url = "https://mempool.space/signet/api"
 fallback_esplora_url = "https://blockstream.info/signet/api"
+# quorum_reads = false      # default; true: spend/HTLC/confirmation reads must agree on both URLs (README)
+# expiry_start = "tip"   # default; "mtp" waits for median time past before counting a dropped lock (~5 more blocks per release)
 key = "credential:maker-btc"
 
 [ltc]
-network = "testnet"
+network = "testnet"        # "mainnet" needs allow_mainnet = true and profile = "mainnet"
+# allow_mainnet = false     # default; mainnet moves real money — off until a reviewed mainnet cutover
 esplora_url = "https://litecoinspace.org/testnet/api"
 # No independent secondary mirror of this API shape is known (swap-chain-ltc lane status,
 # decisions, 2026-10-11); fallback_esplora_url is left unset.
+# crosscheck = "off"        # "blockbook" | "blockcypher" | "off" (default). MAINNET ONLY: refused on
+#                           # testnet at config load. Once at startup, compares the block hash 6 below
+#                           # the tip from esplora_url with an independent explorer: a mismatch refuses
+#                           # to start, an unreachable source only logs a warning. It is required on mainnet: a
+#                           # profile = "mainnet" config with crosscheck "off" (or unset) refuses to start,
+#                           # unless allow_single_source = true below.
+# allow_single_source = false  # default; true lets a mainnet config start with crosscheck "off" and logs a
+#                              # warning at every start. Waives [ltc] only.
+# crosscheck_before_claim = false  # default (opt-in, no mainnet default chosen); needs crosscheck set to a
+#                                  # source, refused with crosscheck "off". Repeats the crosscheck before every
+#                                  # LTC claim: a mismatch holds the claim (retried next tick); an unreachable or
+#                                  # rate-limited source logs one warning per claim and the claim goes ahead. At
+#                                  # most one source request per primary tip block (~150 s); a hanging source
+#                                  # can delay a claim by up to 20 s (HTTP timeout) once per block.
 # Testnets reuse the BTC swap key on every secp256k1 chain (docs/plans/swap-poc/funding.md,
 # decision 64ae2a0): no maker-ltc 1Password item or credential file exists or is needed —
 # this is the same maker-btc credential already loaded above.
+# expiry_start = "tip"   # default; "mtp" waits for median time past before counting a dropped lock (~5 more blocks per release)
 key = "credential:maker-btc"
 
 [usdc]
-# network defaults to "sepolia" if omitted; "base-sepolia" is the only other option
-# (swap_chain_evm::UsdcNetwork). It only picks defaults for rpc_url/token below when they
+# network defaults to "sepolia" if omitted. Options (swap_chain_evm::UsdcNetwork):
+# "sepolia", "base-sepolia" (testnets) and "ethereum", "base" (MAINNETS, real money: need
+# allow_mainnet = true below and a matching top-level profile = "mainnet"). It only picks defaults for rpc_url/token below when they
 # are left unset — a single [usdc] section (one Chain::Usdc backend) serves one EVM network
 # at a time, so switching network here moves the whole backend, it doesn't add a second one.
 network = "sepolia"
+# allow_mainnet = false      # default; mainnet moves real money — off until a reviewed mainnet cutover
 rpc_url = "https://ethereum-sepolia-rpc.publicnode.com"
+# Second, independent EVM JSON-RPC node (ideally your own; must differ from rpc_url). When
+# set, the HTLC lock, spend, confirmation and block-time reads ask both nodes and a
+# disagreement is retried, never acted on; while it is down or behind, claims and refunds
+# wait. Off by default.
+# fallback_rpc_url = "http://127.0.0.1:8545"
 # Placeholder until Erc20Htlc is deployed to Sepolia (orchestrator, funded key) — fill in
 # the real address before enabling a usdc offer.
 htlc = "0x0000000000000000000000000000000000000000"
@@ -44,7 +85,17 @@ htlc = "0x0000000000000000000000000000000000000000"
 key = "credential:maker-btc"
 
 [zec]
+# network = "testnet"       # default; "mainnet" needs allow_mainnet = true and profile = "mainnet"
+# allow_mainnet = false      # default; mainnet moves real money — off until a reviewed mainnet cutover
 lightwalletd_url = "https://testnet.zec.rocks:443"
+# crosscheck_url = "https://lwd.example.net:9067"  # unset (default) = off. A lightwalletd run by a SECOND
+#                           # operator: its tip is compared with the primary's at startup (mismatch refuses
+#                           # to start, unreachable warns) and before every ZEC claim and refund (mismatch
+#                           # or unreachable holds it, retried next tick). Refused if its host shares a
+#                           # registrable domain with lightwalletd_url / the defaults. Required with
+#                           # profile = "mainnet" unless the endpoints already span two operators.
+# allow_single_source = false  # default; true lets a mainnet config start on one operator (logs a warning)
+# expiry_start = "tip"   # default; "mtp" waits for median time past before counting a dropped lock (~5 more blocks per release)
 # Same BTC swap key (funding.md); started only while a zec offer below is enabled.
 key = "credential:maker-btc"
 
@@ -144,6 +195,8 @@ max_btc_sats = 100000000              # 1 XMR
 # [xmr]
 # network = "stagenet"
 # monerod_url = "http://127.0.0.1:38081"
+# The three wallet_rpc_* keys are optional and taker-only (the taker locks XMR through
+# monero-wallet-rpc). A maker omits them: it never sends XMR, it sweeps with the recovered key.
 # wallet_rpc_url = "http://127.0.0.1:38088"
 # wallet_rpc_user = "swap"
 # wallet_rpc_password = "credential:maker-xmr-wallet-rpc"

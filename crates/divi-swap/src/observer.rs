@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::backend::ChainBackend;
+use crate::backend::{ChainBackend, ClaimSizes, FeeBump, TipHeader};
 use crate::error::{Result, SwapError};
 use crate::htlc::HtlcParams;
 use crate::types::{Amount, Chain, Funding, LockedOutput, Outpoint, SignedTx, SpendInfo, Txid};
@@ -122,12 +122,32 @@ impl<B: ChainBackend> ChainBackend for TwoSource<B> {
         self.inner.tip_height().await
     }
 
+    async fn tip_hash(&self) -> Result<String> {
+        self.inner.tip_hash().await
+    }
+
     /// The later of the two: every taker decision that reads MTP ("is it still safe to
     /// claim?") errs toward safety when time is assumed to have advanced further.
     async fn median_time_past(&self) -> Result<u32> {
         let a = self.first.median_time_past().await?;
         let b = self.second.median_time_past().await?;
         Ok(a.max(b))
+    }
+
+    fn refund_final(&self, mtp: u32, locktime: u32) -> bool {
+        self.inner.refund_final(mtp, locktime)
+    }
+
+    async fn tip_header(&self) -> Result<TipHeader> {
+        self.inner.tip_header().await
+    }
+
+    async fn in_best_chain(&self, height: u64, hash: &str) -> Result<bool> {
+        self.inner.in_best_chain(height, hash).await
+    }
+
+    fn target_block_secs(&self) -> Option<u32> {
+        self.inner.target_block_secs()
     }
 
     async fn build_funding(&self, htlc: &HtlcParams, amount: Amount) -> Result<Funding> {
@@ -193,6 +213,63 @@ impl<B: ChainBackend> ChainBackend for TwoSource<B> {
 
     async fn find_spend(&self, outpoint: &Outpoint, from_height: u64) -> Result<Option<SpendInfo>> {
         self.inner.find_spend(outpoint, from_height).await
+    }
+
+    fn lock_finished(&self, at: &Outpoint) {
+        self.inner.lock_finished(at);
+    }
+
+    async fn release_dead_lock(&self, lock: &SignedTx) -> Result<bool> {
+        self.inner.release_dead_lock(lock).await
+    }
+
+    async fn spendable(&self) -> Result<Option<Amount>> {
+        self.inner.spendable().await
+    }
+
+    fn fee_bump(&self) -> FeeBump {
+        self.inner.fee_bump()
+    }
+
+    async fn claim_feerate(&self) -> Result<Option<u64>> {
+        self.inner.claim_feerate().await
+    }
+
+    fn claim_sizes(&self, htlc: &HtlcParams) -> Option<ClaimSizes> {
+        self.inner.claim_sizes(htlc)
+    }
+
+    async fn build_claim_at(
+        &self,
+        htlc: &HtlcParams,
+        at: &Outpoint,
+        amount: Amount,
+        preimage: &[u8; 32],
+        feerate: u64,
+    ) -> Result<SignedTx> {
+        self.inner
+            .build_claim_at(htlc, at, amount, preimage, feerate)
+            .await
+    }
+
+    async fn build_cpfp(
+        &self,
+        package: &[SignedTx],
+        htlc_amount: Amount,
+        feerate: u64,
+    ) -> Result<SignedTx> {
+        self.inner.build_cpfp(package, htlc_amount, feerate).await
+    }
+
+    async fn build_claim_replacement(
+        &self,
+        prev: &SignedTx,
+        feerate: u64,
+        price_bump_pct: u64,
+    ) -> Result<Option<SignedTx>> {
+        self.inner
+            .build_claim_replacement(prev, feerate, price_bump_pct)
+            .await
     }
 }
 
@@ -263,6 +340,7 @@ mod tests {
             claim_pubkey: [2; 33],
             refund_pubkey: [3; 33],
             locktime: 1_800_000_000,
+            script_version: Default::default(),
         }
     }
 

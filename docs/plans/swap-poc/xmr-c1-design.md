@@ -17,7 +17,7 @@ What is built (`61ca99a`, maker binary sha256 `929c9b54…` = `1841a12`) is comp
 
 ## 1. The flaw
 
-`Tx_refund` and `Tx_punish` spend the *signed* `Tx_cancel` by txid (`crates/divi-swap-xmr/src/api.rs:120-144`).
+`Tx_refund` and `Tx_punish` spend the *signed* `Tx_cancel` by txid (`crates/divi-swap-xmr/src/api.rs:167-193`; re-anchored 2026-10-22, was `:120-144`).
 DIVI has no segwit, so that txid covers the scriptSig. Anyone who can produce a different valid
 scriptSig for `Tx_cancel` gives it a new txid. Both presigned children are then invalid, and the
 coins sit in the `{a', b'}` 2-of-2, which neither side can spend alone.
@@ -155,7 +155,7 @@ not mandatory, so OP_NOPs give unboundedly many variants. If `Tx_lock` confirms 
 txid:
 
 - The taker never locks XMR. She waits for the expected `lock_outpoint` to confirm
-  (`taker.rs:513-524`). So she loses nothing.
+  (`taker.rs:778-783`; re-anchored 2026-10-22, was `:513-524`). So she loses nothing.
 - The maker's DIVI is in the `{a, b}` 2-of-2 with no valid `Tx_cancel`. The taker can ransom it.
 
 **Mitigation:** the third, maker-unilateral branch of `Tx_lock` in §4.1, with
@@ -215,9 +215,9 @@ and Castagnos-Laguillaumie-based class-group variants. Picking one is part of th
 - Step 2: no `maker_cancel_sig`. Instead, the 2P-ECDSA signing of `Tx_cancel` runs.
 - Step 3: the taker sends refund adaptor signatures for every `Tx_cancel` variant (option (a)).
   No `Tx_punish` presignature is needed in either direction.
-- `maker.rs:745-764` (treats any non-matching spender of the lock as `Tx_redeem`) must instead
+- `maker.rs:745-764` (gone 2026-10-22, replaced by the C1 fix at `maker.rs:1311-1335`, `lock_scripts::lock_spend_branch`; it described the pre-C1 code that treated any non-matching spender of the lock as `Tx_redeem`) must instead
   match the spender's scriptSig branch: redeem, cancel or late.
-- `taker.rs:458-477` must accept whichever `Tx_cancel` variant confirmed and pick the matching
+- `taker.rs:458-477` (gone 2026-10-22, replaced by the C1 fix at `taker.rs:727-765` and `:857-882`) must accept whichever `Tx_cancel` variant confirmed and pick the matching
   child.
 - A `maker_punish_sig` disappears from `XmrSwapView`.
 

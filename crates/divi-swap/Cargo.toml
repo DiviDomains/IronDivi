@@ -11,6 +11,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 hex = { workspace = true }
+http = "1"
 sha2 = { workspace = true }
 rand = { workspace = true }
 tracing = { workspace = true }
@@ -26,7 +27,7 @@ tokio = { workspace = true }
 # wasm32: the taker runs in the IronDivi browser extension. No tokio runtime (only its
 # executor-agnostic Mutex), browser entropy and clock, JS timers (see `rt`).
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-tokio = { version = "1.35", default-features = false, features = ["sync"] }
+tokio = { version = "1.35", default-features = false, features = ["sync", "macros"] }
 getrandom = { version = "0.2", features = ["js"] }
 uuid = { workspace = true, features = ["js"] }
 gloo-timers = { version = "0.3", features = ["futures"] }
@@ -34,6 +35,12 @@ js-sys = "0.3"
 
 [dev-dependencies]
 alloy = { version = "2.5.0", features = ["node-bindings"] }
+divi-crypto = { workspace = true }
+divi-primitives = { workspace = true }
+divi-wallet = { workspace = true }
 proptest = { workspace = true }
+secp256k1 = { workspace = true }
+swap-chain-divi.workspace = true
 swap-chain-evm.workspace = true
+swap-chain-zec.workspace = true
 tempfile = { workspace = true }

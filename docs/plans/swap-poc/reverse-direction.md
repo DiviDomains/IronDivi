@@ -53,5 +53,8 @@ RESULTS.md (`check-rev-live.sh`).
   - reverse: `divi_lock btc_lock btc_claim_by_taker divi_claim_by_maker btc_spend_by_maker divi_refund_by_taker`
 - Taker DIVI wallet (reverse needs DIVI coins on the taker): `divi-swap --divi-wallet PATH
   [--divi-scan-from HEIGHT]` (wallet JSON outside the repo, mode 0600; scan resumes from its cursor).
+  Optional `--divi-fallback-rpc-url URL` adds a second DIVI endpoint: tip, scan and funding reads then need both
+  endpoints to agree (tip within 2 blocks), and a disagreement is a retryable error. Unset keeps the single default
+  endpoint; the URL must differ from it.
 - `e2e.sh <happy|case-c|case-d> --offer btc-divi-testnet` → state dir `rev-<scenario>-<backend|deployed>`,
   txid prefix `rev_<happy|casec|cased>` (`deployed_rev_…` with `--maker-url`).

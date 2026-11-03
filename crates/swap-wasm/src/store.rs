@@ -251,4 +251,12 @@ impl StoreBackend for EncryptedStore {
         rows.sort_by_key(|r| std::cmp::Reverse(r.0));
         Ok(rows.into_iter().map(|r| r.2.clone()).collect())
     }
+
+    fn delete(&self, table: Table<'_>, id: &str) -> Result<()> {
+        let key = self.full_key(table, id);
+        let mut inner = self.inner.lock();
+        inner.cache.remove(&key);
+        inner.pending.retain(|p| p.key != key);
+        Ok(())
+    }
 }

@@ -23,70 +23,325 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use divi_swap::api::{Direction, Offer};
+use divi_swap::reservation::ExpiryStart;
 use divi_swap::{Chain, Profile};
 use serde::Deserialize;
+
+use crate::proxy::{default_trusted_proxies, IpCidr, ProxyTrust};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum BackendKind {
     /// Every chain simulated in-process.
     Mock,
-    /// Real DIVI testnet RPC + BTC Esplora.
+    /// Real DIVI RPC (testnet unless `[divi].network = "mainnet"`) + BTC Esplora.
     Live,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct DiviSection {
-    /// DIVI JSON-RPC proxy URL.
-    #[serde(default = "default_divi_rpc")]
-    pub rpc_url: String,
+    /// `testnet` (default) or `mainnet`, mirroring `[zec].network`.
+    #[serde(default = "default_divi_network")]
+    pub network: String,
+    /// Must be `true` for `network = "mainnet"`, which moves real money. Off by default,
+    /// mirroring `[zec].allow_mainnet`.
+    #[serde(default)]
+    pub allow_mainnet: bool,
+    /// DIVI JSON-RPC proxy URL. When absent, [`DiviSection::rpc_url`] falls back to
+    /// `swap_chain_divi::default_rpc(network)`.
+    pub rpc_url: Option<String>,
+    /// Second, independent DIVI JSON-RPC endpoint (ideally the operator's own node).
+    /// When set, every swap-relevant read is made on both endpoints and a disagreement is
+    /// `Transient` (retried later), never a decision; a broadcast goes to both. Optional on
+    /// testnet; required on a mainnet profile unless `allow_single_source = true`.
+    #[serde(default)]
+    pub fallback_rpc_url: Option<String>,
+    /// Let a mainnet profile start without `fallback_rpc_url`, trusting one endpoint for every
+    /// swap read. Off by default; when it is used, a warning is logged at every start.
+    #[serde(default)]
+    pub allow_single_source: bool,
     /// Reference (`op://…` or `credential:<name>`) to the maker's DIVI key.
     pub key: String,
     /// Known-UTXO file (public data only).
     pub wallet_path: Option<PathBuf>,
     /// First block height to scan for wallet UTXOs.
     pub scan_from_height: Option<u64>,
+    /// Where the expiry sweep may start counting a dropped DIVI lock's absent blocks:
+    /// `"tip"` (the default) or `"mtp"` ([`DiviSection::expiry_start`]).
+    #[serde(default)]
+    pub expiry_start: Option<String>,
+}
+
+fn default_divi_network() -> String {
+    "testnet".into()
+}
+
+/// A section's `expiry_start`: `"tip"` when absent, `"mtp"`, or an error naming
+/// `[section].expiry_start`.
+fn expiry_start(section: &str, value: Option<&str>) -> Result<ExpiryStart> {
+    match value {
+        None => Ok(ExpiryStart::default()),
+        Some(s) => s
+            .parse()
+            .map_err(|e| anyhow::anyhow!("[{section}].expiry_start {e}")),
+    }
+}
+
+/// Each chain's `expiry_start` ([`DaemonConfig::expiry_starts`]): where its expiry sweep may
+/// start counting a dropped lock's absent blocks. A chain without the key or without a
+/// section is [`ExpiryStart::Tip`]; so is every chain without input reservations (USDC, XMR).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExpiryStarts {
+    pub divi: ExpiryStart,
+    pub btc: ExpiryStart,
+    pub ltc: ExpiryStart,
+    pub zec: ExpiryStart,
+}
+
+impl ExpiryStarts {
+    /// The setting for `chain`.
+    pub fn of(&self, chain: Chain) -> ExpiryStart {
+        match chain {
+            Chain::Divi => self.divi,
+            Chain::Btc => self.btc,
+            Chain::Ltc => self.ltc,
+            Chain::Zec => self.zec,
+            _ => ExpiryStart::default(),
+        }
+    }
+}
+
+impl DiviSection {
+    /// The configured DIVI network (`testnet` or `mainnet`).
+    pub fn network(&self) -> Result<divi_wallet::address::Network> {
+        match self.network.as_str() {
+            "testnet" => Ok(divi_wallet::address::Network::Testnet),
+            "mainnet" => Ok(divi_wallet::address::Network::Mainnet),
+            other => bail!("[divi].network must be testnet or mainnet, got {other:?}"),
+        }
+    }
+
+    /// `rpc_url`, or `network`'s default public endpoint if unset.
+    pub fn rpc_url(&self) -> Result<String> {
+        Ok(match &self.rpc_url {
+            Some(u) => u.clone(),
+            None => swap_chain_divi::default_rpc(self.network()?).to_string(),
+        })
+    }
+
+    /// `expiry_start`: `"tip"` when absent, `"mtp"` to make every first absent check of a
+    /// dropped DIVI lock wait for the node's median time past
+    /// ([`divi_swap::InputReservations::release_expired_from`]).
+    pub fn expiry_start(&self) -> Result<ExpiryStart> {
+        expiry_start("divi", self.expiry_start.as_deref())
+    }
+
+    /// `fallback_rpc_url` when set and non-blank; an identical URL to `rpc_url` is refused
+    /// because it would make the "second" source a copy of the first.
+    pub fn fallback_rpc_url(&self) -> Result<Option<String>> {
+        let Some(f) = self.fallback_rpc_url.as_deref().map(str::trim) else {
+            return Ok(None);
+        };
+        if f.is_empty() {
+            return Ok(None);
+        }
+        if f == self.rpc_url()?.trim() {
+            bail!("[divi].fallback_rpc_url must differ from [divi].rpc_url");
+        }
+        Ok(Some(f.to_string()))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct BtcSection {
+    /// `signet` (default), `testnet` or `mainnet`.
     #[serde(default = "default_network")]
     pub network: String,
-    /// Primary Esplora API base.
-    #[serde(default = "default_esplora")]
-    pub esplora_url: String,
+    /// Must be `true` for `network = "mainnet"`, which moves real money. Off by default,
+    /// mirroring `[zec].allow_mainnet`.
+    #[serde(default)]
+    pub allow_mainnet: bool,
+    /// Primary Esplora API base. When absent, [`BtcSection::endpoints`] falls back to
+    /// `swap_chain_btc::esplora_endpoints(network)` and `fallback_esplora_url` is not consulted.
+    pub esplora_url: Option<String>,
     /// Fallback Esplora API base.
     pub fallback_esplora_url: Option<String>,
+    /// Read `find_spend`, `htlc_output` and `confirmations` (what a claim or refund rests
+    /// on) from the primary and the secondary endpoint, and treat any disagreement, or either
+    /// endpoint failing, as transient (retried, never acted on). Off by default: the secondary
+    /// is then only a failover. Needs two different endpoints (see [`BtcSection::endpoints`]).
+    #[serde(default)]
+    pub quorum_reads: bool,
     /// Reference (`op://…` or `credential:<name>`) to the maker's BTC key.
     pub key: String,
+    /// Where the expiry sweep may start counting a dropped BTC lock's absent blocks:
+    /// `"tip"` (the default) or `"mtp"` ([`BtcSection::expiry_start`]).
+    #[serde(default)]
+    pub expiry_start: Option<String>,
+}
+
+impl BtcSection {
+    /// `expiry_start`: `"tip"` when absent, `"mtp"` to make every first absent check of a
+    /// dropped lock wait for the backend's median time past
+    /// ([`divi_swap::InputReservations::release_expired_from`]).
+    pub fn expiry_start(&self) -> Result<ExpiryStart> {
+        expiry_start("btc", self.expiry_start.as_deref())
+    }
+
+    /// Esplora endpoints, primary first: `esplora_url` (then `fallback_esplora_url`) when
+    /// set, else `network`'s defaults (`swap_chain_btc::esplora_endpoints`).
+    pub fn endpoints(&self) -> Result<Vec<String>> {
+        Ok(match &self.esplora_url {
+            Some(primary) => {
+                let mut eps = vec![primary.clone()];
+                eps.extend(self.fallback_esplora_url.clone());
+                eps
+            }
+            None => swap_chain_btc::esplora_endpoints(&self.network)
+                .map_err(|e| anyhow::anyhow!("[btc].network: {e}"))?,
+        })
+    }
+
+    /// With `quorum_reads` on, the endpoints must be a primary and a different secondary.
+    fn validate_quorum_reads(&self) -> Result<()> {
+        if !self.quorum_reads {
+            return Ok(());
+        }
+        let eps = self.endpoints()?;
+        let norm = |u: &String| u.trim().trim_end_matches('/').to_string();
+        if eps.len() < 2 || norm(&eps[0]) == norm(&eps[1]) {
+            bail!(
+                "[btc].quorum_reads = true needs a second, different Esplora endpoint: set \
+                 [btc].fallback_esplora_url next to [btc].esplora_url (or leave both unset \
+                 for the network's two defaults)"
+            );
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct LtcSection {
+    /// `testnet` (default) or `mainnet`.
     #[serde(default = "default_ltc_network")]
     pub network: String,
-    /// Primary Esplora API base.
-    #[serde(default = "default_ltc_esplora")]
-    pub esplora_url: String,
+    /// Must be `true` for `network = "mainnet"`, which moves real money. Off by default,
+    /// mirroring `[zec].allow_mainnet`.
+    #[serde(default)]
+    pub allow_mainnet: bool,
+    /// Primary Esplora API base. When absent, [`LtcSection::endpoints`] falls back to
+    /// `swap_chain_ltc::esplora_endpoints(network)` and `fallback_esplora_url` is not consulted.
+    pub esplora_url: Option<String>,
     /// Fallback Esplora API base, if one exists (none known as of 2026-10-11 — see
     /// `swap-chain-ltc`'s lane status).
     pub fallback_esplora_url: Option<String>,
     /// Reference (`op://…` or `credential:<name>`) to the maker's LTC key.
     pub key: String,
+    /// Tip-hash cross-check of the primary Esplora against an independent source:
+    /// `"blockbook"`, `"blockcypher"` or `"off"` (default). Mainnet only; refused at config
+    /// load on testnet, required on a mainnet profile unless `allow_single_source = true`.
+    /// Run once at startup, before any LTC action.
+    #[serde(default = "default_ltc_crosscheck")]
+    pub crosscheck: String,
+    /// Let a mainnet profile start with `crosscheck = "off"`, trusting the one Esplora source.
+    /// Off by default; when it is used, a warning is logged at every start.
+    #[serde(default)]
+    pub allow_single_source: bool,
+    /// Run the `crosscheck` comparison again before every LTC claim, not only at startup.
+    /// Off by default (no mainnet default chosen). A disagreement holds the claim and the
+    /// engine retries it; an unreachable or rate-limited source logs a warning and the claim
+    /// goes ahead. Needs `crosscheck` set to a source; on with `crosscheck = "off"` is refused.
+    /// It also checks every LTC lock read (before the maker funds, before the taker claims)
+    /// against the source's script and value at the outpoint; there a disagreeing or
+    /// unreachable source holds the swap (fail closed), since nothing is revealed or paid yet.
+    /// And every LTC `find_spend` (the maker's preimage watch, the refund checks): a spend
+    /// only one side shows, two spenders, or one spender with another witness is `Transient`;
+    /// an unreachable source warns and the primary's answer stands, as for the claim.
+    #[serde(default)]
+    pub crosscheck_before_claim: bool,
+    /// Where the expiry sweep may start counting a dropped LTC lock's absent blocks:
+    /// `"tip"` (the default) or `"mtp"` ([`LtcSection::expiry_start`]).
+    #[serde(default)]
+    pub expiry_start: Option<String>,
+    /// Post every LTC broadcast (lock, claim, CPFP child, refund) to the primary and the
+    /// secondary Esplora at once, so a primary that refuses or drops a claim cannot keep it off
+    /// the network; either one taking it is a broadcast. Off by default: the secondary is then
+    /// only a failover. Needs `esplora_url` and a different `fallback_esplora_url` (the
+    /// network's default list has one endpoint). Reads are unchanged.
+    #[serde(default)]
+    pub dual_broadcast: bool,
+}
+
+impl LtcSection {
+    /// `expiry_start`: `"tip"` when absent, `"mtp"` to make every first absent check of a
+    /// dropped lock wait for the backend's median time past
+    /// ([`divi_swap::InputReservations::release_expired_from`]).
+    pub fn expiry_start(&self) -> Result<ExpiryStart> {
+        expiry_start("ltc", self.expiry_start.as_deref())
+    }
+
+    /// Parsed `crosscheck`; `None` is `off`.
+    pub fn crosscheck_source(&self) -> Result<Option<swap_chain_ltc::CrossCheckSource>> {
+        swap_chain_ltc::CrossCheckSource::parse_opt(&self.crosscheck)
+            .map_err(|e| anyhow::anyhow!("[ltc].crosscheck: {e}"))
+    }
+
+    /// Esplora endpoints, primary first: `esplora_url` (then `fallback_esplora_url`) when
+    /// set, else `network`'s defaults (`swap_chain_ltc::esplora_endpoints`).
+    pub fn endpoints(&self) -> Result<Vec<String>> {
+        Ok(match &self.esplora_url {
+            Some(primary) => {
+                let mut eps = vec![primary.clone()];
+                eps.extend(self.fallback_esplora_url.clone());
+                eps
+            }
+            None => swap_chain_ltc::esplora_endpoints(&self.network)
+                .map_err(|e| anyhow::anyhow!("[ltc].network: {e}"))?,
+        })
+    }
+
+    /// With `dual_broadcast` on, the endpoints must be a primary and a different secondary.
+    fn validate_dual_broadcast(&self) -> Result<()> {
+        if !self.dual_broadcast {
+            return Ok(());
+        }
+        let eps = self.endpoints()?;
+        let norm = |u: &String| u.trim().trim_end_matches('/').to_string();
+        if eps.len() < 2 || norm(&eps[0]) == norm(&eps[1]) {
+            bail!(
+                "[ltc].dual_broadcast = true needs a second, different Esplora endpoint: set \
+                 [ltc].fallback_esplora_url next to [ltc].esplora_url"
+            );
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct UsdcSection {
-    /// Which EVM testnet this backend runs on: `"sepolia"` (default) or `"base-sepolia"`
-    /// (`swap_chain_evm::UsdcNetwork`). Only a label plus a source of defaults for
+    /// Which EVM network this backend runs on: `"sepolia"` (default), `"base-sepolia"`,
+    /// `"ethereum"` or `"base"` (`swap_chain_evm::UsdcNetwork`; the last two are mainnets and
+    /// need `allow_mainnet` below). Only a label plus a source of defaults for
     /// `rpc_url`/`token` below when they are left unset — the backend itself is
     /// network-agnostic, so setting both explicitly works on any EVM chain regardless of
     /// `network`. A single `[usdc]` section (and so a single `Chain::Usdc` backend) serves
     /// one network at a time; running both concurrently needs a second counter chain.
     #[serde(default = "default_usdc_network")]
     pub network: String,
+    /// Must be `true` for a mainnet `network` (`"ethereum"`, `"base"`), which moves real
+    /// money. Off by default, mirroring `[zec].allow_mainnet`.
+    #[serde(default)]
+    pub allow_mainnet: bool,
     /// EVM JSON-RPC URL. Defaults to a free public endpoint for `network`.
     pub rpc_url: Option<String>,
+    /// Second, independent EVM JSON-RPC node (ideally the operator's own). When set, the
+    /// reads a claim or refund rests on (`htlc_output`, `find_spend`, `confirmations`,
+    /// `median_time_past`) are asked of both nodes and a disagreement, or this node not
+    /// answering, is `Transient` (retried later), never a decision
+    /// (`swap_chain_evm::UsdcBackend::with_quorum_rpc`). Off by default; optional on every
+    /// profile.
+    #[serde(default)]
+    pub fallback_rpc_url: Option<String>,
     /// Deployed `Erc20Htlc` contract address.
     pub htlc: String,
     /// ERC-20 (USDC) token address. Defaults to Circle's test USDC for `network`.
@@ -115,6 +370,22 @@ impl UsdcSection {
         })
     }
 
+    /// `fallback_rpc_url` when set and non-blank; an identical URL to `rpc_url` is refused
+    /// because it would make the "second" node a copy of the first.
+    pub fn fallback_rpc_url(&self) -> Result<Option<String>> {
+        let Some(f) = self.fallback_rpc_url.as_deref().map(str::trim) else {
+            return Ok(None);
+        };
+        if f.is_empty() {
+            return Ok(None);
+        }
+        let norm = |u: &str| u.trim().trim_end_matches('/').to_string();
+        if norm(f) == norm(&self.rpc_url()?) {
+            bail!("[usdc].fallback_rpc_url must differ from [usdc].rpc_url");
+        }
+        Ok(Some(f.to_string()))
+    }
+
     /// `token`, or `network`'s USDC token address if unset.
     pub fn token(&self) -> Result<String> {
         Ok(match &self.token {
@@ -137,8 +408,10 @@ pub struct XmrSection {
     pub allow_mainnet: bool,
     /// `monerod` RPC: scanning for the taker's lock, fees, relaying the sweep.
     pub monerod_url: String,
-    /// `monero-wallet-rpc` with the maker's wallet open.
-    pub wallet_rpc_url: String,
+    /// `monero-wallet-rpc` URL. Taker-only: the maker never sends XMR from a wallet (it
+    /// sweeps with the recovered key), so a maker leaves the three `wallet_rpc_*` keys out.
+    #[serde(default)]
+    pub wallet_rpc_url: Option<String>,
     #[serde(default)]
     pub wallet_rpc_user: String,
     /// Reference (`op://…` or `credential:<name>`) to the wallet RPC password.
@@ -173,33 +446,79 @@ fn default_xmr_lookback() -> u64 {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ZecSection {
-    /// Primary lightwalletd gRPC endpoint.
-    #[serde(default = "default_lightwalletd")]
-    pub lightwalletd_url: String,
-    /// Fallback lightwalletd gRPC endpoint.
+    /// `testnet` (default) or `mainnet`, mirroring `[xmr].network`.
+    #[serde(default = "default_zec_network")]
+    pub network: String,
+    /// Must be `true` for `network = "mainnet"`, which moves real money. Off by default,
+    /// mirroring `[xmr].allow_mainnet`.
+    #[serde(default)]
+    pub allow_mainnet: bool,
+    /// Primary lightwalletd gRPC endpoint. When absent, [`ZecSection::endpoints`] falls back
+    /// to `swap_chain_zec::lightwalletd_endpoints(network)` (the probed defaults for
+    /// `network`, plus whatever `SWAP_ZEC_LIGHTWALLETD_EXTRA` adds) and
+    /// `fallback_lightwalletd_url` is not consulted.
+    pub lightwalletd_url: Option<String>,
+    /// Fallback lightwalletd gRPC endpoint, used only when `lightwalletd_url` is set (comes
+    /// after it).
     pub fallback_lightwalletd_url: Option<String>,
+    /// A lightwalletd run by a second operator (`https://host:port`), asked for its tip at
+    /// startup and before every ZEC claim and refund (`swap_chain_zec::crosscheck`). Unset
+    /// (the default) is off. Refused at load when its host shares a registrable domain with
+    /// any primary endpoint; required on a mainnet profile unless the endpoints already span
+    /// two operators or `allow_single_source = true`.
+    pub crosscheck_url: Option<String>,
+    /// Let a mainnet profile start without a second lightwalletd operator, trusting one
+    /// operator's tip. Off by default, mirroring `[ltc].allow_single_source`.
+    #[serde(default)]
+    pub allow_single_source: bool,
     /// Reference (`op://…` or `credential:<name>`) to the maker's ZEC key.
     pub key: String,
+    /// Where the expiry sweep may start counting a dropped ZEC lock's absent blocks:
+    /// `"tip"` (the default) or `"mtp"` ([`ZecSection::expiry_start`]).
+    #[serde(default)]
+    pub expiry_start: Option<String>,
+}
+
+fn default_zec_network() -> String {
+    "testnet".into()
+}
+
+impl ZecSection {
+    /// `expiry_start`: `"tip"` when absent, `"mtp"` to make every first absent check of a
+    /// dropped lock wait for the backend's median time past
+    /// ([`divi_swap::InputReservations::release_expired_from`]).
+    pub fn expiry_start(&self) -> Result<ExpiryStart> {
+        expiry_start("zec", self.expiry_start.as_deref())
+    }
+
+    /// Lightwalletd endpoints, primary first: `lightwalletd_url` (then
+    /// `fallback_lightwalletd_url` if also set) when present, else `network`'s probed
+    /// defaults (`swap_chain_zec::lightwalletd_endpoints`).
+    pub fn endpoints(&self) -> Result<Vec<String>> {
+        Ok(match &self.lightwalletd_url {
+            Some(primary) => {
+                let mut eps = vec![primary.clone()];
+                eps.extend(self.fallback_lightwalletd_url.clone());
+                eps
+            }
+            None => swap_chain_zec::lightwalletd_endpoints(&self.network)
+                .map_err(|e| anyhow::anyhow!("[zec].network: {e}"))?,
+        })
+    }
 }
 
 /// The DIVI testnet RPC proxy: the default `[divi]` and `[xmr]` DIVI endpoint.
 pub fn default_divi_rpc() -> String {
     "https://services.divi.domains/api/testnet/rpc/".into()
 }
-fn default_esplora() -> String {
-    "https://mempool.space/signet/api".into()
-}
-fn default_lightwalletd() -> String {
-    swap_chain_zec::TESTNET_LIGHTWALLETD.to_string()
-}
 fn default_network() -> String {
     "signet".into()
 }
+fn default_ltc_crosscheck() -> String {
+    "off".into()
+}
 fn default_ltc_network() -> String {
     "testnet".into()
-}
-fn default_ltc_esplora() -> String {
-    swap_chain_ltc::LITECOINSPACE_TESTNET.into()
 }
 fn default_listen() -> SocketAddr {
     "127.0.0.1:8480".parse().expect("static address")
@@ -340,6 +659,28 @@ pub struct DaemonConfig {
     pub db_path: PathBuf,
     #[serde(default = "default_profile")]
     pub profile: Profile,
+    /// Key the per-IP rate limit on the last `X-Forwarded-For` entry (else `X-Real-IP`) instead
+    /// of the socket peer, for requests whose peer is in [`Self::trusted_proxies`]. Off by
+    /// default: set it only behind a reverse proxy you control that sets those headers (the
+    /// shipped nginx snippet does). On with an empty `trusted_proxies` is refused at start.
+    #[serde(default)]
+    pub trust_proxy_headers: bool,
+    /// Socket peers (addresses or networks, `"a.b.c.d/n"`, `"x::y/n"`) whose proxy headers are
+    /// believed when [`Self::trust_proxy_headers`] is on; any other peer is keyed on its own
+    /// address, so a client that reaches the daemon directly cannot pick its bucket. Default
+    /// `["127.0.0.1/32", "::1/128"]`: a proxy on the same host.
+    #[serde(default = "default_trusted_proxies")]
+    pub trusted_proxies: Vec<IpCidr>,
+    /// File holding the operator token (one line) that `GET /swaps`, the full swap listing,
+    /// requires in `X-Operator-Token`. Unset: the listing answers 404 to everyone. Keep the
+    /// file out of git, mode 0600; the daemon reads it once at start.
+    #[serde(default)]
+    pub operator_token_file: Option<PathBuf>,
+    /// Let a taker that cannot send swap tokens (built before them) open a swap anyway. That
+    /// swap has no token, so anyone who learns its id can read it and call `lock` on it.
+    /// Off by default: such a taker is refused at accept with a message to upgrade.
+    #[serde(default)]
+    pub allow_tokenless_swaps: bool,
     /// Optional path prefix. Empty by default: nginx strips `/swap/` before proxying.
     #[serde(default)]
     pub path_prefix: String,
@@ -376,6 +717,52 @@ pub struct DaemonConfig {
 }
 
 impl DaemonConfig {
+    /// The operator token from [`DaemonConfig::operator_token_file`], trimmed; `None` when no
+    /// file is configured. A configured file that is unreadable or empty is an error (the
+    /// listing would silently stay closed).
+    pub fn operator_token(&self) -> Result<Option<String>> {
+        let Some(p) = &self.operator_token_file else {
+            return Ok(None);
+        };
+        let t = std::fs::read_to_string(p)
+            .with_context(|| format!("reading operator_token_file {}", p.display()))?;
+        let t = t.trim();
+        if t.is_empty() {
+            bail!("operator_token_file {} is empty", p.display());
+        }
+        Ok(Some(t.to_string()))
+    }
+
+    /// The peers the rate limits take the client address from: [`Self::trusted_proxies`] with
+    /// [`Self::trust_proxy_headers`] on, none with it off.
+    pub fn proxy_trust(&self) -> ProxyTrust {
+        if self.trust_proxy_headers {
+            ProxyTrust::proxies(self.trusted_proxies.iter().copied())
+        } else {
+            ProxyTrust::off()
+        }
+    }
+
+    /// `[divi].expiry_start`, `"tip"` without a `[divi]` section.
+    pub fn divi_expiry_start(&self) -> Result<ExpiryStart> {
+        Ok(match &self.divi {
+            Some(d) => d.expiry_start()?,
+            None => ExpiryStart::default(),
+        })
+    }
+
+    /// `expiry_start` of `[divi]`, `[btc]`, `[ltc]` and `[zec]`, each `"tip"` without its
+    /// section or key.
+    pub fn expiry_starts(&self) -> Result<ExpiryStarts> {
+        let of = |s: Option<Result<ExpiryStart>>| s.unwrap_or(Ok(ExpiryStart::default()));
+        Ok(ExpiryStarts {
+            divi: self.divi_expiry_start()?,
+            btc: of(self.btc.as_ref().map(BtcSection::expiry_start))?,
+            ltc: of(self.ltc.as_ref().map(LtcSection::expiry_start))?,
+            zec: of(self.zec.as_ref().map(ZecSection::expiry_start))?,
+        })
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading config {}", path.display()))?;
@@ -490,10 +877,50 @@ impl DaemonConfig {
         }
     }
 
+    /// The `[btc]`/`[ltc]` network gate, same rules and wording as `[zec]`: a known network
+    /// name, `mainnet` only with `allow_mainnet = true`, and the network must agree with the
+    /// swap timing `profile`.
+    fn validate_mainnet_gate(
+        &self,
+        section: &str,
+        network: &str,
+        allow_mainnet: bool,
+        test_networks: &[&str],
+    ) -> Result<()> {
+        if network != "mainnet" && !test_networks.contains(&network) {
+            bail!(
+                "[{section}].network must be {} or mainnet, got {network:?}",
+                test_networks.join(", ")
+            );
+        }
+        if network == "mainnet" && !allow_mainnet {
+            bail!(
+                "[{section}].network = \"mainnet\": {section} mainnet moves real money: no mainnet \
+                 without the explicit allow_mainnet opt-in (mainnet-readiness.md §{})",
+                section.to_uppercase()
+            );
+        }
+        if (network == "mainnet") != (self.profile == Profile::Mainnet) {
+            bail!(
+                "[{section}].network = {network:?} disagrees with profile = {:?}: the swap timing \
+                 profile and the {section} backend must run on the same network",
+                self.profile
+            );
+        }
+        Ok(())
+    }
+
     fn validate(&self) -> Result<()> {
         if self.tick_secs == 0 {
             bail!("tick_secs must be > 0");
         }
+        if self.trust_proxy_headers && self.trusted_proxies.is_empty() {
+            bail!(
+                "trust_proxy_headers = true with an empty trusted_proxies: no peer's headers \
+                 would be believed; list the proxy's address (default [\"127.0.0.1/32\", \"::1/128\"])"
+            );
+        }
+        self.expiry_starts()?;
         let mut seen = std::collections::BTreeSet::new();
         for o in self.offer_entries.iter().map(|e| &e.offer) {
             if !seen.insert(&o.id) {
@@ -525,10 +952,156 @@ impl DaemonConfig {
                 .map_err(|e| anyhow::anyhow!("bad secret reference: {e}"))?;
         }
         if let Some(u) = &self.usdc {
-            u.network()?;
+            let network = u.network()?;
+            u.fallback_rpc_url()?;
+            if network.is_mainnet() && !u.allow_mainnet {
+                bail!(
+                    "[usdc].network = {:?}: usdc mainnet moves real money: no mainnet \
+                     without the explicit allow_mainnet opt-in (mainnet-readiness.md §USDC/EVM)",
+                    u.network
+                );
+            }
+            if network.is_mainnet() && self.profile != Profile::Mainnet {
+                bail!(
+                    "[usdc].network = {:?} disagrees with profile = {:?}: the swap timing \
+                     profile and the usdc backend must run on the same network",
+                    u.network,
+                    self.profile
+                );
+            }
+        }
+        if let Some(b) = &self.btc {
+            self.validate_mainnet_gate(
+                "btc",
+                &b.network,
+                b.allow_mainnet,
+                &["signet", "testnet", "regtest"],
+            )?;
+            b.validate_quorum_reads()?;
+        }
+        if let Some(l) = &self.ltc {
+            self.validate_mainnet_gate("ltc", &l.network, l.allow_mainnet, &["testnet"])?;
+            if l.crosscheck_source()?.is_some() && l.network != "mainnet" {
+                bail!("[ltc].crosscheck is mainnet-only: no testnet source is verified");
+            }
+            l.validate_dual_broadcast()?;
+            if l.crosscheck_before_claim && l.crosscheck_source()?.is_none() {
+                bail!(
+                    "[ltc].crosscheck_before_claim = true needs a source: set [ltc].crosscheck \
+                     to \"blockbook\" or \"blockcypher\" (it is \"off\")"
+                );
+            }
+            if self.profile == Profile::Mainnet && l.crosscheck_source()?.is_none() {
+                require_second_source("ltc", "[ltc].crosscheck is \"off\"", l.allow_single_source)?;
+            }
+        }
+        if let Some(z) = &self.zec {
+            match z.network.as_str() {
+                "testnet" | "mainnet" => {}
+                other => bail!("[zec].network must be testnet or mainnet, got {other:?}"),
+            }
+            if z.network == "mainnet" && !z.allow_mainnet {
+                bail!(
+                    "[zec].network = \"mainnet\": zec mainnet moves real money: no mainnet \
+                     without the explicit allow_mainnet opt-in (mainnet-readiness.md §ZEC)"
+                );
+            }
+            let zec_mainnet = z.network == "mainnet";
+            let profile_mainnet = self.profile == Profile::Mainnet;
+            if zec_mainnet != profile_mainnet {
+                bail!(
+                    "[zec].network = {:?} disagrees with profile = {:?}: the swap timing \
+                     profile and the zec backend must run on the same network",
+                    z.network,
+                    self.profile
+                );
+            }
+            let endpoints = z.endpoints()?;
+            if let Some(url) = &z.crosscheck_url {
+                divi_swap::operator::check_second_operator(
+                    "lightwalletd endpoint",
+                    &endpoints,
+                    url,
+                )
+                .map_err(|e| anyhow::anyhow!("[zec].crosscheck_url: {e}"))?;
+            }
+            // The rule the taker CLI shares as a warning (`divi_swap_cli::sources::check_zec`).
+            if profile_mainnet
+                && divi_swap::operator::needs_second_operator(
+                    &endpoints,
+                    z.crosscheck_url.as_deref(),
+                )
+            {
+                require_second_source(
+                    "zec",
+                    "[zec].crosscheck_url is unset and every lightwalletd endpoint is one operator's",
+                    z.allow_single_source,
+                )?;
+            }
+        }
+        // One rule for every section (xmr and usdc have no gate of their own above). DIVI
+        // is checked after the counter coins, so their errors are reported first.
+        let mut coins: Vec<divi_swap::config::ConfiguredNetwork<'_>> = Vec::new();
+        if let Some(b) = &self.btc {
+            coins.push((Chain::Btc, &b.network, Some(b.allow_mainnet)));
+        }
+        if let Some(l) = &self.ltc {
+            coins.push((Chain::Ltc, &l.network, Some(l.allow_mainnet)));
+        }
+        if let Some(z) = &self.zec {
+            coins.push((Chain::Zec, &z.network, Some(z.allow_mainnet)));
+        }
+        if let Some(x) = &self.xmr {
+            coins.push((Chain::Xmr, &x.network, Some(x.allow_mainnet)));
+        }
+        if let Some(u) = &self.usdc {
+            coins.push((Chain::Usdc, &u.network, None));
+        }
+        divi_swap::config::check_profile_networks(self.profile, &coins)
+            .map_err(anyhow::Error::msg)?;
+        if let Some(d) = &self.divi {
+            d.network()?;
+            if d.network == "mainnet" && !d.allow_mainnet {
+                bail!(
+                    "[divi].network = \"mainnet\": divi mainnet moves real money: no mainnet \
+                     without the explicit allow_mainnet opt-in (mainnet-readiness.md §DIVI)"
+                );
+            }
+            if (d.network == "mainnet") != (self.profile == Profile::Mainnet) {
+                bail!(
+                    "[divi].network = {:?} disagrees with profile = {:?}: the swap timing \
+                     profile and the divi backend must run on the same network",
+                    d.network,
+                    self.profile
+                );
+            }
+            if self.profile == Profile::Mainnet && d.fallback_rpc_url()?.is_none() {
+                require_second_source(
+                    "divi",
+                    "[divi].fallback_rpc_url is not set",
+                    d.allow_single_source,
+                )?;
+            }
         }
         Ok(())
     }
+}
+
+/// A mainnet `[section]` without its second source (`missing` says which key): refused, unless
+/// `[section].allow_single_source = true` waives it, which logs a warning. Config load runs at
+/// every start, so the warning does too.
+fn require_second_source(section: &str, missing: &str, waived: bool) -> Result<()> {
+    if !waived {
+        bail!(
+            "{missing}: a mainnet [{section}] needs a second, independent source; set it, or set \
+             [{section}].allow_single_source = true to run on one source deliberately"
+        );
+    }
+    tracing::warn!(
+        "{missing}: mainnet [{section}] runs on a single source ([{section}].allow_single_source \
+         = true); one lying or broken endpoint is trusted for HTLC, confirmation and spend reads"
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -564,11 +1137,308 @@ key = "op://v/i/f"
 key = "credential:btc"
 "#;
 
+    /// `GOOD` with its `[btc]` section on mainnet (allowed), for tests that set
+    /// `profile = "mainnet"`: every live section must agree with the profile.
+    fn good_mainnet_btc_only() -> String {
+        GOOD.replace(
+            "[btc]\nkey",
+            "[btc]\nnetwork = \"mainnet\"\nallow_mainnet = true\nkey",
+        )
+    }
+
+    /// As [`good_mainnet_btc_only`], with `[divi]` on mainnet (allowed) too, and the second
+    /// DIVI endpoint a mainnet config needs.
+    fn good_mainnet_btc() -> String {
+        good_mainnet_btc_only().replace(
+            "[divi]\nkey",
+            "[divi]\nnetwork = \"mainnet\"\nallow_mainnet = true\n\
+             fallback_rpc_url = \"http://127.0.0.1:51473\"\nkey",
+        )
+    }
+
+    #[test]
+    fn btc_quorum_reads_are_off_by_default_and_need_two_endpoints() {
+        let b = DaemonConfig::parse(GOOD).unwrap().btc.unwrap();
+        assert!(!b.quorum_reads);
+        let with = |extra: &str| {
+            DaemonConfig::parse(&GOOD.replace("[btc]\n", &format!("[btc]\n{extra}\n")))
+        };
+        // The network's two defaults are a quorum.
+        assert!(
+            with("quorum_reads = true")
+                .unwrap()
+                .btc
+                .unwrap()
+                .quorum_reads
+        );
+        let two = "esplora_url = \"http://a:1\"\nfallback_esplora_url = \"http://b:2\"";
+        assert!(with(&format!("{two}\nquorum_reads = true")).is_ok());
+        // One endpoint, or the same one twice, is refused at load, naming both keys.
+        for one in [
+            "esplora_url = \"http://a:1\"",
+            "esplora_url = \"http://a:1\"\nfallback_esplora_url = \"http://a:1/\"",
+        ] {
+            let err = with(&format!("{one}\nquorum_reads = true"))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("[btc].quorum_reads") && err.contains("[btc].fallback_esplora_url"),
+                "{err}"
+            );
+            // Off, the same single endpoint is fine (failover only, as before).
+            assert!(with(one).is_ok());
+        }
+    }
+
+    #[test]
+    fn divi_expiry_start_is_tip_by_default_takes_mtp_and_refuses_anything_else() {
+        let d = DaemonConfig::parse(GOOD).unwrap().divi.unwrap();
+        assert_eq!(d.expiry_start().unwrap(), ExpiryStart::Tip);
+        let with = |value: &str| {
+            DaemonConfig::parse(
+                &GOOD.replace("[divi]\n", &format!("[divi]\nexpiry_start = \"{value}\"\n")),
+            )
+        };
+        let start = |value: &str| with(value).unwrap().divi.unwrap().expiry_start().unwrap();
+        assert_eq!(start("tip"), ExpiryStart::Tip);
+        assert_eq!(start("mtp"), ExpiryStart::Mtp);
+        for bad in ["median", "MTP", ""] {
+            let e = format!("{:#}", with(bad).unwrap_err());
+            assert!(e.contains("[divi].expiry_start"), "{bad:?}: {e}");
+        }
+    }
+
+    #[test]
+    fn btc_ltc_and_zec_expiry_start_are_tip_by_default_take_mtp_and_refuse_anything_else() {
+        let base =
+            format!("{GOOD}[ltc]\nkey = \"credential:ltc\"\n[zec]\nkey = \"credential:zec\"\n");
+        let cfg = DaemonConfig::parse(&base).unwrap();
+        assert_eq!(cfg.expiry_starts().unwrap(), ExpiryStarts::default());
+        for chain in [Chain::Btc, Chain::Ltc, Chain::Zec] {
+            assert_eq!(ExpiryStarts::default().of(chain), ExpiryStart::Tip);
+            let section = chain.to_string().to_lowercase();
+            let with = |value: &str| {
+                DaemonConfig::parse(&base.replace(
+                    &format!("[{section}]\n"),
+                    &format!("[{section}]\nexpiry_start = \"{value}\"\n"),
+                ))
+            };
+            for (value, start) in [("tip", ExpiryStart::Tip), ("mtp", ExpiryStart::Mtp)] {
+                let starts = with(value).unwrap().expiry_starts().unwrap();
+                assert_eq!(starts.of(chain), start, "[{section}] {value}");
+                for other in [Chain::Divi, Chain::Btc, Chain::Ltc, Chain::Zec] {
+                    if other != chain {
+                        assert_eq!(starts.of(other), ExpiryStart::Tip, "[{section}] {value}");
+                    }
+                }
+            }
+            for bad in ["median", "MTP", ""] {
+                let e = format!("{:#}", with(bad).unwrap_err());
+                assert!(
+                    e.contains(&format!("[{section}].expiry_start")),
+                    "[{section}] {bad:?}: {e}"
+                );
+            }
+        }
+        // USDC and XMR have no input reservations, so no key: always the default.
+        assert_eq!(ExpiryStarts::default().of(Chain::Usdc), ExpiryStart::Tip);
+    }
+
+    #[test]
+    fn divi_fallback_rpc_url_is_off_by_default_and_must_differ_from_the_primary() {
+        let d = DaemonConfig::parse(GOOD).unwrap().divi.unwrap();
+        assert_eq!(d.fallback_rpc_url().unwrap(), None);
+        let with = |extra: &str| {
+            DaemonConfig::parse(&GOOD.replace("[divi]\n", &format!("[divi]\n{extra}\n")))
+                .unwrap()
+                .divi
+                .unwrap()
+        };
+        let d = with("rpc_url = \"http://a:1\"\nfallback_rpc_url = \" http://b:2 \"");
+        assert_eq!(d.fallback_rpc_url().unwrap().as_deref(), Some("http://b:2"));
+        let d = with("fallback_rpc_url = \"  \"");
+        assert_eq!(d.fallback_rpc_url().unwrap(), None);
+        let d = with("rpc_url = \"http://a:1\"\nfallback_rpc_url = \"http://a:1\"");
+        assert!(d.fallback_rpc_url().is_err());
+    }
+
+    #[test]
+    fn usdc_fallback_rpc_url_is_off_by_default_and_must_differ_from_the_primary() {
+        let usdc = |extra: &str| {
+            DaemonConfig::parse(&format!(
+                "{GOOD}\n[usdc]\n{extra}\nhtlc = \"0x00\"\nkey = \"credential:usdc\"\n"
+            ))
+        };
+        let u = usdc("").unwrap().usdc.unwrap();
+        assert_eq!(u.fallback_rpc_url, None);
+        assert_eq!(u.fallback_rpc_url().unwrap(), None);
+        let u = usdc("fallback_rpc_url = \"  \"").unwrap().usdc.unwrap();
+        assert_eq!(u.fallback_rpc_url().unwrap(), None);
+        let u = usdc("rpc_url = \"http://a:1\"\nfallback_rpc_url = \" http://b:2 \"")
+            .unwrap()
+            .usdc
+            .unwrap();
+        assert_eq!(u.fallback_rpc_url().unwrap().as_deref(), Some("http://b:2"));
+        // The same node twice is refused at load, naming both keys: an explicit primary, and
+        // the network's default primary when `rpc_url` is unset.
+        let default = swap_chain_evm::UsdcNetwork::Sepolia.default_rpc_url();
+        for same in [
+            "rpc_url = \"http://a:1\"\nfallback_rpc_url = \" http://a:1/ \"".to_string(),
+            format!("fallback_rpc_url = \"{default}\""),
+        ] {
+            let err = usdc(&same).unwrap_err().to_string();
+            assert!(
+                err.contains("[usdc].fallback_rpc_url") && err.contains("[usdc].rpc_url"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn divi_section_defaults_to_testnet_and_its_rpc() {
+        let d = DaemonConfig::parse(GOOD).unwrap().divi.unwrap();
+        assert_eq!(d.network, "testnet");
+        assert!(!d.allow_mainnet);
+        assert_eq!(d.rpc_url().unwrap(), swap_chain_divi::TESTNET_RPC);
+        assert_eq!(d.rpc_url().unwrap(), default_divi_rpc());
+    }
+
+    #[test]
+    fn divi_mainnet_with_allow_and_matching_profile_is_ok_with_the_mainnet_default_rpc() {
+        let text = format!("profile = \"mainnet\"\n{}", good_mainnet_btc());
+        let d = DaemonConfig::parse(&text).unwrap().divi.unwrap();
+        assert!(d.allow_mainnet);
+        assert_eq!(d.network().unwrap(), divi_wallet::address::Network::Mainnet);
+        assert_eq!(d.rpc_url().unwrap(), swap_chain_divi::MAINNET_RPC);
+        // An explicit rpc_url wins over the network default.
+        let text = text.replace("[divi]\n", "[divi]\nrpc_url = \"http://localhost:9\"\n");
+        let d = DaemonConfig::parse(&text).unwrap().divi.unwrap();
+        assert_eq!(d.rpc_url().unwrap(), "http://localhost:9");
+    }
+
+    #[test]
+    fn divi_mainnet_without_allow_mainnet_is_rejected() {
+        let text = format!(
+            "profile = \"mainnet\"\n{}",
+            good_mainnet_btc().replace(
+                "[divi]\nnetwork = \"mainnet\"\nallow_mainnet = true\n",
+                "[divi]\nnetwork = \"mainnet\"\n"
+            )
+        );
+        let e = DaemonConfig::parse(&text).unwrap_err().to_string();
+        assert!(
+            e.contains("[divi].network = \"mainnet\": divi mainnet moves real money")
+                && e.contains("no mainnet without the explicit allow_mainnet"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn divi_bad_network_is_rejected() {
+        let text = GOOD.replace("[divi]\nkey", "[divi]\nnetwork = \"regtest\"\nkey");
+        let e = DaemonConfig::parse(&text).unwrap_err().to_string();
+        assert!(
+            e.contains("[divi].network must be testnet or mainnet"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn divi_mainnet_under_a_testnet_profile_is_rejected_even_with_allow() {
+        // btc on signet so the btc check passes first; the default profile is testnet.
+        let text = GOOD.replace(
+            "[divi]\nkey",
+            "[divi]\nnetwork = \"mainnet\"\nallow_mainnet = true\nkey",
+        );
+        let e = DaemonConfig::parse(&text).unwrap_err().to_string();
+        assert!(
+            e.contains("[divi].network = \"mainnet\" disagrees with profile = Testnet")
+                && e.contains("must run on the same network"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn divi_testnet_under_a_mainnet_profile_is_rejected() {
+        // The dangerous direction before this lane: real BTC, DIVI silently on testnet.
+        let text = format!("profile = \"mainnet\"\n{}", good_mainnet_btc_only());
+        let e = DaemonConfig::parse(&text).unwrap_err().to_string();
+        assert!(
+            e.contains("[divi].network = \"testnet\" disagrees with profile = Mainnet"),
+            "{e}"
+        );
+    }
+
     #[test]
     fn parses_and_normalises_prefix() {
         let c = DaemonConfig::parse(GOOD).unwrap();
         assert_eq!(c.prefix(), "/swap");
         assert_eq!(c.profile, Profile::Testnet);
+    }
+
+    /// A config from before `trusted_proxies` loads, with the loopback default and the flag
+    /// off (so no peer's headers are read).
+    #[test]
+    fn an_old_config_without_trusted_proxies_loads() {
+        let c = DaemonConfig::parse(GOOD).unwrap();
+        assert!(!c.trust_proxy_headers);
+        assert_eq!(c.trusted_proxies, crate::proxy::default_trusted_proxies());
+        assert!(!c.proxy_trust().trusts("127.0.0.1".parse().unwrap()));
+        let on = DaemonConfig::parse(&format!("trust_proxy_headers = true\n{GOOD}")).unwrap();
+        let t = on.proxy_trust();
+        assert!(t.trusts("127.0.0.1".parse().unwrap()) && t.trusts("::1".parse().unwrap()));
+        assert!(!t.trusts("203.0.113.9".parse().unwrap()));
+    }
+
+    #[test]
+    fn trusted_proxies_take_addresses_and_networks() {
+        let c = DaemonConfig::parse(&format!(
+            "trust_proxy_headers = true\ntrusted_proxies = [\"10.0.0.0/8\", \"192.0.2.7\", \"fd00::/8\"]\n{GOOD}"
+        ))
+        .unwrap();
+        let t = c.proxy_trust();
+        for (ip, trusted) in [
+            ("10.9.8.7", true),
+            ("192.0.2.7", true),
+            ("192.0.2.8", false),
+            ("fd12::1", true),
+            ("127.0.0.1", false),
+        ] {
+            assert_eq!(t.trusts(ip.parse().unwrap()), trusted, "{ip}");
+        }
+        for bad in ["\"10.0.0.1/8\"", "\"10.0.0.0/33\"", "\"nonsense\"", "8"] {
+            let err = DaemonConfig::parse(&format!("trusted_proxies = [{bad}]\n{GOOD}"));
+            assert!(err.is_err(), "{bad} accepted");
+        }
+    }
+
+    /// The example's commented proxy lines, uncommented, parse to the documented defaults.
+    #[test]
+    fn deploy_example_proxy_lines_parse_uncommented() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../deploy/divi-swapd/divi-swapd.toml.example");
+        let text = std::fs::read_to_string(path).unwrap();
+        let on = text
+            .replace("# trust_proxy_headers = true", "trust_proxy_headers = true")
+            .replace("# trusted_proxies = ", "trusted_proxies = ");
+        assert_ne!(on, text);
+        let c = DaemonConfig::parse(&on).unwrap();
+        assert!(c.trust_proxy_headers);
+        assert_eq!(c.trusted_proxies, crate::proxy::default_trusted_proxies());
+    }
+
+    /// Fails on 75c9b7c, which had no `trusted_proxies` (the key was ignored and the flag
+    /// alone trusted every peer).
+    #[test]
+    fn trust_proxy_headers_with_no_trusted_proxies_is_refused() {
+        let err = DaemonConfig::parse(&format!(
+            "trust_proxy_headers = true\ntrusted_proxies = []\n{GOOD}"
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("trusted_proxies"), "{err}");
+        // With the flag off an empty list is harmless: the headers are never read.
+        DaemonConfig::parse(&format!("trusted_proxies = []\n{GOOD}")).unwrap();
     }
 
     #[test]
@@ -577,6 +1447,8 @@ key = "credential:btc"
             .join("../../deploy/divi-swapd/divi-swapd.toml.example");
         let c = DaemonConfig::load(&path).unwrap();
         assert_eq!(c.listen.port(), 18480);
+        assert!(!c.trust_proxy_headers, "shipped commented out");
+        assert_eq!(c.trusted_proxies, crate::proxy::default_trusted_proxies());
         assert_eq!(c.prefix(), "");
         assert_eq!(c.offers[0].id, "divi-btc-testnet");
         let d = c.divi.unwrap();
@@ -588,7 +1460,10 @@ key = "credential:btc"
         assert!(b.fallback_esplora_url.is_some());
         let l = c.ltc.unwrap();
         assert_eq!(l.network, "testnet");
-        assert_eq!(l.esplora_url, swap_chain_ltc::LITECOINSPACE_TESTNET);
+        assert_eq!(
+            l.endpoints().unwrap()[0],
+            swap_chain_ltc::LITECOINSPACE_TESTNET
+        );
         // Reuses the BTC swap key (funding.md decision 64ae2a0); no maker-ltc item exists.
         assert_eq!(l.key, "credential:maker-btc");
         let ltc_ids: Vec<_> = c
@@ -770,6 +1645,24 @@ divi_fund_txids = ["ab"]
 "#;
 
     #[test]
+    fn xmr_section_without_wallet_rpc_keys_loads() {
+        let section = XMR_SECTION
+            .lines()
+            .filter(|l| !l.starts_with("wallet_rpc_"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let c = DaemonConfig::parse(&format!("{GOOD}{XMR}{section}")).unwrap();
+        let x = c.xmr.as_ref().unwrap();
+        assert!(x.wallet_rpc_url.is_none() && x.wallet_rpc_password.is_none());
+        assert!(x.wallet_rpc_user.is_empty());
+        // Keys that are present are still parsed and checked as before.
+        let c = DaemonConfig::parse(&format!("{GOOD}{XMR}{XMR_SECTION}")).unwrap();
+        let x = c.xmr.as_ref().unwrap();
+        assert_eq!(x.wallet_rpc_url.as_deref(), Some("http://127.0.0.1:38088"));
+        assert_eq!(x.wallet_rpc_user, "swap");
+    }
+
+    #[test]
     fn xmr_section_parses_with_defaults_and_rejects_raw_secrets() {
         let c = DaemonConfig::parse(&format!("{GOOD}{XMR}{XMR_SECTION}")).unwrap();
         let x = c.xmr.as_ref().unwrap();
@@ -817,6 +1710,536 @@ divi_fund_txids = ["ab"]
     }
 
     #[test]
+    fn btc_ltc_sections_default_to_test_networks_without_mainnet() {
+        let c = DaemonConfig::parse(&format!("{GOOD}\n[ltc]\nkey = \"credential:btc\"\n")).unwrap();
+        let b = c.btc.unwrap();
+        assert_eq!(b.network, "signet");
+        assert!(
+            !b.allow_mainnet,
+            "mainnet must stay off unless the config says so"
+        );
+        let l = c.ltc.unwrap();
+        assert_eq!(l.network, "testnet");
+        assert!(!l.allow_mainnet);
+    }
+
+    #[test]
+    fn btc_ltc_mainnet_without_allow_is_rejected() {
+        for section in ["btc", "ltc"] {
+            let text = if section == "btc" {
+                "[btc]\nnetwork = \"mainnet\"\nkey = \"credential:btc\"\n".to_string()
+            } else {
+                format!("{GOOD}\n[ltc]\nnetwork = \"mainnet\"\nkey = \"credential:btc\"\n")
+            };
+            let text = if section == "btc" {
+                GOOD.replace("[btc]\nkey = \"credential:btc\"\n", &text)
+            } else {
+                text
+            };
+            let e = DaemonConfig::parse(&text).unwrap_err();
+            assert!(
+                e.to_string()
+                    .contains("no mainnet without the explicit allow_mainnet"),
+                "{section}: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn btc_ltc_mainnet_with_allow_and_matching_profile_is_ok_with_crate_default_endpoints() {
+        let text = format!(
+            "profile = \"mainnet\"\n{}\n[ltc]\nnetwork = \"mainnet\"\nallow_mainnet = true\n\
+             key = \"credential:btc\"\ncrosscheck = \"blockbook\"\n",
+            good_mainnet_btc()
+        );
+        let c = DaemonConfig::parse(&text).unwrap();
+        let b = c.btc.unwrap();
+        assert!(b.allow_mainnet);
+        assert_eq!(b.endpoints().unwrap()[0], "https://mempool.space/api");
+        let l = c.ltc.unwrap();
+        assert_eq!(
+            l.endpoints().unwrap(),
+            vec!["https://litecoinspace.org/api"]
+        );
+    }
+
+    #[test]
+    fn ltc_crosscheck_defaults_off_and_is_mainnet_only() {
+        let c = DaemonConfig::parse(&format!("{GOOD}\n[ltc]\nkey = \"credential:btc\"\n")).unwrap();
+        assert_eq!(c.ltc.unwrap().crosscheck_source().unwrap(), None);
+        // Testnet refuses any source at config load (no testnet source is verified).
+        for src in ["blockbook", "blockcypher"] {
+            let text = format!("{GOOD}\n[ltc]\nkey = \"credential:btc\"\ncrosscheck = \"{src}\"\n");
+            let e = DaemonConfig::parse(&text).unwrap_err();
+            assert!(
+                e.to_string().contains("[ltc].crosscheck is mainnet-only"),
+                "{e}"
+            );
+        }
+        // `off` is fine on testnet; an unknown value is refused anywhere.
+        let ok = format!("{GOOD}\n[ltc]\nkey = \"credential:btc\"\ncrosscheck = \"off\"\n");
+        DaemonConfig::parse(&ok).unwrap();
+        let bad = format!("{GOOD}\n[ltc]\nkey = \"credential:btc\"\ncrosscheck = \"esplora\"\n");
+        let e = DaemonConfig::parse(&bad).unwrap_err();
+        assert!(e.to_string().contains("[ltc].crosscheck"), "{e}");
+    }
+
+    #[test]
+    fn ltc_crosscheck_is_accepted_on_mainnet() {
+        for (src, want) in [
+            ("blockbook", swap_chain_ltc::CrossCheckSource::Blockbook),
+            ("blockcypher", swap_chain_ltc::CrossCheckSource::BlockCypher),
+        ] {
+            let text = format!(
+                "profile = \"mainnet\"\n{}\n[ltc]\nnetwork = \"mainnet\"\nallow_mainnet = true\n\
+                 key = \"credential:btc\"\ncrosscheck = \"{src}\"\n",
+                good_mainnet_btc()
+            );
+            let c = DaemonConfig::parse(&text).unwrap();
+            assert_eq!(c.ltc.unwrap().crosscheck_source().unwrap(), Some(want));
+        }
+    }
+
+    #[test]
+    fn ltc_crosscheck_before_claim_defaults_off_and_needs_a_source() {
+        let c = DaemonConfig::parse(&mainnet_with_ltc(
+            &good_mainnet_btc(),
+            "crosscheck = \"blockbook\"\n",
+        ))
+        .unwrap();
+        assert!(!c.ltc.unwrap().crosscheck_before_claim);
+        let c = DaemonConfig::parse(&mainnet_with_ltc(
+            &good_mainnet_btc(),
+            "crosscheck = \"blockcypher\"\ncrosscheck_before_claim = true\n",
+        ))
+        .unwrap();
+        assert!(c.ltc.unwrap().crosscheck_before_claim);
+        // On with the source off is refused, naming both keys, waiver or not, on any network.
+        for text in [
+            mainnet_with_ltc(
+                &good_mainnet_btc(),
+                "crosscheck = \"off\"\nallow_single_source = true\ncrosscheck_before_claim = true\n",
+            ),
+            format!("{GOOD}\n[ltc]\nkey = \"credential:btc\"\ncrosscheck_before_claim = true\n"),
+        ] {
+            let e = DaemonConfig::parse(&text).unwrap_err().to_string();
+            assert!(
+                e.contains("[ltc].crosscheck_before_claim") && e.contains("[ltc].crosscheck "),
+                "{e}"
+            );
+        }
+    }
+
+    #[test]
+    fn ltc_dual_broadcast_needs_two_different_endpoints() {
+        let ltc = |extra: &str| {
+            DaemonConfig::parse(&format!(
+                "{GOOD}\n[ltc]\nkey = \"credential:btc\"\n{extra}\n"
+            ))
+        };
+        assert!(!ltc("").unwrap().ltc.unwrap().dual_broadcast);
+        let two = "esplora_url = \"http://a:1\"\nfallback_esplora_url = \"http://b:2\"";
+        assert!(
+            ltc(&format!("{two}\ndual_broadcast = true"))
+                .unwrap()
+                .ltc
+                .unwrap()
+                .dual_broadcast
+        );
+        // The network's one default, one endpoint, or the same one twice is refused at load,
+        // naming both keys; off, each is fine (failover only, as before).
+        for one in [
+            "",
+            "esplora_url = \"http://a:1\"",
+            "esplora_url = \"http://a:1\"\nfallback_esplora_url = \"http://a:1/\"",
+        ] {
+            let err = ltc(&format!("{one}\ndual_broadcast = true"))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("[ltc].dual_broadcast") && err.contains("[ltc].fallback_esplora_url"),
+                "{err}"
+            );
+            assert!(ltc(one).is_ok());
+        }
+    }
+
+    #[test]
+    fn btc_ltc_network_disagreeing_with_profile_is_rejected() {
+        // Default profile is testnet; an allowed mainnet section still disagrees.
+        let text = GOOD.replace(
+            "[btc]\nkey",
+            "[btc]\nnetwork = \"mainnet\"\nallow_mainnet = true\nkey",
+        );
+        let e = DaemonConfig::parse(&text).unwrap_err();
+        assert!(e.to_string().contains("disagrees with profile"), "{e}");
+        // Reverse: mainnet profile with a test-network [ltc] section.
+        let text = format!("profile = \"mainnet\"\n{GOOD}\n[ltc]\nkey = \"credential:btc\"\n");
+        let e = DaemonConfig::parse(&text).unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("[btc].network = \"signet\" disagrees with profile"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn btc_ltc_bad_network_is_rejected() {
+        let regtest = GOOD.replace("[btc]\nkey", "[btc]\nnetwork = \"regtest\"\nkey");
+        assert_eq!(
+            DaemonConfig::parse(&regtest).unwrap().btc.unwrap().network,
+            "regtest"
+        );
+        let text = GOOD.replace("[btc]\nkey", "[btc]\nnetwork = \"testnet4\"\nkey");
+        let e = DaemonConfig::parse(&text).unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("[btc].network must be signet, testnet, regtest or mainnet"),
+            "{e}"
+        );
+        let text = format!("{GOOD}\n[ltc]\nnetwork = \"signet\"\nkey = \"credential:btc\"\n");
+        let e = DaemonConfig::parse(&text).unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("[ltc].network must be testnet or mainnet"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn zec_section_defaults_to_testnet() {
+        let text = format!("{GOOD}\n[zec]\nkey = \"credential:maker-btc\"\n");
+        let c = DaemonConfig::parse(&text).unwrap();
+        let z = c.zec.unwrap();
+        assert_eq!(z.network, "testnet");
+        assert!(
+            !z.allow_mainnet,
+            "mainnet must stay off unless the config says so"
+        );
+        assert!(z.lightwalletd_url.is_none());
+    }
+
+    #[test]
+    fn zec_mainnet_without_allow_is_rejected() {
+        let text =
+            format!("{GOOD}\n[zec]\nnetwork = \"mainnet\"\nkey = \"credential:maker-btc\"\n");
+        let e = DaemonConfig::parse(&text).unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("no mainnet without the explicit allow_mainnet"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn zec_mainnet_with_allow_and_matching_profile_is_ok() {
+        // `profile` is a bare top-level key: it must come before GOOD's first `[table]`
+        // header, or TOML scopes it into GOOD's last section ([btc]) instead.
+        let text = format!(
+            "profile = \"mainnet\"\n{}\n[zec]\nnetwork = \"mainnet\"\nallow_mainnet = true\n\
+             key = \"credential:maker-btc\"\n{ZEC_SECOND}",
+            good_mainnet_btc()
+        );
+        let c = DaemonConfig::parse(&text).unwrap();
+        let z = c.zec.unwrap();
+        assert_eq!(z.network, "mainnet");
+        assert!(z.allow_mainnet);
+    }
+
+    const USDC_KEY: &str =
+        "key = \"credential:maker-usdc\"\nhtlc = \"0x1111111111111111111111111111111111111111\"\n";
+
+    #[test]
+    fn usdc_section_defaults_to_sepolia_with_mainnet_off() {
+        let c = DaemonConfig::parse(&format!("{GOOD}\n[usdc]\n{USDC_KEY}")).unwrap();
+        let u = c.usdc.unwrap();
+        assert_eq!(u.network, "sepolia");
+        assert!(
+            !u.allow_mainnet,
+            "mainnet must stay off unless the config says so"
+        );
+        assert!(!u.network().unwrap().is_mainnet());
+    }
+
+    #[test]
+    fn usdc_mainnet_without_allow_is_rejected() {
+        for net in ["ethereum", "base"] {
+            // Even with the matching profile: the opt-in is a separate gate.
+            let text = format!(
+                "profile = \"mainnet\"\n{}\n[usdc]\nnetwork = \"{net}\"\n{USDC_KEY}",
+                good_mainnet_btc()
+            );
+            let e = DaemonConfig::parse(&text).unwrap_err();
+            assert!(
+                e.to_string()
+                    .contains("no mainnet without the explicit allow_mainnet"),
+                "{net}: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn usdc_mainnet_with_allow_and_matching_profile_is_ok() {
+        for net in ["ethereum", "base"] {
+            let text = format!(
+                "profile = \"mainnet\"\n{}\n[usdc]\nnetwork = \"{net}\"\n\
+                 allow_mainnet = true\n{USDC_KEY}",
+                good_mainnet_btc()
+            );
+            let u = DaemonConfig::parse(&text).unwrap().usdc.unwrap();
+            assert_eq!(u.network, net);
+            assert!(u.allow_mainnet && u.network().unwrap().is_mainnet());
+        }
+    }
+
+    #[test]
+    fn usdc_mainnet_disagreeing_with_profile_is_rejected() {
+        for net in ["ethereum", "base"] {
+            // Default profile is testnet; an allowed mainnet [usdc] section disagrees.
+            let text =
+                format!("{GOOD}\n[usdc]\nnetwork = \"{net}\"\nallow_mainnet = true\n{USDC_KEY}");
+            let e = DaemonConfig::parse(&text).unwrap_err();
+            assert!(
+                e.to_string().contains("disagrees with profile"),
+                "{net}: {e}"
+            );
+        }
+    }
+
+    /// A second lightwalletd operator for a mainnet `[zec]` section.
+    const ZEC_SECOND: &str = "crosscheck_url = \"https://lwd.other-operator.net:9067\"\n";
+
+    fn mainnet_zec(extra: &str) -> String {
+        format!(
+            "profile = \"mainnet\"\n{}\n[zec]\nnetwork = \"mainnet\"\nallow_mainnet = true\n\
+             key = \"credential:maker-btc\"\n{extra}",
+            good_mainnet_btc()
+        )
+    }
+
+    #[test]
+    fn zec_crosscheck_url_defaults_off_and_parses() {
+        let c = DaemonConfig::parse(&format!("{GOOD}\n[zec]\nkey = \"credential:maker-btc\"\n"))
+            .unwrap();
+        let z = c.zec.unwrap();
+        assert_eq!(z.crosscheck_url, None);
+        assert!(!z.allow_single_source);
+        let c = DaemonConfig::parse(&format!(
+            "{GOOD}\n[zec]\nkey = \"credential:maker-btc\"\n{ZEC_SECOND}"
+        ))
+        .unwrap();
+        assert_eq!(
+            c.zec.unwrap().crosscheck_url.as_deref(),
+            Some("https://lwd.other-operator.net:9067")
+        );
+        DaemonConfig::parse(&mainnet_zec(ZEC_SECOND)).unwrap();
+    }
+
+    #[test]
+    fn zec_crosscheck_url_of_a_primary_operator_is_refused() {
+        // Testnet, explicit primaries; and mainnet on the zec.rocks defaults.
+        let testnet = format!(
+            "{GOOD}\n[zec]\nkey = \"credential:maker-btc\"\n\
+             lightwalletd_url = \"https://na.zec.rocks:443\"\n\
+             crosscheck_url = \"https://eu.zec.rocks:443\"\n"
+        );
+        let mainnet = mainnet_zec("crosscheck_url = \"https://zec.rocks:9067\"\n");
+        for text in [testnet, mainnet] {
+            let e = DaemonConfig::parse(&text).unwrap_err().to_string();
+            assert!(e.contains("[zec].crosscheck_url"), "{e}");
+            assert!(e.contains("zec.rocks"), "{e}");
+        }
+        let bad = format!(
+            "{GOOD}\n[zec]\nkey = \"credential:maker-btc\"\ncrosscheck_url = \"not a url\"\n"
+        );
+        let e = DaemonConfig::parse(&bad).unwrap_err().to_string();
+        assert!(e.contains("[zec].crosscheck_url"), "{e}");
+    }
+
+    #[test]
+    fn zec_mainnet_without_a_second_operator_is_refused_naming_the_key() {
+        for extra in [
+            "",
+            "lightwalletd_url = \"https://zec.rocks:443\"\n\
+             fallback_lightwalletd_url = \"https://na.zec.rocks:443\"\n",
+        ] {
+            let e = DaemonConfig::parse(&mainnet_zec(extra))
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("[zec].crosscheck_url"), "{extra:?}: {e}");
+            assert!(e.contains("allow_single_source"), "{extra:?}: {e}");
+        }
+        // The endpoint list already naming another operator, or the explicit waiver, starts.
+        for extra in [
+            "lightwalletd_url = \"https://zec.rocks:443\"\n\
+             fallback_lightwalletd_url = \"https://lwd.other-operator.net:9067\"\n",
+            "allow_single_source = true\n",
+        ] {
+            DaemonConfig::parse(&mainnet_zec(extra)).unwrap();
+        }
+        // Testnet stays as today: one operator is fine.
+        DaemonConfig::parse(&format!("{GOOD}\n[zec]\nkey = \"credential:maker-btc\"\n")).unwrap();
+    }
+
+    /// The ZEC second-operator rule, case for case, in the daemon (a refusal unless waived) and
+    /// in the taker CLI (a warning, `divi_swap_cli::sources::check_zec`): one table over both.
+    #[test]
+    fn zec_second_operator_rule_is_the_same_in_the_daemon_and_the_taker_cli() {
+        const OTHER: &str = "https://lwd.other-operator.net:9067";
+        const ROCKS: &str = "https://zec.rocks:443";
+        // (mainnet, lightwalletd_url, fallback_lightwalletd_url, crosscheck_url, verdict)
+        type Case<'a> = (
+            bool,
+            Option<&'a str>,
+            Option<&'a str>,
+            Option<&'a str>,
+            &'a str,
+        );
+        let cases: [Case; 13] = [
+            (true, None, None, None, "single"),
+            (
+                true,
+                Some(ROCKS),
+                Some("https://na.zec.rocks:443"),
+                None,
+                "single",
+            ),
+            (true, Some(ROCKS), None, None, "single"),
+            (true, Some("http://127.0.0.1:9067"), None, None, "single"),
+            (
+                true,
+                Some("https://lwd.example.co.uk:9067"),
+                Some("https://b.example.co.uk:9067"),
+                None,
+                "single",
+            ),
+            (true, Some(ROCKS), Some(OTHER), None, "ok"),
+            (
+                true,
+                Some("https://lwd.a.co.uk:9067"),
+                Some("https://lwd.b.co.uk:9067"),
+                None,
+                "ok",
+            ),
+            (true, None, None, Some(OTHER), "ok"),
+            (true, None, None, Some("https://zec.rocks:9067"), "refused"),
+            (true, None, None, Some("not a url"), "refused"),
+            (false, None, None, None, "ok"),
+            (false, None, None, Some(OTHER), "ok"),
+            (
+                false,
+                Some("https://na.zec.rocks:443"),
+                None,
+                Some("https://eu.zec.rocks:443"),
+                "refused",
+            ),
+        ];
+        for (mainnet, primary, fallback, crosscheck, want) in cases {
+            let case = format!("{mainnet} {primary:?} {fallback:?} {crosscheck:?}");
+            let mut extra = String::new();
+            for (key, v) in [
+                ("lightwalletd_url", primary),
+                ("fallback_lightwalletd_url", fallback),
+                ("crosscheck_url", crosscheck),
+            ] {
+                if let Some(v) = v {
+                    extra.push_str(&format!("{key} = \"{v}\"\n"));
+                }
+            }
+            let text = if mainnet {
+                mainnet_zec(&extra)
+            } else {
+                format!("{GOOD}\n[zec]\nkey = \"credential:maker-btc\"\n{extra}")
+            };
+            let daemon = match DaemonConfig::parse(&text) {
+                Ok(_) => "ok",
+                Err(e) if e.to_string().contains("allow_single_source") => "single",
+                Err(e) if e.to_string().contains("[zec].crosscheck_url") => "refused",
+                Err(e) => panic!("{case}: {e}"),
+            };
+            let primaries = match primary {
+                Some(p) => std::iter::once(p)
+                    .chain(fallback)
+                    .map(String::from)
+                    .collect(),
+                None => swap_chain_zec::lightwalletd_endpoints(if mainnet {
+                    "mainnet"
+                } else {
+                    "testnet"
+                })
+                .unwrap(),
+            };
+            let cli = match divi_swap_cli::sources::check_zec(mainnet, &primaries, crosscheck) {
+                Ok(None) => "ok",
+                Ok(Some(w)) => {
+                    assert!(w.contains(&primaries[0]), "{case}: {w}");
+                    "single"
+                }
+                Err(_) => "refused",
+            };
+            assert_eq!(daemon, want, "daemon: {case}");
+            assert_eq!(cli, want, "taker cli: {case}");
+        }
+    }
+
+    #[test]
+    fn zec_bad_network_is_rejected() {
+        let text =
+            format!("{GOOD}\n[zec]\nnetwork = \"regtest\"\nkey = \"credential:maker-btc\"\n");
+        let e = DaemonConfig::parse(&text).unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("[zec].network must be testnet or mainnet"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn zec_network_disagreeing_with_profile_is_rejected() {
+        // Default profile is testnet; a mainnet [zec] section (even allowed) disagrees.
+        let text = format!(
+            "{GOOD}\n[zec]\nnetwork = \"mainnet\"\nallow_mainnet = true\n\
+             key = \"credential:maker-btc\"\n"
+        );
+        let e = DaemonConfig::parse(&text).unwrap_err();
+        assert!(e.to_string().contains("disagrees with profile"), "{e}");
+        // And the reverse: mainnet profile with a testnet [zec] section.
+        let text =
+            format!("profile = \"mainnet\"\n{GOOD}\n[zec]\nkey = \"credential:maker-btc\"\n");
+        let e = DaemonConfig::parse(&text).unwrap_err();
+        assert!(e.to_string().contains("disagrees with profile"), "{e}");
+    }
+
+    #[test]
+    fn zec_absent_lightwalletd_url_resolves_networks_probed_defaults() {
+        let text = format!(
+            "profile = \"mainnet\"\n{}\n[zec]\nnetwork = \"mainnet\"\nallow_mainnet = true\n\
+             key = \"credential:maker-btc\"\n{ZEC_SECOND}",
+            good_mainnet_btc()
+        );
+        let c = DaemonConfig::parse(&text).unwrap();
+        let eps = c.zec.unwrap().endpoints().unwrap();
+        assert!(!eps.is_empty());
+        assert_eq!(eps[0], "https://zec.rocks:443");
+
+        let t = DaemonConfig::parse(&format!("{GOOD}\n[zec]\nkey = \"credential:maker-btc\"\n"))
+            .unwrap();
+        let eps = t.zec.unwrap().endpoints().unwrap();
+        assert_eq!(eps, vec![swap_chain_zec::TESTNET_LIGHTWALLETD.to_string()]);
+    }
+
+    #[test]
+    fn zec_explicit_lightwalletd_url_stays_primary_with_fallback_after() {
+        let text = format!(
+            "{GOOD}\n[zec]\nlightwalletd_url = \"https://primary:443\"\n\
+             fallback_lightwalletd_url = \"https://fallback:443\"\nkey = \"credential:maker-btc\"\n"
+        );
+        let c = DaemonConfig::parse(&text).unwrap();
+        let eps = c.zec.unwrap().endpoints().unwrap();
+        assert_eq!(eps, vec!["https://primary:443", "https://fallback:443"]);
+    }
+
+    #[test]
     fn wave4_snippet_on_the_deployed_config() {
         // What dnsdivi runs today (pre-counter-chain BTC pair) + the wave-4 append.
         let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/divi-swapd");
@@ -844,7 +2267,10 @@ divi_fund_txids = ["ab"]
         );
         assert_eq!(c.disabled_offers, ["divi-zec-testnet", "zec-divi-testnet"]);
         let l = c.ltc.as_ref().unwrap();
-        assert_eq!(l.esplora_url, swap_chain_ltc::LITECOINSPACE_TESTNET);
+        assert_eq!(
+            l.endpoints().unwrap()[0],
+            swap_chain_ltc::LITECOINSPACE_TESTNET
+        );
         assert_eq!(l.key, "credential:maker-btc");
         assert!(c.zec.is_some() && !c.serves(Chain::Zec));
         assert!(c.usdc.is_none(), "wave 4 does not touch usdc");
@@ -945,6 +2371,66 @@ divi_fund_txids = ["ab"]
     fn rejects_raw_key_values() {
         let bad = GOOD.replace("op://v/i/f", "deadbeefdeadbeef");
         assert!(DaemonConfig::parse(&bad).is_err());
+    }
+
+    #[test]
+    fn xmr_testnet_profile_with_mainnet_network_is_rejected() {
+        // The dangerous direction: real XMR under testnet timeouts, even with the opt-in.
+        let section = XMR_SECTION.replace(
+            "[xmr]\n",
+            "[xmr]\nnetwork = \"mainnet\"\nallow_mainnet = true\n",
+        );
+        let e = DaemonConfig::parse(&format!("{GOOD}{XMR}{section}")).unwrap_err();
+        let e = e.to_string();
+        assert!(
+            e.contains("profile = \"testnet\" but [xmr].network = \"mainnet\"")
+                && e.contains("real funds under testnet timeouts are refused"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn xmr_mainnet_profile_with_stagenet_or_without_allow_is_rejected() {
+        let text = format!(
+            "profile = \"mainnet\"\n{}{XMR}{XMR_SECTION}",
+            good_mainnet_btc()
+        );
+        let e = DaemonConfig::parse(&text).unwrap_err().to_string();
+        assert!(
+            e.contains("profile = \"mainnet\" but [xmr].network = \"stagenet\"")
+                && e.contains("mainnet profile with a test network is refused"),
+            "{e}"
+        );
+        let section = XMR_SECTION.replace("[xmr]\n", "[xmr]\nnetwork = \"mainnet\"\n");
+        let text = format!(
+            "profile = \"mainnet\"\n{}{XMR}{section}",
+            good_mainnet_btc()
+        );
+        let e = DaemonConfig::parse(&text).unwrap_err().to_string();
+        assert!(e.contains("[xmr].allow_mainnet is not set"), "{e}");
+        // All agree: accepted.
+        let section = XMR_SECTION.replace(
+            "[xmr]\n",
+            "[xmr]\nnetwork = \"mainnet\"\nallow_mainnet = true\n",
+        );
+        let text = format!(
+            "profile = \"mainnet\"\n{}{XMR}{section}",
+            good_mainnet_btc()
+        );
+        DaemonConfig::parse(&text).unwrap();
+    }
+
+    #[test]
+    fn usdc_test_network_under_mainnet_profile_is_rejected() {
+        let text = format!(
+            "profile = \"mainnet\"\n{}\n[usdc]\nhtlc = \"0x00\"\nkey = \"credential:usdc\"\n",
+            good_mainnet_btc()
+        );
+        let e = DaemonConfig::parse(&text).unwrap_err().to_string();
+        assert!(
+            e.contains("profile = \"mainnet\" but [usdc].network = \"sepolia\""),
+            "{e}"
+        );
     }
 
     #[test]
@@ -1077,5 +2563,130 @@ divi_fund_txids = ["ab"]
         let s = c.swap_config().unwrap();
         assert_eq!(s.taker_timeout_secs, 14410);
         assert_eq!(s.maker_timeout_secs, 3600);
+    }
+
+    /// A mainnet config with `[ltc]` on mainnet and the given extra `[ltc]` lines.
+    fn mainnet_with_ltc(divi: &str, ltc_extra: &str) -> String {
+        format!(
+            "profile = \"mainnet\"\n{divi}\n[ltc]\nnetwork = \"mainnet\"\nallow_mainnet = true\n\
+             key = \"credential:btc\"\n{ltc_extra}"
+        )
+    }
+
+    /// Parses `text` with a capturing log subscriber; returns the result and the log text.
+    fn parse_logged(text: &str) -> (Result<DaemonConfig>, String) {
+        #[derive(Clone)]
+        struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf(Default::default());
+        let w = buf.clone();
+        let sub = tracing_subscriber::fmt()
+            .with_writer(move || w.clone())
+            .with_ansi(false)
+            .finish();
+        let r = tracing::subscriber::with_default(sub, || DaemonConfig::parse(text));
+        let log = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        (r, log)
+    }
+
+    #[test]
+    fn mainnet_ltc_with_crosscheck_off_or_absent_is_refused_naming_the_key() {
+        for extra in ["", "crosscheck = \"off\"\n"] {
+            let text = mainnet_with_ltc(&good_mainnet_btc(), extra);
+            let e = DaemonConfig::parse(&text).unwrap_err().to_string();
+            assert!(
+                e.contains("[ltc].crosscheck") && e.contains("allow_single_source"),
+                "{extra:?}: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn mainnet_divi_without_a_fallback_is_refused_naming_the_key() {
+        let no_fallback =
+            good_mainnet_btc().replace("fallback_rpc_url = \"http://127.0.0.1:51473\"\n", "");
+        let blank = good_mainnet_btc().replace("\"http://127.0.0.1:51473\"", "\"  \"");
+        for divi in [no_fallback, blank] {
+            let text = format!("profile = \"mainnet\"\n{divi}");
+            let e = DaemonConfig::parse(&text).unwrap_err().to_string();
+            assert!(
+                e.contains("[divi].fallback_rpc_url") && e.contains("allow_single_source"),
+                "{e}"
+            );
+        }
+    }
+
+    #[test]
+    fn allow_single_source_lets_a_mainnet_config_start_and_warns() {
+        // DIVI without a fallback, waived in [divi].
+        let divi = good_mainnet_btc().replace(
+            "fallback_rpc_url = \"http://127.0.0.1:51473\"\n",
+            "allow_single_source = true\n",
+        );
+        let (r, log) = parse_logged(&format!("profile = \"mainnet\"\n{divi}"));
+        r.unwrap();
+        assert!(
+            log.contains("WARN")
+                && log.contains("[divi].fallback_rpc_url")
+                && log.contains("allow_single_source"),
+            "{log}"
+        );
+        // LTC crosscheck off, waived in [ltc]; the DIVI fallback is set, so only LTC warns.
+        let (r, log) = parse_logged(&mainnet_with_ltc(
+            &good_mainnet_btc(),
+            "allow_single_source = true\n",
+        ));
+        r.unwrap();
+        assert!(
+            log.contains("WARN") && log.contains("[ltc].crosscheck"),
+            "{log}"
+        );
+        assert!(!log.contains("[divi].fallback_rpc_url"), "{log}");
+        // A waiver in one section does not cover the other.
+        let text = mainnet_with_ltc(&divi, "");
+        let e = DaemonConfig::parse(&text).unwrap_err().to_string();
+        assert!(e.contains("[ltc].crosscheck"), "{e}");
+        // Both sources present: no warning, waiver or not.
+        let (r, log) = parse_logged(&mainnet_with_ltc(
+            &good_mainnet_btc(),
+            "crosscheck = \"blockcypher\"\nallow_single_source = true\n",
+        ));
+        r.unwrap();
+        assert!(!log.contains("allow_single_source"), "{log}");
+    }
+
+    #[test]
+    fn testnet_configs_without_either_source_still_load_without_a_warning() {
+        let (r, log) = parse_logged(&format!("{GOOD}\n[ltc]\nkey = \"credential:btc\"\n"));
+        let c = r.unwrap();
+        assert_eq!(c.profile, Profile::Testnet);
+        assert_eq!(c.divi.unwrap().fallback_rpc_url().unwrap(), None);
+        assert_eq!(c.ltc.unwrap().crosscheck_source().unwrap(), None);
+        assert!(!log.contains("allow_single_source"), "{log}");
+    }
+
+    #[test]
+    fn deploy_example_documents_the_mainnet_two_source_keys() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../deploy/divi-swapd/divi-swapd.toml.example");
+        let text = std::fs::read_to_string(&path).unwrap();
+        DaemonConfig::parse(&text).unwrap();
+        // Both sections name the mainnet requirement and the waiver.
+        for section in ["[divi]", "[ltc]"] {
+            let body = text.split(&format!("\n{section}\n")).nth(1).unwrap();
+            let body = body.split("\n[").next().unwrap();
+            assert!(
+                body.contains("allow_single_source") && body.contains("required on mainnet"),
+                "{section}: {body}"
+            );
+        }
     }
 }

@@ -13,11 +13,13 @@
 
 mod observe;
 mod rpc;
+mod second_source;
 mod wallet;
 
 pub use observe::{CryptoidObserver, RpcObserver, CRYPTOID};
 
 pub use rpc::{classify_broadcast_error, BroadcastClass, RetryPolicy, RpcClient, RpcError};
+pub use second_source::{CONFIRMATION_TOLERANCE, MTP_TOLERANCE_SECS, TIP_TOLERANCE_BLOCKS};
 pub use wallet::{Utxo, Wallet};
 
 use std::time::Duration;
@@ -35,9 +37,10 @@ use divi_script::{verify_input, SigHashType};
 use divi_swap::htlc::{
     claim_script_sig, push_data, refund_script_sig, HtlcParams, REFUND_SEQUENCE,
 };
+use divi_swap::observer::{Observer, TwoSource};
 use divi_swap::{
-    Amount, Chain, ChainBackend, Funding, LockedOutput, Outpoint, Result, SignedTx, SpendInfo,
-    SwapError, Txid,
+    Amount, Chain, ChainBackend, Funding, InputReservations, LockedOutput, Outpoint, Result,
+    SignedTx, SpendInfo, SwapError, Txid,
 };
 use divi_wallet::address::{Address, Network};
 use divi_wallet::signer::sighash;
@@ -47,18 +50,44 @@ use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use divi_swap::observer::{Observer, TwoSource};
-
-/// Public RPC proxy for Divi mainnet (operator-run: pair it with a second source).
-pub const MAINNET_RPC: &str = "https://services.divi.domains/api/rpc/";
-
 /// Public RPC proxy for Divi testnet.
 pub const TESTNET_RPC: &str = "https://services.divi.domains/api/testnet/rpc/";
+
+/// Public RPC proxy for Divi mainnet (operator-run: pair it with a second source). Note the
+/// path has no `/mainnet/` segment (`/api/mainnet/rpc/` is a 404); `getblockchaininfo` answers
+/// `chain = "main"`.
+pub const MAINNET_RPC: &str = "https://services.divi.domains/api/rpc/";
+
+/// The default public RPC proxy for `network` (regtest has none; it uses the testnet one).
+pub fn default_rpc(network: Network) -> &'static str {
+    match network {
+        Network::Mainnet => MAINNET_RPC,
+        Network::Testnet | Network::Regtest => TESTNET_RPC,
+    }
+}
 
 /// Outputs below this are not worth creating; the remainder goes to fees instead.
 const DUST: u64 = 10_000;
 /// Size of a DER signature + sighash byte used while estimating fees.
 const SIG_LEN_EST: usize = 72;
+/// DIVI's target block spacing in seconds (`nTargetSpacing`; `target_spacing: 60` in
+/// `divi-storage`'s `DifficultyParams`, from `chainparams.cpp`), for the expiry sweep's
+/// freshness check.
+pub const TARGET_BLOCK_SECS: u32 = 60;
+
+/// DIVI Core's default relay minimum, satoshis per 1000 bytes (ab3bf31
+/// `divi/src/defaultValues.h:38` `DEFAULT_TX_RELAY_FEE_PER_KILOBYTE`). A mempool admits a
+/// transaction paying less only on coin-age priority (`MempoolConsensus.cpp:236-266`
+/// `CheckFeesPaidAreAcceptable`).
+pub const RELAY_FEE_PER_KB: u64 = 10_000;
+/// A maker-leg claim pays at least this many times [`RELAY_FEE_PER_KB`] for its size,
+/// whatever the [`FeePolicy`]. DIVI cannot bump a claim (replacement is disabled and block
+/// assembly ignores packages, ab3bf31 `MempoolConsensus.cpp:303-313`,
+/// `BlockMemoryPoolTransactionCollector.cpp:66-83,110-119`), so the first claim must clear
+/// a node whose operator raised `-minimumRelayTransactionFee` and still sort ahead of
+/// transactions paying the minimum. 10 leaves an order of magnitude for both; the default
+/// policy pays about 100.
+pub const CLAIM_FEE_FACTOR: u64 = 10;
 
 /// Fee policy: `max(min_fee, rate * size / 1000)`, in satoshis.
 #[derive(Debug, Clone, Copy)]
@@ -89,12 +118,18 @@ impl FeePolicy {
 /// `ChainBackend` for DIVI over the JSON-RPC proxy, holding one engine key.
 pub struct DiviBackend {
     rpc: RpcClient,
+    /// Optional second endpoint (`[divi].fallback_rpc_url`). When set, every swap-relevant
+    /// read is made on both and a disagreement is `Held`; see [`second_source`].
+    fallback: Option<RpcClient>,
+    retry: RetryPolicy,
     key: SecretKey,
     pubkey: [u8; 33],
     spk: Script,
     network: Network,
     fee: FeePolicy,
-    wallet: Mutex<Wallet>,
+    /// Shared with the [`ChainBackend::primary_only`] view.
+    wallet: Arc<Mutex<Wallet>>,
+    reservations: Option<InputReservations>,
 }
 
 fn to_hash(txid: &Txid) -> Hash256 {
@@ -111,7 +146,12 @@ fn script_err(what: &str, e: impl std::fmt::Debug) -> SwapError {
 
 /// P2SH scriptPubKey of an HTLC.
 pub fn htlc_script_pubkey(htlc: &HtlcParams) -> Script {
-    Script::new_p2sh(divi_crypto::hash::hash160(&htlc.redeem_script()).as_bytes())
+    htlc_script_pubkey_v(htlc, htlc.script_version)
+}
+
+/// P2SH scriptPubKey of an HTLC redeem script of the given version.
+pub fn htlc_script_pubkey_v(htlc: &HtlcParams, version: divi_swap::htlc::ScriptVersion) -> Script {
+    Script::new_p2sh(divi_crypto::hash::hash160(&htlc.redeem_script_v(version)).as_bytes())
 }
 
 impl DiviBackend {
@@ -146,12 +186,15 @@ impl DiviBackend {
         let pk = key.public_key();
         Ok(DiviBackend {
             rpc: RpcClient::new(rpc_url, retry),
+            fallback: None,
+            retry,
             pubkey: pk.serialize_compressed(),
             spk: Script::new_p2pkh(pk.pubkey_hash().as_bytes()),
             key,
             network,
             fee,
-            wallet: Mutex::new(Wallet::open(wallet_path)?),
+            wallet: Arc::new(Mutex::new(Wallet::open(wallet_path)?)),
+            reservations: None,
         })
     }
 
@@ -161,6 +204,90 @@ impl DiviBackend {
     pub fn with_second_source(self, second: Arc<dyn Observer>) -> TwoSource<Self> {
         let first = Arc::new(observe::RpcObserver::from_client(self.rpc.clone()));
         TwoSource::new(self, first, second)
+    }
+
+    /// Keep the inputs of broadcast locks out of coin selection in every process on the same
+    /// swap database (see [`InputReservations`]). The wallet file tombstones a lock's inputs
+    /// only in the process that broadcast it, so without this a second `divi-swap` on the
+    /// same wallet file can fund its lock from the same coin. Tests and one-shot tools omit it.
+    pub fn with_input_reservations(mut self, reservations: InputReservations) -> Self {
+        self.reservations = Some(reservations);
+        self
+    }
+
+    /// Inputs reserved on DIVI by any process on the swap database; empty without one.
+    fn held(&self) -> Result<std::collections::HashSet<Outpoint>> {
+        match &self.reservations {
+            Some(res) => res.reserved(Chain::Divi),
+            None => Ok(Default::default()),
+        }
+    }
+
+    /// Whether `input` spends one of this key's P2PKH coins: its scriptSig is exactly
+    /// `<sig> <our pubkey>`. A claim or refund spends an HTLC (its scriptSig ends with the
+    /// redeem script), so it never matches.
+    fn spends_own_p2pkh(&self, input: &TxIn) -> bool {
+        let s = input.script_sig.as_bytes();
+        match s.first() {
+            Some(&n) if (1..=75).contains(&n) && s.len() == 1 + n as usize + 34 => {
+                s[1 + n as usize] == 33 && s[2 + n as usize..] == self.pubkey
+            }
+            _ => false,
+        }
+    }
+
+    /// Before `tx` is sent: reserve the wallet inputs it spends. Only a transaction whose
+    /// every input is this key's P2PKH coin (a lock funding) is reserved; a claim or refund is
+    /// left alone, so a store fault cannot hold one up. Inputs another transaction holds are
+    /// `InputsHeld` (nothing sent), and this transaction's coins go back from the wallet file's own `reserved`
+    /// list (the next selection skips the held one); any other error blocks the broadcast.
+    fn reserve_inputs(&self, tx: &Transaction, txid: &Txid) -> Result<()> {
+        let Some(res) = &self.reservations else {
+            return Ok(());
+        };
+        if tx.vin.is_empty() || !tx.vin.iter().all(|i| self.spends_own_p2pkh(i)) {
+            return Ok(());
+        }
+        let inputs: Vec<Outpoint> = tx.vin.iter().map(prevout).collect();
+        match res.reserve(Chain::Divi, txid, &inputs) {
+            Err(e @ SwapError::InputsHeld(_)) => {
+                self.wallet.lock().release(txid)?;
+                Err(e)
+            }
+            other => other,
+        }
+    }
+
+    /// `txid` is on chain: its inputs are spent (the wallet keeps them tombstoned), so the
+    /// reservation has done its job. A store fault here is only logged; the next poll
+    /// releases again.
+    fn release_confirmed(&self, txid: &Txid, confs: u32) {
+        if confs == 0 {
+            return;
+        }
+        if let Some(res) = &self.reservations {
+            if let Err(e) = res.release_tx(Chain::Divi, txid) {
+                tracing::warn!(%txid, error = %e, "could not release confirmed input reservation");
+            }
+        }
+    }
+
+    /// Add a second, independent endpoint. Every swap-relevant read (confirmations, HTLC
+    /// output, find-spend, MTP, tip height and hash, and the wallet scan reads) is then made on both and any disagreement, or
+    /// the fallback failing, is `SwapError::Held` (the engine's bounded hold, with
+    /// [`ChainBackend::primary_only`]); a broadcast goes to both. An empty `url` leaves the backend
+    /// single-source.
+    pub fn with_fallback_rpc(mut self, url: &str) -> Self {
+        let url = url.trim();
+        if !url.is_empty() {
+            self.fallback = Some(RpcClient::new(url, self.retry));
+        }
+        self
+    }
+
+    /// Whether a second endpoint is configured.
+    pub fn has_fallback(&self) -> bool {
+        self.fallback.is_some()
     }
 
     /// The key's P2PKH address.
@@ -181,10 +308,7 @@ impl DiviBackend {
     /// Learn the coins a known transaction (e.g. the faucet send) pays to this key.
     /// Returns how many new coins were added.
     pub async fn add_funding_tx(&self, txid: &Txid) -> Result<usize> {
-        let tx = self
-            .rpc
-            .call_ok("getrawtransaction", json!([txid.to_rpc_hex(), 1]))
-            .await?;
+        let tx = self.get_tx(&txid.to_rpc_hex()).await?;
         self.wallet.lock().apply_tx(&tx, &self.spk.to_hex())
     }
 
@@ -231,36 +355,37 @@ impl DiviBackend {
         Ok(to_height + 1)
     }
 
+    /// The transactions of block `height`. With a fallback both endpoints must list the same
+    /// ones: a primary that hides a block's transactions would hide a coin or a spend from the
+    /// wallet for good, because the scan cursor moves past the block.
     async fn block_txids(&self, height: u64) -> Result<Vec<String>> {
-        let hash = self.rpc.call_ok("getblockhash", json!([height])).await?;
-        let block = self.rpc.call_ok("getblock", json!([hash, true])).await?;
-        Ok(block["tx"]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(|t| t.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default())
+        let Some(fb) = &self.fallback else {
+            return block_txids_on(&self.rpc, height).await;
+        };
+        let (a, b) = tokio::join!(
+            block_txids_on(&self.rpc, height),
+            block_txids_on(fb, height)
+        );
+        let (a, b) = second_source::pair("block_txids", a, b)?;
+        second_source::agree_block_txids(a, b)
     }
 
+    /// A transaction as the wallet will learn it. With a fallback both endpoints must give the
+    /// same txid, spent outpoints and outputs; the wallet derives coins and spends from them,
+    /// and coin selection (which UTXO is spent, for how much) follows from the coins.
     async fn get_tx(&self, txid: &str) -> Result<Value> {
-        self.rpc
-            .call_ok("getrawtransaction", json!([txid, 1]))
-            .await
+        let Some(fb) = &self.fallback else {
+            return get_tx_on(&self.rpc, txid).await;
+        };
+        let (a, b) = tokio::join!(get_tx_on(&self.rpc, txid), get_tx_on(fb, txid));
+        let (a, b) = second_source::pair("wallet_tx", a, b)?;
+        second_source::agree_wallet_tx(a, b)
     }
 
     /// Like `get_tx` but `None` for "No such mempool or blockchain transaction" (-5).
+    #[cfg(test)]
     async fn get_tx_opt(&self, txid: &Txid) -> Result<Option<Value>> {
-        match self
-            .rpc
-            .call("getrawtransaction", json!([txid.to_rpc_hex(), 1]))
-            .await
-        {
-            Ok(v) => Ok(Some(v)),
-            Err(RpcError::Node { code: -5, .. }) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
+        get_tx_opt_on(&self.rpc, txid).await
     }
 
     fn sign_input(&self, tx: &Transaction, idx: usize, script_code: &Script) -> Result<Vec<u8>> {
@@ -313,7 +438,10 @@ impl DiviBackend {
             .push(TxOut::new(DiviAmount::from_sat(0), self.spk.clone()));
         // Fee from the real size with a placeholder signature.
         tx.vin[0].script_sig = Script::from_bytes(script_sig(&[0u8; SIG_LEN_EST]));
-        let fee = self.fee.fee(tx.size());
+        let mut fee = self.fee.fee(tx.size());
+        if claim_with.is_some() {
+            fee = fee.max(CLAIM_FEE_FACTOR * (RELAY_FEE_PER_KB * tx.size() as u64).div_ceil(1000));
+        }
         let value = amount
             .to_sat()
             .checked_sub(fee)
@@ -351,28 +479,111 @@ impl ChainBackend for DiviBackend {
         self.pubkey
     }
 
+    /// With a fallback, the same key and wallet on the primary endpoint alone: the engine
+    /// reads and builds on it only where a hold ends at its deadline (`divi_swap` `hold.rs`).
+    /// Without one, none.
+    fn primary_only(&self) -> Option<Arc<dyn ChainBackend>> {
+        self.fallback.as_ref()?;
+        Some(Arc::new(DiviBackend {
+            rpc: self.rpc.clone(),
+            fallback: None,
+            retry: self.retry,
+            key: self.key.clone(),
+            pubkey: self.pubkey,
+            spk: self.spk.clone(),
+            network: self.network,
+            fee: self.fee,
+            wallet: self.wallet.clone(),
+            reservations: self.reservations.clone(),
+        }))
+    }
+
     async fn tip_height(&self) -> Result<u64> {
-        self.rpc
-            .call_ok("getblockcount", json!([]))
-            .await?
-            .as_u64()
-            .ok_or_else(|| {
-                // A proxy returning a null/non-numeric block count is a glitch, not a real
-                // "the chain has no height" condition.
-                SwapError::Transient("getblockcount: not a number".into())
-            })
+        let Some(fb) = &self.fallback else {
+            return tip_height_on(&self.rpc).await;
+        };
+        let (a, b) = tokio::join!(tip_height_on(&self.rpc), tip_height_on(fb));
+        let (a, b) = second_source::pair("tip_height", a, b)?;
+        second_source::agree_tip_height(a, b)
+    }
+
+    async fn tip_hash(&self) -> Result<String> {
+        let Some(fb) = &self.fallback else {
+            return tip_hash_on(&self.rpc).await;
+        };
+        let (a, b) = tokio::join!(tip_hash_on(&self.rpc), tip_hash_on(fb));
+        let (a, b) = second_source::pair("tip_hash", a, b)?;
+        second_source::agree_tip_hash(a, b)
     }
 
     async fn median_time_past(&self) -> Result<u32> {
-        observe::rpc_median_time_past(&self.rpc).await
+        let Some(fb) = &self.fallback else {
+            return median_time_past_on(&self.rpc).await;
+        };
+        let (a, b) = tokio::join!(median_time_past_on(&self.rpc), median_time_past_on(fb));
+        let (a, b) = second_source::pair("median_time_past", a, b)?;
+        second_source::agree_mtp(a, b)
+    }
+
+    async fn spendable(&self) -> Result<Option<Amount>> {
+        let held = self.held()?;
+        let mut wallet = self.wallet.lock();
+        wallet.refresh();
+        let sum = wallet
+            .available()
+            .iter()
+            .filter(|c| !held.contains(&c.outpoint))
+            .map(|c| c.value)
+            .sum();
+        Ok(Some(Amount(sum)))
+    }
+
+    /// `getbestblockhash`, then `getblock` of that hash for its `height` and `time`: both from
+    /// the one block named, so a tip that moves between the calls cannot mix two blocks. A
+    /// block whose `hash` is not the one asked for is `Transient`. With a fallback both
+    /// endpoints must name the same block.
+    async fn tip_header(&self) -> Result<divi_swap::backend::TipHeader> {
+        let Some(fb) = &self.fallback else {
+            return tip_header_on(&self.rpc).await;
+        };
+        let (a, b) = tokio::join!(tip_header_on(&self.rpc), tip_header_on(fb));
+        let (a, b) = second_source::pair("tip_header", a, b)?;
+        second_source::agree_tip_header(a, b)
+    }
+
+    /// Whether `getblockhash height` still names `hash`. With a fallback both endpoints
+    /// must say the same.
+    async fn in_best_chain(&self, height: u64, hash: &str) -> Result<bool> {
+        let Some(fb) = &self.fallback else {
+            return in_best_chain_on(&self.rpc, height, hash).await;
+        };
+        let (a, b) = tokio::join!(
+            in_best_chain_on(&self.rpc, height, hash),
+            in_best_chain_on(fb, height, hash)
+        );
+        let (a, b) = second_source::pair("in_best_chain", a, b)?;
+        second_source::agree_in_best_chain(a, b)
+    }
+
+    /// [`TARGET_BLOCK_SECS`] on every network.
+    fn target_block_secs(&self) -> Option<u32> {
+        Some(TARGET_BLOCK_SECS)
     }
 
     async fn build_funding(&self, htlc: &HtlcParams, amount: Amount) -> Result<Funding> {
         htlc.validate()?;
         let target = amount.to_sat();
         let htlc_spk = htlc_script_pubkey(htlc);
+        // Coins another process's lock holds, or that it tombstoned in the wallet file, are
+        // not this process's to select.
+        let held = self.held()?;
         let mut wallet = self.wallet.lock();
-        let mut coins = wallet.available();
+        wallet.refresh();
+        let mut coins: Vec<Utxo> = wallet
+            .available()
+            .into_iter()
+            .filter(|c| !held.contains(&c.outpoint))
+            .collect();
         coins.sort_by_key(|c| c.value);
         // Prefer the smallest single coin that covers the amount, else take largest first.
         let est_fee = |n: usize| self.fee.fee(10 + n * 148 + 2 * 34);
@@ -479,37 +690,29 @@ impl ChainBackend for DiviBackend {
     async fn broadcast(&self, tx: &SignedTx) -> Result<Txid> {
         let parsed: Transaction = divi_primitives::serialize::deserialize(&tx.raw)
             .map_err(|e| SwapError::InvalidParams(format!("undecodable transaction: {e}")))?;
-        let result = self
-            .rpc
-            .call("sendrawtransaction", json!([hex::encode(&tx.raw)]))
-            .await;
-        match result {
-            Ok(_) => {}
-            Err(RpcError::Node { message, .. }) => match classify_broadcast_error(&message) {
-                BroadcastClass::AlreadyKnown => {}
-                BroadcastClass::Premature => return Err(SwapError::Premature(message)),
-                BroadcastClass::Rejected => {
-                    // A rejection of a tx the chain already has (e.g. its inputs are now
-                    // spent by itself) is still success. A single `None` here is not
-                    // proof of absence, though: a proxy fronting more than one node can
-                    // reject against one backend while another already has the tx (the
-                    // same lagging-backend race as the esplora "Block not found" bug) —
-                    // so double-check a couple of times, with a short delay, before
-                    // concluding the rejection is real.
-                    let mut known = self.get_tx_opt(&tx.txid).await?.is_some();
-                    for _ in 0..2 {
-                        if known {
-                            break;
-                        }
-                        divi_swap::rt::sleep(Duration::from_millis(500)).await;
-                        known = self.get_tx_opt(&tx.txid).await?.is_some();
+        self.reserve_inputs(&parsed, &tx.txid)?;
+        let raw_hex = hex::encode(&tx.raw);
+        match &self.fallback {
+            None => send_raw_on(&self.rpc, &raw_hex, &tx.txid).await?,
+            Some(fb) => {
+                // Broadcast goes to both endpoints: a transaction either one accepts is on
+                // the network, so one endpoint dropping or hiding it cannot stall a claim
+                // or a refund.
+                let (p, f) = tokio::join!(
+                    send_raw_on(&self.rpc, &raw_hex, &tx.txid),
+                    send_raw_on(fb, &raw_hex, &tx.txid)
+                );
+                match (p, f) {
+                    (Ok(()), Ok(())) => {}
+                    (Ok(()), Err(e)) => {
+                        tracing::warn!(txid = %tx.txid, "fallback endpoint did not take the broadcast: {e}");
                     }
-                    if !known {
-                        return Err(SwapError::Rejected(message));
+                    (Err(e), Ok(())) => {
+                        tracing::warn!(txid = %tx.txid, "primary endpoint did not take the broadcast: {e}");
                     }
+                    (Err(e), Err(_)) => return Err(e),
                 }
-            },
-            Err(e) => return Err(e.into()),
+            }
         }
         let own: Vec<Utxo> = parsed
             .vout
@@ -524,64 +727,314 @@ impl ChainBackend for DiviBackend {
                 value: o.value.as_sat() as u64,
             })
             .collect();
-        let inputs: Vec<Outpoint> = parsed
-            .vin
-            .iter()
-            .map(|i| Outpoint {
-                txid: from_hash(&i.prevout.txid),
-                vout: i.prevout.vout,
-            })
-            .collect();
+        let inputs: Vec<Outpoint> = parsed.vin.iter().map(prevout).collect();
         self.wallet.lock().record_broadcast(&inputs, &own)?;
         Ok(tx.txid)
     }
 
+    async fn release_dead_lock(&self, lock: &SignedTx) -> Result<bool> {
+        let parsed: Transaction = divi_primitives::serialize::deserialize(&lock.raw)
+            .map_err(|e| SwapError::InvalidParams(format!("undecodable transaction: {e}")))?;
+        // Proof the lock is not in the chain: every input is still an unspent output paying
+        // our key. `gettxout` needs no index; a node that refuses it is an error here, so
+        // there is no release without the proof.
+        let mut coins = Vec::new();
+        for i in &parsed.vin {
+            let op = prevout(i);
+            let mut views = vec![txout_on(&self.rpc, &op, &self.spk).await?];
+            if let Some(fb) = &self.fallback {
+                views.push(txout_on(fb, &op, &self.spk).await?);
+            }
+            match views.as_slice() {
+                [Some(value)] => coins.push(Utxo {
+                    outpoint: op,
+                    value: *value,
+                }),
+                [Some(a), Some(b)] if a == b => coins.push(Utxo {
+                    outpoint: op,
+                    value: *a,
+                }),
+                // Spent (by the lock or a rival), unknown, not ours, or the endpoints disagree.
+                _ => return Ok(false),
+            }
+        }
+        let booked = self.wallet.lock().release_dead_tx(lock.txid, &coins)?;
+        // The same proof frees the lock's row in the shared table, so the coins it gave back
+        // are selectable in every process, not only this one.
+        let reserved = match &self.reservations {
+            Some(res) => res.release_tx(Chain::Divi, &lock.txid)?,
+            None => 0,
+        };
+        Ok(booked || reserved > 0)
+    }
+
     async fn confirmations(&self, txid: &Txid) -> Result<Option<u32>> {
-        Ok(self
-            .get_tx_opt(txid)
-            .await?
-            .map(|v| v["confirmations"].as_u64().unwrap_or(0) as u32))
+        let confs = match &self.fallback {
+            None => confirmations_on(&self.rpc, txid).await?,
+            Some(fb) => {
+                let (a, b) = tokio::join!(
+                    confirmations_on(&self.rpc, txid),
+                    confirmations_on(fb, txid)
+                );
+                let (a, b) = second_source::pair("confirmations", a, b)?;
+                second_source::agree_confirmations(a, b)?
+            }
+        };
+        if let Some(c) = confs {
+            self.release_confirmed(txid, c);
+        }
+        Ok(confs)
     }
 
     async fn htlc_output(&self, htlc: &HtlcParams, at: &Outpoint) -> Result<Option<LockedOutput>> {
-        let Some(tx) = self.get_tx_opt(&at.txid).await? else {
-            return Ok(None);
+        let Some(fb) = &self.fallback else {
+            return htlc_output_on(&self.rpc, htlc, at).await;
         };
-        Ok(
-            observe::observed_lock(&tx, htlc, at.vout)?.map(|l| LockedOutput {
-                amount: l.amount,
-                confirmations: l.tx.confirmations,
-            }),
-        )
+        let (a, b) = tokio::join!(
+            htlc_output_on(&self.rpc, htlc, at),
+            htlc_output_on(fb, htlc, at)
+        );
+        let (a, b) = second_source::pair("htlc_output", a, b)?;
+        second_source::agree_htlc_output(a, b)
     }
 
     async fn find_spend(&self, outpoint: &Outpoint, from_height: u64) -> Result<Option<SpendInfo>> {
-        let want_txid = outpoint.txid.to_rpc_hex();
-        let tip = self.tip_height().await?;
-        for h in from_height..=tip {
-            for txid in self.block_txids(h).await? {
-                let tx = self.get_tx(&txid).await?;
-                if let Some(s) = spend_in(&tx, &want_txid, outpoint.vout, Some(h))? {
-                    return Ok(Some(s));
-                }
-            }
+        let Some(fb) = &self.fallback else {
+            return find_spend_on(&self.rpc, outpoint, from_height).await;
+        };
+        let (a, b) = tokio::join!(
+            find_spend_on(&self.rpc, outpoint, from_height),
+            find_spend_on(fb, outpoint, from_height)
+        );
+        let (a, b) = second_source::pair("find_spend", a, b)?;
+        second_source::agree_spend(a, b)
+    }
+}
+
+async fn block_txids_on(rpc: &RpcClient, height: u64) -> Result<Vec<String>> {
+    let hash = rpc.call_ok("getblockhash", json!([height])).await?;
+    let block = rpc.call_ok("getblock", json!([hash, true])).await?;
+    Ok(block["tx"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|t| t.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+fn prevout(input: &TxIn) -> Outpoint {
+    Outpoint {
+        txid: from_hash(&input.prevout.txid),
+        vout: input.prevout.vout,
+    }
+}
+
+async fn tip_header_on(rpc: &RpcClient) -> Result<divi_swap::backend::TipHeader> {
+    let hash = tip_hash_on(rpc).await?;
+    let block = rpc.call_ok("getblock", json!([hash, true])).await?;
+    let id = block["hash"]
+        .as_str()
+        .ok_or_else(|| SwapError::Transient("getblock: no hash (still indexing?)".into()))
+        .and_then(divi_swap::backend::normalize_block_hash)?;
+    if id != hash {
+        return Err(SwapError::Transient(format!(
+            "asked for block {hash}, got {id}"
+        )));
+    }
+    let field = |name: &str| {
+        block[name]
+            .as_u64()
+            .ok_or_else(|| SwapError::Transient(format!("getblock: no {name} (still indexing?)")))
+    };
+    Ok(divi_swap::backend::TipHeader {
+        height: field("height")?,
+        hash,
+        time: field("time")? as u32,
+    })
+}
+
+async fn in_best_chain_on(rpc: &RpcClient, height: u64, hash: &str) -> Result<bool> {
+    let want = divi_swap::backend::normalize_block_hash(hash)?;
+    let got = rpc.call_ok("getblockhash", json!([height])).await?;
+    let got = got
+        .as_str()
+        .ok_or_else(|| SwapError::Transient("getblockhash: not a string".into()))?;
+    Ok(divi_swap::backend::normalize_block_hash(got)? == want)
+}
+
+async fn get_tx_on(rpc: &RpcClient, txid: &str) -> Result<Value> {
+    rpc.call_ok("getrawtransaction", json!([txid, 1])).await
+}
+
+async fn get_tx_opt_on(rpc: &RpcClient, txid: &Txid) -> Result<Option<Value>> {
+    match rpc
+        .call("getrawtransaction", json!([txid.to_rpc_hex(), 1]))
+        .await
+    {
+        Ok(v) => Ok(Some(v)),
+        Err(RpcError::Node { code: -5, .. }) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Value in satoshis of `op` if it is unspent (`gettxout`, mempool included) and pays
+/// `spk`; `None` if it is spent, unknown or pays something else.
+async fn txout_on(rpc: &RpcClient, op: &Outpoint, spk: &Script) -> Result<Option<u64>> {
+    let v = rpc
+        .call_ok("gettxout", json!([op.txid.to_rpc_hex(), op.vout, true]))
+        .await?;
+    if v.is_null()
+        || v["scriptPubKey"]["hex"].as_str() != Some(hex::encode(spk.as_bytes()).as_str())
+    {
+        return Ok(None);
+    }
+    let sat = v["valueSat"]
+        .as_u64()
+        .or_else(|| v["value"].as_f64().map(|x| (x * 1e8).round() as u64))
+        .ok_or_else(|| SwapError::Transient("gettxout: output without value".into()))?;
+    Ok(Some(sat))
+}
+
+async fn tip_hash_on(rpc: &RpcClient) -> Result<String> {
+    let v = rpc.call_ok("getbestblockhash", json!([])).await?;
+    let s = v
+        .as_str()
+        .ok_or_else(|| SwapError::Transient("getbestblockhash: not a string".into()))?;
+    divi_swap::backend::normalize_block_hash(s)
+}
+
+async fn tip_height_on(rpc: &RpcClient) -> Result<u64> {
+    rpc.call_ok("getblockcount", json!([]))
+        .await?
+        .as_u64()
+        .ok_or_else(|| {
+            // A proxy returning a null/non-numeric block count is a glitch, not a real
+            // "the chain has no height" condition.
+            SwapError::Transient("getblockcount: not a number".into())
+        })
+}
+
+async fn median_time_past_on(rpc: &RpcClient) -> Result<u32> {
+    // The node reports `mediantime: null`, so take the median of the last 11 block times.
+    let tip = tip_height_on(rpc).await?;
+    let mut hash = rpc.call_ok("getblockhash", json!([tip])).await?;
+    let mut times = Vec::with_capacity(11);
+    for _ in 0..11 {
+        let block = rpc.call_ok("getblock", json!([hash, true])).await?;
+        times.push(block["time"].as_u64().ok_or_else(|| {
+            // A real block always has a time; its absence means a proxy-fronted
+            // node behind the one that reported this hash hasn't indexed it yet.
+            SwapError::Transient("block without time (still indexing?)".into())
+        })?);
+        match block.get("previousblockhash").filter(|p| p.is_string()) {
+            Some(prev) => hash = prev.clone(),
+            None => break,
         }
-        let pool = self.rpc.call_ok("getrawmempool", json!([])).await?;
-        for txid in pool
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-        {
-            let tx = match self.get_tx_opt(&txid.parse()?).await? {
-                Some(tx) => tx,
-                None => continue, // left the mempool meanwhile; a block scan will see it
-            };
-            if let Some(s) = spend_in(&tx, &want_txid, outpoint.vout, None)? {
+    }
+    times.sort_unstable();
+    Ok(times[times.len() / 2] as u32)
+}
+
+async fn confirmations_on(rpc: &RpcClient, txid: &Txid) -> Result<Option<u32>> {
+    Ok(get_tx_opt_on(rpc, txid)
+        .await?
+        .map(|v| v["confirmations"].as_u64().unwrap_or(0) as u32))
+}
+
+async fn htlc_output_on(
+    rpc: &RpcClient,
+    htlc: &HtlcParams,
+    at: &Outpoint,
+) -> Result<Option<LockedOutput>> {
+    let Some(tx) = get_tx_opt_on(rpc, &at.txid).await? else {
+        return Ok(None);
+    };
+    let Some(out) = tx["vout"]
+        .as_array()
+        .and_then(|a| a.iter().find(|o| o["n"].as_u64() == Some(at.vout as u64)))
+    else {
+        return Ok(None);
+    };
+    if out["scriptPubKey"]["hex"].as_str() != Some(htlc_script_pubkey(htlc).to_hex().as_str()) {
+        return Ok(None);
+    }
+    let sat = out["valueSat"]
+        .as_u64()
+        .or_else(|| out["value"].as_f64().map(|v| (v * 1e8).round() as u64))
+        .ok_or_else(|| SwapError::Other("output without value".into()))?;
+    Ok(Some(LockedOutput {
+        amount: Amount(sat),
+        confirmations: tx["confirmations"].as_u64().unwrap_or(0) as u32,
+    }))
+}
+
+async fn find_spend_on(
+    rpc: &RpcClient,
+    outpoint: &Outpoint,
+    from_height: u64,
+) -> Result<Option<SpendInfo>> {
+    let want_txid = outpoint.txid.to_rpc_hex();
+    let tip = tip_height_on(rpc).await?;
+    for h in from_height..=tip {
+        for txid in block_txids_on(rpc, h).await? {
+            let tx = get_tx_on(rpc, &txid).await?;
+            if let Some(s) = spend_in(&tx, &want_txid, outpoint.vout, Some(h))? {
                 return Ok(Some(s));
             }
         }
-        Ok(None)
+    }
+    let pool = rpc.call_ok("getrawmempool", json!([])).await?;
+    for txid in pool
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+    {
+        let tx = match get_tx_opt_on(rpc, &txid.parse()?).await? {
+            Some(tx) => tx,
+            None => continue, // left the mempool meanwhile; a block scan will see it
+        };
+        if let Some(s) = spend_in(&tx, &want_txid, outpoint.vout, None)? {
+            return Ok(Some(s));
+        }
+    }
+    Ok(None)
+}
+
+/// One endpoint's `sendrawtransaction`, with the "already known" / premature / recheck
+/// classification the single-source backend always had.
+async fn send_raw_on(rpc: &RpcClient, raw_hex: &str, txid: &Txid) -> Result<()> {
+    match rpc.call("sendrawtransaction", json!([raw_hex])).await {
+        Ok(_) => Ok(()),
+        Err(RpcError::Node { message, .. }) => match classify_broadcast_error(&message) {
+            BroadcastClass::AlreadyKnown => Ok(()),
+            BroadcastClass::Premature => Err(SwapError::Premature(message)),
+            BroadcastClass::Rejected => {
+                // A rejection of a tx the chain already has (e.g. its inputs are now
+                // spent by itself) is still success. A single `None` here is not
+                // proof of absence, though: a proxy fronting more than one node can
+                // reject against one backend while another already has the tx (the
+                // same lagging-backend race as the esplora "Block not found" bug) —
+                // so double-check a couple of times, with a short delay, before
+                // concluding the rejection is real.
+                let mut known = get_tx_opt_on(rpc, txid).await?.is_some();
+                for _ in 0..2 {
+                    if known {
+                        break;
+                    }
+                    divi_swap::rt::sleep(Duration::from_millis(500)).await;
+                    known = get_tx_opt_on(rpc, txid).await?.is_some();
+                }
+                if known {
+                    Ok(())
+                } else {
+                    Err(SwapError::Rejected(message))
+                }
+            }
+        },
+        Err(e) => Err(e.into()),
     }
 }
 

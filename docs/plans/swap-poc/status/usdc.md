@@ -114,8 +114,8 @@
     `divi-usdc-sepolia` swap (maker sells DIVI, taker pays USDC) through `divi-swapd` +
     `divi-swap`, mirroring `e2e.sh`'s structure (state dir outside the repo, `op://` refs
     passed through to the Rust binaries that resolve them, `secret get` preflight). Keys
-    resolved here only for `sepolia_ops` calls (raw hex via `op read`, unset immediately
-    after); `divi-swapd`/`divi-swap` get `op://` reference strings and resolve their own.
+    resolved here only for `sepolia_ops` calls (raw hex via `secret get`, resolved once per process by
+    `resolve_secret`, passed only in the child's environment, unset immediately after); `divi-swapd`/`divi-swap` get `op://` reference strings and resolve their own.
     **Untested beyond `sepolia_ops` itself** — it needs 1Password and the real network,
     neither available on hp2; written carefully against `e2e.sh`'s established pattern.
   - Gas measured for real (anvil, same contract bytecode that will go to Sepolia):
@@ -708,3 +708,100 @@
     and acting on secrets rather than disclosing them. Did neither; recording this so the
     orchestrator/Human sees it rather than it being quietly actioned or quietly dropped.
   - No code changes this wave — documentation only; `check-usdc.sh` unaffected, still PASS.
+
+## 2026-10-21 — Sepolia funding attempt (Mac, branch `signed/usdc`)
+
+- Human OQ 0900 overruled the earlier "out of scope": Sepolia gas for the taker is
+  self-serve via faucet, and this lane was to drive a live DIVI⇄USDC swap. Outcome: still
+  blocked on gas — every faucet path ends in an in-browser bot-check (details below), and
+  bot-checks are not defeated by tooling. Needs one human claim.
+- Taker `0x4bb95b0cD0AC55556D96D7E850a5090Cc450D60C`: 0 ETH, 20 USDC (publicnode
+  `eth_getBalance` + `usdc-live.sh --dry-run`). Maker `0x9956…5bd2`: 0 ETH, 0 USDC.
+  Dry-run target for `--scenario happy --direction forward`: taker ≥ 0.047 ETH; a
+  both-directions run needs ≥ 0.067 ETH on the taker (0.02/run + 0.015 deploy + 0.01
+  lock_claim self-test + 0.002 funding sends).
+- **pk910 correction** to the 2026-10-12 table above ("no CAPTCHA"): `/api/getFaucetConfig`
+  reports `modules.captcha = {provider: "custom", requiredForStart: true}`. The custom
+  captcha script (`faucets.pk910.de/captcha/captchaScript.php`) fetches an obfuscated
+  challenge (`captchaChallenge.php`, opening comment: "If you can read this, you're
+  probably trying to farm my faucet") that loads Cloudflare Turnstile with hCaptcha /
+  reCAPTCHA fallbacks plus a FingerprintJS browser fingerprint. Mining (cryptonight,
+  difficulty 12, capped 1000 H/s, min claim 0.05 ETH) only starts after that passes, so a
+  headless/CLI miner cannot open a session. Claiming is not captcha-gated
+  (`requiredForClaim: false`).
+- QuickNode: client-rendered app behind a JS bot-manager; a guessed `POST /api/claim`
+  returns a JavaScript challenge page, no JSON API. Chainlink: wallet-connect client app.
+  Alchemy: 0.001 mainnet ETH gate. Google: sign-in + reCAPTCHA. Coinbase CDP / thirdweb:
+  account. ethereum-sepolia-faucet.com, sepolia-faucet.io, faucet.sepolia.dev: no response.
+- Code: `usdc-live.sh` resolved `SWAP_EVM_KEY_HEX` with the raw 1Password CLI at four
+  call sites, which the op-guard refuses from agent shells; it now resolves `taker-btc`
+  once via `secret get` and passes the value only in the child's environment
+  (`fix(swap-poc): resolve usdc-live keys through the secret proxy`, 6b87191, signed,
+  on `signed/usdc`). `usdc-deploy.md` §3 and the `sepolia_ops` doc comment fixed the
+  same way. `bash -n` ok; dry-run exit 0.
+- Next, once the taker holds ≥ 0.07 ETH: rebuild `divi-swap` on the Mac
+  (`~/.local/state/iron-divi-swap-poc/bin/divi-swap` is 0.2.5, stale), then
+  `tools/swap-poc/usdc-live.sh --network sepolia --scenario happy --direction both`
+  (it deploys the HTLC and funds the maker itself), then the `usdc-deploy.md` §2–§4
+  maker config on dnsdivi with the deployed address, then `--scenario case-c`.
+
+## 2026-10-21 — mainnet network variants behind allow_mainnet (hp3, branch `lane/usdc-mainnet-wiring`)
+
+- **done:** `UsdcNetwork::Ethereum` (`"ethereum"`, chain 1) and `UsdcNetwork::Base` (`"base"`, chain 8453) with
+  `is_mainnet()`, Circle's native USDC addresses (source: developers.circle.com/stablecoins/usdc-contract-addresses)
+  and public default RPCs; `"mainnet"` still rejected, the error names the four accepted strings. Daemon:
+  `[usdc].allow_mainnet` (default off) plus the profile-agreement check. CLI: `--usdc-network ethereum|base`
+  requires `--allow-mainnet`, checked before any key or network use. Example config, deploy README and
+  `mainnet-readiness.md` §USDC/EVM updated.
+- **proof:** `cargo test -p swap-chain-evm -p divi-swapd -p divi-swap` 237 passed, 0 failed (230 before, +7);
+  fmt and `clippy -D warnings` clean. Read-only mainnet facts: ethereum height 26243153, base height 52911267,
+  USDC `decimals()` 6 / `symbol()` `USDC` on both. Daemon smoke logged `usdc backend ready` with zero balances
+  on both networks; the three gate refusals fired (see readiness doc).
+- **left:** no audited mainnet `Erc20Htlc` deployment; `check-usdc.sh` has one failing check that predates this
+  change (see STATUS); the CLI success-path smoke was not completed (`balance` answered "needs --backend live"
+  although the flag was given), the guard itself is unit-tested and the refusal run live.
+- **needs:** nothing from the human for this change.
+- **decisions:** only the networks `ethereum`/`base` are mainnets; a mainnet `[usdc]` under a testnet profile is
+  refused, but a testnet `[usdc]` under `profile = "mainnet"` is not (unlike `[zec]`), so existing mixed configs keep working.
+
+## 2026-10-22 — Erc20Htlc pre-audit and two R defects (hp1, branch `lane/usdc-htlc-preaudit`, builder Y)
+
+- **done:** pre-audit of `contracts/htlc/src/Erc20Htlc.sol` against a 23-row hazard checklist (20 ok, 3 risky, 0 defect;
+  the risky rows are USDC blacklist, pause and token upgradeability, outside the HTLC's control). 18 new Foundry tests
+  (`test/Erc20HtlcPreaudit.t.sol`: USDC-style blacklist/pause mock, reentrant lock, replay, who-may-call, fuzz, solvency
+  invariant); contract unchanged. Slither 0.11.6: 8 results, all triaged (false positive or accepted), none open.
+  Local anvil end-to-end through the Rust `swap-chain-evm` tests (lock-claim, lock-refund, log scan, swap id) passes.
+  Defect 1 (CLI `balance` said "needs --backend live"): `live_backends` returns `live: None` for `--counter-chain usdc`
+  and `Cmd::Balance` bailed on that; USDC-live now has its own arm reading ETH and token balance (`main.rs`
+  `is_usdc_live`, `UsdcBackend::address`). Defect 2 (`check-usdc.sh`): not reproducible on hp1, prints `PASS: usdc`;
+  recorded as environment, script not edited.
+- **proof:** `usdc-htlc-preaudit.md` (checklist, Slither triage, coverage, digests). `forge test` 26 → 44 passed;
+  `src/Erc20Htlc.sol` coverage lines 100%, branches 90.0% → 96.7%. Rust: 250 passed before (`-p swap-chain-evm -p
+  divi-swap -p divi-swapd`), 280 passed after (295 once rebased onto signed/main 42d8493, other lanes tests) over those plus `divi-swap-cli` (not like-for-like: the extra package
+  adds 30 tests, one of them the new `balance_routes_usdc_live_to_its_own_path`), 0 failed. `cargo fmt --check` and clippy
+  `--all-targets -D warnings` clean on the touched packages. CLI balance against a local anvil: before `Error: balance
+  needs --backend live`, after `usdc_address=0xf39F…2266 usdc_eth_wei=9999998789807667221346 usdc_balance_units=0`.
+  Images: foundry v1.3.0 `sha256:74a831a6046e7f04412802ee9eecfdce7009e983727c0cb7a91fe950ad203306`, slither
+  `sha256:89d4127ec3bfeba9725a863c58dd96b01781ff73737871dd3b07606ebc4cf16b`.
+- **left:** outside audit of a real deployment (still open); Aderyn not run (no pinned image found);
+  the `check-usdc.sh` failure R saw was not reproduced
+  (cause on that host unknown); one branch of `Erc20Htlc.sol` is uncovered and was not identified.
+- **needs:** nothing from the human.
+- **decisions:** USDC blacklist/pause/freeze risks are documented, not mitigated: an owner key or upgrade path in the
+  HTLC would be worse. No funds, no public network.
+
+## 2026-10-22 — Last Erc20Htlc branch covered, pinned Aderyn run (hp1, branch `lane/usdc-htlc-coverage`, builder AI)
+
+- **done:** identified the uncovered branch from `forge coverage --report lcov` (`BRDA:136,9,0,-`): the "no such swap"
+  require in `Erc20Htlc.refund` (`src/Erc20Htlc.sol:136`), reachable, never exercised. Added
+  `test_refundOfUnknownIdRejected` (exact revert reason for a near-miss id and `bytes32(0)`, no state created, no tokens
+  moved). Ran Aderyn 0.6.8 (Cyfrin release binary, pinned by version and sha256) on `contracts/htlc`: High 0, Low 1
+  (`Unsafe ERC20 Operation` x2, false positive; one `for auditor` note). Contract and artifact unchanged.
+- **proof:** `forge test` 44 -> 45 passed; branches 29/30 -> **30/30** (lines, statements, functions stay 100%).
+  `cargo test -p swap-chain-evm` with the pinned anvil on `PATH`: 21 passed, 0 failed (3 anvil tests included); no Rust
+  or `src/` file touched, so the count is unchanged from the base. Tooling and Aderyn triage in `usdc-htlc-preaudit.md`.
+- **left:** outside audit of a real deployment (still open); `forge fmt --check` already reports diffs in `src/` and
+  two existing test spots on the base (not touched here); Slither not re-run (digest was not local).
+- **needs:** nothing from the human.
+- **decisions:** Aderyn's L-1 is not "fixed" by swapping in OpenZeppelin: no new dependency and no contract change in
+  this lane; the hand-rolled `SafeTransfer` is covered by no-return and false-return token tests.

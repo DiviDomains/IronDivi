@@ -23,7 +23,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use divi_swap::mock::MockChain;
-use divi_swap::{Amount, Chain, ChainBackend, Store, Taker};
+use divi_swap::{Amount, Chain, ChainBackend, InputReservations, Store, Taker};
 use divi_swap_cli::{flow, ClaimGate, ClaimPolicy, MakerClient, RunOpts, Sessions};
 use swap_chain_btc::BtcBackend;
 use swap_chain_divi::DiviBackend;
@@ -67,7 +67,48 @@ struct Cli {
     /// DIVI height to start scanning for the taker's coins when the wallet has no cursor yet.
     #[arg(long, global = true)]
     divi_scan_from: Option<u64>,
-    /// BTC test network: `signet`, `testnet` (testnet3) or `regtest` (local Esplora).
+    /// The taker's own DIVI JSON-RPC endpoint (an own node, or an operator other than the
+    /// maker's): every DIVI read and broadcast goes here instead of the network's default
+    /// proxy, which the reference maker's operator runs. Unset or blank = the default proxy,
+    /// as before. Not used by the xmr arm (`--xmr-divi-rpc-url`).
+    #[arg(long, global = true)]
+    divi_rpc_url: Option<String>,
+    /// A second, independent DIVI JSON-RPC endpoint. When set, the taker's DIVI reads
+    /// (confirmations, HTLC output, find-spend, median time, tip, wallet scan) are made on both
+    /// endpoints and a disagreement is retried, never acted on. Must differ from the DIVI
+    /// endpoint in use (`--divi-rpc-url`, or the default); unset = single endpoint. Not used by
+    /// the xmr arm.
+    #[arg(long, global = true)]
+    divi_fallback_rpc_url: Option<String>,
+    /// On `--profile mainnet`, start although every DIVI source (`--divi-rpc-url`, or the
+    /// default proxy, and `--divi-fallback-rpc-url`) is one operator's, which is refused
+    /// without it; a warning is then printed at every start (one lying or broken endpoint is
+    /// trusted). Off by default, as the daemon's `allow_single_source`. DIVI only; the ZEC
+    /// arm's one-operator case is a warning, and the xmr arm is not covered.
+    #[arg(long, global = true)]
+    allow_single_source: bool,
+    /// Where the DIVI lock-expiry sweep may start counting a dropped lock's absent blocks:
+    /// `tip` (default) counts at once from a tip whose own time is within two spacings of
+    /// the clock; `mtp` waits until the node's median time past reaches the first absent
+    /// check, however fresh the tip looks (about five blocks later on every release).
+    #[arg(long, global = true, default_value = "tip")]
+    divi_expiry_start: divi_swap::reservation::ExpiryStart,
+    /// As `--divi-expiry-start`, for the BTC lock-expiry sweep (`--counter-chain btc`).
+    #[arg(long, global = true, default_value = "tip")]
+    btc_expiry_start: divi_swap::reservation::ExpiryStart,
+    /// As `--divi-expiry-start`, for the LTC lock-expiry sweep (`--counter-chain ltc`).
+    #[arg(long, global = true, default_value = "tip")]
+    ltc_expiry_start: divi_swap::reservation::ExpiryStart,
+    /// As `--divi-expiry-start`, for the ZEC lock-expiry sweep (`--counter-chain zec`).
+    #[arg(long, global = true, default_value = "tip")]
+    zec_expiry_start: divi_swap::reservation::ExpiryStart,
+    /// DIVI network: `testnet` (default) or `mainnet` (only with `--allow-mainnet`). Picks the
+    /// DIVI RPC endpoint and address version; with `--profile` it must agree (not used by the
+    /// xmr arm, whose DIVI side follows `--xmr-network`).
+    #[arg(long, global = true, default_value = "testnet")]
+    divi_network: String,
+    /// BTC network: `signet` (default), `testnet` (testnet3), `regtest` (local Esplora) or
+    /// `mainnet` (only with `--allow-mainnet`).
     #[arg(
         long,
         global = true,
@@ -75,10 +116,62 @@ struct Cli {
         default_value = "signet"
     )]
     btc_network: String,
+    /// Read the BTC spend, HTLC output and confirmations (what a claim or refund rests on)
+    /// from both of the network's Esplora endpoints; a disagreement, or either endpoint
+    /// failing, is retried, never acted on. Off = the second endpoint is only a failover.
+    #[arg(long, global = true)]
+    btc_quorum_reads: bool,
+    /// Litecoin network: `testnet` (default) or `mainnet` (only with `--allow-mainnet`).
+    #[arg(
+        long,
+        global = true,
+        env = "SWAP_LTC_NETWORK",
+        default_value = "testnet"
+    )]
+    ltc_network: String,
+    /// Opt-in LTC mainnet tip-hash cross-check against an independent source: `blockbook`,
+    /// `blockcypher` or `off` (default). Mainnet only; run before any LTC action. A
+    /// disagreement refuses; an unreachable source only warns.
+    #[arg(
+        long,
+        global = true,
+        env = "SWAP_LTC_CROSSCHECK",
+        default_value = "off"
+    )]
+    ltc_crosscheck: String,
+    /// Run `--ltc-crosscheck` again before every LTC claim, not only at start (off by
+    /// default). A disagreement holds the claim for a retry; an unreachable source warns and
+    /// the claim goes ahead. Needs `--ltc-crosscheck` set to a source.
+    #[arg(long, global = true, env = "SWAP_LTC_CROSSCHECK_BEFORE_CLAIM")]
+    ltc_crosscheck_before_claim: bool,
+    /// Zcash network: `testnet` (default) or `mainnet` (only with `--allow-mainnet`).
+    #[arg(long, global = true, default_value = "testnet")]
+    zec_network: String,
+    /// Opt-in ZEC tip cross-check against a lightwalletd run by a second operator
+    /// (`https://host:port`; unset: off). Compared before any ZEC action (a mismatch refuses,
+    /// an unreachable operator warns) and before every ZEC claim and refund (a mismatch or an
+    /// unreachable operator holds it for a retry). Refused when its host shares a
+    /// registrable domain with a primary lightwalletd endpoint.
+    #[arg(long, global = true, env = "SWAP_ZEC_CROSSCHECK_URL")]
+    zec_crosscheck_url: Option<String>,
+    /// Allow `--divi-network`, `--zec-network`, `--btc-network`, `--ltc-network` or
+    /// `--usdc-network` mainnet
+    /// (`mainnet`, or `ethereum`/`base` for usdc), which moves real money. Off by default,
+    /// mirroring `--xmr-allow-mainnet` (one shared flag for the zec/btc/ltc/usdc arms; xmr
+    /// keeps its own).
+    #[arg(long, global = true)]
+    allow_mainnet: bool,
+    /// Swap timing profile the networks must agree with: `testnet` (default) or `mainnet`.
+    /// The taker takes its terms from the maker, so this only gates the network flags: a
+    /// `mainnet` profile with a test network, or a `testnet` profile with a mainnet one, is
+    /// refused before any network call.
+    #[arg(long, global = true, default_value = "testnet", value_parser = parse_profile)]
+    profile: divi_swap::Profile,
     /// Secret reference for the taker's USDC (EVM) key. Needed when `--counter-chain usdc`.
     #[arg(long, global = true)]
     usdc_key: Option<String>,
-    /// Which EVM testnet: `sepolia` (default) or `base-sepolia`. Only picks defaults for
+    /// Which EVM network: `sepolia` (default), `base-sepolia`, or the mainnets `ethereum` and
+    /// `base` (only with `--allow-mainnet`). Only picks defaults for
     /// `--usdc-rpc-url`/`--usdc-token` below when they are left unset.
     #[arg(long, global = true, default_value = "sepolia")]
     usdc_network: String,
@@ -91,6 +184,12 @@ struct Cli {
     /// ERC-20 (USDC) token address. Defaults to Circle's test USDC for `--usdc-network`.
     #[arg(long, global = true)]
     usdc_token: Option<String>,
+    /// A second, independent EVM JSON-RPC node. When set, the USDC reads a claim or refund rests
+    /// on (HTLC output, find-spend, confirmations, latest block time) are made on both nodes
+    /// and a disagreement, or this node not answering, is retried, never acted on. Must differ
+    /// from the `--usdc-rpc-url` in use; unset = one node.
+    #[arg(long, global = true)]
+    usdc_fallback_rpc_url: Option<String>,
     /// `monerod` RPC URL (when `--counter-chain xmr`, live).
     #[arg(long, global = true, env = "SWAP_XMR_MONEROD_URL")]
     xmr_monerod_url: Option<String>,
@@ -122,8 +221,45 @@ struct Cli {
     /// scans once from there, then follows the tip).
     #[arg(long, global = true, default_value_t = 720)]
     xmr_lookback_blocks: u64,
+    /// Highest feerate a maker-leg claim on CHAIN ever pays, as `CHAIN=FEERATE` (base unit per
+    /// vbyte; on usdc wei per gas, the claim's `maxFeePerGas`). Repeatable, one per chain.
+    /// Unset: the chain's builtin cap (usdc 500 gwei, `500000000000`).
+    #[arg(long, global = true, value_parser = divi_swap::config::parse_chain_value)]
+    claim_fee_cap: Vec<(Chain, u64)>,
+    /// Replacement price bump, percent, of the node a same-nonce (usdc) claim is sent to, as
+    /// `CHAIN=PCT`: each replacement raises both fees at least this much (geth
+    /// `--txpool.pricebump`). Repeatable. Unset: 10, geth's default. A node stricter than this
+    /// is still outbid: every second "underpriced" refusal doubles the next step.
+    #[arg(long, global = true, value_parser = divi_swap::config::parse_chain_value)]
+    claim_price_bump: Vec<(Chain, u64)>,
     #[command(subcommand)]
     cmd: Cmd,
+}
+
+/// The fee escalations `--claim-fee-cap` and `--claim-price-bump` set
+/// ([`divi_swap::config::claim_fee_escalations`]).
+fn claim_fee_escalations(cli: &Cli) -> Result<Vec<(Chain, divi_swap::FeeEscalation)>> {
+    Ok(divi_swap::config::claim_fee_escalations(
+        &cli.claim_fee_cap,
+        &cli.claim_price_bump,
+    )?)
+}
+
+/// `taker` with the escalations of [`claim_fee_escalations`] applied.
+fn with_claim_fees(taker: Taker, cli: &Cli) -> Result<Taker> {
+    Ok(claim_fee_escalations(cli)?
+        .into_iter()
+        .fold(taker, |t, (chain, esc)| {
+            t.with_fee_escalation(chain, Some(esc))
+        }))
+}
+
+fn parse_profile(s: &str) -> Result<divi_swap::Profile, String> {
+    match s {
+        "testnet" => Ok(divi_swap::Profile::Testnet),
+        "mainnet" => Ok(divi_swap::Profile::Mainnet),
+        other => Err(format!("profile must be testnet or mainnet, got {other:?}")),
+    }
 }
 
 fn parse_counter_chain(s: &str) -> Result<Chain, String> {
@@ -212,6 +348,14 @@ enum Cmd {
     },
     /// Print the taker's DIVI and BTC addresses and balances (live backend; no keys).
     Balance,
+    /// Print each chain's tip as the swap code sees it, one `chain network height hash`
+    /// line per chain (read-only; the same network flags and mainnet guards as `balance`).
+    Tip {
+        /// `divi`, `btc`, `ltc`, `zec`, `xmr` or `all`. `xmr` needs `--xmr-monerod-url`; `all`
+        /// includes it only when that URL is given.
+        #[arg(long, default_value = "all")]
+        chain: String,
+    },
     /// Print `key=value` txids for a swap: the taker's own plus the maker's view.
     Txids {
         /// Local swap id.
@@ -233,18 +377,18 @@ impl CounterLive {
         match self {
             CounterLive::Btc(b) => b.address().to_string(),
             CounterLive::Ltc(b) => b.address().to_string(),
-            CounterLive::Zec(z) => z.address().encode(),
+            CounterLive::Zec(z) => z.encoded_address(),
         }
     }
 
     /// Confirmed plus pending balance, in the chain's smallest unit.
-    async fn balance_sats(&self, btc_network: &str) -> Result<i64> {
+    async fn balance_sats(&self, btc_network: &str, ltc_network: &str) -> Result<i64> {
         match self {
             CounterLive::Zec(z) => Ok(z.balance_zatoshi().await? as i64),
             CounterLive::Btc(_) | CounterLive::Ltc(_) => {
                 let endpoints = match self {
                     CounterLive::Btc(_) => swap_chain_btc::esplora_endpoints(btc_network)?,
-                    CounterLive::Ltc(_) => swap_chain_ltc::esplora_endpoints("testnet")?,
+                    CounterLive::Ltc(_) => swap_chain_ltc::esplora_endpoints(ltc_network)?,
                     CounterLive::Zec(_) => unreachable!(),
                 };
                 chain_balance(&endpoints, &self.address()).await
@@ -326,6 +470,12 @@ fn usdc_endpoints(cli: &Cli) -> Result<(swap_chain_evm::UsdcNetwork, String, Str
         .usdc_network
         .parse()
         .map_err(|e: String| anyhow::anyhow!("--usdc-network: {e}"))?;
+    if network.is_mainnet() && !cli.allow_mainnet {
+        bail!(
+            "--usdc-network {network} moves real money: no mainnet without the explicit \
+             --allow-mainnet opt-in"
+        );
+    }
     let rpc_url = cli
         .usdc_rpc_url
         .clone()
@@ -339,7 +489,7 @@ fn usdc_endpoints(cli: &Cli) -> Result<(swap_chain_evm::UsdcNetwork, String, Str
 
 /// The `--counter-chain usdc` live backend. `Backends.live` stays `None` for it (that tuple
 /// is concretely `(DiviBackend, CounterLive)`, used only by `Balance`).
-fn live_usdc_backend(cli: &Cli) -> Result<Arc<dyn ChainBackend>> {
+fn live_usdc_backend(cli: &Cli) -> Result<Arc<swap_chain_evm::UsdcBackend>> {
     let hex_key = secret_hex(&cli.usdc_key, "--usdc-key", "usdc")?;
     let key: swap_chain_evm::PrivateKeySigner = hex_key
         .trim()
@@ -356,12 +506,249 @@ fn live_usdc_backend(cli: &Cli) -> Result<Arc<dyn ChainBackend>> {
     let token = token
         .parse()
         .map_err(|e| anyhow::anyhow!("--usdc-token: {e}"))?;
-    Ok(Arc::new(swap_chain_evm::UsdcBackend::new(
-        &rpc_url, key, htlc, token,
-    )?))
+    let backend = swap_chain_evm::UsdcBackend::new(&rpc_url, key, htlc, token)?;
+    Ok(Arc::new(with_usdc_fallback(cli, &rpc_url, backend)?))
+}
+
+/// Apply `--usdc-fallback-rpc-url` to a USDC backend on `rpc_url`. Unset or blank leaves it
+/// untouched; the same URL as `rpc_url` is refused (one node asked twice is not a second
+/// source).
+fn with_usdc_fallback(
+    cli: &Cli,
+    rpc_url: &str,
+    backend: swap_chain_evm::UsdcBackend,
+) -> Result<swap_chain_evm::UsdcBackend> {
+    let Some(url) = cli
+        .usdc_fallback_rpc_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+    else {
+        return Ok(backend);
+    };
+    if url.trim_end_matches('/') == rpc_url.trim().trim_end_matches('/') {
+        bail!("--usdc-fallback-rpc-url must differ from --usdc-rpc-url");
+    }
+    Ok(backend.with_quorum_rpc(url)?)
+}
+
+/// Refuse `mainnet` for the btc/ltc arms without `--allow-mainnet`, and an unknown network
+/// name outright — before any key is resolved or any network call is made. Same wording as
+/// the zec guard.
+fn guard_network(flag: &str, network: &str, test_networks: &[&str], allow: bool) -> Result<()> {
+    if network != "mainnet" && !test_networks.contains(&network) {
+        bail!(
+            "{flag} must be {} or mainnet, got {network:?}",
+            test_networks.join(", ")
+        );
+    }
+    if network == "mainnet" && !allow {
+        bail!(
+            "{flag} mainnet moves real money: no mainnet without the explicit \
+             --allow-mainnet opt-in"
+        );
+    }
+    Ok(())
+}
+
+/// The engine profile must agree with the network of the counter chain in use.
+/// USDC has no `CounterLive` handle (it is an EVM account, not a UTXO address), so `balance`
+/// takes its own path instead of the `Backends::live` one.
+fn is_usdc_live(cli: &Cli) -> bool {
+    cli.counter_chain == Chain::Usdc && matches!(cli.backend, BackendArg::Live)
+}
+
+fn guard_profile(cli: &Cli) -> Result<()> {
+    let coin = match cli.counter_chain {
+        Chain::Btc => (
+            Chain::Btc,
+            cli.btc_network.as_str(),
+            Some(cli.allow_mainnet),
+        ),
+        Chain::Ltc => (
+            Chain::Ltc,
+            cli.ltc_network.as_str(),
+            Some(cli.allow_mainnet),
+        ),
+        Chain::Zec => (
+            Chain::Zec,
+            cli.zec_network.as_str(),
+            Some(cli.allow_mainnet),
+        ),
+        Chain::Usdc => (Chain::Usdc, cli.usdc_network.as_str(), None),
+        Chain::Xmr => (
+            Chain::Xmr,
+            cli.xmr_network.as_str(),
+            Some(cli.xmr_allow_mainnet),
+        ),
+        Chain::Divi => (
+            Chain::Divi,
+            cli.divi_network.as_str(),
+            Some(cli.allow_mainnet),
+        ),
+    };
+    let mut coins = vec![coin];
+    // DIVI last, so a counter coin's disagreement is reported first. The xmr arm's DIVI side
+    // follows `--xmr-network` (`live::divi_network`), not `--divi-network`.
+    if !matches!(cli.counter_chain, Chain::Xmr | Chain::Divi) {
+        coins.push((
+            Chain::Divi,
+            cli.divi_network.as_str(),
+            Some(cli.allow_mainnet),
+        ));
+    }
+    divi_swap::config::check_profile_networks(cli.profile, &coins).map_err(anyhow::Error::msg)
+}
+
+/// Apply `--divi-fallback-rpc-url` to a DIVI backend. Unset or blank leaves it untouched; the
+/// same URL as the primary in use ([`divi_rpc_url`]) is refused (one node asked twice is not a
+/// second source).
+fn with_divi_fallback(
+    cli: &Cli,
+    network: divi_wallet::address::Network,
+    backend: DiviBackend,
+) -> Result<DiviBackend> {
+    let Some(url) = cli
+        .divi_fallback_rpc_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+    else {
+        return Ok(backend);
+    };
+    if url.trim_end_matches('/') == divi_rpc_url(cli, network).trim_end_matches('/') {
+        if own_divi_rpc_url(cli).is_some() {
+            bail!("--divi-fallback-rpc-url must differ from --divi-rpc-url");
+        }
+        bail!("--divi-fallback-rpc-url must differ from the default DIVI endpoint");
+    }
+    Ok(backend.with_fallback_rpc(url))
+}
+
+/// `--divi-rpc-url` when set and non-blank.
+fn own_divi_rpc_url(cli: &Cli) -> Option<&str> {
+    cli.divi_rpc_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+}
+
+/// The DIVI JSON-RPC endpoint the taker reads first: `--divi-rpc-url`, else `network`'s
+/// default proxy.
+fn divi_rpc_url(cli: &Cli, network: divi_wallet::address::Network) -> String {
+    own_divi_rpc_url(cli)
+        .unwrap_or(swap_chain_divi::default_rpc(network))
+        .to_string()
+}
+
+/// The start checks of who runs the taker's read sources, on a mainnet profile only
+/// ([`divi_swap_cli::sources`]): every DIVI source on the default proxy's operator is
+/// refused (`Err`) unless `--allow-single-source`, and then warned; (with `--counter-chain
+/// zec`) one lightwalletd operator with no `--zec-crosscheck-url` is warned. At most one
+/// warning per chain. The xmr arm's DIVI side is not covered.
+fn taker_source_warnings(cli: &Cli) -> Result<Vec<String>> {
+    let mainnet = cli.profile == divi_swap::Profile::Mainnet;
+    let mut out = Vec::new();
+    if cli.counter_chain == Chain::Zec {
+        if let Ok(primaries) = swap_chain_zec::lightwalletd_endpoints(&cli.zec_network) {
+            if let Ok(Some(w)) = divi_swap_cli::sources::check_zec(
+                mainnet,
+                &primaries,
+                cli.zec_crosscheck_url.as_deref(),
+            ) {
+                out.push(w);
+            }
+        }
+    }
+    if cli.counter_chain != Chain::Xmr {
+        let network = if cli.divi_network == "mainnet" {
+            divi_wallet::address::Network::Mainnet
+        } else {
+            divi_wallet::address::Network::Testnet
+        };
+        let mut sources = vec![divi_rpc_url(cli, network)];
+        sources.extend(
+            cli.divi_fallback_rpc_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|u| !u.is_empty())
+                .map(String::from),
+        );
+        out.extend(
+            divi_swap_cli::sources::check_divi(
+                mainnet,
+                cli.allow_single_source,
+                swap_chain_divi::default_rpc(network),
+                &sources,
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))?,
+        );
+    }
+    Ok(out)
 }
 
 fn live_backends(cli: &Cli) -> Result<Backends> {
+    match cli.counter_chain {
+        Chain::Btc => guard_network(
+            "--btc-network",
+            &cli.btc_network,
+            &["signet", "testnet", "regtest"],
+            cli.allow_mainnet,
+        )?,
+        Chain::Ltc => {
+            guard_network(
+                "--ltc-network",
+                &cli.ltc_network,
+                &["testnet"],
+                cli.allow_mainnet,
+            )?;
+            if ltc_crosscheck_source(cli)?.is_some() && cli.ltc_network != "mainnet" {
+                bail!("--ltc-crosscheck is mainnet-only: no testnet source is verified");
+            }
+            if cli.ltc_crosscheck_before_claim && ltc_crosscheck_source(cli)?.is_none() {
+                bail!(
+                    "--ltc-crosscheck-before-claim needs a source: set --ltc-crosscheck to \
+                     blockbook or blockcypher (it is off)"
+                );
+            }
+        }
+        _ => {}
+    }
+    if cli.counter_chain == Chain::Zec {
+        match cli.zec_network.as_str() {
+            "testnet" | "mainnet" => {}
+            other => bail!("--zec-network must be testnet or mainnet, got {other:?}"),
+        }
+        if cli.zec_network == "mainnet" && !cli.allow_mainnet {
+            bail!(
+                "--zec-network mainnet moves real money: no mainnet without the explicit \
+                 --allow-mainnet opt-in"
+            );
+        }
+        if let Some(url) = &cli.zec_crosscheck_url {
+            let primaries = swap_chain_zec::lightwalletd_endpoints(&cli.zec_network)?;
+            divi_swap_cli::sources::check_zec(false, &primaries, Some(url))
+                .map_err(|e| anyhow::anyhow!("--zec-crosscheck-url: {e}"))?;
+        }
+    }
+    guard_network(
+        "--divi-network",
+        &cli.divi_network,
+        &["testnet"],
+        cli.allow_mainnet,
+    )?;
+    guard_profile(cli)?;
+    // T32-20 (Manager ruling 2, 2026-10-28, provisional on Human's 2026-10-26 "single-source
+    // stays opt-in and off on mainnet"): one DIVI operator is refused here unless
+    // `--allow-single-source`; what is left is warned at every start.
+    for w in taker_source_warnings(cli)? {
+        tracing::warn!("{w}");
+    }
+    let divi_network = if cli.divi_network == "mainnet" {
+        divi_wallet::address::Network::Mainnet
+    } else {
+        divi_wallet::address::Network::Testnet
+    };
     let dhex = secret_hex(&cli.divi_key, "--divi-key", "divi")?;
     let dkey = divi_crypto::keys::SecretKey::from_hex(dhex.trim())
         .map_err(|_| anyhow::anyhow!("divi key is not a valid 32-byte hex key"))?;
@@ -371,12 +758,14 @@ fn live_backends(cli: &Cli) -> Result<Backends> {
         .as_deref()
         .map(divi_swap_cli::wallet::prepare_wallet_path)
         .transpose()?;
-    let divi = Arc::new(DiviBackend::new(
-        "https://services.divi.domains/api/testnet/rpc/",
+    let (_, reservations) = divi_swap_cli::reservations::open(&cli.db)?;
+    let divi = Arc::new(live_divi(
+        cli,
+        &divi_rpc_url(cli, divi_network),
         dkey,
-        divi_wallet::address::Network::Testnet,
-        swap_chain_divi::FeePolicy::default(),
+        divi_network,
         wallet,
+        &reservations,
     )?);
 
     if cli.counter_chain == Chain::Usdc {
@@ -386,41 +775,465 @@ fn live_backends(cli: &Cli) -> Result<Backends> {
             live: None,
         });
     }
-    let (btc, counter): (Arc<dyn ChainBackend>, CounterLive) = match cli.counter_chain {
-        Chain::Btc => {
-            let bkey = secp_key(&cli.btc_key, "--btc-key", "btc")?;
-            let backend = Arc::new(BtcBackend::for_network(
-                &cli.btc_network,
-                bkey,
-                swap_chain_btc::FeePolicy::default(),
-            )?);
-            (backend.clone(), CounterLive::Btc(backend))
-        }
-        Chain::Ltc => {
-            let lkey = secp_key(&cli.ltc_key, "--ltc-key", "ltc")?;
-            let backend = Arc::new(LtcBackend::for_network(
-                "testnet",
-                lkey,
-                swap_chain_ltc::FeePolicy::default(),
-            )?);
-            (backend.clone(), CounterLive::Ltc(backend))
-        }
-        Chain::Zec => {
-            let zkey = secp_key(&cli.zec_key, "--zec-key", "zec")?;
-            let backend = Arc::new(ZecBackend::testnet(
-                zkey,
-                swap_chain_zec::FeePolicy::default(),
-            )?);
-            (backend.clone(), CounterLive::Zec(backend))
-        }
+    let (key, endpoints) = match cli.counter_chain {
+        Chain::Btc => (
+            secp_key(&cli.btc_key, "--btc-key", "btc")?,
+            swap_chain_btc::esplora_endpoints(&cli.btc_network)?,
+        ),
+        Chain::Ltc => (
+            secp_key(&cli.ltc_key, "--ltc-key", "ltc")?,
+            swap_chain_ltc::esplora_endpoints(&cli.ltc_network)?,
+        ),
+        Chain::Zec => (
+            secp_key(&cli.zec_key, "--zec-key", "zec")?,
+            swap_chain_zec::lightwalletd_endpoints(&cli.zec_network)?,
+        ),
         other => bail!("no live {other} backend in this build yet; use --backend mock"),
     };
+    let (btc, counter) = live_counter(cli, key, endpoints, &reservations)?;
 
     Ok(Backends {
         divi: divi.clone(),
         btc,
         live: Some((divi, counter)),
     })
+}
+
+/// The live DIVI backend for `key` on `url` ([`divi_rpc_url`] in production), its
+/// coin set in `wallet`, with `--divi-fallback-rpc-url` applied, reserving the inputs of its
+/// lock in `reservations` so a second DIVI-leg taker on the same wallet and `--db` never
+/// funds from them.
+fn live_divi(
+    cli: &Cli,
+    url: &str,
+    key: divi_crypto::keys::SecretKey,
+    network: divi_wallet::address::Network,
+    wallet: Option<std::path::PathBuf>,
+    reservations: &InputReservations,
+) -> Result<DiviBackend> {
+    with_divi_fallback(
+        cli,
+        network,
+        DiviBackend::new(
+            url,
+            key,
+            network,
+            swap_chain_divi::FeePolicy::default(),
+            wallet,
+        )?
+        .with_input_reservations(reservations.clone()),
+    )
+}
+
+/// The live `--counter-chain` backend for `key` on `endpoints` (the network's defaults in
+/// production), reserving the inputs of its lock in `reservations` so a second taker on the
+/// same wallet and `--db` never funds from them.
+fn live_counter(
+    cli: &Cli,
+    key: bitcoin::secp256k1::SecretKey,
+    endpoints: Vec<String>,
+    reservations: &InputReservations,
+) -> Result<(Arc<dyn ChainBackend>, CounterLive)> {
+    Ok(match cli.counter_chain {
+        Chain::Btc => {
+            let backend = Arc::new(
+                BtcBackend::new_on(
+                    &cli.btc_network,
+                    endpoints,
+                    key,
+                    swap_chain_btc::FeePolicy::default(),
+                    swap_chain_btc::RetryPolicy::default(),
+                )?
+                .with_quorum_reads(cli.btc_quorum_reads)?
+                .with_input_reservations(reservations.clone()),
+            );
+            (backend.clone(), CounterLive::Btc(backend))
+        }
+        Chain::Ltc => {
+            let backend = Arc::new(
+                LtcBackend::new_on(
+                    &cli.ltc_network,
+                    endpoints,
+                    key,
+                    swap_chain_ltc::FeePolicy::default(),
+                    swap_chain_ltc::RetryPolicy::default(),
+                )?
+                .with_input_reservations(reservations.clone())
+                .with_claim_crosscheck(if cli.ltc_crosscheck_before_claim {
+                    ltc_crosscheck_source(cli)?
+                } else {
+                    None
+                }),
+            );
+            (backend.clone(), CounterLive::Ltc(backend))
+        }
+        Chain::Zec => {
+            let backend = Arc::new(
+                ZecBackend::new(
+                    endpoints,
+                    key,
+                    swap_chain_zec::FeePolicy::default(),
+                    swap_chain_zec::RetryPolicy::default(),
+                )?
+                .with_network(&cli.zec_network)?
+                .with_input_reservations(reservations.clone())
+                .with_crosscheck(cli.zec_crosscheck_url.clone())?,
+            );
+            (backend.clone(), CounterLive::Zec(backend))
+        }
+        other => bail!("no live {other} backend in this build yet; use --backend mock"),
+    })
+}
+
+/// The wall clock in unix seconds, for the expiry sweep's freshness check.
+fn unix_now() -> u32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs().min(u32::MAX as u64) as u32)
+}
+
+/// Live taker: release the lock inputs of every finished swap in `--db`
+/// ([`divi_swap_cli::reservations::release_finished`]), then those of every lock past its
+/// swap's deadline that its chain's backend (`divi` for a DIVI-leg lock, `counter` for a
+/// BTC, LTC or ZEC one), fresh at wall-clock `now`, has found in no mempool and no block on
+/// two checks [`divi_swap::reservation::EXPIRY_ABSENT_BLOCKS`] blocks apart
+/// ([`InputReservations::release_expired_swaps`]; the first check's block is kept in
+/// `--db`, so the second can come from a later command). A released DIVI lock's inputs also
+/// go back to the DIVI wallet file ([`divi_swap_cli::reservations::release_expired_divi`],
+/// counting as `--divi-expiry-start` says; a BTC, LTC or ZEC lock counts as
+/// `--btc-expiry-start`, `--ltc-expiry-start` or `--zec-expiry-start` says,
+/// [`InputReservations::release_expired_swaps_from`]). Run before each taker command (a
+/// swap that finished, or a lock that expired, since the last one) and after each command
+/// that can finish a swap, whether or not that command succeeded. A failure only warns: an
+/// unreleased input stays out of coin selection, never spent twice.
+async fn sweep_locks(cli: &Cli, divi: &dyn ChainBackend, counter: &dyn ChainBackend, now: u32) {
+    if !matches!(cli.backend, BackendArg::Live) {
+        return;
+    }
+    let (store, res) = match divi_swap_cli::reservations::open(&cli.db) {
+        Ok(opened) => opened,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not open the lock-input reservations");
+            return;
+        }
+    };
+    match divi_swap_cli::reservations::release_finished(&store, &res) {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(n, "released the lock inputs of finished taker swaps"),
+        Err(e) => tracing::warn!(error = %e, "could not release finished taker lock inputs"),
+    }
+    let counter_start = match cli.counter_chain {
+        Chain::Btc => Some(cli.btc_expiry_start),
+        Chain::Ltc => Some(cli.ltc_expiry_start),
+        Chain::Zec => Some(cli.zec_expiry_start),
+        _ => None,
+    };
+    if let Some(start) = counter_start {
+        match res
+            .release_expired_swaps_from(&store, counter, now, start)
+            .await
+        {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(
+                n,
+                "released the inputs of dropped locks past their deadline"
+            ),
+            Err(e) => tracing::warn!(error = %e, "could not check taker locks for expiry"),
+        }
+    }
+    match divi_swap_cli::reservations::release_expired_divi(
+        &store,
+        &res,
+        divi,
+        now,
+        cli.divi_expiry_start,
+    )
+    .await
+    {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(
+            n,
+            "released the inputs of dropped DIVI locks past their deadline"
+        ),
+        Err(e) => tracing::warn!(error = %e, "could not check DIVI taker locks for expiry"),
+    }
+}
+
+/// Per-chain tip read deadline: a hung endpoint becomes a named error for that chain
+/// instead of stalling the whole report.
+const TIP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The chains `tip --chain <name>` reports, in print order. `all` adds XMR only when a
+/// monerod URL was given (`xmr_url`); otherwise `tip_main` prints a skip note.
+fn tip_chains(name: &str, xmr_url: bool) -> Result<Vec<Chain>> {
+    match name.to_ascii_lowercase().as_str() {
+        "all" => {
+            let mut chains = vec![Chain::Divi, Chain::Btc, Chain::Ltc, Chain::Zec];
+            if xmr_url {
+                chains.push(Chain::Xmr);
+            }
+            Ok(chains)
+        }
+        "xmr" => Ok(vec![Chain::Xmr]),
+        "divi" => Ok(vec![Chain::Divi]),
+        "btc" => Ok(vec![Chain::Btc]),
+        "ltc" => Ok(vec![Chain::Ltc]),
+        "zec" => Ok(vec![Chain::Zec]),
+        other => bail!("--chain must be divi, btc, ltc, zec, xmr or all, got {other:?}"),
+    }
+}
+
+/// The network flag value `chain` runs on (`mock` for the mock backend).
+fn tip_network(cli: &Cli, chain: Chain) -> &str {
+    if matches!(cli.backend, BackendArg::Mock) {
+        return "mock";
+    }
+    match chain {
+        Chain::Btc => &cli.btc_network,
+        Chain::Ltc => &cli.ltc_network,
+        Chain::Zec => &cli.zec_network,
+        Chain::Xmr => &cli.xmr_network,
+        _ => &cli.divi_network,
+    }
+}
+
+/// The `balance` network guards for every selected chain, plus the profile agreement, all
+/// before any network call. A mainnet chain needs `--allow-mainnet` and `--profile mainnet`.
+fn tip_guards(cli: &Cli, chains: &[Chain]) -> Result<()> {
+    for &chain in chains {
+        match chain {
+            Chain::Btc => guard_network(
+                "--btc-network",
+                &cli.btc_network,
+                &["signet", "testnet", "regtest"],
+                cli.allow_mainnet,
+            )?,
+            Chain::Ltc => guard_network(
+                "--ltc-network",
+                &cli.ltc_network,
+                &["testnet"],
+                cli.allow_mainnet,
+            )?,
+            Chain::Zec => guard_network(
+                "--zec-network",
+                &cli.zec_network,
+                &["testnet"],
+                cli.allow_mainnet,
+            )?,
+            // XMR keeps its own mainnet opt-in, as in `guard_profile`.
+            Chain::Xmr => {
+                guard_network(
+                    "--xmr-network",
+                    &cli.xmr_network,
+                    &["stagenet", "testnet"],
+                    cli.xmr_allow_mainnet,
+                )
+                .map_err(|e| anyhow::anyhow!("{e} (for xmr: --xmr-allow-mainnet)"))?;
+                if cli.xmr_monerod_url.is_none() {
+                    bail!("tip --chain xmr needs --xmr-monerod-url");
+                }
+            }
+            _ => guard_network(
+                "--divi-network",
+                &cli.divi_network,
+                &["testnet"],
+                cli.allow_mainnet,
+            )?,
+        }
+        let allow = if chain == Chain::Xmr {
+            cli.xmr_allow_mainnet
+        } else {
+            cli.allow_mainnet
+        };
+        divi_swap::config::check_profile_networks(
+            cli.profile,
+            &[(chain, tip_network(cli, chain), Some(allow))],
+        )
+        .map_err(anyhow::Error::msg)?;
+    }
+    Ok(())
+}
+
+/// A live backend for `chain`. Reading a tip needs no key, but every backend constructor
+/// takes one: a fresh in-memory key that is never saved, never funded and dropped on return.
+fn tip_backend(cli: &Cli, chain: Chain) -> Result<Arc<dyn ChainBackend>> {
+    let key = bitcoin::secp256k1::SecretKey::new(&mut rand::thread_rng());
+    Ok(match chain {
+        Chain::Btc => Arc::new(BtcBackend::for_network(
+            &cli.btc_network,
+            key,
+            swap_chain_btc::FeePolicy::default(),
+        )?),
+        Chain::Ltc => Arc::new(LtcBackend::for_network(
+            &cli.ltc_network,
+            key,
+            swap_chain_ltc::FeePolicy::default(),
+        )?),
+        Chain::Zec => Arc::new(ZecBackend::for_network(
+            &cli.zec_network,
+            key,
+            swap_chain_zec::FeePolicy::default(),
+        )?),
+        Chain::Divi => {
+            let network = if cli.divi_network == "mainnet" {
+                divi_wallet::address::Network::Mainnet
+            } else {
+                divi_wallet::address::Network::Testnet
+            };
+            let dkey = divi_crypto::keys::SecretKey::from_hex(&hex::encode(key.secret_bytes()))
+                .map_err(|_| anyhow::anyhow!("divi throwaway key"))?;
+            Arc::new(with_divi_fallback(
+                cli,
+                network,
+                DiviBackend::new(
+                    &divi_rpc_url(cli, network),
+                    dkey,
+                    network,
+                    swap_chain_divi::FeePolicy::default(),
+                    None,
+                )?,
+            )?)
+        }
+        other => bail!("no tip backend for {other}"),
+    })
+}
+
+/// Where a chain's tip comes from: a `ChainBackend`, or (XMR, which bypasses `ChainBackend`)
+/// the height of a monerod after `ensure_monerod_network` confirmed its network.
+enum TipSource {
+    Backend(Result<Arc<dyn ChainBackend>>),
+    Monerod { url: String, network: String },
+}
+
+/// A chain, its network label and its tip source.
+type TipEntry = (Chain, String, TipSource);
+
+/// One backend per selected chain (a mock chain per chain under `--backend mock`). A chain
+/// whose backend cannot be built keeps its error so it is reported by name.
+fn tip_backends(cli: &Cli, chains: &[Chain]) -> Vec<TipEntry> {
+    chains
+        .iter()
+        .map(|&chain| {
+            let backend = match cli.backend {
+                _ if chain == Chain::Xmr => {
+                    return (
+                        chain,
+                        cli.xmr_network.clone(),
+                        match &cli.xmr_monerod_url {
+                            Some(url) => TipSource::Monerod {
+                                url: url.clone(),
+                                network: cli.xmr_network.clone(),
+                            },
+                            None => {
+                                TipSource::Backend(Err(anyhow::anyhow!("no --xmr-monerod-url")))
+                            }
+                        },
+                    );
+                }
+                BackendArg::Mock => {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as u32)
+                        .unwrap_or(1_700_000_000);
+                    let backend: Arc<dyn ChainBackend> =
+                        Arc::new(MockChain::new(chain, now, 60).backend(3, Amount(0)));
+                    Ok(backend)
+                }
+                BackendArg::Live => tip_backend(cli, chain),
+            };
+            (
+                chain,
+                tip_network(cli, chain).to_string(),
+                TipSource::Backend(backend),
+            )
+        })
+        .collect()
+}
+
+/// Read every chain's tip: `(lines, failures)`. A chain that cannot be reached prints
+/// `chain network error: …` and counts as a failure; the others still print.
+async fn tip_report(entries: Vec<TipEntry>, xmr_allow_mainnet: bool) -> (Vec<String>, usize) {
+    let mut lines = Vec::new();
+    let mut failures = 0;
+    for (chain, network, backend) in entries {
+        let (height, hash) = match backend {
+            TipSource::Backend(Err(e)) => (Err(format!("{e:#}")), Ok(String::new())),
+            TipSource::Backend(Ok(b)) => {
+                let height = match tokio::time::timeout(TIP_TIMEOUT, b.tip_height()).await {
+                    Ok(Ok(h)) => Ok(h),
+                    Ok(Err(e)) => Err(e.to_string()),
+                    Err(_) => Err(format!("no answer within {}s", TIP_TIMEOUT.as_secs())),
+                };
+                let hash = match tokio::time::timeout(TIP_TIMEOUT, b.tip_hash()).await {
+                    Ok(Ok(h)) => Ok(h),
+                    Ok(Err(e)) => Err(e.to_string()),
+                    Err(_) => Err(format!("no answer within {}s", TIP_TIMEOUT.as_secs())),
+                };
+                (height, hash)
+            }
+            // `get_info` supplies both the nettype and the height; the network must match the
+            // selected one before the height is printed.
+            TipSource::Monerod { url, network } => {
+                let r = divi_swap_xmr::live::ensure_monerod_network(
+                    "--xmr-network",
+                    &network,
+                    xmr_allow_mainnet,
+                    &url,
+                );
+                match tokio::time::timeout(TIP_TIMEOUT, r).await {
+                    Ok(Ok(net)) => (
+                        Ok(net.height),
+                        Ok(net.top_block_hash.unwrap_or_else(|| "-".to_string())),
+                    ),
+                    Ok(Err(e)) => (Err(e.to_string()), Ok(String::new())),
+                    Err(_) => (
+                        Err(format!("no answer within {}s", TIP_TIMEOUT.as_secs())),
+                        Ok(String::new()),
+                    ),
+                }
+            }
+        };
+        let (line, failed) = tip_line(chain, &network, height, hash);
+        failures += usize::from(failed);
+        lines.push(line);
+    }
+    (lines, failures)
+}
+
+/// One output line, `chain network height hash`. The first three fields are the original
+/// format. A height that cannot be read prints `chain network error: …`; a hash that cannot
+/// be read after a good height prints `chain network height hash-error: …` so the height is
+/// not lost. Returns the line and whether it counts as a failure.
+fn tip_line(
+    chain: Chain,
+    network: &str,
+    height: Result<u64, String>,
+    hash: Result<String, String>,
+) -> (String, bool) {
+    match (height, hash) {
+        (Ok(h), Ok(x)) => (format!("{chain} {network} {h} {x}"), false),
+        (Ok(h), Err(e)) => (format!("{chain} {network} {h} hash-error: {e}"), true),
+        (Err(e), _) => (format!("{chain} {network} error: {e}"), true),
+    }
+}
+
+async fn tip_main(cli: &Cli, chain: &str) -> Result<()> {
+    let chains = tip_chains(chain, cli.xmr_monerod_url.is_some())?;
+    if matches!(cli.backend, BackendArg::Live) {
+        tip_guards(cli, &chains)?;
+    }
+    let (mut lines, failures) = tip_report(tip_backends(cli, &chains), cli.xmr_allow_mainnet).await;
+    let reported = lines.len();
+    if chain.eq_ignore_ascii_case("all") && cli.xmr_monerod_url.is_none() {
+        lines.push("xmr skipped (no --xmr-monerod-url)".to_string());
+    }
+    for line in &lines {
+        println!("{line}");
+    }
+    if failures > 0 {
+        bail!("{failures} of {reported} chain tips could not be read");
+    }
+    Ok(())
 }
 
 /// Bring the DIVI wallet up to the chain tip when the taker will spend DIVI from it.
@@ -457,10 +1270,104 @@ async fn chain_balance(endpoints: &[String], address: &str) -> Result<i64> {
     Err(last.unwrap_or_else(|| anyhow::anyhow!("no esplora endpoint")))
 }
 
-async fn taker(cli: &Cli) -> Result<Taker> {
+/// `--ltc-crosscheck` parsed; `None` is `off`.
+fn ltc_crosscheck_source(cli: &Cli) -> Result<Option<swap_chain_ltc::CrossCheckSource>> {
+    swap_chain_ltc::CrossCheckSource::parse_opt(&cli.ltc_crosscheck)
+        .map_err(|e| anyhow::anyhow!("--ltc-crosscheck: {e}"))
+}
+
+/// Before any LTC or ZEC action: the opt-in tip cross-check (`--ltc-crosscheck`,
+/// `--zec-crosscheck-url`). A disagreement is an error; an unavailable source warns and
+/// continues; off, and other chains, make no request.
+async fn ltc_preflight(cli: &Cli, b: &Backends) -> Result<()> {
+    match &b.live {
+        Some((_, CounterLive::Ltc(ltc))) => ltc.crosscheck(ltc_crosscheck_source(cli)?).await?,
+        Some((_, CounterLive::Zec(zec))) => zec.crosscheck().await?,
+        _ => {}
+    }
+    Ok(())
+}
+
+/// [`backends`], then what every taker command runs first: the LTC or ZEC crosscheck, the DIVI
+/// wallet scan and the lock-input sweep ([`sweep_locks`]).
+async fn ready_backends(cli: &Cli) -> Result<Backends> {
     let b = backends(cli)?;
+    ltc_preflight(cli, &b).await?;
     sync_divi(cli, &b).await?;
-    Ok(Taker::new(b.divi, b.btc, Store::open(&cli.db)?))
+    sweep_locks(cli, b.divi.as_ref(), b.btc.as_ref(), unix_now()).await;
+    Ok(b)
+}
+
+async fn taker(cli: &Cli) -> Result<Taker> {
+    let b = ready_backends(cli).await?;
+    with_claim_fees(
+        Taker::new(b.divi, b.btc, Store::open(&cli.db)?).with_profile_floor(cli.profile),
+        cli,
+    )
+}
+
+/// `claim`, `refund` and `run` on the prepared backends `b`, then [`sweep_locks`] whether
+/// the command succeeded or not (refunding a dropped lock fails, and that is when its inputs
+/// may be due for release), with the wall clock at `now`. Returns the line the command prints.
+async fn finishing(cli: &Cli, sessions: &Sessions, b: Backends, now: u32) -> Result<String> {
+    let (divi, counter) = (b.divi.clone(), b.btc.clone());
+    let out = finish(cli, sessions, b).await;
+    sweep_locks(cli, divi.as_ref(), counter.as_ref(), now).await;
+    out
+}
+
+async fn finish(cli: &Cli, sessions: &Sessions, b: Backends) -> Result<String> {
+    let taker = with_claim_fees(
+        Taker::new(b.divi.clone(), b.btc.clone(), Store::open(&cli.db)?)
+            .with_profile_floor(cli.profile),
+        cli,
+    )?;
+    match &cli.cmd {
+        Cmd::Claim { swap } => {
+            let client = MakerClient::new(&sessions.get(swap)?.maker_url);
+            let state = flow::step(&taker, &client, sessions, swap).await?;
+            Ok(format!("{state:?}"))
+        }
+        Cmd::Refund { swap } => Ok(format!("{:?}", flow::refund(&taker, swap).await?)),
+        Cmd::Run {
+            deal,
+            timeout_secs,
+            poll_secs,
+            claim_not_before,
+            never_claim,
+        } => {
+            let opts = RunOpts {
+                timeout: Duration::from_secs(*timeout_secs),
+                poll: Duration::from_secs(*poll_secs),
+            };
+            let policy = match (claim_not_before, never_claim) {
+                (Some(n), _) => ClaimPolicy::NotBefore {
+                    secs_before_timeout: *n,
+                },
+                (None, true) => ClaimPolicy::Never,
+                (None, false) => ClaimPolicy::Asap,
+            };
+            let gate = ClaimGate {
+                policy,
+                store: Store::open(&cli.db)?,
+                divi: b.divi,
+                btc: b.btc,
+            };
+            let (local, state) = flow::run_swap_gated(
+                &taker,
+                &MakerClient::new(&deal.maker.maker),
+                sessions,
+                &deal.offer,
+                deal.btc_sats,
+                &opts,
+                &mut || {},
+                Some(&gate),
+            )
+            .await?;
+            Ok(format!("{local} {state:?}"))
+        }
+        _ => bail!("not a claim, refund or run command"),
+    }
 }
 
 #[tokio::main]
@@ -473,6 +1380,9 @@ async fn main() -> Result<()> {
         )
         .init();
     let cli = Cli::parse();
+    if let Cmd::Tip { chain } = &cli.cmd {
+        return tip_main(&cli, chain).await;
+    }
     let sessions = Sessions::beside(&cli.db);
     if cli.counter_chain == Chain::Xmr {
         return xmr_main(&cli, &sessions).await;
@@ -504,58 +1414,25 @@ async fn main() -> Result<()> {
         Cmd::Status { swap } => {
             let s = sessions.get(swap)?;
             let view = MakerClient::new(&s.maker_url)
+                .with_swap_token(&s.maker_swap_id, &s.swap_token)
                 .swap(&s.maker_swap_id)
                 .await?;
             println!("{}", serde_json::to_string_pretty(&view)?);
         }
-        Cmd::Claim { swap } => {
-            let client = MakerClient::new(&sessions.get(swap)?.maker_url);
-            let state = flow::step(&taker(&cli).await?, &client, &sessions, swap).await?;
-            println!("{state:?}");
+        Cmd::Claim { .. } | Cmd::Refund { .. } | Cmd::Run { .. } => {
+            println!(
+                "{}",
+                finishing(&cli, &sessions, ready_backends(&cli).await?, unix_now()).await?
+            );
         }
-        Cmd::Refund { swap } => {
-            let state = flow::refund(&taker(&cli).await?, swap).await?;
-            println!("{state:?}");
-        }
-        Cmd::Run {
-            deal,
-            timeout_secs,
-            poll_secs,
-            claim_not_before,
-            never_claim,
-        } => {
-            let opts = RunOpts {
-                timeout: Duration::from_secs(*timeout_secs),
-                poll: Duration::from_secs(*poll_secs),
-            };
-            let policy = match (claim_not_before, never_claim) {
-                (Some(n), _) => ClaimPolicy::NotBefore {
-                    secs_before_timeout: *n,
-                },
-                (None, true) => ClaimPolicy::Never,
-                (None, false) => ClaimPolicy::Asap,
-            };
-            let b = backends(&cli)?;
-            sync_divi(&cli, &b).await?;
-            let gate = ClaimGate {
-                policy,
-                store: Store::open(&cli.db)?,
-                divi: b.divi.clone(),
-                btc: b.btc.clone(),
-            };
-            let taker = Taker::new(b.divi, b.btc, Store::open(&cli.db)?);
-            let (local, state) = flow::run_swap_gated(
-                &taker,
-                &MakerClient::new(&deal.maker.maker),
-                &sessions,
-                &deal.offer,
-                deal.btc_sats,
-                &opts,
-                &mut || {},
-                Some(&gate),
-            )
-            .await?;
-            println!("{local} {state:?}");
+        Cmd::Tip { .. } => unreachable!("handled before the match"),
+        Cmd::Balance if is_usdc_live(&cli) => {
+            guard_profile(&cli)?;
+            let usdc = live_usdc_backend(&cli)?;
+            let (eth, units) = usdc.gas_and_token_balance().await?;
+            println!("usdc_address={}", usdc.address());
+            println!("usdc_eth_wei={eth}");
+            println!("usdc_balance_units={units}");
         }
         Cmd::Balance => {
             let b = backends(&cli)?;
@@ -570,7 +1447,9 @@ async fn main() -> Result<()> {
             println!(
                 "{}_balance_sats={}",
                 cli.counter_chain,
-                counter.balance_sats(&cli.btc_network).await?
+                counter
+                    .balance_sats(&cli.btc_network, &cli.ltc_network)
+                    .await?
             );
         }
         Cmd::Txids { swap } => {
@@ -579,6 +1458,7 @@ async fn main() -> Result<()> {
                 .get_taker_swap(swap)?
                 .with_context(|| format!("no taker record {swap}"))?;
             let view = MakerClient::new(&s.maker_url)
+                .with_swap_token(&s.maker_swap_id, &s.swap_token)
                 .swap(&s.maker_swap_id)
                 .await?;
             for l in divi_swap_cli::txids::lines(&rec, &view) {
@@ -592,10 +1472,10 @@ async fn main() -> Result<()> {
 /// The taker engine for `--counter-chain xmr`. Live: the DIVI wallet of `--divi-key` (it only
 /// receives) and the Monero wallet behind `--xmr-wallet-rpc-url`; the lock journal sits next
 /// to `--db`. Mock: a DIVI wallet that receives the DIVI, a Monero wallet holding 10 XMR.
-fn xmr_taker(cli: &Cli) -> Result<divi_swap_xmr::XmrTaker> {
+async fn xmr_taker(cli: &Cli) -> Result<divi_swap_xmr::XmrTaker> {
     use divi_swap_xmr::mock::{MockDiviChain, MockMoneroChain};
     if matches!(cli.backend, BackendArg::Live) {
-        return live_xmr_taker(cli);
+        return live_xmr_taker(cli).await;
     }
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -604,19 +1484,21 @@ fn xmr_taker(cli: &Cli) -> Result<divi_swap_xmr::XmrTaker> {
     let divi = MockDiviChain::new(now, 60).wallet(8);
     let xmr = MockMoneroChain::new().wallet("taker", 10_000_000_000_000);
     Ok(divi_swap_xmr::XmrTaker::new(
-        divi_swap_xmr::XmrConfig::testnet(),
+        divi_swap_xmr::XmrConfig::for_profile(cli.profile),
         Arc::new(divi),
         Arc::new(xmr),
         Store::open(&cli.db)?,
-    )?)
+    )?
+    .with_profile_floor(cli.profile))
 }
 
 /// [`xmr_taker`]'s live engine.
-fn live_xmr_taker(cli: &Cli) -> Result<divi_swap_xmr::XmrTaker> {
+async fn live_xmr_taker(cli: &Cli) -> Result<divi_swap_xmr::XmrTaker> {
     use divi_swap_xmr::live::{self, LiveDivi, LiveDiviChain, LiveMonero, LiveMoneroConfig};
     let network = live::parse_network(&cli.xmr_network)?;
     let profile = live::profile_for(network, cli.xmr_allow_mainnet)
         .map_err(|e| anyhow::anyhow!("--xmr-network {}: {e}", cli.xmr_network))?;
+    guard_profile(cli)?;
     let divi_rpc_url = match (&cli.xmr_divi_rpc_url, network) {
         (Some(u), _) => u.clone(),
         (None, live::Network::Mainnet) => {
@@ -635,6 +1517,15 @@ fn live_xmr_taker(cli: &Cli) -> Result<divi_swap_xmr::XmrTaker> {
     .map_err(|e| anyhow::anyhow!("--xmr-sweep-address: {e}"))?;
     let monerod_url = need(&cli.xmr_monerod_url, "--xmr-monerod-url")?;
     let wallet_rpc_url = need(&cli.xmr_wallet_rpc_url, "--xmr-wallet-rpc-url")?;
+    // Before any secret or wallet work: the node must be on the network --xmr-network names.
+    live::ensure_monerod_network(
+        "--xmr-network",
+        &cli.xmr_network,
+        cli.xmr_allow_mainnet,
+        &monerod_url,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
     let wallet_rpc_password = match &cli.xmr_wallet_rpc_password {
         Some(_) => secret_hex(
             &cli.xmr_wallet_rpc_password,
@@ -662,7 +1553,7 @@ fn live_xmr_taker(cli: &Cli) -> Result<divi_swap_xmr::XmrTaker> {
     )?;
     let xmr = LiveMonero::new(LiveMoneroConfig {
         monerod_url,
-        wallet_rpc_url,
+        wallet_rpc_url: Some(wallet_rpc_url),
         wallet_rpc_user: cli.xmr_wallet_rpc_user.clone(),
         wallet_rpc_password,
         network,
@@ -670,12 +1561,17 @@ fn live_xmr_taker(cli: &Cli) -> Result<divi_swap_xmr::XmrTaker> {
         lookback_blocks: cli.xmr_lookback_blocks,
         journal_dir: PathBuf::from(format!("{}.xmr-journal", cli.db.display())),
     })?;
+    let divi = LiveDivi::new(divi);
+    divi_swap_xmr::check_divi_chain(&divi, live::divi_chain_name(network))
+        .await
+        .map_err(|e| anyhow::anyhow!("--xmr-divi-rpc-url: {e}"))?;
     Ok(divi_swap_xmr::XmrTaker::new(
         profile,
-        Arc::new(LiveDivi::new(divi)),
+        Arc::new(divi),
         Arc::new(xmr),
         Store::open(&cli.db)?,
-    )?)
+    )?
+    .with_profile_floor(cli.profile))
 }
 
 /// `--counter-chain xmr`: the adaptor-swap taker (`divi_swap_cli::xmr_flow`).
@@ -689,7 +1585,7 @@ async fn xmr_main(cli: &Cli, sessions: &Sessions) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&quote)?);
         }
         Cmd::Accept(d) => {
-            let taker = xmr_taker(cli)?;
+            let taker = xmr_taker(cli).await?;
             let local = xmr_flow::begin(
                 &taker,
                 &MakerClient::new(&d.maker.maker),
@@ -703,13 +1599,13 @@ async fn xmr_main(cli: &Cli, sessions: &Sessions) -> Result<()> {
         Cmd::Status { swap } => {
             let s = sessions.get(swap)?;
             let view = MakerClient::new(&s.maker_url)
-                .xmr_swap(&s.maker_swap_id)
+                .xmr_swap(&s.maker_swap_id, &s.swap_token)
                 .await?;
             println!("{}", serde_json::to_string_pretty(&view)?);
         }
         Cmd::Claim { swap } | Cmd::Refund { swap } => {
             let client = MakerClient::new(&sessions.get(swap)?.maker_url);
-            let state = xmr_flow::step(&xmr_taker(cli)?, &client, sessions, swap).await?;
+            let state = xmr_flow::step(&xmr_taker(cli).await?, &client, sessions, swap).await?;
             println!("{state:?}");
         }
         Cmd::Run {
@@ -727,7 +1623,7 @@ async fn xmr_main(cli: &Cli, sessions: &Sessions) -> Result<()> {
                 poll: Duration::from_secs(*poll_secs),
             };
             let (local, outcome) = xmr_flow::run(
-                &xmr_taker(cli)?,
+                &xmr_taker(cli).await?,
                 &MakerClient::new(&deal.maker.maker),
                 sessions,
                 &deal.offer,
@@ -738,6 +1634,7 @@ async fn xmr_main(cli: &Cli, sessions: &Sessions) -> Result<()> {
             .await?;
             println!("{local} {outcome}");
         }
+        Cmd::Tip { .. } => unreachable!("handled before the xmr arm"),
         Cmd::Lock { .. } | Cmd::Balance | Cmd::Txids { .. } => {
             bail!("not available for xmr: `accept` sends the signatures, `claim` steps the swap (it locks XMR and redeems)");
         }
@@ -748,6 +1645,378 @@ async fn xmr_main(cli: &Cli, sessions: &Sessions) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tip_cli(extra: &[&str]) -> Cli {
+        let mut argv = vec!["divi-swap"];
+        argv.extend_from_slice(extra);
+        argv.push("tip");
+        Cli::parse_from(argv)
+    }
+
+    /// `--claim-fee-cap` and `--claim-price-bump` override the chain's builtin escalation one
+    /// field at a time (repeatable, `CHAIN=N`); unset, nothing is overridden and the builtin
+    /// 500 gwei cap and 10% bump hold. A chain with no escalation, or a malformed value, is
+    /// refused.
+    #[test]
+    fn claim_fee_flags_override_the_builtin_escalation_per_chain() {
+        use divi_swap::FeeEscalation;
+        assert!(claim_fee_escalations(&tip_cli(&[])).unwrap().is_empty());
+        let cli = tip_cli(&[
+            "--claim-fee-cap",
+            "usdc=40000000000",
+            "--claim-price-bump",
+            "usdc=30",
+            "--claim-fee-cap",
+            "btc=200",
+        ]);
+        let got = claim_fee_escalations(&cli).unwrap();
+        assert_eq!(got.len(), 2, "{got:?}");
+        let of = |c: Chain| got.iter().find(|(g, _)| *g == c).map(|(_, e)| *e);
+        assert_eq!(
+            of(Chain::Usdc),
+            Some(
+                FeeEscalation::builtin(Chain::Usdc)
+                    .unwrap()
+                    .with_cap_feerate(40_000_000_000)
+                    .with_price_bump(30)
+            )
+        );
+        assert_eq!(
+            of(Chain::Btc),
+            Some(
+                FeeEscalation::builtin(Chain::Btc)
+                    .unwrap()
+                    .with_cap_feerate(200)
+            )
+        );
+        let taker_esc = with_claim_fees(
+            Taker::new(
+                std::sync::Arc::new(
+                    divi_swap::mock::MockChain::new(Chain::Divi, 0, 60)
+                        .backend(1, divi_swap::Amount(1)),
+                ),
+                std::sync::Arc::new(
+                    divi_swap::mock::MockChain::new(Chain::Usdc, 0, 12)
+                        .backend(2, divi_swap::Amount(1)),
+                ),
+                Store::in_memory().unwrap(),
+            ),
+            &cli,
+        )
+        .unwrap()
+        .fee_escalation(Chain::Usdc)
+        .unwrap();
+        assert_eq!(taker_esc.cap_feerate, 40_000_000_000);
+        assert_eq!(taker_esc.price_bump_pct, 30);
+
+        let err = claim_fee_escalations(&tip_cli(&["--claim-fee-cap", "divi=5"])).unwrap_err();
+        assert!(err.to_string().contains("divi"), "{err}");
+        for bad in ["usdc", "usdc=", "usdc=-1", "usdc=x", "nope=5"] {
+            let argv = ["divi-swap", "--claim-price-bump", bad, "tip"];
+            assert!(Cli::try_parse_from(argv).is_err(), "{bad}");
+        }
+    }
+
+    #[tokio::test]
+    async fn tip_prints_one_line_per_chain_on_the_mock_backend() {
+        let cli = tip_cli(&["--backend", "mock"]);
+        let chains = tip_chains("all", false).unwrap();
+        let (lines, failures) = tip_report(tip_backends(&cli, &chains), false).await;
+        assert_eq!(failures, 0);
+        assert_eq!(lines.len(), 4);
+        for (line, chain) in lines.iter().zip(["divi", "btc", "ltc", "zec"]) {
+            let f: Vec<&str> = line.split(' ').collect();
+            assert_eq!(f.len(), 4, "{line}");
+            assert_eq!((f[0], f[1]), (chain, "mock"));
+            f[2].parse::<u64>().unwrap();
+            assert_eq!(f[3].len(), 64, "{line}");
+            assert!(f[3].bytes().all(|b| b.is_ascii_hexdigit()), "{line}");
+        }
+    }
+
+    /// A parser written for the old `chain network height` line (first three fields) still
+    /// reads every line, and the hash is the mock's own tip hash.
+    #[tokio::test]
+    async fn tip_height_only_parser_still_reads_the_first_three_fields() {
+        let cli = tip_cli(&["--backend", "mock"]);
+        let chains = tip_chains("all", false).unwrap();
+        let (lines, _) = tip_report(tip_backends(&cli, &chains), false).await;
+        for line in &lines {
+            let mut it = line.split_whitespace();
+            let (chain, network, height) = (it.next(), it.next(), it.next());
+            assert!(chain.is_some() && network == Some("mock"), "{line}");
+            height.unwrap().parse::<u64>().unwrap();
+        }
+        let want = MockChain::new(Chain::Btc, 1_700_000_000, 60)
+            .backend(3, Amount(0))
+            .tip_hash()
+            .await
+            .unwrap();
+        assert_eq!(lines[1].split(' ').nth(3), Some(want.as_str()));
+    }
+
+    /// One chain whose backend is down prints a named error; the others still print a
+    /// full four-field line, in `--chain all` order.
+    #[tokio::test]
+    async fn tip_reports_one_chain_error_while_the_others_still_print() {
+        let mk = |chain: Chain, offline: bool| {
+            let c = MockChain::new(chain, 1_700_000_000, 60);
+            c.set_offline(offline);
+            let b: Arc<dyn ChainBackend> = Arc::new(c.backend(3, Amount(0)));
+            (chain, "mock".to_string(), TipSource::Backend(Ok(b)))
+        };
+        let entries = vec![
+            mk(Chain::Divi, false),
+            mk(Chain::Btc, true),
+            mk(Chain::Ltc, false),
+            mk(Chain::Zec, false),
+        ];
+        let (lines, failures) = tip_report(entries, false).await;
+        assert_eq!(failures, 1);
+        let order: Vec<&str> = lines.iter().map(|l| l.split(' ').next().unwrap()).collect();
+        assert_eq!(order, ["divi", "btc", "ltc", "zec"]);
+        assert!(lines[1].starts_with("btc mock error: "), "{}", lines[1]);
+        for i in [0, 2, 3] {
+            assert_eq!(lines[i].split(' ').count(), 4, "{}", lines[i]);
+        }
+    }
+
+    #[test]
+    fn tip_line_keeps_the_height_when_only_the_hash_fails() {
+        let (line, failed) = tip_line(
+            Chain::Btc,
+            "mainnet",
+            Ok(7),
+            Err("endpoint down".to_string()),
+        );
+        assert!(failed);
+        assert_eq!(line, "btc mainnet 7 hash-error: endpoint down");
+        let (line, failed) = tip_line(Chain::Xmr, "stagenet", Ok(9), Ok("-".to_string()));
+        assert!(!failed);
+        assert_eq!(line, "xmr stagenet 9 -");
+    }
+
+    #[test]
+    fn tip_chain_selector_names_what_it_accepts() {
+        assert_eq!(tip_chains("zec", false).unwrap(), vec![Chain::Zec]);
+        assert_eq!(tip_chains("xmr", false).unwrap(), vec![Chain::Xmr]);
+        let e = tip_chains("doge", false).unwrap_err().to_string();
+        assert!(e.contains("divi, btc, ltc, zec, xmr or all"), "{e}");
+        // `all` carries XMR only with a monerod URL.
+        assert!(!tip_chains("all", false).unwrap().contains(&Chain::Xmr));
+        assert_eq!(tip_chains("all", true).unwrap().last(), Some(&Chain::Xmr));
+    }
+
+    #[test]
+    fn tip_refuses_a_mainnet_network_without_allow_mainnet() {
+        for (chain, flag) in [
+            ("btc", "--btc-network"),
+            ("ltc", "--ltc-network"),
+            ("zec", "--zec-network"),
+            ("divi", "--divi-network"),
+        ] {
+            let cli = tip_cli(&[flag, "mainnet", "--profile", "mainnet"]);
+            let e = tip_guards(&cli, &tip_chains(chain, false).unwrap())
+                .unwrap_err()
+                .to_string();
+            assert!(
+                e.contains("no mainnet without the explicit --allow-mainnet"),
+                "{chain}: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn tip_guards_accept_mainnet_with_both_opt_ins_and_refuse_a_profile_mismatch() {
+        let ok = tip_cli(&[
+            "--btc-network",
+            "mainnet",
+            "--allow-mainnet",
+            "--profile",
+            "mainnet",
+        ]);
+        tip_guards(&ok, &[Chain::Btc]).unwrap();
+        let bad = tip_cli(&["--btc-network", "mainnet", "--allow-mainnet"]);
+        let e = tip_guards(&bad, &[Chain::Btc]).unwrap_err().to_string();
+        assert!(e.contains("profile"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn tip_names_the_unreachable_chain_and_still_prints_the_rest() {
+        let cli = tip_cli(&["--backend", "mock"]);
+        let mut entries = tip_backends(&cli, &[Chain::Divi, Chain::Ltc, Chain::Zec]);
+        entries[1].2 = TipSource::Backend(Err(anyhow::anyhow!("esplora unreachable")));
+        let (lines, failures) = tip_report(entries, false).await;
+        assert_eq!(failures, 1);
+        assert!(lines[0].starts_with("divi mock "), "{lines:?}");
+        assert_eq!(lines[1], "ltc mock error: esplora unreachable");
+        assert!(lines[2].starts_with("zec mock "), "{lines:?}");
+    }
+
+    /// A monerod answering `get_info` with `nettype`/`height`; returns its base URL.
+    async fn fake_monerod(nettype: &'static str, height: u64) -> String {
+        fake_monerod_with_hash(nettype, height, Some(XMR_HASH)).await
+    }
+
+    const XMR_HASH: &str = "ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12";
+
+    /// As [`fake_monerod`], with `get_info`'s `top_block_hash` present or absent.
+    async fn fake_monerod_with_hash(
+        nettype: &'static str,
+        height: u64,
+        hash: Option<&'static str>,
+    ) -> String {
+        let app = axum::Router::new().route(
+            "/json_rpc",
+            axum::routing::post(move || async move {
+                let mut result = serde_json::json!({
+                    "nettype": nettype, "mainnet": nettype == "mainnet",
+                    "height": height, "status": "OK"});
+                if let Some(h) = hash {
+                    result["top_block_hash"] = serde_json::json!(h);
+                }
+                axum::Json(serde_json::json!({"id":"0","jsonrpc":"2.0","result":result}))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    async fn xmr_tip(extra: &[&str]) -> (Vec<String>, usize) {
+        let cli = tip_cli(extra);
+        let chains = tip_chains("xmr", true).unwrap();
+        tip_report(tip_backends(&cli, &chains), cli.xmr_allow_mainnet).await
+    }
+
+    #[tokio::test]
+    async fn tip_xmr_prints_the_monerod_height() {
+        let url = fake_monerod("stagenet", 2_227_400).await;
+        let (lines, failures) = xmr_tip(&["--xmr-monerod-url", &url]).await;
+        assert_eq!(failures, 0);
+        assert_eq!(lines, vec![format!("xmr stagenet 2227400 {XMR_HASH}")]);
+    }
+
+    #[tokio::test]
+    async fn tip_xmr_prints_a_dash_when_monerod_sends_no_hash() {
+        let url = fake_monerod_with_hash("stagenet", 2_227_400, None).await;
+        let (lines, failures) = xmr_tip(&["--xmr-monerod-url", &url]).await;
+        assert_eq!(failures, 0);
+        assert_eq!(lines, vec!["xmr stagenet 2227400 -".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn tip_xmr_refuses_a_node_on_another_network() {
+        let url = fake_monerod("mainnet", 3_000_000).await;
+        let (lines, failures) = xmr_tip(&["--xmr-monerod-url", &url]).await;
+        assert_eq!(failures, 1);
+        assert!(
+            lines[0].starts_with("xmr stagenet error: ") && lines[0].contains("mainnet"),
+            "{lines:?}"
+        );
+        assert!(!lines[0].contains("3000000"), "{lines:?}");
+    }
+
+    #[test]
+    fn tip_xmr_refuses_mainnet_without_the_opt_in_before_any_network_call() {
+        let cli = tip_cli(&[
+            "--xmr-network",
+            "mainnet",
+            "--xmr-monerod-url",
+            "http://127.0.0.1:1",
+            "--profile",
+            "mainnet",
+        ]);
+        let e = tip_guards(&cli, &[Chain::Xmr]).unwrap_err().to_string();
+        assert!(e.contains("--xmr-allow-mainnet"), "{e}");
+        let ok = tip_cli(&[
+            "--xmr-network",
+            "mainnet",
+            "--xmr-allow-mainnet",
+            "--xmr-monerod-url",
+            "http://127.0.0.1:1",
+            "--profile",
+            "mainnet",
+        ]);
+        tip_guards(&ok, &[Chain::Xmr]).unwrap();
+        let none = tip_cli(&[]);
+        let e = tip_guards(&none, &[Chain::Xmr]).unwrap_err().to_string();
+        assert!(e.contains("--xmr-monerod-url"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn tip_all_without_a_monerod_url_skips_xmr_with_a_note() {
+        let cli = tip_cli(&["--backend", "mock"]);
+        assert!(cli.xmr_monerod_url.is_none());
+        tip_main(&cli, "all").await.unwrap();
+        // The note itself is printed by `tip_main`; `all` must not have built an XMR entry.
+        assert!(!tip_chains("all", false).unwrap().contains(&Chain::Xmr));
+    }
+
+    #[tokio::test]
+    async fn tip_xmr_names_an_unreachable_monerod_and_still_prints_the_rest() {
+        let cli = tip_cli(&[
+            "--backend",
+            "mock",
+            "--xmr-monerod-url",
+            "http://127.0.0.1:1",
+        ]);
+        let chains = [Chain::Divi, Chain::Xmr, Chain::Zec];
+        let (lines, failures) = tip_report(tip_backends(&cli, &chains), false).await;
+        assert_eq!(failures, 1);
+        assert!(lines[0].starts_with("divi mock "), "{lines:?}");
+        assert!(lines[1].starts_with("xmr stagenet error: "), "{lines:?}");
+        assert!(lines[1].contains("127.0.0.1:1"), "{lines:?}");
+        assert!(lines[2].starts_with("zec mock "), "{lines:?}");
+    }
+
+    fn throwaway_divi() -> DiviBackend {
+        let key = divi_crypto::keys::SecretKey::from_hex(&"11".repeat(32)).unwrap();
+        DiviBackend::new(
+            "http://127.0.0.1:1",
+            key,
+            divi_wallet::address::Network::Testnet,
+            swap_chain_divi::FeePolicy::default(),
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn divi_fallback_flag_parses_and_builds_a_backend_with_a_fallback() {
+        let net = divi_wallet::address::Network::Testnet;
+        let c = cli(&["--divi-fallback-rpc-url", "http://127.0.0.1:2"]);
+        assert_eq!(
+            c.divi_fallback_rpc_url.as_deref(),
+            Some("http://127.0.0.1:2")
+        );
+        let b = with_divi_fallback(&c, net, throwaway_divi()).unwrap();
+        assert!(b.has_fallback());
+    }
+
+    #[test]
+    fn divi_fallback_unset_or_blank_leaves_the_backend_single_source() {
+        let net = divi_wallet::address::Network::Testnet;
+        let unset = cli(&[]);
+        assert_eq!(unset.divi_fallback_rpc_url, None);
+        assert!(!with_divi_fallback(&unset, net, throwaway_divi())
+            .unwrap()
+            .has_fallback());
+        let blank = cli(&["--divi-fallback-rpc-url", "  "]);
+        assert!(!with_divi_fallback(&blank, net, throwaway_divi())
+            .unwrap()
+            .has_fallback());
+    }
+
+    #[test]
+    fn divi_fallback_equal_to_the_default_endpoint_is_refused() {
+        let net = divi_wallet::address::Network::Testnet;
+        let same = swap_chain_divi::default_rpc(net).to_string();
+        let c = cli(&["--divi-fallback-rpc-url", &same]);
+        let err = with_divi_fallback(&c, net, throwaway_divi()).err().unwrap();
+        assert!(err.to_string().contains("must differ"), "{err}");
+    }
 
     fn cli(extra: &[&str]) -> Cli {
         let mut argv = vec!["divi-swap"];
@@ -765,14 +2034,314 @@ mod tests {
     }
 
     #[test]
-    fn live_xmr_taker_names_what_it_is_missing_before_touching_anything() {
-        let err = |extra: &[&str]| match live_xmr_taker(&cli(extra)) {
-            Ok(_) => panic!("built a live xmr taker from {extra:?}"),
+    fn zec_network_defaults_to_testnet() {
+        assert_eq!(cli(&[]).zec_network, "testnet");
+        assert!(!cli(&[]).allow_mainnet);
+    }
+
+    #[test]
+    fn divi_network_defaults_to_testnet() {
+        assert_eq!(cli(&[]).divi_network, "testnet");
+    }
+
+    #[test]
+    fn divi_mainnet_without_allow_mainnet_is_rejected_before_any_network_call() {
+        let e = match live_backends(&cli(&["--divi-network", "mainnet"])) {
+            Ok(_) => panic!("built a live divi backend without --allow-mainnet"),
             Err(e) => e.to_string(),
         };
-        let e = err(&["--counter-chain", "xmr"]);
+        assert!(
+            e.contains("--divi-network mainnet moves real money") && e.contains("--allow-mainnet"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn divi_bad_network_is_rejected_before_any_network_call() {
+        let e = match live_backends(&cli(&["--divi-network", "regtest"])) {
+            Ok(_) => panic!("built a live divi backend on regtest"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            e.contains("--divi-network must be testnet or mainnet"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn divi_network_must_agree_with_the_profile_in_both_directions() {
+        // Mainnet profile + mainnet btc, DIVI left on testnet.
+        let e = match live_backends(&cli(&[
+            "--profile",
+            "mainnet",
+            "--btc-network",
+            "mainnet",
+            "--allow-mainnet",
+        ])) {
+            Ok(_) => panic!("built a live backend: mainnet profile, divi testnet"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            e.contains("profile = \"mainnet\" but [divi].network = \"testnet\"")
+                && e.contains("mainnet profile with a test network is refused"),
+            "{e}"
+        );
+        // Testnet profile (default), DIVI on mainnet with the opt-in.
+        let e = match live_backends(&cli(&["--divi-network", "mainnet", "--allow-mainnet"])) {
+            Ok(_) => panic!("built a live backend: testnet profile, divi mainnet"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            e.contains("profile = \"testnet\" but [divi].network = \"mainnet\"")
+                && e.contains("real funds under testnet timeouts are refused"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn divi_mainnet_passes_every_guard_when_all_agree() {
+        let c = cli(&[
+            "--profile",
+            "mainnet",
+            "--btc-network",
+            "mainnet",
+            "--divi-network",
+            "mainnet",
+            "--allow-mainnet",
+        ]);
+        guard_network(
+            "--divi-network",
+            &c.divi_network,
+            &["testnet"],
+            c.allow_mainnet,
+        )
+        .unwrap();
+        guard_profile(&c).unwrap();
+    }
+
+    #[test]
+    fn zec_mainnet_without_allow_mainnet_is_rejected_before_any_network_call() {
+        let e = match live_backends(&cli(&[
+            "--counter-chain",
+            "zec",
+            "--zec-network",
+            "mainnet",
+        ])) {
+            Ok(_) => panic!("built a live zec backend without --allow-mainnet"),
+            Err(e) => e,
+        };
+        assert!(e.to_string().contains("--allow-mainnet"), "{e}");
+    }
+
+    #[test]
+    fn zec_crosscheck_url_defaults_off_and_the_primary_operator_is_refused() {
+        assert_eq!(cli(&[]).zec_crosscheck_url, None);
+        let e = match live_backends(&cli(&[
+            "--counter-chain",
+            "zec",
+            "--zec-crosscheck-url",
+            "https://lwd.zec.rocks:9067",
+        ])) {
+            Ok(_) => panic!("accepted a --zec-crosscheck-url of the primary operator"),
+            Err(e) => e,
+        };
+        let e = e.to_string();
+        assert!(
+            e.contains("--zec-crosscheck-url") && e.contains("zec.rocks"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn zec_bad_network_is_rejected_before_any_network_call() {
+        let e = match live_backends(&cli(&[
+            "--counter-chain",
+            "zec",
+            "--zec-network",
+            "regtest",
+        ])) {
+            Ok(_) => panic!("built a live zec backend with an unknown network"),
+            Err(e) => e,
+        };
+        assert!(
+            e.to_string()
+                .contains("--zec-network must be testnet or mainnet"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn ltc_crosscheck_defaults_off_and_testnet_refuses_it_before_any_network_call() {
+        assert_eq!(cli(&[]).ltc_crosscheck, "off");
+        for src in ["blockbook", "blockcypher"] {
+            let e = match live_backends(&cli(&["--counter-chain", "ltc", "--ltc-crosscheck", src]))
+            {
+                Ok(_) => panic!("built a live testnet ltc backend with --ltc-crosscheck {src}"),
+                Err(e) => e,
+            };
+            assert!(
+                e.to_string().contains("--ltc-crosscheck is mainnet-only"),
+                "{e}"
+            );
+        }
+        let e = match live_backends(&cli(&["--counter-chain", "ltc", "--ltc-crosscheck", "x"])) {
+            Ok(_) => panic!("accepted an unknown --ltc-crosscheck"),
+            Err(e) => e,
+        };
+        assert!(e.to_string().contains("--ltc-crosscheck"), "{e}");
+    }
+
+    #[test]
+    fn ltc_crosscheck_before_claim_defaults_off_and_needs_a_source() {
+        assert!(!cli(&[]).ltc_crosscheck_before_claim);
+        let e = match live_backends(&cli(&[
+            "--counter-chain",
+            "ltc",
+            "--ltc-crosscheck-before-claim",
+        ])) {
+            Ok(_) => panic!("built an ltc backend with the claim check on and no source"),
+            Err(e) => e,
+        };
+        let e = e.to_string();
+        assert!(
+            e.contains("--ltc-crosscheck-before-claim") && e.contains("--ltc-crosscheck "),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn btc_and_ltc_networks_default_to_the_test_networks() {
+        assert_eq!(cli(&[]).btc_network, "signet");
+        assert_eq!(cli(&[]).ltc_network, "testnet");
+    }
+
+    #[test]
+    fn btc_ltc_mainnet_without_allow_mainnet_is_rejected_before_any_network_call() {
+        for (chain, flag) in [("btc", "--btc-network"), ("ltc", "--ltc-network")] {
+            let e = match live_backends(&cli(&["--counter-chain", chain, flag, "mainnet"])) {
+                Ok(_) => panic!("built a live {chain} backend on mainnet without --allow-mainnet"),
+                Err(e) => e,
+            };
+            assert!(e.to_string().contains("--allow-mainnet"), "{chain}: {e}");
+            assert!(e.to_string().contains(flag), "{chain}: {e}");
+        }
+    }
+
+    #[test]
+    fn btc_ltc_bad_network_is_rejected_before_any_network_call() {
+        for (chain, flag) in [("btc", "--btc-network"), ("ltc", "--ltc-network")] {
+            let e = match live_backends(&cli(&["--counter-chain", chain, flag, "testnet4"])) {
+                Ok(_) => panic!("built a live {chain} backend on an unknown network"),
+                Err(e) => e,
+            };
+            assert!(
+                e.to_string().contains(&format!("{flag} must be")),
+                "{chain}: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn profile_defaults_to_testnet() {
+        assert_eq!(cli(&[]).profile, divi_swap::Profile::Testnet);
+    }
+
+    #[test]
+    fn mainnet_profile_with_a_test_network_is_rejected_before_any_network_call() {
+        for (chain, extra) in [("btc", &[][..]), ("ltc", &[]), ("zec", &[]), ("usdc", &[])] {
+            let mut argv = vec!["--counter-chain", chain, "--profile", "mainnet"];
+            argv.extend_from_slice(extra);
+            let e = match live_backends(&cli(&argv)) {
+                Ok(_) => panic!("built a live {chain} backend: mainnet profile, test network"),
+                Err(e) => e.to_string(),
+            };
+            assert!(
+                e.contains(&format!("profile = \"mainnet\" but [{chain}].network"))
+                    && e.contains("mainnet profile with a test network is refused"),
+                "{chain}: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn testnet_profile_with_a_mainnet_network_is_rejected_before_any_network_call() {
+        for (chain, flag) in [
+            ("btc", "--btc-network"),
+            ("ltc", "--ltc-network"),
+            ("zec", "--zec-network"),
+        ] {
+            let e = match live_backends(&cli(&[
+                "--counter-chain",
+                chain,
+                flag,
+                "mainnet",
+                "--allow-mainnet",
+            ])) {
+                Ok(_) => panic!("built a live {chain} backend: testnet profile, mainnet"),
+                Err(e) => e.to_string(),
+            };
+            assert!(
+                e.contains(&format!(
+                    "profile = \"testnet\" but [{chain}].network = \"mainnet\""
+                )) && e.contains("real funds under testnet timeouts are refused"),
+                "{chain}: {e}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn xmr_profile_must_agree_with_xmr_network_before_any_network_call() {
+        let mainnet_testnet = cli(&[
+            "--counter-chain",
+            "xmr",
+            "--xmr-network",
+            "mainnet",
+            "--xmr-allow-mainnet",
+            "--xmr-divi-rpc-url",
+            "http://127.0.0.1:1",
+            "--xmr-sweep-address",
+            "x",
+        ]);
+        let e = live_xmr_taker(&mainnet_testnet)
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            e.contains("profile = \"testnet\" but [xmr].network = \"mainnet\""),
+            "{e}"
+        );
+        let stagenet_mainnet = cli(&["--counter-chain", "xmr", "--profile", "mainnet"]);
+        let e = live_xmr_taker(&stagenet_mainnet)
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            e.contains("profile = \"mainnet\" but [xmr].network = \"stagenet\""),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn mainnet_guard_passes_with_allow_mainnet() {
+        guard_network("--btc-network", "mainnet", &["signet", "testnet"], true).unwrap();
+        guard_network("--ltc-network", "mainnet", &["testnet"], true).unwrap();
+        guard_network("--btc-network", "signet", &["signet", "testnet"], false).unwrap();
+    }
+
+    #[tokio::test]
+    async fn live_xmr_taker_names_what_it_is_missing_before_touching_anything() {
+        // The failures asserted here all come before any network call.
+        async fn err(extra: &[&str]) -> String {
+            match live_xmr_taker(&cli(extra)).await {
+                Ok(_) => panic!("built a live xmr taker from {extra:?}"),
+                Err(e) => e.to_string(),
+            }
+        }
+        let e = err(&["--counter-chain", "xmr"]).await;
         assert!(e.contains("--xmr-sweep-address"), "{e}");
-        let e = err(&["--counter-chain", "xmr", "--xmr-network", "mainnet"]);
+        let e = err(&["--counter-chain", "xmr", "--xmr-network", "mainnet"]).await;
         assert!(e.contains("no mainnet"), "{e}");
         let e = err(&[
             "--counter-chain",
@@ -780,15 +2349,68 @@ mod tests {
             "--xmr-network",
             "mainnet",
             "--xmr-allow-mainnet",
-        ]);
+            "--profile",
+            "mainnet",
+        ])
+        .await;
         assert!(e.contains("--xmr-divi-rpc-url"), "{e}");
         let e = err(&[
             "--counter-chain",
             "xmr",
             "--xmr-sweep-address",
             "5notanaddress",
-        ]);
+        ])
+        .await;
         assert!(e.contains("monero address"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn live_xmr_taker_refuses_a_monerod_it_cannot_confirm_the_network_of() {
+        // Valid args, monerod on a closed loopback port: refused before any wallet work.
+        let sweep = "53hWE4DtPhFAvGj998ShM5D47iQ7hC6L2FhtiNiaHzX54dqQgtDemNoAdsYQHiS1C5Uqejdhe6D9bTAtcCT2jtwE6wyf2mn";
+        let e = match live_xmr_taker(&cli(&[
+            "--counter-chain",
+            "xmr",
+            "--xmr-sweep-address",
+            sweep,
+            "--xmr-monerod-url",
+            "http://127.0.0.1:1",
+            "--xmr-wallet-rpc-url",
+            "http://127.0.0.1:1",
+        ]))
+        .await
+        {
+            Ok(_) => panic!("built a live xmr taker against an unreachable monerod"),
+            Err(e) => e.to_string(),
+        };
+        assert!(e.contains("--xmr-network = \"stagenet\""), "{e}");
+        assert!(e.contains("refusing to start"), "{e}");
+    }
+
+    #[test]
+    fn balance_routes_usdc_live_to_its_own_path() {
+        assert!(is_usdc_live(&cli(&[
+            "--backend",
+            "live",
+            "--counter-chain",
+            "usdc"
+        ])));
+        assert!(
+            is_usdc_live(&cli(&["--counter-chain", "usdc"])),
+            "live is the default"
+        );
+        assert!(!is_usdc_live(&cli(&[
+            "--backend",
+            "mock",
+            "--counter-chain",
+            "usdc"
+        ])));
+        assert!(!is_usdc_live(&cli(&[
+            "--backend",
+            "live",
+            "--counter-chain",
+            "btc"
+        ])));
     }
 
     #[test]
@@ -812,6 +2434,36 @@ mod tests {
             swap_chain_evm::UsdcNetwork::BaseSepolia.default_rpc_url()
         );
         assert_eq!(token, swap_chain_evm::BASE_SEPOLIA_USDC);
+    }
+
+    #[test]
+    fn usdc_mainnet_without_allow_mainnet_is_rejected_before_any_network_call() {
+        for net in ["ethereum", "base"] {
+            let e = usdc_endpoints(&cli(&["--usdc-network", net])).unwrap_err();
+            assert!(e.to_string().contains("--allow-mainnet"), "{net}: {e}");
+        }
+    }
+
+    #[test]
+    fn usdc_mainnet_with_allow_mainnet_returns_mainnet_defaults() {
+        for (net, want, token) in [
+            (
+                "ethereum",
+                swap_chain_evm::UsdcNetwork::Ethereum,
+                swap_chain_evm::ETHEREUM_USDC,
+            ),
+            (
+                "base",
+                swap_chain_evm::UsdcNetwork::Base,
+                swap_chain_evm::BASE_USDC,
+            ),
+        ] {
+            let (network, rpc_url, tok) =
+                usdc_endpoints(&cli(&["--usdc-network", net, "--allow-mainnet"])).unwrap();
+            assert_eq!(network, want);
+            assert_eq!(rpc_url, want.default_rpc_url());
+            assert_eq!(tok, token);
+        }
     }
 
     #[test]
@@ -855,6 +2507,1563 @@ mod tests {
             )
             .unwrap();
             assert_eq!(backend.chain(), Chain::Usdc);
+        }
+    }
+
+    /// An EVM JSON-RPC node that answers `eth_getBlockByNumber` with a latest block at
+    /// `timestamp`, and refuses everything else.
+    async fn evm_node(timestamp: u64) -> wiremock::MockServer {
+        let zero = format!("0x{}", "0".repeat(64));
+        let block = serde_json::json!({
+            "hash": format!("0x{}", "bc".repeat(32)), "parentHash": zero, "sha3Uncles": zero,
+            "miner": format!("0x{}", "0".repeat(40)), "stateRoot": zero,
+            "transactionsRoot": zero, "receiptsRoot": zero,
+            "logsBloom": format!("0x{}", "0".repeat(512)), "difficulty": "0x0",
+            "number": "0x64", "gasLimit": "0x1c9c380", "gasUsed": "0x0",
+            "timestamp": format!("{timestamp:#x}"), "extraData": "0x", "mixHash": zero,
+            "nonce": "0x0000000000000000", "baseFeePerGas": "0x3b9aca00", "uncles": [],
+            "transactions": [],
+        });
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(move |req: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+                let mut reply = match body["method"].as_str() {
+                    Some("eth_getBlockByNumber") => serde_json::json!({"result": block}),
+                    _ => serde_json::json!({"error": {"code": -32601, "message": "unmocked"}}),
+                };
+                reply["jsonrpc"] = "2.0".into();
+                reply["id"] = body["id"].clone();
+                wiremock::ResponseTemplate::new(200).set_body_json(reply)
+            })
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn usdc_on(rpc_url: &str) -> swap_chain_evm::UsdcBackend {
+        swap_chain_evm::UsdcBackend::new(
+            rpc_url,
+            swap_chain_evm::PrivateKeySigner::random(),
+            "0x1111111111111111111111111111111111111111"
+                .parse()
+                .unwrap(),
+            swap_chain_evm::SEPOLIA_USDC.parse().unwrap(),
+        )
+        .unwrap()
+    }
+
+    async fn requests(node: &wiremock::MockServer) -> usize {
+        node.received_requests().await.unwrap_or_default().len()
+    }
+
+    #[tokio::test]
+    async fn usdc_fallback_flag_makes_the_backend_ask_the_second_node() {
+        let (primary, second) = (evm_node(2_000).await, evm_node(1_000).await);
+        let c = cli(&["--usdc-fallback-rpc-url", &second.uri()]);
+        assert_eq!(
+            c.usdc_fallback_rpc_url.as_deref(),
+            Some(second.uri().as_str())
+        );
+        let b = with_usdc_fallback(&c, &primary.uri(), usdc_on(&primary.uri())).unwrap();
+        // The smaller of the two latest-block times (`quorum.rs`).
+        assert_eq!(b.median_time_past().await.unwrap(), 1_000);
+        assert_eq!(requests(&second).await, 1);
+    }
+
+    #[tokio::test]
+    async fn usdc_fallback_unset_or_blank_reads_one_node() {
+        for flags in [&[][..], &["--usdc-fallback-rpc-url", "  "][..]] {
+            let (primary, second) = (evm_node(2_000).await, evm_node(1_000).await);
+            let c = cli(flags);
+            let b = with_usdc_fallback(&c, &primary.uri(), usdc_on(&primary.uri())).unwrap();
+            assert_eq!(b.median_time_past().await.unwrap(), 2_000);
+            assert_eq!(requests(&primary).await, 1);
+            assert_eq!(requests(&second).await, 0);
+        }
+    }
+
+    #[test]
+    fn usdc_fallback_equal_to_the_rpc_url_is_refused() {
+        let c = cli(&["--usdc-fallback-rpc-url", " http://127.0.0.1:8545/ "]);
+        let err = with_usdc_fallback(
+            &c,
+            "http://127.0.0.1:8545",
+            usdc_on("http://127.0.0.1:8545"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("--usdc-fallback-rpc-url") && err.contains("--usdc-rpc-url"),
+            "{err}"
+        );
+    }
+
+    // ---- lock-input reservations: two takers on one wallet and one --db ----
+
+    use bitcoin::hashes::Hash;
+    use divi_swap::api::{Direction, Quote};
+    use divi_swap::store::TakerRecord;
+    use divi_swap::{Funding, HtlcParams, TakerState};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const WALLET_KEY: [u8; 32] = [0x22; 32];
+
+    fn live_cli(chain: &str, db: &std::path::Path) -> Cli {
+        cli(&[
+            "--backend",
+            "live",
+            "--counter-chain",
+            chain,
+            "--db",
+            db.to_str().unwrap(),
+        ])
+    }
+
+    /// One `divi-swap` process: its own handle on `--db`, the wallet key, `server` as the
+    /// esplora endpoint.
+    fn taker(cli: &Cli, server: &MockServer) -> (Arc<dyn ChainBackend>, CounterLive) {
+        let (_, res) = divi_swap_cli::reservations::open(&cli.db).unwrap();
+        let key = bitcoin::secp256k1::SecretKey::from_slice(&WALLET_KEY).unwrap();
+        live_counter(cli, key, vec![server.uri()], &res).unwrap()
+    }
+
+    #[test]
+    fn btc_quorum_reads_flag_is_off_by_default_and_needs_two_endpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("cli.db");
+        assert!(!live_cli("btc", &db).btc_quorum_reads);
+        let mut on = live_cli("btc", &db);
+        on.btc_quorum_reads = true;
+        let (_, res) = divi_swap_cli::reservations::open(&on.db).unwrap();
+        let key = bitcoin::secp256k1::SecretKey::from_slice(&WALLET_KEY).unwrap();
+        let one = vec!["http://127.0.0.1:1".to_string()];
+        let err = live_counter(&on, key, one, &res).err().unwrap();
+        assert!(err.to_string().contains("quorum"), "{err}");
+        let two = swap_chain_btc::esplora_endpoints("signet").unwrap();
+        assert!(live_counter(&on, key, two, &res).is_ok());
+    }
+
+    /// The wallet owns coins `[1; 32]:0` (20,000) and `[2; 32]:0` (15,000) and the address
+    /// query keeps listing both (a broadcast lock not yet confirmed); every broadcast is
+    /// accepted.
+    async fn two_coin_wallet(address: &str) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/address/{address}/utxo")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"txid": hex::encode([1u8; 32]), "vout": 0, "value": 20_000, "status": {"confirmed": true}},
+                {"txid": hex::encode([2u8; 32]), "vout": 0, "value": 15_000, "status": {"confirmed": true}}
+            ])))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/tx"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn lock_htlc(hash: u8) -> HtlcParams {
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let pk = |k: u8| {
+            bitcoin::secp256k1::SecretKey::from_slice(&[k; 32])
+                .unwrap()
+                .public_key(&secp)
+                .serialize()
+        };
+        HtlcParams {
+            hash: [hash; 32],
+            claim_pubkey: pk(0x11),
+            refund_pubkey: pk(0x22),
+            locktime: 1_900_000_000,
+            script_version: Default::default(),
+        }
+    }
+
+    /// Build and broadcast a 5,000 lock to the HTLC of swap hash `[hash; 32]` (each swap has
+    /// its own, so two locks are never the same tx); a broadcast refused because the other
+    /// taker reserved the same coin first is retried once with a fresh selection.
+    async fn fund(b: &dyn ChainBackend, hash: u8) -> anyhow::Result<Funding> {
+        fund_amount(b, hash, Amount::from_sat(5_000)).await
+    }
+
+    /// [`fund`] for a lock of `amount`.
+    async fn fund_amount(
+        b: &dyn ChainBackend,
+        hash: u8,
+        amount: Amount,
+    ) -> anyhow::Result<Funding> {
+        let h = lock_htlc(hash);
+        let mut last = None;
+        for _ in 0..2 {
+            let f = b.build_funding(&h, amount).await?;
+            match b.broadcast(&f.tx).await {
+                Ok(_) => return Ok(f),
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(last.unwrap().into())
+    }
+
+    fn spent(f: &Funding) -> Vec<[u8; 32]> {
+        let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&f.tx.raw).unwrap();
+        tx.input
+            .iter()
+            .map(|i| i.previous_output.txid.to_byte_array())
+            .collect()
+    }
+
+    async fn posts(server: &MockServer) -> usize {
+        let reqs = server.received_requests().await.unwrap();
+        reqs.iter().filter(|r| r.method.as_str() == "POST").count()
+    }
+
+    fn held(db: &std::path::Path) -> Vec<(Chain, divi_swap::Txid)> {
+        let mut rows: Vec<_> = InputReservations::open_read_only(db)
+            .unwrap()
+            .list_all()
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.chain, r.reserved_by))
+            .collect();
+        rows.sort_by_key(|r| r.1 .0);
+        rows.dedup();
+        rows
+    }
+
+    /// The taker swap `id` on `chain` whose taker-leg lock is `lock`.
+    fn taker_swap(id: &str, state: TakerState, chain: Chain, lock: &Funding) -> TakerRecord {
+        taker_swap_paying(id, state, chain, Direction::TakerPaysBtc, lock)
+    }
+
+    /// [`taker_swap`] in `direction`: `TakerPaysDivi` puts the lock on DIVI.
+    fn taker_swap_paying(
+        id: &str,
+        state: TakerState,
+        chain: Chain,
+        direction: Direction,
+        lock: &Funding,
+    ) -> TakerRecord {
+        TakerRecord {
+            id: id.into(),
+            state,
+            quote: Quote {
+                id: format!("q-{id}"),
+                offer_id: "o".into(),
+                direction,
+                counter_chain: chain,
+                btc_amount: Amount::from_sat(5_000),
+                divi_amount: Amount(2),
+                expires_at: 3,
+                maker_btc_pubkey: [2; 33],
+                maker_divi_pubkey: [3; 33],
+                taker_timeout_secs: 4,
+                maker_timeout_secs: 5,
+                btc_confirmations: 1,
+                divi_confirmations: 1,
+            },
+            preimage: [9; 32],
+            hash: [7; 32],
+            maker_swap_id: None,
+            taker_leg_htlc: Some(lock_htlc(7)),
+            taker_leg_funding: Some(lock.clone()),
+            maker_leg_htlc: None,
+            maker_leg_outpoint: None,
+            maker_leg_amount: None,
+            maker_leg_claim: None,
+            taker_leg_refund: None,
+            claim_declined: None,
+            claim_base_feerate: None,
+            claim_feerate: None,
+            claim_replaced: Vec::new(),
+            claim_children: Vec::new(),
+            claim_underpriced: 0,
+            claim_child_replaced: None,
+            last_error: None,
+        }
+    }
+
+    /// Two concurrent takers on one two-coin wallet and one `--db`: their locks never share
+    /// an input, a third (nothing unreserved left) aborts before broadcasting and reserves
+    /// nothing; a completed swap and a refunded one free their coin for the next lock; a
+    /// restart neither leaks a reservation nor releases one twice.
+    async fn two_takers_never_share_a_lock_input(chain: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("cli.db");
+        let cli = live_cli(chain, &db);
+        let placeholder = MockServer::start().await;
+        let address = taker(&cli, &placeholder).1.address();
+        let server = two_coin_wallet(&address).await;
+
+        let ((one, _), (two, _)) = (taker(&cli, &server), taker(&cli, &server));
+        let (a, b) = tokio::join!(fund(one.as_ref(), 1), fund(two.as_ref(), 2));
+        let (a, b) = (a.unwrap(), b.unwrap());
+        let (ia, ib) = (spent(&a), spent(&b));
+        let shared = ia.iter().filter(|i| ib.contains(i)).count();
+        assert_eq!(shared, 0, "both locks spend {ia:?} / {ib:?}");
+        assert_eq!(posts(&server).await, 2);
+        let counter = cli.counter_chain;
+        assert_eq!(held(&db).len(), 2, "{:?}", held(&db));
+        assert!(held(&db).iter().all(|(c, _)| *c == counter));
+
+        // Abort: no unreserved coin covers a third lock; nothing posted, nothing reserved.
+        let (three, _) = taker(&cli, &server);
+        assert!(fund(three.as_ref(), 3).await.is_err());
+        assert_eq!(posts(&server).await, 2);
+        assert_eq!(held(&db).len(), 2);
+
+        // Restart: a new process rebroadcasts lock `a`; it keeps its one reservation.
+        let (again, _) = taker(&cli, &server);
+        again.broadcast(&a.tx).await.unwrap();
+        assert_eq!(held(&db).len(), 2);
+
+        // Completion: `a`'s swap is done; the next command releases its coin and only it.
+        let store = Store::open(&db).unwrap();
+        store
+            .put_taker_swap(&taker_swap("a", TakerState::Done, counter, &a))
+            .unwrap();
+        let mut refunding = taker_swap("b", TakerState::Refunded, counter, &b);
+        refunding.taker_leg_refund = Some(b.tx.clone());
+        store.put_taker_swap(&refunding).unwrap();
+        refund_command(&db, chain, "a", three.clone(), unix_now())
+            .await
+            .unwrap();
+        assert_eq!(held(&db), vec![(counter, b.tx.txid)]);
+        let next = fund(three.as_ref(), 4).await.unwrap();
+        assert_eq!(spent(&next), ia, "the completed swap's coin is free again");
+
+        // Refund: `b` finishes; released once, and a restart releases nothing twice.
+        refunding.state = TakerState::Done;
+        store.put_taker_swap(&refunding).unwrap();
+        refund_command(&db, chain, "b", three.clone(), unix_now())
+            .await
+            .unwrap();
+        assert_eq!(held(&db), vec![(counter, next.tx.txid)]);
+        let (_, after_restart) = divi_swap_cli::reservations::open(&db).unwrap();
+        assert_eq!(
+            divi_swap_cli::reservations::release_finished(&store, &after_restart).unwrap(),
+            0
+        );
+        assert_eq!(held(&db), vec![(counter, next.tx.txid)]);
+        let last = fund(three.as_ref(), 5).await.unwrap();
+        assert_eq!(spent(&last), ib, "the refunded swap's coin is free again");
+    }
+
+    #[tokio::test]
+    async fn two_btc_takers_never_share_a_lock_input() {
+        two_takers_never_share_a_lock_input("btc").await;
+    }
+
+    #[tokio::test]
+    async fn two_ltc_takers_never_share_a_lock_input() {
+        two_takers_never_share_a_lock_input("ltc").await;
+    }
+
+    /// A lightwalletd on 127.0.0.1 that speaks just enough gRPC (HTTP/2 without TLS) for coin
+    /// selection and broadcast: the wallet owns coins `[1; 32]:0` (200,000 zats) and
+    /// `[2; 32]:0` (150,000), the address query keeps listing both, and every
+    /// `SendTransaction` is accepted and counted. Requests are not decoded: each RPC has one
+    /// answer.
+    async fn lightwalletd(pubkey: &[u8; 33]) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use axum::body::{Body, Bytes};
+        use http_body_util::BodyExt;
+        use prost::Message;
+        use swap_chain_zec::grpc::{
+            BlockId, GetAddressUtxosReply, GetAddressUtxosReplyList, LightdInfo, SendResponse,
+        };
+
+        fn grpc(msg: Vec<u8>) -> axum::response::Response {
+            let mut frame = vec![0u8]; // not compressed
+            frame.extend((msg.len() as u32).to_be_bytes());
+            frame.extend(msg);
+            let mut trailers = axum::http::HeaderMap::new();
+            trailers.insert("grpc-status", "0".parse().unwrap());
+            let body = http_body_util::Full::new(Bytes::from(frame))
+                .with_trailers(async move { Some(Ok(trailers)) });
+            axum::response::Response::builder()
+                .header("content-type", "application/grpc")
+                .body(Body::new(body))
+                .unwrap()
+        }
+        let script = swap_chain_zec::address::TransparentAddress::p2pkh(pubkey).script_pubkey();
+        let coin = |n: u8, value_zat| GetAddressUtxosReply {
+            txid: vec![n; 32],
+            index: 0,
+            script: script.clone(),
+            value_zat,
+            height: 3_000_000,
+            address: String::new(),
+        };
+        let utxos = GetAddressUtxosReplyList {
+            address_utxos: vec![coin(1, 200_000), coin(2, 150_000)],
+        }
+        .encode_to_vec();
+        let posts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sent = posts.clone();
+        let app = axum::Router::new().fallback(move |uri: axum::http::Uri| {
+            let (utxos, sent) = (utxos.clone(), sent.clone());
+            async move {
+                match uri.path().rsplit('/').next().unwrap_or_default() {
+                    "GetLightdInfo" => grpc(
+                        LightdInfo {
+                            version: "stub".into(),
+                            chain_name: "test".into(),
+                            consensus_branch_id: "c2d6d0b4".into(), // NU5
+                            block_height: 3_000_000,
+                        }
+                        .encode_to_vec(),
+                    ),
+                    "GetLatestBlock" => grpc(
+                        BlockId {
+                            height: 3_000_000, // below NU6.3 on testnet: v5
+                            hash: vec![0; 32],
+                        }
+                        .encode_to_vec(),
+                    ),
+                    "GetAddressUtxos" => grpc(utxos),
+                    "SendTransaction" => {
+                        sent.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        grpc(
+                            SendResponse {
+                                error_code: 0,
+                                error_message: String::new(),
+                            }
+                            .encode_to_vec(),
+                        )
+                    }
+                    other => panic!("lightwalletd stub: no {other} answer"),
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (url, posts)
+    }
+
+    /// The prevout txids a ZEC lock spends.
+    fn zec_spent(f: &Funding) -> Vec<[u8; 32]> {
+        swap_chain_zec::tx::ParsedTx::parse(&f.tx.raw)
+            .unwrap()
+            .vin
+            .iter()
+            .map(|i| i.prevout.txid)
+            .collect()
+    }
+
+    /// The ZEC case of [`two_takers_never_share_a_lock_input`]: two concurrent takers on one
+    /// two-coin wallet and one `--db` lock different coins, and a third, with nothing
+    /// unreserved left, aborts before broadcasting and reserves nothing.
+    #[tokio::test]
+    async fn two_zec_takers_never_share_a_lock_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("cli.db");
+        let cli = live_cli("zec", &db);
+        let key = bitcoin::secp256k1::SecretKey::from_slice(&WALLET_KEY).unwrap();
+        let pubkey = key
+            .public_key(&bitcoin::secp256k1::Secp256k1::new())
+            .serialize();
+        let (url, posts) = lightwalletd(&pubkey).await;
+        let sent = || posts.load(std::sync::atomic::Ordering::SeqCst);
+        let taker = || {
+            let (_, res) = divi_swap_cli::reservations::open(&cli.db).unwrap();
+            live_counter(&cli, key, vec![url.clone()], &res).unwrap().0
+        };
+
+        let (one, two) = (taker(), taker());
+        let (a, b) = tokio::join!(fund(one.as_ref(), 1), fund(two.as_ref(), 2));
+        let (a, b) = (a.unwrap(), b.unwrap());
+        let (ia, ib) = (zec_spent(&a), zec_spent(&b));
+        assert!(!ia.is_empty() && !ib.is_empty());
+        let shared = ia.iter().filter(|i| ib.contains(i)).count();
+        assert_eq!(shared, 0, "both locks spend {ia:?} / {ib:?}");
+        assert_eq!(sent(), 2);
+        assert_eq!(held(&db).len(), 2, "{:?}", held(&db));
+        assert!(held(&db).iter().all(|(c, _)| *c == Chain::Zec));
+
+        let three = taker();
+        assert!(fund(three.as_ref(), 3).await.is_err());
+        assert_eq!(sent(), 2, "the third lock is never sent");
+        assert_eq!(held(&db).len(), 2);
+    }
+
+    /// The DIVI wallet key of the two-taker DIVI tests.
+    fn divi_key() -> divi_crypto::keys::SecretKey {
+        divi_crypto::keys::SecretKey::from_bytes(&[0x33; 32]).unwrap()
+    }
+
+    /// A DIVI lock of [`DIVI_LOCK`] from coin `[1; 32]:0` or `[2; 32]:0` leaves change under
+    /// the dust limit, so no lock creates a coin a third one could spend.
+    const DIVI_LOCK: Amount = Amount(500_000_000);
+    const DIVI_COINS: [(u8, u64); 2] = [(1, 500_226_000), (2, 500_230_000)];
+
+    /// A DIVI wallet file holding [`DIVI_COINS`], as a scan leaves it.
+    fn divi_wallet(dir: &std::path::Path) -> std::path::PathBuf {
+        let path = dir.join("divi-wallet.json");
+        let utxos: Vec<_> = DIVI_COINS
+            .iter()
+            .map(|(n, value)| {
+                serde_json::json!({
+                    "outpoint": {"txid": divi_swap::Txid([*n; 32]).to_rpc_hex(), "vout": 0},
+                    "value": value,
+                })
+            })
+            .collect();
+        let wallet = serde_json::json!({
+            "utxos": utxos, "reserved": [], "spent": [], "excluded": [], "scanned_height": 1,
+        });
+        std::fs::write(&path, wallet.to_string()).unwrap();
+        path
+    }
+
+    /// A DIVI node that accepts every `sendrawtransaction` and counts it, and refuses every
+    /// other call (the expiry sweep's tip read fails, so it releases nothing).
+    struct DiviNode(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl wiremock::Respond for DiviNode {
+        fn respond(&self, req: &wiremock::Request) -> ResponseTemplate {
+            let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+            let ok = |v| {
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"result": v, "error": null, "id": 1}))
+            };
+            match body["method"].as_str().unwrap_or_default() {
+                "sendrawtransaction" => {
+                    self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    ok(serde_json::json!("00"))
+                }
+                _ => ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                    "result": null, "error": {"code": -32601, "message": "Method not found"}, "id": 1
+                })),
+            }
+        }
+    }
+
+    /// The prevout txids of a legacy-format DIVI transaction (fewer than 253 inputs, each
+    /// scriptSig shorter than 253 bytes).
+    fn divi_spent(f: &Funding) -> Vec<[u8; 32]> {
+        let raw = &f.tx.raw;
+        let mut at = 5;
+        (0..raw[4])
+            .map(|_| {
+                let txid: [u8; 32] = raw[at..at + 32].try_into().unwrap();
+                at += 36;
+                at += 1 + raw[at] as usize + 4;
+                txid
+            })
+            .collect()
+    }
+
+    /// The DIVI case of [`two_takers_never_share_a_lock_input`]: two DIVI-leg takers, each
+    /// its own `divi-swap` process on one wallet file and one `--db`, lock different coins; a
+    /// third, with nothing unreserved left, aborts before broadcasting and reserves nothing; a
+    /// rebroadcast after a restart keeps its one reservation; a completed swap and a refunded
+    /// one release theirs, once.
+    #[tokio::test]
+    async fn two_divi_takers_never_share_a_lock_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("cli.db");
+        let wallet = divi_wallet(dir.path());
+        let cli = live_cli("btc", &db);
+        let server = MockServer::start().await;
+        let posts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .respond_with(DiviNode(posts.clone()))
+            .mount(&server)
+            .await;
+        let sent = || posts.load(std::sync::atomic::Ordering::SeqCst);
+        let taker = || -> Arc<dyn ChainBackend> {
+            let (_, res) = divi_swap_cli::reservations::open(&cli.db).unwrap();
+            Arc::new(
+                live_divi(
+                    &cli,
+                    &server.uri(),
+                    divi_key(),
+                    divi_wallet::address::Network::Testnet,
+                    Some(wallet.clone()),
+                    &res,
+                )
+                .unwrap(),
+            )
+        };
+
+        let (one, two) = (taker(), taker());
+        let (a, b) = tokio::join!(
+            fund_amount(one.as_ref(), 1, DIVI_LOCK),
+            fund_amount(two.as_ref(), 2, DIVI_LOCK)
+        );
+        let (a, b) = (a.unwrap(), b.unwrap());
+        let (ia, ib) = (divi_spent(&a), divi_spent(&b));
+        assert!(!ia.is_empty() && !ib.is_empty());
+        let shared = ia.iter().filter(|i| ib.contains(i)).count();
+        assert_eq!(shared, 0, "both locks spend {ia:?} / {ib:?}");
+        assert_eq!(sent(), 2);
+        assert_eq!(held(&db).len(), 2, "{:?}", held(&db));
+        assert!(held(&db).iter().all(|(c, _)| *c == Chain::Divi));
+
+        // Abort: no unreserved coin covers a third lock; nothing sent, nothing reserved.
+        let three = taker();
+        assert!(fund_amount(three.as_ref(), 3, DIVI_LOCK).await.is_err());
+        assert_eq!(sent(), 2, "the third lock is never sent");
+        assert_eq!(held(&db).len(), 2);
+
+        // Restart: a new process rebroadcasts lock `a`; it keeps its one reservation.
+        taker().broadcast(&a.tx).await.unwrap();
+        assert_eq!(held(&db).len(), 2);
+
+        // Completion and refund: each finished swap releases its lock, and only it, once.
+        let store = Store::open(&db).unwrap();
+        let swap = |id, state, lock| {
+            taker_swap_paying(id, state, Chain::Btc, Direction::TakerPaysDivi, lock)
+        };
+        store
+            .put_taker_swap(&swap("a", TakerState::Done, &a))
+            .unwrap();
+        let mut refunding = swap("b", TakerState::Refunded, &b);
+        refunding.taker_leg_refund = Some(b.tx.clone());
+        store.put_taker_swap(&refunding).unwrap();
+        let counter: Arc<dyn ChainBackend> =
+            Arc::new(MockChain::new(Chain::Btc, T0, 600).backend(4, Amount(Amount::COIN)));
+        refund_command_on(&db, "btc", "a", three.clone(), counter.clone(), unix_now())
+            .await
+            .unwrap();
+        assert_eq!(held(&db), vec![(Chain::Divi, b.tx.txid)]);
+        refunding.state = TakerState::Done;
+        store.put_taker_swap(&refunding).unwrap();
+        refund_command_on(&db, "btc", "b", three.clone(), counter, unix_now())
+            .await
+            .unwrap();
+        assert_eq!(held(&db), vec![]);
+        let (_, after_restart) = divi_swap_cli::reservations::open(&db).unwrap();
+        assert_eq!(
+            divi_swap_cli::reservations::release_finished(&store, &after_restart).unwrap(),
+            0
+        );
+        // The released inputs are spent on chain: the wallet file never offers them again.
+        assert!(fund_amount(three.as_ref(), 6, DIVI_LOCK).await.is_err());
+        assert!(fund_amount(taker().as_ref(), 7, DIVI_LOCK).await.is_err());
+        assert_eq!(sent(), 3, "two locks and the rebroadcast");
+    }
+
+    #[tokio::test]
+    async fn the_sweep_is_live_counter_chain_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("cli.db");
+        let mut c = live_cli("btc", &db);
+        c.backend = BackendArg::Mock;
+        let counter = MockChain::new(Chain::Btc, T0, 600).backend(4, Amount(Amount::COIN));
+        sweep_locks(&c, &counter, &counter, T0).await;
+        assert!(!db.exists(), "a mock run never opens --db for reservations");
+    }
+
+    // ---- the sweep, through the claim, refund and run commands ----
+
+    /// Mock MTP of both chains at the start of a command test: [`lock_htlc`]'s deadline is an
+    /// hour later.
+    const T0: u32 = 1_900_000_000 - 3_600;
+
+    /// `divi-swap --backend live --counter-chain <chain> --db <db> <args…>`.
+    fn command(db: &std::path::Path, chain: &str, args: &[&str]) -> Cli {
+        let mut argv = vec![
+            "divi-swap",
+            "--backend",
+            "live",
+            "--counter-chain",
+            chain,
+            "--db",
+            db.to_str().unwrap(),
+        ];
+        argv.extend_from_slice(args);
+        Cli::try_parse_from(argv).unwrap()
+    }
+
+    /// The prepared backends of a command: a mock DIVI wallet and `counter`.
+    fn prepared(divi: Arc<dyn ChainBackend>, counter: Arc<dyn ChainBackend>) -> Backends {
+        Backends {
+            divi,
+            btc: counter,
+            live: None,
+        }
+    }
+
+    /// `divi-swap refund <swap>` on `counter` with the wall clock at `now` (DIVI is a fresh
+    /// mock: a refund never uses it).
+    async fn refund_command(
+        db: &std::path::Path,
+        chain: &str,
+        swap: &str,
+        counter: Arc<dyn ChainBackend>,
+        now: u32,
+    ) -> Result<String> {
+        let divi = MockChain::new(Chain::Divi, T0, 60).backend(3, Amount(Amount::COIN));
+        refund_command_on(db, chain, swap, Arc::new(divi), counter, now).await
+    }
+
+    /// [`refund_command`] with `divi` as the DIVI backend (the taker leg of a DIVI-leg swap).
+    async fn refund_command_on(
+        db: &std::path::Path,
+        chain: &str,
+        swap: &str,
+        divi: Arc<dyn ChainBackend>,
+        counter: Arc<dyn ChainBackend>,
+        now: u32,
+    ) -> Result<String> {
+        let cli = command(db, chain, &["refund", "--swap", swap]);
+        finishing(&cli, &Sessions::beside(db), prepared(divi, counter), now).await
+    }
+
+    /// A BTC mock chain at [`T0`] and the taker's wallet on it.
+    fn btc_chain() -> (MockChain, Arc<dyn ChainBackend>) {
+        let c = MockChain::new(Chain::Btc, T0, 600);
+        let b = c.backend(4, Amount(10 * Amount::COIN));
+        (c, Arc::new(b))
+    }
+
+    /// Fund and broadcast the taker-leg lock of swap `id` (HTLC [`lock_htlc`]`(7)`) on `b`'s
+    /// chain (a DIVI lock is a `TakerPaysDivi` swap against BTC), store the swap in `state`
+    /// and reserve input `[n; 32]:0` for the lock, as the live backend does.
+    async fn locked_swap(
+        db: &std::path::Path,
+        b: &dyn ChainBackend,
+        id: &str,
+        state: TakerState,
+        n: u8,
+    ) -> TakerRecord {
+        let f = b
+            .build_funding(&lock_htlc(7), Amount::from_sat(5_000))
+            .await
+            .unwrap();
+        b.broadcast(&f.tx).await.unwrap();
+        let (store, res) = divi_swap_cli::reservations::open(db).unwrap();
+        res.reserve(
+            b.chain(),
+            &f.tx.txid,
+            &[divi_swap::Outpoint {
+                txid: divi_swap::Txid([n; 32]),
+                vout: 0,
+            }],
+        )
+        .unwrap();
+        let direction = match b.chain() {
+            Chain::Divi => Direction::TakerPaysDivi,
+            _ => Direction::TakerPaysBtc,
+        };
+        let counter = match b.chain() {
+            Chain::Divi => Chain::Btc,
+            c => c,
+        };
+        let s = taker_swap_paying(id, state, counter, direction, &f);
+        store.put_taker_swap(&s).unwrap();
+        s
+    }
+
+    fn lock_of(s: &TakerRecord) -> divi_swap::Txid {
+        s.taker_leg_funding.as_ref().unwrap().tx.txid
+    }
+
+    #[tokio::test]
+    async fn the_refund_command_releases_the_lock_once_its_refund_confirms() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("cli.db");
+        let (c, b) = btc_chain();
+        let s = locked_swap(&db, b.as_ref(), "r", TakerState::Locked, 1).await;
+        c.mine(1);
+        let refund = || refund_command(&db, "btc", "r", b.clone(), c.mtp());
+
+        assert_eq!(refund().await.unwrap(), "Locked", "before the deadline");
+        assert_eq!(held(&db), vec![(Chain::Btc, lock_of(&s))]);
+        c.advance_time(3_600);
+        assert_eq!(refund().await.unwrap(), "Refunded", "refund broadcast");
+        assert_eq!(held(&db), vec![(Chain::Btc, lock_of(&s))], "lock on chain");
+        c.mine(1);
+        assert_eq!(refund().await.unwrap(), "Done");
+        assert_eq!(held(&db), vec![], "the finished swap released its lock");
+    }
+
+    #[tokio::test]
+    async fn refunding_a_dropped_lock_fails_but_releases_its_inputs_after_the_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("cli.db");
+        let (c, b) = btc_chain();
+        let s = locked_swap(&db, b.as_ref(), "dropped", TakerState::Locked, 1).await;
+        c.forget(&lock_of(&s)); // in no mempool and no block
+        let refund_at = |now: u32| refund_command(&db, "btc", "dropped", b.clone(), now);
+        let refund = || refund_at(c.mtp());
+
+        assert_eq!(refund().await.unwrap(), "Locked");
+        assert_eq!(
+            held(&db),
+            vec![(Chain::Btc, lock_of(&s))],
+            "deadline not passed"
+        );
+        c.advance_time(3_601); // MTP past the locktime: the refund is final
+        for _ in 0..2 {
+            let err = refund().await.unwrap_err();
+            assert!(err.to_string().contains("missing inputs"), "{err:#}");
+            assert_eq!(
+                held(&db),
+                vec![(Chain::Btc, lock_of(&s))],
+                "absent past the deadline, but only at one height"
+            );
+        }
+        c.mine(divi_swap::reservation::EXPIRY_ABSENT_BLOCKS);
+        assert!(
+            refund_at(c.mtp() + divi_swap::reservation::EXPIRY_MAX_TIP_AGE_SECS + 1)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            held(&db),
+            vec![(Chain::Btc, lock_of(&s))],
+            "a stale backend releases nothing"
+        );
+        assert!(refund().await.is_err());
+        assert_eq!(
+            held(&db),
+            vec![],
+            "absent past the deadline six blocks apart: released"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_refund_command_keeps_a_lock_still_in_the_mempool_past_its_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("cli.db");
+        let (c, b) = btc_chain();
+        let s = locked_swap(&db, b.as_ref(), "slow", TakerState::Locked, 1).await;
+        c.advance_time(3_601); // past the locktime; the lock never confirmed but is in the mempool
+        let out = refund_command(&db, "btc", "slow", b.clone(), c.mtp())
+            .await
+            .unwrap();
+        assert_eq!(out, "Refunded", "the refund spends the pending lock");
+        assert_eq!(held(&db), vec![(Chain::Btc, lock_of(&s))]);
+    }
+
+    #[tokio::test]
+    async fn the_claim_command_releases_the_lock_once_the_claim_confirms() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("cli.db");
+        let (btc, b) = btc_chain();
+        let divi = MockChain::new(Chain::Divi, T0, 60);
+        let mut s = locked_swap(&db, b.as_ref(), "c", TakerState::Claimed, 1).await;
+        btc.mine(1);
+        // The maker's DIVI lock to the swap's hash, confirmed.
+        let maker_leg = HtlcParams {
+            hash: bitcoin::hashes::sha256::Hash::hash(&s.preimage).to_byte_array(),
+            ..lock_htlc(0)
+        };
+        let maker = divi.backend(5, Amount(10 * Amount::COIN));
+        let f = maker
+            .build_funding(&maker_leg, Amount(Amount::COIN))
+            .await
+            .unwrap();
+        maker.broadcast(&f.tx).await.unwrap();
+        divi.mine(1);
+        s.maker_leg_htlc = Some(maker_leg);
+        s.maker_leg_outpoint = Some(f.outpoint);
+        s.maker_leg_amount = Some(f.amount);
+        Store::open(&db).unwrap().put_taker_swap(&s).unwrap();
+        let sessions = Sessions::beside(&db);
+        sessions
+            .put(
+                "c",
+                divi_swap_cli::session::Session {
+                    maker_url: "http://127.0.0.1:1".into(), // unreachable: steps without it
+                    maker_swap_id: "m".into(),
+                    swap_token: String::new(),
+                },
+            )
+            .unwrap();
+        let cli = command(&db, "btc", &["claim", "--swap", "c"]);
+        let taker_divi: Arc<dyn ChainBackend> = Arc::new(divi.backend(3, Amount(Amount::COIN)));
+        let claim = || {
+            finishing(
+                &cli,
+                &sessions,
+                prepared(taker_divi.clone(), b.clone()),
+                btc.mtp(),
+            )
+        };
+
+        assert_eq!(claim().await.unwrap(), "Claimed", "claim broadcast");
+        assert_eq!(held(&db), vec![(Chain::Btc, lock_of(&s))]);
+        divi.mine(1);
+        assert_eq!(claim().await.unwrap(), "Done");
+        assert_eq!(held(&db), vec![], "the finished swap released its lock");
+    }
+
+    #[tokio::test]
+    async fn the_run_command_sweeps_even_when_the_maker_is_unreachable() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("cli.db");
+        let (c, b) = btc_chain();
+        locked_swap(&db, b.as_ref(), "done", TakerState::Done, 1).await;
+        let dropped = locked_swap(&db, b.as_ref(), "dropped", TakerState::Locked, 2).await;
+        let live = locked_swap(&db, b.as_ref(), "live", TakerState::Locked, 3).await;
+        c.forget(&lock_of(&dropped));
+        c.advance_time(3_600);
+        let cli = command(
+            &db,
+            "btc",
+            &[
+                "run",
+                "--maker",
+                "http://127.0.0.1:1",
+                "--offer",
+                "o",
+                "--btc-sats",
+                "5000",
+            ],
+        );
+        let divi: Arc<dyn ChainBackend> =
+            Arc::new(MockChain::new(Chain::Divi, T0, 60).backend(3, Amount(Amount::COIN)));
+        let sessions = Sessions::beside(&db);
+        let run = || finishing(&cli, &sessions, prepared(divi.clone(), b.clone()), c.mtp());
+        assert!(run().await.is_err(), "no maker answers the quote");
+        // The finished swap's lock is released; the dropped one has had one absent check.
+        let mut want = vec![
+            (Chain::Btc, lock_of(&dropped)),
+            (Chain::Btc, lock_of(&live)),
+        ];
+        want.sort_by_key(|(_, t)| t.0);
+        assert_eq!(held(&db), want);
+        c.mine(divi_swap::reservation::EXPIRY_ABSENT_BLOCKS);
+        assert!(run().await.is_err());
+        // Six blocks later the dropped lock is released too; the lock still in the mempool
+        // (now mined) keeps its input.
+        assert_eq!(held(&db), vec![(Chain::Btc, lock_of(&live))]);
+    }
+
+    // ---- the sweep, for a DIVI-leg lock ----
+
+    /// A DIVI mock chain at [`T0`] and the taker's wallet on it.
+    fn divi_chain() -> (MockChain, Arc<divi_swap::mock::MockBackend>) {
+        let c = MockChain::new(Chain::Divi, T0, 60);
+        let b = c.backend(4, Amount(10 * Amount::COIN));
+        (c, Arc::new(b))
+    }
+
+    /// A fresh BTC counter backend: a DIVI-leg refund never uses it.
+    fn idle_btc() -> Arc<dyn ChainBackend> {
+        btc_chain().1
+    }
+
+    #[tokio::test]
+    async fn the_refund_command_releases_a_divi_lock_once_its_refund_confirms() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("cli.db");
+        let (c, b) = divi_chain();
+        let s = locked_swap(&db, b.as_ref(), "r", TakerState::Locked, 1).await;
+        c.mine(1);
+        let refund = || refund_command_on(&db, "btc", "r", b.clone(), idle_btc(), c.mtp());
+
+        assert_eq!(refund().await.unwrap(), "Locked", "before the deadline");
+        assert_eq!(held(&db), vec![(Chain::Divi, lock_of(&s))]);
+        c.advance_time(3_600);
+        assert_eq!(refund().await.unwrap(), "Refunded", "refund broadcast");
+        assert_eq!(held(&db), vec![(Chain::Divi, lock_of(&s))], "lock on chain");
+        c.mine(1);
+        assert_eq!(refund().await.unwrap(), "Done");
+        assert_eq!(held(&db), vec![], "the finished swap released its lock");
+        assert!(
+            b.released_locks().is_empty(),
+            "a lock on chain is never given back"
+        );
+    }
+
+    #[tokio::test]
+    async fn refunding_a_dropped_divi_lock_releases_its_inputs_after_the_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("cli.db");
+        let (c, b) = divi_chain();
+        let s = locked_swap(&db, b.as_ref(), "dropped", TakerState::Locked, 1).await;
+        c.forget(&lock_of(&s)); // in no mempool and no block
+        let refund_at =
+            |now: u32| refund_command_on(&db, "btc", "dropped", b.clone(), idle_btc(), now);
+        let refund = || refund_at(c.mtp());
+
+        assert_eq!(refund().await.unwrap(), "Locked");
+        assert_eq!(
+            held(&db),
+            vec![(Chain::Divi, lock_of(&s))],
+            "deadline not passed"
+        );
+        c.advance_time(3_601); // MTP past the locktime: the refund is final
+        for _ in 0..2 {
+            assert!(
+                refund().await.is_err(),
+                "the refund spends a lock nobody has"
+            );
+            assert_eq!(
+                held(&db),
+                vec![(Chain::Divi, lock_of(&s))],
+                "absent past the deadline, but only at one height"
+            );
+        }
+        c.mine(divi_swap::reservation::EXPIRY_ABSENT_BLOCKS);
+        assert!(
+            refund_at(c.mtp() + divi_swap::reservation::EXPIRY_MAX_TIP_AGE_SECS + 1)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            held(&db),
+            vec![(Chain::Divi, lock_of(&s))],
+            "a stale backend releases nothing"
+        );
+        assert!(b.released_locks().is_empty());
+        assert!(refund().await.is_err());
+        assert_eq!(
+            held(&db),
+            vec![],
+            "absent past the deadline six blocks apart: released"
+        );
+        assert_eq!(
+            b.released_locks(),
+            vec![lock_of(&s)],
+            "the wallet file gets the lock's inputs back too"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_divi_lock_sweep_starts_each_count_where_divi_expiry_start_says() {
+        use divi_swap::reservation::{ExpiryStart, EXPIRY_ABSENT_BLOCKS};
+        let dir = tempfile::tempdir().unwrap();
+        let args = |db: &std::path::Path, start: Option<&'static str>| {
+            let mut a = vec![
+                "--backend".to_string(),
+                "live".into(),
+                "--counter-chain".into(),
+                "btc".into(),
+                "--db".into(),
+                db.to_str().unwrap().into(),
+            ];
+            if let Some(s) = start {
+                a.extend(["--divi-expiry-start".into(), s.into()]);
+            }
+            a
+        };
+        let parse = |a: &[String]| cli(&a.iter().map(String::as_str).collect::<Vec<_>>());
+        let db = dir.path().join("x.db");
+        assert_eq!(parse(&args(&db, None)).divi_expiry_start, ExpiryStart::Tip);
+        assert_eq!(
+            parse(&args(&db, Some("mtp"))).divi_expiry_start,
+            ExpiryStart::Mtp
+        );
+        let Err(e) = Cli::try_parse_from(
+            ["divi-swap".to_string()]
+                .into_iter()
+                .chain(args(&db, Some("median")))
+                .chain(
+                    [
+                        "quote",
+                        "--maker",
+                        "http://x",
+                        "--offer",
+                        "o",
+                        "--btc-sats",
+                        "1",
+                    ]
+                    .map(String::from),
+                ),
+        ) else {
+            panic!("--divi-expiry-start median parsed");
+        };
+        let e = e.to_string();
+        assert!(e.contains("--divi-expiry-start"), "{e}");
+
+        let mut released_at = Vec::new();
+        for (i, start) in [None, Some("tip"), Some("mtp")].into_iter().enumerate() {
+            let db = dir.path().join(format!("cli{i}.db"));
+            let (c, b) = divi_chain();
+            let s = locked_swap(&db, b.as_ref(), "dropped", TakerState::Locked, 1).await;
+            c.forget(&lock_of(&s));
+            c.advance_time(3_601);
+            // Tips that look fresh (swept at the tip's own time) while MTP trails them by
+            // five blocks.
+            b.set_tip_lead(5 * 60);
+            let cli = parse(&args(&db, start));
+            let first = c.height();
+            loop {
+                sweep_locks(&cli, b.as_ref(), idle_btc().as_ref(), c.mtp() + 5 * 60).await;
+                if held(&db).is_empty() {
+                    break;
+                }
+                assert!(c.height() < first + 20, "{start:?}: never released");
+                c.mine(1);
+            }
+            assert_eq!(b.released_locks(), vec![lock_of(&s)]);
+            released_at.push(c.height() - first);
+        }
+        let n = EXPIRY_ABSENT_BLOCKS;
+        assert_eq!(released_at, [n, n, n + 4]);
+    }
+
+    #[tokio::test]
+    async fn each_counter_lock_sweep_starts_its_count_where_its_expiry_start_flag_says() {
+        use divi_swap::reservation::{ExpiryStart, EXPIRY_ABSENT_BLOCKS};
+        let dir = tempfile::tempdir().unwrap();
+        for chain in [Chain::Btc, Chain::Ltc, Chain::Zec] {
+            let name = chain.to_string().to_lowercase();
+            let flag = format!("--{name}-expiry-start");
+            let args = |db: &std::path::Path, start: Option<&str>| {
+                let mut a = vec![
+                    "--backend".to_string(),
+                    "live".into(),
+                    "--counter-chain".into(),
+                    name.clone(),
+                    "--db".into(),
+                    db.to_str().unwrap().into(),
+                ];
+                // Every other chain's flag, DIVI's included, says "mtp": only this
+                // chain's own counts.
+                for other in ["divi", "btc", "ltc", "zec"] {
+                    if other != name {
+                        a.extend([format!("--{other}-expiry-start"), "mtp".into()]);
+                    }
+                }
+                if let Some(s) = start {
+                    a.extend([flag.clone(), s.into()]);
+                }
+                a
+            };
+            let parse = |a: &[String]| cli(&a.iter().map(String::as_str).collect::<Vec<_>>());
+            let db = dir.path().join(format!("{name}.db"));
+            let own = |c: &Cli| match chain {
+                Chain::Btc => c.btc_expiry_start,
+                Chain::Ltc => c.ltc_expiry_start,
+                _ => c.zec_expiry_start,
+            };
+            assert_eq!(own(&parse(&args(&db, None))), ExpiryStart::Tip);
+            assert_eq!(own(&parse(&args(&db, Some("mtp")))), ExpiryStart::Mtp);
+            let Err(e) = Cli::try_parse_from(
+                ["divi-swap".to_string()]
+                    .into_iter()
+                    .chain(args(&db, Some("median")))
+                    .chain(
+                        [
+                            "quote",
+                            "--maker",
+                            "http://x",
+                            "--offer",
+                            "o",
+                            "--btc-sats",
+                            "1",
+                        ]
+                        .map(String::from),
+                    ),
+            ) else {
+                panic!("{flag} median parsed");
+            };
+            let e = e.to_string();
+            assert!(e.contains(&flag), "{e}");
+
+            let mut released_at = Vec::new();
+            for (i, start) in [None, Some("tip"), Some("mtp")].into_iter().enumerate() {
+                let db = dir.path().join(format!("{name}{i}.db"));
+                let c = MockChain::new(chain, T0, 600);
+                let b: Arc<divi_swap::mock::MockBackend> =
+                    Arc::new(c.backend(4, Amount(10 * Amount::COIN)));
+                let s = locked_swap(&db, b.as_ref(), "dropped", TakerState::Locked, 1).await;
+                c.forget(&lock_of(&s));
+                c.advance_time(3_601);
+                // Tips that look fresh (swept at the tip's own time) while MTP trails them
+                // by five blocks.
+                b.set_tip_lead(5 * 600);
+                let cli = parse(&args(&db, start));
+                assert_eq!(
+                    cli.counter_chain, chain,
+                    "{start:?}: the sweep runs on this chain"
+                );
+                let first = c.height();
+                loop {
+                    let (_, divi) = divi_chain();
+                    sweep_locks(&cli, divi.as_ref(), b.as_ref(), c.mtp() + 5 * 600).await;
+                    if held(&db).is_empty() {
+                        break;
+                    }
+                    assert!(c.height() < first + 20, "{flag} {start:?}: never released");
+                    c.mine(1);
+                }
+                released_at.push(c.height() - first);
+            }
+            let n = EXPIRY_ABSENT_BLOCKS;
+            assert_eq!(released_at, [n, n, n + 4], "{flag}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_refund_command_keeps_a_divi_lock_still_in_the_mempool_past_its_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("cli.db");
+        let (c, b) = divi_chain();
+        let s = locked_swap(&db, b.as_ref(), "slow", TakerState::Locked, 1).await;
+        c.advance_time(3_601); // past the locktime; the lock never confirmed but is in the mempool
+        for _ in 0..2 {
+            let out = refund_command_on(&db, "btc", "slow", b.clone(), idle_btc(), c.mtp())
+                .await
+                .unwrap();
+            assert_eq!(out, "Refunded", "the refund spends the pending lock");
+            assert_eq!(held(&db), vec![(Chain::Divi, lock_of(&s))]);
+        }
+        assert!(b.released_locks().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_run_command_sweeps_divi_locks_and_keeps_those_on_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("cli.db");
+        let (c, b) = divi_chain();
+        let mined = locked_swap(&db, b.as_ref(), "mined", TakerState::Locked, 4).await;
+        c.mine(1);
+        locked_swap(&db, b.as_ref(), "done", TakerState::Done, 1).await;
+        let dropped = locked_swap(&db, b.as_ref(), "dropped", TakerState::Locked, 2).await;
+        let live = locked_swap(&db, b.as_ref(), "live", TakerState::Locked, 3).await;
+        c.forget(&lock_of(&dropped));
+        c.advance_time(3_600);
+        let cli = command(
+            &db,
+            "btc",
+            &[
+                "run",
+                "--maker",
+                "http://127.0.0.1:1",
+                "--offer",
+                "o",
+                "--btc-sats",
+                "5000",
+            ],
+        );
+        let sessions = Sessions::beside(&db);
+        let run = || finishing(&cli, &sessions, prepared(b.clone(), idle_btc()), c.mtp());
+        assert!(run().await.is_err(), "no maker answers the quote");
+        let sorted = |mut v: Vec<(Chain, divi_swap::Txid)>| {
+            v.sort_by_key(|(_, t)| t.0);
+            v
+        };
+        // The finished swap's lock is released; the dropped one has had one absent check.
+        assert_eq!(
+            held(&db),
+            sorted(vec![
+                (Chain::Divi, lock_of(&mined)),
+                (Chain::Divi, lock_of(&dropped)),
+                (Chain::Divi, lock_of(&live)),
+            ])
+        );
+        c.mine(divi_swap::reservation::EXPIRY_ABSENT_BLOCKS);
+        assert!(run().await.is_err());
+        // Six blocks later the dropped lock is released too; the locks on chain keep theirs.
+        assert_eq!(
+            held(&db),
+            sorted(vec![
+                (Chain::Divi, lock_of(&mined)),
+                (Chain::Divi, lock_of(&live)),
+            ])
+        );
+        assert_eq!(b.released_locks(), vec![lock_of(&dropped)]);
+    }
+
+    // ---- the taker's own DIVI source, and who runs the taker's sources (T32-16) ----
+
+    /// A [`DiviNode`] on a fresh mock server.
+    async fn divi_node() -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(DiviNode(Arc::new(std::sync::atomic::AtomicUsize::new(0))))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// `--divi-rpc-url` is the taker's DIVI primary: every taker DIVI read (tip, median time,
+    /// confirmations, the HTLC output, find-spend) and the broadcast go to it, and to
+    /// `--divi-fallback-rpc-url` as well when that is set; the default proxy is not asked.
+    /// `tip` reads it too.
+    #[tokio::test]
+    async fn taker_divi_rpc_url_replaces_the_default_primary() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("cli.db");
+        let net = divi_wallet::address::Network::Testnet;
+        let (own, second) = (divi_node().await, divi_node().await);
+        let (own_uri, second_uri) = (own.uri(), second.uri());
+        for fallback in [None, Some(second_uri.as_str())] {
+            let mut argv = vec![
+                "--backend",
+                "live",
+                "--counter-chain",
+                "btc",
+                "--db",
+                db.to_str().unwrap(),
+                "--divi-rpc-url",
+                &own_uri,
+            ];
+            if let Some(f) = fallback {
+                argv.extend(["--divi-fallback-rpc-url", f]);
+            }
+            let cli = cli(&argv);
+            assert_eq!(divi_rpc_url(&cli, net), own_uri);
+            let (_, res) = divi_swap_cli::reservations::open(&cli.db).unwrap();
+            let b = live_divi(
+                &cli,
+                &divi_rpc_url(&cli, net),
+                divi_key(),
+                net,
+                Some(divi_wallet(dir.path())),
+                &res,
+            )
+            .unwrap();
+            assert_eq!(b.has_fallback(), fallback.is_some());
+            let tip = tip_backend(&cli, Chain::Divi).unwrap();
+            let at = divi_swap::Outpoint {
+                txid: divi_swap::Txid([9; 32]),
+                vout: 0,
+            };
+            let lock = b.build_funding(&lock_htlc(7), DIVI_LOCK).await.unwrap();
+            macro_rules! read_on_both {
+                ($what:literal, $read:expr) => {{
+                    let before = (posts(&own).await, posts(&second).await);
+                    let _ = $read.await;
+                    let after = (posts(&own).await, posts(&second).await);
+                    assert!(after.0 > before.0, "{}: not read on --divi-rpc-url", $what);
+                    assert_eq!(
+                        after.1 > before.1,
+                        fallback.is_some(),
+                        "{}: read on the fallback iff it is set",
+                        $what
+                    );
+                }};
+            }
+            read_on_both!("tip_height", b.tip_height());
+            read_on_both!("median_time_past", b.median_time_past());
+            read_on_both!("confirmations", b.confirmations(&at.txid));
+            read_on_both!("htlc_output", b.htlc_output(&lock_htlc(7), &at));
+            read_on_both!("find_spend", b.find_spend(&at, 1));
+            read_on_both!("broadcast", b.broadcast(&lock.tx));
+            read_on_both!("tip", tip.tip_height());
+        }
+    }
+
+    /// Without `--divi-rpc-url` (or with a blank one) the taker's DIVI primary is the
+    /// network's default proxy, as before the flag existed.
+    #[test]
+    fn divi_rpc_url_unset_keeps_the_default_proxy() {
+        use divi_wallet::address::Network;
+        for net in [Network::Testnet, Network::Mainnet] {
+            assert_eq!(
+                divi_rpc_url(&cli(&[]), net),
+                swap_chain_divi::default_rpc(net)
+            );
+        }
+    }
+
+    /// With `--divi-rpc-url` set, the fallback must differ from it (not from the default,
+    /// which is then a valid second source); a blank `--divi-rpc-url` is unset.
+    #[test]
+    fn divi_fallback_must_differ_from_the_divi_rpc_url_in_use() {
+        let net = divi_wallet::address::Network::Testnet;
+        let own = "http://127.0.0.1:51473";
+        let c = cli(&["--divi-rpc-url", own, "--divi-fallback-rpc-url", own]);
+        let err = with_divi_fallback(&c, net, throwaway_divi()).err().unwrap();
+        assert!(
+            err.to_string().contains("--divi-rpc-url") && err.to_string().contains("must differ"),
+            "{err}"
+        );
+        let proxy = swap_chain_divi::default_rpc(net);
+        let c = cli(&["--divi-rpc-url", own, "--divi-fallback-rpc-url", proxy]);
+        assert!(with_divi_fallback(&c, net, throwaway_divi())
+            .unwrap()
+            .has_fallback());
+        let blank = cli(&["--divi-rpc-url", " "]);
+        assert_eq!(divi_rpc_url(&blank, net), swap_chain_divi::default_rpc(net));
+    }
+
+    /// The argv of a mainnet taker against BTC, plus `extra`.
+    fn mainnet_cli(counter: &str, extra: &[&str]) -> Cli {
+        let mut argv = vec![
+            "--profile",
+            "mainnet",
+            "--allow-mainnet",
+            "--divi-network",
+            "mainnet",
+            "--counter-chain",
+            counter,
+            "--btc-network",
+            "mainnet",
+            "--zec-network",
+            "mainnet",
+        ];
+        argv.extend_from_slice(extra);
+        cli(&argv)
+    }
+
+    fn divi_warnings(cli: &Cli) -> Vec<String> {
+        taker_source_warnings(cli)
+            .unwrap()
+            .into_iter()
+            .filter(|w| w.starts_with("DIVI"))
+            .collect()
+    }
+
+    /// On `--profile mainnet` with `--allow-single-source` (without it the start is refused:
+    /// T32-20), a taker whose every DIVI source is the default proxy or under its registrable
+    /// domain gets one warning naming the endpoint and the risk; an own primary, or a second
+    /// source of another operator, gets none. Testnet: nothing new.
+    #[test]
+    fn mainnet_taker_on_the_default_divi_proxy_only_is_warned() {
+        let proxy = swap_chain_divi::MAINNET_RPC;
+        for extra in [
+            &["--allow-single-source"][..],
+            &[
+                "--allow-single-source",
+                "--divi-fallback-rpc-url",
+                "https://other.services.divi.domains/rpc/",
+            ][..],
+            &["--allow-single-source", "--divi-rpc-url", proxy][..],
+        ] {
+            let w = divi_warnings(&mainnet_cli("btc", extra));
+            assert_eq!(w.len(), 1, "{extra:?}: {w:?}");
+            assert!(w[0].contains(proxy), "{extra:?}: {}", w[0]);
+            assert!(w[0].contains("--divi-rpc-url"), "{}", w[0]);
+            assert!(w[0].contains("maker lock"), "{}", w[0]);
+        }
+        for extra in [
+            &["--divi-rpc-url", "https://divi.own-node.example:51473"][..],
+            &["--divi-fallback-rpc-url", "http://127.0.0.1:51473"][..],
+        ] {
+            assert!(
+                divi_warnings(&mainnet_cli("btc", extra)).is_empty(),
+                "{extra:?}"
+            );
+        }
+        assert!(taker_source_warnings(&cli(&[])).unwrap().is_empty());
+        assert!(taker_source_warnings(&cli(&["--counter-chain", "zec"]))
+            .unwrap()
+            .is_empty());
+    }
+
+    /// On `--profile mainnet` with `--counter-chain zec`, one lightwalletd operator and no
+    /// `--zec-crosscheck-url` is warned (the daemon's rule, as a warning); a second operator
+    /// silences it, and no other counter chain gets it. The DIVI side is an own node here, so
+    /// the DIVI single-source refusal stays out of the way.
+    #[test]
+    fn mainnet_taker_on_one_zec_operator_is_warned() {
+        let zec = |cli: &Cli| -> Vec<String> {
+            taker_source_warnings(cli)
+                .unwrap()
+                .into_iter()
+                .filter(|w| w.starts_with("ZEC"))
+                .collect()
+        };
+        let mainnet_cli = |counter: &str, extra: &[&str]| {
+            mainnet_cli(
+                counter,
+                &[
+                    &["--divi-rpc-url", "https://divi.own-node.example:51473"],
+                    extra,
+                ]
+                .concat(),
+            )
+        };
+        let w = zec(&mainnet_cli("zec", &[]));
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(
+            w[0].contains("zec.rocks") && w[0].contains("--zec-crosscheck-url"),
+            "{}",
+            w[0]
+        );
+        assert!(zec(&mainnet_cli(
+            "zec",
+            &[
+                "--zec-crosscheck-url",
+                "https://lwd.other-operator.net:9067"
+            ]
+        ))
+        .is_empty());
+        assert!(zec(&mainnet_cli("btc", &[])).is_empty());
+    }
+
+    /// The start error of `cli`: `live_backends` without a `--divi-key` stops at the key, so
+    /// any earlier refusal is the one returned, and nothing touches the network.
+    fn start_error(cli: &Cli) -> String {
+        match live_backends(cli) {
+            Ok(_) => panic!("built a live backend without a --divi-key"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    /// The DIVI one-operator shapes of a mainnet taker: the default proxy alone, the proxy
+    /// plus another host of its operator, the proxy named as `--divi-rpc-url`.
+    const ONE_DIVI_OPERATOR: [&[&str]; 3] = [
+        &[],
+        &[
+            "--divi-fallback-rpc-url",
+            "https://other.services.divi.domains/rpc/",
+        ],
+        &["--divi-rpc-url", swap_chain_divi::MAINNET_RPC],
+    ];
+
+    /// T32-20 (Manager ruling 2, 2026-10-28): on `--profile mainnet`, a taker whose every
+    /// DIVI source is one operator's is refused at start, before any network action, naming
+    /// the missing second source and the `--allow-single-source` opt-in.
+    #[test]
+    fn mainnet_taker_on_one_divi_operator_is_refused_without_the_opt_in() {
+        for extra in ONE_DIVI_OPERATOR {
+            let e = start_error(&mainnet_cli("btc", extra));
+            assert!(
+                e.contains("second, independent DIVI source")
+                    && e.contains("--divi-fallback-rpc-url")
+                    && e.contains("--allow-single-source"),
+                "{extra:?}: {e}"
+            );
+            assert!(!e.contains("--divi-key"), "{extra:?}: {e}");
+        }
+    }
+
+    /// With `--allow-single-source` the same taker starts (it gets as far as its key) and is
+    /// warned at every start, in the daemon's `allow_single_source` wording.
+    #[test]
+    fn mainnet_taker_on_one_divi_operator_starts_with_the_opt_in_and_is_warned() {
+        for extra in ONE_DIVI_OPERATOR {
+            let mut argv = extra.to_vec();
+            argv.push("--allow-single-source");
+            let c = mainnet_cli("btc", &argv);
+            let e = start_error(&c);
+            assert!(e.contains("--divi-key"), "{argv:?}: {e}");
+            let w = divi_warnings(&c);
+            assert_eq!(w.len(), 1, "{argv:?}: {w:?}");
+            assert!(
+                w[0].contains(swap_chain_divi::MAINNET_RPC)
+                    && w[0].contains("--allow-single-source")
+                    && w[0].contains("one lying or broken endpoint is trusted"),
+                "{argv:?}: {}",
+                w[0]
+            );
+        }
+    }
+
+    /// Controls: testnet is neither refused nor warned, with or without the opt-in; a
+    /// mainnet taker with a second operator is neither refused nor warned, and the opt-in
+    /// on such a taker adds no warning.
+    #[test]
+    fn the_divi_single_source_rule_leaves_testnet_and_two_operators_alone() {
+        for extra in [&[][..], &["--allow-single-source"][..]] {
+            let c = cli(extra);
+            assert!(start_error(&c).contains("--divi-key"), "{extra:?}");
+            assert!(divi_warnings(&c).is_empty(), "{extra:?}");
+        }
+        for two in [
+            &["--divi-rpc-url", "https://divi.own-node.example:51473"][..],
+            &["--divi-fallback-rpc-url", "http://127.0.0.1:51473"][..],
+        ] {
+            for opt_in in [&[][..], &["--allow-single-source"][..]] {
+                let argv = [two, opt_in].concat();
+                let c = mainnet_cli("btc", &argv);
+                assert!(start_error(&c).contains("--divi-key"), "{argv:?}");
+                assert!(divi_warnings(&c).is_empty(), "{argv:?}");
+            }
         }
     }
 }

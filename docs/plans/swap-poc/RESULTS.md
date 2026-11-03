@@ -101,7 +101,7 @@ Plan Wave 3 step 4's promo-page "Status" line: not applicable — no promo page 
 - Full table: `status/chaos.md`.
 
 ## Staking claim (plan §1.5)
-- Engine test `no_coin_selection_before_taker_lock_confirmed` (`crates/divi-swap/tests/engine.rs:521`): `funding_calls == 0` after accept, at `TakerLockSeen`, and at `TakerLockConfirmed`; exactly 1 on the edge to `MakerLocked`. Passes on main (CI `Test` job, and locally 2026-10-10).
+- Engine test `no_coin_selection_before_taker_lock_confirmed` (`crates/divi-swap/tests/engine.rs:521`; at HEAD 2026-10-22 now `:697-723`, `no_coin_selection_body` and its macro cases): `funding_calls == 0` after accept, at `TakerLockSeen`, and at `TakerLockConfirmed`; exactly 1 on the edge to `MakerLocked`. Passes on main (CI `Test` job, and locally 2026-10-10).
 - Live corroboration: deployed case-C maker swap `406b03ad…` sat in `TakerLockSeen` with no DIVI lock while the BTC lock awaited confirmations.
 
 ## CI (plan §1.6)
@@ -381,7 +381,7 @@ run waits only on test ETH (PARKED.md #3). Clean worktree of `46e6b30`, all anvi
     cc8749bf8790 → cf457b9f22c2, `9a36be57` d7045a0bbe4e → 42639b28ff34 → df8bd7ac0eb1.
     Taker outcome `refunded`, XMR swept back with `s_m` read from `Tx_refund`:
     `2f442343b7e7f31e…`, `8f3426cdea5e947f…`, `62d6611bb0a66cc4…`. Two taker runs panicked on a
-    public-node connection reset (`crates/swap-chain-xmr/src/live_rpc.rs:249` `expect`) while
+    public-node connection reset (`crates/swap-chain-xmr/src/live_rpc.rs:249` `expect`; at HEAD 2026-10-22 gone, the `get_block reachable` expect no longer exists in `live_rpc.rs`) while
     waiting; the rerun picked up from the journal. A transient RPC error should be an error, not a
     panic (logged as C8).
   - total through dnsdivi: 22 maker swaps, all `done`, 0 stuck, 0 lost (14 redeemed, 4 + 3 refunded,

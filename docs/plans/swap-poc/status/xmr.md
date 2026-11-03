@@ -1150,3 +1150,140 @@ before any real-money swap.
 - **Phase C brief:** `xmr-review-brief.md` (e6a6fad). Drafting it found C1-C6 (plan §Phase C);
   C1, counterparty malleation of `Tx_cancel`, needs a protocol change or written acceptance before
   any mainnet swap.
+
+## Go-live acceptance run (Human's authorization, all 5 swap lanes)
+
+- **Pre-flight**: lane-synced clean, `check-xmr.sh` PASS, re-verified the `never mainnet`
+  runtime guard is still intact in every live example (asserts real `nettype`/`mainnet` from
+  `get_info`, not just a doc promise) before touching anything — that guard, not this
+  authorization, is what actually gates the network this lane will ever run against; "going
+  live" here means the same thing it has every round this session: DIVI testnet + Monero
+  stagenet, never mainnet.
+- **`examples/xmr_live_final.rs`** (new): one more forward happy-path round, funded by
+  spending the role-swap round's own reclaimed DIVI (`xmr_live_role_swap.rs`'s `Tx_redeem`
+  output 0, 95,900,000 sat) — but through `divi_chain::LiveDiviChain::{learn_utxo,
+  build_funding, broadcast}` instead of a hand-built raw transaction, the first time that
+  module has funded anything for real outside its own tests.
+- Real transactions broadcast, confirmed:
+  1. DIVI `Tx_lock`, via `LiveDiviChain` (learned the recycled coin, built, signed, broadcast):
+     `0a1ed4ab42913f6aa6248daefdae960040dbdce23bf987d41fa7b109db56aecd`
+  2. Monero lock, 0.02 XMR from `mining-wallet`:
+     `d282fa818729cbb0eba453fa2ecf1ee983c22ad4f8ccb8651179f00d0be6927f`, fee 44,060,000
+     atomic units, spent key images `db2876b3164118597df30fc6ba12fd07fa0f5188fead81534c5
+     2570fcf5d7f7d` and `8b8727c873ba74260784970184a868304ea0f43fbd4fbb0309c39a4cbf7f2373`
+  3. DIVI `Tx_redeem`: `1b844e7adb787af031699a6b2e318b5671b355c1ffb99eaa2d5330b6e982ddab`
+     (confirmed `gettxout` on the spent `Tx_lock` output returning null before this was
+     recorded in state -- the broadcast itself returned a bare `rpc -25` with no message on
+     this run, caught and cross-checked against the mempool rather than taken at face value)
+  - Waiting on the Monero lock to reach `SPENDABLE_AGE` (10 confirmations, ~18 more minutes
+    at stagenet's ~2 min/block) before the final sweep via `monero_chain::sweep`.
+- **Bug found this round, fixed**: `xmr_live_final.rs`'s `sendrawtransaction` error path for
+  `Tx_redeem` printed "fine if already broadcast" without actually verifying that or recording
+  `divi_redeem_txid` -- on a real `-25` response with an empty message, this would have
+  silently left the state file believing `Tx_redeem` was never sent, even though it already
+  was (confirmed via `gettxout` on `Tx_lock`'s output returning null, then matching the
+  mempool's one transaction's input against it). Recorded the real txid once found; did not
+  change the example's code this round since the run was already past that step by the time
+  this was caught -- **flagging for a follow-up**: that error path should actually check the
+  chain before calling itself "fine," the same way `divi_chain::LiveDiviChain::broadcast`'s
+  reject-then-recheck already does, rather than printing a reassuring message and moving on.
+- decisions: `cargo fmt` had not been run on `xmr_live_final.rs` before the stop hook caught
+  it (written directly rather than via the usual Edit-after-Read flow mid-live-run) --
+  formatting-only fix, re-verified the example still builds after.
+- needs: nothing from a human right now. Sweep still pending on Monero confirmations; will
+  record the final txid and close out this round once it broadcasts.
+- **The go-live acceptance run is complete.** Monero lock reached `SPENDABLE_AGE` (10
+  confirmations); `monero_chain::sweep` recovered `s_t` from the already-broadcast
+  `Tx_redeem`, combined it with `s_m`, and swept the full 2-of-2 to a fresh destination:
+  4. Monero sweep: `1f2c4f1c1a859f3a2287dd32ac8e9bbea6b3b531ab9093d0273b7fdcabd9733b`
+     (broadcast accepted, in the mempool at check time)
+  Full chain this round: `Tx_lock` → `Tx_redeem` → Monero lock → Monero sweep, all four real,
+  on DIVI testnet + Monero stagenet, with `LiveDiviChain` funding `Tx_lock` and
+  `monero_chain::sweep` completing the Monero side — both new library modules' first live use
+  outside their own tests, not just the protocol itself (already proven five times over prior
+  rounds). Never touched mainnet at any point (`nettype`/`mainnet` checked at startup, same as
+  every round).
+- needs: nothing from a human right now.
+- **Follow-up closed**: `xmr_live_final.rs`'s `Tx_redeem` broadcast error path no longer just
+  prints "fine if already broadcast." On a `sendrawtransaction` error it now computes the
+  tx's real txid locally (`tx_redeem.txid()`) and calls `getrawtransaction` on it; if the
+  node confirms the tx is really there, it records the txid and proceeds, otherwise it
+  panics rather than silently continuing to the Monero sweep with an unconfirmed redeem --
+  the same reject-then-recheck posture `divi_chain::LiveDiviChain::broadcast` already uses.
+  `cargo fmt`/`clippy -D warnings`/`check-xmr.sh` all pass with this change.
+
+## Gate C shrink: C4 + C5 fixed, C2/C7 regression tests (builder I on hp2, 2026-10-21)
+
+Base `0c6e721` (`signed/main`), branch `lane/xmr-gate-shrink`. Testnet/mock only; no chain was touched.
+
+- done: **C4** — `DiviChain::chain_name` (`getblockchaininfo.chain`); `check_divi_chain` runs at XMR
+  startup in `divi-swapd` (`[xmr].divi_rpc_url`) and in `divi-swap`'s live taker
+  (`--xmr-divi-rpc-url`) and refuses a node on another chain than the configured Monero network
+  needs (`live::divi_chain_name`: mainnet → `main`, stagenet/testnet → `test`). The mock chain
+  names itself (`MockDiviChain::set_chain_name`). **C5** — the taker rejects
+  `t_cancel > mtp + MAX_CANCEL_AFTER_SECS` (24 h) and `t_punish > t_cancel + MAX_PUNISH_AFTER_SECS`
+  (12 h), the largest `cancel_h`/`punish_h` the `tests/schedule.rs` grid considers (the mainnet
+  profile uses 12 h / 12 h). **C2/C7 regression tests** in `crates/divi-swap-xmr/tests/engine.rs`:
+  `the_taker_checks_tx_cancels_output_value` (reduced and dust `Tx_cancel` refused, exact value
+  accepted); `a_malleated_tx_lock_is_reclaimed_after_t_late` (`MockDiviChain::malleate` re-encodes
+  the unconfirmed `Tx_lock`'s scriptSigs — new txid, same signatures; the maker records
+  `lock_actual`, offers no redeem, waits through `t_cancel`, signs the late spend past `t_late`)
+  and `the_late_branch_stays_idle_on_the_normal_path`. Also
+  `divi_chain_check_accepts_a_match_and_refuses_a_mismatch` (C4, offline node is not assumed to
+  match), `the_taker_bounds_t_cancel_and_t_punish_from_above` (C5, at the bound / one second above,
+  each field), `chain_name_reads_getblockchaininfo` / `chain_name_errors_without_a_chain_field`
+  (`swap-chain-xmr`), `divi_chain_names_follow_the_monero_network` (`live.rs`). Code commit
+  `f3d343d`. Plan: C4 and C5 moved from the gate to the Fixed table; gate list is now C3, C6;
+  review brief §7 cites the test paths instead of "no unit regression test yet".
+- proof: `cargo fmt --check` clean; `cargo clippy -p divi-swap-xmr -p divi-swapd -p divi-swap-cli
+  --all-targets -- -D warnings` clean; `cargo test -p divi-swap-xmr -p divi-swapd -p divi-swap-cli
+  -p swap-chain-xmr`: 170 passed, 0 failed (162 before, 8 added); `tools/swap-poc/check-xmr.sh`
+  PASS. No new dependencies (root `Cargo.toml` untouched).
+- decisions: the chain check lives behind the `DiviChain` trait (not a raw RPC call at the
+  binaries) so the mock engine tests cover it; `live_xmr_taker` became `async` for the check, and
+  its missing-flag test still fails before any network call. Upper bounds are taker-side
+  constants, not profile fields, since the taker must not trust a maker-supplied profile.
+- left: C3 and C6 (auth/rate-limit design, out of scope here).
+- needs: nothing from a human.
+
+## Gate C close: C3 + C6 fixed (builder J on hp1, 2026-10-21)
+
+Base `eea659b`, branch `lane/xmr-gate-close`, code commit `1ef0c52`. Testnet/mock only; no chain was touched.
+
+- done: **C3** — `DiviChain::release_funding` (live wallet `release`, mock reservations); released on every setup error, on `abort_setup`, and when `sigs_wait_secs` (1800 s, the setup timeout) expires in `Accepted`; a locked swap keeps its coins. `MAX_XMR_QUOTES` = 1000 with expired-first eviction (`Store::list_quotes`/`delete_quote`). Per-IP fixed-window limiter, 20 requests / 60 s on `GET /offers/:id/quote` and `POST /xmr/swaps` → 429 (`divi-swapd` now serves with `ConnectInfo`). Per-swap 32-byte hex token returned in `JRoundReply.swap_token`, required as `X-Swap-Token` on every `/xmr/swaps/:id…` route by a gate that runs before body parsing; mismatch → 404; the CLI stores it in its session. **C6** — `GET /xmr/swaps` removed (405); `find_lock` takes `min_amount` and skips smaller outputs; maker `Done` waits for `xmr_confirmations` (XMR sweep) / `divi_confirmations` (DIVI refund, reclaim) instead of 1; `deadlines()` uses `checked_add` and the C5 bounds (test hook `without_deadline_bounds` keeps the C5 taker test valid).
+- proof: `cargo fmt --check`, `cargo clippy -p divi-swap-xmr -p divi-swapd -p divi-swap-cli -p swap-chain-xmr --all-targets -- -D warnings` clean; `cargo test` same packages: 182 passed, 0 failed (170 before, 12 added); `tools/swap-poc/check-xmr.sh` PASS. No new dependencies. Tests added: `an_aborted_setup_releases_its_coins_and_a_locked_swap_keeps_them`, `the_quote_store_is_bounded`, `the_swap_token_gates_a_swap`, `find_lock_skips_dust_to_the_lock_address`, `done_waits_for_the_profiles_confirmation_depth`, `setup_refuses_overflowing_timelocks`, `deadlines_are_checked_and_bounded`, `tokens_compare_whole_and_never_match_empty`, `a_dust_output_before_the_real_lock_is_not_selected`, `xmr_swap_routes_need_the_swap_token`, `xmr_setup_is_rate_limited_per_ip`, `the_limiter_counts_per_ip_per_window`.
+- left: a crash between `build_funding` reserving coins and the record being persisted leaves a reservation no record points at (not swept). Pre-token maker records are unreachable over HTTP. Behind a reverse proxy all clients share one rate-limit bucket.
+- needs: nothing from a human.
+
+## Gate C left-overs (builder M on hp1, 2026-10-21)
+
+Base `0ad897c`, branch `lane/xmr-gate-left`, code commit `17ce839`. Testnet/mock only; no chain was touched.
+
+- done: **Orphan reservation** — finding: the reservation lives in the wallet file, not process memory (`crates/swap-chain-divi/src/wallet.rs:41` `reserved`, written by `persist` at :66), so a crash between `build_funding` and the record being stored leaves an orphan. `DiviChain::release_orphan_funding(keep)` (live: `Wallet::release_unreferenced`, :181) is called once by the first successful `tick` with the `Tx_lock` txid of every persisted record; each orphan is logged once. A `funding_gate` RwLock (read-held by setup from `build_funding` to the record being stored) keeps the sweep from racing a live setup. **Pre-token records** — option (a): `tick` mints and persists a token for a record without one (`migrate_pre_token`, info log with the swap id only); `tick` already drove those swaps without HTTP. **Proxy-aware rate limit** — `trust_proxy_headers` (default false) in `DaemonConfig`; when true the limiter keys on the first `X-Forwarded-For` address, else `X-Real-IP`, else the socket; when false the headers are never read. README paragraph and commented example config added.
+- proof: `cargo fmt --check` clean; `cargo clippy -p divi-swap-xmr -p divi-swapd -p divi-swap-cli -p swap-chain-xmr --all-targets -- -D warnings` clean; `cargo test` of those four plus `swap-chain-divi`: 215 passed, 0 failed (182 before for the four, 7 tests added); `tools/swap-poc/check-xmr.sh` PASS. No new dependencies.
+- tests added: `a_restart_sweeps_a_reservation_with_no_record_and_keeps_one_with_a_record`, `a_pre_token_record_gets_a_token_and_still_completes`, `release_unreferenced_frees_only_reservations_outside_keep`, `spoofed_forwarded_for_is_ignored_by_default`, `forwarded_for_selects_the_bucket_when_trusted`, `garbage_forwarded_for_falls_back_to_the_socket`, `proxy_headers_are_ignored_unless_trusted`, `trusted_proxy_headers_pick_the_client_and_garbage_falls_back`.
+- left: none.
+- needs: nothing from a human.
+- decisions: sweep runs on the first successful tick (retried if the DIVI wallet is unreachable), not at construction, so it can use the async chain trait.
+
+## monerod nettype guard + XMR readiness rows (builder S on hp1, 2026-10-21)
+
+Base `0d12f57`, branch `lane/xmr-nettype-guard`. Read-only `get_info` against public nodes only; no wallet, key or funds touched.
+
+- done: `swap_chain_xmr::live_rpc::{MonerodNet, NettypeError, parse_nettype, monerod_nettype, expected_nettype}` (strict parse; a missing field is named; `mainnet` flag disagreeing with `nettype` is refused). `divi_swap_xmr::live::{check_nettype, ensure_monerod_network}`: `live_xmr_engine` (daemon) and `live_xmr_taker` (CLI) now ask the node for its `nettype` before any wallet or secret work and refuse to start on a mismatch, or on mainnet without `allow_mainnet` even when the node agrees; the matching `nettype` + `height` are logged at info. Readiness rows (confirmations, reorg depth, public backends, Summary) refreshed; deploy README sentence added.
+- proof: `cargo fmt --check` clean; `cargo clippy -p swap-chain-xmr -p divi-swap-xmr -p divi-swapd -p divi-swap-cli --all-targets -- -D warnings` clean; `cargo test` same four packages: 208 passed before (signed/main `0d12f57`), 221 passed after, 0 failed; `tools/swap-poc/check-xmr.sh` PASS. Live `get_info` facts (curl, `get_info` only, 2026-10-21T20:04Z): `http://node.monerodevs.org:38089` nettype `stagenet`, mainnet false, height 2234660, restricted true; `http://node.monerodevs.org:18089` nettype `mainnet`, mainnet true, height 3789119, restricted true; `http://xmr-node.cakewallet.com:18081` mainnet, 3789119, restricted true (all `verified`); `http://node.community.rino.io:18081` gave no answer (`could not verify`). Field semantics: https://docs.getmonero.org/rpc-library/monerod-rpc/#get_info.
+- tests added: `parses_a_stagenet_get_info`, `parses_a_mainnet_get_info`, `missing_fields_are_named`, `mainnet_flag_disagreeing_with_nettype_is_refused`, `a_jsonrpc_error_is_surfaced`, `expected_nettype_maps_the_three_networks_and_rejects_the_rest`, `nettype_matching_the_config_passes`, `every_nettype_mismatch_is_refused`, `stagenet_config_against_a_mainnet_node_is_refused`, `mainnet_without_allow_mainnet_is_refused_even_when_the_node_agrees`, `a_bad_configured_network_is_an_error`, `an_unreachable_monerod_is_refused_with_the_setting_and_url`, `live_xmr_taker_refuses_a_monerod_it_cannot_confirm_the_network_of`.
+- left: the crate has no ignored `get_info` test (its live tests sit behind `--features live` and do not match `get_info`), so none was run; the mismatch path against a real wrong-network node is covered by the pure-fn tests, not a live run. Timeouts/margins row untouched (phase D).
+- needs: nothing from a human.
+- decisions: the pure check lives in `divi-swap-xmr::live` (shared by daemon and CLI) rather than in `divi-swapd`.
+
+## XMR maker runs without monero-wallet-rpc (builder AG on hp3, 2026-10-22)
+
+Base `789dcee`, branch `lane/xmr-maker-no-wallet-rpc`. Pure code + tests + docs; no funds, keys, wallets or network.
+
+- done: `[xmr].wallet_rpc_url` is `Option<String>` (`bin/divi-swapd/src/config.rs`, serde default); `LiveMoneroConfig.wallet_rpc_url` is `Option<String>` (`crates/divi-swap-xmr/src/live.rs`); `LiveMonero::lock` returns `SwapError::InvalidParams("… wallet_rpc_url is not configured …")` before touching the journal or the network; the taker CLI (`bin/divi-swap/src/main.rs`) still requires `--xmr-wallet-rpc-url`. `wallet_rpc_password` is resolved only when present (unchanged).
+- proof: the maker never calls the wallet RPC — the only caller of `MoneroChain::lock` is `crates/divi-swap-xmr/src/taker.rs:674`; the maker sweeps with the recovered key through monerod. `cargo fmt --check` clean; `cargo clippy -p divi-swap-xmr -p divi-swapd -p divi-swap-cli --all-targets -- -D warnings` clean; `cargo test` same three packages: 195 passed before, 197 after.
+- tests added: `xmr_section_without_wallet_rpc_keys_loads` (divi-swapd; also checks configs with the keys set parse as before), `lock_without_a_wallet_rpc_fails_named_and_writes_no_journal` (divi-swap-xmr). Maker swap to `done` and to refund with mock backends is covered by the existing maker tests, whose mock chain has no wallet RPC at all.
+- left: the runbook does not tell the maker operator to run monero-wallet-rpc (only the `maker-xmr-wallet-rpc` credential row), so it is unchanged.
+- needs: nothing from a human.
+- decisions: the named error is `InvalidParams` so the engine does not retry it as transient.

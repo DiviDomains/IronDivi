@@ -19,6 +19,7 @@ use bitcoin::transaction::Version;
 use bitcoin::{
     Amount, CompressedPublicKey, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
 };
+use divi_swap::htlc::ScriptVersion;
 use divi_swap::htlc::REFUND_SEQUENCE;
 use divi_swap::{HtlcParams, SwapError};
 use sha2::{Digest, Sha256};
@@ -42,7 +43,12 @@ pub struct Coin {
 
 /// The P2WSH script pubkey of an HTLC.
 pub fn htlc_script_pubkey(htlc: &HtlcParams) -> ScriptBuf {
-    ScriptBuf::new_p2wsh(&ScriptBuf::from_bytes(htlc.redeem_script()).wscript_hash())
+    htlc_script_pubkey_v(htlc, htlc.script_version)
+}
+
+/// The P2WSH script pubkey of an HTLC redeem script of the given version.
+pub fn htlc_script_pubkey_v(htlc: &HtlcParams, version: ScriptVersion) -> ScriptBuf {
+    ScriptBuf::new_p2wsh(&ScriptBuf::from_bytes(htlc.redeem_script_v(version)).wscript_hash())
 }
 
 /// Result of a funding build.
@@ -248,7 +254,9 @@ pub fn build_spend_tx(
         Spend::Refund => Witness::from_slice(&[sig, vec![], ws.to_bytes()]),
     };
     let (lock_time, sequence) = match spend {
-        Spend::Claim(_) => (LockTime::ZERO, Sequence::MAX),
+        // Signals replacement (BIP125), so a claim that is not confirming can be re-signed
+        // at a higher feerate (`build_claim_at`). The claim branch has no relative lock.
+        Spend::Claim(_) => (LockTime::ZERO, Sequence::ENABLE_RBF_NO_LOCKTIME),
         Spend::Refund => (
             LockTime::from_time(htlc.locktime)
                 .map_err(|e| SwapError::InvalidParams(format!("locktime: {e}")))?,
@@ -280,6 +288,24 @@ pub fn build_spend_tx(
     tx.input[0].witness = witness_for(Signature::sighash_all(sig).to_vec());
     verify_htlc_spend(&tx, htlc, amount)?;
     Ok(tx)
+}
+
+/// Virtual size of a claim of `htlc` as [`build_spend_tx`] builds it, the signature at its
+/// 72-byte maximum (what the fee is computed on).
+pub fn claim_vsize(htlc: &HtlcParams) -> u64 {
+    let ws = ScriptBuf::from_bytes(htlc.redeem_script());
+    let mut tx = Transaction {
+        version: Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![input(OutPoint::null(), Sequence::ENABLE_RBF_NO_LOCKTIME)],
+        output: vec![TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::all_zeros()),
+        }],
+    };
+    tx.input[0].witness =
+        Witness::from_slice(&[DUMMY_SIG.to_vec(), vec![0; 32], vec![1], ws.to_bytes()]);
+    tx.vsize() as u64
 }
 
 /// Run libbitcoinconsensus over input 0 of `tx` against the HTLC's P2WSH output.

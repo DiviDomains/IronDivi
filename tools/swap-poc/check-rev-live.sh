@@ -6,6 +6,7 @@
 # shellcheck disable=SC1091
 source "$(dirname "$0")/lib.sh"
 export SWAP_BTC_NETWORK="${SWAP_BTC_NETWORK:-testnet}"
+export SWAP_CHECK_NETWORK=1  # live script: its whole job is the explorer lookups
 
 # check <key-stem> <divi|btc>: value of rev_<stem>_txid or deployed_rev_<stem>_txid, confirmed on that chain.
 check() {

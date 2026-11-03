@@ -18,7 +18,9 @@
 
 pub mod client;
 pub mod flow;
+pub mod reservations;
 pub mod session;
+pub mod sources;
 pub mod txids;
 pub mod wallet;
 pub mod xmr_flow;

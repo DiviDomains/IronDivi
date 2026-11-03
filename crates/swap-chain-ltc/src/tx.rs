@@ -23,6 +23,7 @@ use bitcoin::transaction::Version;
 use bitcoin::{
     Amount, CompressedPublicKey, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
 };
+use divi_swap::htlc::ScriptVersion;
 use divi_swap::htlc::REFUND_SEQUENCE;
 use divi_swap::{HtlcParams, SwapError};
 use sha2::{Digest, Sha256};
@@ -46,7 +47,12 @@ pub struct Coin {
 
 /// The P2WSH script pubkey of an HTLC.
 pub fn htlc_script_pubkey(htlc: &HtlcParams) -> ScriptBuf {
-    ScriptBuf::new_p2wsh(&ScriptBuf::from_bytes(htlc.redeem_script()).wscript_hash())
+    htlc_script_pubkey_v(htlc, htlc.script_version)
+}
+
+/// The P2WSH script pubkey of an HTLC redeem script of the given version.
+pub fn htlc_script_pubkey_v(htlc: &HtlcParams, version: ScriptVersion) -> ScriptBuf {
+    ScriptBuf::new_p2wsh(&ScriptBuf::from_bytes(htlc.redeem_script_v(version)).wscript_hash())
 }
 
 /// Result of a funding build.
@@ -286,6 +292,41 @@ pub fn build_spend_tx(
     Ok(tx)
 }
 
+/// Virtual size of a claim of `htlc` as [`build_spend_tx`] builds it, the signature at its
+/// 72-byte maximum (what the fee is computed on).
+pub fn claim_vsize(htlc: &HtlcParams) -> u64 {
+    let ws = ScriptBuf::from_bytes(htlc.redeem_script());
+    let mut tx = Transaction {
+        version: Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![input(OutPoint::null(), Sequence::MAX)],
+        output: vec![TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::all_zeros()),
+        }],
+    };
+    tx.input[0].witness =
+        Witness::from_slice(&[DUMMY_SIG.to_vec(), vec![0; 32], vec![1], ws.to_bytes()]);
+    tx.vsize() as u64
+}
+
+/// Virtual size of a CPFP child as [`build_cpfp_tx`] builds it (one P2WPKH input and output,
+/// the signature at its 72-byte maximum).
+pub fn cpfp_child_vsize() -> u64 {
+    let spk = ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::all_zeros());
+    let mut tx = Transaction {
+        version: Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![input(OutPoint::null(), Sequence::MAX)],
+        output: vec![TxOut {
+            value: Amount::ZERO,
+            script_pubkey: spk,
+        }],
+    };
+    tx.input[0].witness = Witness::from_slice(&[DUMMY_SIG.to_vec(), vec![0; 33]]);
+    tx.vsize() as u64
+}
+
 /// Run libbitcoinconsensus over input 0 of `tx` against the HTLC's P2WSH output. The
 /// interpreter is script-identical for Litecoin and Bitcoin SegWit v0 (brief).
 pub fn verify_htlc_spend(
@@ -322,4 +363,55 @@ pub(crate) fn verify_input(
     _raw: &[u8],
 ) -> Result<(), String> {
     Ok(())
+}
+
+/// Build and sign a CPFP child: spend output 0 of `parent` (paid to the key's own P2WPKH,
+/// worth `parent_value`) back to the same address, paying enough that the package it joins
+/// (`package_vsize` vbytes that paid `package_fee` in all) and the child together pay
+/// `sat_per_vb`, and never less than 1 litoshi/vB for the child itself. The child signals
+/// BIP125, so a node run with `-mempoolreplacement=1` takes a richer child of the same
+/// parent in its place (the next bump), keeping the package two deep.
+pub fn build_cpfp_tx(
+    secp: &Secp256k1<All>,
+    sk: &SecretKey,
+    parent: &Transaction,
+    parent_value: u64,
+    package_vsize: u64,
+    package_fee: u64,
+    sat_per_vb: u64,
+) -> Result<Transaction, SwapError> {
+    let pk = CompressedPublicKey(sk.public_key(secp));
+    let my_spk = ScriptBuf::new_p2wpkh(&pk.wpubkey_hash());
+    if parent.output.first().map(|o| &o.script_pubkey) != Some(&my_spk) {
+        return Err(SwapError::InvalidParams(
+            "CPFP parent output 0 is not this key's address".into(),
+        ));
+    }
+    let at = OutPoint::new(parent.compute_txid(), 0);
+    let mut tx = Transaction {
+        version: Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![input(at, Sequence::ENABLE_RBF_NO_LOCKTIME)],
+        output: vec![TxOut {
+            value: Amount::from_sat(parent_value),
+            script_pubkey: my_spk.clone(),
+        }],
+    };
+    let pk_bytes = pk.to_bytes().to_vec();
+    tx.input[0].witness = Witness::from_slice(&[DUMMY_SIG.to_vec(), pk_bytes.clone()]);
+    let child_vsize = tx.vsize() as u64;
+    let want = sat_per_vb
+        .max(1)
+        .saturating_mul(package_vsize.saturating_add(child_vsize));
+    let fee = want.saturating_sub(package_fee).max(child_vsize);
+    let out = parent_value.checked_sub(fee).filter(|v| *v >= DUST_SATS);
+    let out = out.ok_or_else(|| {
+        SwapError::InsufficientFunds(format!(
+            "claim output {parent_value} does not cover fee {fee}"
+        ))
+    })?;
+    tx.output[0].value = Amount::from_sat(out);
+    let sig = p2wpkh_sign(secp, sk, &tx, 0, &my_spk, parent_value)?;
+    tx.input[0].witness = Witness::from_slice(&[sig, pk_bytes]);
+    Ok(tx)
 }

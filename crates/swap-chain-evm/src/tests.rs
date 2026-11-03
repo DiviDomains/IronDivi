@@ -281,6 +281,7 @@ async fn locked_and_refundable(
         claim_pubkey: pk,
         refund_pubkey: pk,
         locktime,
+        script_version: Default::default(),
     };
     let amount = Amount::from_sat(100); // 1 USDC base unit (100 engine sats / 100 per unit)
 
@@ -500,4 +501,33 @@ async fn live_base_sepolia_lock_claim() {
 
     let state = client.swap_state(id).await.expect("swap_state");
     assert!(state.claimed);
+}
+
+/// `tip_hash` is the latest block's hash, 64 lowercase hex characters with no `0x`.
+#[tokio::test]
+async fn tip_hash_is_latest_block_hash_without_prefix() {
+    require_foundry!();
+    let anvil = Anvil::new().spawn();
+    let endpoint = anvil.endpoint();
+    let key = PrivateKeySigner::from(&anvil.keys()[0]);
+    let provider = connect_provider(&endpoint, key.clone()).expect("provider");
+    let backend = UsdcBackend::new(&endpoint, key, Address::ZERO, Address::ZERO).expect("backend");
+    let latest = provider
+        .get_block_by_number(alloy::eips::BlockNumberOrTag::Latest)
+        .await
+        .expect("rpc")
+        .expect("latest block");
+    let got = backend.tip_hash().await.expect("tip_hash");
+    assert_eq!(got.len(), 64, "{got}");
+    assert_eq!(got, format!("{:x}", latest.header.hash));
+}
+
+/// A dead endpoint is a retryable error, not a hash. Needs no anvil: nothing listens on :1.
+#[tokio::test]
+async fn tip_hash_unreachable_endpoint_is_transient() {
+    let key = PrivateKeySigner::random();
+    let backend =
+        UsdcBackend::new("http://127.0.0.1:1", key, Address::ZERO, Address::ZERO).expect("backend");
+    let err = backend.tip_hash().await.unwrap_err();
+    assert!(matches!(err, divi_swap::SwapError::Transient(_)), "{err:?}");
 }

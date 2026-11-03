@@ -20,6 +20,24 @@ pub async fn sleep(d: Duration) {
     gloo_timers::future::sleep(d).await;
 }
 
+/// Returned by [`timeout`] when `f` does not finish within `d`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Elapsed;
+
+/// Await `f` up to `d`, returning `Err(Elapsed)` if it does not finish in time.
+pub async fn timeout<F: std::future::Future>(
+    d: Duration,
+    f: F,
+) -> std::result::Result<F::Output, Elapsed> {
+    #[cfg(not(target_arch = "wasm32"))]
+    return tokio::time::timeout(d, f).await.map_err(|_| Elapsed);
+    #[cfg(target_arch = "wasm32")]
+    return tokio::select! {
+        out = f => Ok(out),
+        () = sleep(d) => Err(Elapsed),
+    };
+}
+
 /// Wall-clock seconds since the Unix epoch.
 pub fn unix_now() -> u64 {
     #[cfg(not(target_arch = "wasm32"))]

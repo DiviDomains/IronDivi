@@ -86,7 +86,9 @@ One Rust command, no `forge` needed (`crates/swap-chain-evm/examples/sepolia_ops
 embeds the compiled bytecode). Run from the Mac once the taker has gas:
 
 ```sh
-SWAP_EVM_KEY_HEX="$(op read 'op://global_secret_store/IronDivi Swap POC - taker-btc/password')" \
+# key via the secret proxy (the raw 1Password CLI is refused from agent shells — one Touch ID per call)
+SWAP_EVM_KEY_HEX="$(secret get --name irondivi-swap-poc-taker-btc-password \
+    --op-ref 'op://global_secret_store/IronDivi Swap POC - taker-btc/password')" \
   cargo run -q -p swap-chain-evm --features live --example sepolia_ops -- deploy
 # prints:
 #   htlc_address: 0x...

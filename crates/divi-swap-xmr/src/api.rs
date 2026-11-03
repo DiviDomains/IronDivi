@@ -49,6 +49,9 @@ impl WireOutpoint {
     }
 }
 
+/// Header carrying a swap's token ([`JRoundReply::swap_token`]) on every request after setup.
+pub const SWAP_TOKEN_HEADER: &str = "x-swap-token";
+
 /// Step 1, taker → maker (`POST /xmr/swaps`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SetupRequest {
@@ -88,16 +91,41 @@ pub struct JRoundRequest {
 }
 
 /// The maker's answer to `POST /xmr/swaps` and to each `POST /xmr/swaps/:id/j`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct JRoundReply {
     /// The maker's swap id.
     pub swap_id: String,
+    /// The swap's bearer token: the taker sends it as the `X-Swap-Token` header on every
+    /// later request for this swap (`/j`, `/sigs`, `/xmr-lock`, `GET`). Anyone without it
+    /// gets a 404.
+    #[serde(default)]
+    pub swap_token: String,
     /// The maker's messages for the taker.
     pub msgs: Vec<JMsg>,
     /// Present once `J` exists and the maker has built `Tx_lock` / `Tx_cancel` around it.
     pub setup: Option<SetupReply>,
     /// Whether the maker holds his `σ_J` share's output (his signing is finished).
     pub signed: bool,
+}
+
+// Hand-written so a stray `{:?}` never prints the bearer token.
+impl std::fmt::Debug for JRoundReply {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let JRoundReply {
+            swap_id,
+            swap_token: _,
+            msgs,
+            setup,
+            signed,
+        } = self;
+        f.debug_struct("JRoundReply")
+            .field("swap_id", swap_id)
+            .field("swap_token", &"<redacted>")
+            .field("msgs", msgs)
+            .field("setup", setup)
+            .field("signed", signed)
+            .finish()
+    }
 }
 
 /// Step 2, maker → taker (the reply to `POST /xmr/swaps`).
@@ -138,6 +166,12 @@ pub struct SetupReply {
     pub t_late: u32,
     /// DIVI fee each presigned transaction pays, sats.
     pub divi_fee_sats: u64,
+    /// The DIVI median time past (unix seconds) the maker derived `t_cancel` from
+    /// (`t_cancel = maker_mtp + cancel_after_secs`). Optional on the wire: a maker that
+    /// predates it omits it (the taker then keeps the tolerant `t_cancel` floor), and a peer
+    /// that predates it ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maker_mtp: Option<u32>,
     /// `Tx_cancel`: lock (cancel branch) → [`swap_chain_xmr::lock_scripts::CancelScript`];
     /// unsigned. Both sides sign its digest with `J`.
     #[serde(with = "wire::divi_tx")]

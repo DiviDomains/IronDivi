@@ -19,6 +19,7 @@ mod backend;
 mod contract;
 mod embedded_bytecode;
 mod network;
+mod quorum;
 
 pub mod client;
 
@@ -42,6 +43,16 @@ pub const SEPOLIA_USDC: &str = "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238";
 /// Circle test USDC — Base Sepolia.
 /// Source: <https://developers.circle.com/stablecoins/usdc-contract-addresses>, 2026-10-11.
 pub const BASE_SEPOLIA_USDC: &str = "0x036CbD53842c5426634e7929541eC2318f3dCF7e";
+
+/// Circle native USDC — Ethereum mainnet (chain id 1). Real money.
+/// Source: <https://developers.circle.com/stablecoins/usdc-contract-addresses>, 2026-10-21
+/// (the page links `etherscan.io/token/0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48`).
+pub const ETHEREUM_USDC: &str = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48";
+
+/// Circle native USDC — Base mainnet (chain id 8453). Real money.
+/// Source: <https://developers.circle.com/stablecoins/usdc-contract-addresses>, 2026-10-21
+/// (the page links `basescan.org/token/0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913`).
+pub const BASE_USDC: &str = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
 
 #[cfg(test)]
 mod tests;

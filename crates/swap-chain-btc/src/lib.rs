@@ -11,16 +11,19 @@
 //! Lane **btc** (docs/plans/swap-poc/lanes/btc.md) owns this crate. The Wave 0 live
 //! proof (`examples/*_cltv_proof.rs`) shows the transaction shapes that signet accepts.
 
+mod broadcast;
 mod client;
+mod quorum;
 mod send;
 mod tx;
 
 pub use client::{ClientError, EsploraClient, RetryPolicy};
 pub use tx::{
-    build_funding_tx, build_spend_tx, htlc_script_pubkey, verify_htlc_spend, Coin, Spend,
+    build_funding_tx, build_spend_tx, claim_vsize, htlc_script_pubkey, verify_htlc_spend, Coin,
+    Spend, DUST_SATS,
 };
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::str::FromStr;
 
 use async_trait::async_trait;
@@ -29,8 +32,8 @@ use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::{All, Secp256k1, SecretKey};
 use bitcoin::{Address, CompressedPublicKey, Network, OutPoint};
 use divi_swap::{
-    Amount, Chain, ChainBackend, Funding, HtlcParams, LockedOutput, Outpoint, SignedTx, SpendInfo,
-    SwapError, Txid,
+    Amount, Chain, ChainBackend, ClaimSizes, FeeBump, Funding, HtlcParams, InputReservations,
+    LockedOutput, Outpoint, SignedTx, SpendInfo, SwapError, Txid,
 };
 use serde_json::Value;
 
@@ -49,6 +52,10 @@ pub const BLOCKSTREAM_TESTNET: &str = "https://blockstream.info/testnet/api";
 
 /// Regtest has no public Esplora: a local one (electrs' regtest HTTP default port).
 pub const LOCAL_REGTEST_ESPLORA: &str = "http://127.0.0.1:3002";
+/// Mainnet primary Esplora endpoint.
+pub const MEMPOOL_MAINNET: &str = "https://mempool.space/api";
+/// Mainnet secondary Esplora endpoint.
+pub const BLOCKSTREAM_MAINNET: &str = "https://blockstream.info/api";
 
 /// Bitcoin network for a test network name: `signet`, `testnet` (testnet3) or `regtest`.
 /// Mainnet is not accepted.
@@ -63,14 +70,33 @@ pub fn btc_network(network: &str) -> Result<Network> {
     }
 }
 
-/// Default Esplora endpoints (primary first) for a test network name: `signet`, `testnet`
-/// (testnet3) or `regtest` (a local Esplora). Signet and testnet both use `tb1` addresses;
-/// regtest uses `bcrt1`.
+/// The `bitcoin` network (address HRP) for a network name: `mainnet`, `signet`, `testnet` or
+/// `regtest`. Signet and testnet3 share the `tb1` HRP, so only the endpoints differ between
+/// them; mainnet uses `bc1` and regtest uses `bcrt1`.
+pub fn bitcoin_network(network: &str) -> Result<Network> {
+    match network {
+        "mainnet" => Ok(Network::Bitcoin),
+        "signet" => Ok(Network::Signet),
+        "testnet" => Ok(Network::Testnet),
+        "regtest" => Ok(Network::Regtest),
+        other => Err(SwapError::InvalidParams(format!(
+            "btc network {other:?} unsupported: mainnet, signet, testnet or regtest"
+        ))),
+    }
+}
+
+/// Default Esplora endpoints (primary first) for a network name: `mainnet`, `signet`,
+/// `testnet` (testnet3) or `regtest` (a local Esplora). Callers gate `mainnet` behind an
+/// explicit opt-in (`allow_mainnet`).
 pub fn esplora_endpoints(network: &str) -> Result<Vec<String>> {
-    match btc_network(network)? {
-        Network::Signet => Ok(vec![MEMPOOL_SIGNET.into(), BLOCKSTREAM_SIGNET.into()]),
-        Network::Testnet => Ok(vec![MEMPOOL_TESTNET.into(), BLOCKSTREAM_TESTNET.into()]),
-        _ => Ok(vec![LOCAL_REGTEST_ESPLORA.into()]),
+    match network {
+        "mainnet" => Ok(vec![MEMPOOL_MAINNET.into(), BLOCKSTREAM_MAINNET.into()]),
+        "signet" => Ok(vec![MEMPOOL_SIGNET.into(), BLOCKSTREAM_SIGNET.into()]),
+        "testnet" => Ok(vec![MEMPOOL_TESTNET.into(), BLOCKSTREAM_TESTNET.into()]),
+        "regtest" => Ok(vec![LOCAL_REGTEST_ESPLORA.into()]),
+        other => Err(SwapError::InvalidParams(format!(
+            "btc network {other:?} unsupported: mainnet, signet, testnet or regtest"
+        ))),
     }
 }
 
@@ -95,7 +121,7 @@ impl Default for FeePolicy {
 /// Blocks scanned per `find_spend` call when falling back to block scanning.
 const MAX_SCAN_BLOCKS: u64 = 200;
 
-/// Bitcoin signet [`ChainBackend`].
+/// Bitcoin [`ChainBackend`] (signet by default; see [`BtcBackend::new_on`]).
 pub struct BtcBackend {
     esplora: EsploraClient,
     secp: Secp256k1<All>,
@@ -105,7 +131,10 @@ pub struct BtcBackend {
     network: Network,
     fees: FeePolicy,
     /// Coins spent by transactions built here; see [`Self::with_free_coins`].
-    spent_by_built: parking_lot::Mutex<HashSet<OutPoint>>,
+    spent_by_built: std::sync::Arc<parking_lot::Mutex<HashMap<OutPoint, Txid>>>,
+    reservations: Option<InputReservations>,
+    /// The primary alone and the secondary, when quorum reads are on.
+    quorum: Option<(EsploraClient, EsploraClient)>,
 }
 
 impl std::fmt::Debug for BtcBackend {
@@ -117,25 +146,159 @@ impl std::fmt::Debug for BtcBackend {
 }
 
 impl BtcBackend {
-    /// `endpoints`: Esplora base URLs, primary first. `key` is resolved by the caller.
+    /// Keep the inputs of broadcast wallet transactions out of coin selection until they
+    /// confirm (see [`InputReservations`]). Without it selection reads the live address
+    /// query only, so a lock that dropped out of the mempool can lose its inputs to a second
+    /// swap. The handle is the daemon's swap database; tests and one-shot tools omit it.
+    pub fn with_input_reservations(mut self, reservations: InputReservations) -> Self {
+        self.reservations = Some(reservations);
+        self
+    }
+
+    /// Read `find_spend`, `htlc_output` and `confirmations` from the primary and the secondary
+    /// Esplora and act only on an answer both give (single-source-design.md section 5, BTC).
+    /// A disagreement, or the secondary failing, is `SwapError::Held` (the engine's bounded
+    /// hold, with [`ChainBackend::primary_only`]); the primary failing is `Transient` (see
+    /// `quorum.rs`). The same
+    /// switch posts every broadcast to both endpoints (see `broadcast.rs`), funds only from
+    /// coins both list, and takes the higher of their fee rates. Off by default; refused with
+    /// fewer than two endpoints.
+    pub fn with_quorum_reads(mut self, on: bool) -> Result<Self> {
+        self.quorum = match on {
+            false => None,
+            true => Some(self.esplora.split_primary().ok_or_else(|| {
+                SwapError::InvalidParams(
+                    "quorum reads need a primary and a secondary Esplora endpoint".into(),
+                )
+            })?),
+        };
+        Ok(self)
+    }
+
+    /// `coins` without those reserved by a broadcast transaction that has not confirmed.
+    fn unreserved(&self, coins: Vec<Coin>) -> Result<Vec<Coin>> {
+        let Some(res) = &self.reservations else {
+            return Ok(coins);
+        };
+        let held = res.reserved(Chain::Btc)?;
+        Ok(coins
+            .into_iter()
+            .filter(|c| {
+                !held.contains(&Outpoint {
+                    txid: Txid(c.outpoint.txid.to_byte_array()),
+                    vout: c.outpoint.vout,
+                })
+            })
+            .collect())
+    }
+
+    /// This key's coins from the address query, less those [`Self::unreserved`] holds back:
+    /// what funding selects from. With quorum reads, only the coins both endpoints list
+    /// (`quorum::agree_coins`); either endpoint failing is `Transient`.
+    async fn my_utxos(&self) -> Result<Vec<Coin>> {
+        let path = format!("/address/{}/utxo", self.address);
+        let coins = match &self.quorum {
+            None => coins_from(&self.get_json(&path).await?)?,
+            Some((primary, secondary)) => {
+                let (a, b) =
+                    tokio::join!(get_json_on(primary, &path), get_json_on(secondary, &path));
+                let (a, b) = quorum::pair("utxos", a, b)?;
+                quorum::agree_coins(coins_from(&a)?, coins_from(&b)?)
+            }
+        };
+        self.unreserved(coins)
+    }
+
+    /// Before `tx` is posted: reserve the wallet inputs it spends. Only a transaction whose
+    /// inputs are all this key's P2WPKH coins (a lock funding, a plain send) is reserved; a
+    /// claim or refund spends an HTLC output, never in the address UTXO list, so it is left
+    /// alone and a store fault cannot hold up a refund. An error blocks the broadcast.
+    fn reserve_inputs(&self, tx: &SignedTx) -> Result<()> {
+        let Some(res) = &self.reservations else {
+            return Ok(());
+        };
+        let parsed: bitcoin::Transaction =
+            bitcoin::consensus::deserialize(&tx.raw).map_err(|e| {
+                SwapError::Other(format!("cannot read own transaction to reserve: {e}"))
+            })?;
+        let ours = self.pubkey.to_bytes();
+        let own_p2wpkh =
+            |i: &bitcoin::TxIn| i.witness.len() == 2 && i.witness.last() == Some(ours.as_slice());
+        if parsed.input.is_empty() || !parsed.input.iter().all(own_p2wpkh) {
+            return Ok(());
+        }
+        let inputs: Vec<Outpoint> = parsed
+            .input
+            .iter()
+            .map(|i| Outpoint {
+                txid: Txid(i.previous_output.txid.to_byte_array()),
+                vout: i.previous_output.vout,
+            })
+            .collect();
+        match res.reserve(Chain::Btc, &tx.txid, &inputs) {
+            Err(e @ SwapError::InputsHeld(_)) => {
+                self.spent_by_built.lock().retain(|_, id| *id != tx.txid);
+                Err(e)
+            }
+            other => other,
+        }
+    }
+
+    /// The transaction is on chain: its inputs are spent, so the reservation has done its
+    /// job. A store fault here is only logged; the next poll releases again.
+    fn release_confirmed(&self, txid: &Txid, confs: u32) {
+        if confs == 0 {
+            return;
+        }
+        self.spent_by_built.lock().retain(|_, id| id != txid);
+        if let Some(res) = &self.reservations {
+            if let Err(e) = res.release_tx(Chain::Btc, txid) {
+                tracing::warn!(%txid, error = %e, "could not release confirmed input reservation");
+            }
+        }
+    }
+
+    /// The raw `/blocks/tip/hash` body, for `tip_hash` without quorum reads.
+    async fn tip_hash_raw(&self) -> Result<String> {
+        tip_hash_raw_on(&self.esplora).await
+    }
+
+    /// Signet backend on explicit `endpoints`: Esplora base URLs, primary first. `key` is
+    /// resolved by the caller. Other networks: [`BtcBackend::new_on`].
     pub fn new(
         endpoints: Vec<String>,
         key: SecretKey,
         fees: FeePolicy,
         retry: RetryPolicy,
     ) -> Result<Self> {
+        Self::new_on("signet", endpoints, key, fees, retry)
+    }
+
+    /// Like [`BtcBackend::new`] for the named `network` (`mainnet`, `signet`, `testnet`):
+    /// the network picks the address HRP (`bc1` vs `tb1`). Not gated here — the daemon and
+    /// CLI refuse `mainnet` unless explicitly allowed.
+    pub fn new_on(
+        network: &str,
+        endpoints: Vec<String>,
+        key: SecretKey,
+        fees: FeePolicy,
+        retry: RetryPolicy,
+    ) -> Result<Self> {
+        let network = bitcoin_network(network)?;
         let secp = Secp256k1::new();
         let pubkey = CompressedPublicKey(key.public_key(&secp));
-        let address = Address::p2wpkh(&pubkey, Network::Signet);
+        let address = Address::p2wpkh(&pubkey, network);
         Ok(Self {
             esplora: EsploraClient::new(endpoints, retry)?,
             secp,
             key,
             pubkey,
             address,
-            network: Network::Signet,
+            network,
             fees,
             spent_by_built: Default::default(),
+            reservations: None,
+            quorum: None,
         })
     }
 
@@ -144,15 +307,15 @@ impl BtcBackend {
         Self::for_network("signet", key, fees)
     }
 
-    /// Default endpoints for `signet`, `testnet` or `regtest` (see [`esplora_endpoints`]).
+    /// Default endpoints for `mainnet`, `signet`, `testnet` or `regtest` (see [`esplora_endpoints`]).
     pub fn for_network(network: &str, key: SecretKey, fees: FeePolicy) -> Result<Self> {
-        Ok(Self::new(
+        Self::new_on(
+            network,
             esplora_endpoints(network)?,
             key,
             fees,
             RetryPolicy::default(),
-        )?
-        .with_network(btc_network(network)?))
+        )
     }
 
     /// Use the address encoding of `network` (`new` defaults to signet's `tb1`).
@@ -162,8 +325,8 @@ impl BtcBackend {
         self
     }
 
-    /// The key's P2WPKH address: `tb1` on signet and testnet3 (same string), `bcrt1` on
-    /// regtest; where funding coins live and spends land.
+    /// The key's P2WPKH address (`bc1` on mainnet; the same `tb1` string on signet and testnet3;
+    /// `bcrt1` on regtest; where funding coins live and spends land).
     pub fn address(&self) -> &Address {
         &self.address
     }
@@ -172,12 +335,24 @@ impl BtcBackend {
         match self.fees {
             FeePolicy::Fixed(r) => r.max(1),
             FeePolicy::Recommended { floor } => {
-                let rate = async {
-                    let body = self.esplora.get("/v1/fees/recommended").await.ok()?;
-                    let v: Value = serde_json::from_str(&body).ok()?;
-                    v["halfHourFee"].as_u64()
-                }
-                .await;
+                // With quorum reads, the higher of the two rates, so a primary quoting low
+                // cannot leave a transaction stuck; one endpoint failing uses the other's
+                // (a fee read never holds up a claim or refund).
+                let rate = match &self.quorum {
+                    None => half_hour_fee_on(&self.esplora).await,
+                    Some((primary, secondary)) => {
+                        let (a, b) =
+                            tokio::join!(half_hour_fee_on(primary), half_hour_fee_on(secondary));
+                        if a.is_none() != b.is_none() {
+                            tracing::warn!(
+                                primary = ?a,
+                                secondary = ?b,
+                                "fee estimate from one Esplora endpoint only"
+                            );
+                        }
+                        a.max(b)
+                    }
+                };
                 if rate.is_none() {
                     tracing::warn!(floor, "fee estimate unavailable, using floor");
                 }
@@ -187,40 +362,7 @@ impl BtcBackend {
     }
 
     async fn get_json(&self, path: &str) -> Result<Value> {
-        let body = self.esplora.get(path).await?;
-        parse_json(&body)
-    }
-
-    async fn get_json_opt(&self, path: &str) -> Result<Option<Value>> {
-        match self.esplora.get_opt(path).await? {
-            Some(b) => Ok(Some(parse_json(&b)?)),
-            None => Ok(None),
-        }
-    }
-
-    /// This backend's own UTXOs, from the Esplora address endpoint.
-    async fn my_utxos(&self) -> Result<Vec<Coin>> {
-        let utxos = self
-            .get_json(&format!("/address/{}/utxo", self.address))
-            .await?;
-        utxos
-            .as_array()
-            .ok_or_else(|| {
-                SwapError::Transient("utxo response is not an array (malformed?)".into())
-            })?
-            .iter()
-            .map(|u| {
-                Ok(Coin {
-                    outpoint: OutPoint::new(
-                        bitcoin::Txid::from_str(u["txid"].as_str().unwrap_or(""))
-                            .map_err(|e| SwapError::Other(format!("utxo txid: {e}")))?,
-                        u["vout"].as_u64().unwrap_or(u64::MAX) as u32,
-                    ),
-                    value: u["value"].as_u64().unwrap_or(0),
-                    confirmed: u["status"]["confirmed"].as_bool().unwrap_or(false),
-                })
-            })
-            .collect()
+        get_json_on(&self.esplora, path).await
     }
 
     /// Build, sign and consensus-verify a plain P2WPKH send of `sats` to `to` (a P2WPKH
@@ -270,13 +412,15 @@ impl BtcBackend {
         tx: impl FnOnce(&T) -> &bitcoin::Transaction,
     ) -> Result<T> {
         let mut spent = self.spent_by_built.lock();
-        spent.retain(|op| coins.iter().any(|c| c.outpoint == *op));
+        spent.retain(|op, _| coins.iter().any(|c| c.outpoint == *op));
         let free: Vec<Coin> = coins
             .into_iter()
-            .filter(|c| !spent.contains(&c.outpoint))
+            .filter(|c| !spent.contains_key(&c.outpoint))
             .collect();
         let built = build(&free)?;
-        spent.extend(tx(&built).input.iter().map(|i| i.previous_output));
+        let raw = tx(&built);
+        let txid = Txid(raw.compute_txid().to_byte_array());
+        spent.extend(raw.input.iter().map(|i| (i.previous_output, txid)));
         Ok(built)
     }
 
@@ -300,23 +444,22 @@ impl BtcBackend {
 
     /// Scan blocks `from_height..=tip` for a transaction spending `outpoint`.
     async fn scan_blocks(
-        &self,
+        es: &EsploraClient,
         outpoint: &Outpoint,
         from_height: u64,
     ) -> Result<Option<SpendInfo>> {
-        let tip = self.tip_height().await?;
+        let tip = tip_height_on(es).await?;
         let want_txid = outpoint.txid.to_rpc_hex();
         let last = tip.min(from_height.saturating_add(MAX_SCAN_BLOCKS - 1));
         for height in from_height..=last {
-            let hash = self
-                .esplora
+            let hash = es
                 .get(&format!("/block-height/{height}"))
                 .await?
                 .trim()
                 .to_string();
             let mut start = 0u32;
             loop {
-                let txs = self.get_json(&format!("/block/{hash}/txs/{start}")).await?;
+                let txs = get_json_on(es, &format!("/block/{hash}/txs/{start}")).await?;
                 let txs = txs.as_array().cloned().unwrap_or_default();
                 if txs.is_empty() {
                     break;
@@ -338,6 +481,63 @@ fn parse_json(body: &str) -> Result<Value> {
     // (a truncated or HTML body), not a deliberate answer from the chain: real Esplora
     // error bodies are plain text and never reach this function (see `ClientError::Http`).
     serde_json::from_str(body).map_err(|e| SwapError::Transient(format!("bad Esplora JSON: {e}")))
+}
+
+async fn get_json_on(es: &EsploraClient, path: &str) -> Result<Value> {
+    let body = es.get(path).await?;
+    parse_json(&body)
+}
+
+async fn get_json_opt_on(es: &EsploraClient, path: &str) -> Result<Option<Value>> {
+    match es.get_opt(path).await? {
+        Some(b) => Ok(Some(parse_json(&b)?)),
+        None => Ok(None),
+    }
+}
+
+async fn tip_hash_raw_on(es: &EsploraClient) -> Result<String> {
+    Ok(es.get("/blocks/tip/hash").await?)
+}
+
+async fn tip_height_on(es: &EsploraClient) -> Result<u64> {
+    let body = es.get("/blocks/tip/height").await?;
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        // A load-balanced backend occasionally answers 200 with an empty body
+        // mid-reindex; a real tip height is never empty.
+        return Err(SwapError::Transient("empty tip height response".into()));
+    }
+    trimmed
+        .parse()
+        .map_err(|_| SwapError::Transient(format!("unparseable tip height {body:?}")))
+}
+
+/// The coins in an Esplora `/address/:address/utxo` answer (`txid`, `vout`, `value`,
+/// `status.confirmed`).
+fn coins_from(utxos: &Value) -> Result<Vec<Coin>> {
+    utxos
+        .as_array()
+        .ok_or_else(|| SwapError::Transient("utxo response is not an array (malformed?)".into()))?
+        .iter()
+        .map(|u| {
+            Ok(Coin {
+                outpoint: OutPoint::new(
+                    bitcoin::Txid::from_str(u["txid"].as_str().unwrap_or(""))
+                        .map_err(|e| SwapError::Other(format!("utxo txid: {e}")))?,
+                    u["vout"].as_u64().unwrap_or(u64::MAX) as u32,
+                ),
+                value: u["value"].as_u64().unwrap_or(0),
+                confirmed: u["status"]["confirmed"].as_bool().unwrap_or(false),
+            })
+        })
+        .collect()
+}
+
+/// `/v1/fees/recommended` `halfHourFee` from one endpoint view; `None` if it cannot be read.
+async fn half_hour_fee_on(es: &EsploraClient) -> Option<u64> {
+    let body = es.get("/v1/fees/recommended").await.ok()?;
+    let v: Value = serde_json::from_str(&body).ok()?;
+    v["halfHourFee"].as_u64()
 }
 
 fn hex_items(v: &Value) -> Result<Vec<Vec<u8>>> {
@@ -417,30 +617,95 @@ impl ChainBackend for BtcBackend {
         self.pubkey.to_bytes()
     }
 
+    /// With quorum reads, the same key on the primary Esplora alone, quorum reads off and no
+    /// failover (the secondary is the source being held): the engine reads and builds on it
+    /// only where a hold ends at its deadline (`divi_swap` `hold.rs`). Off, none.
+    fn primary_only(&self) -> Option<std::sync::Arc<dyn ChainBackend>> {
+        let (primary, _) = self.quorum.as_ref()?;
+        Some(std::sync::Arc::new(BtcBackend {
+            esplora: primary.clone(),
+            secp: self.secp.clone(),
+            key: self.key,
+            pubkey: self.pubkey,
+            address: self.address.clone(),
+            network: self.network,
+            fees: self.fees,
+            spent_by_built: std::sync::Arc::clone(&self.spent_by_built),
+            reservations: self.reservations.clone(),
+            quorum: None,
+        }))
+    }
+
     async fn tip_height(&self) -> Result<u64> {
-        let body = self.esplora.get("/blocks/tip/height").await?;
-        let trimmed = body.trim();
-        if trimmed.is_empty() {
-            // A load-balanced backend occasionally answers 200 with an empty body
-            // mid-reindex; a real tip height is never empty.
-            return Err(SwapError::Transient("empty tip height response".into()));
+        let Some((primary, secondary)) = &self.quorum else {
+            return tip_height_on(&self.esplora).await;
+        };
+        let (a, b) = tokio::join!(tip_height_on(primary), tip_height_on(secondary));
+        let (a, b) = quorum::pair("tip_height", a, b)?;
+        Ok(a.min(b))
+    }
+
+    async fn tip_hash(&self) -> Result<String> {
+        if self.quorum.is_some() {
+            return Ok(self.tip_header().await?.hash);
         }
-        trimmed
-            .parse()
-            .map_err(|_| SwapError::Transient(format!("unparseable tip height {body:?}")))
+        divi_swap::backend::normalize_block_hash(&self.tip_hash_raw().await?)
+    }
+
+    /// Esplora `GET /blocks/tip/hash` ("the hash of the last block"), then `GET /block/:hash`
+    /// for that block's `height`, `timestamp` and `id` (Blockstream esplora `API.md`). Height
+    /// and time come from the one block whose hash was read, so a tip that moves between
+    /// the two requests cannot mix two blocks; a block whose `id` is not the hash asked for
+    /// is a transient error. With quorum reads, the lower of the two endpoints' tips, once
+    /// the other names the same block at that height (see [`Self::quorum_tip_header`]).
+    async fn tip_header(&self) -> Result<divi_swap::backend::TipHeader> {
+        match &self.quorum {
+            None => Self::tip_header_on(&self.esplora).await,
+            Some((primary, secondary)) => Self::quorum_tip_header(primary, secondary).await,
+        }
+    }
+
+    /// Esplora `GET /block/:hash/status`: `in_best_chain` is "false for orphaned blocks"
+    /// (Blockstream esplora `API.md`). A status whose `height` is not `height` is a transient
+    /// error, as is one without `in_best_chain`. Esplora may also answer `false` (or 404, an
+    /// error here) for a hash it never saw; the expiry sweep only asks about a block at or
+    /// below a tip it has already accepted from this chain. With quorum reads both endpoints
+    /// must give the same answer.
+    async fn in_best_chain(&self, height: u64, hash: &str) -> Result<bool> {
+        let Some((primary, secondary)) = &self.quorum else {
+            return Self::in_best_chain_on(&self.esplora, height, hash).await;
+        };
+        let (a, b) = tokio::join!(
+            Self::in_best_chain_on(primary, height, hash),
+            Self::in_best_chain_on(secondary, height, hash)
+        );
+        let (a, b) = quorum::pair("in_best_chain", a, b)?;
+        quorum::agree_in_best_chain(hash, a, b)
+    }
+
+    /// `pow_target_spacing` of rust-bitcoin's consensus parameters for this network
+    /// (`bitcoin::params::Params`, 600 s on every network; Bitcoin Core's
+    /// `consensus.nPowTargetSpacing = 10 * 60` in `src/kernel/chainparams.cpp`).
+    fn target_block_secs(&self) -> Option<u32> {
+        Some(bitcoin::params::Params::new(self.network).pow_target_spacing as u32)
     }
 
     async fn median_time_past(&self) -> Result<u32> {
-        let hash = self.esplora.get("/blocks/tip/hash").await?;
-        let block = self.get_json(&format!("/block/{}", hash.trim())).await?;
-        block["mediantime"]
-            .as_u64()
-            .map(|t| t as u32)
-            .ok_or_else(|| {
-                // Esplora always sets mediantime on a real block; its absence means we read a
-                // block from a backend that has not finished indexing it yet.
-                SwapError::Transient("block JSON lacks mediantime (still indexing?)".into())
-            })
+        let Some((primary, secondary)) = &self.quorum else {
+            return Self::median_time_past_on(&self.esplora).await;
+        };
+        let (a, b) = tokio::join!(
+            Self::median_time_past_on(primary),
+            Self::median_time_past_on(secondary)
+        );
+        let (a, b) = quorum::pair("median_time_past", a, b)?;
+        Ok(a.min(b))
+    }
+
+    async fn spendable(&self) -> Result<Option<Amount>> {
+        Ok(Some(Amount(
+            self.my_utxos().await?.iter().map(|c| c.value).sum(),
+        )))
     }
 
     async fn build_funding(&self, htlc: &HtlcParams, amount: Amount) -> Result<Funding> {
@@ -490,6 +755,44 @@ impl ChainBackend for BtcBackend {
         Ok(Self::to_signed(&tx))
     }
 
+    /// Bitcoin Core relays replacements (full RBF is on by default since v28,
+    /// `src/kernel/mempool_options.h:25`), and the claim signals BIP125 anyway.
+    fn fee_bump(&self) -> FeeBump {
+        FeeBump::Rbf
+    }
+
+    async fn claim_feerate(&self) -> Result<Option<u64>> {
+        Ok(Some(self.sat_per_vb().await))
+    }
+
+    fn claim_sizes(&self, htlc: &HtlcParams) -> Option<ClaimSizes> {
+        Some(ClaimSizes {
+            claim_vsize: claim_vsize(htlc),
+            child_vsize: 0,
+            dust: DUST_SATS,
+        })
+    }
+
+    async fn build_claim_at(
+        &self,
+        htlc: &HtlcParams,
+        at: &Outpoint,
+        amount: Amount,
+        preimage: &[u8; 32],
+        feerate: u64,
+    ) -> Result<SignedTx> {
+        let tx = build_spend_tx(
+            &self.secp,
+            &self.key,
+            htlc,
+            btc_outpoint(at),
+            amount.to_sat(),
+            Spend::Claim(preimage),
+            feerate.max(1),
+        )?;
+        Ok(Self::to_signed(&tx))
+    }
+
     async fn build_refund(
         &self,
         htlc: &HtlcParams,
@@ -509,6 +812,18 @@ impl ChainBackend for BtcBackend {
     }
 
     async fn broadcast(&self, tx: &SignedTx) -> Result<Txid> {
+        self.reserve_inputs(tx)?;
+        if let Some((primary, secondary)) = &self.quorum {
+            return match broadcast::post_both(primary, secondary, tx).await {
+                Ok(()) => Ok(tx.txid),
+                Err(f) => {
+                    if f.missing_or_spent && self.confirmations(&tx.txid).await?.is_some() {
+                        return Ok(tx.txid);
+                    }
+                    Err(f.err)
+                }
+            };
+        }
         match self.esplora.post("/tx", hex::encode(&tx.raw)).await {
             Ok(_) => Ok(tx.txid),
             Err(ClientError::Http(f)) => {
@@ -529,24 +844,72 @@ impl ChainBackend for BtcBackend {
     }
 
     async fn confirmations(&self, txid: &Txid) -> Result<Option<u32>> {
-        let Some(status) = self
-            .get_json_opt(&format!("/tx/{}/status", txid.to_rpc_hex()))
-            .await?
+        let confs = match &self.quorum {
+            None => Self::confirmations_on(&self.esplora, txid).await?,
+            Some((primary, secondary)) => {
+                let (a, b) = tokio::join!(
+                    Self::confirmations_on(primary, txid),
+                    Self::confirmations_on(secondary, txid)
+                );
+                let (a, b) = quorum::pair("confirmations", a, b)?;
+                quorum::agree_confirmations(a, b)?
+            }
+        };
+        if let Some(c) = confs {
+            self.release_confirmed(txid, c);
+        }
+        Ok(confs)
+    }
+
+    async fn htlc_output(&self, htlc: &HtlcParams, at: &Outpoint) -> Result<Option<LockedOutput>> {
+        let Some((primary, secondary)) = &self.quorum else {
+            return Self::htlc_output_on(&self.esplora, htlc, at).await;
+        };
+        let (a, b) = tokio::join!(
+            Self::htlc_output_on(primary, htlc, at),
+            Self::htlc_output_on(secondary, htlc, at)
+        );
+        let (a, b) = quorum::pair("htlc_output", a, b)?;
+        quorum::agree_htlc_output(a, b)
+    }
+
+    async fn find_spend(&self, outpoint: &Outpoint, from_height: u64) -> Result<Option<SpendInfo>> {
+        let Some((primary, secondary)) = &self.quorum else {
+            return Self::find_spend_on(&self.esplora, outpoint, from_height).await;
+        };
+        let (a, b) = tokio::join!(
+            Self::find_spend_on(primary, outpoint, from_height),
+            Self::find_spend_on(secondary, outpoint, from_height)
+        );
+        let (a, b) = quorum::pair("find_spend", a, b)?;
+        quorum::agree_spend(a, b)
+    }
+}
+
+/// The three reads a claim or refund rests on, as one endpoint view answers them. Without
+/// quorum reads the view is the failover client; with them, each endpoint on its own.
+impl BtcBackend {
+    /// `confirmations` as one endpoint view `es` answers it.
+    async fn confirmations_on(es: &EsploraClient, txid: &Txid) -> Result<Option<u32>> {
+        let Some(status) =
+            get_json_opt_on(es, &format!("/tx/{}/status", txid.to_rpc_hex())).await?
         else {
             return Ok(None);
         };
         if status["confirmed"].as_bool() != Some(true) {
             return Ok(Some(0));
         }
-        let tip = self.tip_height().await?;
+        let tip = tip_height_on(es).await?;
         Ok(Some(Self::confs_from_status(&status, tip)))
     }
 
-    async fn htlc_output(&self, htlc: &HtlcParams, at: &Outpoint) -> Result<Option<LockedOutput>> {
-        let Some(t) = self
-            .get_json_opt(&format!("/tx/{}", at.txid.to_rpc_hex()))
-            .await?
-        else {
+    /// `htlc_output` as one endpoint view `es` answers it.
+    async fn htlc_output_on(
+        es: &EsploraClient,
+        htlc: &HtlcParams,
+        at: &Outpoint,
+    ) -> Result<Option<LockedOutput>> {
+        let Some(t) = get_json_opt_on(es, &format!("/tx/{}", at.txid.to_rpc_hex())).await? else {
             return Ok(None);
         };
         let Some(out) = t["vout"].as_array().and_then(|v| v.get(at.vout as usize)) else {
@@ -560,7 +923,7 @@ impl ChainBackend for BtcBackend {
             .as_u64()
             .ok_or_else(|| SwapError::Other("vout lacks value".into()))?;
         let confirmations = if t["status"]["confirmed"].as_bool() == Some(true) {
-            Self::confs_from_status(&t["status"], self.tip_height().await?)
+            Self::confs_from_status(&t["status"], tip_height_on(es).await?)
         } else {
             0
         };
@@ -570,15 +933,20 @@ impl ChainBackend for BtcBackend {
         }))
     }
 
-    async fn find_spend(&self, outpoint: &Outpoint, from_height: u64) -> Result<Option<SpendInfo>> {
+    /// `find_spend` as one endpoint view `es` answers it.
+    async fn find_spend_on(
+        es: &EsploraClient,
+        outpoint: &Outpoint,
+        from_height: u64,
+    ) -> Result<Option<SpendInfo>> {
         let prev = outpoint.txid.to_rpc_hex();
         let path = format!("/tx/{prev}/outspend/{}", outpoint.vout);
-        let outspend = match self.esplora.get_opt(&path).await {
+        let outspend = match es.get_opt(&path).await {
             Ok(Some(b)) => parse_json(&b)?,
             Ok(None) => return Ok(None),
             // Endpoint without outspend support: fall back to scanning blocks.
             Err(ClientError::Http(f)) if f.status == 400 || f.status == 501 => {
-                return self.scan_blocks(outpoint, from_height).await;
+                return Self::scan_blocks(es, outpoint, from_height).await;
             }
             Err(e) => return Err(e.into()),
         };
@@ -591,11 +959,110 @@ impl ChainBackend for BtcBackend {
         // A load-balanced backend can report the outspend before another replica has
         // indexed the spending tx itself; treat that race as "not found yet" (the caller
         // polls find_spend again), not a permanent error.
-        let Some(t) = self.get_json_opt(&format!("/tx/{spender}")).await? else {
+        let Some(t) = get_json_opt_on(es, &format!("/tx/{spender}")).await? else {
             return Ok(None);
         };
         let height = outspend["status"]["block_height"].as_u64();
         spend_from_tx(&t, &prev, outpoint.vout, height)
+    }
+}
+
+/// The tip, header, block-status and median-time reads as one endpoint view answers them,
+/// and the header's quorum join (`[btc].quorum_reads`). Without quorum reads the view is the
+/// failover client and these are the reads as they were.
+impl BtcBackend {
+    /// `tip_header` as one endpoint view `es` answers it.
+    async fn tip_header_on(es: &EsploraClient) -> Result<divi_swap::backend::TipHeader> {
+        let hash = divi_swap::backend::normalize_block_hash(&tip_hash_raw_on(es).await?)?;
+        let block = get_json_on(es, &format!("/block/{hash}")).await?;
+        let id = block["id"]
+            .as_str()
+            .ok_or_else(|| SwapError::Transient("block JSON lacks id (still indexing?)".into()))
+            .and_then(divi_swap::backend::normalize_block_hash)?;
+        if id != hash {
+            return Err(SwapError::Transient(format!(
+                "asked for block {hash}, got {id}"
+            )));
+        }
+        let field = |name: &str| {
+            block[name].as_u64().ok_or_else(|| {
+                SwapError::Transient(format!("block JSON lacks {name} (still indexing?)"))
+            })
+        };
+        Ok(divi_swap::backend::TipHeader {
+            height: field("height")?,
+            hash,
+            time: field("timestamp")? as u32,
+        })
+    }
+
+    /// Both endpoints' tip headers; the lower one, after the endpoint that is ahead names the
+    /// same block at that height (Esplora `GET /block-height/:height`). Endpoints a block (or
+    /// more) apart are lag; two different blocks at one height are `Transient`, as is either
+    /// endpoint failing.
+    async fn quorum_tip_header(
+        primary: &EsploraClient,
+        secondary: &EsploraClient,
+    ) -> Result<divi_swap::backend::TipHeader> {
+        let (a, b) = tokio::join!(Self::tip_header_on(primary), Self::tip_header_on(secondary));
+        let (a, b) = quorum::pair("tip_header", a, b)?;
+        let (low, ahead, ahead_es) = if a.height <= b.height {
+            (a, b, secondary)
+        } else {
+            (b, a, primary)
+        };
+        let ahead_hash = if ahead.height == low.height {
+            ahead.hash
+        } else {
+            let body = ahead_es
+                .get(&format!("/block-height/{}", low.height))
+                .await
+                .map_err(SwapError::from)
+                .and_then(|b| divi_swap::backend::normalize_block_hash(&b));
+            match body {
+                Ok(h) => h,
+                Err(e) => {
+                    return Err(quorum::disagree(
+                        "tip_header",
+                        format!(
+                            "the endpoint at {} has no block at {}: {e}",
+                            ahead.height, low.height
+                        ),
+                    ))
+                }
+            }
+        };
+        quorum::agree_block_at(low, ahead_hash)
+    }
+
+    /// `in_best_chain` as one endpoint view `es` answers it.
+    async fn in_best_chain_on(es: &EsploraClient, height: u64, hash: &str) -> Result<bool> {
+        let hash = divi_swap::backend::normalize_block_hash(hash)?;
+        let status = get_json_on(es, &format!("/block/{hash}/status")).await?;
+        let best = status["in_best_chain"]
+            .as_bool()
+            .ok_or_else(|| SwapError::Transient("block status JSON lacks in_best_chain".into()))?;
+        if best && status["height"].as_u64() != Some(height) {
+            return Err(SwapError::Transient(format!(
+                "block {hash} is in the best chain at {}, not {height}",
+                status["height"]
+            )));
+        }
+        Ok(best)
+    }
+
+    /// `median_time_past` as one endpoint view `es` answers it.
+    async fn median_time_past_on(es: &EsploraClient) -> Result<u32> {
+        let hash = tip_hash_raw_on(es).await?;
+        let block = get_json_on(es, &format!("/block/{}", hash.trim())).await?;
+        block["mediantime"]
+            .as_u64()
+            .map(|t| t as u32)
+            .ok_or_else(|| {
+                // Esplora always sets mediantime on a real block; its absence means we read a
+                // block from a backend that has not finished indexing it yet.
+                SwapError::Transient("block JSON lacks mediantime (still indexing?)".into())
+            })
     }
 }
 

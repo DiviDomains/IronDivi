@@ -62,6 +62,7 @@ async fn main() {
         claim_pubkey: backend.pubkey(),
         refund_pubkey: backend.pubkey(),
         locktime: mtp + REFUND_AHEAD_OF_MTP,
+        script_version: Default::default(),
     };
     let amount = Amount::from_sat(HTLC_SATS);
     // Claim/refund building signs a spend of this outpoint; it does not need the output to

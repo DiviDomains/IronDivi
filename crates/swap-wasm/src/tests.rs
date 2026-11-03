@@ -150,6 +150,7 @@ fn htlc(claim: [u8; 33], refund: [u8; 33]) -> HtlcParams {
         claim_pubkey: claim,
         refund_pubkey: refund,
         locktime: 1_800_000_000,
+        script_version: divi_swap::ScriptVersion::V1,
     }
 }
 

@@ -28,6 +28,13 @@ use crate::state::SwapState;
 use crate::taker::TakerState;
 use crate::types::{Amount, Funding, Outpoint, SignedTx};
 
+/// Schema version this binary writes and understands, kept in SQLite's `PRAGMA user_version`
+/// (a header integer: no table, no `SCHEMA` change, and a pre-marker binary ignores it).
+/// 0 = no marker; 1 = everything before V1 scripts (what an unmarked DB is); 2 = this marker.
+/// A binary refuses a database stamped with a larger number, because an older reader silently
+/// drops fields it does not know (a V1 `script_version` becomes a V0 script: wrong address).
+pub const STORE_SCHEMA_VERSION: u32 = 2;
+
 /// Swap database handle. Cheap to clone.
 #[derive(Clone)]
 pub struct Store {
@@ -46,7 +53,7 @@ pub struct QuoteRecord {
 /// The maker's persisted view of one swap. Legs are role-based: the *taker leg* is on
 /// `quote.taker_chain()`, the *maker leg* on `quote.maker_chain()`. Pre-direction records
 /// (taker leg = BTC, maker leg = DIVI) load through the serde aliases.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MakerRecord {
     /// Swap id.
     pub id: String,
@@ -79,6 +86,9 @@ pub struct MakerRecord {
     /// Maker-leg chain height from which to scan for the taker's claim.
     #[serde(alias = "divi_scan_from")]
     pub maker_leg_scan_from: u64,
+    /// Maker-chain MTP read when the maker-leg locktime was set; sent to the taker.
+    #[serde(default)]
+    pub maker_mtp_at_lock: Option<u32>,
     /// The signed maker-leg refund tx, once built.
     #[serde(alias = "divi_refund")]
     pub maker_leg_refund: Option<SignedTx>,
@@ -89,10 +99,48 @@ pub struct MakerRecord {
     pub taker_leg_claim: Option<SignedTx>,
     /// Last error the scheduler hit.
     pub last_error: Option<String>,
+    /// Set once a re-broadcast of the maker lock was refused for good (its inputs are gone):
+    /// the watcher stops re-sending and keeps reporting one error. Absent in older records.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub maker_lock_dropped: bool,
+    /// Set once the maker-leg funding was sent (a broadcast returned Ok) or the node reported
+    /// it: those bytes can still be mined, so a refusal by the reservation table no longer
+    /// re-selects coins. Absent in older records (read as unsent, as before).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub maker_lock_sent: bool,
+    /// Fee history of `taker_leg_claim` (keys at the top level, as in [`TakerRecord`]).
+    /// Absent in older records.
+    #[serde(flatten)]
+    pub claim_fees: ClaimFees,
+}
+
+/// Fee history of the maker's taker-leg claim; each field as the same-named one of
+/// [`TakerRecord`] does for the maker-leg claim.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimFees {
+    /// Feerate the first claim paid, where its backend can bump it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_base_feerate: Option<u64>,
+    /// Feerate the claim (with its CPFP children) pays now.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_feerate: Option<u64>,
+    /// Earlier versions a replacement superseded, oldest first, with their feerates.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claim_replaced: Vec<(SignedTx, u64)>,
+    /// CPFP children, in spend order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claim_children: Vec<SignedTx>,
+    /// The child the newest child replaces, with the feerate the package paid with it, until
+    /// the replacement is relayed or refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_child_replaced: Option<(SignedTx, u64)>,
+    /// Same-nonce replacements refused as underpriced since a version was last taken.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub claim_underpriced: u32,
 }
 
 /// The taker's persisted view of one swap (role-based legs, see [`MakerRecord`]).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TakerRecord {
     /// Local swap id.
     pub id: String,
@@ -132,8 +180,141 @@ pub struct TakerRecord {
     /// waits out the taker-leg refund. Absent in records written before the field existed.
     #[serde(default)]
     pub claim_declined: Option<String>,
+    /// Feerate (base unit per vbyte) the first maker-leg claim paid, where its backend can
+    /// bump it (`FeeBump::Rbf`/`Cpfp`); the base [`crate::FeeEscalation`] climbs from.
+    #[serde(default)]
+    pub claim_base_feerate: Option<u64>,
+    /// Feerate the claim pays now: `maker_leg_claim`'s own under RBF, the package's (claim
+    /// plus `claim_children`) under CPFP.
+    #[serde(default)]
+    pub claim_feerate: Option<u64>,
+    /// Earlier versions of the maker-leg claim that an RBF bump replaced, oldest first, with
+    /// the feerate each paid. Any of them may still be the one that confirms.
+    #[serde(default)]
+    pub claim_replaced: Vec<(SignedTx, u64)>,
+    /// CPFP children raising the claim's package feerate, in spend order: the first spends
+    /// the claim's output, each later one its predecessor's. Persisted before broadcast.
+    #[serde(default)]
+    pub claim_children: Vec<SignedTx>,
+    /// The child the newest of `claim_children` replaces
+    /// ([`crate::FeeEscalation::replace_cpfp_child`]), with the feerate the package paid with
+    /// it, from the replacement's write-ahead until the node relays or refuses it. A node
+    /// that refuses it still holds this one, which is then put back. Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_child_replaced: Option<(SignedTx, u64)>,
+    /// "replacement transaction underpriced" refusals of a same-nonce replacement
+    /// (`FeeBump::SameNonce`) since the claim was last taken: the node holds a stricter price
+    /// bump than configured. Every second one doubles the next step
+    /// ([`crate::FeeEscalation::underpriced_target`]); cleared when a version is taken.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub claim_underpriced: u32,
     /// Last error.
     pub last_error: Option<String>,
+}
+
+/// What a secret prints as in `Debug` output.
+const REDACTED: &str = "<redacted>";
+
+// `Debug` is written by hand so a stray `{:?}` never prints the preimage. Every field is
+// listed; adding a field to the struct without listing it here fails to compile.
+impl std::fmt::Debug for MakerRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let MakerRecord {
+            id,
+            created_at,
+            state,
+            quote,
+            hash,
+            taker_maker_leg_pubkey,
+            taker_leg_htlc,
+            taker_leg_outpoint,
+            taker_leg_locked,
+            maker_leg_htlc,
+            maker_leg_funding,
+            maker_leg_scan_from,
+            maker_mtp_at_lock,
+            maker_leg_refund,
+            preimage,
+            taker_leg_claim,
+            last_error,
+            maker_lock_dropped,
+            maker_lock_sent,
+            claim_fees,
+        } = self;
+        f.debug_struct("MakerRecord")
+            .field("id", id)
+            .field("created_at", created_at)
+            .field("state", state)
+            .field("quote", quote)
+            .field("hash", hash)
+            .field("taker_maker_leg_pubkey", taker_maker_leg_pubkey)
+            .field("taker_leg_htlc", taker_leg_htlc)
+            .field("taker_leg_outpoint", taker_leg_outpoint)
+            .field("taker_leg_locked", taker_leg_locked)
+            .field("maker_leg_htlc", maker_leg_htlc)
+            .field("maker_leg_funding", maker_leg_funding)
+            .field("maker_leg_scan_from", maker_leg_scan_from)
+            .field("maker_mtp_at_lock", maker_mtp_at_lock)
+            .field("maker_leg_refund", maker_leg_refund)
+            .field("preimage", &preimage.as_ref().map(|_| REDACTED))
+            .field("taker_leg_claim", taker_leg_claim)
+            .field("last_error", last_error)
+            .field("maker_lock_dropped", maker_lock_dropped)
+            .field("maker_lock_sent", maker_lock_sent)
+            .field("claim_fees", claim_fees)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for TakerRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let TakerRecord {
+            id,
+            state,
+            quote,
+            preimage: _,
+            hash,
+            maker_swap_id,
+            taker_leg_htlc,
+            taker_leg_funding,
+            maker_leg_htlc,
+            maker_leg_outpoint,
+            maker_leg_amount,
+            maker_leg_claim,
+            taker_leg_refund,
+            claim_declined,
+            claim_base_feerate,
+            claim_feerate,
+            claim_replaced,
+            claim_children,
+            claim_child_replaced,
+            claim_underpriced,
+            last_error,
+        } = self;
+        f.debug_struct("TakerRecord")
+            .field("id", id)
+            .field("state", state)
+            .field("quote", quote)
+            .field("preimage", &REDACTED)
+            .field("hash", hash)
+            .field("maker_swap_id", maker_swap_id)
+            .field("taker_leg_htlc", taker_leg_htlc)
+            .field("taker_leg_funding", taker_leg_funding)
+            .field("maker_leg_htlc", maker_leg_htlc)
+            .field("maker_leg_outpoint", maker_leg_outpoint)
+            .field("maker_leg_amount", maker_leg_amount)
+            .field("maker_leg_claim", maker_leg_claim)
+            .field("taker_leg_refund", taker_leg_refund)
+            .field("claim_declined", claim_declined)
+            .field("claim_base_feerate", claim_base_feerate)
+            .field("claim_feerate", claim_feerate)
+            .field("claim_replaced", claim_replaced)
+            .field("claim_children", claim_children)
+            .field("claim_child_replaced", claim_child_replaced)
+            .field("claim_underpriced", claim_underpriced)
+            .field("last_error", last_error)
+            .finish()
+    }
 }
 
 fn storage<E: std::fmt::Display>(e: E) -> SwapError {
@@ -194,17 +375,32 @@ pub trait StoreBackend: MaybeSendSync {
     fn get(&self, table: Table<'_>, id: &str) -> Result<Option<String>>;
     /// All documents in `table`, newest first by first insertion.
     fn list(&self, table: Table<'_>) -> Result<Vec<String>>;
+    /// Drop document `id` from `table` (a no-op for an unknown id).
+    fn delete(&self, table: Table<'_>, id: &str) -> Result<()>;
 }
 
 impl Store {
     /// Open (creating if needed) the database at `path`, migrating the schema.
     ///
-    /// The file is created with mode 0600 before SQLite touches it.
+    /// A new file is created with mode 0600 before SQLite touches it. An existing database
+    /// and its `-wal`/`-shm` that are looser than 0600 (an older build, a copied file) are
+    /// tightened to 0600 with a warning; one that cannot be tightened is an error, because
+    /// the file holds the preimage and per-swap keys. [`Store::open_read_only`] never chmods.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn open(path: &std::path::Path) -> Result<Self> {
         Ok(Self::with_backend(Arc::new(sqlite::SqliteBackend::open(
             path,
         )?)))
+    }
+
+    /// Open an existing database read-only: no file is created, no pragma or schema is
+    /// written (so it is safe next to a running daemon, and an absent `path` is an error,
+    /// never an empty store). For inspection tools such as `divi-swapd --xmr-inflight`.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn open_read_only(path: &std::path::Path) -> Result<Self> {
+        Ok(Self::with_backend(Arc::new(
+            sqlite::SqliteBackend::open_read_only(path)?,
+        )))
     }
 
     /// A throwaway in-memory database (tests).
@@ -232,6 +428,16 @@ impl Store {
     /// Fetch a quote.
     pub fn get_quote(&self, id: &str) -> Result<Option<QuoteRecord>> {
         self.get_json(Table::Quotes, id)
+    }
+
+    /// Every stored quote (any order).
+    pub fn list_quotes(&self) -> Result<Vec<QuoteRecord>> {
+        self.list_json(Table::Quotes)
+    }
+
+    /// Drop a quote (a no-op for an unknown id).
+    pub fn delete_quote(&self, id: &str) -> Result<()> {
+        self.backend.delete(Table::Quotes, id)
     }
 
     // ---- maker swaps ----
@@ -377,6 +583,14 @@ impl StoreBackend for MemoryBackend {
         rows.sort_by_key(|r| std::cmp::Reverse(r.0));
         Ok(rows.into_iter().map(|(_, j)| j.clone()).collect())
     }
+
+    fn delete(&self, table: Table<'_>, id: &str) -> Result<()> {
+        let mut tables = self.tables.lock();
+        if let Some(t) = tables.get_mut(&table_key(table)) {
+            t.rows.remove(id);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -384,10 +598,10 @@ mod sqlite {
     use rusqlite::{params, Connection, OptionalExtension};
     use std::path::Path;
 
-    use super::{storage, MakerMeta, StoreBackend, Table};
+    use super::{storage, MakerMeta, StoreBackend, Table, STORE_SCHEMA_VERSION};
     use crate::error::{Result, SwapError};
 
-    const SCHEMA: &str = "
+    pub(super) const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS quotes (
     id TEXT PRIMARY KEY,
     json TEXT NOT NULL
@@ -412,6 +626,58 @@ CREATE TABLE IF NOT EXISTS docs (
 );
 ";
 
+    /// One maker swap per hashlock. The hash lives in the record JSON (`$.hash`, a 32-number
+    /// array), so this is an expression index; `put_maker_swap` of a second swap for a hash fails
+    /// even if the engine's gate were bypassed.
+    pub(super) const UNIQUE_HASH_INDEX: &str = "maker_swaps_hash_unique";
+
+    fn read_marker(conn: &Connection) -> Result<u32> {
+        let v: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .map_err(storage)?;
+        Ok(u32::try_from(v).unwrap_or(u32::MAX))
+    }
+
+    /// Refuse a database stamped newer than this binary. Reads only.
+    fn check_marker(conn: &Connection) -> Result<u32> {
+        let found = read_marker(conn)?;
+        if found > STORE_SCHEMA_VERSION {
+            return Err(SwapError::StoreTooNew {
+                found,
+                supported: STORE_SCHEMA_VERSION,
+            });
+        }
+        Ok(found)
+    }
+
+    /// Create the unique-hash index (idempotent). A database that already holds two swaps for one
+    /// hash cannot take it: that is logged loudly and the store runs without the index (the
+    /// engine's gate is then the only guard, as before) rather than refusing to start.
+    fn ensure_unique_hash(conn: &Connection) -> Result<()> {
+        let dup: Option<(String, i64)> = conn
+            .query_row(
+                "SELECT json_extract(json, '$.hash'), COUNT(*) FROM maker_swaps
+                 GROUP BY json_extract(json, '$.hash') HAVING COUNT(*) > 1 LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(storage)?;
+        if let Some((hash, n)) = dup {
+            tracing::error!(
+                %hash, swaps = n,
+                "maker_swaps holds several swaps for one hashlock: NOT creating the unique-hash index; \
+                 one swap per hash is enforced only by the engine gate until the duplicates are resolved"
+            );
+            return Ok(());
+        }
+        conn.execute_batch(&format!(
+            "CREATE UNIQUE INDEX IF NOT EXISTS {UNIQUE_HASH_INDEX}
+             ON maker_swaps (json_extract(json, '$.hash'))"
+        ))
+        .map_err(storage)
+    }
+
     /// The SQLite backend (native default): one statement per write.
     pub(super) struct SqliteBackend {
         conn: parking_lot::Mutex<Connection>,
@@ -422,12 +688,27 @@ CREATE TABLE IF NOT EXISTS docs (
             if !path.exists() {
                 create_private(path)?;
             }
+            super::tighten_existing(path)?;
             let conn = Connection::open(path).map_err(storage)?;
+            // Before any pragma or schema write: a too-new file must be left untouched.
+            check_marker(&conn)?;
             conn.pragma_update(None, "journal_mode", "WAL")
                 .map_err(storage)?;
             conn.pragma_update(None, "synchronous", "FULL")
                 .map_err(storage)?;
+            // SQLite has now created (or reopened) the sidecars.
+            super::tighten_existing(path)?;
             Self::init(conn)
+        }
+
+        pub(super) fn open_read_only(path: &Path) -> Result<Self> {
+            let conn =
+                Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                    .map_err(storage)?;
+            check_marker(&conn)?;
+            Ok(SqliteBackend {
+                conn: parking_lot::Mutex::new(conn),
+            })
         }
 
         pub(super) fn in_memory() -> Result<Self> {
@@ -435,7 +716,14 @@ CREATE TABLE IF NOT EXISTS docs (
         }
 
         fn init(conn: Connection) -> Result<Self> {
+            let found = check_marker(&conn)?;
             conn.execute_batch(SCHEMA).map_err(storage)?;
+            ensure_unique_hash(&conn)?;
+            // Unmarked (0) or older: stamp in place. Safe, V0 records stay V0.
+            if found != STORE_SCHEMA_VERSION {
+                conn.pragma_update(None, "user_version", STORE_SCHEMA_VERSION)
+                    .map_err(storage)?;
+            }
             Ok(SqliteBackend {
                 conn: parking_lot::Mutex::new(conn),
             })
@@ -537,6 +825,25 @@ CREATE TABLE IF NOT EXISTS docs (
             .map_err(storage)?;
             rows.map(|j| j.map_err(storage)).collect()
         }
+
+        fn delete(&self, table: Table<'_>, id: &str) -> Result<()> {
+            let conn = self.conn.lock();
+            match table {
+                Table::Quotes => conn.execute("DELETE FROM quotes WHERE id = ?1", params![id]),
+                Table::MakerSwaps => {
+                    conn.execute("DELETE FROM maker_swaps WHERE id = ?1", params![id])
+                }
+                Table::TakerSwaps => {
+                    conn.execute("DELETE FROM taker_swaps WHERE id = ?1", params![id])
+                }
+                Table::Docs(kind) => conn.execute(
+                    "DELETE FROM docs WHERE kind = ?1 AND id = ?2",
+                    params![kind, id],
+                ),
+            }
+            .map_err(storage)?;
+            Ok(())
+        }
     }
 
     #[cfg(unix)]
@@ -557,6 +864,44 @@ CREATE TABLE IF NOT EXISTS docs (
     }
 }
 
+/// Tighten `path` and its `-wal`/`-shm` to 0600 when they exist and are looser. A file the
+/// process cannot chmod (not the owner) is an error rather than a silent pass: the caller is
+/// about to put secrets into it.
+#[cfg(all(unix, not(target_arch = "wasm32")))]
+fn tighten_existing(path: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    for suffix in ["", "-wal", "-shm"] {
+        let mut name = path.as_os_str().to_owned();
+        name.push(suffix);
+        let p = std::path::PathBuf::from(name);
+        let mode = match std::fs::metadata(&p) {
+            Ok(m) => m.permissions().mode() & 0o777,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(storage(format!("{}: {e}", p.display()))),
+        };
+        if mode & 0o077 == 0 {
+            continue;
+        }
+        tracing::warn!(
+            path = %p.display(), old_mode = format!("{mode:04o}"),
+            "swap database file was readable beyond its owner; tightening to 0600"
+        );
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).map_err(|e| {
+            storage(format!(
+                "{} has mode {mode:04o} and cannot be tightened to 0600 ({e}); it holds swap \
+                 secrets, so the store will not open it",
+                p.display()
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(all(not(unix), not(target_arch = "wasm32")))]
+fn tighten_existing(_path: &std::path::Path) -> Result<()> {
+    Ok(())
+}
+
 mod hex33 {
     use serde::{Deserialize, Deserializer, Serializer};
     pub fn serialize<S: Serializer>(v: &[u8; 33], s: S) -> Result<S::Ok, S::Error> {
@@ -570,9 +915,17 @@ mod hex33 {
     }
 }
 
-#[cfg(test)]
+/// Serde: leave a zero count out, so records at rest keep their earlier shape.
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
+    use super::sqlite::{SCHEMA, UNIQUE_HASH_INDEX};
     use super::*;
+    use rusqlite::{params, Connection};
+    use std::path::Path;
 
     fn quote(id: &str) -> Quote {
         Quote {
@@ -605,16 +958,21 @@ mod tests {
                 claim_pubkey: [2; 33],
                 refund_pubkey: [3; 33],
                 locktime: 1_800_000_000,
+                script_version: Default::default(),
             },
             taker_leg_outpoint: None,
             taker_leg_locked: None,
             maker_leg_htlc: None,
             maker_leg_funding: None,
             maker_leg_scan_from: 0,
+            maker_mtp_at_lock: None,
             maker_leg_refund: None,
             preimage: None,
             taker_leg_claim: None,
             last_error: None,
+            maker_lock_dropped: false,
+            maker_lock_sent: false,
+            claim_fees: Default::default(),
         }
     }
 
@@ -625,7 +983,7 @@ mod tests {
         let store = Store::open(&path).unwrap();
         let rec = maker_rec("a", 10);
         store.put_maker_swap(&rec).unwrap();
-        store.put_maker_swap(&maker_rec("b", 20)).unwrap();
+        store.put_maker_swap(&with_hash("b", 20, [2; 32])).unwrap();
         let q = QuoteRecord {
             quote: quote("q1"),
             used: false,
@@ -694,10 +1052,10 @@ mod tests {
     #[test]
     fn memory_backend_matches_sqlite() {
         fn exercise(store: &Store) -> (Vec<String>, Vec<serde_json::Value>, Option<QuoteRecord>) {
-            store.put_maker_swap(&maker_rec("a", 10)).unwrap();
-            store.put_maker_swap(&maker_rec("b", 30)).unwrap();
-            store.put_maker_swap(&maker_rec("c", 10)).unwrap();
-            store.put_maker_swap(&maker_rec("a", 10)).unwrap();
+            store.put_maker_swap(&with_hash("a", 10, [1; 32])).unwrap();
+            store.put_maker_swap(&with_hash("b", 30, [2; 32])).unwrap();
+            store.put_maker_swap(&with_hash("c", 10, [3; 32])).unwrap();
+            store.put_maker_swap(&with_hash("a", 10, [1; 32])).unwrap();
             store
                 .put_doc("k", "x", &serde_json::json!({"n": 1}))
                 .unwrap();
@@ -709,10 +1067,19 @@ mod tests {
                 .unwrap();
             store
                 .put_quote(&QuoteRecord {
+                    quote: quote("q_drop"),
+                    used: false,
+                })
+                .unwrap();
+            store.delete_quote("q_drop").unwrap();
+            assert_eq!(store.get_quote("q_drop").unwrap(), None);
+            store
+                .put_quote(&QuoteRecord {
                     quote: quote("q"),
                     used: true,
                 })
                 .unwrap();
+            assert_eq!(store.list_quotes().unwrap().len(), 1);
             let ids = store
                 .list_maker_swaps()
                 .unwrap()
@@ -744,5 +1111,195 @@ mod tests {
             let mode = entry.metadata().unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "{:?}", entry.path());
         }
+    }
+
+    // ---- unique maker hash ----
+
+    fn has_hash_index(conn: &Connection) -> bool {
+        conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+            params![UNIQUE_HASH_INDEX],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+            == 1
+    }
+
+    fn with_hash(id: &str, created_at: u64, hash: [u8; 32]) -> MakerRecord {
+        let mut r = maker_rec(id, created_at);
+        r.hash = hash;
+        r.taker_leg_htlc.hash = hash;
+        r
+    }
+
+    /// A database as the previous binary left it: the schema without the index, rows in it.
+    fn old_db(path: &Path, recs: &[MakerRecord]) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        for r in recs {
+            conn.execute(
+                "INSERT INTO maker_swaps (id, created_at, state, json) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    r.id,
+                    r.created_at as i64,
+                    r.state.as_str(),
+                    serde_json::to_string(r).unwrap()
+                ],
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn second_maker_swap_for_one_hash_is_refused_by_the_store() {
+        let s = Store::in_memory().unwrap();
+        s.put_maker_swap(&with_hash("a", 1, [7; 32])).unwrap();
+        let err = s.put_maker_swap(&with_hash("b", 2, [7; 32])).unwrap_err();
+        assert!(matches!(err, SwapError::Storage(_)), "{err:?}");
+        assert_eq!(s.list_maker_swaps().unwrap().len(), 1);
+        // The same swap updated, and another hash, are fine.
+        let mut a = with_hash("a", 1, [7; 32]);
+        a.last_error = Some("x".into());
+        s.put_maker_swap(&a).unwrap();
+        s.put_maker_swap(&with_hash("c", 3, [8; 32])).unwrap();
+        assert_eq!(s.list_maker_swaps().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn migration_on_a_database_with_rows_adds_the_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("swap.db");
+        old_db(
+            &path,
+            &[with_hash("a", 1, [1; 32]), with_hash("b", 2, [2; 32])],
+        );
+        let s = Store::open(&path).unwrap();
+        assert_eq!(s.list_maker_swaps().unwrap().len(), 2);
+        assert!(has_hash_index(&Connection::open(&path).unwrap()));
+        assert!(s.put_maker_swap(&with_hash("c", 3, [1; 32])).is_err());
+        // Idempotent: a second open is fine.
+        drop(s);
+        Store::open(&path).unwrap();
+    }
+
+    #[test]
+    fn migration_on_a_database_with_a_duplicate_hash_keeps_running_without_the_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("swap.db");
+        old_db(
+            &path,
+            &[with_hash("a", 1, [9; 32]), with_hash("b", 2, [9; 32])],
+        );
+        let s = Store::open(&path).unwrap(); // must not refuse to start
+        assert!(!has_hash_index(&Connection::open(&path).unwrap()));
+        assert_eq!(s.list_maker_swaps().unwrap().len(), 2);
+        // Existing rows stay writable, the store keeps working.
+        let mut a = with_hash("a", 1, [9; 32]);
+        a.last_error = Some("still updatable".into());
+        s.put_maker_swap(&a).unwrap();
+        s.put_maker_swap(&with_hash("c", 3, [5; 32])).unwrap();
+    }
+
+    #[test]
+    fn database_with_only_the_old_tables_opens_and_an_old_writer_still_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("swap.db");
+        old_db(&path, &[]);
+        let s = Store::open(&path).unwrap();
+        s.put_maker_swap(&with_hash("a", 1, [3; 32])).unwrap();
+        drop(s);
+        // What the previous binary does against the migrated file: open (old SCHEMA is
+        // IF NOT EXISTS, never mentions the index) and upsert by id.
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        let r = with_hash("a", 1, [3; 32]);
+        conn.execute(
+            "INSERT INTO maker_swaps (id, created_at, state, json) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(id) DO UPDATE SET state = excluded.state, json = excluded.json",
+            params![
+                r.id,
+                1i64,
+                r.state.as_str(),
+                serde_json::to_string(&r).unwrap()
+            ],
+        )
+        .unwrap();
+    }
+
+    // ---- schema version marker ----
+
+    fn marker(path: &Path) -> i64 {
+        Connection::open(path)
+            .unwrap()
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap()
+    }
+
+    fn stamp(path: &Path, v: i64) {
+        Connection::open(path)
+            .unwrap()
+            .pragma_update(None, "user_version", v)
+            .unwrap();
+    }
+
+    #[test]
+    fn fresh_database_is_stamped_with_the_current_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("swap.db");
+        drop(Store::open(&path).unwrap());
+        assert_eq!(marker(&path), 2);
+        assert_eq!(STORE_SCHEMA_VERSION, 2);
+    }
+
+    #[test]
+    fn unmarked_database_opens_and_is_stamped_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("swap.db");
+        old_db(&path, &[with_hash("a", 1, [1; 32])]);
+        assert_eq!(marker(&path), 0);
+        let s = Store::open(&path).unwrap();
+        assert_eq!(s.list_maker_swaps().unwrap().len(), 1);
+        drop(s);
+        assert_eq!(marker(&path), 2);
+    }
+
+    #[test]
+    fn older_marker_is_bumped_and_the_current_one_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("swap.db");
+        old_db(&path, &[]);
+        stamp(&path, 1);
+        drop(Store::open(&path).unwrap());
+        assert_eq!(marker(&path), 2);
+        drop(Store::open(&path).unwrap());
+        assert_eq!(marker(&path), 2);
+    }
+
+    #[test]
+    fn too_new_database_is_refused_by_both_opens_and_not_modified() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("swap.db");
+        old_db(&path, &[with_hash("a", 1, [1; 32])]);
+        stamp(&path, 3);
+        let before = std::fs::read(&path).unwrap();
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        let want = SwapError::StoreTooNew {
+            found: 3,
+            supported: 2,
+        };
+        assert_eq!(Store::open(&path).err().unwrap(), want);
+        assert_eq!(Store::open_read_only(&path).err().unwrap(), want);
+
+        assert_eq!(std::fs::read(&path).unwrap(), before, "file bytes changed");
+        assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), mtime);
+        assert_eq!(marker(&path), 3);
+        // No sidecar was created by the refused opens.
+        assert!(!dir.path().join("swap.db-wal").exists());
+        let msg = want.to_string();
+        assert!(
+            msg.contains("newer") && msg.contains('3') && msg.contains('2'),
+            "{msg}"
+        );
     }
 }

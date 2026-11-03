@@ -130,12 +130,14 @@ async fn main() {
                 claim_pubkey: mypk,
                 refund_pubkey: mypk,
                 locktime: m + 86_400,
+                script_version: Default::default(),
             };
             let b = HtlcParams {
                 hash: hash_b,
                 claim_pubkey: mypk,
                 refund_pubkey: mypk,
                 locktime: m + REFUND_AHEAD_OF_MTP,
+                script_version: Default::default(),
             };
             let change = value - 2 * HTLC_VALUE - FEE;
             let mut tx = Transaction {

@@ -32,8 +32,10 @@ parking_lot = { workspace = true }
 tokio = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+tokio = { version = "1.35", default-features = false, features = ["macros"] }
 getrandom = { version = "0.2", features = ["js"] }
 
 [dev-dependencies]
 wiremock = { workspace = true }
+tracing-subscriber = { workspace = true }
 proptest = { workspace = true }

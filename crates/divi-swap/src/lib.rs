@@ -16,12 +16,16 @@
 
 pub mod api;
 pub mod backend;
+mod claim_fee;
 pub mod config;
 pub mod error;
+mod hold;
 pub mod htlc;
 pub mod maker;
 pub mod mock;
 pub mod observer;
+pub mod operator;
+pub mod reservation;
 pub mod rt;
 pub mod secrets;
 pub mod state;
@@ -30,12 +34,13 @@ pub mod taker;
 pub mod types;
 
 pub use api::Direction;
-pub use backend::ChainBackend;
-pub use config::{ChainParams, Profile, SwapConfig};
+pub use backend::{ChainBackend, ClaimSizes, FeeBump};
+pub use config::{ChainParams, ClaimDeadline, FeeEscalation, Profile, SwapConfig};
 pub use error::{Result, SwapError};
-pub use htlc::HtlcParams;
+pub use htlc::{HtlcParams, ScriptVersion};
 pub use maker::{Maker, OfferEngine};
 pub use observer::{ObservedLock, ObservedTx, Observer, TwoSource};
+pub use reservation::{ExpiryStart, InputReservations, ReservationRow};
 pub use state::SwapState;
 pub use store::{MemoryBackend, Store, StoreBackend};
 pub use taker::{Taker, TakerState};

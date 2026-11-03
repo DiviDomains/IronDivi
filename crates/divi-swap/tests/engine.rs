@@ -10,11 +10,12 @@
 
 use async_trait::async_trait;
 use divi_swap::api::{AcceptRequest, Direction, LockNotice, Offer, Quote};
-use divi_swap::mock::{MockBackend, MockChain};
+use divi_swap::htlc::ScriptVersion;
+use divi_swap::mock::{KindCounts, MockBackend, MockChain, TxKind, MOCK_FEE};
 use divi_swap::store::{MakerRecord, TakerRecord};
 use divi_swap::{
     Amount, Chain, ChainBackend, Funding, HtlcParams, LockedOutput, Maker, Outpoint, Profile,
-    Result, SignedTx, SpendInfo, Store, SwapConfig, SwapState, Taker, TakerState, Txid,
+    Result, SignedTx, SpendInfo, Store, SwapConfig, SwapError, SwapState, Taker, TakerState, Txid,
 };
 use proptest::prelude::*;
 use std::path::PathBuf;
@@ -76,13 +77,80 @@ struct H {
     maker_id: String,
     taker_id: String,
     restarts: u32,
+    /// Restart at every checkpoint instead of once at an armed crash state.
+    restart_every: bool,
+    /// Armed for the crash restart: the leg whose chain then fails, with what, and whether
+    /// only broadcasts fail. Starts at the restart, or at the first round if the restart
+    /// came earlier; lasts `FAULT_ROUNDS` rounds.
+    fault: Option<(Leg, SwapError, bool)>,
+    fault_left: usize,
+    /// Fault rounds after which either side had an error recorded.
+    fault_errors: usize,
+    in_rounds: bool,
+    round_no: usize,
+    /// The first round each state was seen in (sampled after each engine pass).
+    first_maker: Vec<(SwapState, usize)>,
+    first_taker: Vec<(TakerState, usize)>,
+    drop: Option<DropPlan>,
+    /// The refund swap pins its clocks at this edge instead of `expire_both`.
+    edge: Option<Edge>,
+    /// Rounds left without blocks while the refund clock is pinned.
+    hold: usize,
+    /// Refund attempts per leg (taker, maker) already looked at by `check_refund_gate`.
+    seen_refunds: [usize; 2],
+    /// Refund broadcasts seen while that leg's MTP was at most its locktime.
+    early_refunds: Vec<String>,
+}
+
+/// Where a refund-edge row pins the refund swap's clocks when it times out.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Edge {
+    /// Each leg's chain MTP exactly at that leg's locktime L plus this offset.
+    At(i64),
+    /// A late lock: the maker's lock goes back to the mempool and the clocks sit at
+    /// L - claim_margin/2, where the maker stops waiting (`MakerRefundable`) before L.
+    LateLock,
+}
+
+/// Rounds an edge row holds the clocks where it pinned them (no blocks) before it releases
+/// them to L+1: the engines pass the edge several times, crashes and drops included.
+const HOLD_ROUNDS: usize = 4;
+
+/// The refund-edge rows: MTP at L-1, L and L+1, and the late lock.
+const EDGES: [Edge; 4] = [Edge::At(-1), Edge::At(0), Edge::At(1), Edge::LateLock];
+
+fn add_counts(a: KindCounts, b: KindCounts) -> KindCounts {
+    KindCounts {
+        funds: a.funds + b.funds,
+        claims: a.claims + b.claims,
+        refunds: a.refunds + b.refunds,
+    }
+}
+
+/// One leg of the swap: the taker's lock and its spend, or the maker's.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Leg {
+    Taker,
+    Maker,
+}
+
+/// Evict the first `kind` tx seen unconfirmed on `leg`'s chain, `times` times (each time
+/// after it came back), optionally restarting both engines right after each eviction.
+struct DropPlan {
+    leg: Leg,
+    kind: TxKind,
+    times: usize,
+    restart: bool,
+    /// (txid, round dropped, round it was on the chain again)
+    drops: Vec<(Txid, usize, Option<usize>)>,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Scn {
     /// Taker claims; both sides complete.
     Happy,
-    /// Taker goes silent after locking; both sides time out and refund.
+    /// Taker goes silent after locking (it keeps its own funding tx alive but never looks
+    /// at the maker's lock, so never claims); both sides time out and refund.
     Refund,
 }
 
@@ -158,6 +226,19 @@ impl H {
             maker_id: String::new(),
             taker_id: String::new(),
             restarts: 0,
+            restart_every: false,
+            fault: None,
+            fault_left: 0,
+            fault_errors: 0,
+            in_rounds: false,
+            round_no: 0,
+            first_maker: Vec::new(),
+            first_taker: Vec::new(),
+            drop: None,
+            edge: None,
+            hold: 0,
+            seen_refunds: [0; 2],
+            early_refunds: Vec::new(),
         };
         h.maker = build_maker(&h, store.clone());
         h.taker = Taker::new(
@@ -207,6 +288,10 @@ impl H {
 
     /// Restart once if the armed crash state has been reached.
     fn maybe_crash(&mut self, crash: Option<Crash>) {
+        if self.restart_every && !(self.maker_id.is_empty() && self.taker_id.is_empty()) {
+            self.restart();
+            return;
+        }
         if self.restarts > 0 || self.maker_id.is_empty() && self.taker_id.is_empty() {
             return;
         }
@@ -216,6 +301,88 @@ impl H {
             None => false,
         };
         if hit {
+            self.restart();
+            if self.in_rounds {
+                self.start_fault();
+            }
+        }
+    }
+
+    fn leg_chain(&self, leg: Leg) -> &MockChain {
+        match leg {
+            Leg::Taker => self.tl_chain(),
+            Leg::Maker => self.ml_chain(),
+        }
+    }
+
+    fn start_fault(&mut self) {
+        let Some((leg, err, send_only)) = self.fault.take() else {
+            return;
+        };
+        let chain = self.leg_chain(leg);
+        if send_only {
+            chain.fail_broadcasts_with(Some(err));
+        } else {
+            chain.fail_with(Some(err));
+        }
+        self.fault_left = FAULT_ROUNDS;
+    }
+
+    fn heal(&mut self) {
+        for chain in [&self.btc, &self.divi] {
+            chain.fail_with(None);
+            chain.fail_broadcasts_with(None);
+        }
+        self.fault_left = 0;
+    }
+
+    fn end_fault_round(&mut self) {
+        if self.fault_left == 0 {
+            return;
+        }
+        let m = self.store.get_maker_swap(&self.maker_id).unwrap().unwrap();
+        let t = self.store.get_taker_swap(&self.taker_id).unwrap().unwrap();
+        if m.last_error.is_some() || t.last_error.is_some() {
+            self.fault_errors += 1;
+        }
+        self.fault_left -= 1;
+        if self.fault_left == 0 {
+            self.heal();
+        }
+    }
+
+    fn note_states(&mut self) {
+        let (m, t, at) = (self.maker_state(), self.taker_state(), self.round_no);
+        if !self.first_maker.iter().any(|(s, _)| *s == m) {
+            self.first_maker.push((m, at));
+        }
+        if !self.first_taker.iter().any(|(s, _)| *s == t) {
+            self.first_taker.push((t, at));
+        }
+    }
+
+    /// Before the round's blocks: note a dropped tx that is back, then evict the next one.
+    fn drop_tick(&mut self) {
+        let Some(mut p) = self.drop.take() else {
+            return;
+        };
+        let chain = self.leg_chain(p.leg).clone();
+        if let Some(last) = p.drops.last_mut() {
+            if last.2.is_none() && chain.contains(&last.0) {
+                last.2 = Some(self.round_no);
+            }
+        }
+        let ready = p.drops.last().is_none_or(|d| d.2.is_some());
+        let mut restart = false;
+        if ready && p.drops.len() < p.times {
+            if let Some((id, _)) = chain.mempool().into_iter().find(|(_, k)| *k == p.kind) {
+                assert!(chain.drop_from_mempool(&id));
+                p.drops.push((id, self.round_no, None));
+                restart = p.restart;
+            }
+        }
+        self.drop = Some(p);
+        if restart {
             self.restart();
         }
     }
@@ -256,24 +423,128 @@ impl H {
     }
 
     async fn round(&mut self, scn: Scn, crash: Option<Crash>, timed_out: &mut bool, offline: bool) {
+        self.in_rounds = true;
+        if self.restarts > 0 {
+            self.start_fault();
+        }
         self.btc.set_offline(offline);
         self.divi.set_offline(offline);
         let _ = self.maker.tick().await;
+        self.check_refund_gate();
         self.maybe_crash(crash);
+        self.note_states();
         if scn == Scn::Refund && !*timed_out && self.maker_state() == SwapState::MakerLockConfirmed
         {
-            self.expire_both();
+            match self.edge {
+                Some(edge) => self.pin_edge(edge),
+                None => self.expire_both(),
+            }
             *timed_out = true;
         }
         if scn == Scn::Happy || *timed_out {
             let view = self.maker.view(&self.maker_id).unwrap();
             let _ = self.taker.step(&self.taker_id, view.as_ref()).await;
+            self.check_refund_gate();
+            self.maybe_crash(crash);
+        } else {
+            // The silent taker: a real step (`on_locked` re-sends the persisted funding tx,
+            // same bytes, same txid) with no maker view, so it never sees a lock to claim.
+            let _ = self.taker.step(&self.taker_id, None).await;
+            self.check_refund_gate();
             self.maybe_crash(crash);
         }
+        self.note_states();
         self.btc.set_offline(false);
         self.divi.set_offline(false);
-        self.btc.mine(1);
-        self.divi.mine(1);
+        self.end_fault_round();
+        self.drop_tick();
+        if self.hold > 0 {
+            // A pinned refund clock: no blocks, so each chain's MTP stays exactly where it
+            // was set; on the last held round it is released to L+1 and blocks resume.
+            self.hold -= 1;
+            if self.hold == 0 {
+                self.pin_offset(1);
+            }
+        } else {
+            self.btc.mine(1);
+            self.divi.mine(1);
+        }
+        self.round_no += 1;
+    }
+
+    /// Each leg's HTLC locktime, once the side that funds it has recorded it.
+    fn leg_locktime(&self, leg: Leg) -> Option<u32> {
+        match leg {
+            Leg::Maker if !self.maker_id.is_empty() => self
+                .store
+                .get_maker_swap(&self.maker_id)
+                .unwrap()?
+                .maker_leg_htlc
+                .map(|h| h.locktime),
+            Leg::Taker if !self.taker_id.is_empty() => self
+                .store
+                .get_taker_swap(&self.taker_id)
+                .unwrap()?
+                .taker_leg_htlc
+                .map(|h| h.locktime),
+            _ => None,
+        }
+    }
+
+    /// Note every refund broadcast that reached a leg's chain while its MTP was not past
+    /// that leg's locktime L: Core refuses it as non-final, so the engine must not send it.
+    /// Called after each engine pass; MTP only moves between passes.
+    fn check_refund_gate(&mut self) {
+        for (i, leg) in [Leg::Taker, Leg::Maker].into_iter().enumerate() {
+            let chain = self.leg_chain(leg);
+            let (n, mtp) = (chain.attempts(TxKind::Refund), chain.mtp());
+            if n > self.seen_refunds[i] {
+                if let Some(l) = self.leg_locktime(leg).filter(|l| mtp <= *l) {
+                    self.early_refunds.push(format!(
+                        "{leg:?} leg: {} refund attempt(s) at mtp {mtp}, locktime {l}",
+                        n - self.seen_refunds[i]
+                    ));
+                }
+                self.seen_refunds[i] = n;
+            }
+        }
+    }
+
+    /// Set each leg's chain MTP to exactly its own locktime L plus `off`.
+    fn pin_offset(&self, off: i64) {
+        for leg in [Leg::Taker, Leg::Maker] {
+            let l = self
+                .leg_locktime(leg)
+                .expect("pinned before the HTLC is set");
+            let at = (i64::from(l) + off) as u32;
+            let chain = self.leg_chain(leg);
+            assert!(
+                chain.mtp() <= at,
+                "{leg:?} leg: mtp {} past {at}",
+                chain.mtp()
+            );
+            chain.advance_time(at - chain.mtp());
+        }
+    }
+
+    /// The refund swap's timeout for an edge row (instead of `expire_both`): pin the clocks
+    /// and hold them there for `HOLD_ROUNDS` rounds.
+    fn pin_edge(&mut self, edge: Edge) {
+        let off = match edge {
+            Edge::At(off) => off,
+            Edge::LateLock => {
+                let lock = self.maker_rec().maker_leg_funding.unwrap().tx.txid;
+                self.ml_chain().unconfirm(&lock);
+                -i64::from(self.cfg.claim_margin_secs / 2)
+            }
+        };
+        self.pin_offset(off);
+        self.hold = HOLD_ROUNDS;
+    }
+
+    /// Broadcast attempts on both chains, by kind, refused ones included.
+    fn attempts(&self) -> KindCounts {
+        add_counts(self.btc.attempt_counts(), self.divi.attempt_counts())
     }
 
     fn finished(&self) -> bool {
@@ -548,10 +819,15 @@ async fn case_d_body(dir: Direction) {
     assert_eq!(h.maker_state(), SwapState::MakerLockConfirmed);
     let rec = h.store.get_maker_swap(&h.maker_id).unwrap().unwrap();
     let locktime = rec.maker_leg_htlc.unwrap().locktime;
-    // Move to just inside the taker's claim window (locktime − safety margin).
+    // Move to just inside the taker's claim window (locktime − the maker-leg chain's claim
+    // deadline, which on BTC is wider than the 1800 s floor).
     let ml = h.ml_chain().clone();
     let now = ml.mtp();
-    let target = locktime - divi_swap::taker::TAKER_SAFETY_MARGIN_SECS - 30;
+    let ml_chain = match h.dir.maker_chain() {
+        Chain::Divi => Chain::Divi,
+        _ => counter().0,
+    };
+    let target = locktime - h.taker.claim_deadline(ml_chain).margin_secs() - 30;
     ml.advance_time(target - now);
     let view = h.maker.view(&h.maker_id).unwrap();
     h.taker.step(&h.taker_id, view.as_ref()).await.unwrap();
@@ -619,6 +895,538 @@ both!(
     crash_at_every_taker_state,
     rev_crash_at_every_taker_state,
     crash_taker_body
+);
+
+/// Everything a finished swap left behind: both terminal states, every key's balance on
+/// both chains, the funding / claim / refund txs each chain accepted, and how often each
+/// side selected coins for its lock.
+#[derive(Debug, PartialEq)]
+struct Outcome {
+    maker: SwapState,
+    taker: TakerState,
+    balances: [u64; 4],
+    taker_leg_txs: KindCounts,
+    maker_leg_txs: KindCounts,
+    coin_selections: (u64, u64),
+    /// Maker locks handed back to the wallet as lost.
+    released: usize,
+}
+
+impl H {
+    fn outcome(&self) -> Outcome {
+        Outcome {
+            maker: self.maker_state(),
+            taker: self.taker_state(),
+            balances: [
+                self.divi.balance(&self.mdivi.pubkey()).0,
+                self.btc.balance(&self.mbtc.pubkey()).0,
+                self.divi.balance(&self.tdivi.pubkey()).0,
+                self.btc.balance(&self.tbtc.pubkey()).0,
+            ],
+            taker_leg_txs: self.tl_chain().kind_counts(),
+            maker_leg_txs: self.ml_chain().kind_counts(),
+            coin_selections: (self.m_ml().funding_calls(), self.t_tl().funding_calls()),
+            released: [&self.mdivi, &self.mbtc, &self.tdivi, &self.tbtc]
+                .iter()
+                .map(|b| b.released_locks().len())
+                .sum(),
+        }
+    }
+
+    /// Restart once more after the swap finished and keep both engines running: a
+    /// finished swap must not broadcast anything again.
+    async fn restart_and_settle(&mut self) {
+        self.restart();
+        for _ in 0..3 {
+            let _ = self.maker.tick().await;
+            self.check_refund_gate();
+            let view = self.maker.view(&self.maker_id).unwrap();
+            let _ = self.taker.step(&self.taker_id, view.as_ref()).await;
+            self.check_refund_gate();
+            self.mine_all(1);
+        }
+    }
+}
+
+/// Restart points: every state each side persists, terminal ones included.
+const MAKER_RESTART_POINTS: [SwapState; 10] = [
+    SwapState::Accepted,
+    SwapState::TakerLockSeen,
+    SwapState::TakerLockConfirmed,
+    SwapState::MakerLocked,
+    SwapState::MakerLockConfirmed,
+    SwapState::TakerClaimed,
+    SwapState::MakerClaimed,
+    SwapState::MakerRefundable,
+    SwapState::MakerRefunded,
+    SwapState::Done,
+];
+const TAKER_RESTART_POINTS: [TakerState; 7] = [
+    TakerState::Prepared,
+    TakerState::Accepted,
+    TakerState::Locked,
+    TakerState::MakerLockConfirmed,
+    TakerState::Claimed,
+    TakerState::Refunded,
+    TakerState::Done,
+];
+
+/// Restart safety, the whole matrix: for the happy and the refund scenario, an in-process
+/// restart (both engines dropped, the same DB file reopened, the same mock chains) right
+/// after each state either side persists, plus one run that restarts at every checkpoint.
+/// Each run must end exactly like the run with no restart: same terminal states, same
+/// balances to the sat, one funding per leg, exactly one claim (happy) or one refund
+/// (refund) per leg and nothing else, one coin selection per side. A second restart after
+/// the swap finished must change nothing.
+async fn restart_matrix_body(dir: Direction) {
+    use SwapState as M;
+    use TakerState as T;
+    for scn in [Scn::Happy, Scn::Refund] {
+        let mut base = H::with(dir);
+        base.run(scn, None, &[]).await;
+        assert_atomic(&base, scn);
+        base.restart_and_settle().await;
+        let want = base.outcome();
+        let happy = u64::from(scn == Scn::Happy);
+        let leg = KindCounts {
+            funds: 1,
+            claims: happy,
+            refunds: 1 - happy,
+        };
+        assert_eq!(
+            (want.taker_leg_txs, want.maker_leg_txs),
+            (leg, leg),
+            "{scn:?}"
+        );
+        assert_eq!(want.coin_selections, (1, 1), "{scn:?}");
+        assert_eq!((want.maker, want.taker), (M::Done, T::Done), "{scn:?}");
+
+        let crashes = MAKER_RESTART_POINTS
+            .iter()
+            .map(|s| Crash::Maker(*s))
+            .chain(TAKER_RESTART_POINTS.iter().map(|s| Crash::Taker(*s)));
+        let mut hit = Vec::new();
+        for crash in crashes {
+            let mut h = H::with(dir);
+            h.run(scn, Some(crash), &[]).await;
+            if h.restarts == 1 {
+                hit.push(format!("{crash:?}"));
+            }
+            assert_atomic(&h, scn);
+            h.restart_and_settle().await;
+            assert_eq!(
+                h.outcome(),
+                want,
+                "{dir:?} {scn:?}: restart after {crash:?}"
+            );
+        }
+
+        let mut h = H::with(dir);
+        h.restart_every = true;
+        h.run(scn, None, &[]).await;
+        assert!(h.restarts >= 10, "only {} restarts", h.restarts);
+        h.restart_and_settle().await;
+        assert_eq!(
+            h.outcome(),
+            want,
+            "{dir:?} {scn:?}: restart at every checkpoint"
+        );
+
+        // Every state the scenario passes through was a restart point.
+        let path: Vec<Crash> = match scn {
+            Scn::Happy => [M::TakerClaimed, M::MakerClaimed]
+                .iter()
+                .map(|s| Crash::Maker(*s))
+                .chain(
+                    [T::MakerLockConfirmed, T::Claimed]
+                        .iter()
+                        .map(|s| Crash::Taker(*s)),
+                )
+                .collect(),
+            Scn::Refund => [M::MakerRefundable, M::MakerRefunded]
+                .iter()
+                .map(|s| Crash::Maker(*s))
+                .chain([T::Refunded].iter().map(|s| Crash::Taker(*s)))
+                .collect(),
+        };
+        let common = [
+            Crash::Maker(M::Accepted),
+            Crash::Maker(M::TakerLockSeen),
+            Crash::Maker(M::TakerLockConfirmed),
+            Crash::Maker(M::MakerLocked),
+            Crash::Maker(M::MakerLockConfirmed),
+            Crash::Maker(M::Done),
+            Crash::Taker(T::Prepared),
+            Crash::Taker(T::Accepted),
+            Crash::Taker(T::Locked),
+            Crash::Taker(T::Done),
+        ];
+        for c in common.iter().chain(path.iter()) {
+            assert!(
+                hit.contains(&format!("{c:?}")),
+                "{dir:?} {scn:?}: restart after {c:?} never triggered (hit: {hit:?})"
+            );
+        }
+        eprintln!(
+            "{dir:?} {scn:?}: {} restart points triggered, every-checkpoint run restarted {} times",
+            hit.len(),
+            h.restarts
+        );
+    }
+}
+both!(
+    restart_matrix_same_outcome,
+    rev_restart_matrix_same_outcome,
+    restart_matrix_body
+);
+
+/// How long an injected backend fault lasts, in rounds (one block on each chain per round).
+const FAULT_ROUNDS: usize = 5;
+
+/// The ways a chain backend fails, as (name, error, only broadcasts fail). The engine
+/// treats Transient/Premature as retryable, Rejected as "these bytes are dead" (forget and
+/// re-sign a spend, flag a dropped maker lock) and anything else as a plain step error.
+fn faults() -> [(&'static str, SwapError, bool); 7] {
+    [
+        (
+            "down",
+            SwapError::Transient("mock: node down (test)".into()),
+            false,
+        ),
+        (
+            "premature",
+            SwapError::Premature("mock: premature (test)".into()),
+            false,
+        ),
+        (
+            "rejected",
+            SwapError::Rejected("mock: rejected (test)".into()),
+            false,
+        ),
+        (
+            "other",
+            SwapError::Other("mock: internal error (test)".into()),
+            false,
+        ),
+        (
+            "send-transient",
+            SwapError::Transient("mock: send failed (test)".into()),
+            true,
+        ),
+        (
+            "send-premature",
+            SwapError::Premature("mock: send premature (test)".into()),
+            true,
+        ),
+        (
+            "send-rejected",
+            SwapError::Rejected("mock: send rejected (test)".into()),
+            true,
+        ),
+    ]
+}
+
+/// No state was first reached in an earlier round than in the undisturbed run `base`: a
+/// fault or an eviction may only delay the swap, never hurry it into a timeout.
+fn assert_not_earlier(h: &H, base: &H, what: &str) {
+    for (s, at) in &h.first_maker {
+        if let Some((_, b)) = base.first_maker.iter().find(|(x, _)| x == s) {
+            assert!(
+                at >= b,
+                "{what}: maker {s:?} in round {at}, undisturbed in round {b}"
+            );
+        }
+    }
+    for (s, at) in &h.first_taker {
+        if let Some((_, b)) = base.first_taker.iter().find(|(x, _)| x == s) {
+            assert!(
+                at >= b,
+                "{what}: taker {s:?} in round {at}, undisturbed in round {b}"
+            );
+        }
+    }
+}
+
+/// Neither side was ever seen in a state off the scenario's path: no abort or refund in
+/// the happy swap, no abort or claim in the refund swap.
+fn assert_on_path(h: &H, scn: Scn, what: &str) {
+    use SwapState as M;
+    use TakerState as T;
+    let (bad_m, bad_t): (&[SwapState], &[TakerState]) = match scn {
+        Scn::Happy => (
+            &[M::Aborted, M::MakerRefundable, M::MakerRefunded],
+            &[T::Refunded],
+        ),
+        Scn::Refund => (
+            &[M::Aborted, M::TakerClaimed, M::MakerClaimed],
+            &[T::Claimed],
+        ),
+    };
+    for (s, at) in &h.first_maker {
+        assert!(!bad_m.contains(s), "{what}: maker {s:?} in round {at}");
+    }
+    for (s, at) in &h.first_taker {
+        assert!(!bad_t.contains(s), "{what}: taker {s:?} in round {at}");
+    }
+}
+
+/// The undisturbed run: its outcome is what every disturbed run must end with.
+async fn undisturbed(dir: Direction, scn: Scn) -> (H, Outcome) {
+    undisturbed_at(dir, scn, None).await
+}
+
+async fn undisturbed_at(dir: Direction, scn: Scn, edge: Option<Edge>) -> (H, Outcome) {
+    let mut base = H::with(dir);
+    base.edge = edge;
+    base.run(scn, None, &[]).await;
+    assert_atomic(&base, scn);
+    assert_on_path(&base, scn, "undisturbed");
+    base.restart_and_settle().await;
+    assert_no_early_refund(&base, &format!("{dir:?} {scn:?} {edge:?} undisturbed"));
+    let want = base.outcome();
+    assert_eq!(want.coin_selections, (1, 1), "{scn:?}");
+    assert_eq!(want.released, 0, "{scn:?}");
+    (base, want)
+}
+
+/// No refund broadcast ever reached a leg's chain before that leg's refund was final.
+fn assert_no_early_refund(h: &H, what: &str) {
+    assert!(
+        h.early_refunds.is_empty(),
+        "{what}: refund sent before final: {:?}",
+        h.early_refunds
+    );
+}
+
+/// The per-matrix summary line: broadcast attempts on both chains, refused ones included.
+fn report_attempts(matrix: &str, dir: Direction, what: &str, runs: usize, a: KindCounts) {
+    eprintln!(
+        "DF-ATTEMPTS {matrix} {dir:?} {what}: {runs} runs, fund {} claim {} refund {} all {}",
+        a.funds,
+        a.claims,
+        a.refunds,
+        a.funds + a.claims + a.refunds
+    );
+}
+
+/// Restart while a chain backend is down or erroring: for the happy and the refund
+/// scenario, each leg's chain, each fault kind and each restart point, restart both engines
+/// and make that chain fail for `FAULT_ROUNDS` rounds. Meanwhile the engines keep retrying
+/// (a step error is recorded), nothing reaches a state earlier than undisturbed and nothing
+/// leaves the scenario's path (no abort, no refund of a happy swap). Healed, every run ends
+/// like the undisturbed one: same states, balances, tx counts, coin selections.
+async fn outage_matrix_body(dir: Direction) {
+    let crashes = restart_points();
+    for scn in [Scn::Happy, Scn::Refund] {
+        let (base, want) = undisturbed(dir, scn).await;
+        let mut sent = base.attempts();
+        let mut runs = 0;
+        for leg in [Leg::Taker, Leg::Maker] {
+            for (name, err, send_only) in faults() {
+                let mut errored = 0;
+                for crash in &crashes {
+                    let mut h = H::with(dir);
+                    h.fault = Some((leg, err.clone(), send_only));
+                    h.run(scn, Some(*crash), &[]).await;
+                    if h.restarts == 0 {
+                        sent = add_counts(sent, h.attempts());
+                        continue;
+                    }
+                    let what = format!(
+                        "{dir:?} {scn:?}: {leg:?}-leg chain {name} from restart after {crash:?}"
+                    );
+                    assert!(h.fault.is_none(), "{what}: the fault never started");
+                    assert_on_path(&h, scn, &what);
+                    assert_not_earlier(&h, &base, &what);
+                    assert_atomic(&h, scn);
+                    errored += h.fault_errors;
+                    h.heal();
+                    h.restart_and_settle().await;
+                    assert_eq!(h.outcome(), want, "{what}");
+                    assert_no_early_refund(&h, &what);
+                    sent = add_counts(sent, h.attempts());
+                    runs += 1;
+                }
+                assert!(
+                    errored > 0,
+                    "{dir:?} {scn:?} {leg:?} {name}: no step ever hit the fault"
+                );
+            }
+        }
+        eprintln!("DF-MATRIX outage {dir:?} {scn:?}: {runs} runs");
+        report_attempts("outage", dir, &format!("{scn:?}"), runs, sent);
+    }
+}
+both!(
+    outage_matrix_same_outcome,
+    rev_outage_matrix_same_outcome,
+    outage_matrix_body
+);
+
+/// Every restart point of both sides, as the restart and outage matrices use them.
+fn restart_points() -> Vec<Crash> {
+    MAKER_RESTART_POINTS
+        .iter()
+        .map(|s| Crash::Maker(*s))
+        .chain(TAKER_RESTART_POINTS.iter().map(|s| Crash::Taker(*s)))
+        .collect()
+}
+
+/// Every eviction plan of the mempool-drop matrix for a scenario whose spend is `spend`:
+/// each leg, its funding then its spend, once or three times, with or without a restart.
+fn drop_plans(spend: TxKind) -> Vec<DropPlan> {
+    let mut plans = Vec::new();
+    for leg in [Leg::Taker, Leg::Maker] {
+        for kind in [TxKind::Fund, spend] {
+            for times in [1, 3] {
+                for restart in [false, true] {
+                    plans.push(DropPlan {
+                        leg,
+                        kind,
+                        times,
+                        restart,
+                        drops: Vec::new(),
+                    });
+                }
+            }
+        }
+    }
+    plans
+}
+
+/// The eviction plan ran in full and each evicted tx came back by the next round with the
+/// same txid: the chain only ever saw one tx of that kind on that leg.
+fn assert_drops_resent(h: &mut H, what: &str) {
+    let p = h.drop.take().unwrap();
+    let (leg, kind) = (p.leg, p.kind);
+    assert_eq!(p.drops.len(), p.times, "{what}: {:?}", p.drops);
+    let id = p.drops[0].0;
+    for (d, at, back) in &p.drops {
+        assert_eq!(*d, id, "{what}: another {kind:?} was sent");
+        let back = back.unwrap_or_else(|| panic!("{what}: never sent again after round {at}"));
+        assert!(
+            back <= at + 1,
+            "{what}: evicted in round {at}, back in {back}"
+        );
+    }
+    assert!(h.leg_chain(leg).contains(&id), "{what}: not on chain");
+    let ids: Vec<Txid> = h
+        .leg_chain(leg)
+        .accepted()
+        .into_iter()
+        .filter(|(_, k)| *k == kind)
+        .map(|(t, _)| t)
+        .collect();
+    assert_eq!(ids, vec![id], "{what}: a second {kind:?} txid");
+}
+
+/// Mempool eviction: for the happy and the refund scenario, each leg and each tx the
+/// scenario sends on it (funding, then the claim or the refund), evict it while
+/// unconfirmed, once or three times, with or without a restart right after. The engine
+/// must send the same tx again by the next round (same txid; it never re-signs or selects
+/// coins anew, so the chain only ever sees one tx of that kind on that leg) and the swap
+/// must end like the undisturbed run: the refund still lands and pays the same.
+async fn mempool_drop_matrix_body(dir: Direction) {
+    for scn in [Scn::Happy, Scn::Refund] {
+        let (base, want) = undisturbed(dir, scn).await;
+        let spend = match scn {
+            Scn::Happy => TxKind::Claim,
+            Scn::Refund => TxKind::Refund,
+        };
+        let mut sent = base.attempts();
+        let mut runs = 0;
+        for plan in drop_plans(spend) {
+            let what = format!(
+                "{dir:?} {scn:?}: {:?}-leg {:?} evicted {}x, restart {}",
+                plan.leg, plan.kind, plan.times, plan.restart
+            );
+            let mut h = H::with(dir);
+            h.drop = Some(plan);
+            h.run(scn, None, &[]).await;
+            assert_drops_resent(&mut h, &what);
+            assert_on_path(&h, scn, &what);
+            assert_not_earlier(&h, &base, &what);
+            assert_atomic(&h, scn);
+            h.restart_and_settle().await;
+            assert_eq!(h.outcome(), want, "{what}");
+            assert_no_early_refund(&h, &what);
+            sent = add_counts(sent, h.attempts());
+            runs += 1;
+        }
+        eprintln!("DF-MATRIX mempool-drop {dir:?} {scn:?}: {runs} runs");
+        report_attempts("mempool-drop", dir, &format!("{scn:?}"), runs, sent);
+    }
+}
+both!(
+    mempool_drop_matrix_same_txid,
+    rev_mempool_drop_matrix_same_txid,
+    mempool_drop_matrix_body
+);
+
+/// The refund clock at its edge: for each row of `EDGES`, the refund scenario times out by
+/// pinning each leg's chain MTP at exactly L-1, L or L+1 (or, for the late lock, sending the
+/// maker's lock back to the mempool at L - claim_margin/2, past the point where the maker
+/// goes `MakerRefundable`) and holding it there for `HOLD_ROUNDS` rounds before L+1. Each
+/// row runs undisturbed, then from every restart point and with every eviction plan. No
+/// refund attempt reaches either chain while its MTP is at most L (none before final, no
+/// extra one at L), and every run ends like the row's undisturbed one.
+async fn refund_edge_matrix_body(dir: Direction) {
+    let scn = Scn::Refund;
+    let crashes = restart_points();
+    let mut refunds = Vec::new();
+    for edge in EDGES {
+        let (base, want) = undisturbed_at(dir, scn, Some(edge)).await;
+        let mut sent = base.attempts();
+        let mut runs = 0;
+        for crash in &crashes {
+            let mut h = H::with(dir);
+            h.edge = Some(edge);
+            h.run(scn, Some(*crash), &[]).await;
+            let what = format!("{dir:?} {edge:?}: restart after {crash:?}");
+            if h.restarts > 0 {
+                assert_on_path(&h, scn, &what);
+                assert_not_earlier(&h, &base, &what);
+                assert_atomic(&h, scn);
+                h.restart_and_settle().await;
+                assert_eq!(h.outcome(), want, "{what}");
+                runs += 1;
+            }
+            assert_no_early_refund(&h, &what);
+            sent = add_counts(sent, h.attempts());
+        }
+        for plan in drop_plans(TxKind::Refund) {
+            let what = format!(
+                "{dir:?} {edge:?}: {:?}-leg {:?} evicted {}x, restart {}",
+                plan.leg, plan.kind, plan.times, plan.restart
+            );
+            let mut h = H::with(dir);
+            h.edge = Some(edge);
+            h.drop = Some(plan);
+            h.run(scn, None, &[]).await;
+            assert_drops_resent(&mut h, &what);
+            assert_on_path(&h, scn, &what);
+            assert_not_earlier(&h, &base, &what);
+            assert_atomic(&h, scn);
+            h.restart_and_settle().await;
+            assert_eq!(h.outcome(), want, "{what}");
+            assert_no_early_refund(&h, &what);
+            sent = add_counts(sent, h.attempts());
+            runs += 1;
+        }
+        eprintln!("DF-MATRIX refund-edge {dir:?} {edge:?}: {runs} runs");
+        report_attempts("refund-edge", dir, &format!("{edge:?}"), runs, sent);
+        refunds.push((edge, sent.refunds));
+    }
+    // MTP at L is still not final: pinning there sends no more refunds than at L-1.
+    assert_eq!(
+        refunds[0].1, refunds[1].1,
+        "{dir:?} refund attempts: {refunds:?}"
+    );
+}
+both!(
+    refund_edge_matrix_same_outcome,
+    rev_refund_edge_matrix_same_outcome,
+    refund_edge_matrix_body
 );
 
 const MAKER_STATES: [SwapState; 9] = [
@@ -811,6 +1619,9 @@ impl ChainBackend for Spy {
     }
     async fn tip_height(&self) -> Result<u64> {
         self.inner.tip_height().await
+    }
+    async fn tip_hash(&self) -> Result<String> {
+        self.inner.tip_hash().await
     }
     async fn median_time_past(&self) -> Result<u32> {
         self.inner.median_time_past().await
@@ -1095,6 +1906,149 @@ async fn refund_on_claimed_does_nothing_body(dir: Direction) {
     );
 }
 
+/// The engines' refund gate is the node's own finality rule. Each leg's refund has
+/// nLockTime = that HTLC's locktime L (a unix time) and a BIP68-disabled sequence, so Core's
+/// `IsFinalTx` (BIP113) is the only lock: final once the tip's MTP is *past* L. At MTP L-1
+/// and at MTP L the node refuses the refund (sent here directly to show it), and the engine
+/// step holds: the side stays put (maker `MakerLockConfirmed` with no refund built, taker
+/// `Locked`) and makes no refund broadcast attempt at all. At L+1 the step sends the refund
+/// exactly once, the node accepts it, and once mined both end `Done` with the lock paid
+/// back and exactly one refund on the chain. MTP moves with `advance_time` only, never a
+/// block, so each point is exact.
+async fn refund_at_timelock_boundary_body(dir: Direction) {
+    let mut h = H::with(dir);
+    h.accept(None).await;
+    h.lock_and_notify(None).await;
+    for _ in 0..40 {
+        let _ = h.maker.tick().await;
+        if h.maker_state() == SwapState::MakerLockConfirmed {
+            break;
+        }
+        h.mine_all(1);
+    }
+    assert_eq!(h.maker_state(), SwapState::MakerLockConfirmed, "setup");
+
+    // Maker leg.
+    let rec = h.store.get_maker_swap(&h.maker_id).unwrap().unwrap();
+    let (htlc, f) = (rec.maker_leg_htlc.unwrap(), rec.maker_leg_funding.unwrap());
+    let l = htlc.locktime;
+    let ml = h.ml_chain().clone();
+    let bal = ml.balance(&h.m_ml().pubkey());
+    assert!(ml.mtp() < l - 1, "setup: mtp {} locktime {l}", ml.mtp());
+    ml.advance_time(l - 1 - ml.mtp());
+    let own = h
+        .m_ml()
+        .build_refund(&htlc, &f.outpoint, f.amount)
+        .await
+        .unwrap();
+    for at in [l - 1, l] {
+        assert_eq!(ml.mtp(), at);
+        match h.m_ml().broadcast(&own).await {
+            Err(SwapError::Premature(m)) => assert!(m.starts_with("non-final"), "{at}: {m}"),
+            other => panic!("maker refund at mtp {at}: {other:?}"),
+        }
+        let before = ml.attempts(TxKind::Refund);
+        let state = h.maker.step(&h.maker_id).await.unwrap();
+        assert_eq!(
+            ml.attempts(TxKind::Refund) - before,
+            0,
+            "maker engine broadcast its refund at mtp {at} (locktime {l}): not final yet"
+        );
+        assert_eq!(state, SwapState::MakerLockConfirmed, "maker at mtp {at}");
+        let rec = h.store.get_maker_swap(&h.maker_id).unwrap().unwrap();
+        assert!(rec.maker_leg_refund.is_none(), "maker at mtp {at}");
+        assert_eq!(
+            ml.kind_counts().refunds,
+            0,
+            "maker refund accepted at mtp {at}"
+        );
+        assert_eq!(ml.balance(&h.m_ml().pubkey()), bal, "maker at mtp {at}");
+        ml.advance_time(1);
+    }
+    assert_eq!(ml.mtp(), l + 1);
+    let before = ml.attempts(TxKind::Refund);
+    assert_eq!(
+        h.maker.step(&h.maker_id).await.unwrap(),
+        SwapState::MakerRefundable
+    );
+    assert_eq!(ml.attempts(TxKind::Refund) - before, 1, "maker at mtp L+1");
+    let rec = h.store.get_maker_swap(&h.maker_id).unwrap().unwrap();
+    assert_eq!(rec.maker_leg_refund.map(|t| t.txid), Some(own.txid));
+    assert_eq!(ml.mempool(), vec![(own.txid, TxKind::Refund)]);
+    ml.mine(1);
+    // One step: MakerRefundable → MakerRefunded (refund confirmed) → Done.
+    assert_eq!(h.maker.step(&h.maker_id).await.unwrap(), SwapState::Done);
+    assert_eq!(ml.kind_counts().refunds, 1);
+    assert_eq!(
+        ml.balance(&h.m_ml().pubkey()).0,
+        bal.0 + f.amount.0 - MOCK_FEE.0
+    );
+
+    // Taker leg: the taker never claimed (it is never shown the maker's lock).
+    assert_eq!(h.taker_state(), TakerState::Locked);
+    let rec = h.store.get_taker_swap(&h.taker_id).unwrap().unwrap();
+    let (htlc, f) = (rec.taker_leg_htlc.unwrap(), rec.taker_leg_funding.unwrap());
+    let l = htlc.locktime;
+    let tl = h.tl_chain().clone();
+    let bal = tl.balance(&h.t_tl().pubkey());
+    assert!(tl.mtp() < l - 1, "setup: mtp {} locktime {l}", tl.mtp());
+    tl.advance_time(l - 1 - tl.mtp());
+    let own = h
+        .t_tl()
+        .build_refund(&htlc, &f.outpoint, f.amount)
+        .await
+        .unwrap();
+    for at in [l - 1, l] {
+        assert_eq!(tl.mtp(), at);
+        match h.t_tl().broadcast(&own).await {
+            Err(SwapError::Premature(m)) => assert!(m.starts_with("non-final"), "{at}: {m}"),
+            other => panic!("taker refund at mtp {at}: {other:?}"),
+        }
+        let before = tl.attempts(TxKind::Refund);
+        let state = h.taker.step(&h.taker_id, None).await.unwrap();
+        assert_eq!(
+            tl.attempts(TxKind::Refund) - before,
+            0,
+            "taker engine broadcast its refund at mtp {at} (locktime {l}): not final yet"
+        );
+        assert_eq!(state, TakerState::Locked, "taker at mtp {at}");
+        let rec = h.store.get_taker_swap(&h.taker_id).unwrap().unwrap();
+        assert!(rec.taker_leg_refund.is_none(), "taker at mtp {at}");
+        assert_eq!(
+            tl.kind_counts().refunds,
+            0,
+            "taker refund accepted at mtp {at}"
+        );
+        assert_eq!(tl.balance(&h.t_tl().pubkey()), bal, "taker at mtp {at}");
+        tl.advance_time(1);
+    }
+    assert_eq!(tl.mtp(), l + 1);
+    let before = tl.attempts(TxKind::Refund);
+    assert_eq!(
+        h.taker.step(&h.taker_id, None).await.unwrap(),
+        TakerState::Refunded
+    );
+    assert_eq!(tl.attempts(TxKind::Refund) - before, 1, "taker at mtp L+1");
+    let rec = h.store.get_taker_swap(&h.taker_id).unwrap().unwrap();
+    assert_eq!(rec.taker_leg_refund.map(|t| t.txid), Some(own.txid));
+    assert_eq!(tl.mempool(), vec![(own.txid, TxKind::Refund)]);
+    tl.mine(1);
+    assert_eq!(
+        h.taker.step(&h.taker_id, None).await.unwrap(),
+        TakerState::Done
+    );
+    assert_eq!(tl.kind_counts().refunds, 1);
+    assert_eq!(
+        tl.balance(&h.t_tl().pubkey()).0,
+        bal.0 + f.amount.0 - MOCK_FEE.0
+    );
+}
+
+both!(
+    refund_at_timelock_boundary,
+    rev_refund_at_timelock_boundary,
+    refund_at_timelock_boundary_body
+);
 both!(
     refund_never_claims,
     rev_refund_never_claims,
@@ -1481,3 +2435,819 @@ proptest! {
         prop_body(REV, refund, maker_side, mi, ti, &outages);
     }
 }
+
+// ---- F3: new swaps lock with the size-checked V1 script; records written before it stay V0 ----
+
+/// A swap accepted now is V1 on both legs, on both sides' records.
+async fn new_swap_is_v1_body(dir: Direction) {
+    let mut h = H::with(dir);
+    h.run(Scn::Happy, None, &[]).await;
+    assert_atomic(&h, Scn::Happy);
+    let m = h.store.get_maker_swap(&h.maker_id).unwrap().unwrap();
+    assert_eq!(m.taker_leg_htlc.script_version, ScriptVersion::V1);
+    assert_eq!(m.maker_leg_htlc.unwrap().script_version, ScriptVersion::V1);
+    let t = h.store.get_taker_swap(&h.taker_id).unwrap().unwrap();
+    assert_eq!(t.taker_leg_htlc.unwrap().script_version, ScriptVersion::V1);
+    assert_eq!(t.maker_leg_htlc.unwrap().script_version, ScriptVersion::V1);
+    // The V1 script is on the wire the taker reads.
+    let v = h.maker.view(&h.maker_id).unwrap().unwrap();
+    assert_eq!(v.taker_leg.htlc.script_version, ScriptVersion::V1);
+    assert_eq!(v.maker_leg.unwrap().htlc.script_version, ScriptVersion::V1);
+}
+both!(new_swap_is_v1, rev_new_swap_is_v1, new_swap_is_v1_body);
+
+/// A taker that locks the V0 script (an old client building its own leg) for a new swap is
+/// refused with no write, and the maker never funds its leg.
+async fn maker_refuses_v0_taker_leg_body(dir: Direction) {
+    let mut h = H::with(dir);
+    h.accept(None).await;
+    let before = h.store.get_maker_swap(&h.maker_id).unwrap().unwrap();
+    assert_eq!(before.taker_leg_htlc.script_version, ScriptVersion::V1);
+    let v0 = HtlcParams {
+        script_version: ScriptVersion::V0,
+        ..before.taker_leg_htlc
+    };
+    let f = h
+        .t_tl()
+        .build_funding(&v0, before.quote.taker_leg_amount())
+        .await
+        .unwrap();
+    h.t_tl().broadcast(&f.tx).await.unwrap();
+    h.mine_all(1);
+    let err = h
+        .maker
+        .notify_lock(
+            &h.maker_id,
+            LockNotice {
+                outpoint: f.outpoint,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("V0"), "{err}");
+    let after = h.store.get_maker_swap(&h.maker_id).unwrap().unwrap();
+    assert_eq!(
+        serde_json::to_value(&after).unwrap(),
+        serde_json::to_value(&before).unwrap(),
+        "refusal must not write"
+    );
+    for _ in 0..5 {
+        h.maker.tick().await.unwrap();
+        h.mine_all(1);
+    }
+    assert_eq!(h.m_ml().funding_calls(), 0);
+}
+both!(
+    maker_refuses_v0_taker_leg,
+    rev_maker_refuses_v0_taker_leg,
+    maker_refuses_v0_taker_leg_body
+);
+
+/// Today's JSON (no `script_version`) is V0, and its script is rebuilt byte for byte from the
+/// raw fixture fields, independently of `redeem_script`.
+#[test]
+fn old_records_are_v0_and_rebuild_byte_for_byte() {
+    let raw: serde_json::Value = serde_json::from_str(MAKER_HAPPY).unwrap();
+    let rec: MakerRecord = serde_json::from_str(MAKER_HAPPY).unwrap();
+    for (key, got) in [
+        ("btc_htlc", rec.taker_leg_htlc),
+        ("divi_htlc", rec.maker_leg_htlc.unwrap()),
+    ] {
+        let j = &raw[key];
+        assert!(
+            j.get("script_version").is_none(),
+            "{key}: fixture is not pre-F3"
+        );
+        assert_eq!(got.script_version, ScriptVersion::V0);
+        // OP_IF OP_SHA256 <h> OP_EQUALVERIFY <claim> OP_ELSE <lt> CLTV OP_DROP <refund> OP_ENDIF CHECKSIG
+        let lt = divi_swap::htlc::script_num(got.locktime as i64);
+        let want = format!(
+            "63a820{}8821{}67{:02x}{}b17521{}68ac",
+            j["hash"].as_str().unwrap(),
+            j["claim_pubkey"].as_str().unwrap(),
+            lt.len(),
+            hex::encode(&lt),
+            j["refund_pubkey"].as_str().unwrap()
+        );
+        assert_eq!(hex::encode(got.redeem_script()), want, "{key}");
+        assert_eq!(got.redeem_script(), got.redeem_script_v(ScriptVersion::V0));
+        // And it re-serializes to exactly today's JSON.
+        assert_eq!(&serde_json::to_value(got).unwrap(), j, "{key}");
+    }
+}
+
+ltc_rev!(ltc_rev_new_swap_is_v1, new_swap_is_v1_body);
+ltc_fwd!(ltc_fwd_new_swap_is_v1, new_swap_is_v1_body);
+zec_fwd!(zec_fwd_new_swap_is_v1, new_swap_is_v1_body);
+zec_rev!(zec_rev_new_swap_is_v1, new_swap_is_v1_body);
+ltc_rev!(
+    ltc_rev_maker_refuses_v0_taker_leg,
+    maker_refuses_v0_taker_leg_body
+);
+zec_fwd!(
+    zec_fwd_maker_refuses_v0_taker_leg,
+    maker_refuses_v0_taker_leg_body
+);
+
+// ---- F2: the maker re-sends a lock a reorg dropped, and stops early when it is too late ----
+
+/// Drive the maker alone to `MakerLockConfirmed`; returns the maker lock's txid.
+async fn to_maker_lock_confirmed(h: &mut H) -> Txid {
+    h.accept(None).await;
+    h.lock_and_notify(None).await;
+    for _ in 0..30 {
+        h.maker.tick().await.unwrap();
+        h.mine_all(1);
+        if h.maker_state() == SwapState::MakerLockConfirmed {
+            break;
+        }
+    }
+    assert_eq!(h.maker_state(), SwapState::MakerLockConfirmed);
+    h.maker_rec().maker_leg_funding.unwrap().tx.txid
+}
+
+impl H {
+    fn maker_rec(&self) -> MakerRecord {
+        self.store.get_maker_swap(&self.maker_id).unwrap().unwrap()
+    }
+
+    fn maker_leg_needed(&self) -> u32 {
+        self.cfg.confirmations(self.dir.maker_chain())
+    }
+
+    async fn lock_confs(&self, lock: &Txid) -> Option<u32> {
+        self.m_ml().confirmations(lock).await.unwrap()
+    }
+
+    /// Mine and tick the maker until the lock is `maker_leg_needed` deep again.
+    async fn redeepen(&self, lock: &Txid) {
+        for _ in 0..30 {
+            self.ml_chain().mine(1);
+            self.maker.tick().await.unwrap();
+            if self
+                .lock_confs(lock)
+                .await
+                .is_some_and(|c| c >= self.maker_leg_needed())
+            {
+                return;
+            }
+        }
+        panic!("lock never got {} confirmations", self.maker_leg_needed());
+    }
+}
+
+/// Lock confirmed → reorged back to the mempool: same bytes, no new coin selection, same
+/// state; once mined deep again nothing else happens.
+async fn reorged_lock_unconfirmed_body(dir: Direction) {
+    let mut h = H::with(dir);
+    let lock = to_maker_lock_confirmed(&mut h).await;
+    let before = h.maker_rec();
+    let calls = h.m_ml().funding_calls();
+    h.ml_chain().unconfirm(&lock);
+    assert_eq!(h.lock_confs(&lock).await, Some(0));
+    h.maker.tick().await.unwrap();
+    assert_eq!(h.maker_state(), SwapState::MakerLockConfirmed);
+    h.redeepen(&lock).await;
+    let after = h.maker_rec();
+    assert_eq!(
+        after.maker_leg_funding, before.maker_leg_funding,
+        "never re-signed"
+    );
+    assert_eq!(h.m_ml().funding_calls(), calls);
+    assert_eq!(after.state, SwapState::MakerLockConfirmed);
+    assert!(after.last_error.is_none() && !after.maker_lock_dropped);
+}
+both!(
+    reorged_lock_unconfirmed,
+    rev_reorged_lock_unconfirmed,
+    reorged_lock_unconfirmed_body
+);
+
+/// Lock confirmed → dropped from chain and mempool (`confirmations` is `None`): one tick
+/// re-sends the same signed bytes, mining confirms them. Fails on the base: nothing re-sends.
+async fn reorged_lock_is_resent_body(dir: Direction) {
+    let mut h = H::with(dir);
+    let lock = to_maker_lock_confirmed(&mut h).await;
+    let funding = h.maker_rec().maker_leg_funding.unwrap();
+    h.ml_chain().forget(&lock);
+    assert_eq!(h.lock_confs(&lock).await, None);
+    h.maker.tick().await.unwrap();
+    assert_eq!(h.lock_confs(&lock).await, Some(0), "lock was not re-sent");
+    assert_eq!(h.maker_state(), SwapState::MakerLockConfirmed);
+    h.redeepen(&lock).await;
+    assert_eq!(h.maker_rec().maker_leg_funding.unwrap(), funding);
+}
+both!(
+    reorged_lock_is_resent,
+    rev_reorged_lock_is_resent,
+    reorged_lock_is_resent_body
+);
+
+/// The re-send is refused for good (inputs spent): one error, state unchanged, no retry loop.
+async fn dropped_lock_rejected_body(dir: Direction) {
+    let mut h = H::with(dir);
+    let lock = to_maker_lock_confirmed(&mut h).await;
+    h.ml_chain().forget(&lock);
+    h.ml_chain().reject_next_broadcast();
+    h.maker.tick().await.unwrap();
+    let first = h.maker_rec();
+    assert!(first.maker_lock_dropped);
+    let msg = first.last_error.clone().unwrap();
+    assert!(msg.contains("dropped by a reorg"), "{msg}");
+    assert_eq!(first.state, SwapState::MakerLockConfirmed);
+    for _ in 0..3 {
+        h.maker.tick().await.unwrap();
+        assert_eq!(
+            h.maker_rec(),
+            first,
+            "the error is recorded once, not per tick"
+        );
+    }
+    assert_eq!(h.lock_confs(&lock).await, None, "no further re-broadcast");
+    assert_eq!(
+        h.maker.view(&h.maker_id).unwrap().unwrap().last_error,
+        Some(msg)
+    );
+}
+both!(
+    dropped_lock_rejected,
+    rev_dropped_lock_rejected,
+    dropped_lock_rejected_body
+);
+
+/// The taker's claim is already in the mempool when the lock is orphaned: the maker sees the
+/// preimage first and does not re-send the lock.
+async fn claim_in_mempool_wins_body(dir: Direction) {
+    let mut h = H::with(dir);
+    let lock = to_maker_lock_confirmed(&mut h).await;
+    for _ in 0..40 {
+        let view = h.maker.view(&h.maker_id).unwrap();
+        h.taker.step(&h.taker_id, view.as_ref()).await.unwrap();
+        if h.taker_state() == TakerState::Claimed {
+            break;
+        }
+        h.mine_all(1);
+    }
+    assert_eq!(h.taker_state(), TakerState::Claimed);
+    h.ml_chain().unconfirm(&lock);
+    h.maker.tick().await.unwrap();
+    let rec = h.maker_rec();
+    assert!(rec.preimage.is_some());
+    assert_ne!(rec.state, SwapState::MakerLockConfirmed);
+    assert!(!rec.maker_lock_dropped);
+}
+both!(
+    claim_in_mempool_wins,
+    rev_claim_in_mempool_wins,
+    claim_in_mempool_wins_body
+);
+
+/// Reorg near the locktime: a late lock cannot be claimed, so the maker stops waiting and
+/// refunds as soon as the locktime allows.
+async fn late_reorg_refunds_early_body(dir: Direction) {
+    let mut h = H::with(dir);
+    let lock = to_maker_lock_confirmed(&mut h).await;
+    let locktime = h.maker_rec().maker_leg_htlc.unwrap().locktime;
+    h.ml_chain().unconfirm(&lock);
+    let ml = h.ml_chain().clone();
+    ml.advance_time(locktime - h.cfg.claim_margin_secs / 2 - ml.mtp());
+    h.maker.tick().await.unwrap();
+    assert_eq!(h.maker_state(), SwapState::MakerRefundable);
+    ml.advance_time(h.cfg.claim_margin_secs);
+    for _ in 0..30 {
+        h.maker.tick().await.unwrap();
+        ml.mine(1);
+        if h.maker_state().is_terminal() {
+            break;
+        }
+    }
+    assert_eq!(h.maker_state(), SwapState::Done);
+    assert!(h.maker_rec().maker_leg_refund.is_some());
+}
+both!(
+    late_reorg_refunds_early,
+    rev_late_reorg_refunds_early,
+    late_reorg_refunds_early_body
+);
+
+/// The early `MakerRefundable` of a late lock (a reorg near the locktime) still waits for
+/// the refund to be final: no refund broadcast attempt while MTP is at most the locktime L
+/// (at L - claim_margin/2, at L-1 and at L), exactly one at L+1, accepted and mined.
+async fn late_lock_refund_waits_for_final_body(dir: Direction) {
+    let mut h = H::with(dir);
+    let lock = to_maker_lock_confirmed(&mut h).await;
+    let l = h.maker_rec().maker_leg_htlc.unwrap().locktime;
+    h.ml_chain().unconfirm(&lock);
+    let ml = h.ml_chain().clone();
+    ml.advance_time(l - h.cfg.claim_margin_secs / 2 - ml.mtp());
+    let before = ml.attempts(TxKind::Refund);
+    for at in [l - h.cfg.claim_margin_secs / 2, l - 1, l] {
+        ml.advance_time(at - ml.mtp());
+        h.maker.tick().await.unwrap();
+        assert_eq!(
+            ml.attempts(TxKind::Refund) - before,
+            0,
+            "maker engine broadcast its refund at mtp {at} (locktime {l}): not final yet"
+        );
+        let rec = h.maker_rec();
+        assert_eq!(rec.state, SwapState::MakerRefundable, "mtp {at}");
+        assert!(rec.maker_leg_refund.is_none(), "mtp {at}");
+    }
+    ml.advance_time(1);
+    h.maker.tick().await.unwrap();
+    assert_eq!(ml.attempts(TxKind::Refund) - before, 1, "mtp L+1");
+    ml.mine(1);
+    h.maker.tick().await.unwrap();
+    assert_eq!(h.maker_state(), SwapState::Done);
+    assert_eq!(ml.kind_counts().refunds, 1);
+}
+both!(
+    late_lock_refund_waits_for_final,
+    rev_late_lock_refund_waits_for_final,
+    late_lock_refund_waits_for_final_body
+);
+
+/// A lock that is confirmed is never abandoned early, however close the locktime is.
+async fn confirmed_lock_not_refunded_early_body(dir: Direction) {
+    let mut h = H::with(dir);
+    let lock = to_maker_lock_confirmed(&mut h).await;
+    assert!(h.lock_confs(&lock).await.unwrap() >= h.maker_leg_needed());
+    let locktime = h.maker_rec().maker_leg_htlc.unwrap().locktime;
+    let ml = h.ml_chain().clone();
+    ml.advance_time(locktime - 10 - ml.mtp());
+    h.maker.tick().await.unwrap();
+    let rec = h.maker_rec();
+    assert_eq!(rec.state, SwapState::MakerLockConfirmed);
+    assert!(rec.maker_leg_refund.is_none());
+}
+both!(
+    confirmed_lock_not_refunded_early,
+    rev_confirmed_lock_not_refunded_early,
+    confirmed_lock_not_refunded_early_body
+);
+
+/// The lock is gone and never returns: once its refund is final (MTP past the locktime) the
+/// maker is `MakerRefundable` and reports a stable error, not a growing one.
+async fn lost_lock_past_locktime_body(dir: Direction) {
+    let mut h = H::with(dir);
+    let lock = to_maker_lock_confirmed(&mut h).await;
+    let locktime = h.maker_rec().maker_leg_htlc.unwrap().locktime;
+    h.ml_chain().forget(&lock);
+    h.ml_chain().reject_next_broadcast();
+    h.maker.tick().await.unwrap(); // lock dropped, flagged
+    let ml = h.ml_chain().clone();
+    ml.advance_time(locktime + 1 - ml.mtp());
+    assert!(h.maker.tick().await.is_ok()); // tick records errors, never returns them
+    let first = h.maker_rec();
+    assert_eq!(first.state, SwapState::MakerRefundable);
+    assert!(first.last_error.is_some());
+    for _ in 0..3 {
+        h.maker.tick().await.unwrap();
+        let again = h.maker_rec();
+        assert_eq!(again.state, SwapState::MakerRefundable);
+        assert_eq!(again.last_error, first.last_error);
+    }
+}
+both!(
+    lost_lock_past_locktime,
+    rev_lost_lock_past_locktime,
+    lost_lock_past_locktime_body
+);
+
+/// Crash (restart) between the re-send and the next tick loses nothing.
+async fn restart_after_resend_body(dir: Direction) {
+    let mut h = H::with(dir);
+    let lock = to_maker_lock_confirmed(&mut h).await;
+    h.ml_chain().forget(&lock);
+    h.maker.tick().await.unwrap();
+    h.restart();
+    h.redeepen(&lock).await;
+    assert_eq!(h.maker_state(), SwapState::MakerLockConfirmed);
+}
+both!(
+    restart_after_resend,
+    rev_restart_after_resend,
+    restart_after_resend_body
+);
+
+/// A record written before this change (no `maker_lock_dropped` key) loads unchanged and a
+/// step leaves it alone.
+async fn old_record_resumes_body(dir: Direction) {
+    let mut h = H::with(dir);
+    let _ = to_maker_lock_confirmed(&mut h).await;
+    let rec = h.maker_rec();
+    let mut json = serde_json::to_value(&rec).unwrap();
+    assert!(json
+        .as_object_mut()
+        .unwrap()
+        .shift_remove("maker_lock_dropped")
+        .is_none());
+    let old: MakerRecord = serde_json::from_value(json).unwrap();
+    assert_eq!(old, rec);
+    h.store.put_maker_swap(&old).unwrap();
+    h.maker.tick().await.unwrap();
+    assert_eq!(h.maker_rec(), rec);
+}
+both!(
+    old_record_resumes,
+    rev_old_record_resumes,
+    old_record_resumes_body
+);
+
+ltc_rev!(ltc_rev_reorged_lock_is_resent, reorged_lock_is_resent_body);
+ltc_fwd!(ltc_fwd_reorged_lock_is_resent, reorged_lock_is_resent_body);
+zec_fwd!(zec_fwd_reorged_lock_is_resent, reorged_lock_is_resent_body);
+zec_rev!(zec_rev_reorged_lock_is_resent, reorged_lock_is_resent_body);
+ltc_fwd!(
+    ltc_fwd_late_reorg_refunds_early,
+    late_reorg_refunds_early_body
+);
+zec_rev!(
+    zec_rev_late_reorg_refunds_early,
+    late_reorg_refunds_early_body
+);
+
+// ---- reorg follow-ups q3 / q4 (maker-rebroadcast-design.md §5) ----
+
+/// q3: the re-send was refused (inputs spent) and the lock is flagged dropped. Once the node
+/// sees the lock again (relayed by another node), the flag and error clear, so a second drop
+/// is re-sent instead of staying stuck behind the stale flag. Fails on the base: the flag
+/// only cleared at full depth, so a lock back in the mempool kept the stale error and a
+/// later drop was never re-sent.
+async fn dropped_flag_clears_when_lock_returns_body(dir: Direction) {
+    let mut h = H::with(dir);
+    let lock = to_maker_lock_confirmed(&mut h).await;
+    let funding = h.maker_rec().maker_leg_funding.unwrap();
+    h.ml_chain().forget(&lock);
+    h.ml_chain().reject_next_broadcast();
+    h.maker.tick().await.unwrap();
+    assert!(h.maker_rec().maker_lock_dropped);
+    // Another node relays the lock: back in the mempool, below `maker_leg_confs`.
+    h.m_ml().broadcast(&funding.tx).await.unwrap();
+    assert_eq!(h.lock_confs(&lock).await, Some(0));
+    h.maker.tick().await.unwrap();
+    let rec = h.maker_rec();
+    assert!(!rec.maker_lock_dropped, "stale dropped flag");
+    assert!(rec.last_error.is_none(), "stale error");
+    // Dropped again: re-sent this time.
+    h.ml_chain().forget(&lock);
+    h.maker.tick().await.unwrap();
+    assert_eq!(h.lock_confs(&lock).await, Some(0), "lock was not re-sent");
+    assert_eq!(h.maker_state(), SwapState::MakerLockConfirmed);
+}
+both!(
+    dropped_flag_clears_when_lock_returns,
+    rev_dropped_flag_clears_when_lock_returns,
+    dropped_flag_clears_when_lock_returns_body
+);
+
+/// q4: a backend that cannot look the lock up (no txindex: `confirmations` and `htlc_output`
+/// say `None`) but whose node still has it: the re-broadcast answers already-known, so the
+/// watcher records nothing, flags nothing and changes no state. Pinned, not fixed.
+async fn blind_node_is_not_a_dropped_lock_body(dir: Direction) {
+    let mut h = H::with(dir);
+    let lock = to_maker_lock_confirmed(&mut h).await;
+    let before = h.maker_rec();
+    h.ml_chain().blind(&lock);
+    assert_eq!(h.lock_confs(&lock).await, None);
+    for _ in 0..3 {
+        h.maker.tick().await.unwrap();
+    }
+    assert_eq!(h.maker_rec(), before);
+    assert!(!h.maker_rec().maker_lock_dropped);
+}
+both!(
+    blind_node_is_not_a_dropped_lock,
+    rev_blind_node_is_not_a_dropped_lock,
+    blind_node_is_not_a_dropped_lock_body
+);
+
+/// q3 tail: the lock is gone for good (inputs spent) and the locktime passes. The swap goes
+/// to `MakerRefundable` and stays there, reporting an error each pass; it is never made
+/// terminal, because "gone for good" cannot be told from "this node cannot see it" (q4).
+async fn gone_lock_past_locktime_stays_refundable_body(dir: Direction) {
+    let mut h = H::with(dir);
+    let lock = to_maker_lock_confirmed(&mut h).await;
+    let locktime = h.maker_rec().maker_leg_htlc.unwrap().locktime;
+    h.ml_chain().forget(&lock);
+    h.ml_chain().reject_next_broadcast();
+    h.maker.tick().await.unwrap();
+    assert!(h.maker_rec().maker_lock_dropped);
+    let ml = h.ml_chain().clone();
+    ml.advance_time(locktime + 1 - ml.mtp());
+    for _ in 0..4 {
+        let _ = h.maker.tick().await;
+        ml.mine(1);
+        assert_eq!(h.maker_state(), SwapState::MakerRefundable);
+    }
+    assert!(!h.maker_state().is_terminal());
+    assert!(
+        h.maker_rec().maker_leg_refund.is_none(),
+        "dead refund bytes kept"
+    );
+    assert_eq!(h.lock_confs(&lock).await, None);
+}
+both!(
+    gone_lock_past_locktime_stays_refundable,
+    rev_gone_lock_past_locktime_stays_refundable,
+    gone_lock_past_locktime_stays_refundable_body
+);
+
+/// q4 follow-up: once the refund of a lock is refused and the node does not know the lock,
+/// the engine asks the backend to release the lock's wallet booking (the phantom change coin
+/// and the tombstoned inputs). Not before: a dropped lock inside its locktime is only re-sent.
+async fn gone_lock_is_released_body(dir: Direction) {
+    let mut h = H::with(dir);
+    let lock = to_maker_lock_confirmed(&mut h).await;
+    let locktime = h.maker_rec().maker_leg_htlc.unwrap().locktime;
+    h.ml_chain().forget(&lock);
+    h.ml_chain().reject_next_broadcast();
+    h.maker.tick().await.unwrap();
+    assert!(h.maker_rec().maker_lock_dropped);
+    assert!(
+        h.m_ml().released_locks().is_empty(),
+        "released while merely dropped"
+    );
+    let ml = h.ml_chain().clone();
+    ml.advance_time(locktime + 1 - ml.mtp());
+    for _ in 0..3 {
+        let _ = h.maker.tick().await;
+        ml.mine(1);
+    }
+    assert_eq!(h.maker_state(), SwapState::MakerRefundable);
+    let released = h.m_ml().released_locks();
+    assert!(!released.is_empty(), "phantom lock never released");
+    assert!(released.iter().all(|t| *t == lock));
+}
+both!(
+    gone_lock_is_released,
+    rev_gone_lock_is_released,
+    gone_lock_is_released_body
+);
+
+/// The counterpart: a lock the node merely cannot look up (no txindex) is still in the chain,
+/// so the refund goes through and nothing is released.
+async fn unseen_lock_is_not_released_body(dir: Direction) {
+    let mut h = H::with(dir);
+    let lock = to_maker_lock_confirmed(&mut h).await;
+    let locktime = h.maker_rec().maker_leg_htlc.unwrap().locktime;
+    h.ml_chain().blind(&lock);
+    let ml = h.ml_chain().clone();
+    ml.advance_time(locktime + 1 - ml.mtp());
+    for _ in 0..4 {
+        let _ = h.maker.tick().await;
+        ml.mine(1);
+    }
+    assert!(
+        h.m_ml().released_locks().is_empty(),
+        "released a lock that is in the chain"
+    );
+}
+both!(
+    unseen_lock_is_not_released,
+    rev_unseen_lock_is_not_released,
+    unseen_lock_is_not_released_body
+);
+
+/// Found by `swap_model.rs`: the taker persists its claim and goes down before broadcasting
+/// it, and stays down past the maker-leg locktime, so the maker refunds its leg. The stored
+/// claim is now refused for good, and re-signing it gives the same refused bytes: the taker
+/// sat in `Claimed` forever and never refunded its own, still-locked leg. It must notice the
+/// maker leg is gone and refund instead — through `step` and through `refund` alike.
+async fn claimed_after_maker_refund_body(dir: Direction, refund_only: bool) {
+    let mut h = H::with(dir);
+    h.accept(None).await;
+    h.lock_and_notify(None).await;
+    drive_taker_to(&mut h, TakerState::Claimed).await; // signed and stored, not broadcast
+    h.restart();
+
+    let locktime = h.maker_rec().maker_leg_htlc.unwrap().locktime;
+    let ml = h.ml_chain().clone();
+    ml.advance_time(locktime + 1 - ml.mtp());
+    h.clock.fetch_add(22_000, Ordering::SeqCst);
+    for _ in 0..8 {
+        let _ = h.maker.tick().await;
+        h.mine_all(1);
+    }
+    assert_eq!(
+        h.maker_state(),
+        SwapState::Done,
+        "the maker refunds its leg"
+    );
+
+    h.tl_chain().advance_time(22_000); // past the taker's own timeout
+    for _ in 0..8 {
+        let _ = if refund_only {
+            h.taker.refund(&h.taker_id).await
+        } else {
+            let view = h.maker.view(&h.maker_id).unwrap();
+            h.taker.step(&h.taker_id, view.as_ref()).await
+        };
+        h.mine_all(1);
+    }
+    let taker = h.store.get_taker_swap(&h.taker_id).unwrap().unwrap();
+    assert_eq!(
+        taker.state,
+        TakerState::Done,
+        "the taker leg must be refunded"
+    );
+    let at = taker.taker_leg_funding.unwrap().outpoint;
+    let counts = h.tl_chain().tx_counts(&at);
+    assert_eq!((counts.claims, counts.refunds), (0, 1), "{counts:?}");
+}
+
+async fn claimed_after_maker_refund_steps_body(dir: Direction) {
+    claimed_after_maker_refund_body(dir, false).await
+}
+both!(
+    claimed_after_maker_refund_steps,
+    rev_claimed_after_maker_refund_steps,
+    claimed_after_maker_refund_steps_body
+);
+
+async fn claimed_after_maker_refund_refund_only_body(dir: Direction) {
+    claimed_after_maker_refund_body(dir, true).await
+}
+both!(
+    claimed_after_maker_refund_refund_only,
+    rev_claimed_after_maker_refund_refund_only,
+    claimed_after_maker_refund_refund_only_body
+);
+
+/// An evicted maker-leg claim is resent, the same signed bytes on every step, for as long as
+/// the maker cannot refund: the claim confirms before the maker-leg locktime and wins the leg,
+/// so an eviction alone never costs the taker the swap. DF's mempool-drop matrix (hp3,
+/// `lane/restart-safety` at 7ade81c, `crates/divi-swap/tests/engine.rs`, the "Fund/claim
+/// evicted" cases) covers evictions across restarts; this pins the resend itself.
+async fn evicted_claim_is_resent_body(dir: Direction) {
+    let mut h = H::with(dir);
+    h.accept(None).await;
+    h.lock_and_notify(None).await;
+    drive_taker_to(&mut h, TakerState::Claimed).await; // signed and stored, not broadcast
+    let t = h.store.get_taker_swap(&h.taker_id).unwrap().unwrap();
+    let claim = t.maker_leg_claim.clone().unwrap();
+    let (htlc, at, amount) = (
+        t.maker_leg_htlc.unwrap(),
+        t.maker_leg_outpoint.unwrap(),
+        t.maker_leg_amount.unwrap(),
+    );
+    let ml = h.ml_chain().clone();
+    let maker_refund = h.m_ml().build_refund(&htlc, &at, amount).await.unwrap();
+    for _ in 0..3 {
+        let view = h.maker.view(&h.maker_id).unwrap();
+        h.taker.step(&h.taker_id, view.as_ref()).await.unwrap();
+        let c = ml.tx_counts(&at);
+        assert_eq!(
+            (c.claims, c.claim_attempts),
+            (1, 1),
+            "the claim is resent: {c:?}"
+        );
+        ml.forget(&claim.txid); // evicted
+        assert_eq!(ml.tx_counts(&at).claims, 0);
+        assert!(
+            matches!(
+                h.m_ml().broadcast(&maker_refund).await,
+                Err(SwapError::Premature(_))
+            ),
+            "the maker's refund is not valid yet"
+        );
+        h.mine_all(1); // a block goes by without the claim
+    }
+    for _ in 0..2 {
+        let view = h.maker.view(&h.maker_id).unwrap();
+        h.taker.step(&h.taker_id, view.as_ref()).await.unwrap();
+        h.mine_all(1);
+    }
+    assert_eq!(h.taker_state(), TakerState::Done);
+    assert!(
+        ml.mtp() < htlc.locktime,
+        "confirmed before the maker could refund"
+    );
+    assert_eq!(
+        h.t_ml().confirmations(&claim.txid).await.unwrap(),
+        Some(2),
+        "the stored claim is the one that confirmed"
+    );
+    let c = ml.tx_counts(&at);
+    assert_eq!((c.claims, c.refunds, c.claim_attempts), (1, 0, 1), "{c:?}");
+}
+both!(
+    evicted_claim_is_resent,
+    rev_evicted_claim_is_resent,
+    evicted_claim_is_resent_body
+);
+
+/// The loss the taker can only detect, not undo: its maker-leg claim reveals the preimage in
+/// the mempool and is evicted, the maker refunds the maker leg after its locktime and then
+/// claims the taker leg with the leaked preimage, before the taker-leg locktime. Both legs go
+/// to the maker. The taker must end `Lost` (error-level log naming the swap and both
+/// outpoints), never put a second spend of the taker leg on chain, and not re-sign its
+/// refused refund on every step forever.
+///
+/// Why moving `Claimed → Refunded` once the maker refunded (6420158) is safe: it needs a mined
+/// spend of the maker leg that carries no preimage, valid only after the maker-leg locktime,
+/// and the maker-leg locktime is earlier than the taker-leg one. Our refund is then built but
+/// stays premature until the taker-leg locktime; in that window the maker can claim the taker
+/// leg only with the preimage, i.e. only if a claim of ours leaked it. Without a leak our
+/// refund wins after the taker-leg locktime; with one the node refuses our refund as a double
+/// spend, so the move never makes a second spend of the taker leg, and `Lost` ends the
+/// retries.
+async fn lost_after_leaked_preimage_body(dir: Direction, refund_only: bool) {
+    let mut h = H::with(dir);
+    h.accept(None).await;
+    h.lock_and_notify(None).await;
+    drive_taker_to(&mut h, TakerState::Claimed).await;
+    let view = h.maker.view(&h.maker_id).unwrap();
+    h.taker.step(&h.taker_id, view.as_ref()).await.unwrap(); // the preimage is out
+    let t = h.store.get_taker_swap(&h.taker_id).unwrap().unwrap();
+    let (mhtlc, mat, mamount) = (
+        t.maker_leg_htlc.unwrap(),
+        t.maker_leg_outpoint.unwrap(),
+        t.maker_leg_amount.unwrap(),
+    );
+    let (thtlc, tf) = (
+        t.taker_leg_htlc.unwrap(),
+        t.taker_leg_funding.clone().unwrap(),
+    );
+    let (ml, tl) = (h.ml_chain().clone(), h.tl_chain().clone());
+    ml.forget(&t.maker_leg_claim.unwrap().txid); // evicted
+
+    // A hostile maker refunds its leg once the locktime allows...
+    ml.advance_time(mhtlc.locktime + 1 - ml.mtp());
+    let refund = h.m_ml().build_refund(&mhtlc, &mat, mamount).await.unwrap();
+    h.m_ml().broadcast(&refund).await.unwrap();
+    // ...and claims the taker leg with the preimage it saw, before the taker-leg locktime.
+    let claim = h
+        .m_tl()
+        .build_claim(&thtlc, &tf.outpoint, tf.amount, &t.preimage)
+        .await
+        .unwrap();
+    h.m_tl().broadcast(&claim).await.unwrap();
+    h.mine_all(1);
+    assert!(
+        tl.mtp() < thtlc.locktime,
+        "test setup: taker leg still locked"
+    );
+
+    let mut errors_when_lost = 0;
+    for round in 0..12 {
+        if round == 6 {
+            tl.advance_time(22_000); // past the taker-leg locktime too
+        }
+        let res = if refund_only {
+            h.taker.refund(&h.taker_id).await
+        } else {
+            let view = h.maker.view(&h.maker_id).unwrap();
+            h.taker.step(&h.taker_id, view.as_ref()).await
+        };
+        if h.taker_state() == TakerState::Lost && res.is_err() {
+            errors_when_lost += 1;
+        }
+        h.mine_all(1);
+    }
+    let t = h.store.get_taker_swap(&h.taker_id).unwrap().unwrap();
+    assert_eq!(t.state, TakerState::Lost, "last error: {:?}", t.last_error);
+    assert!(t.state.is_terminal());
+    assert_eq!(errors_when_lost, 0, "a Lost swap keeps failing");
+    assert!(
+        t.taker_leg_refund.is_none(),
+        "no refund is kept for resending"
+    );
+    assert!(t.last_error.as_deref().unwrap_or("").starts_with("lost"));
+    let c = tl.tx_counts(&tf.outpoint);
+    assert_eq!(
+        (c.claims, c.refunds),
+        (1, 0),
+        "one spend, the maker's: {c:?}"
+    );
+    assert!(c.refund_attempts <= 1, "{c:?}");
+    let c = ml.tx_counts(&mat);
+    assert_eq!((c.claims, c.refunds), (0, 1), "{c:?}");
+    // Once Lost, nothing is sent again.
+    let before = tl.tx_counts(&tf.outpoint);
+    let view = h.maker.view(&h.maker_id).unwrap();
+    assert_eq!(
+        h.taker.step(&h.taker_id, view.as_ref()).await.unwrap(),
+        TakerState::Lost
+    );
+    assert_eq!(h.taker.refund(&h.taker_id).await.unwrap(), TakerState::Lost);
+    assert_eq!(tl.tx_counts(&tf.outpoint), before);
+}
+
+async fn lost_after_leaked_preimage_steps_body(dir: Direction) {
+    lost_after_leaked_preimage_body(dir, false).await
+}
+both!(
+    lost_after_leaked_preimage_steps,
+    rev_lost_after_leaked_preimage_steps,
+    lost_after_leaked_preimage_steps_body
+);
+
+async fn lost_after_leaked_preimage_refund_only_body(dir: Direction) {
+    lost_after_leaked_preimage_body(dir, true).await
+}
+both!(
+    lost_after_leaked_preimage_refund_only,
+    rev_lost_after_leaked_preimage_refund_only,
+    lost_after_leaked_preimage_refund_only_body
+);

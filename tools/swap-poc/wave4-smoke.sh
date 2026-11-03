@@ -16,7 +16,11 @@
 #
 #   tools/swap-poc/wave4-smoke.sh [--dry-run] [--host dnsdivi] [--local-port 18581]
 #                                 [--remote-port 18480] [--base URL] [--divi-swap PATH]
+#                                 [--operator-token-file PATH]
 #
+# GET /swaps (the listing) is operator-only: --operator-token-file (or env OPERATOR_TOKEN_FILE)
+# names a local file with the maker's operator token, sent to curl on stdin. Without it the
+# "no swap created" count in step 4 is skipped (reported, not passed).
 # --base URL skips the tunnel and talks to URL directly (an existing tunnel, or a local
 # `divi-swapd --backend mock` for rehearsal). --dry-run prints every command and runs none.
 # Needs: ssh (the `dnsdivi` alias), curl, jq, openssl, and a divi-swap binary built from main
@@ -24,7 +28,7 @@
 set -euo pipefail
 
 usage() {
-  sed -n '17,18p' "$0" | sed 's/^# *//' >&2
+  sed -n '17,19p' "$0" | sed 's/^# *//' >&2
   exit 2
 }
 
@@ -33,6 +37,7 @@ local_port=18581
 remote_port=18480
 base=""
 divi_swap=""
+op_token_file="${OPERATOR_TOKEN_FILE:-}"
 dry_run=0
 while (($#)); do
   case "$1" in
@@ -42,6 +47,7 @@ while (($#)); do
     --remote-port) remote_port="${2:?}"; shift 2 ;;
     --base) base="${2:?}"; shift 2 ;;
     --divi-swap) divi_swap="${2:?}"; shift 2 ;;
+    --operator-token-file) op_token_file="${2:?}"; shift 2 ;;
     -h | --help) usage ;;
     *) usage ;;
   esac
@@ -65,6 +71,15 @@ pass() { echo "ok:   $*"; }
 fail() { echo "FAIL: $*"; FAILS=$((FAILS + 1)); }
 info() { echo "info: $*"; }
 show() { printf '  [dry-run]'; printf ' %q' "$@"; echo; }
+# swap_count: how many swaps the listing shows (operator token on curl's stdin); fails if it
+# cannot be read, so a refused listing is never read as zero.
+swap_count() {
+  local tok
+  [[ -r "$op_token_file" ]] || return 1
+  tok="$(tr -d '\r\n' <"$op_token_file")"
+  [[ -n "$tok" ]] || return 1
+  printf 'header = "X-Operator-Token: %s"\n' "$tok" | curl -fsS -m 20 --config - "$base/swaps" | jq length
+}
 
 # A dummy old-client take body: no counter_chain, throwaway (unspendable) pubkeys and hash.
 take_body() {
@@ -90,11 +105,11 @@ if ((dry_run)); then
     -L "$local_port:127.0.0.1:$remote_port" "$host"
   show curl -fsS "$base/healthz"
   show curl -fsS "$base/offers"
-  show curl -fsS "$base/swaps"
+  show curl -fsS --config - "$base/swaps"   # X-Operator-Token from "$op_token_file" on stdin
   show curl -fsS "$base/offers/$offer/quote?btc_sats=$sats"
   show curl -sS -o BODY -w '%{http_code}' -X POST "$base/swaps" \
-    -H 'content-type: application/json' -d "$(take_body QUOTE_ID)"
-  show curl -fsS "$base/swaps"
+    -H 'content-type: application/json' -H 'X-Swap-Token-Support: 1' -d "$(take_body QUOTE_ID)"
+  show curl -fsS --config - "$base/swaps"   # X-Operator-Token from "$op_token_file" on stdin
   show "$divi_swap" --db TMPDIR/smoke.db --backend mock --counter-chain ltc \
     quote --maker "$base" --offer "$offer" --btc-sats "$sats"
   exit 0
@@ -148,15 +163,20 @@ else fail "quote on $offer did not say counter_chain ltc: ${q:-<no answer>}"; fi
 
 # 4. old-client take refused (only against a daemon proven to check counter chains)
 if ((new_daemon)); then
-  before="$(curl -fsS -m 20 "$base/swaps" | jq length)"
+  before="$(swap_count || true)"
+  # X-Swap-Token-Support: this is the pre-counter-chain body of an otherwise current taker; a
+  # maker that issues swap tokens answers a taker without it 426 before looking at the body.
   code="$(curl -sS -m 20 -o "$tmp/take.json" -w '%{http_code}' -X POST "$base/swaps" \
-    -H 'content-type: application/json' -d "$(take_body "$(jq -r .id <<<"$q")")")"
-  after="$(curl -fsS -m 20 "$base/swaps" | jq length)"
+    -H 'content-type: application/json' -H 'X-Swap-Token-Support: 1' \
+    -d "$(take_body "$(jq -r .id <<<"$q")")")"
+  after="$(swap_count || true)"
   msg="$(jq -r '.error // empty' "$tmp/take.json" 2>/dev/null || true)"
   if [[ "$code" == 400 && "$msg" == *"does not name a counter chain"* ]]; then
     pass "take without counter_chain refused: 400"
   else fail "take without counter_chain: HTTP $code $(head -c 300 "$tmp/take.json")"; fi
-  if [[ "$before" == "$after" ]]; then pass "no swap created (/swaps stays at $after)"
+  if [[ -z "$before" || -z "$after" ]]; then
+    info "SKIPPED the no-swap-created count: GET /swaps needs --operator-token-file (the maker's operator token)"
+  elif [[ "$before" == "$after" ]]; then pass "no swap created (/swaps stays at $after)"
   else fail "/swaps grew from $before to $after: inspect the newest swap"; fi
 else
   fail "skipped the old-client take: the daemon did not prove it checks counter chains (an old one would accept it)"

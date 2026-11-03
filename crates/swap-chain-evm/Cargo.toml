@@ -25,5 +25,7 @@ required-features = ["live"]
 
 [dev-dependencies]
 clap = { workspace = true, features = ["derive"] }
+proptest = { workspace = true }
 tempfile = { workspace = true }
+wiremock = { workspace = true }
 zeroize.workspace = true

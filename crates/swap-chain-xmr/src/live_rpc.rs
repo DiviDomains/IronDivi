@@ -48,6 +48,180 @@ pub async fn monerod_get_info(monerod_rpc: &str) -> reqwest::Result<serde_json::
         .await
 }
 
+/// What a monerod's `get_info` says about the network it is on
+/// (<https://docs.getmonero.org/rpc-library/monerod-rpc/#get_info>: `nettype` is
+/// `"mainnet"`, `"testnet"` or `"stagenet"`; `mainnet` is the matching boolean; `height` is
+/// the chain height).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MonerodNet {
+    pub nettype: String,
+    pub mainnet: bool,
+    pub height: u64,
+    /// `get_info`'s `top_block_hash` (64 hex characters); `None` if the daemon did not send a
+    /// well-formed one.
+    pub top_block_hash: Option<String>,
+}
+
+/// Why [`monerod_nettype`] could not say what network a daemon is on.
+#[derive(Debug, thiserror::Error)]
+pub enum NettypeError {
+    #[error("monerod get_info request failed: {0}")]
+    Request(String),
+    #[error("monerod get_info returned a JSON-RPC error: {0}")]
+    Rpc(String),
+    #[error("monerod get_info result has no usable `{0}` field")]
+    MissingField(&'static str),
+    #[error("monerod get_info disagrees with itself: nettype {nettype:?} but mainnet = {mainnet}")]
+    Inconsistent { nettype: String, mainnet: bool },
+    #[error("monero network must be stagenet, testnet or mainnet, got {0:?}")]
+    BadNetwork(String),
+}
+
+/// Parses a `get_info` JSON-RPC response strictly: a missing `nettype`/`mainnet`/`height`
+/// is an error naming the field, and so is a `mainnet` flag that disagrees with `nettype`.
+pub fn parse_nettype(info: &serde_json::Value) -> Result<MonerodNet, NettypeError> {
+    if let Some(e) = info.get("error") {
+        return Err(NettypeError::Rpc(e.to_string()));
+    }
+    let result = info
+        .get("result")
+        .ok_or(NettypeError::MissingField("result"))?;
+    let nettype = result
+        .get("nettype")
+        .and_then(|v| v.as_str())
+        .ok_or(NettypeError::MissingField("nettype"))?
+        .to_string();
+    let mainnet = result
+        .get("mainnet")
+        .and_then(|v| v.as_bool())
+        .ok_or(NettypeError::MissingField("mainnet"))?;
+    let height = result
+        .get("height")
+        .and_then(|v| v.as_u64())
+        .ok_or(NettypeError::MissingField("height"))?;
+    if mainnet != (nettype == "mainnet") {
+        return Err(NettypeError::Inconsistent { nettype, mainnet });
+    }
+    let top_block_hash = result
+        .get("top_block_hash")
+        .and_then(|v| v.as_str())
+        .filter(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map(str::to_ascii_lowercase);
+    Ok(MonerodNet {
+        nettype,
+        mainnet,
+        height,
+        top_block_hash,
+    })
+}
+
+/// Asks the daemon which network it claims to be on (`get_info`, [`parse_nettype`]) -- the
+/// check `examples/xmr_live.rs` has always made, now available to the production paths.
+pub async fn monerod_nettype(monerod_rpc: &str) -> Result<MonerodNet, NettypeError> {
+    let info = monerod_get_info(monerod_rpc)
+        .await
+        .map_err(|e| NettypeError::Request(e.to_string()))?;
+    parse_nettype(&info)
+}
+
+/// The monerod `nettype` string for a daemon/CLI network name (`stagenet`, `testnet`,
+/// `mainnet`); anything else is an error.
+pub fn expected_nettype(network: &str) -> Result<&'static str, NettypeError> {
+    match network {
+        "stagenet" => Ok("stagenet"),
+        "testnet" => Ok("testnet"),
+        "mainnet" => Ok("mainnet"),
+        other => Err(NettypeError::BadNetwork(other.to_string())),
+    }
+}
+
+#[cfg(test)]
+mod nettype_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn info(nettype: serde_json::Value, mainnet: serde_json::Value) -> serde_json::Value {
+        json!({"id":"0","jsonrpc":"2.0","result":{
+            "nettype": nettype, "mainnet": mainnet, "height": 2_227_400u64,
+            "restricted": true, "status": "OK"}})
+    }
+
+    #[test]
+    fn parses_a_stagenet_get_info() {
+        let n = parse_nettype(&info(json!("stagenet"), json!(false))).unwrap();
+        assert_eq!(
+            n,
+            MonerodNet {
+                nettype: "stagenet".into(),
+                mainnet: false,
+                height: 2_227_400,
+                top_block_hash: None,
+            }
+        );
+    }
+
+    #[test]
+    fn top_block_hash_is_kept_only_when_well_formed() {
+        let hash = "A".repeat(64);
+        let mut i = info(json!("stagenet"), json!(false));
+        i["result"]["top_block_hash"] = json!(hash);
+        assert_eq!(
+            parse_nettype(&i).unwrap().top_block_hash,
+            Some("a".repeat(64))
+        );
+        i["result"]["top_block_hash"] = json!("nothex");
+        assert_eq!(parse_nettype(&i).unwrap().top_block_hash, None);
+    }
+
+    #[test]
+    fn parses_a_mainnet_get_info() {
+        let n = parse_nettype(&info(json!("mainnet"), json!(true))).unwrap();
+        assert!(n.mainnet);
+        assert_eq!(n.nettype, "mainnet");
+    }
+
+    #[test]
+    fn missing_fields_are_named() {
+        let e = parse_nettype(&json!({"result":{"mainnet":false,"height":1}})).unwrap_err();
+        assert!(e.to_string().contains("`nettype`"), "{e}");
+        let e = parse_nettype(&json!({"result":{"nettype":"stagenet","height":1}})).unwrap_err();
+        assert!(e.to_string().contains("`mainnet`"), "{e}");
+        let e =
+            parse_nettype(&json!({"result":{"nettype":"stagenet","mainnet":false}})).unwrap_err();
+        assert!(e.to_string().contains("`height`"), "{e}");
+        let e = parse_nettype(&json!({})).unwrap_err();
+        assert!(e.to_string().contains("`result`"), "{e}");
+        // A wrongly-typed field is as good as missing.
+        let e = parse_nettype(&info(json!(7), json!(false))).unwrap_err();
+        assert!(e.to_string().contains("`nettype`"), "{e}");
+    }
+
+    #[test]
+    fn mainnet_flag_disagreeing_with_nettype_is_refused() {
+        for (nettype, flag) in [("stagenet", true), ("mainnet", false), ("testnet", true)] {
+            let e = parse_nettype(&info(json!(nettype), json!(flag))).unwrap_err();
+            assert!(matches!(e, NettypeError::Inconsistent { .. }), "{e}");
+        }
+    }
+
+    #[test]
+    fn a_jsonrpc_error_is_surfaced() {
+        let e = parse_nettype(&json!({"error":{"code":-32601,"message":"Method not found"}}))
+            .unwrap_err();
+        assert!(e.to_string().contains("Method not found"), "{e}");
+    }
+
+    #[test]
+    fn expected_nettype_maps_the_three_networks_and_rejects_the_rest() {
+        for n in ["stagenet", "testnet", "mainnet"] {
+            assert_eq!(expected_nettype(n).unwrap(), n);
+        }
+        for bad in ["", "main", "Mainnet", "regtest"] {
+            assert!(expected_nettype(bad).is_err(), "{bad:?}");
+        }
+    }
+}
+
 /// The shared engine's mainnet DIVI confirmation depth
 /// (`crates/divi-swap/src/config.rs`'s `SwapConfig::profile(Profile::Mainnet)
 /// .divi_confirmations`) -- mirrored here, not imported, since `swap-chain-xmr` has no
@@ -58,7 +232,7 @@ pub async fn monerod_get_info(monerod_rpc: &str) -> reqwest::Result<serde_json::
 /// mirror. Found via the mainnet-readiness review: this
 /// crate's DIVI-side confirmation check was hardcoded to `>= 1`, 10x thinner than the
 /// engine uses for every other coin's DIVI leg on mainnet.
-pub const DIVI_CONFIRMATIONS_MAINNET: u64 = 10;
+pub const DIVI_CONFIRMATIONS_MAINNET: u64 = 17;
 
 /// Whether a DIVI transaction has at least `min_confirmations`
 /// (`getrawtransaction` against the testnet RPC proxy).

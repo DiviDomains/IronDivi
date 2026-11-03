@@ -30,6 +30,8 @@ pub const OP_IF: u8 = 0x63;
 pub const OP_ELSE: u8 = 0x67;
 /// `OP_ENDIF`
 pub const OP_ENDIF: u8 = 0x68;
+/// `OP_SIZE`
+pub const OP_SIZE: u8 = 0x82;
 /// `OP_SHA256`
 pub const OP_SHA256: u8 = 0xa8;
 /// `OP_EQUALVERIFY`
@@ -44,6 +46,27 @@ pub const OP_CHECKSIG: u8 = 0xac;
 pub const OP_0: u8 = 0x00;
 /// `OP_1` / `OP_TRUE`
 pub const OP_1: u8 = 0x51;
+
+/// The only preimage length any leg accepts (the EVM contract takes `bytes32`).
+pub const PREIMAGE_LEN: usize = 32;
+
+/// Which redeem script a record was built with. Records written before F3 carry no version
+/// and deserialize as `V0`, so their script is rebuilt byte-for-byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum ScriptVersion {
+    /// `OP_IF OP_SHA256 <h> OP_EQUALVERIFY ...`: accepts a preimage of any length.
+    #[default]
+    V0,
+    /// `OP_IF OP_SIZE <32> OP_EQUALVERIFY OP_SHA256 <h> OP_EQUALVERIFY ...`: 32 bytes only.
+    V1,
+}
+
+impl ScriptVersion {
+    /// True for `V0`; a V0 HTLC serializes without the field, byte-identical to a pre-F3 record.
+    pub fn is_v0(&self) -> bool {
+        *self == ScriptVersion::V0
+    }
+}
 
 /// Locktimes below this are block heights; the HTLC only accepts unix timestamps.
 pub const LOCKTIME_THRESHOLD: u32 = 500_000_000;
@@ -66,6 +89,10 @@ pub struct HtlcParams {
     pub refund_pubkey: [u8; 33],
     /// Unix timestamp, compared against median time past (must be `>= LOCKTIME_THRESHOLD`).
     pub locktime: u32,
+    /// Which redeem script this HTLC uses. Records and wire messages written before F3 carry
+    /// no version and read as `V0`, so their script, address, claim and refund are unchanged.
+    #[serde(default, skip_serializing_if = "ScriptVersion::is_v0")]
+    pub script_version: ScriptVersion,
 }
 
 impl HtlcParams {
@@ -99,6 +126,7 @@ impl HtlcParams {
     ///     claim_pubkey: [0x02; 33],
     ///     refund_pubkey: [0x03; 33],
     ///     locktime: 1_800_000_000, // 0x6b49d200
+    ///     script_version: Default::default(),
     /// };
     /// let s = hex::encode(p.redeem_script());
     /// assert_eq!(
@@ -114,8 +142,20 @@ impl HtlcParams {
     /// assert_eq!(p.redeem_script().len(), 114);
     /// ```
     pub fn redeem_script(&self) -> Vec<u8> {
-        let mut s = Vec::with_capacity(114);
-        s.extend([OP_IF, OP_SHA256]);
+        self.redeem_script_v(self.script_version)
+    }
+
+    /// The redeem / witness script of an explicit version, whatever `self.script_version` says.
+    /// `V0` is the pre-F3 script; `V1` adds `OP_SIZE <32> OP_EQUALVERIFY` (4 bytes) so only a 32-byte preimage claims.
+    pub fn redeem_script_v(&self, version: ScriptVersion) -> Vec<u8> {
+        let mut s = Vec::with_capacity(118);
+        s.push(OP_IF);
+        if version == ScriptVersion::V1 {
+            s.push(OP_SIZE);
+            push_data(&mut s, &script_num(PREIMAGE_LEN as i64));
+            s.push(OP_EQUALVERIFY);
+        }
+        s.push(OP_SHA256);
         push_data(&mut s, &self.hash);
         s.push(OP_EQUALVERIFY);
         push_data(&mut s, &self.claim_pubkey);
@@ -127,10 +167,25 @@ impl HtlcParams {
         s
     }
 
+    /// SHA256 of the redeem script of the given version.
+    pub fn script_sha256_v(&self, version: ScriptVersion) -> [u8; 32] {
+        Sha256::digest(self.redeem_script_v(version)).into()
+    }
+
     /// SHA256 of the redeem script (the P2WSH program).
     pub fn script_sha256(&self) -> [u8; 32] {
-        Sha256::digest(self.redeem_script()).into()
+        self.script_sha256_v(self.script_version)
     }
+}
+
+/// Refuse a preimage that is not exactly [`PREIMAGE_LEN`] bytes, before anything is built or signed.
+pub fn check_preimage_len(preimage: &[u8]) -> Result<[u8; 32]> {
+    <[u8; 32]>::try_from(preimage).map_err(|_| {
+        SwapError::InvalidParams(format!(
+            "preimage is {} bytes, must be {PREIMAGE_LEN}",
+            preimage.len()
+        ))
+    })
 }
 
 /// Generate a fresh random 32-byte preimage and its SHA256 hash.
@@ -248,6 +303,7 @@ mod tests {
             claim_pubkey: [2; 33],
             refund_pubkey: [3; 33],
             locktime: 1_800_000_000,
+            script_version: Default::default(),
         };
         assert!(p.validate().is_ok());
         p.locktime = 340_000;
@@ -270,8 +326,50 @@ mod tests {
             claim_pubkey: [2; 33],
             refund_pubkey: [3; 33],
             locktime: 1_800_000_000,
+            script_version: Default::default(),
         };
         let j = serde_json::to_string(&p).unwrap();
         assert_eq!(serde_json::from_str::<HtlcParams>(&j).unwrap(), p);
+    }
+
+    #[test]
+    fn v0_script_unchanged_and_v1_adds_size_check() {
+        let p = HtlcParams {
+            hash: [0xaa; 32],
+            claim_pubkey: [2; 33],
+            refund_pubkey: [3; 33],
+            locktime: 1_800_000_000,
+            script_version: Default::default(),
+        };
+        let v0 = p.redeem_script();
+        assert_eq!(v0.len(), 114);
+        assert_eq!(v0, p.redeem_script_v(ScriptVersion::V0));
+        let v1 = p.redeem_script_v(ScriptVersion::V1);
+        assert_eq!(v1.len(), 118);
+        // 63 | 82 01 20 88 | a8 20 <h> 88 ...
+        assert_eq!(&v1[..5], &[OP_IF, OP_SIZE, 0x01, 0x20, OP_EQUALVERIFY]);
+        assert_eq!(&v1[5..], &v0[1..]);
+        assert_ne!(p.script_sha256_v(ScriptVersion::V1), p.script_sha256());
+    }
+
+    #[test]
+    fn script_version_defaults_to_v0_for_old_records() {
+        #[derive(Deserialize)]
+        struct Rec {
+            #[serde(default)]
+            script_version: ScriptVersion,
+        }
+        assert_eq!(
+            serde_json::from_str::<Rec>("{}").unwrap().script_version,
+            ScriptVersion::V0
+        );
+    }
+
+    #[test]
+    fn preimage_len_gate() {
+        assert!(check_preimage_len(&[0; 32]).is_ok());
+        for n in [0usize, 31, 33, 64, 81, 520] {
+            assert!(check_preimage_len(&vec![0; n]).is_err(), "{n}");
+        }
     }
 }

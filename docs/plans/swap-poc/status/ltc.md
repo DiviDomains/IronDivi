@@ -536,8 +536,9 @@ every flag/subcommand name was confirmed against `divi-swap --help`/`run --help`
       bind port, confirmed in `deploy/divi-swapd/README.md` and `wave4-deploy.md`).
 - [ ] Maker currently healthy on the *old* binary before touching anything:
       `curl -fsS http://127.0.0.1:18482/healthz | jq '{ok, version}'` → `ok: true`.
-- [ ] 1Password / secret-broker unlocked on the Mac (`op whoami`, or
-      `secret-broker status` if that's the path this runner uses) — the taker/maker keys
+- [ ] 1Password / secret-broker unlocked on the Mac (prove it with `secret-broker status`, or one
+      `secret get --name <n> --op-ref op://…` on a known ref; never a raw CLI identity check, it
+      is unreliable) — the taker/maker keys
       below are resolved from `op://…` refs passed as flag *values*, not environment
       variables, so there is no key-bearing env var to set for the swap CLI itself. The
       taker's LTC address needs funds already (`balance` in step 5 confirms this; if it
@@ -654,3 +655,77 @@ run above) is the orchestrator's step, from the Mac, same as every prior live le
 
 ## 2026-10-13 live on the redeployed maker (4e0ac26)
 - result: PASS — live LTC happy swap both directions against dnsdivi 4e0ac26, Done/Done each (fwd `3bd97391…`, rev `60f622d2…`); txids in RESULTS.md; verify-results 137/137.
+
+## Round: case-c closed live, both directions (orchestrator, 2026-10-21)
+
+- done: `ltc-live.sh --scenario case-c --maker-url` (deployed maker, divi-swapd 0.2.6) ran to
+  `taker_state=Refunded`, `maker_state=Done` in both directions; results in
+  `~/.local/state/iron-divi-swap-poc/ltc-case-c-deployed/{forward,reverse}/results.txt` and already
+  recorded in `RESULTS.md`. Re-verified on chain 2026-10-21 13:40 UTC (reads only):
+  - forward (taker pays LTC): LTC lock `b7e7d75e8ea4a398552970f1e0fcbdae7c8d7af351acff394c27ba5eab563025`
+    (testnet4 block 4912601), DIVI lock `7f5588a43db9e5af6371411735e1263e5c394744390c6bd9ca46baf96194e03f`,
+    DIVI spend by maker `19f58c6bcfc60f565b6815b4d0a561ddde5c63f23aef9535ada74c9752205056`,
+    LTC refund by taker `504b901f831c34948adede119b1180f97399b1a816199f06cd986c4e2708e7fe` (block 4912684).
+  - reverse (taker pays DIVI): DIVI lock `fae5fc620d355e189c82aa94278f36e366234e778c0d3ea76547b541e83d04e3`,
+    LTC lock by maker `1a95af0e7e2be26f6e3821366f124cd88ddb5c4e8516da7a2b86069a679b8cff` (block 4912672),
+    LTC spend by maker `98b734ea734ea1f3011f66a73e25bef7f017b8f17889a7bba45579f2ffda3e16` (block 4912710),
+    DIVI refund by taker `02073185c8884f7f23d4196118db565ca0171dca826db714de6164bb71d05e1e`.
+  - LTC legs via `litecoinspace.org/testnet/api/tx/<txid>/status` (all `confirmed: true`); DIVI legs via
+    `divi-cli getrawtransaction` on the testnet node, 13,070–13,733 confirmations.
+- left: none for the LTC lane. The "case-c still pending" lines in the earlier rounds above are
+  superseded by this round. `live_fund_claim_refund` (`#[ignore] --features live`) remains an optional
+  third check and needs `SWAP_LTC_TEST_KEY_HEX` from the taker-btc item.
+- needs: nothing.
+
+## Round: explicit mainnet wiring (builder P, 2026-10-21)
+
+- done: `swap-chain-ltc` accepts `network = "mainnet"` end to end — endpoints ``https://litecoinspace.org/api` (single operator, no independent mirror known)`, address HRP ``ltc``
+  via ``LtcBackend::new_on("mainnet", …)` / `for_network("mainnet", …)`; `build_send` now refuses a destination whose HRP is not the backend's own`; signet/testnet behaviour is byte-for-byte unchanged (pinned by test). The daemon's
+  `[ltc]` section gained `allow_mainnet` (default `false`): `network = "mainnet"` without it, an
+  unknown network name, or a network that disagrees with the top-level `profile` is a config-load
+  error with the same wording as `[zec]` (`bin/divi-swapd/src/config.rs` `validate_mainnet_gate`).
+  `esplora_url` is now optional and falls back to the crate's defaults for `network`. The CLI
+  gates `--ltc-network mainnet` behind the shared `--allow-mainnet` flag before any key is resolved or any
+  network call is made (`bin/divi-swap/src/main.rs` `guard_network`); the CLI gained `--ltc-network` (env `SWAP_LTC_NETWORK`, default `testnet`) where it previously hardcoded `"testnet"`, and `balance_sats` uses it.
+- proof (read-only, no wallet, no key, no funds):
+  - LTC mainnet tip `https://litecoinspace.org/api/blocks/tip/height` → `3199195` (HTTP 200, 2026-10-21T19:10:41Z); verdict `verified`.
+  - fee endpoint `https://litecoinspace.org/api/v1/fees/recommended` answered at 2026-10-21T19:33:51Z (`halfHourFee` 1); verdict `verified`.
+  - HRP source: litecoin `src/chainparams.cpp` `bech32_hrp = "ltc"` (main) / `"tltc"` (test) (https://github.com/litecoin-project/litecoin/blob/master/src/chainparams.cpp); verdict `verified`.
+  - tests added: `mainnet_endpoint_list_is_non_empty_and_testnet_unchanged`, `unknown_ltc_network_is_rejected`, `mainnet_address_is_ltc1q_and_testnet_stays_tltc1q`, `build_send_rejects_a_destination_on_the_other_network` (crate); daemon/CLI tests as listed in `status/btc.md`.
+  - `cargo fmt --check`, `cargo clippy -p swap-chain-btc -p swap-chain-ltc -p divi-swapd -p divi-swap
+    --all-targets -- -D warnings`, and `cargo test` on the same four packages: green (counts in
+    `~/swap-lanes/builders/P/STATUS.md` on hp1 and in the lane commit message).
+- left: still a single mainnet data source (`litecoinspace.org`); no live mainnet run of any kind was made.
+- needs: nothing. Mainnet funds remain the only money gate; nothing here turns `allow_mainnet` on.
+
+## Round: LTC mainnet read-only smoke (builder W, 2026-10-22)
+
+- done: ran `divi-swap` and `divi-swapd` against LTC mainnet with a throwaway zero-balance key (generated on hp3, mode 600, outside git, deleted). CLI `balance` with `--ltc-network mainnet --allow-mainnet` printed `ltc_address=ltc1q…`, `ltc_balance_sats=0` in 0.19 s via `https://litecoinspace.org/api`; without `--allow-mainnet` it refuses before any network call. Daemon (`profile = "mainnet"`, `[btc]` and `[ltc]` mainnet, defaults for URLs) logged "ltc backend ready" network `mainnet`, `/healthz` `counters.ltc.tip` 3199562. Corrected the stale §LTC "Public backends", "Address network" and findings rows in `mainnet-readiness.md`; added the two smoke rows. Confirmation, MTP and reorg rows untouched.
+- proof: tip `https://litecoinspace.org/api/blocks/tip/height` → `3199562` (HTTP 200, 2026-10-22T11:09Z), same value from the daemon `/healthz` and the direct curl; verdict `verified`. Gate first lines (verbatim) are in the readiness row: `allow_mainnet = false`, `profile = "testnet"` + mainnet coin, `profile = "mainnet"` + testnet coin. fmt clean, clippy `-D warnings` on the four packages clean, tests 178 passed / 0 failed / 1 ignored (docs-only change, so before = after).
+- left: `litecoinspace.org` is still the only LTC endpoint (`crates/swap-chain-ltc/src/lib.rs:69`); the CLI has no `tip` subcommand (tip checked by curl); a live `[ltc]` section needs `[divi]` + `[btc]` and an enabled ltc offer (`bin/divi-swapd/src/main.rs:382-384`); the DIVI backend is built on `DiviNetwork::Testnet` whatever the profile (`bin/divi-swapd/src/main.rs:430-436`, `bin/divi-swap/src/main.rs:487-494`).
+- needs: nothing.
+- decisions: no code change, no confirmation/MTP/timeout/margin change.
+
+## Round: LTC second-mirror survey (builder AC, 2026-10-22)
+
+LTC second-mirror survey. Backend paths (`crates/swap-chain-ltc/src/lib.rs`): `/v1/fees/recommended` :176, `/address/{a}/utxo` :204, `/block-height/{h}` :290, `/block/{hash}/txs/{start}` :296, `/blocks/tip/height` :397, `/blocks/tip/hash` :410, `/block/{hash}` :411, `POST /tx` :481, `/tx/{id}/status` :502, `/tx/{id}` :516, `/tx/{prev}/outspend/{vout}` :544.
+
+- done: surveyed public LTC mainnet APIs from hp3 (read-only GET, 2026-10-22T12:1xZ). Esplora probe `GET <base>/blocks/tip/height` on 17 candidate bases, `/block-height/3199000` where it answered:
+  - `https://litecoinspace.org/api` (primary, litecoinspace.org, Litecoin Foundation mempool.space port): 3199581, `/block-height/3199000` → `6417df70…93f2`. Baseline.
+  - `https://blockstream.info/litecoin/api`, `https://mempool.space/litecoin/api`, `https://mempool.space/ltc/api`: HTTP 200 but an HTML SPA page (Bitcoin explorer), not API → `missing` on every path.
+  - `https://litecoin.mempool.space/api`: answers `972614` (a Bitcoin height) and `Block not found` for LTC block 3199000 → not Litecoin, `differs`.
+  - ltc.mempool.space, mempool.litecoin.net, electrs.litecoin.net, ltcspace.org, litecoin.space, ltc.blockstream.info, esplora.litecoin.net, api.litecoinspace.org, ltc-electrs.bitaps.com, mempool.ltc.dev: no connection (HTTP 000) → `missing`. `ltc.nownodes.io`: 401 key required; `explorer.litecoin.net`: 301.
+  - Non-Esplora, completeness only: Blockbook `https://litecoinblockexplorer.net/api/v2/block/3199000` → same hash `6417df70…93f2` (`same`, different shape; status bestHeight 3199581); BlockCypher `https://api.blockcypher.com/v1/ltc/main/blocks/3199000` → same hash, tip hash `d1251386…fa37` equal to litecoinspace tip (`same`, different shape, rate limited); Blockchair `api.blockchair.com/litecoin/...` → HTTP 430 from hp3 IP (key needed); SoChain v2 retired, v3 key needed; ltc1/ltc2.trezor.io → HTML.
+  - Verdict: no candidate is Esplora-compatible on the paths the backend uses → no code change.
+- proof: raw curl commands/outputs in `~/swap-lanes/builders/AC/STATUS.md`; litecoind size from Blockbook status `https://litecoinblockexplorer.net/api/` → `backend.sizeOnDisk` 268274359429 B, `blockbook.dbSize` 288734518625 B (`verified`, that operator's own node).
+- left: cheapest independent option = a non-Esplora tip-hash cross-check against Blockbook (`litecoinblockexplorer.net`) or BlockCypher: ~no disk, but needs new client code for a second API shape and cannot serve UTXO/spend lookups (read-only sanity check only). Self-hosted electrs on hp3 needs an UNPRUNED litecoind (electrs indexes from block files; Litecoin Core `-prune` is incompatible with `-txindex`, source: git.boxtec.ch litecoind.1 mirror; whether electrs works on a pruned node: `could not verify`): ~268 GB node alone (measured on another operator's node, above) vs hp3 ≈52 GB free → infeasible without new disk; sync time `could not verify` (no Litecoin figure found; not guessed). Not built.
+- needs: nothing for this round; any second-source code is a new lane.
+- decisions: no code change; no confirmation/MTP/timeout/margin change.
+
+## Round: LTC opt-in tip-hash cross-check (builder AE, 2026-10-22)
+
+- done: `swap-chain-ltc::crosscheck` with `tip_crosscheck`, `enforce`, `CrossCheckSource::{Blockbook,BlockCypher}` and `CrossCheckOutcome::{Agree,Disagree,Unavailable}`. It takes the primary Esplora tip H and compares the block hash at `H - 6` (`CROSSCHECK_DEPTH`, a comparison depth, not a confirmation count) from the primary (`/block-height/{n}`) with the independent source (Blockbook `/api/v2/block-index/{n}` field `blockHash`; BlockCypher `/v1/ltc/main/blocks/{n}` field `hash`). Wired as `[ltc].crosscheck = "blockbook"|"blockcypher"|"off"` in `divi-swapd` (default `off`, checked once when the LTC backend is built) and `--ltc-crosscheck` / `SWAP_LTC_CROSSCHECK` in `divi-swap` (before an LTC taker or claim action; not on read-only balance). `Disagree` refuses, naming both hashes and both URLs. `Unavailable` (network error, 404/429/5xx, malformed body, Blockbook empty hash for an unindexed height) warns and continues. Testnet refuses any source at config load, CLI guard and backend. `off` makes no request. No new dependency; no confirmation count, MTP lag, timeout or margin touched.
+- proof: read-only curl from the Mac, 2026-10-22 (`verified`): tip 3199583 on litecoinspace `/blocks/tip/height`, Blockbook `/api/v2` `bestHeight` and BlockCypher `/v1/ltc/main` `height`; block 3199577 hash `bb06e9077c1907d25a1d986ac281b6d119228b8eae984c21b59fcfdb4af66b11` from litecoinspace `/block-height/3199577`, Blockbook `/api/v2/block-index/3199577` and BlockCypher `/v1/ltc/main/blocks/3199577`. Error shapes: Blockbook unknown height gives HTTP 200 `{"blockHash":""}`; BlockCypher unknown height gives HTTP 404 `{"error":"Block 99999999 not found."}`. Rate limits: BlockCypher sends `x-ratelimit-remaining` (it was 1 on the first call); Blockbook sent none. Live smoke on hp3 (`cargo test -p swap-chain-ltc --features live --lib -- --ignored live_mainnet_agrees --nocapture`): `blockbook: Agree { height: 3199584, hash: "d5076e35…6e61" }` and `blockcypher: Agree { height: 3199584, hash: "d5076e35…6e61" }`. Tests before → after: swap-chain-ltc 40 → 48 passed (1 ignored, the live smoke); divi-swapd lib 49 → 51; divi-swap-cli main 26 → 27; others unchanged. `cargo fmt --all --check` clean; `cargo clippy -p swap-chain-ltc -p divi-swapd -p divi-swap-cli --all-targets --features swap-chain-ltc/live -- -D warnings` clean.
+- left: BlockCypher's free rate limit is small, so the check runs once per daemon start or CLI action only, never continuously. It adds no availability (a litecoinspace outage still stalls swaps) and is not a UTXO source. No testnet cross-check source is verified. Error URLs name only the primary endpoint in use. Source base URLs are not configurable from config.
+- needs: nothing.
+- decisions: depth 6 rather than the tip, so ordinary 1-5 block reorgs and explorer lag cannot cause a false `Disagree`; `Unavailable` continues (fail-open); default `off`; one source at a time.

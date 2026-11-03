@@ -5,16 +5,26 @@
 # `divi-swapd`, health at /healthz) but skips deploy.sh's slow "rsync source + build on
 # dnsdivi" step: it builds (or takes a prebuilt) linux x86_64 binary and only ships that.
 #
-# Before touching anything, it reads the running maker's swap lists over an already-open
-# tunnel and refuses to redeploy while any swap is not in a terminal state: `/swaps` entries
-# must be `Done` or `Aborted` (docs/plans/swap-poc/wave4-deploy.md's own definition), and
-# `/xmr/swaps` entries `done`, `aborted` or `punished` (XmrMakerState::is_terminal; a 404
-# there means the maker runs no XMR engine). A restart mid-swap is a cut-over the old binary
-# never had to survive.
+# Before installing anything, it refuses to redeploy while any swap is not in a terminal state:
+#   - hashlock swaps: `GET /swaps` over an already-open tunnel; entries must be `Done` or
+#     `Aborted` (docs/plans/swap-poc/wave4-deploy.md's own definition).
+#   - XMR swaps: there is no HTTP listing (C3 removed `GET /xmr/swaps`; it answers 405, or 404
+#     with no XMR engine), so the gate runs `divi-swapd --config <toml> --xmr-inflight` over
+#     ssh as the service user: a read-only look at the maker's store that decides "terminal"
+#     with XmrMakerState::is_terminal (done, aborted, punished). Nothing is exposed over HTTP.
+#     A full redeploy ships the NEW binary to the host first and runs the gate with that (the
+#     installed one may predate the flag); --check-only (and so rollback-maker.sh) uses the
+#     installed binary, and says so if it is too old to know the flag.
+# A restart mid-swap is a cut-over the old binary never had to survive.
 #
 #   tools/swap-poc/redeploy-maker.sh [--dry-run] [--check-only] [--force-inflight]
 #     [--maker-url URL]            default http://127.0.0.1:18482 (tunnel to dnsdivi's API;
-#                                   open it yourself, e.g. ssh -N -L 18482:127.0.0.1:18480 dnsdivi)
+#                                   open it yourself, e.g. ssh -N -L 18482:127.0.0.1:18480 dnsdivi);
+#                                   only the /swaps half of the gate needs it
+#     [--operator-token-file PATH] the maker's operator_token_file contents, a local file (env
+#                                   OPERATOR_TOKEN_FILE): GET /swaps is operator-only, so the
+#                                   gate cannot read the hashlock swaps without it and refuses
+#                                   (it is sent to curl on stdin, never on the command line)
 #     [--binary PATH]              use this prebuilt divi-swapd instead of building one
 #     [--built-binary-path PATH]   where a remote-cargo build is expected to land
 #                                   (default: <repo>/target/release/divi-swapd)
@@ -31,12 +41,15 @@
 #     [--remote-unit PATH]         installed unit (default: /etc/systemd/system/divi-swapd.service)
 #     [--backup-dir PATH]          snapshot root on dnsdivi (default: /var/backups/divi-swapd)
 #     [--service NAME]             systemd unit name (default: divi-swapd)
+#     [--service-user USER]        user the XMR in-flight read runs as (default: divi-swapd, the
+#                                   unit's User=; never root: SQLite WAL files would be root-owned)
 #     [--health-timeout SECONDS]   total time to wait for /healthz after restart (default: 300)
 #     [--health-interval SECONDS]  poll interval while waiting (default: 5)
 #
-# --check-only runs just the in-flight gate (a real read against --maker-url) and exits with
-# its verdict; nothing is built or installed. --dry-run prints every command, including the
-# gate's, and runs none — it cannot tell you whether the gate would pass.
+# --check-only runs just the in-flight gate (a real read: --maker-url and, over ssh, the XMR
+# store on --host) and exits with its verdict; nothing is built or installed. --dry-run prints
+# every command, including the gate's, and runs none — it cannot tell you whether the gate
+# would pass.
 #
 # Rollback set: before installing anything it snapshots the binary, config and unit together
 # (all three must exist; run deploy.sh first otherwise) into <backup-dir>/<UTC timestamp>/
@@ -53,11 +66,12 @@
 set -euo pipefail
 
 usage() {
-  sed -n '15,40p' "$0" | sed 's/^# \{0,1\}//' >&2
+  sed -n '20,47p' "$0" | sed 's/^# \{0,1\}//' >&2
   exit 2
 }
 
 MAKER_URL="http://127.0.0.1:18482"
+OPERATOR_TOKEN_FILE="${OPERATOR_TOKEN_FILE:-}"
 FORCE_INFLIGHT=0
 BINARY_PATH=""
 BUILT_BINARY_PATH=""
@@ -71,6 +85,7 @@ REMOTE_TOML=/etc/divi-swapd/divi-swapd.toml
 REMOTE_UNIT=/etc/systemd/system/divi-swapd.service
 BACKUP_DIR=/var/backups/divi-swapd
 SERVICE=divi-swapd
+SERVICE_USER=divi-swapd
 HEALTH_TIMEOUT=300
 HEALTH_INTERVAL=5
 DRY=0
@@ -82,6 +97,7 @@ while (($#)); do
     --check-only) CHECK_ONLY=1; shift ;;
     --force-inflight) FORCE_INFLIGHT=1; shift ;;
     --maker-url) MAKER_URL="${2:?}"; shift 2 ;;
+    --operator-token-file) OPERATOR_TOKEN_FILE="${2:?}"; shift 2 ;;
     --binary) BINARY_PATH="${2:?}"; shift 2 ;;
     --built-binary-path) BUILT_BINARY_PATH="${2:?}"; shift 2 ;;
     --remote-cargo) REMOTE_CARGO="${2:?}"; shift 2 ;;
@@ -94,6 +110,7 @@ while (($#)); do
     --remote-unit) REMOTE_UNIT="${2:?}"; shift 2 ;;
     --backup-dir) BACKUP_DIR="${2:?}"; shift 2 ;;
     --service) SERVICE="${2:?}"; shift 2 ;;
+    --service-user) SERVICE_USER="${2:?}"; shift 2 ;;
     --health-timeout) HEALTH_TIMEOUT="${2:?}"; shift 2 ;;
     --health-interval) HEALTH_INTERVAL="${2:?}"; shift 2 ;;
     -h | --help) usage ;;
@@ -131,10 +148,24 @@ in_flight_ids() {
   jq -r '.[] | select(.state != "Done" and .state != "Aborted") | .id'
 }
 
-# xmr_in_flight_ids: the same for a /xmr/swaps array. Terminal = "done", "aborted" or
-# "punished" (crates/divi-swap-xmr/src/maker.rs XmrMakerState::is_terminal; snake_case).
-xmr_in_flight_ids() {
-  jq -r '.[] | select(.state != "done" and .state != "aborted" and .state != "punished") | .id'
+# xmr_inflight_read: run `divi-swapd --xmr-inflight` on $HOST (as $SERVICE_USER, read-only) with
+# the binary $GATE_BIN and the installed config. Prints its stdout; returns ssh's status.
+GATE_BIN=""
+xmr_inflight_read() {
+  # shellcheck disable=SC2029  # the command line is built client-side on purpose
+  ssh "$HOST" sudo -n -u "$SERVICE_USER" "$GATE_BIN" --config "$REMOTE_TOML" --xmr-inflight
+}
+
+# xmr_parse: the --xmr-inflight output on stdin -> "<configured> <n>" on the first line, then one
+# `<id> <state>` line per in-flight swap. Fails unless the output has exactly the documented
+# shape and the listed swaps match the count, so a truncated or foreign output is never "0".
+xmr_parse() {
+  awk '
+    NR == 1 { if (NF != 2 || $1 != "xmr_configured" || ($2 != "yes" && $2 != "no")) bad = 1; cfg = $2; next }
+    NR == 2 { if (NF != 2 || $1 != "in_flight" || $2 !~ /^[0-9]+$/) bad = 1; n = $2; next }
+    { if (NF != 2) bad = 1; ids[++k] = $0 }
+    END { if (NR < 2 || bad || k != n) exit 1; print cfg, n; for (i = 1; i <= k; i++) print ids[i] }
+  '
 }
 
 # unreadable <what> <detail>: the gate could not read a swap list. Returns 0 under
@@ -145,56 +176,68 @@ unreadable() {
     return 0
   fi
   echo "REFUSE: could not read $1 ($2); cannot confirm every swap is terminal." >&2
-  echo "        Is the tunnel open? e.g. ssh -N -L 18482:127.0.0.1:$REMOTE_PORT $HOST" >&2
+  echo "        (/swaps needs the tunnel, e.g. ssh -N -L 18482:127.0.0.1:$REMOTE_PORT $HOST;" \
+    "the XMR read needs ssh and passwordless sudo -u $SERVICE_USER on $HOST)" >&2
   echo "        Override with --force-inflight if you are certain it is safe." >&2
   return 1
 }
 
-# check_inflight: the safety gate. Returns 0 if it is safe to redeploy (every swap in both
-# lists terminal, or --force-inflight), 1 otherwise. Always a real read, even under
-# --check-only; under --dry-run it only prints what it would run.
+# check_inflight: the safety gate. Returns 0 if it is safe to redeploy (every swap terminal, or
+# --force-inflight), 1 otherwise. Always a real read, even under --check-only; under --dry-run
+# it only prints what it would run. $GATE_BIN is the divi-swapd that runs --xmr-inflight.
 check_inflight() {
-  step "checking for in-flight swaps on the running maker ($MAKER_URL/swaps, $MAKER_URL/xmr/swaps)"
+  step "checking for in-flight swaps on the running maker ($MAKER_URL/swaps; XMR store via ssh $HOST)"
+  [[ -n "$GATE_BIN" ]] || GATE_BIN="$REMOTE_BIN"
   if ((DRY)); then
-    echo "  [dry-run] curl -fsS -m 20 $MAKER_URL/swaps"
-    echo "  [dry-run] curl -sS -m 20 -w '%{http_code}' $MAKER_URL/xmr/swaps   (404 = no XMR engine)"
-    echo "  [dry-run] refuse if any /swaps state is not Done/Aborted, or any /xmr/swaps state is"
-    echo "            not done/aborted/punished, unless --force-inflight"
+    echo "  [dry-run] curl -fsS -m 20 --config - $MAKER_URL/swaps   (X-Operator-Token from ${OPERATOR_TOKEN_FILE:-<no --operator-token-file>} on stdin)"
+    echo "  [dry-run] ssh $HOST sudo -n -u $SERVICE_USER $GATE_BIN --config $REMOTE_TOML --xmr-inflight"
+    echo "  [dry-run] refuse if any /swaps state is not Done/Aborted, or any XMR swap is not"
+    echo "            done/aborted/punished, unless --force-inflight"
     return 0
   fi
-  local swaps_json xmr_out xmr_code xmr_json ids xmr_ids="" n listed=""
-  if ! swaps_json="$(curl -fsS -m 20 "$MAKER_URL/swaps" 2>&1)"; then
-    unreadable "$MAKER_URL/swaps" "$swaps_json"
+  local swaps_json xmr_out xmr_parsed ids xmr_ids n listed="" xmr_cfg xmr_n rc
+  # GET /swaps is operator-only: a missing credential must refuse, never read as "no swaps".
+  local op_tok=""
+  if [[ -n "$OPERATOR_TOKEN_FILE" && -r "$OPERATOR_TOKEN_FILE" ]]; then
+    op_tok="$(tr -d '\r\n' <"$OPERATOR_TOKEN_FILE")"
+  fi
+  if [[ -z "$op_tok" ]]; then
+    unreadable "$MAKER_URL/swaps" "no operator token: pass --operator-token-file (the maker's operator_token_file contents)"
     return
   fi
+  if ! swaps_json="$(printf 'header = "X-Operator-Token: %s"\n' "$op_tok" |
+    curl -fsS -m 20 --config - "$MAKER_URL/swaps" 2>&1)"; then
+    unreadable "$MAKER_URL/swaps" "$swaps_json; a 404 means the token is wrong or operator_token_file is unset"
+    return
+  fi
+  op_tok=""
   if ! ids="$(in_flight_ids <<<"$swaps_json" 2>&1)"; then
     unreadable "$MAKER_URL/swaps" "not a swap list: $ids"
     return
   fi
 
-  # /xmr/swaps: -f would hide the 404 that means "no XMR engine", so read the status code.
-  if ! xmr_out="$(curl -sS -m 20 -w '\n%{http_code}' "$MAKER_URL/xmr/swaps" 2>&1)"; then
-    unreadable "$MAKER_URL/xmr/swaps" "$xmr_out"
+  # XMR: no HTTP route (see the header); read the store on the host.
+  rc=0
+  xmr_out="$(xmr_inflight_read 2>&1)" || rc=$?
+  if ((rc != 0)); then
+    if ((rc == 2)) && grep -q -e "--xmr-inflight" <<<"$xmr_out"; then
+      xmr_out="$GATE_BIN on $HOST is too old for --xmr-inflight (a full redeploy checks with the new binary)"
+    fi
+    unreadable "the XMR swap store on $HOST" "exit $rc: $xmr_out"
     return
   fi
-  xmr_code="${xmr_out##*$'\n'}"
-  xmr_json="${xmr_out%$'\n'*}"
-  case "$xmr_code" in
-    200)
-      if ! xmr_ids="$(xmr_in_flight_ids <<<"$xmr_json" 2>&1)"; then
-        unreadable "$MAKER_URL/xmr/swaps" "not a swap list: $xmr_ids"
-        return
-      fi
-      ;;
-    404) echo "note: $MAKER_URL/xmr/swaps is 404 (no XMR engine configured); nothing to check there" ;;
-    *)
-      unreadable "$MAKER_URL/xmr/swaps" "HTTP $xmr_code: $xmr_json"
-      return
-      ;;
-  esac
+  if ! xmr_parsed="$(xmr_parse <<<"$xmr_out")"; then
+    unreadable "the XMR swap store on $HOST" "unexpected --xmr-inflight output"
+    return
+  fi
+  read -r xmr_cfg xmr_n <<<"$(head -n1 <<<"$xmr_parsed")"
+  xmr_ids="$(tail -n +2 <<<"$xmr_parsed")"
+  if [[ "$xmr_cfg" == no && "$xmr_n" == 0 ]]; then
+    echo "note: no XMR engine configured on $HOST and no XMR swap in its store; nothing to check there"
+  fi
 
-  [[ -z "$ids" ]] || listed+="$(sed 's/^/  \/swaps      /' <<<"$ids")"$'\n'
-  [[ -z "$xmr_ids" ]] || listed+="$(sed 's/^/  \/xmr\/swaps  /' <<<"$xmr_ids")"$'\n'
+  [[ -z "$ids" ]] || listed+="$(sed 's/^/  \/swaps  /' <<<"$ids")"$'\n'
+  [[ -z "$xmr_ids" ]] || listed+="$(sed 's/^/  xmr     /' <<<"$xmr_ids")"$'\n'
   if [[ -z "$listed" ]]; then
     echo "ok: no in-flight swaps"
     return 0
@@ -206,15 +249,17 @@ check_inflight() {
     echo "WARN: proceeding anyway (--force-inflight)" >&2
     return 0
   fi
-  echo "REFUSE: $n swap(s) not in a terminal state (/swaps: Done/Aborted; /xmr/swaps:" \
+  echo "REFUSE: $n swap(s) not in a terminal state (/swaps: Done/Aborted; XMR:" \
     "done/aborted/punished). Rerun with --force-inflight to redeploy anyway." >&2
   return 1
 }
 
 ((DRY)) && echo "DRY RUN: nothing below is executed (the in-flight check is only printed, not run)."
 
-if ! check_inflight; then exit 1; fi
-((CHECK_ONLY)) && exit 0
+if ((CHECK_ONLY)); then
+  check_inflight || exit 1
+  exit 0
+fi
 
 # --- acquire the binary -----------------------------------------------------------------
 SRC_BIN=""
@@ -248,6 +293,17 @@ for f in "$TOML_PATH" "$UNIT_PATH"; do
   [[ -z "$f" || -f "$f" ]] || { echo "redeploy-maker: no file at $f" >&2; exit 1; }
 done
 
+# --- ship the binary, then gate with it (the installed one may predate --xmr-inflight) ---
+step "copy $SRC_BIN to $HOST:$REMOTE_TMP"
+run scp "$SRC_BIN" "$HOST:$REMOTE_TMP"
+run ssh "$HOST" chmod 0755 "$REMOTE_TMP"
+GATE_BIN="$REMOTE_TMP"
+if ! check_inflight; then
+  # Nothing was installed or restarted; drop the staged copy.
+  ssh "$HOST" rm -f "$REMOTE_TMP" >/dev/null 2>&1 || true
+  exit 1
+fi
+
 # --- snapshot the running set ------------------------------------------------------------
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
 SNAP="$BACKUP_DIR/$TS"
@@ -271,9 +327,7 @@ mv $BACKUP_DIR/prev.new $BACKUP_DIR/prev
 cp -p $REMOTE_BIN $REMOTE_BIN.prev
 echo \"snapshot: $SNAP\""
 
-# --- ship and install --------------------------------------------------------------------
-step "copy $SRC_BIN to $HOST:$REMOTE_TMP"
-run scp "$SRC_BIN" "$HOST:$REMOTE_TMP"
+# --- install -----------------------------------------------------------------------------
 install_extra=""
 if [[ -n "$TOML_PATH" ]]; then
   step "copy $TOML_PATH to $HOST:$REMOTE_TMP_TOML"

@@ -109,9 +109,17 @@ pub struct Offer {
 }
 
 impl Offer {
-    /// DIVI sats for `btc_sats` counter-chain sats, rounded down.
+    /// DIVI sats for `btc_sats` counter-chain sats, rounded down, or `None` when that does
+    /// not fit in a `u64`.
+    pub fn checked_divi_for(&self, btc_sats: u64) -> Option<Amount> {
+        let divi = u128::from(btc_sats) * u128::from(self.divi_sats_per_btc) / 100_000_000;
+        u64::try_from(divi).ok().map(Amount)
+    }
+
+    /// DIVI sats for `btc_sats` counter-chain sats, rounded down, saturating at `u64::MAX`
+    /// rather than wrapping. `Maker::quote` refuses instead (`checked_divi_for`).
     pub fn divi_for(&self, btc_sats: u64) -> Amount {
-        Amount(((btc_sats as u128 * self.divi_sats_per_btc as u128) / 100_000_000) as u64)
+        self.checked_divi_for(btc_sats).unwrap_or(Amount(u64::MAX))
     }
 
     /// Chain of the taker leg.
@@ -285,6 +293,43 @@ pub struct LegView {
     pub spend_txid: Option<Txid>,
 }
 
+/// Header carrying a hashlock swap's token ([`AcceptReply::swap_token`]) on `GET /swaps/:id`
+/// and `POST /swaps/:id/lock`. The same name the XMR routes use.
+pub const SWAP_TOKEN_HEADER: &str = "x-swap-token";
+/// Header a taker sends on `POST /swaps` to say it keeps the swap token and sends it back. A
+/// maker that issues tokens refuses an accept without it (a taker that cannot send the token
+/// could never read its own swap) unless the operator allowed tokenless swaps.
+pub const SWAP_TOKEN_SUPPORT_HEADER: &str = "x-swap-token-support";
+/// Header carrying the operator token on `GET /swaps` (the full listing).
+pub const OPERATOR_TOKEN_HEADER: &str = "x-operator-token";
+
+/// `POST /swaps` reply: the new swap's [`SwapView`] plus its per-swap token. The token is the
+/// credential for every later call on that swap and is only ever returned here, once, to the
+/// taker that accepted. A maker from before tokens omits it; a taker from before tokens
+/// ignores it (the `SwapView` fields sit at the top level, as before).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcceptReply {
+    /// The swap, as `GET /swaps/:id` would show it.
+    #[serde(flatten)]
+    pub view: SwapView,
+    /// The swap token (hex); absent from a maker that does not issue tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swap_token: Option<String>,
+}
+
+impl std::fmt::Debug for AcceptReply {
+    // Never prints the token.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AcceptReply")
+            .field("view", &self.view)
+            .field(
+                "swap_token",
+                &self.swap_token.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
 /// `GET /swaps/:id` — what either party may see. Never contains a key; contains the
 /// preimage only after the taker has revealed it on chain.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -305,6 +350,11 @@ pub struct SwapView {
     pub preimage: Option<String>,
     /// Last error the scheduler hit on this swap, for operators.
     pub last_error: Option<String>,
+    /// The maker-chain median time past the maker read when it built its lock (the locktime
+    /// is this plus `quote.maker_timeout_secs`). Optional on the wire: an older maker omits
+    /// it and the taker falls back to the tolerant floor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maker_mtp_at_lock: Option<u32>,
 }
 
 mod hex32 {
@@ -336,6 +386,7 @@ mod hex33 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn divi_for_rounds_down() {
@@ -348,6 +399,53 @@ mod tests {
             max_btc_sats: 1_000_000,
         };
         assert_eq!(o.divi_for(100_000).0, 3_000 * 100_000_000);
+    }
+
+    #[test]
+    fn checked_divi_for_refuses_what_does_not_fit() {
+        let o = Offer {
+            id: "o".into(),
+            direction: Direction::TakerPaysBtc,
+            counter_chain: Chain::Btc,
+            divi_sats_per_btc: u64::MAX,
+            min_btc_sats: 1,
+            max_btc_sats: u64::MAX,
+        };
+        assert_eq!(o.checked_divi_for(100_000_000), Some(Amount(u64::MAX)));
+        assert_eq!(o.checked_divi_for(100_000_001), None);
+        assert_eq!(o.divi_for(100_000_001), Amount(u64::MAX));
+    }
+
+    fn edge() -> impl Strategy<Value = u64> {
+        prop_oneof![
+            Just(0u64),
+            Just(1),
+            Just(100_000_000),
+            Just(u64::MAX),
+            0..=1_000_000_000_000u64,
+            any::<u64>(),
+        ]
+    }
+
+    proptest! {
+        /// Never wraps: the exact rounded-down quotient when it fits in a `u64`, `u64::MAX`
+        /// when it does not.
+        #[test]
+        fn divi_for_is_exact_or_saturates(rate in edge(), btc_sats in edge()) {
+            let o = Offer {
+                id: "o".into(),
+                direction: Direction::TakerPaysBtc,
+                counter_chain: Chain::Btc,
+                divi_sats_per_btc: rate,
+                min_btc_sats: 0,
+                max_btc_sats: u64::MAX,
+            };
+            let exact = u128::from(btc_sats) * u128::from(rate) / 100_000_000;
+            prop_assert_eq!(
+                u128::from(o.divi_for(btc_sats).0),
+                exact.min(u128::from(u64::MAX))
+            );
+        }
     }
 
     #[test]

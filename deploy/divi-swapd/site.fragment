@@ -1,0 +1,21 @@
+# --- divi-swap website (read-only static site; BEGIN) ---
+# Two locations only. Home is exact-match; every other site file lives under /swap/site/, a prefix that is
+# not a divi-swapd route (routes: healthz, offers, swaps, xmr), so no API path can be shadowed.
+location = /swap/ {
+    root /var/www/divi-swap;
+    rewrite ^ /index.html break;
+    default_type text/html;
+    add_header Content-Security-Policy "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'" always;
+    add_header X-Content-Type-Options nosniff always;
+    add_header Referrer-Policy no-referrer always;
+    add_header Cache-Control "no-cache" always;
+}
+location ^~ /swap/site/ {
+    alias /var/www/divi-swap/site/;
+    autoindex off;
+    add_header Content-Security-Policy "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'" always;
+    add_header X-Content-Type-Options nosniff always;
+    add_header Referrer-Policy no-referrer always;
+    add_header Cache-Control "no-cache" always;
+}
+# --- divi-swap website (END) ---

@@ -15,8 +15,9 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 //! Which maker swap a local taker swap id belongs to. The engine `Store` keeps the taker's
-//! own state; this sidecar (no secrets) only remembers where the maker lives so separate
-//! CLI invocations (`accept`, then `lock`, then `status`) can find it.
+//! own state; this sidecar only remembers where the maker lives so separate CLI invocations
+//! (`accept`, then `lock`, then `status`) can find it. It holds the xmr maker's per-swap bearer
+//! token, so it is written mode 0600 like the database beside it.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -24,10 +25,31 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Session {
     pub maker_url: String,
     pub maker_swap_id: String,
+    /// The xmr maker's per-swap token (`X-Swap-Token`); empty for hashlock sessions.
+    #[serde(default)]
+    pub swap_token: String,
+}
+
+// Hand-written so a stray `{:?}` never prints the bearer token.
+impl std::fmt::Debug for Session {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Session")
+            .field("maker_url", &self.maker_url)
+            .field("maker_swap_id", &self.maker_swap_id)
+            .field(
+                "swap_token",
+                &if self.swap_token.is_empty() {
+                    ""
+                } else {
+                    "<redacted>"
+                },
+            )
+            .finish()
+    }
 }
 
 pub struct Sessions {
@@ -56,7 +78,7 @@ impl Sessions {
         let mut all = self.load()?;
         all.insert(local_id.to_string(), s);
         let tmp = self.path.with_extension("tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(&all)?)?;
+        write_private(&tmp, &serde_json::to_vec_pretty(&all)?)?;
         std::fs::rename(&tmp, &self.path)?;
         Ok(())
     }
@@ -66,6 +88,27 @@ impl Sessions {
             .remove(local_id)
             .ok_or_else(|| anyhow!("unknown local swap id {local_id}"))
     }
+}
+
+/// Write `bytes` to `path` with mode 0600, whatever the umask or a stale file already there.
+#[cfg(unix)]
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    // `mode` applies only when the file is created; tighten a leftover before any byte lands.
+    f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    f.write_all(bytes)
+}
+
+#[cfg(not(unix))]
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    std::fs::write(path, bytes)
 }
 
 #[cfg(test)]
@@ -80,6 +123,7 @@ mod tests {
         let v = Session {
             maker_url: "http://m".into(),
             maker_swap_id: "x".into(),
+            swap_token: String::new(),
         };
         s.put("a", v.clone()).unwrap();
         assert_eq!(s.get("a").unwrap(), v);

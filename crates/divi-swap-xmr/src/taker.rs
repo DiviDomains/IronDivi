@@ -97,6 +97,10 @@ pub struct XmrTakerRecord {
     /// `s_t`: Monero spend-key share and `Tx_redeem` adaptor secret.
     #[serde(with = "wire::ed_scalar")]
     pub s_t: ScalarQ,
+    /// The taker's own DIVI MTP read in `prepare`, before the request: the floor for the
+    /// maker's `t_cancel` clock. `None` on a record that predates it.
+    #[serde(default)]
+    pub prepare_mtp: Option<u32>,
     /// Where the DIVI is paid.
     #[serde(with = "wire::bytes")]
     pub payout_script: Vec<u8>,
@@ -243,6 +247,9 @@ struct Keying {
 /// Taker engine for `counter_chain = "xmr"` quotes.
 pub struct XmrTaker {
     cfg: XmrConfig,
+    /// Terms every maker quote and setup must meet (`None`: taken as offered, `cfg`'s own
+    /// margins and window sizes still apply in `verify_setup`).
+    floor: Option<XmrConfig>,
     divi: Arc<dyn DiviChain>,
     xmr: Arc<dyn MoneroChain>,
     store: Store,
@@ -264,6 +271,7 @@ impl XmrTaker {
         cfg.validate()?;
         Ok(XmrTaker {
             cfg,
+            floor: None,
             divi,
             xmr,
             store,
@@ -272,6 +280,15 @@ impl XmrTaker {
             primes_fn: Arc::new(jsig::generate_primes),
             warm: parking_lot::Mutex::new(Vec::new()),
         })
+    }
+
+    /// Refuse, in [`XmrTaker::prepare`] (before any key is generated or anything persisted)
+    /// and again in the setup check, maker terms weaker than `profile`'s own
+    /// ([`XmrConfig::for_profile`]): confirmation depths, `t_cancel`, `t_punish`, `t_late`.
+    /// Without it the taker takes the terms as offered.
+    pub fn with_profile_floor(mut self, profile: divi_swap::Profile) -> Self {
+        self.floor = Some(XmrConfig::for_profile(profile));
+        self
     }
 
     /// Replace the Paillier prime generator (tests hand out precomputed ones).
@@ -296,6 +313,10 @@ impl XmrTaker {
         if quote.counter_chain != Chain::Xmr {
             return Err(SwapError::InvalidParams("not an xmr quote".into()));
         }
+        if let Some(f) = &self.floor {
+            f.check_quote_terms(quote)
+                .map_err(SwapError::InvalidParams)?;
+        }
         let (divi_key, s_t, proof, x_point, share, j_sid) = {
             let mut rng = rand::thread_rng();
             let s_t = random_clamped_secret(&mut rng);
@@ -305,12 +326,18 @@ impl XmrTaker {
             (SecretKey::new_random(), s_t, proof, x, share, sid)
         };
         let payout = self.divi.payout_script();
+        // Her own clock, before the maker commits to one (`xmr-design.md`, "Maker MTP bound").
+        let prepare_mtp = match &self.floor {
+            Some(_) => Some(self.divi.median_time_past().await?),
+            None => None,
+        };
         let rec = XmrTakerRecord {
             id: uuid::Uuid::new_v4().to_string(),
             state: XmrTakerState::Prepared,
             quote: quote.clone(),
             divi_key,
             s_t,
+            prepare_mtp,
             payout_script: payout.as_bytes().to_vec(),
             j_sid,
             setup: None,
@@ -505,6 +532,23 @@ impl XmrTaker {
                 "timelocks leave no room to redeem, to punish, or to cancel before t_late",
             ));
         }
+        if let Some(f) = &self.floor {
+            f.check_setup_timelocks(
+                mtp,
+                r.prepare_mtp,
+                reply.maker_mtp,
+                reply.t_cancel,
+                reply.t_punish,
+                reply.t_late,
+            )
+            .map_err(|e| bad(&e))?;
+        }
+        // Upper bounds: a maker must not be able to park the taker's XMR for years.
+        if reply.t_cancel > mtp.saturating_add(crate::MAX_CANCEL_AFTER_SECS)
+            || reply.t_punish > reply.t_cancel.saturating_add(crate::MAX_PUNISH_AFTER_SECS)
+        {
+            return Err(bad("timelocks are further out than the schedule allows"));
+        }
         let digest = crypto::digest(tx_cancel, &lock.redeem_script())?;
         r.setup = Some(reply);
         self.store.put_doc(KIND, &r.id, &r)?;
@@ -636,7 +680,11 @@ impl XmrTaker {
                 let spend_pub = r.shared_spend_key()?;
                 let view = r.setup()?.xmr_view_secret;
                 // Recover a crash between locking and persisting: the lock may already exist.
-                let txid = match self.xmr.find_lock(&spend_pub, &view).await? {
+                let txid = match self
+                    .xmr
+                    .find_lock(&spend_pub, &view, r.setup()?.xmr_amount)
+                    .await?
+                {
                     Some(o) => o.txid,
                     None => {
                         self.xmr
@@ -917,7 +965,7 @@ impl XmrTaker {
             None => {
                 let lock = self
                     .xmr
-                    .find_lock(&spend_pub, &view)
+                    .find_lock(&spend_pub, &view, r.setup()?.xmr_amount)
                     .await?
                     .ok_or_else(|| SwapError::Other("our XMR lock vanished".into()))?;
                 let full = (r.s_t + s_m).to_bytes();

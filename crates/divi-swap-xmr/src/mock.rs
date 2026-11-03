@@ -57,6 +57,11 @@ struct DiviState {
     spends: HashMap<OutPoint, Hash256>,
     offline: bool,
     minted: u64,
+    /// Coins `build_funding` picked for a transaction that is not broadcast (yet): not
+    /// offered to the next `build_funding`, like the live wallet's reservations.
+    reserved: HashMap<Hash256, Vec<OutPoint>>,
+    /// What `getblockchaininfo` would call this chain.
+    name: String,
 }
 
 /// A simulated DIVI chain shared by several wallets.
@@ -73,9 +78,80 @@ impl MockDiviChain {
             block_secs,
             st: Arc::new(Mutex::new(DiviState {
                 mtp,
+                name: "test".into(),
                 ..DiviState::default()
             })),
         }
+    }
+
+    /// Re-encode the unconfirmed `txid` the way a staker can: a no-op prefix (`OP_0 OP_DROP`)
+    /// in each P2PKH scriptSig, which keeps every signature valid (DIVI has no segwit and
+    /// signs no scriptSigs) and changes the txid. The old encoding leaves the mempool, the
+    /// new one takes its inputs. Returns the new transaction.
+    pub fn malleate(&self, txid: &Hash256) -> Result<Transaction> {
+        let mut s = self.st.lock();
+        let (tx, mined) = s
+            .txs
+            .get(txid)
+            .cloned()
+            .ok_or_else(|| SwapError::Rejected("malleate: unknown transaction".into()))?;
+        if mined.is_some() {
+            return Err(SwapError::Rejected("malleate: already in a block".into()));
+        }
+        let mut m = tx.clone();
+        for input in &mut m.vin {
+            let mut sig = vec![0x00, 0x75];
+            sig.extend_from_slice(input.script_sig.as_bytes());
+            input.script_sig = Script::from_bytes(sig);
+        }
+        s.txs.remove(txid);
+        let new = m.txid();
+        for input in &tx.vin {
+            s.spends.insert(input.prevout, new);
+        }
+        s.txs.insert(new, (m.clone(), None));
+        Ok(m)
+    }
+
+    /// Reorg: `txid` (and every mined tx spending its outputs) goes back to the mempool.
+    /// Test-only; an unknown id is ignored.
+    pub fn unconfirm(&self, txid: &Hash256) {
+        let mut s = self.st.lock();
+        for id in Self::with_dependents(&s, txid) {
+            if let Some((_, mined)) = s.txs.get_mut(&id) {
+                *mined = None;
+            }
+        }
+    }
+
+    /// Reorg: `txid` (and every tx spending its outputs) is gone from chain and mempool and
+    /// the inputs it took are free again, so its bytes can be broadcast anew. Test-only.
+    pub fn forget(&self, txid: &Hash256) {
+        let mut s = self.st.lock();
+        for id in Self::with_dependents(&s, txid) {
+            s.txs.remove(&id);
+            s.spends.retain(|_, spender| *spender != id);
+        }
+    }
+
+    fn with_dependents(s: &DiviState, txid: &Hash256) -> Vec<Hash256> {
+        let mut ids = vec![*txid];
+        let mut i = 0;
+        while i < ids.len() {
+            let parent = ids[i];
+            for (id, (tx, _)) in &s.txs {
+                if !ids.contains(id) && tx.vin.iter().any(|v| v.prevout.txid == parent) {
+                    ids.push(*id);
+                }
+            }
+            i += 1;
+        }
+        ids
+    }
+
+    /// Rename the chain (`main`, `test`, `regtest`), as `getblockchaininfo` reports it.
+    pub fn set_chain_name(&self, name: &str) {
+        self.st.lock().name = name.into();
     }
 
     /// Mine `n` blocks: confirms the mempool, advances height and MTP.
@@ -174,6 +250,11 @@ impl MockDiviChain {
         v
     }
 
+    /// Coins currently reserved for unbroadcast funding transactions.
+    pub fn reserved_count(&self) -> usize {
+        self.st.lock().reserved.values().map(Vec::len).sum()
+    }
+
     fn broadcast_tx(&self, tx: &Transaction) -> Result<()> {
         let mut s = self.st.lock();
         if s.offline {
@@ -243,6 +324,11 @@ impl MockDiviWallet {
         self.chain.balance(&self.script())
     }
 
+    /// Coins reserved for unbroadcast funding transactions (chain-wide).
+    pub fn reserved_count(&self) -> usize {
+        self.chain.reserved_count()
+    }
+
     /// The chain.
     pub fn chain(&self) -> &MockDiviChain {
         &self.chain
@@ -253,6 +339,14 @@ impl MockDiviWallet {
 impl DiviChain for MockDiviWallet {
     fn payout_script(&self) -> Script {
         self.script()
+    }
+
+    async fn chain_name(&self) -> Result<String> {
+        let s = self.chain.st.lock();
+        if s.offline {
+            return Err(transient());
+        }
+        Ok(s.name.clone())
     }
 
     async fn tip_height(&self) -> Result<u64> {
@@ -275,7 +369,19 @@ impl DiviChain for MockDiviWallet {
         let mine = self.script();
         let mut picked = Vec::new();
         let mut total = 0u64;
+        let reserved: Vec<OutPoint> = self
+            .chain
+            .st
+            .lock()
+            .reserved
+            .values()
+            .flatten()
+            .copied()
+            .collect();
         for (op, out) in self.chain.unspent_paying(&mine) {
+            if reserved.contains(&op) {
+                continue;
+            }
             if total >= amount + MOCK_DIVI_FEE {
                 break;
             }
@@ -315,7 +421,31 @@ impl DiviChain for MockDiviWallet {
         for (i, sig) in sigs.iter().enumerate() {
             tx.vin[i].script_sig = create_p2pkh_script_sig(sig, &pubkey);
         }
+        self.chain
+            .st
+            .lock()
+            .reserved
+            .insert(tx.txid(), tx.vin.iter().map(|i| i.prevout).collect());
         Ok(tx)
+    }
+
+    async fn release_funding(&self, tx: &Transaction) -> Result<()> {
+        self.chain.st.lock().reserved.remove(&tx.txid());
+        Ok(())
+    }
+
+    async fn release_orphan_funding(&self, keep: &[Hash256]) -> Result<Vec<Hash256>> {
+        let mut s = self.chain.st.lock();
+        let orphans: Vec<Hash256> = s
+            .reserved
+            .keys()
+            .filter(|t| !keep.contains(t))
+            .copied()
+            .collect();
+        for t in &orphans {
+            s.reserved.remove(t);
+        }
+        Ok(orphans)
     }
 
     async fn broadcast(&self, tx: &Transaction) -> Result<()> {
@@ -489,6 +619,7 @@ impl MoneroChain for MockMoneroWallet {
         &self,
         spend_pub: &[u8; 32],
         view_secret: &[u8; 32],
+        min_amount: u64,
     ) -> Result<Option<XmrOutput>> {
         let s = self.chain.st.lock();
         if s.offline {
@@ -496,7 +627,7 @@ impl MoneroChain for MockMoneroWallet {
         }
         Ok(s.outputs
             .iter()
-            .find(|o| &o.spend_pub == spend_pub && &o.view == view_secret)
+            .find(|o| &o.spend_pub == spend_pub && &o.view == view_secret && o.amount >= min_amount)
             .map(|o| XmrOutput {
                 txid: o.txid.clone(),
                 amount: o.amount,

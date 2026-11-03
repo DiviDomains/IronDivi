@@ -19,9 +19,13 @@
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use divi_swap::api::{AcceptRequest, LockNotice, Offer, Quote, SwapView};
+use divi_swap::api::{
+    AcceptReply, AcceptRequest, LockNotice, Offer, Quote, SwapView,
+    SWAP_TOKEN_HEADER as HASHLOCK_TOKEN_HEADER, SWAP_TOKEN_SUPPORT_HEADER,
+};
 use divi_swap_xmr::api::{
     JRoundReply, JRoundRequest, SetupRequest, SigsRequest, XmrLockNotice, XmrSwapView,
+    SWAP_TOKEN_HEADER,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -90,6 +94,9 @@ pub struct MakerClient {
     base: String,
     http: reqwest::Client,
     ready: ReadyWait,
+    /// Hashlock swap tokens by maker swap id: filled by [`MakerClient::accept`], or from a
+    /// saved session by [`MakerClient::with_swap_token`]. Never printed.
+    tokens: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
 }
 
 impl MakerClient {
@@ -103,6 +110,35 @@ impl MakerClient {
                 .build()
                 .expect("reqwest client"),
             ready: ReadyWait::default(),
+            tokens: Default::default(),
+        }
+    }
+
+    /// Use `token` for hashlock swap `swap_id` (from a saved session). An empty token — a swap
+    /// from before tokens, or from a maker that does not issue them — sends no header.
+    pub fn with_swap_token(self, swap_id: &str, token: &str) -> Self {
+        if !token.is_empty() {
+            self.tokens
+                .lock()
+                .unwrap()
+                .insert(swap_id.to_string(), token.to_string());
+        }
+        self
+    }
+
+    /// The token [`MakerClient::accept`] was given for `swap_id`, to save in the session.
+    pub fn swap_token(&self, swap_id: &str) -> Option<String> {
+        self.tokens.lock().unwrap().get(swap_id).cloned()
+    }
+
+    fn with_token_header(
+        &self,
+        swap_id: &str,
+        rb: reqwest::RequestBuilder,
+    ) -> reqwest::RequestBuilder {
+        match self.swap_token(swap_id) {
+            Some(t) => rb.header(HASHLOCK_TOKEN_HEADER, t),
+            None => rb,
         }
     }
 
@@ -215,16 +251,52 @@ impl MakerClient {
             .await
     }
 
+    /// `POST /swaps`. Says the taker keeps the swap token; the one the maker returns (a maker
+    /// from before tokens returns none) is remembered for [`MakerClient::lock`] and
+    /// [`MakerClient::swap`].
     pub async fn accept(&self, req: &AcceptRequest) -> Result<SwapView> {
-        self.post("/swaps", req).await
+        let resp = self
+            .http
+            .post(format!("{}/swaps", self.base))
+            .header(SWAP_TOKEN_SUPPORT_HEADER, "1")
+            .json(req)
+            .send()
+            .await
+            .context("POST /swaps")?;
+        let status = resp.status();
+        let body = resp.text().await.context("reading maker response")?;
+        if !status.is_success() {
+            return Err(MakerStatus { status, body }.into());
+        }
+        // The body holds the token: a decode error must not quote it.
+        let reply: AcceptReply = serde_json::from_str(&body)
+            .map_err(|e| anyhow::anyhow!("decoding maker accept response: {e}"))?;
+        if let Some(t) = reply.swap_token.filter(|t| !t.is_empty()) {
+            self.tokens.lock().unwrap().insert(reply.view.id.clone(), t);
+        }
+        Ok(reply.view)
     }
 
     pub async fn lock(&self, swap_id: &str, notice: &LockNotice) -> Result<SwapView> {
-        self.post(&format!("/swaps/{swap_id}/lock"), notice).await
+        let path = format!("/swaps/{swap_id}/lock");
+        let rb = self.http.post(format!("{}{path}", self.base)).json(notice);
+        let resp = self
+            .with_token_header(swap_id, rb)
+            .send()
+            .await
+            .with_context(|| format!("POST {path}"))?;
+        Self::decode(resp).await
     }
 
     pub async fn swap(&self, swap_id: &str) -> Result<SwapView> {
-        self.get(&format!("/swaps/{swap_id}")).await
+        let path = format!("/swaps/{swap_id}");
+        let rb = self.http.get(format!("{}{path}", self.base));
+        let resp = self
+            .with_token_header(swap_id, rb)
+            .send()
+            .await
+            .with_context(|| format!("GET {path}"))?;
+        Self::decode(resp).await
     }
 
     // ---- DIVI<->XMR adaptor swap (`divi_swap_xmr`) ----
@@ -233,21 +305,63 @@ impl MakerClient {
         self.post("/xmr/swaps", req).await
     }
 
-    pub async fn xmr_j(&self, swap_id: &str, req: &JRoundRequest) -> Result<JRoundReply> {
-        self.post(&format!("/xmr/swaps/{swap_id}/j"), req).await
-    }
-
-    pub async fn xmr_sigs(&self, swap_id: &str, req: &SigsRequest) -> Result<XmrSwapView> {
-        self.post(&format!("/xmr/swaps/{swap_id}/sigs"), req).await
-    }
-
-    pub async fn xmr_lock(&self, swap_id: &str, notice: &XmrLockNotice) -> Result<XmrSwapView> {
-        self.post(&format!("/xmr/swaps/{swap_id}/xmr-lock"), notice)
+    pub async fn xmr_j(
+        &self,
+        swap_id: &str,
+        token: &str,
+        req: &JRoundRequest,
+    ) -> Result<JRoundReply> {
+        self.post_with_token(&format!("/xmr/swaps/{swap_id}/j"), token, req)
             .await
     }
 
-    pub async fn xmr_swap(&self, swap_id: &str) -> Result<XmrSwapView> {
-        self.get(&format!("/xmr/swaps/{swap_id}")).await
+    pub async fn xmr_sigs(
+        &self,
+        swap_id: &str,
+        token: &str,
+        req: &SigsRequest,
+    ) -> Result<XmrSwapView> {
+        self.post_with_token(&format!("/xmr/swaps/{swap_id}/sigs"), token, req)
+            .await
+    }
+
+    pub async fn xmr_lock(
+        &self,
+        swap_id: &str,
+        token: &str,
+        notice: &XmrLockNotice,
+    ) -> Result<XmrSwapView> {
+        self.post_with_token(&format!("/xmr/swaps/{swap_id}/xmr-lock"), token, notice)
+            .await
+    }
+
+    pub async fn xmr_swap(&self, swap_id: &str, token: &str) -> Result<XmrSwapView> {
+        let path = format!("/xmr/swaps/{swap_id}");
+        let resp = self
+            .http
+            .get(format!("{}{path}", self.base))
+            .header(SWAP_TOKEN_HEADER, token)
+            .send()
+            .await
+            .with_context(|| format!("GET {path}"))?;
+        Self::decode(resp).await
+    }
+
+    async fn post_with_token<B: Serialize, T: DeserializeOwned>(
+        &self,
+        path: &str,
+        token: &str,
+        body: &B,
+    ) -> Result<T> {
+        let resp = self
+            .http
+            .post(format!("{}{path}", self.base))
+            .header(SWAP_TOKEN_HEADER, token)
+            .json(body)
+            .send()
+            .await
+            .with_context(|| format!("POST {path}"))?;
+        Self::decode(resp).await
     }
 }
 

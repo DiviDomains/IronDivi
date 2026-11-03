@@ -178,6 +178,9 @@ pub struct CompactTx {
 pub struct CompactBlock {
     #[prost(uint64, tag = "2")]
     pub height: u64,
+    /// The block's hash, little-endian (wire) byte order like `BlockID.hash`.
+    #[prost(bytes = "vec", tag = "3")]
+    pub hash: Vec<u8>,
     #[prost(uint32, tag = "5")]
     pub time: u32,
     #[prost(message, repeated, tag = "7")]
@@ -314,6 +317,7 @@ pub struct LightwalletdClient {
 }
 
 const PATH_GET_LATEST_BLOCK: &str = "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLatestBlock";
+const PATH_GET_BLOCK: &str = "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetBlock";
 const PATH_GET_BLOCK_RANGE: &str = "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetBlockRange";
 const PATH_GET_TRANSACTION: &str = "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetTransaction";
 const PATH_SEND_TRANSACTION: &str = "/cash.z.wallet.sdk.rpc.CompactTxStreamer/SendTransaction";
@@ -327,6 +331,16 @@ impl LightwalletdClient {
             return Err(SwapError::InvalidParams("no lightwalletd endpoints".into()));
         }
         Ok(Self { endpoints, retry })
+    }
+
+    /// The endpoints, primary first.
+    pub fn endpoints(&self) -> &[String] {
+        &self.endpoints
+    }
+
+    /// The retry policy every call uses.
+    pub fn retry(&self) -> RetryPolicy {
+        self.retry
     }
 
     async fn connect(endpoint: String) -> Result<Channel, ClientError> {
@@ -405,6 +419,19 @@ impl LightwalletdClient {
     pub async fn latest_block(&self) -> Result<BlockId, ClientError> {
         retry_fallback(&self.endpoints, &self.retry, |ep| {
             Self::unary(ep, PATH_GET_LATEST_BLOCK, ChainSpec {})
+        })
+        .await
+    }
+
+    /// `GetBlock` by height (lightwalletd answers a hash-only `BlockID` with
+    /// InvalidArgument, "Block hash specifier is not yet implemented").
+    pub async fn block(&self, height: u64) -> Result<CompactBlock, ClientError> {
+        let req = BlockId {
+            height,
+            hash: Vec::new(),
+        };
+        retry_fallback(&self.endpoints, &self.retry, |ep| {
+            Self::unary(ep, PATH_GET_BLOCK, req.clone())
         })
         .await
     }

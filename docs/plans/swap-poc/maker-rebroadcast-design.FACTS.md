@@ -1,0 +1,11 @@
+# FACTS — third-party claims behind maker-rebroadcast-design.md
+
+This lane had no network access, so none of these could be checked against the vendor. Verdict
+"could not verify" is a verdict; the URL is where to check. No claim here changes a code path.
+
+| Claim | Verdict | Source URL | What the design says now |
+|---|---|---|---|
+| DIVI Core `getrawtransaction` without `txindex` answers only for mempool transactions (or via the coins view for unspent outputs), so a confirmed spent-output tx can read as -5 | could not verify | https://github.com/DiviProject/Divi | q4: the engine does not rely on it; `None` always means re-send, which is idempotent |
+| `sendrawtransaction` of a transaction already in the chain answers "already in block chain" / "txn-already-known" | could not verify | https://github.com/DiviProject/Divi | q4: the wording is matched in `classify_broadcast_error` (`rpc.rs:174`); an unmatched wording would surface as a `Rejected`, not as lost funds |
+| DIVI Core `gettxout txid vout true` answers for an unspent output of a confirmed or mempool transaction without `txindex` (it reads the coins view), and null once spent | could not verify | https://github.com/DiviProject/Divi | q4: `release_dead_lock` requires a non-null answer with our scriptPubKey for every input; anything else is no release |
+| IronDivi `gettxout` serves the chain UTXO set only and ignores `include_mempool` | code-read (`crates/divi-rpc/src/blockchain.rs:829`), not run against a node | https://github.com/DiviDomains/IronDivi | q4: an input spent only in the mempool still reads unspent; the release is best-effort and the rebroadcast refusal gates it |
