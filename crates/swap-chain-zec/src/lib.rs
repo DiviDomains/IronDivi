@@ -190,6 +190,11 @@ pub struct ZecBackend {
     pubkey: [u8; 33],
     address: TransparentAddress,
     fees: FeePolicy,
+    /// Outpoints spent by transactions this backend has built (persisted by the caller before
+    /// broadcast), mapped to the spending `Txid`, so a concurrent build cannot pick the same
+    /// coin while `GetAddressUtxos` still lists it. Shared with [`ChainBackend::primary_only`]
+    /// views.
+    spent_by_built: Arc<Mutex<HashMap<tx::OutPoint, Txid>>>,
     reservations: Option<InputReservations>,
     /// `"mainnet"` or `"testnet"`: selects address prefixes and the v5/v6 activation height.
     network: String,
@@ -249,6 +254,7 @@ impl ZecBackend {
             pubkey,
             address,
             fees,
+            spent_by_built: Arc::default(),
             reservations: None,
             network: "testnet".to_string(),
             second: None,
@@ -589,7 +595,16 @@ impl ZecBackend {
                 vout: i.prevout.n,
             })
             .collect();
-        res.reserve(Chain::Zec, &signed_tx.txid, &inputs)
+        match res.reserve(Chain::Zec, &signed_tx.txid, &inputs) {
+            Err(e @ SwapError::InputsHeld(_)) => {
+                self.spent_by_built
+                    .lock()
+                    .expect("spent_by_built")
+                    .retain(|_, id| *id != signed_tx.txid);
+                Err(e)
+            }
+            other => other,
+        }
     }
 
     /// The transaction is on chain: its inputs are spent, so the reservation has done its
@@ -598,6 +613,10 @@ impl ZecBackend {
         if confs == 0 {
             return;
         }
+        self.spent_by_built
+            .lock()
+            .expect("spent_by_built")
+            .retain(|_, id| id != txid);
         if let Some(res) = &self.reservations {
             if let Err(e) = res.release_tx(Chain::Zec, txid) {
                 tracing::warn!(%txid, error = %e, "could not release confirmed input reservation");
@@ -696,6 +715,26 @@ impl ZecBackend {
         let next = u32::try_from(next)
             .map_err(|_| SwapError::Other(format!("tip height {next} overflows u32")))?;
         tx::tx_version_for(&self.network, next)
+    }
+
+    /// Build from `coins` minus anything a transaction this backend already built spends, and
+    /// record the inputs the new transaction spends before releasing the lock.
+    fn with_free_coins<T>(
+        &self,
+        coins: Vec<tx::Coin>,
+        build: impl FnOnce(&[tx::Coin]) -> Result<T>,
+        tx_of: impl FnOnce(&T) -> &tx::ZecTx,
+    ) -> Result<T> {
+        let mut spent = self.spent_by_built.lock().expect("spent_by_built");
+        let free: Vec<tx::Coin> = coins
+            .into_iter()
+            .filter(|c| !spent.contains_key(&c.outpoint))
+            .collect();
+        let built = build(&free)?;
+        let raw = tx_of(&built);
+        let txid = Txid(raw.txid());
+        spent.extend(raw.vin.iter().map(|i| (i.prevout, txid)));
+        Ok(built)
     }
 
     fn to_signed(built: &tx::ZecTx) -> SignedTx {
@@ -871,8 +910,14 @@ impl ChainBackend for ZecBackend {
     }
 
     async fn spendable(&self) -> Result<Option<Amount>> {
+        let coins = self.my_coins().await?;
+        let spent = self.spent_by_built.lock().expect("spent_by_built");
         Ok(Some(Amount(
-            self.my_coins().await?.iter().map(|c| c.value).sum(),
+            coins
+                .iter()
+                .filter(|c| !spent.contains_key(&c.outpoint))
+                .map(|c| c.value)
+                .sum(),
         )))
     }
 
@@ -880,16 +925,22 @@ impl ChainBackend for ZecBackend {
         let branch_id = self.consensus_branch_id().await?;
         let version = self.tx_version().await?;
         let coins = self.my_coins().await?;
-        let built = tx::build_funding_tx(
-            &self.secp,
-            &self.key,
-            &self.pubkey,
-            &coins,
-            htlc,
-            amount.to_sat(),
-            version,
-            branch_id,
-            self.fees.zats_per_byte(),
+        let built = self.with_free_coins(
+            coins,
+            |free| {
+                tx::build_funding_tx(
+                    &self.secp,
+                    &self.key,
+                    &self.pubkey,
+                    free,
+                    htlc,
+                    amount.to_sat(),
+                    version,
+                    branch_id,
+                    self.fees.zats_per_byte(),
+                )
+            },
+            |f| &f.tx,
         )?;
         let signed = Self::to_signed(&built.tx);
         Ok(Funding {
@@ -977,6 +1028,7 @@ impl ChainBackend for ZecBackend {
             pubkey: self.pubkey,
             address: self.address,
             fees: self.fees,
+            spent_by_built: self.spent_by_built.clone(),
             reservations: self.reservations.clone(),
             network: self.network.clone(),
             second: None,
@@ -1816,5 +1868,50 @@ mod tests {
             b.reserve_inputs(&ZecBackend::to_signed(&built)).unwrap();
         }
         assert!(res.reserved(Chain::Zec).unwrap().is_empty());
+    }
+
+    /// Two swaps locking at once: the second build must not reuse the coin the first spends,
+    /// though lightwalletd still lists it (the first is built, persisted, and not yet broadcast).
+    #[tokio::test]
+    async fn concurrent_builds_never_share_a_coin() {
+        use crate::grpc::GetAddressUtxosReply;
+        use crate::lwd_stub::Lightwalletd;
+
+        let lwd = Lightwalletd::start(100);
+        let b = lwd.backend();
+        let addr = b.encoded_address();
+        let spk = b.address().script_pubkey();
+        let coin = |n: u8| GetAddressUtxosReply {
+            txid: vec![n; 32],
+            index: 0,
+            script: spk.clone(),
+            value_zat: 200_000,
+            height: 50,
+            address: addr.clone(),
+        };
+        let input = |f: &Funding| {
+            let parsed = tx::ParsedTx::parse(&f.tx.raw).unwrap();
+            assert_eq!(parsed.vin.len(), 1);
+            parsed.vin[0].prevout
+        };
+        lwd.set_utxos(vec![coin(1), coin(2)]);
+        let (h1, h2) = (res_htlc(&b), res_htlc(&b));
+        let amount = Amount::from_sat(50_000);
+
+        let (f1, f2) = tokio::join!(b.build_funding(&h1, amount), b.build_funding(&h2, amount));
+        let (a, c) = (input(&f1.unwrap()), input(&f2.unwrap()));
+        assert_ne!(a, c, "two fundings spend the same coin");
+
+        // Both coins are taken: a third funding finds none, and spendable reflects the free set.
+        let err = b.build_funding(&h1, amount).await.unwrap_err();
+        assert!(matches!(err, SwapError::InsufficientFunds(_)), "{err:?}");
+        assert_eq!(b.spendable().await.unwrap(), Some(Amount(0)));
+
+        // The first funding was broadcast (its coin left GetAddressUtxos) and a new coin arrived:
+        // the new coin is free, the second funding's coin stays reserved in memory.
+        let listed = if a.txid == [1; 32] { 2 } else { 1 };
+        lwd.set_utxos(vec![coin(listed), coin(3)]);
+        let f3 = b.build_funding(&h1, amount).await.unwrap();
+        assert_eq!(input(&f3).txid, [3; 32]);
     }
 }

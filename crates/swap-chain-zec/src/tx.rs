@@ -160,7 +160,7 @@ impl<'a> Reader<'a> {
 // ---- Transparent tx parts ---------------------------------------------------------------
 
 /// A transparent output reference, internal (not reversed) txid byte order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct OutPoint {
     /// The previous transaction's id.
     pub txid: [u8; 32],

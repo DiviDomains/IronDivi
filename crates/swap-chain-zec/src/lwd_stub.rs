@@ -33,8 +33,9 @@ use tonic::Status;
 use tonic_prost::ProstCodec;
 
 use crate::grpc::{
-    BlockId, BlockRange, ChainSpec, CompactBlock, CompactTx, Empty, LightdInfo, RawTransaction,
-    SendResponse, TxFilter,
+    BlockId, BlockRange, ChainSpec, CompactBlock, CompactTx, Empty, GetAddressUtxosArg,
+    GetAddressUtxosReply, GetAddressUtxosReplyList, LightdInfo, RawTransaction, SendResponse,
+    TxFilter,
 };
 use crate::{FeePolicy, RetryPolicy, ZecBackend};
 
@@ -67,6 +68,8 @@ struct Chain {
     txs: HashMap<[u8; 32], (Vec<u8>, u64)>,
     /// The compact transactions of a block, by height (none by default).
     vtx: HashMap<u64, Vec<CompactTx>>,
+    /// Address UTXOs returned by `GetAddressUtxos`.
+    utxos: Vec<GetAddressUtxosReply>,
     /// Every method fails `Unavailable`.
     down: bool,
     /// Every method is accepted and never answered (EX).
@@ -224,6 +227,11 @@ impl Lightwalletd {
         self.chain.lock().unwrap().txs.remove(&txid);
     }
 
+    /// Replace what `GetAddressUtxos` answers.
+    pub(crate) fn set_utxos(&self, utxos: Vec<GetAddressUtxosReply>) {
+        self.chain.lock().unwrap().utxos = utxos;
+    }
+
     /// While `down`, every method fails `Unavailable` (and is not recorded).
     pub(crate) fn set_down(&self, down: bool) {
         self.chain.lock().unwrap().down = down;
@@ -320,6 +328,10 @@ impl Service<http::Request<Body>> for Stub {
                     let mut grpc = Grpc::new(ProstCodec::default());
                     grpc.unary(Unary(chain, send_transaction), req).await
                 }
+                "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetAddressUtxos" => {
+                    let mut grpc = Grpc::new(ProstCodec::default());
+                    grpc.unary(Unary(chain, get_address_utxos), req).await
+                }
                 "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetBlockRange" => {
                     let mut grpc = Grpc::new(ProstCodec::default());
                     grpc.server_streaming(BlockRangeSvc(chain), req).await
@@ -410,6 +422,20 @@ fn send_transaction(c: &mut Chain, tx: RawTransaction) -> Result<SendResponse, S
         error_code: 0,
         error_message: String::new(),
     })
+}
+
+fn get_address_utxos(
+    c: &mut Chain,
+    arg: GetAddressUtxosArg,
+) -> Result<GetAddressUtxosReplyList, Status> {
+    c.calls.push("GetAddressUtxos");
+    let address_utxos = c
+        .utxos
+        .iter()
+        .filter(|u| arg.addresses.is_empty() || arg.addresses.contains(&u.address))
+        .cloned()
+        .collect();
+    Ok(GetAddressUtxosReplyList { address_utxos })
 }
 
 struct BlockRangeSvc(Arc<Mutex<Chain>>);
