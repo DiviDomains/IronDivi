@@ -11,7 +11,7 @@
 
 IronDivi is a ground-up Rust reimplementation of the [Divi Core](https://github.com/DiviProject/Divi) full node. It supports full block validation, Proof-of-Stake (PoS) consensus, wallet management with HD key derivation, peer-to-peer networking, and JSON-RPC API compatibility with Divi Core.
 
-The goal is to provide a memory-safe, performant, and well-structured alternative to the C++ reference implementation while maintaining full consensus compatibility.
+The goal is to provide a memory-safe, performant, and well-structured client alongside the C++ reference implementation while maintaining full consensus compatibility. **IronDivi does not replace or retire C++ Divi Core (`divid`):** both implementations are maintained as first-class mainnet clients and upgraded in strict consensus lockstep, including planned post-quantum cryptography upgrades (see [docs/divid-differences.md](docs/divid-differences.md) and [docs/plans/post-quantum-lockstep.md](docs/plans/post-quantum-lockstep.md)).
 
 ## Features
 

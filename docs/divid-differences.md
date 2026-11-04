@@ -1,8 +1,11 @@
 # Where irondivid knowingly differs from divid
 
-irondivid follows Divi Core 3.0.0's `divid` (tag v3.0.0, commit 9e2f76c). The rows below are the places where it
-differs on purpose. Each row names what divid does, what irondivid does, why the difference is kept, and the test
-that pins it: a change that removes or alters a difference fails that test, and should update this page too.
+irondivid follows Divi Core 3.0.0's `divid` (tag v3.0.0, commit 9e2f76c). C++ `divid` is not being retired: both `divid`
+and `irondivid` are maintained as co-equal mainnet implementations and upgraded in strict consensus lockstep (including
+future protocol and post-quantum upgrades; see [`docs/plans/post-quantum-lockstep.md`](plans/post-quantum-lockstep.md)).
+The rows below are the non-consensus places where `irondivid` differs on purpose. Each row names what divid does, what
+irondivid does, why the difference is kept, and the test that pins it: a change that removes or alters a difference
+fails that test, and should update this page too.
 
 Core paths are under `divi/src/` of the Divi Core source. IronDivi paths are from the repository root.
 
