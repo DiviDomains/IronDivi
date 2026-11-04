@@ -9,6 +9,10 @@ description = "IronDivi daemon - Rust implementation of Divi node"
 name = "irondivid"
 path = "src/main.rs"
 
+[[test]]
+name = "regtest_log_symmetry_canary"
+harness = false
+
 [dependencies]
 chrono = { workspace = true }
 # Internal crates
@@ -50,10 +54,20 @@ serde_json = { workspace = true }
 anyhow = { workspace = true }
 toml = "0.8"
 
+# --features sidechains: the sidechain market (bshuler/irondivi-sidechain-market),
+# pinned to one commit
+axum = { workspace = true, optional = true }
+irondivi-sidechains = { git = "ssh://git@github.com/bshuler/irondivi-sidechain-market.git", rev = "52fbd26928e6417ab9980863aa99de4e3b24392c", optional = true }
+dvsm-manifest = { git = "ssh://git@github.com/bshuler/irondivi-sidechain-market.git", rev = "52fbd26928e6417ab9980863aa99de4e3b24392c", optional = true }
+dvsc-registry = { git = "ssh://git@github.com/bshuler/irondivi-sidechain-market.git", rev = "52fbd26928e6417ab9980863aa99de4e3b24392c", optional = true }
+
 [features]
 fault-injection = ["divi-storage/fault-injection"]
+# Off by default: the Sidechains page answers 503 not_installed without it
+sidechains = ["dep:axum", "dep:irondivi-sidechains", "dep:dvsm-manifest", "dep:dvsc-registry"]
 
 [dev-dependencies]
+divi-diag = { workspace = true }
 divi-test-support = { workspace = true }
 rocksdb = { workspace = true }
 tempfile = { workspace = true }

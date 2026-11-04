@@ -279,7 +279,7 @@ async fn accept_loop(
         let backend = backend.clone();
         let banner = banner.clone();
         let tls = tls.clone();
-        tokio::spawn(async move {
+        tokio::spawn(session::PEER.scope(peer.ip(), async move {
             let _permit = permit;
             match tls {
                 None => serve(stream, framing, backend, banner).await,
@@ -296,6 +296,6 @@ async fn accept_loop(
                     }
                 }
             }
-        });
+        }));
     }
 }

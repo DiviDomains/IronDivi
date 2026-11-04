@@ -48,6 +48,12 @@ const FATAL: [i32; 7] = [
 
 /// The pre-opened crash.log (-1: not yet)
 static FD: AtomicI32 = AtomicI32::new(-1);
+/// The mirror's crash.log (A14; -1: none)
+static MIRROR_FD: AtomicI32 = AtomicI32::new(-1);
+/// crash.log's size at start above which it is moved to crash.log.1 (A14)
+const CAP: u64 = 1 << 20;
+/// What the mirror's crash.log keeps at each start (A14)
+const MIRROR_KEEP: u64 = 256 << 10;
 /// The thread now writing a record (0: none)
 static CRASHING: AtomicI64 = AtomicI64::new(0);
 /// That record is written
@@ -130,10 +136,21 @@ pub fn install() {
 }
 
 /// Open `<data_dir>/diag/crash.log` for the handler (diag/ exists: runs.log
-/// made it)
+/// made it), moved to crash.log.1 first when it is over 1 MB, and the
+/// mirror's crash.log, cut to its last 256 KB (A14)
 pub fn open(data_dir: &std::path::Path) {
-    use std::os::unix::ffi::OsStrExt;
     let path = data_dir.join("diag").join("crash.log");
+    crate::runs_log::rotate_at_open(&path, CAP);
+    open_into(&path, &FD);
+    if let Some(m) = crate::mirror::dir() {
+        let path = m.join("crash.log");
+        keep_tail(&path, MIRROR_KEEP);
+        open_into(&path, &MIRROR_FD);
+    }
+}
+
+fn open_into(path: &std::path::Path, slot: &AtomicI32) {
+    use std::os::unix::ffi::OsStrExt;
     let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
         return;
     };
@@ -145,11 +162,32 @@ pub fn open(data_dir: &std::path::Path) {
         )
     };
     if fd >= 0 {
-        let old = FD.swap(fd, Ordering::AcqRel);
+        let old = slot.swap(fd, Ordering::AcqRel);
         if old >= 0 {
             unsafe { libc::close(old) };
         }
     }
+}
+
+/// Cut `path` to its last `keep` bytes, from a line start, by replacing it
+fn keep_tail(path: &std::path::Path, keep: u64) {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return;
+    };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    if len <= keep || f.seek(SeekFrom::Start(len - keep)).is_err() {
+        return;
+    }
+    let mut bytes = Vec::new();
+    if f.read_to_end(&mut bytes).is_err() {
+        return;
+    }
+    let from = bytes
+        .iter()
+        .position(|&b| b == b'\n')
+        .map_or(bytes.len(), |i| i + 1);
+    let _ = crate::private_files::write_private_atomic(path, &bytes[from..]);
 }
 
 fn fill(slot: &Entry, tid: i64, name: &[u8]) {
@@ -160,6 +198,41 @@ fn fill(slot: &Entry, tid: i64, name: &[u8]) {
     slot.lo.store(lo, Ordering::Relaxed);
     slot.hi.store(hi, Ordering::Relaxed);
     slot.tid.store(tid, Ordering::Release);
+}
+
+/// The threads in the table now, as (tid, name) (A17's vanished check)
+pub fn threads() -> Vec<(i64, String)> {
+    TABLE
+        .iter()
+        .filter_map(|e| {
+            let tid = e.tid.load(Ordering::Acquire);
+            if tid <= 0 {
+                return None;
+            }
+            let name: Vec<u8> = e
+                .name
+                .iter()
+                .map(|b| b.load(Ordering::Relaxed))
+                .take_while(|&b| b != 0)
+                .collect();
+            Some((tid, String::from_utf8_lossy(&name).into_owned()))
+        })
+        .collect()
+}
+
+/// Append one line to crash.log, when it is open (A17), the mirror's first
+/// (A14)
+pub fn note(line: &str) {
+    let mut text = line.to_string();
+    text.push('\n');
+    for fd in [
+        MIRROR_FD.load(Ordering::Acquire),
+        FD.load(Ordering::Acquire),
+    ] {
+        if fd >= 0 {
+            unsafe { libc::write(fd, text.as_ptr().cast(), text.len()) };
+        }
+    }
 }
 
 /// This thread's stack, from pthread (0, 0 where it is not read)
@@ -457,18 +530,34 @@ fn chain(signo: i32, info: *mut libc::siginfo_t, ctx: *mut libc::c_void) {
     }
 }
 
+/// The record, to the mirror's crash.log first (A14), then crash.log
 fn write_record(signo: i32, info: *mut libc::siginfo_t, ctx: *mut libc::c_void, me: i64) {
-    let fd = FD.load(Ordering::Acquire);
-    if fd < 0 {
-        return;
+    for fd in [
+        MIRROR_FD.load(Ordering::Acquire),
+        FD.load(Ordering::Acquire),
+    ] {
+        if fd >= 0 {
+            write_record_to(fd, signo, info, ctx, me);
+        }
     }
+}
+
+fn write_record_to(
+    fd: i32,
+    signo: i32,
+    info: *mut libc::siginfo_t,
+    ctx: *mut libc::c_void,
+    me: i64,
+) {
     let mut line = RawLine::new("fatal-signal");
     line.text(" run=")
         .num(crate::runs_log::run_number() as i64)
         .text(" pid=")
         .num(i64::from(unsafe { libc::getpid() }))
         .text(" signal=")
-        .text(signal_name(signo));
+        .text(signal_name(signo))
+        .text(" build-id=")
+        .text(crate::build_id::get());
     let (code, addr, pid, uid) = if info.is_null() {
         (0, 0, 0, 0)
     } else {
@@ -657,6 +746,7 @@ pub struct Alloc;
 fn alloc_null(size: usize) {
     let mut line = RawLine::new("alloc-null");
     line.text(" size=").num(size as i64);
+    line.write_to(MIRROR_FD.load(Ordering::Acquire));
     line.write_to(FD.load(Ordering::Acquire));
 }
 
@@ -688,8 +778,9 @@ unsafe impl std::alloc::GlobalAlloc for Alloc {
 }
 
 /// Debug builds on regtest only: `IRONDIVI_TEST_CRASH` asks for a SEGV
-/// (`segv`), an abort (`abort`) or a Rust thread's stack overflow
-/// (`overflow`) once the node runs. (The plan's `crashtest` build feature;
+/// (`segv`; `segv-worker` on a tokio worker), an abort (`abort`), a failed
+/// allocation (`alloc`) or a Rust thread's stack overflow (`overflow`) once
+/// the node runs. (The plan's `crashtest` build feature;
 /// Revision 16)
 pub fn start_test_crash(regtest: bool) {
     if !cfg!(debug_assertions) || !regtest {
@@ -699,6 +790,14 @@ pub fn start_test_crash(regtest: bool) {
         return;
     };
     let wait = std::time::Duration::from_secs(2);
+    if what == "segv-worker" {
+        // a fault on a tokio worker thread, not one of ours
+        crate::tasks::spawn_supervised("test-crash", async move {
+            tokio::time::sleep(wait).await;
+            unsafe { std::ptr::null_mut::<u64>().write_volatile(1) };
+        });
+        return;
+    }
     let _ = crate::tasks::thread("test-crash", crate::tasks::Kind::Supervised, move || {
         std::thread::sleep(wait);
         match what.as_str() {
@@ -706,6 +805,10 @@ pub fn start_test_crash(regtest: bool) {
                 std::ptr::null_mut::<u64>().write_volatile(1);
             },
             "abort" => std::process::abort(),
+            // fails in the allocator: alloc-null, then the abort
+            "alloc" => {
+                std::hint::black_box(Vec::<u8>::with_capacity(1 << 60));
+            }
             "overflow" => {
                 std::hint::black_box(recurse(0));
             }

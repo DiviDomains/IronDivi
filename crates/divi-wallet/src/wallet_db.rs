@@ -26,7 +26,7 @@ use crate::persistence::{
 use divi_primitives::amount::Amount;
 use divi_primitives::counted::{self, Site};
 use divi_primitives::hash::{Hash160, Hash256};
-use divi_primitives::redact::{OwnOutpoint, WalletAddress, WalletAmount, WalletTxid};
+use divi_primitives::redact::{OwnOutpoint, WalletAddress, WalletAmount, WalletTxid, WalletValue};
 use divi_primitives::script::Script;
 use divi_primitives::transaction::OutPoint;
 use divi_primitives::ChainMode;
@@ -476,6 +476,26 @@ const SCANNED_HASHES_KEPT: usize = 10_000;
 const SCANNED_HASHES_SAVED: usize = 128;
 
 impl WalletDb {
+    /// `transactions` for reading, timed (diag A17)
+    fn transactions_r(&self) -> parking_lot::RwLockReadGuard<'_, HashMap<Hash256, WalletTx>> {
+        divi_primitives::diag_lock::timed(
+            divi_primitives::diag_lock::Lock::Wallet,
+            || self.transactions.try_read(),
+            || self.transactions.read(),
+        )
+    }
+
+    /// `transactions` for writing, timed (diag A17)
+    fn transactions_w(&self) -> parking_lot::RwLockWriteGuard<'_, HashMap<Hash256, WalletTx>> {
+        divi_primitives::diag_lock::timed(
+            divi_primitives::diag_lock::Lock::Wallet,
+            || self.transactions.try_write(),
+            || self.transactions.write(),
+        )
+    }
+}
+
+impl WalletDb {
     /// Create a new in-memory wallet
     pub fn new(network: Network) -> Self {
         WalletDb {
@@ -653,7 +673,7 @@ impl WalletDb {
             let txid = tx.txid();
             let orphaned = tx.vin.iter().any(|i| dropped.contains(&i.prevout.txid));
             let confirmed = matches!(
-                self.transactions.read().get(&txid),
+                self.transactions_r().get(&txid),
                 Some(t) if t.block_height.is_some()
             );
             let conflicted = {
@@ -716,7 +736,7 @@ impl WalletDb {
 
     /// Recorded from a block, or in the mempool overlay
     fn is_recorded(&self, txid: &Hash256) -> bool {
-        matches!(self.transactions.read().get(txid), Some(t) if t.block_height.is_some())
+        matches!(self.transactions_r().get(txid), Some(t) if t.block_height.is_some())
             || self.mempool_txs.read().contains_key(txid)
     }
 
@@ -1106,12 +1126,12 @@ impl WalletDb {
         // Load transactions
         let transactions = db.load_transactions()?;
         {
-            let mut tx_map = self.transactions.write();
+            let mut tx_map = self.transactions_w();
             for tx in transactions {
                 tx_map.insert(tx.txid, tx);
             }
         }
-        debug!("Restored {} transactions", self.transactions.read().len());
+        debug!("Restored {} transactions", self.transactions_r().len());
 
         // Load used addresses
         let addresses = db.load_used_addresses()?;
@@ -1201,7 +1221,7 @@ impl WalletDb {
             "Wallet loaded: {} keys, {} UTXOs, {} transactions, {} accounts, {} scripts, balance = {}",
             self.keystore.key_count(),
             self.utxos.read().len(),
-            self.transactions.read().len(),
+            self.transactions_r().len(),
             self.accounts.read().len(),
             self.scripts.read().len(),
             WalletAmount(self.get_balance().as_sat())
@@ -1461,7 +1481,7 @@ impl WalletDb {
         }
 
         // Save transactions
-        for tx in self.transactions.read().values() {
+        for tx in self.transactions_r().values() {
             batch.put_cf(db.cf_transactions(), tx.txid.as_bytes(), serialize_tx(tx));
         }
 
@@ -1622,7 +1642,7 @@ impl WalletDb {
         }
 
         if flags.transactions {
-            for tx in self.transactions.read().values() {
+            for tx in self.transactions_r().values() {
                 let value = serialize_tx(tx);
                 batch.put_cf(db.cf_transactions(), tx.txid.as_bytes(), &value);
             }
@@ -1830,7 +1850,10 @@ impl WalletDb {
             let _ = std::fs::remove_dir_all(&staging);
         }
         result?;
-        info!("Wallet backed up to {}", target.display());
+        info!(
+            "Wallet backed up to {}",
+            WalletValue(&target.to_string_lossy())
+        );
         Ok(target)
     }
 
@@ -2782,7 +2805,7 @@ impl WalletDb {
             let mut pending = self.pending_deletes.write();
             pending
                 .transactions
-                .extend(self.transactions.write().drain().map(|(txid, _)| txid));
+                .extend(self.transactions_w().drain().map(|(txid, _)| txid));
             pending
                 .utxos
                 .extend(self.utxos.write().drain().map(|(outpoint, _)| outpoint));
@@ -2812,7 +2835,7 @@ impl WalletDb {
         let (txid, confirmed) = (tx.txid, tx.block_height.is_some());
         // A confirmed record's timestamp is its block time, at most now
         self.note_first_seen(&txid, tx.block_hash.map(|_| tx.timestamp));
-        self.transactions.write().insert(tx.txid, tx);
+        self.transactions_w().insert(tx.txid, tx);
         self.dirty.write().transactions = true;
         if confirmed {
             self.reattach(&txid);
@@ -2836,7 +2859,7 @@ impl WalletDb {
         tip_height: u32,
         in_block: impl Fn(&WalletTx) -> Option<(divi_primitives::transaction::Transaction, usize)>,
     ) -> (usize, usize) {
-        let original = self.transactions.read().len()
+        let original = self.transactions_r().len()
             + self.mempool_txs.read().len()
             + self.detached_txs.read().len();
         let mut confirmed: Vec<_> = self
@@ -2869,7 +2892,7 @@ impl WalletDb {
                 // An input of ours from a transaction kept keeps this one
                 let from_kept = tx.vin.iter().any(|input| {
                     spent.contains_key(&input.prevout)
-                        && self.transactions.read().contains_key(&input.prevout.txid)
+                        && self.transactions_r().contains_key(&input.prevout.txid)
                         && !pruned.contains(&input.prevout.txid)
                 });
                 if outputs_gone && !from_kept {
@@ -2885,7 +2908,7 @@ impl WalletDb {
     }
 
     pub fn get_transactions(&self, count: Option<usize>) -> Vec<WalletTx> {
-        let mut list: Vec<_> = self.transactions.read().values().cloned().collect();
+        let mut list: Vec<_> = self.transactions_r().values().cloned().collect();
         list.extend(self.mempool_txs.read().values().map(|e| e.record.clone()));
 
         // Sort by timestamp descending
@@ -2899,7 +2922,7 @@ impl WalletDb {
 
     /// Get a specific transaction
     pub fn get_transaction(&self, txid: &Hash256) -> Option<WalletTx> {
-        if let Some(tx) = self.transactions.read().get(txid) {
+        if let Some(tx) = self.transactions_r().get(txid) {
             return Some(tx.clone());
         }
         self.mempool_txs.read().get(txid).map(|e| e.record.clone())
@@ -3939,7 +3962,7 @@ impl WalletDb {
             return false;
         }
         let txid = tx.txid();
-        if matches!(self.transactions.read().get(&txid), Some(t) if t.block_height.is_some()) {
+        if matches!(self.transactions_r().get(&txid), Some(t) if t.block_height.is_some()) {
             return false;
         }
 
@@ -4101,7 +4124,11 @@ impl WalletDb {
         self.tx_times.write().insert(*txid, (received, smart));
         if let Some(db) = &self.db() {
             if let Err(e) = db.store_tx_times(txid, received, smart) {
-                tracing::warn!("Failed to store the times of {}: {}", txid, e);
+                tracing::warn!(
+                    "Failed to store the times of {}: {}",
+                    WalletTxid::of(txid),
+                    e
+                );
             }
         }
     }
@@ -4234,7 +4261,7 @@ impl WalletDb {
 
     /// Update confirmation counts for all transactions
     pub fn update_confirmations(&self, current_height: u32) {
-        let mut txs = self.transactions.write();
+        let mut txs = self.transactions_w();
         for tx in txs.values_mut() {
             tx.confirmations = match tx.block_height {
                 Some(h) if current_height >= h => current_height - h + 1,
@@ -4286,7 +4313,7 @@ impl WalletDb {
 
         let mut disconnected = Vec::new();
         {
-            let mut txs = self.transactions.write();
+            let mut txs = self.transactions_w();
             let gone: Vec<Hash256> = txs
                 .iter()
                 .filter(|(_, tx)| tx.block_height.is_some_and(in_range))
@@ -4617,7 +4644,11 @@ impl WalletDb {
             Some(db) => db,
             None => {
                 if let Err(e) = self.closed_database() {
-                    warn!("Failed to store the label of {}: {}", address, e);
+                    warn!(
+                        "Failed to store the label of {}: {}",
+                        WalletAddress(&address.to_string()),
+                        e
+                    );
                 }
                 return Ok(());
             }
@@ -4647,7 +4678,11 @@ impl WalletDb {
         // (rpcwallet.cpp:310, :361, :616; rpcdump.cpp:85, :152): the label is
         // kept in memory and the next save writes it
         if let Err(e) = db.write_batch_sync(batch) {
-            warn!("Failed to store the label of {}: {}", address, e);
+            warn!(
+                "Failed to store the label of {}: {}",
+                WalletAddress(&address.to_string()),
+                e
+            );
         }
         Ok(())
     }

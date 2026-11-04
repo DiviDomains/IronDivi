@@ -7,6 +7,10 @@ description = "IronDivi's optional web interface (-webui)"
 
 [dependencies]
 divi-rpc = { workspace = true }
+divi-electrum = { workspace = true }
+divi-wallet = { workspace = true }
+divi-primitives = { workspace = true }
+divi-script = { workspace = true }
 
 axum = { workspace = true }
 tokio = { workspace = true }
@@ -21,6 +25,10 @@ zeroize = { workspace = true }
 anyhow = { workspace = true }
 # The admin password's hash, as the wallet's passphrase key (raw Argon2id)
 argon2 = { version = "0.5", default-features = false, features = ["alloc", "zeroize"] }
+# The interface wallets' sealed words
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+# The NFT page's calls to the testnet NFT service (`/api/nft/`)
+reqwest = { workspace = true }
 # The config file is edited in place, its comments and order kept
 toml_edit = "0.22"
 

@@ -48,6 +48,8 @@
 //! let _ = std::fs::remove_dir_all(&temp_dir);
 //! ```
 
+/// The call recorder (diag A15), for the transports built on this crate
+pub use divi_primitives::diag_rpc;
 pub mod access;
 pub mod auth_cookie;
 pub mod blockchain;
@@ -57,6 +59,7 @@ mod flat_file;
 pub mod http;
 pub mod json_spirit_text;
 pub mod lite_wallet;
+pub mod logctl;
 pub mod masternode;
 pub mod mn_broadcast;
 pub mod mn_list;
@@ -83,8 +86,8 @@ pub use protocol::{Params, Request, RequestId, Response};
 pub use server::{
     create_router_with_auth, rpc_access, start_server, start_server_with_peer_manager,
     start_server_with_peer_manager_and_setup, start_server_with_wallet_and_peer_manager,
-    start_server_with_wallet_peer_and_staker, LogConfigInfo, LogLevelsCallback, RpcConfig,
-    RpcServer, ShutdownCallback, Subnet,
+    start_server_with_wallet_peer_and_staker, Caller, CallerTransport, DiagInfoCallback,
+    LogConfigInfo, LogLevelsCallback, RpcConfig, RpcServer, ShutdownCallback, Subnet,
 };
 pub use staking::{StakingInfo, StakingRpc};
 pub use wallet::{TxSubmitError, WalletRpc};

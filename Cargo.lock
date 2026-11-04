@@ -3290,10 +3290,16 @@ dependencies = [
  "anyhow",
  "argon2",
  "axum",
+ "chacha20poly1305",
+ "divi-electrum",
+ "divi-primitives",
  "divi-rpc",
+ "divi-script",
+ "divi-wallet",
  "hex",
  "parking_lot",
  "rand 0.8.8",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -3361,6 +3367,37 @@ name = "dunce"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
+
+[[package]]
+name = "dvsc-registry"
+version = "0.1.0"
+source = "git+ssh://git@github.com/bshuler/irondivi-sidechain-market.git?rev=52fbd26928e6417ab9980863aa99de4e3b24392c#52fbd26928e6417ab9980863aa99de4e3b24392c"
+dependencies = [
+ "dvsm-manifest",
+ "hex",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
+name = "dvsm-manifest"
+version = "0.1.0"
+source = "git+ssh://git@github.com/bshuler/irondivi-sidechain-market.git?rev=52fbd26928e6417ab9980863aa99de4e3b24392c#52fbd26928e6417ab9980863aa99de4e3b24392c"
+dependencies = [
+ "base64 0.22.1",
+ "bs58",
+ "hex",
+ "ripemd 0.1.3",
+ "secp256k1 0.29.1",
+ "semver 1.0.27",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 1.0.69",
+]
 
 [[package]]
 name = "dyn-clone"
@@ -4672,10 +4709,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "irondivi-sidechains"
+version = "0.1.0"
+source = "git+ssh://git@github.com/bshuler/irondivi-sidechain-market.git?rev=52fbd26928e6417ab9980863aa99de4e3b24392c#52fbd26928e6417ab9980863aa99de4e3b24392c"
+dependencies = [
+ "axum",
+ "dvsc-registry",
+ "dvsm-manifest",
+ "hex",
+ "libc",
+ "reqwest 0.12.28",
+ "semver 1.0.27",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "irondivid"
 version = "0.2.9"
 dependencies = [
  "anyhow",
+ "axum",
  "base64 0.22.1",
  "chrono",
  "clap",
@@ -4692,7 +4750,10 @@ dependencies = [
  "divi-test-support",
  "divi-wallet",
  "divi-webui",
+ "dvsc-registry",
+ "dvsm-manifest",
  "hex",
+ "irondivi-sidechains",
  "libc",
  "rocksdb",
  "rustls",
@@ -7097,6 +7158,10 @@ name = "semver"
 version = "1.0.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d767eb0aabc880b29956c35734170f26ed551a859dbd361d140cdbeca61ab1e2"
+dependencies = [
+ "serde",
+ "serde_core",
+]
 
 [[package]]
 name = "semver-parser"

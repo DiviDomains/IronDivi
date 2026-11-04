@@ -160,6 +160,21 @@ fn each_run_records_its_start_phases_stop_and_exit() {
     assert!(lines[13].contains(" start run=2 "), "{log}");
     assert!(lines[0].contains(" network=regtest/divi "), "{log}");
     assert!(lines[0].contains(" daemon=no "), "{log}");
+    // A16: the binary's build-id, never `-` on Linux
+    #[cfg(target_os = "linux")]
+    {
+        let id = lines[0]
+            .split(" build-id=")
+            .nth(1)
+            .unwrap()
+            .split(' ')
+            .next()
+            .unwrap();
+        assert!(
+            id.len() >= 32 && id.bytes().all(|b| b.is_ascii_hexdigit()),
+            "{log}"
+        );
+    }
     // The sender: this test process, its command line masked
     let me = std::process::id();
     let uid = unsafe { libc::getuid() };
@@ -627,20 +642,31 @@ fn health_writes_a_line_with_each_group_of_fields() {
         " panics=0 ",
         " dropped_lines=",
         " sigpipe=0 ",
-        " rpc_calls=n/a ",
+        " rpc_calls=",
         " dumpable=",
         " dumpable_resets=0",
     ] {
         assert!(line.contains(field), "{field}: {line}");
     }
+    assert!(!line.contains(" rpc_calls=n/a "), "{line}");
     assert!(line.contains(" fd_source=fd/ "), "{line}");
-    // A second line, at the 10 s tick, reads the dumpable check's value
+    // Issue a few RPC calls so the next 10 s health tick records a positive count
+    for _ in 0..3 {
+        let _ = rpc(rpc_port, "getblockcount");
+    }
+    // A second line, at the 10 s tick, reads the dumpable check's value and rpc_calls >= 3
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let health = std::fs::read_to_string(dir.path().join("diag/health.log")).unwrap();
         if health.lines().count() >= 2 {
             let second = health.lines().nth(1).unwrap();
             assert!(second.contains(" dumpable=0 "), "{second}");
+            let calls: u64 = second
+                .split_whitespace()
+                .find_map(|kv| kv.strip_prefix("rpc_calls="))
+                .and_then(|v| v.parse().ok())
+                .unwrap_or_else(|| panic!("non-numeric rpc_calls in: {second}"));
+            assert!(calls >= 3, "expected rpc_calls >= 3 in: {second}");
             break;
         }
         assert!(Instant::now() < deadline, "{health}");

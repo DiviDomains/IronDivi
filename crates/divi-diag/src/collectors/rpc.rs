@@ -88,7 +88,7 @@ const BLOCK_ARG: &[&str] = &["getblock", "getblockheader", "getblockhash"];
 
 pub const CALL_SECS: u64 = 2;
 pub const TOTAL_SECS: u64 = 60;
-const MIN_FREE: u64 = 512 << 20;
+pub(crate) const MIN_FREE: u64 = 512 << 20;
 const MAX_TXCOUNT: u64 = 10_000;
 const MAX_MEMPOOL_VERBOSE: u64 = 5_000;
 const MAX_SINCE_DEPTH: i64 = 1_000;
@@ -100,6 +100,9 @@ pub struct Req {
     pub params: Vec<Value>,
     /// the clamps the parent applied, one line each
     pub clamps: Vec<String>,
+    /// named with `--rpc-clear`: after a yes to the redacted answer the
+    /// user is asked whether to send it in clear (§8.2, B6.5)
+    pub clear: bool,
 }
 
 /// `--rpc` arguments as the node takes them: JSON when it parses, else a
@@ -205,7 +208,161 @@ pub fn check(method: &str, mut params: Vec<Value>) -> Result<Req, String> {
         method: method.to_string(),
         params,
         clamps,
+        clear: false,
     })
+}
+
+/// `--rpc-clear` on top of [`check`]: never for getdiaginfo (§8.2), and
+/// never for a block method, whose block argument and answer follow the
+/// own-staked-block rule (B6.5 P2) that a clear answer would undo
+pub fn check_clear(method: &str, params: Vec<Value>) -> Result<Req, String> {
+    if method == "getdiaginfo" {
+        return Err("getdiaginfo is never sent in clear (§8.2)".into());
+    }
+    if BLOCK_ARG.contains(&method) {
+        return Err(format!(
+            "a block answer is never sent in clear: a block your wallet staked would show your stake; \
+             use --rpc {method} for its redacted answer, or --tx <txid> for one transaction in clear"
+        ));
+    }
+    check(method, params).map(|r| Req { clear: true, ..r })
+}
+
+/// Distinct addresses plus transaction ids above which an answer is not
+/// offered in clear (§8.2)
+const MAX_CLEAR: usize = 100;
+
+/// §8.2 `--rpc-clear`: asked only after a yes to the redacted answer of a
+/// call named with `--rpc-clear`. The node is called again (the redacted
+/// collector never hands the parent a clear answer), the clear drop and
+/// the clear pass are applied, the counts are shown and the user is asked
+/// once more. Returns the lines for `rpc/summary.txt` and the file
+/// written, if any.
+pub fn ask_clear(
+    ctx: &Ctx,
+    red: &Redactor,
+    root: &std::path::Path,
+    n: usize,
+    inp: &mut dyn std::io::BufRead,
+    out: &mut dyn std::io::Write,
+) -> (Vec<String>, Option<String>) {
+    let Some(req) = ctx.rpc.get(n.wrapping_sub(1)).filter(|r| r.clear) else {
+        return (vec![], None);
+    };
+    let not = |out: &mut dyn std::io::Write, why: String| {
+        let _ = writeln!(out, "Not offered in clear: {why}");
+        (vec![format!("    not in clear: {why}")], None)
+    };
+    let Some(d) = ctx
+        .rpc_datadir
+        .and_then(|k| ctx.datadirs.iter().find(|d| d.n == k))
+    else {
+        return not(out, "no data dir chosen".into());
+    };
+    let Some(node) = ctx.node_for(d) else {
+        return not(out, "the node is no longer running".into());
+    };
+    let rpc = match live::rpc_for(d, Some(node)) {
+        Ok(r) => r,
+        Err(why) => return not(out, why),
+    };
+    if let Some(b) = crate::mem::free_memory(Some(node.pid)).bytes {
+        if b < MIN_FREE {
+            return not(out, format!("free memory {} MB is under 512 MB", b >> 20));
+        }
+    }
+    let mut params = req.params.clone();
+    if let Gate::Refuse(why) = gate(&rpc, &req.method, &mut params) {
+        return not(out, why);
+    }
+    let v = match live::call(
+        &rpc,
+        &req.method,
+        Value::Array(params.clone()),
+        Duration::from_secs(CALL_SECS),
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            return not(
+                out,
+                format!("the call made again for the clear answer failed: {e}"),
+            )
+        }
+    };
+    let (v, dropped) = crate::rpcjson::clear(v);
+    let (na, nt) = crate::rpcjson::clear_counts(&v, &|s| red.is_address(s));
+    if na + nt > MAX_CLEAR {
+        return not(
+            out,
+            format!(
+                "it names {na} addresses and {nt} transaction ids, more than {MAX_CLEAR}; send one transaction \
+                 in clear with irondivi-cli diag --tx <txid>"
+            ),
+        );
+    }
+    let mut call = req.method.clone();
+    for p in &params {
+        call.push(' ');
+        call.push_str(&red.scrub_clear(&crate::rpcjson::backstop(&match p {
+            Value::String(x) => x.clone(),
+            other => other.to_string(),
+        })));
+    }
+    let text = red.scrub_clear(&serde_json::to_string_pretty(&v).unwrap_or_default());
+    let _ = writeln!(
+        out,
+        "\n---- the same answer in clear (the node was called again)"
+    );
+    let lines = text.lines().count();
+    for l in text.lines().take(PREVIEW_LINES) {
+        let _ = writeln!(out, "  | {l}");
+    }
+    if lines > PREVIEW_LINES {
+        let _ = writeln!(out, "  | ... {} more lines", lines - PREVIEW_LINES);
+    }
+    let _ = write!(
+        out,
+        "Send the answer to `{call}` in clear? It shows the amounts, {na} addresses and {nt} transaction ids in \
+         it. Scripts and raw transaction data are never sent in clear. [yes/no] "
+    );
+    let _ = out.flush();
+    let mut a = String::new();
+    if !(matches!(inp.read_line(&mut a), Ok(k) if k > 0) && crate::consent::is_yes(&a)) {
+        return (
+            vec!["    not in clear: you did not answer yes (§8.2)".into()],
+            None,
+        );
+    }
+    let rel = format!("rpc/clear/{n}-{}.json", req.method);
+    let path = root.join(&rel);
+    let wrote = (|| -> std::io::Result<()> {
+        use std::io::Write as _;
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path.parent().unwrap_or(root))?;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)?;
+        f.write_all(text.as_bytes())?;
+        f.write_all(b"\n")
+    })();
+    match wrote {
+        Ok(()) => (
+            vec![format!(
+                "    in clear: {rel}, you answered yes; {na} addresses, {nt} transaction ids, {dropped} script, raw \
+                 data and label fields dropped; the node was called again at consent time"
+            )],
+            Some(rel),
+        ),
+        Err(e) => {
+            let _ = std::fs::remove_file(&path);
+            (vec![format!("    not in clear: could not be written ({})", e.kind())], None)
+        }
+    }
 }
 
 /// The call as it is shown, logged and sent. The block argument of
@@ -706,6 +863,114 @@ pub fn rpc(ctx: &Ctx, o: &mut Out) {
     }
 }
 
+/// Lines of an answer shown on screen before its question; the rest is
+/// named by its file, which the review can page through
+const PREVIEW_LINES: usize = 200;
+
+/// The `--rpc-clear` question for call `n`, asked after a yes to its
+/// redacted answer; returns the lines for `rpc/summary.txt`
+pub type AskClear<'a> =
+    dyn FnMut(usize, &mut dyn std::io::BufRead, &mut dyn std::io::Write) -> Vec<String> + 'a;
+
+/// §8.2 "One RPC answer": every answer the collector wrote is shown,
+/// redacted, with its call line, clamps and dropped fields from
+/// `rpc/summary.txt`, then asked about on its own; only the full word
+/// `yes` keeps it. An answer not kept, or asked with no terminal, is
+/// deleted and its summary entry says why. Returns how many were kept.
+pub fn consent_answers(
+    root: &std::path::Path,
+    inp: &mut dyn std::io::BufRead,
+    out: &mut dyn std::io::Write,
+    tty: bool,
+    clear: &mut AskClear,
+) -> usize {
+    let sp = root.join("rpc/summary.txt");
+    let Ok(text) = std::fs::read_to_string(&sp) else {
+        return 0;
+    };
+    let lines: Vec<&str> = text.lines().collect();
+    let mut res: Vec<String> = Vec::with_capacity(lines.len() + 8);
+    let mut kept = 0;
+    let mut i = 0;
+    while i < lines.len() {
+        if !lines[i].starts_with("call ") {
+            res.push(lines[i].to_string());
+            i += 1;
+            continue;
+        }
+        let mut j = i + 1;
+        while j < lines.len() && lines[j].starts_with("    ") {
+            j += 1;
+        }
+        let block = &lines[i..j];
+        res.extend(block.iter().map(|l| l.to_string()));
+        let file = block.iter().find_map(|l| {
+            l.trim_start()
+                .strip_prefix("answered in ")
+                .and_then(|r| r.split_once(": "))
+                .map(|(_, f)| f.to_string())
+        });
+        if let Some(rel) = file.filter(|f| f.starts_with("rpc/") && !f.contains("..")) {
+            let path = root.join(&rel);
+            let keep = tty
+                && {
+                    let _ = writeln!(out, "\n---- {}", block.join("\n"));
+                    let body = std::fs::read_to_string(&path).unwrap_or_default();
+                    let n = body.lines().count();
+                    for l in body.lines().take(PREVIEW_LINES) {
+                        let _ = writeln!(out, "  | {l}");
+                    }
+                    if n > PREVIEW_LINES {
+                        let _ = writeln!(
+                            out,
+                            "  | ... {} more lines; the whole answer is {}",
+                            n - PREVIEW_LINES,
+                            path.display()
+                        );
+                    }
+                    let call = block[0].split_once(": ").map_or(block[0], |(_, c)| c);
+                    let _ = write!(
+                    out,
+                    "Include the answer to `{call}` shown above? Addresses and transaction ids in it are \
+                     pseudonymised, amounts, balances, values and fees are bucketed, stake weights are a ratio \
+                     bucket, confirmation counts are bucketed, and labels, comments, HD ids, scripts, raw \
+                     transaction hex, and the heights, times and block hashes of your transactions are dropped; \
+                     everything else is as shown. [yes/no] "
+                );
+                    let _ = out.flush();
+                    let mut a = String::new();
+                    matches!(inp.read_line(&mut a), Ok(n) if n > 0) && crate::consent::is_yes(&a)
+                };
+            if keep {
+                kept += 1;
+                res.push("    included: you answered yes".into());
+                let n = block[0]
+                    .strip_prefix("call ")
+                    .and_then(|r| r.split_once(':'))
+                    .and_then(|(k, _)| k.parse().ok());
+                if let Some(n) = n {
+                    res.extend(clear(n, inp, out));
+                }
+            } else {
+                let _ = std::fs::remove_file(&path);
+                res.push(
+                    if tty {
+                        "    not included: you did not answer yes (§8.2)"
+                    } else {
+                        "    not included: no terminal to ask on (§8.2), so the answer was deleted"
+                    }
+                    .into(),
+                );
+            }
+        }
+        i = j;
+    }
+    let mut t = res.join("\n");
+    t.push('\n');
+    let _ = std::fs::write(&sp, t);
+    kept
+}
+
 enum Gate {
     Go(Vec<String>),
     Refuse(String),
@@ -1069,5 +1334,86 @@ mod tests {
             &pubt,
         );
         assert_eq!(t.json, Value::Null);
+    }
+
+    #[test]
+    fn clear_is_refused_where_it_would_undo_a_rule() {
+        assert!(check_clear("getdiaginfo", vec![]).is_err());
+        for m in BLOCK_ARG {
+            assert!(check_clear(m, vec![Value::from(5)]).is_err(), "{m}");
+        }
+        assert!(check_clear("dumpprivkey", vec![]).is_err());
+        let r = check_clear(
+            "listtransactions",
+            vec![Value::from("*"), Value::from(5000)],
+        )
+        .unwrap();
+        assert!(r.clear && r.params[1] == 1000);
+        assert!(!check("getwalletinfo", vec![]).unwrap().clear);
+    }
+
+    #[test]
+    fn each_answer_is_asked_about_on_its_own() {
+        let d = tempfile::tempdir().unwrap();
+        let r = d.path();
+        std::fs::create_dir_all(r.join("rpc")).unwrap();
+        std::fs::write(r.join("rpc/1-getbalance.json"), "\"10-100\"\n").unwrap();
+        std::fs::write(r.join("rpc/2-getblockcount.json"), "113\n").unwrap();
+        let summary = "node: datadir-1 pid 1\nmnsync refused: x\n\ncall 1: getbalance\n    answered in 1 ms: rpc/1-getbalance.json\n    treatment: RPC answer: getbalance\n\ncall 2: getblockcount\n    answered in 0 ms: rpc/2-getblockcount.json\n\ncall 3: getpeerinfo\n    failed: timeout\n";
+        std::fs::write(r.join("rpc/summary.txt"), summary).unwrap();
+        let mut out = Vec::new();
+        // "y" is not yes; the second answer is
+        // the clear question comes after a yes only, with the call's number
+        let mut asked = Vec::new();
+        let mut clear = |n: usize, _: &mut dyn std::io::BufRead, _: &mut dyn std::io::Write| {
+            asked.push(n);
+            vec!["    not in clear: test".to_string()]
+        };
+        let n = consent_answers(r, &mut "y\nyes\n".as_bytes(), &mut out, true, &mut clear);
+        assert_eq!(n, 1);
+        assert_eq!(asked, vec![2]);
+        let screen = String::from_utf8(out).unwrap();
+        assert!(screen.contains("  | \"10-100\""), "{screen}");
+        assert!(
+            screen.contains("Include the answer to `getbalance` shown above?"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("treatment: RPC answer: getbalance"),
+            "{screen}"
+        );
+        assert!(!r.join("rpc/1-getbalance.json").exists());
+        assert!(r.join("rpc/2-getblockcount.json").exists());
+        let s = std::fs::read_to_string(r.join("rpc/summary.txt")).unwrap();
+        assert!(s.contains("rpc/1-getbalance.json\n    treatment: RPC answer: getbalance\n    not included: you did not answer yes"), "{s}");
+        assert!(
+            s.contains(
+                "rpc/2-getblockcount.json\n    included: you answered yes\n    not in clear: test"
+            ),
+            "{s}"
+        );
+        assert!(
+            s.contains("mnsync refused: x")
+                && s.contains("call 3: getpeerinfo\n    failed: timeout\n"),
+            "{s}"
+        );
+        // with no terminal nothing is asked and every answer goes
+        std::fs::write(r.join("rpc/summary.txt"), summary).unwrap();
+        let mut out = Vec::new();
+        assert_eq!(
+            consent_answers(
+                r,
+                &mut "yes\nyes\n".as_bytes(),
+                &mut out,
+                false,
+                &mut |_, _, _| vec![]
+            ),
+            0
+        );
+        assert!(out.is_empty());
+        assert!(!r.join("rpc/2-getblockcount.json").exists());
+        assert!(std::fs::read_to_string(r.join("rpc/summary.txt"))
+            .unwrap()
+            .contains("no terminal to ask on"));
     }
 }

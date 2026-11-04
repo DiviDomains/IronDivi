@@ -1525,35 +1525,44 @@ mod tests {
         fn sample(&mut self, _: u32) {}
     }
 
-    fn quick() -> Timing {
-        Timing {
-            start_bound: Duration::from_secs(2),
-            after_running: Duration::from_secs(1),
-            to_term: Duration::from_secs(1),
-            to_kill: Duration::from_secs(1),
-            tick: Duration::from_millis(50),
-            sample: Duration::from_secs(1),
-        }
-    }
-
-    fn stub(script: &str, log: &Path) -> Child {
-        Command::new("sh")
+    fn stub(script: &str, log: &Path, ready: &Path) -> Child {
+        let child = Command::new("sh")
             .arg("-c")
             .arg(script)
             .arg("sh")
             .arg(log)
+            .arg(ready)
             .spawn()
-            .unwrap()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !ready.exists() {
+            assert!(Instant::now() < deadline, "stub shell did not start");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        child
     }
 
     #[test]
     fn ladder_running_then_term() {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("runs.log");
+        let ready = dir.path().join("ready");
         std::fs::write(&log, "old line\n").unwrap();
-        let mut c = stub("echo 't mono=1 phase name=running prev=rpc' >> \"$1\"; trap 'exit 0' TERM; while :; do sleep 0.1; done", &log);
+        let mut c = stub(
+            "trap 'exit 0' TERM; echo 't mono=1 phase name=running prev=rpc' >> \"$1\"; : > \"$2\"; while :; do sleep 0.05; done",
+            &log,
+            &ready,
+        );
+        let timing = Timing {
+            start_bound: Duration::from_secs(15),
+            after_running: Duration::from_millis(100),
+            to_term: Duration::from_millis(100),
+            to_kill: Duration::from_secs(15),
+            tick: Duration::from_millis(20),
+            sample: Duration::from_secs(1),
+        };
         let mut h = Stub { stops: 0, snaps: 0 };
-        let l = ladder(&mut c, &log, 9, &quick(), &mut h);
+        let l = ladder(&mut c, &log, 9, &timing, &mut h);
         assert!(l.running_after.is_some(), "{:?}", l.events);
         assert_eq!((h.stops, h.snaps), (1, 0));
         assert_eq!(l.status.and_then(|s| s.code()), Some(0), "{:?}", l.events);
@@ -1565,9 +1574,22 @@ mod tests {
         use std::os::unix::process::ExitStatusExt;
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("runs.log");
-        let mut c = stub("trap '' TERM; while :; do sleep 0.1; done", &log);
+        let ready = dir.path().join("ready");
+        let mut c = stub(
+            "trap '' TERM; : > \"$2\"; while :; do sleep 0.1; done",
+            &log,
+            &ready,
+        );
+        let timing = Timing {
+            start_bound: Duration::from_millis(200),
+            after_running: Duration::from_millis(100),
+            to_term: Duration::from_millis(100),
+            to_kill: Duration::from_millis(200),
+            tick: Duration::from_millis(20),
+            sample: Duration::from_secs(1),
+        };
         let mut h = Stub { stops: 0, snaps: 0 };
-        let l = ladder(&mut c, &log, 0, &quick(), &mut h);
+        let l = ladder(&mut c, &log, 0, &timing, &mut h);
         assert!(l.running_after.is_none());
         assert_eq!((h.stops, h.snaps), (0, 2), "{:?}", l.events);
         assert_eq!(l.status.and_then(|s| s.signal()), Some(9), "{:?}", l.events);

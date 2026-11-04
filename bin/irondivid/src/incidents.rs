@@ -8,14 +8,14 @@
 
 //! A12 incidents: `<datadir>/diag/incidents/<n>/` with `info.txt` (kind,
 //! run, time, detail), `ring.txt` (the debug ring, A8), `debug.log.tail`
-//! (its last 256 KB) and `health.txt` (the last health record, A6).
+//! (its last 256 KB), `health.txt` (the last health record, A6) and
+//! `getdiaginfo.json` (A10's content, which never waits).
 //!
 //! The last 10 are kept, but the first incident of each kind stays
 //! (consensus N-k), so a long run of one kind cannot push out the incident
 //! that explains it. Written so far: a stall over 10 minutes (once per
-//! stall, A6) and a supervised task's panic (A4). Not yet: `getdiaginfo`
-//! output, and the other triggers A12 lists (invalid block, ban storm,
-//! watchdog, SIGQUIT/SIGUSR1), which come with their own parts.
+//! stall, A6), a supervised task's panic (A4), the watchdog's hangs (A17)
+//! and the chain events (A12).
 //!
 //! Never panics: the panic hook calls it.
 
@@ -39,6 +39,10 @@ pub fn set_data_dir(data_dir: &Path) {
 /// returns its number
 pub fn write(kind: &str, detail: &str) -> Option<u64> {
     let data_dir = DATA_DIR.get()?;
+    // A14: not while the low-disk pause is on
+    if crate::budget::paused() {
+        return None;
+    }
     // A panic while an incident is being written is not waited on
     let _guard = match WRITING.try_lock() {
         Ok(g) => g,
@@ -53,7 +57,7 @@ pub fn write(kind: &str, detail: &str) -> Option<u64> {
         return None;
     }
     let info = format!(
-        "kind={}\nrun={}\ntime={}\nmono={}\n{}\ngetdiaginfo: n/a (not built yet)\n",
+        "kind={}\nrun={}\ntime={}\nmono={}\n{}\n",
         kind,
         crate::runs_log::run_number(),
         crate::runs_log::utc_now(),
@@ -71,6 +75,13 @@ pub fn write(kind: &str, detail: &str) -> Option<u64> {
     put(
         &dir.join("health.txt"),
         crate::health::last_line().as_bytes(),
+    );
+    let info = crate::diaginfo::build();
+    put(
+        &dir.join("getdiaginfo.json"),
+        serde_json::to_string_pretty(&info)
+            .unwrap_or_default()
+            .as_bytes(),
     );
     prune(&root);
     Some(n)

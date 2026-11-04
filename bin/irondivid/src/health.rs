@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use divi_network::{BlockSync, PeerManager};
+use divi_network::{BlockSync, PeerManager, SporkManager};
 use divi_node::Mempool;
 use divi_primitives::hash::Hash256;
 use divi_storage::Chain;
@@ -50,6 +50,15 @@ type StakingFn = Box<dyn Fn() -> Staking + Send + Sync>;
 static STAKING: Mutex<Option<StakingFn>> = Mutex::new(None);
 /// The last line written, for incidents
 static LAST: Mutex<String> = Mutex::new(String::new());
+/// Wakes the `health` thread to write an immediate health record (e.g. SIGUSR1)
+static WAKE: (Mutex<bool>, std::sync::Condvar) = (Mutex::new(false), std::sync::Condvar::new());
+
+pub fn wake() {
+    if let Ok(mut w) = WAKE.0.try_lock() {
+        *w = true;
+        WAKE.1.notify_all();
+    }
+}
 
 pub fn set_staking(f: StakingFn) {
     *STAKING.lock().unwrap_or_else(|e| e.into_inner()) = Some(f);
@@ -78,6 +87,7 @@ pub struct Handles {
     pub block_sync: Arc<BlockSync>,
     pub peers: Arc<PeerManager>,
     pub mempool: Arc<Mempool>,
+    pub sporks: Arc<SporkManager>,
     pub data_dir: PathBuf,
 }
 
@@ -85,11 +95,35 @@ pub struct Handles {
 pub fn start(h: Handles) {
     let started = crate::tasks::thread("health", crate::tasks::Kind::Supervised, move || {
         let mut tick = Tick::default();
+        let mut prev: Option<Snap> = None;
         loop {
             let line = tick.line(&h);
             crate::events::HEALTH.record("health", &line);
+            // A12: the changes between this tick and the last, as events
+            let sporks = h
+                .sporks
+                .active_sporks()
+                .iter()
+                .map(|s| (s.spork_id, s.time_signed))
+                .collect();
+            let snap = Snap::of(&line, sporks);
+            if let Some(prev) = &prev {
+                for (kind, fields) in transitions(prev, &snap) {
+                    crate::events::event(kind, &fields);
+                }
+            }
+            prev = Some(snap);
             *LAST.lock().unwrap_or_else(|e| e.into_inner()) = line;
-            std::thread::sleep(interval());
+            // A15: a quiet minute after a busy one is still written
+            crate::rpc_log::tick();
+            #[cfg(unix)]
+            crate::watchdog::beat_health();
+            let guard = WAKE.0.lock().unwrap_or_else(|e| e.into_inner());
+            let (mut guard, _) = WAKE
+                .1
+                .wait_timeout_while(guard, interval(), |w| !*w)
+                .unwrap_or_else(|e| e.into_inner());
+            *guard = false;
         }
     });
     if let Err(e) = started {
@@ -104,6 +138,7 @@ struct Tick {
     wall_offset: Option<f64>,
     stall: StallLatch,
     reason: Option<&'static str>,
+    stakes: StakeDays,
 }
 
 impl Tick {
@@ -230,10 +265,131 @@ impl Tick {
             },
         );
         f.put("last_stake", stake_age_bucket(s.last_stake_time, now));
+        if let Some(day) = self.stakes.observe(s.last_stake_time, now) {
+            crate::events::event("stakes", &day);
+        }
         f.na("stakes_30d");
         f.na("stake_ratio");
         masternode(f);
     }
+}
+
+/// Stakes found per UTC day (A12): a stake is a rise of the staker's last
+/// stake time between two ticks, so two stakes within one tick count once.
+/// The day in progress is lost at a stop.
+#[derive(Default)]
+struct StakeDays {
+    seen: Option<u64>,
+    day: Option<i64>,
+    n: u32,
+}
+
+impl StakeDays {
+    /// Count a tick; the `day= n=` record of the day that just ended
+    fn observe(&mut self, last_stake_time: u64, now: u64) -> Option<String> {
+        let today = (now / 86_400) as i64;
+        let mut out = None;
+        if let Some(day) = self.day.filter(|d| *d != today) {
+            let date = crate::runs_log::format_utc(day * 86_400, 0);
+            out = Some(format!("day={} n={}", &date[..10], self.n));
+            self.n = 0;
+        }
+        self.day = Some(today);
+        if self.seen.is_some_and(|s| last_stake_time > s) {
+            self.n += 1;
+        }
+        self.seen = Some(last_stake_time);
+        out
+    }
+}
+
+/// The fields of a health line A12's transition events compare
+#[derive(Debug, Default, PartialEq)]
+struct Snap {
+    sync: Option<String>,
+    wallet: Option<String>,
+    disk_mb: Option<u64>,
+    /// `psi_mem`'s `some` ten-second average
+    psi_some: Option<f64>,
+    cgroup_high: Option<u64>,
+    time_offset: Option<i64>,
+    /// (id, time signed), sorted
+    sporks: Vec<(i32, i64)>,
+}
+
+impl Snap {
+    fn of(line: &str, mut sporks: Vec<(i32, i64)>) -> Snap {
+        let field = |key: &str| {
+            line.split(' ')
+                .find_map(|w| w.strip_prefix(key)?.strip_prefix('='))
+                .filter(|v| !v.starts_with("n/a") && !v.starts_with('"'))
+        };
+        sporks.sort_unstable();
+        Snap {
+            sync: field("sync").map(str::to_string),
+            wallet: field("wallet").map(str::to_string),
+            disk_mb: field("disk_free_mb").and_then(|v| v.parse().ok()),
+            psi_some: field("psi_mem")
+                .and_then(|v| v.strip_prefix("some:")?.split('/').next()?.parse().ok()),
+            cgroup_high: field("cgroup_mem_high_events").and_then(|v| v.parse().ok()),
+            time_offset: field("time_offset").and_then(|v| v.parse().ok()),
+            sporks,
+        }
+    }
+}
+
+/// Peer time offset above which the clock is called wrong (seconds)
+const OFFSET_WARN_S: i64 = 300;
+
+/// The events between two ticks: each a change of state or band, never a
+/// value that only moved within one
+fn transitions(prev: &Snap, now: &Snap) -> Vec<(&'static str, String)> {
+    let mut out = Vec::new();
+    // A field that was not read on one side is not a change
+    fn both<T, U: PartialEq>(a: &Option<T>, b: &Option<T>, f: impl Fn(&T) -> U) -> Option<U> {
+        match (a, b) {
+            (Some(a), Some(b)) if f(a) != f(b) => Some(f(b)),
+            _ => None,
+        }
+    }
+    if let Some(s) = both(&prev.sync, &now.sync, |s| s.clone()) {
+        out.push(("sync", format!("state={}", s)));
+    }
+    if let Some(s) = both(&prev.wallet, &now.wallet, |s| s.clone()) {
+        out.push(("wallet", format!("state={}", s)));
+    }
+    let band = |mb: &u64| match *mb {
+        0..=99 => "below-100mb",
+        100..=1023 => "below-1gb",
+        _ => "above-1gb",
+    };
+    if let Some(b) = both(&prev.disk_mb, &now.disk_mb, band) {
+        out.push(("disk", format!("free={}", b)));
+    }
+    let over = |p: &f64| if *p > 10.0 { "over-10" } else { "under-10" };
+    if let Some(b) = both(&prev.psi_some, &now.psi_some, over) {
+        out.push(("memory-pressure", format!("psi_mem={}", b)));
+    }
+    if let (Some(a), Some(b)) = (prev.cgroup_high, now.cgroup_high) {
+        if b > a {
+            out.push(("memory-pressure", format!("cgroup_high_events=+{}", b - a)));
+        }
+    }
+    let warn = |o: &i64| o.abs() > OFFSET_WARN_S;
+    if let Some(w) = both(&prev.time_offset, &now.time_offset, warn) {
+        out.push((
+            "time-offset",
+            format!(
+                "warning={} offset_s={}",
+                crate::runs_log::yes(w),
+                now.time_offset.unwrap_or_default()
+            ),
+        ));
+    }
+    for s in now.sporks.iter().filter(|s| !prev.sporks.contains(s)) {
+        out.push(("spork", format!("id={} signed={}", s.0, s.1)));
+    }
+    out
 }
 
 struct Clock {
@@ -291,8 +447,13 @@ fn counters(f: &mut Fields) {
         f.put("sigpipe", sigpipes.to_string());
         f.put("epipe", epipes.to_string());
     }
-    f.na("lock_waits");
-    f.na("rpc_calls");
+    // A17: waits of 1 s or more on the main locks since start
+    let waits: u64 = divi_primitives::diag_lock::counts()
+        .iter()
+        .map(|w| w.1)
+        .sum();
+    f.put("lock_waits", waits.to_string());
+    f.put("rpc_calls", divi_primitives::diag_rpc::calls().to_string());
     match DUMPABLE.load(Ordering::Relaxed) {
         -1 if cfg!(target_os = "linux") => f.put("dumpable", "not-yet"),
         -1 => f.na_mac("dumpable"),
@@ -687,6 +848,8 @@ fn disk(f: &mut Fields, h: &Handles) {
     let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
     if path.is_some_and(|p| unsafe { libc::statvfs(p.as_ptr(), &mut st) } == 0) {
         let free = st.f_bavail as u64 * st.f_frsize as u64;
+        // A14: the low-disk pause follows this sample
+        crate::budget::sample(free);
         f.put("disk_free_mb", (free >> 20).to_string());
         f.put("inodes_free", (st.f_favail as u64).to_string());
     } else {
@@ -772,6 +935,67 @@ mod tests {
         assert_eq!(stake_age_bucket(now - 3 * 86_400, now), "1-7d");
         assert_eq!(stake_age_bucket(now - 20 * 86_400, now), "7-30d");
         assert_eq!(stake_age_bucket(now - 40 * 86_400, now), "gt-30d");
+    }
+
+    #[test]
+    fn stakes_are_counted_per_utc_day_from_the_second_tick() {
+        let day = 20_000 * 86_400;
+        let mut s = StakeDays::default();
+        // The first tick is the baseline, whatever the last stake
+        assert_eq!(s.observe(day - 5, day + 10), None);
+        assert_eq!(s.observe(day + 20, day + 60), None);
+        assert_eq!(s.observe(day + 20, day + 120), None);
+        assert_eq!(s.observe(day + 500, day + 600), None);
+        let next = s.observe(day + 500, day + 86_400 + 5).unwrap();
+        assert_eq!(next, "day=2024-10-04 n=2");
+        assert_eq!(
+            s.observe(day + 500, day + 2 * 86_400).as_deref(),
+            Some("day=2024-10-05 n=0")
+        );
+    }
+
+    #[test]
+    fn health_transitions_are_changes_of_state_or_band() {
+        let line = |sync: &str, disk: u64, psi: &str, high: u64, off: i64| {
+            format!(
+                "pid=1 psi_mem={} cgroup_mem_high_events={} disk_free_mb={} \
+                 time_offset={} sync={} staking=no wallet=locked",
+                psi, high, disk, off, sync
+            )
+        };
+        let a = Snap::of(
+            &line("headers", 5000, "some:0.00/full:0.00", 3, 2),
+            vec![(10007, 5)],
+        );
+        assert_eq!(a.psi_some, Some(0.0));
+        assert!(transitions(&a, &a).is_empty());
+        // Values moving within a band are no event
+        let b = Snap::of(
+            &line("headers", 4000, "some:9.99/full:1.00", 3, -250),
+            vec![(10007, 5)],
+        );
+        assert!(transitions(&a, &b).is_empty());
+        let c = Snap::of(
+            &line("synced", 50, "some:12.50/full:3.00", 7, 400),
+            vec![(10008, 9), (10007, 5)],
+        );
+        assert_eq!(
+            transitions(&b, &c),
+            vec![
+                ("sync", "state=synced".to_string()),
+                ("disk", "free=below-100mb".to_string()),
+                ("memory-pressure", "psi_mem=over-10".to_string()),
+                ("memory-pressure", "cgroup_high_events=+4".to_string()),
+                ("time-offset", "warning=yes offset_s=400".to_string()),
+                ("spork", "id=10008 signed=9".to_string()),
+            ]
+        );
+        // A field not read (macOS) is never a change
+        let mac = Snap::of("psi_mem=\"n/a (macOS)\" sync=synced", vec![]);
+        assert_eq!(mac.psi_some, None);
+        assert!(transitions(&c, &mac)
+            .iter()
+            .all(|(k, _)| *k != "memory-pressure"));
     }
 
     #[cfg(target_os = "linux")]

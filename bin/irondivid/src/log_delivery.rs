@@ -139,6 +139,7 @@ fn writer() {
 /// The queue drained after a burst of dropped lines
 fn note_dropped(n: u64) {
     crate::runs_log::record("dropped", &format!("lines={}", n));
+    crate::events::event("dropped", &format!("lines={}", n));
     let line = format!(
         "{} WARN irondivid::log: {} log lines dropped: the debug.log writer was behind for {} s\n",
         crate::runs_log::utc_now(),

@@ -16,6 +16,10 @@
 //! ignored (the node goes on). A writer never panics: the panic hook calls
 //! it. A record asked for while the same thread is writing (a panic inside
 //! the writer) is dropped rather than waiting on itself.
+//!
+//! A14: nothing is written while the low-disk pause is on
+//! ([`crate::budget`]), and the last 1 MB of events.log is also kept in
+//! the mirror directory ([`crate::mirror`]), written first.
 
 use std::cell::Cell;
 use std::fs::File;
@@ -32,6 +36,8 @@ pub struct Log {
     keep: usize,
     /// fdatasync after each record
     durable: bool,
+    /// A copy written first, in the A14 mirror directory
+    mirror: Option<&'static Log>,
     state: Mutex<Option<Open>>,
 }
 
@@ -47,24 +53,45 @@ thread_local! {
 }
 
 /// State transitions (A12)
-pub static EVENTS: Log = Log::new("events.log", 4 << 20, 2, true);
+pub static EVENTS: Log = Log::mirrored("events.log", 4 << 20, 2, true, &EVENTS_MIRROR);
+/// The last 1 MB of events.log, in the mirror directory (A14)
+static EVENTS_MIRROR: Log = Log::new("events.log", 512 << 10, 2, true);
 /// Chain transitions: stalls for now (A12)
 pub static CHAIN_EVENTS: Log = Log::new("chain-events.log", 4 << 20, 2, true);
 /// One line per tick (A6)
 pub static HEALTH: Log = Log::new("health.log", 1 << 20, 5, false);
 
 impl Log {
-    const fn new(name: &'static str, cap: u64, keep: usize, durable: bool) -> Self {
+    pub(crate) const fn new(name: &'static str, cap: u64, keep: usize, durable: bool) -> Self {
         Log {
             name,
             cap,
             keep,
             durable,
+            mirror: None,
             state: Mutex::new(None),
         }
     }
 
-    fn set_dir(&self, diag: &Path) {
+    /// A log that writes `mirror` first
+    pub(crate) const fn mirrored(
+        name: &'static str,
+        cap: u64,
+        keep: usize,
+        durable: bool,
+        mirror: &'static Log,
+    ) -> Self {
+        Log {
+            name,
+            cap,
+            keep,
+            durable,
+            mirror: Some(mirror),
+            state: Mutex::new(None),
+        }
+    }
+
+    pub(crate) fn set_dir(&self, diag: &Path) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.is_none() {
             *state = Some(Open {
@@ -89,8 +116,22 @@ impl Log {
     }
 
     fn write_line(&self, line: &[u8]) {
+        self.write_gated(line, crate::budget::paused());
+    }
+
+    /// `write_line` with the pause given (the tests' way past the global)
+    fn write_gated(&self, line: &[u8], paused: bool) {
+        if paused {
+            return;
+        }
         if WRITING.with(|w| w.replace(true)) {
             return;
+        }
+        if let Some(mirror) = self.mirror {
+            let mut state = mirror.state.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(open) = state.as_mut() {
+                mirror.write_locked(open, line);
+            }
         }
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(open) = state.as_mut() {
@@ -148,14 +189,65 @@ pub fn set_data_dir(data_dir: &Path) {
     }
 }
 
+/// The events.log mirror goes into `dir` (A14)
+pub fn set_mirror_dir(dir: &Path) {
+    EVENTS_MIRROR.set_dir(dir);
+}
+
 /// A record in events.log
 pub fn event(kind: &str, fields: &str) {
     EVENTS.record(kind, fields);
 }
 
+/// The `config` event (A12): whether the config file's sha256 differs
+/// from the last start's, kept in `diag/config.sha256`. The hash itself is
+/// never written to a log.
+pub fn note_config(data_dir: &Path, conf: &Path) {
+    let now = match std::fs::read(conf) {
+        Ok(bytes) => hex::encode(divi_crypto::sha256(&bytes)),
+        Err(_) => "none".to_string(),
+    };
+    let kept = data_dir.join("diag").join("config.sha256");
+    let prev = std::fs::read_to_string(&kept).ok();
+    if let Some(changed) = config_change(prev.as_deref(), &now) {
+        event("config", &format!("changed={}", changed));
+        let _ = crate::private_files::write_private_atomic(&kept, now.as_bytes());
+    }
+}
+
+/// `first` with no hash kept, `yes` for a different one, none for the same
+fn config_change(prev: Option<&str>, now: &str) -> Option<&'static str> {
+    match prev.map(str::trim) {
+        None => Some("first"),
+        Some(p) if p != now => Some("yes"),
+        Some(_) => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_config_change_is_reported_once_and_never_its_hash() {
+        assert_eq!(config_change(None, "ab"), Some("first"));
+        assert_eq!(config_change(Some("ab\n"), "ab"), None);
+        assert_eq!(config_change(Some("ab"), "none"), Some("yes"));
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("diag")).unwrap();
+        let conf = dir.path().join("divi.conf");
+        std::fs::write(&conf, "rpcuser=x\n").unwrap();
+        note_config(dir.path(), &conf);
+        let kept = std::fs::read_to_string(dir.path().join("diag/config.sha256")).unwrap();
+        assert_eq!(kept.len(), 64);
+        note_config(dir.path(), &conf);
+        std::fs::write(&conf, "rpcuser=y\n").unwrap();
+        note_config(dir.path(), &conf);
+        assert_ne!(
+            std::fs::read_to_string(dir.path().join("diag/config.sha256")).unwrap(),
+            kept
+        );
+    }
 
     #[test]
     fn a_full_log_is_rotated_and_only_keep_files_stay() {
@@ -176,6 +268,27 @@ mod tests {
         let first: Vec<u32> = all.lines().map(|l| l[5..7].parse().unwrap()).collect();
         assert!(first.windows(2).all(|w| w[1] == w[0] + 1), "{all}");
         assert_eq!(*first.last().unwrap(), 19);
+    }
+
+    #[test]
+    fn nothing_is_written_while_paused_and_the_mirror_comes_first() {
+        static M: Log = Log::new("m.log", 1 << 20, 2, false);
+        let dir = tempfile::tempdir().unwrap();
+        let log = Log::mirrored("t.log", 1 << 20, 2, false, &M);
+        log.set_dir(dir.path());
+        log.write_gated(b"dropped\n", true);
+        assert!(!dir.path().join("t.log").exists());
+        log.write_gated(b"kept\n", false);
+        assert_eq!(std::fs::read(dir.path().join("t.log")).unwrap(), b"kept\n");
+        let mdir = dir.path().join("mirror");
+        std::fs::create_dir(&mdir).unwrap();
+        M.set_dir(&mdir);
+        log.write_gated(b"both\n", false);
+        assert_eq!(std::fs::read(mdir.join("m.log")).unwrap(), b"both\n");
+        assert_eq!(
+            std::fs::read(dir.path().join("t.log")).unwrap(),
+            b"kept\nboth\n"
+        );
     }
 
     #[test]

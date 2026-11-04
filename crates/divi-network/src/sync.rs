@@ -1300,7 +1300,8 @@ impl BlockSync {
     /// Returns true when the block is invalid, scored or not, so callers drop it
     /// instead of retrying: Divi Core keeps nothing of a block it refuses, and asks
     /// for nothing more because of it. An orphan or a local error is kept.
-    fn note_block_rejected(&self, hash: &Hash256, err: &StorageError) -> bool {
+    fn note_block_rejected(&self, hash: &Hash256, block: &Block, err: &StorageError) -> bool {
+        let prev = &block.header.prev_block;
         // Divi Core tells the peer why (main.cpp:840-843), score or none
         if let Some((code, reason)) = err.block_reject() {
             let source = self.block_sources.read().get(hash).copied();
@@ -1327,7 +1328,24 @@ impl BlockSync {
         if !invalid {
             return false;
         }
-        if let Some(peer_id) = self.block_sources.write().remove(hash) {
+        let source = self.block_sources.write().remove(hash);
+        // A12: before the score, which may ban the peer and drop its stats
+        let reason = err.to_string();
+        divi_primitives::diag_events::emit(&divi_primitives::diag_events::Event::InvalidBlock {
+            hash: *hash,
+            height: self
+                .chain
+                .get_block_index(prev)
+                .ok()
+                .flatten()
+                .map(|p| p.height + 1),
+            reason: &reason,
+            peer: source.and_then(|id| self.peer_manager.peer_ip(id)),
+            // A13: the bundle keeps the block and the refusal's code path
+            block: Some(block),
+            code: divi_primitives::diag_events::code_of(&format!("{:?}", err)),
+        });
+        if let Some(peer_id) = source {
             if score > 0 {
                 self.peer_manager.report_misbehavior_score(
                     peer_id,
@@ -1492,7 +1510,7 @@ impl BlockSync {
                 }
                 Err(e) => {
                     log_block_connect_failed(&hash, &e);
-                    self.note_block_rejected(&hash, &e);
+                    self.note_block_rejected(&hash, &block, &e);
                     break;
                 }
             }
@@ -1617,7 +1635,7 @@ impl BlockSync {
                 }
                 Err(e) => {
                     log_block_connect_failed(&hash, &e);
-                    self.note_block_rejected(&hash, &e);
+                    self.note_block_rejected(&hash, &block, &e);
                     break;
                 }
             }
@@ -1671,7 +1689,7 @@ impl BlockSync {
                     Err(e) => {
                         // An invalid block is scored and dropped; an orphan is
                         // kept, it might be usable after we get more blocks
-                        if self.note_block_rejected(&hash, &e) {
+                        if self.note_block_rejected(&hash, &block, &e) {
                             self.downloaded_blocks.write().remove(&hash);
                             warn!("Dropped invalid block {}: {}", hash, e);
                         } else {
@@ -2568,7 +2586,7 @@ impl BlockSync {
                         connected_any = true;
                     }
                     Err(e) => {
-                        if self.note_block_rejected(&hash, &e) {
+                        if self.note_block_rejected(&hash, &block, &e) {
                             self.orphan_blocks.write().remove(&hash);
                             warn!("Dropped invalid orphan block {}: {}", hash, e);
                         } else {
@@ -2752,6 +2770,7 @@ mod tests {
         use divi_storage::StorageError;
         let (sync, _dir) = create_test_sync();
         let hash = Hash256::from_bytes([5; 32]);
+        let block = Block::new();
         for (error, dropped) in [
             (
                 StorageError::invalid_block_scored(0, "bad-diffbits".into()),
@@ -2765,7 +2784,11 @@ mod tests {
             (StorageError::OrphanBlock("parent".into()), false),
             (StorageError::ChainState("local".into()), false),
         ] {
-            assert_eq!(sync.note_block_rejected(&hash, &error), dropped, "{error}");
+            assert_eq!(
+                sync.note_block_rejected(&hash, &block, &error),
+                dropped,
+                "{error}"
+            );
         }
     }
 

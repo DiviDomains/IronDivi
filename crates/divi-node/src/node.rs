@@ -2282,6 +2282,16 @@ impl Node {
                 // the refusal bans still gets it (main.cpp:803-811)
                 if let Err(e) = &result {
                     if let Some(msg) = relay_reject(e, &event.txid) {
+                        // A12: a refusal with a reject message; the node's
+                        // sink leaves out the wallet's own
+                        let reason = e.to_string();
+                        divi_primitives::diag_events::emit(
+                            &divi_primitives::diag_events::Event::RejectedTx {
+                                txid: event.txid,
+                                tx: &event.tx,
+                                reason: &reason,
+                            },
+                        );
                         let _ = peers_for_relay.send_to_peer(event.from_peer, msg).await;
                     }
                     score_relayed_refusal(&peers_for_relay, &event, e);

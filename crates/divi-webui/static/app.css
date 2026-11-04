@@ -67,3 +67,27 @@ canvas.qr { width: 100%; max-width: 300px; height: auto; image-rendering: pixela
 .uri { overflow-wrap: anywhere; }
 .scanner { margin-bottom: 12px; }
 video.scan { width: 100%; max-width: 420px; border-radius: 8px; background: #000; margin-top: 8px; }
+.logs { font-size: 12px; line-height: 1.45; white-space: pre-wrap; word-break: break-word; height: 50vh; }
+.logs .lvl-error { color: #e5484d; }
+.logs .lvl-warn { color: #d9a400; }
+.logs .lvl-debug, .logs .lvl-trace { opacity: 0.7; }
+label.check { display: inline-flex; align-items: center; gap: 4px; margin-right: 10px; }
+
+/* The interface wallets */
+ol.words { columns: 9em 3; column-gap: 2.5em; font-family: ui-monospace, monospace; margin: 0.5rem 0 1rem; padding-left: 2.5em; }
+ol.words li { break-inside: avoid; }
+.card.warn { border-color: #c98a00; }
+td.neg { color: #c0392b; }
+td.pos { color: #1e8449; }
+.field.check { display: flex; gap: 0.5rem; align-items: center; }
+.field.check input { width: auto; }
+.field.check span { display: inline; margin: 0; }
+
+/* Sidechains */
+.badge.ok { color: var(--ok); border-color: var(--ok); }
+.badge.err { color: var(--err); border-color: var(--err); }
+.card.grey { opacity: 0.6; }
+h4 { margin: 12px 0 6px; font-size: 14px; }
+details.drawer { margin-top: 10px; }
+details.drawer summary { cursor: pointer; color: var(--accent); }
+.drawer-body { margin-top: 8px; }

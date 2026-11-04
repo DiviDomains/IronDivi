@@ -366,6 +366,209 @@ pub type ShutdownCallback = Arc<dyn Fn() + Send + Sync>;
 /// (or `debug` / `default`) and returns the levels now in force
 pub type LogLevelsCallback = Arc<dyn Fn(&str) -> Result<String, String> + Send + Sync>;
 
+/// Extra node-level diagnostic state supplied by `irondivid` for `getdiaginfo` (A10):
+/// `(base_diaginfo_json, sent_txid_hex_list)`.
+pub type DiagInfoCallback = Arc<dyn Fn() -> (serde_json::Value, Vec<String>) + Send + Sync>;
+
+/// Transport on which a call entered [`RpcServer`] (diag plan A10)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CallerTransport {
+    JsonRpc,
+    WebUi,
+    Electrum,
+    Internal,
+    Unknown,
+}
+
+/// Caller identity for gating local-only diagnostics (`known_values`, A10 V2/W5)
+/// and recording A15 JSON-RPC calls without double-counting Web UI or Electrum.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Caller {
+    pub transport: CallerTransport,
+    pub peer: Option<std::net::IpAddr>,
+    pub proxied: bool,
+    pub authenticated: bool,
+}
+
+impl Caller {
+    /// HTTP JSON-RPC caller from `peer`
+    pub fn json_rpc(peer: std::net::IpAddr, proxied: bool, authenticated: bool) -> Self {
+        Caller {
+            transport: CallerTransport::JsonRpc,
+            peer: Some(peer),
+            proxied,
+            authenticated,
+        }
+    }
+
+    /// In-process Web UI caller (recorded separately under `Transport::WebUi`)
+    pub fn webui() -> Self {
+        Caller {
+            transport: CallerTransport::WebUi,
+            peer: None,
+            proxied: false,
+            authenticated: true,
+        }
+    }
+
+    /// In-process Electrum backend caller (recorded separately under `Transport::Electrum`)
+    pub fn electrum() -> Self {
+        Caller {
+            transport: CallerTransport::Electrum,
+            peer: None,
+            proxied: false,
+            authenticated: false,
+        }
+    }
+
+    /// Internal / unit-test caller
+    pub fn internal() -> Self {
+        Caller {
+            transport: CallerTransport::Internal,
+            peer: None,
+            proxied: false,
+            authenticated: false,
+        }
+    }
+
+    /// Missing caller extension on a route mounted without the access middleware (W5)
+    pub fn unknown() -> Self {
+        Caller {
+            transport: CallerTransport::Unknown,
+            peer: None,
+            proxied: false,
+            authenticated: false,
+        }
+    }
+
+    /// Whether `peer` is a loopback IPv4, IPv6, or IPv4-mapped IPv6 address
+    pub fn is_loopback_peer(&self) -> bool {
+        match self.peer {
+            Some(std::net::IpAddr::V4(v4)) => v4.is_loopback(),
+            Some(std::net::IpAddr::V6(v6)) => {
+                v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+            }
+            None => false,
+        }
+    }
+
+    /// V2 & W5: `known_values` is served only on unproxied loopback JSON-RPC
+    pub fn allows_known_values(&self) -> bool {
+        self.transport == CallerTransport::JsonRpc && self.is_loopback_peer() && !self.proxied
+    }
+}
+
+fn has_proxy_header(headers: &HeaderMap) -> bool {
+    headers.contains_key("forwarded")
+        || headers.contains_key("x-forwarded-for")
+        || headers.contains_key("x-real-ip")
+}
+
+fn siphash24(k0: u64, k1: u64, data: &[u8; 8]) -> u64 {
+    let mut v0 = k0 ^ 0x736f6d6570736575u64;
+    let mut v1 = k1 ^ 0x646f72616e646f6du64;
+    let mut v2 = k0 ^ 0x6c7967656e657261u64;
+    let mut v3 = k1 ^ 0x7465646279746573u64;
+
+    macro_rules! sipround {
+        () => {
+            v0 = v0.wrapping_add(v1);
+            v1 = v1.rotate_left(13) ^ v0;
+            v0 = v0.rotate_left(32);
+            v2 = v2.wrapping_add(v3);
+            v3 = v3.rotate_left(16) ^ v2;
+            v0 = v0.wrapping_add(v3);
+            v3 = v3.rotate_left(21) ^ v0;
+            v2 = v2.wrapping_add(v1);
+            v1 = v1.rotate_left(17) ^ v2;
+            v2 = v2.rotate_left(32);
+        };
+    }
+
+    let m = u64::from_le_bytes(*data);
+    v3 ^= m;
+    sipround!();
+    sipround!();
+    v0 ^= m;
+
+    let b = (data.len() as u64) << 56;
+    v3 ^= b;
+    sipround!();
+    sipround!();
+    v0 ^= b;
+
+    v2 ^= 0xff;
+    sipround!();
+    sipround!();
+    sipround!();
+    sipround!();
+    v0 ^ v1 ^ v2 ^ v3
+}
+
+/// N1 rolling-hash + SipHash-2-4 tag for secret-named environment values (diag plan A10):
+/// computes `k2 = HMAC_SHA256(diag_key, "tag")`, polynomial rolling hash `R_b(value) mod (2^61 - 1)`
+/// with base `b` derived from `k2[0..8]`, and returns `(R_b, SipHash24(k2[16..32], le_bytes(R_b)) as u16)`.
+/// Only the 16-bit SipHash output is ever emitted by `getdiaginfo`.
+pub fn compute_n1_secret_tag(diag_key: &[u8; 32], value: &[u8]) -> (u64, u16) {
+    use hmac::{Hmac, Mac};
+    const M61: u64 = (1u64 << 61) - 1;
+
+    let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(diag_key).expect("32-byte HMAC key");
+    mac.update(b"tag");
+    let k2 = zeroize::Zeroizing::new(<[u8; 32]>::from(mac.finalize().into_bytes()));
+
+    let raw_b = u64::from_le_bytes(k2[0..8].try_into().unwrap()) & M61;
+    let b = (raw_b % M61).max(257);
+
+    let mut acc: u64 = 0;
+    for &byte in value {
+        let prod = (acc as u128) * (b as u128) + (byte as u128);
+        let folded = ((prod & (M61 as u128)) + (prod >> 61)) as u64;
+        acc = if folded >= M61 { folded - M61 } else { folded };
+    }
+
+    let k0 = u64::from_le_bytes(k2[16..24].try_into().unwrap());
+    let k1 = u64::from_le_bytes(k2[24..32].try_into().unwrap());
+    let sip = siphash24(k0, k1, &acc.to_le_bytes());
+    (acc, (sip & 0xffff) as u16)
+}
+
+fn is_secret_env_name(name: &str, value: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.contains("pass")
+        || lower.contains("secret")
+        || lower.contains("token")
+        || lower.contains("key")
+        || lower.contains("auth")
+        || lower.contains("cookie")
+        || lower.contains("seed")
+        || lower.contains("mnemonic")
+        || lower.contains("wif")
+        || lower.contains("priv")
+        || lower == "rpcuser"
+        || lower == "database_url"
+        || (lower.ends_with("_url") && value.contains("://") && value.contains('@'))
+}
+
+fn is_excluded_env_name(name: &str) -> bool {
+    matches!(
+        name,
+        "PATH"
+            | "TERM"
+            | "SHELL"
+            | "SHLVL"
+            | "LANG"
+            | "TZ"
+            | "PWD"
+            | "OLDPWD"
+            | "_"
+            | "RUST_LOG"
+            | "RUST_BACKTRACE"
+            | "COLORTERM"
+            | "LS_COLORS"
+    ) || name.starts_with("LC_")
+}
+
 /// RPC server state
 pub struct RpcServer {
     blockchain: BlockchainRpc,
@@ -381,6 +584,7 @@ pub struct RpcServer {
     /// new connection
     stopping: tokio::sync::watch::Sender<bool>,
     log_levels: RwLock<Option<LogLevelsCallback>>,
+    diag_info: RwLock<Option<DiagInfoCallback>>,
 }
 
 impl RpcServer {
@@ -398,6 +602,7 @@ impl RpcServer {
             shutdown: RwLock::new(None),
             stopping: tokio::sync::watch::channel(false).0,
             log_levels: RwLock::new(None),
+            diag_info: RwLock::new(None),
         }
     }
 
@@ -415,6 +620,7 @@ impl RpcServer {
             shutdown: RwLock::new(None),
             stopping: tokio::sync::watch::channel(false).0,
             log_levels: RwLock::new(None),
+            diag_info: RwLock::new(None),
         }
     }
 
@@ -432,6 +638,7 @@ impl RpcServer {
             shutdown: RwLock::new(None),
             stopping: tokio::sync::watch::channel(false).0,
             log_levels: RwLock::new(None),
+            diag_info: RwLock::new(None),
         }
     }
 
@@ -453,6 +660,7 @@ impl RpcServer {
             shutdown: RwLock::new(None),
             stopping: tokio::sync::watch::channel(false).0,
             log_levels: RwLock::new(None),
+            diag_info: RwLock::new(None),
         }
     }
 
@@ -574,56 +782,144 @@ impl RpcServer {
         *self.log_config.write() = Some(config);
     }
 
+    /// Set the node diagnostic callback used by `getdiaginfo` (diag plan A10)
+    pub fn set_diag_info_callback(&self, callback: DiagInfoCallback) {
+        *self.diag_info.write() = Some(callback);
+    }
+
     /// Get current log configuration
     fn get_log_config(&self, _params: &Params) -> Result<serde_json::Value, Error> {
         let config = self.log_config.read();
-        match &*config {
-            Some(c) => Ok(serde_json::json!({
-                "max_file_size": c.max_file_size,
-                "max_file_size_mb": c.max_file_size / 1_048_576,
-                "max_files": c.max_files,
-                "debug": c.debug,
-                "levels": c.levels,
-                "print_to_console": c.print_to_console
-            })),
-            None => Ok(serde_json::json!({
+        let Some(c) = &*config else {
+            return Ok(serde_json::json!({
                 "error": "Log configuration not available"
-            })),
+            }));
+        };
+        let mut out = serde_json::json!({
+            "max_file_size": c.max_file_size,
+            "max_file_size_mb": c.max_file_size / 1_048_576,
+            "max_files": c.max_files,
+            "debug": c.debug,
+            "levels": c.levels,
+            "print_to_console": c.print_to_console
+        });
+        if let Some(live) = crate::logctl::control() {
+            let st = live.state();
+            let spec = st.spec();
+            let debug = !st.categories.is_empty() || st.level == "debug" || st.level == "trace";
+            out["debug"] = serde_json::json!(debug);
+            // Keep `c.levels` when it holds per-category non-debug levels set via
+            // 1-arg `setlogconfig`; otherwise reflect live WebUI updates too
+            if !c.levels.contains(':') || st.categories.iter().any(|cat| !c.levels.contains(cat)) {
+                out["levels"] = serde_json::json!(spec);
+            }
+            out["level"] = serde_json::json!(st.level);
+            out["categories"] = serde_json::json!(st.categories);
+            out["env_override"] = serde_json::json!(st.env_override);
         }
+        Ok(out)
     }
 
     /// Change the log levels of the running node: `true` is every category
-    /// at debug, `false` the start-up default, a string a `loglevel` value
+    /// at debug, `false` the start-up default, a single string is a `loglevel`
+    /// value (`"default"`, `"info,sync:debug"`), or `"<level>" ["<category>",...]`
+    /// sets the overall level and debug categories (a list or comma-separated string).
     fn set_log_config_rpc(&self, params: &Params) -> Result<serde_json::Value, Error> {
-        let spec = match (params.get_bool(0), params.get_str(0)) {
-            (Some(true), _) => "debug".to_string(),
-            (Some(false), _) => "default".to_string(),
-            (None, Some(s)) => s.to_string(),
-            (None, None) => return Err(RpcError::invalid_params(
-                "setlogconfig needs true, false or a loglevel value such as \"info,sync:debug\"",
-            )
-            .into()),
+        let usage = || {
+            Error::from(RpcError::invalid_params(
+                "setlogconfig needs true, false, a loglevel value such as \"info,sync:debug\", or \"<level>\" [\"<category>\",...]",
+            ))
         };
-        let callback = self.log_levels.read().clone();
-        let Some(callback) = callback else {
-            return Err(
-                RpcError::internal_error("log levels cannot be changed in this node").into(),
-            );
+        let two_arg_cats: Option<Vec<String>> = match params.get(1) {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::Array(a)) => Some(
+                a.iter()
+                    .map(|v| v.as_str().map(str::to_string).ok_or_else(usage))
+                    .collect::<Result<_, _>>()?,
+            ),
+            Some(serde_json::Value::String(c)) => Some(
+                c.split(',')
+                    .map(|x| x.trim().to_string())
+                    .filter(|x| !x.is_empty())
+                    .collect(),
+            ),
+            _ => return Err(usage()),
         };
-        let levels = callback(&spec).map_err(RpcError::invalid_params)?;
-        let debug = levels.split(',').any(|l| {
-            let lvl = l.rsplit(':').next().unwrap_or(l);
-            lvl == "debug" || lvl == "trace"
-        });
-        if let Some(c) = self.log_config.write().as_mut() {
-            c.levels = levels.clone();
-            c.debug = debug;
+
+        let spec = match (params.get_bool(0), params.get_str(0), &two_arg_cats) {
+            (Some(true), _, None) => "debug".to_string(),
+            (Some(false), _, None) => "default".to_string(),
+            (None, Some(level), Some(cats)) => {
+                let norm = crate::logctl::normalize(cats);
+                if norm.iter().any(|c| c == "all") {
+                    "debug".to_string()
+                } else if norm.is_empty() {
+                    level.trim().to_string()
+                } else {
+                    let mut s = level.trim().to_string();
+                    for c in &norm {
+                        s.push(',');
+                        s.push_str(c);
+                        s.push_str(":debug");
+                    }
+                    s
+                }
+            }
+            (None, Some(s), None) => s.to_string(),
+            _ => return Err(usage()),
+        };
+
+        if let Some(callback) = self.log_levels.read().clone() {
+            let levels = callback(&spec).map_err(RpcError::invalid_params)?;
+            let debug = levels.split(',').any(|l| {
+                let lvl = l.rsplit(':').next().unwrap_or(l);
+                lvl == "debug" || lvl == "trace"
+            });
+            if let Some(c) = self.log_config.write().as_mut() {
+                c.levels = levels.clone();
+                c.debug = debug;
+            }
+            let mut out = serde_json::json!({
+                "success": true,
+                "message": "Log filter changed. File size and count settings require restart.",
+                "levels": levels,
+                "debug": debug,
+            });
+            if let Some(live) = crate::logctl::control() {
+                let st = live.state();
+                out["level"] = serde_json::json!(st.level);
+                out["categories"] = serde_json::json!(st.categories);
+            }
+            return Ok(out);
         }
-        Ok(serde_json::json!({
-            "success": true,
-            "levels": levels,
-            "debug": debug
-        }))
+
+        if let Some(live) = crate::logctl::control() {
+            let (lvl, cats) = match (params.get_bool(0), params.get_str(0)) {
+                (Some(on), _) => (None, Some(vec![if on { "all" } else { "0" }.to_string()])),
+                (None, Some("default")) => (Some("info"), Some(vec!["0".to_string()])),
+                (None, Some(s)) => (Some(s), two_arg_cats),
+                _ => return Err(usage()),
+            };
+            let st = live
+                .set(lvl, cats.as_deref())
+                .map_err(RpcError::invalid_params)?;
+            let debug = !st.categories.is_empty() || st.level == "debug" || st.level == "trace";
+            let levels = st.spec();
+            if let Some(c) = self.log_config.write().as_mut() {
+                c.levels = levels.clone();
+                c.debug = debug;
+            }
+            return Ok(serde_json::json!({
+                "success": true,
+                "message": "Log filter changed. File size and count settings require restart.",
+                "levels": levels,
+                "debug": debug,
+                "level": st.level,
+                "categories": st.categories,
+            }));
+        }
+
+        Err(RpcError::internal_error("log levels cannot be changed in this node").into())
     }
 
     /// Composite getinfo handler that pulls data from all subsystems.
@@ -744,29 +1040,329 @@ impl RpcServer {
         self.staking.generate_block(params)
     }
 
-    /// Handle a single RPC request
+    /// `getdiaginfo` (diag plan A10): returns node diagnostic state, a safe wallet
+    /// summary (counts and magnitude buckets only), optional `pseudonym_map` under a
+    /// per-call 32-byte `diag_key`, and optional local-only `known_values` pages (1000/page)
+    /// gated by [`Caller::allows_known_values`] (V2, W2, W5).
+    fn get_diag_info(&self, params: &Params, caller: Caller) -> Result<serde_json::Value, Error> {
+        use hmac::{Hmac, Mac};
+        use serde_json::{json, Map, Value};
+        use std::collections::BTreeSet;
+
+        let opts: Option<&Map<String, Value>> = match params {
+            Params::None => None,
+            Params::Object(m) => Some(m),
+            Params::Array(a) if a.is_empty() => None,
+            Params::Array(a) if a.len() == 1 => match &a[0] {
+                Value::Null => None,
+                Value::Object(m) => Some(m),
+                _ => {
+                    return Err(RpcError::invalid_params(
+                        "getdiaginfo takes an optional options object",
+                    )
+                    .into());
+                }
+            },
+            Params::Array(_) => {
+                return Err(RpcError::invalid_params(
+                    "getdiaginfo takes at most one options object",
+                )
+                .into());
+            }
+        };
+
+        let mut diag_key: Option<zeroize::Zeroizing<[u8; 32]>> = None;
+        let mut known_values_page: Option<u64> = None;
+
+        if let Some(m) = opts {
+            for k in m.keys() {
+                if k != "diag_key" && k != "known_values" {
+                    return Err(RpcError::invalid_params("unknown getdiaginfo option").into());
+                }
+            }
+            if let Some(v) = m.get("diag_key") {
+                if !v.is_null() {
+                    // Never echo or log the caller's diag_key value on error
+                    let Some(hex_str) = v.as_str() else {
+                        return Err(RpcError::invalid_params("invalid diag_key").into());
+                    };
+                    if hex_str.len() != 64 {
+                        return Err(RpcError::invalid_params("invalid diag_key").into());
+                    }
+                    let mut raw = zeroize::Zeroizing::new([0u8; 32]);
+                    if hex::decode_to_slice(hex_str, &mut *raw).is_err() {
+                        return Err(RpcError::invalid_params("invalid diag_key").into());
+                    }
+                    diag_key = Some(raw);
+                }
+            }
+            if let Some(v) = m.get("known_values") {
+                if !v.is_null() {
+                    let Some(page) = v.as_u64() else {
+                        return Err(RpcError::invalid_params("invalid known_values page").into());
+                    };
+                    known_values_page = Some(page);
+                }
+            }
+        }
+
+        // V2 & W5: check caller locality BEFORE touching known_values or requiring diag_key
+        if known_values_page.is_some() && !caller.allows_known_values() {
+            return Err(RpcError::invalid_params("known_values is local only").into());
+        }
+
+        let (mut base, sent_txids) = match self.diag_info.read().clone() {
+            Some(cb) => cb(),
+            None => (
+                json!({
+                    "version": 1,
+                    "rpc_in_flight": divi_primitives::diag_rpc::in_flight()
+                        .into_iter()
+                        .map(|c| json!({
+                            "method": c.method,
+                            "transport": c.transport.as_str(),
+                            "for_ms": c.for_ms,
+                        }))
+                        .collect::<Vec<_>>(),
+                }),
+                Vec::new(),
+            ),
+        };
+
+        let Some(out) = base.as_object_mut() else {
+            return Err(RpcError::internal_error("invalid diaginfo payload").into());
+        };
+
+        // Safe wallet summary (B2.9: counts, flags, and magnitude buckets only)
+        let wallet_section = match self.wallet.wallet_db() {
+            Some(w) => {
+                let tx_count = w.history_records().len() as u64;
+                let tx_bucket = if tx_count == 0 {
+                    "count-0".to_string()
+                } else {
+                    format!("count-1e{}", tx_count.ilog10())
+                };
+                json!({
+                    "loaded": true,
+                    "encrypted": w.is_encrypted(),
+                    "encryption_status": w.encryption_status(),
+                    "address_count": w.get_addresses().len(),
+                    "utxo_count": w.get_utxos().len(),
+                    "tx_count_bucket": tx_bucket,
+                    "mempool_tx_count": w.mempool_tx_count(),
+                    "keypool_size": w.keypool_size(),
+                })
+            }
+            None => json!({ "loaded": false }),
+        };
+        out.insert("wallet".into(), wallet_section);
+
+        if let Some(Value::Array(not_inc)) = out.get_mut("not_included") {
+            not_inc.retain(|v| {
+                v.as_str() != Some("wallet section, diag_key pseudonym map, known_values pages")
+            });
+        }
+
+        if let Some(ref key) = diag_key {
+            match divi_primitives::redact::pseudonym_hmacs(key) {
+                Some(pmap) => {
+                    out.insert(
+                        "pseudonym_map".into(),
+                        serde_json::to_value(pmap).unwrap_or_else(|_| json!({})),
+                    );
+                }
+                None => {
+                    out.insert("pseudonym_map".into(), json!("busy"));
+                }
+            }
+        }
+
+        if let Some(page) = known_values_page {
+            let Some(ref key) = diag_key else {
+                return Err(RpcError::invalid_params("invalid diag_key").into());
+            };
+            let mut entries: Vec<Value> = Vec::new();
+
+            if let Some(w) = self.wallet.wallet_db() {
+                let mut addrs = BTreeSet::new();
+                for a in w.get_addresses() {
+                    addrs.insert(a.to_string());
+                }
+                let mut labels = BTreeSet::new();
+                for (a, l) in w.address_book() {
+                    if !a.is_empty() {
+                        addrs.insert(a);
+                    }
+                    if !l.is_empty() {
+                        labels.insert(l);
+                    }
+                }
+                for (acct, acct_addrs) in w.list_accounts() {
+                    if !acct.is_empty() {
+                        labels.insert(acct);
+                    }
+                    for a in acct_addrs {
+                        if !a.is_empty() {
+                            addrs.insert(a);
+                        }
+                    }
+                }
+                for a in addrs {
+                    entries.push(json!({ "kind": "address", "value": a }));
+                }
+                for l in labels {
+                    entries.push(json!({ "kind": "label", "value": l }));
+                }
+
+                let mut txids = BTreeSet::new();
+                let mut own_blocks = BTreeSet::new();
+                for tx in w.history_records() {
+                    txids.insert(tx.txid.to_string());
+                    if matches!(tx.category.as_str(), "stake" | "generate" | "immature") {
+                        if let Some(bh) = tx.block_hash {
+                            own_blocks.insert(bh.to_string());
+                        }
+                    }
+                }
+                for tx in w.unconfirmed_transactions() {
+                    txids.insert(tx.txid().to_string());
+                }
+                for (txid, _) in w.detached_transactions() {
+                    txids.insert(txid.to_string());
+                }
+                for t in txids {
+                    entries.push(json!({ "kind": "txid", "value": t }));
+                }
+
+                let mut outpoints = BTreeSet::new();
+                for u in w.get_utxos() {
+                    outpoints.insert(format!("{}:{}", u.txid, u.vout));
+                }
+                for u in w.received_outputs() {
+                    outpoints.insert(format!("{}:{}", u.txid, u.vout));
+                }
+                for op in outpoints {
+                    entries.push(json!({ "kind": "outpoint", "value": op }));
+                }
+
+                for bh in own_blocks {
+                    entries.push(json!({ "kind": "own_block", "value": bh }));
+                }
+
+                let mut vault_vals = BTreeSet::new();
+                for v in w.get_all_vaults() {
+                    if !v.owner_address.is_empty() {
+                        vault_vals.insert(v.owner_address);
+                    }
+                    if !v.manager_address.is_empty() {
+                        vault_vals.insert(v.manager_address);
+                    }
+                    vault_vals.insert(divi_primitives::hash::Hash256(v.funding_txid).to_string());
+                    if !v.vault_script.is_empty() {
+                        vault_vals.insert(hex::encode(&v.vault_script));
+                    }
+                }
+                for vv in vault_vals {
+                    entries.push(json!({ "kind": "vault", "value": vv }));
+                }
+            }
+
+            if let Ok(mn) = self.masternode.get_masternode_status(&Params::None) {
+                if let (Some(txh), Some(idx)) = (
+                    mn.get("txhash").and_then(Value::as_str),
+                    mn.get("outputidx").and_then(Value::as_u64),
+                ) {
+                    if !txh.is_empty() && !txh.bytes().all(|b| b == b'0') {
+                        entries.push(json!({
+                            "kind": "mn_collateral",
+                            "value": format!("{txh}:{idx}"),
+                        }));
+                    }
+                }
+            }
+
+            for txid in sent_txids {
+                entries.push(json!({ "kind": "sent_txid", "value": txid }));
+            }
+
+            let mut env_vars: Vec<(String, String)> = std::env::vars().collect();
+            env_vars.sort_by(|a, b| a.0.cmp(&b.0));
+            for (name, val) in env_vars {
+                if is_excluded_env_name(&name) || val.is_empty() {
+                    continue;
+                }
+                if is_secret_env_name(&name, &val) {
+                    let val_bytes = zeroize::Zeroizing::new(val.into_bytes());
+                    if val_bytes.len() < 8 {
+                        entries.push(json!({
+                            "kind": "short_secret_env",
+                            "name": name,
+                        }));
+                    } else {
+                        let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(&**key)
+                            .expect("32-byte HMAC key");
+                        mac.update(&val_bytes);
+                        let hmac_hex = hex::encode(mac.finalize().into_bytes());
+                        let (_, tag) = compute_n1_secret_tag(key, &val_bytes);
+                        entries.push(json!({
+                            "kind": "secret_env",
+                            "name": name,
+                            "len": val_bytes.len(),
+                            "hmac": hmac_hex,
+                            "tag": tag,
+                        }));
+                    }
+                } else if val.len() >= 4 {
+                    entries.push(json!({
+                        "kind": "env",
+                        "name": name,
+                        "value": val,
+                    }));
+                }
+            }
+
+            const PAGE_SIZE: usize = 1000;
+            let start = (page as usize).saturating_mul(PAGE_SIZE).min(entries.len());
+            let end = (start + PAGE_SIZE).min(entries.len());
+            let has_more = end < entries.len();
+            out.insert(
+                "known_values".into(),
+                json!({
+                    "page": page,
+                    "values": &entries[start..end],
+                    "has_more": has_more,
+                }),
+            );
+        }
+
+        drop(diag_key);
+        Ok(base)
+    }
+
+    /// Handle a single RPC request (internal caller)
     pub fn handle_request(&self, request: Request) -> Response {
+        self.handle_request_from(request, Caller::internal())
+    }
+
+    /// Handle a single RPC request with an explicit [`Caller`] (used by Web UI and Electrum)
+    pub fn handle_request_from(&self, request: Request, caller: Caller) -> Response {
         let id = request.id.clone();
 
-        match self.dispatch(&request.method, &request.params) {
+        match self.dispatch(&request.method, &request.params, None, caller) {
             Ok(result) => Response::success(id, result),
             Err(Error::Rpc(rpc_err)) => Response::error(id, rpc_err),
             Err(e) => Response::error(id, RpcError::internal_error(e.to_string())),
         }
     }
 
-    /// Dispatch a method call
-    fn dispatch(&self, method: &str, params: &Params) -> Result<serde_json::Value, Error> {
-        self.dispatch_with(method, params, None)
-    }
-
     /// Dispatch a method call; `amounts` is sendmany's or fundvault's amounts
     /// object with every pair as the request wrote it, when it came as JSON text
-    fn dispatch_with(
+    fn dispatch(
         &self,
         method: &str,
         params: &Params,
         amounts: Option<&[(String, serde_json::Value)]>,
+        caller: Caller,
     ) -> Result<serde_json::Value, Error> {
         // Divi Core's dispatcher refuses a wallet call without a wallet before
         // the call runs (rpcserver.cpp:1043-1047)
@@ -1022,6 +1618,7 @@ impl RpcServer {
             "reclaimvaultfunds" => self.wallet.reclaim_vault_funds(params),
 
             // Logging methods
+            "getdiaginfo" => self.get_diag_info(params, caller),
             "getlogconfig" => self.get_log_config(params),
             "setlogconfig" => self.set_log_config_rpc(params),
 
@@ -1195,8 +1792,9 @@ impl RpcServer {
                 "debitvaultbyname" => "debitvaultbyname vault-encoding destination amount (feeMode)\n\nWithdraw an amount from a specific vaults to a destination address. The amount is a real and is rounded to the nearest 0.00000001\n\nRequires wallet passphrase to be set with walletpassphrase call.\nArguments:\n1. \"vault-encoding\"  (string, required) The vault encoding to withdraw from.\n2. \"diviaddress\"  (string, required) The divi address of your choosing to send to.\n3. \"amount\"      (numeric, required) The amount in DIVI to move. eg 0.1\n4. \"fee mode\"      (string, optional) The fee + change output calculation mode\n\nResult:\n\"transactionid\"  (string) The transaction id.",
                 "reclaimvaultfunds" => "reclaimvaultfunds destination amount (feeMode|metadata) ( \"comment\" \"comment-to\" )\n\nWithdraw an amount from your vaults into a separate address. The amount is a real and is rounded to the nearest 0.00000001\n\nRequires wallet passphrase to be set with walletpassphrase call.\nArguments:\n1. \"diviaddress\"  (string, required) The divi address of your choosing to send to.\n2. \"amount\"      (numeric, required) The amount in DIVI to move. eg 0.1\n\nResult:\n\"transactionid\"  (string) The transaction id.",
                 // Logging
-                "getlogconfig" => "getlogconfig\n\nReturns the current logging configuration.\n\nResult:\n{\n  \"max_file_size\": n,      (numeric) Maximum log file size in bytes\n  \"max_file_size_mb\": n,   (numeric) Maximum log file size in MB\n  \"max_files\": n,          (numeric) Number of log files to keep\n  \"debug\": true|false,     (boolean) Whether any category writes debug lines\n  \"levels\": \"...\",       (string) The log levels, as a loglevel value\n  \"print_to_console\": true|false  (boolean) Whether logging to console\n}",
-                "setlogconfig" => "setlogconfig levels\n\nChanges the log levels of the running node until it stops (the config file's\nloglevel= and debug= apply again at the next start). File size and count\nneed a restart.\n\nArguments:\n1. levels   (string or boolean, required) A loglevel value: a level for all of\n            IronDivi (off, error, warn, info, debug, trace) and/or\n            category:level pairs, separated by commas; \"default\" for the\n            start-up default. true is every category at debug, false the default.\n            Categories: net, sync, peers, node, mempool, staking, chain, wallet,\n            masternode, spork, rpc, electrum, webui, swap, zmq, daemon\n\nResult:\n{\n  \"success\": true,\n  \"levels\": \"...\",   (string) The levels now in force\n  \"debug\": true|false\n}\n\nExamples:\n> irondivi-cli setlogconfig \"info,sync:debug\"\n> irondivi-cli setlogconfig default",
+                "getdiaginfo" => "getdiaginfo ( options )\n\nReturns redacted node health, in-flight RPCs, lock-wait counters, recent masked RPC errors,\nthread state samples, and a safe wallet summary (counts and magnitude buckets only).\n\nArguments:\n1. options   (object, optional)\n    {\n      \"diag_key\": \"<64-hex>\",   (string, optional) Per-call 32-byte key in hex; returns pseudonym_map HMACs and Zeroizes the key after the call\n      \"known_values\": page       (numeric, optional) 0-based page (1000 entries/page) of wallet and environment values for local diag redaction\n    }\n\nSecurity note:\n`known_values` is served only on the JSON-RPC transport when the peer address is loopback and\nno `Forwarded`, `X-Forwarded-For` or `X-Real-IP` header is present. Note that a reverse proxy\non the same host forwarding remote callers to loopback while stripping those headers appears\nas a local caller (just as it already exposes full RPC).",
+                "getlogconfig" => "getlogconfig\n\nReturns the current logging configuration.\n\nResult:\n{\n  \"max_file_size\": n,      (numeric) Maximum log file size in bytes\n  \"max_file_size_mb\": n,   (numeric) Maximum log file size in MB\n  \"max_files\": n,          (numeric) Number of log files to keep\n  \"debug\": true|false,     (boolean) Whether any category writes debug lines\n  \"levels\": \"...\",       (string) The log levels, as a loglevel value\n  \"level\": \"...\",        (string, optional) Overall base log level\n  \"categories\": [...],     (array, optional) Active debug categories\n  \"env_override\": true|false, (boolean, optional) Whether RUST_LOG overrides live changes\n  \"print_to_console\": true|false  (boolean) Whether logging to console\n}",
+                "setlogconfig" => "setlogconfig levels | setlogconfig \"level\" ( [\"category\",...] )\n\nChanges the log levels of the running node until it stops (the config file's\nloglevel= and debug= apply again at the next start). File size and count\nneed a restart.\n\nArguments:\n1. levels   (string or boolean, required) A loglevel value: a level for all of\n            IronDivi (off, error, warn, info, debug, trace) and/or\n            category:level pairs, separated by commas; \"default\" for the\n            start-up default. true is every category at debug, false the default.\n            Categories: net, sync, peers, node, mempool, staking, chain, wallet,\n            masternode, spork, rpc, electrum, webui, swap, zmq, daemon\n            Alternatively, pass \"level\" as argument 1 and an array or\n            comma-separated string of debug categories as argument 2.\n\nResult:\n{\n  \"success\": true,\n  \"message\": \"...\",\n  \"levels\": \"...\",   (string) The levels now in force\n  \"debug\": true|false\n}\n\nExamples:\n> irondivi-cli setlogconfig \"info,sync:debug\"\n> irondivi-cli setlogconfig default",
                 // Control
                 "help" => "help ( \"command\" )\n\nList all commands, or get help for a specified command.",
                 "stop" => "stop\n\nStop Divi server.",
@@ -1365,6 +1963,7 @@ impl RpcServer {
                 "removevault",
                 "",
                 "== Logging ==",
+                "getdiaginfo",
                 "getlogconfig",
                 "setlogconfig",
                 "",
@@ -1823,11 +2422,13 @@ async fn handle_rpc(
     State(server): State<Arc<RpcServer>>,
     Extension(slots): Extension<Arc<Semaphore>>,
     Extension(grant): Extension<MethodGrant>,
+    caller: Option<Extension<Caller>>,
     version: Version,
     headers: HeaderMap,
     body: String,
 ) -> axum::response::Response {
-    rpc_reply(server, slots, grant, body, &version, &headers).await
+    let caller = caller.map(|Extension(c)| c).unwrap_or_else(Caller::unknown);
+    rpc_reply(server, slots, grant, caller, body, &version, &headers).await
 }
 
 /// Run a request and write its reply. Never logs a body or a result: they
@@ -1837,6 +2438,7 @@ async fn rpc_reply(
     server: Arc<RpcServer>,
     slots: Arc<Semaphore>,
     grant: MethodGrant,
+    caller: Caller,
     body: String,
     version: &Version,
     headers: &HeaderMap,
@@ -1844,7 +2446,7 @@ async fn rpc_reply(
     let Ok(_slot) = slots.acquire_owned().await else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let (status, reply) = handle_body(server, grant, body).await;
+    let (status, reply) = handle_body(server, grant, caller, body).await;
     // No byte counts: a sendrawtransaction request is about twice the raw
     // tx's size, which with the time names the user's tx on chain.
     debug!("RPC request: status {status}");
@@ -1862,9 +2464,14 @@ async fn rpc_reply(
 async fn handle_body(
     server: Arc<RpcServer>,
     grant: MethodGrant,
+    caller: Caller,
     body: String,
 ) -> (StatusCode, String) {
-    match tokio::task::spawn_blocking(move || server.handle_http_body_for(&grant, &body)).await {
+    match tokio::task::spawn_blocking(move || {
+        server.handle_http_body_with_caller(&grant, caller, &body)
+    })
+    .await
+    {
         Ok(reply) => reply,
         Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
         // Cancelled: the runtime is shutting down
@@ -1904,19 +2511,35 @@ fn json_reply(
 /// HTTP handler for wallet-specific JSON-RPC requests. The wallet name is not
 /// used for routing yet: the server has one wallet, and this path lets
 /// multi-wallet clients talk to it.
+#[allow(clippy::too_many_arguments)]
 async fn handle_wallet_rpc(
     State(server): State<Arc<RpcServer>>,
     Path(wallet_name): Path<String>,
     Extension(slots): Extension<Arc<Semaphore>>,
     Extension(grant): Extension<MethodGrant>,
+    caller: Option<Extension<Caller>>,
     version: Version,
     headers: HeaderMap,
     body: String,
 ) -> axum::response::Response {
     debug!("RPC request for wallet '{}'", sanitize_string(&wallet_name));
+    let caller = caller.map(|Extension(c)| c).unwrap_or_else(Caller::unknown);
     // The wallet name is not used for routing yet: the server has one wallet.
     // As handle_rpc, neither the request nor the reply is logged
-    rpc_reply(server, slots, grant, body, &version, &headers).await
+    rpc_reply(server, slots, grant, caller, body, &version, &headers).await
+}
+
+/// Router mounting `/wallet/:wallet_name` without the peer/access middleware,
+/// used by integration tests to verify W5 (`Caller::unknown()` refuses `known_values`).
+pub fn test_bare_wallet_router(server: Arc<RpcServer>) -> Router {
+    Router::new()
+        .route(
+            "/wallet/:wallet_name",
+            post(handle_wallet_rpc).get(handle_wallet_rpc),
+        )
+        .with_state(server)
+        .layer(Extension(Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS))))
+        .layer(Extension(MethodGrant::All))
 }
 
 /// A reply object as Divi Core writes it (rpcprotocol.cpp JSONRPCReplyObj):
@@ -1964,12 +2587,37 @@ impl RpcServer {
         grant: &MethodGrant,
         body_text: &str,
     ) -> (StatusCode, String) {
+        self.handle_http_body_with_caller(grant, Caller::internal(), body_text)
+    }
+
+    /// [`Self::handle_http_body_for`] with explicit [`Caller`] tracking for
+    /// A10 locality gating and A15 `diag_rpc` recording.
+    pub fn handle_http_body_with_caller(
+        &self,
+        grant: &MethodGrant,
+        caller: Caller,
+        body_text: &str,
+    ) -> (StatusCode, String) {
+        use divi_primitives::diag_rpc::{self, Transport};
         use serde_json::Value;
+        let record_err = |method: &str, code: i64, msg: &str| {
+            if caller.transport == CallerTransport::JsonRpc {
+                let w = diag_rpc::begin(method, Transport::JsonRpc);
+                w.finish(
+                    method,
+                    Transport::JsonRpc,
+                    caller.peer,
+                    caller.authenticated,
+                    Some((code, msg)),
+                );
+            }
+        };
         let denied = |r: &Value| match r.get("method") {
             Some(Value::String(m)) if !grant.allows(m) => Some(m.clone()),
             _ => None,
         };
         let forbidden = |method: String| {
+            record_err(&method, codes::INVALID_REQUEST as i64, "rpcwhitelist");
             warn!("RPC method {method:?} refused by rpcwhitelist");
             (StatusCode::FORBIDDEN, String::new())
         };
@@ -1983,7 +2631,9 @@ impl RpcServer {
             Err(_) => {
                 // The body is not logged: it can carry a passphrase
                 debug!("RPC request that is not JSON, {} bytes", body.len());
-                return error_reply(RpcError::parse_error(), Value::Null);
+                let err = RpcError::parse_error();
+                record_err("unknown", err.code as i64, &err.message);
+                return error_reply(err, Value::Null);
             }
         };
         let request = tree.first_wins();
@@ -1996,7 +2646,7 @@ impl RpcServer {
                 // Never log a body or a result: they carry passphrases, private
                 // keys and seeds. The method name is logged as Divi Core logs it
                 // (ThreadRPCServer method=, in execute_json_request).
-                match self.execute_json_request(&request, &tree) {
+                match self.execute_json_request(&request, &tree, caller) {
                     Ok(result) => (StatusCode::OK, reply_text(Ok(result), &id) + "\n"),
                     Err(e) => error_reply(e, id),
                 }
@@ -2007,13 +2657,12 @@ impl RpcServer {
                         "RPC batch of {} calls refused (limit {MAX_BATCH_CALLS})",
                         requests.len()
                     );
-                    return error_reply(
-                        RpcError::invalid_request(format!(
-                            "Batch of {} calls is over the limit of {MAX_BATCH_CALLS}",
-                            requests.len()
-                        )),
-                        Value::Null,
-                    );
+                    let err = RpcError::invalid_request(format!(
+                        "Batch of {} calls is over the limit of {MAX_BATCH_CALLS}",
+                        requests.len()
+                    ));
+                    record_err("unknown", err.code as i64, &err.message);
+                    return error_reply(err, Value::Null);
                 }
                 if let Some(method) = requests.iter().find_map(denied) {
                     return forbidden(method);
@@ -2030,15 +2679,16 @@ impl RpcServer {
                     .map(|(i, r)| {
                         let id = r.get("id").cloned().unwrap_or(Value::Null);
                         let tree = tree.element(i).expect("the batch's own entry");
-                        reply_text(self.execute_json_request(r, tree), &id)
+                        reply_text(self.execute_json_request(r, tree, caller), &id)
                     })
                     .collect();
                 (StatusCode::OK, format!("[{}]\n", replies.join(",")))
             }
-            _ => error_reply(
-                RpcError::new(codes::PARSE_ERROR, "Top-level object parse error"),
-                Value::Null,
-            ),
+            _ => {
+                let err = RpcError::new(codes::PARSE_ERROR, "Top-level object parse error");
+                record_err("unknown", err.code as i64, &err.message);
+                error_reply(err, Value::Null)
+            }
         }
     }
 
@@ -2049,43 +2699,83 @@ impl RpcServer {
         &self,
         request: &serde_json::Value,
         tree: &crate::http::Json,
+        caller: Caller,
     ) -> Result<serde_json::Value, RpcError> {
+        use divi_primitives::diag_rpc::{self, Transport};
         use serde_json::Value;
-        let Value::Object(obj) = request else {
-            return Err(RpcError::invalid_request("Invalid Request object"));
-        };
-        let method = match obj.get("method") {
-            None | Some(Value::Null) => return Err(RpcError::invalid_request("Missing method")),
-            Some(Value::String(m)) => m,
-            Some(_) => return Err(RpcError::invalid_request("Method must be a string")),
-        };
-        // The method's name only, never its params (rpcserver.cpp:893-894)
-        if method != "getblocktemplate" {
-            debug!("ThreadRPCServer method={}", sanitize_string(method));
+
+        let raw_method = request
+            .as_object()
+            .and_then(|o| o.get("method"))
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+
+        // A15: record JSON-RPC calls here so in-flight slots are visible to panic hooks
+        // before unwinding and cleared by `Drop for Call` on unwind. Web UI and Electrum
+        // record at their own transport boundaries and do not have `CallerTransport::JsonRpc`.
+        let watch = (caller.transport == CallerTransport::JsonRpc)
+            .then(|| diag_rpc::begin(raw_method, Transport::JsonRpc));
+
+        let outcome: Result<serde_json::Value, RpcError> = (|| {
+            let Value::Object(obj) = request else {
+                return Err(RpcError::invalid_request("Invalid Request object"));
+            };
+            let method = match obj.get("method") {
+                None | Some(Value::Null) => {
+                    return Err(RpcError::invalid_request("Missing method"))
+                }
+                Some(Value::String(m)) => m,
+                Some(_) => return Err(RpcError::invalid_request("Method must be a string")),
+            };
+            // The method's name only, never its params (rpcserver.cpp:893-894)
+            if method != "getblocktemplate" {
+                debug!("ThreadRPCServer method={}", sanitize_string(method));
+            }
+            let params = match obj.get("params") {
+                None | Some(Value::Null) => Params::Array(Vec::new()),
+                Some(Value::Array(a)) => Params::Array(a.clone()),
+                Some(_) => return Err(RpcError::invalid_request("Params must be an array")),
+            };
+            // sendmany and fundvault read each pair of their amounts object, equal
+            // keys included (rpcwallet.cpp parseMultiSendJson, parseFundVaultRPCParameters)
+            let amounts = match method.as_str() {
+                "sendmany" => tree
+                    .member("params")
+                    .and_then(|p| p.element(1))
+                    .and_then(|a| a.members()),
+                "fundvault" => tree
+                    .member("params")
+                    .and_then(|p| p.element(0))
+                    .and_then(|a| a.members()),
+                _ => None,
+            };
+            let dispatched = if caller.transport == CallerTransport::JsonRpc
+                && !caller.is_loopback_peer()
+            {
+                diag_rpc::as_remote(|| self.dispatch(method, &params, amounts.as_deref(), caller))
+            } else {
+                self.dispatch(method, &params, amounts.as_deref(), caller)
+            };
+            match dispatched {
+                Ok(result) => Ok(result),
+                Err(Error::Rpc(e)) => Err(e),
+                Err(e) => Err(RpcError::internal_error(e.to_string())),
+            }
+        })();
+
+        if let Some(w) = watch {
+            w.finish(
+                raw_method,
+                Transport::JsonRpc,
+                caller.peer,
+                caller.authenticated,
+                outcome
+                    .as_ref()
+                    .err()
+                    .map(|e| (e.code as i64, e.message.as_str())),
+            );
         }
-        let params = match obj.get("params") {
-            None | Some(Value::Null) => Params::Array(Vec::new()),
-            Some(Value::Array(a)) => Params::Array(a.clone()),
-            Some(_) => return Err(RpcError::invalid_request("Params must be an array")),
-        };
-        // sendmany and fundvault read each pair of their amounts object, equal
-        // keys included (rpcwallet.cpp parseMultiSendJson, parseFundVaultRPCParameters)
-        let amounts = match method.as_str() {
-            "sendmany" => tree
-                .member("params")
-                .and_then(|p| p.element(1))
-                .and_then(|a| a.members()),
-            "fundvault" => tree
-                .member("params")
-                .and_then(|p| p.element(0))
-                .and_then(|a| a.members()),
-            _ => None,
-        };
-        match self.dispatch_with(method, &params, amounts.as_deref()) {
-            Ok(result) => Ok(result),
-            Err(Error::Rpc(e)) => Err(e),
-            Err(e) => Err(RpcError::internal_error(e.to_string())),
-        }
+        outcome
     }
 }
 
@@ -2178,7 +2868,23 @@ fn build_router(
     let router = router.layer(middleware::from_fn(
         |req: HttpRequest, next: Next| async move {
             if crate::http::body_too_large(req.headers()) {
-                let (status, reply) = error_reply(RpcError::parse_error(), serde_json::Value::Null);
+                let err = RpcError::parse_error();
+                if let Some(c) = req.extensions().get::<Caller>().copied() {
+                    if c.transport == CallerTransport::JsonRpc {
+                        divi_primitives::diag_rpc::begin(
+                            "?",
+                            divi_primitives::diag_rpc::Transport::JsonRpc,
+                        )
+                        .finish(
+                            "?",
+                            divi_primitives::diag_rpc::Transport::JsonRpc,
+                            c.peer,
+                            c.authenticated,
+                            Some((err.code as i64, err.message.as_str())),
+                        );
+                    }
+                }
+                let (status, reply) = error_reply(err, serde_json::Value::Null);
                 return json_reply(status, reply, &req.version(), req.headers());
             }
             next.run(req).await
@@ -2204,6 +2910,9 @@ fn build_router(
                 };
                 match user {
                     Some(user) => {
+                        if let Some(c) = req.extensions_mut().get_mut::<Caller>() {
+                            c.authenticated = true;
+                        }
                         req.extensions_mut().insert(access.grant_for(&user));
                         next.run(req).await
                     }
@@ -2256,24 +2965,34 @@ fn build_router(
     // cross-site requests from a browser). Without the peer address
     // (no ConnectInfo) every request is refused.
     let router = router.layer(middleware::from_fn(
-        move |connect: Option<ConnectInfo<SocketAddr>>, req: HttpRequest, next: Next| {
+        move |connect: Option<ConnectInfo<SocketAddr>>, mut req: HttpRequest, next: Next| {
             let access = access.clone();
             async move {
                 let checked = {
                     let headers = req.headers();
                     let hdr = |name| headers.get(name).and_then(|v| v.to_str().ok());
-                    if !connect.is_some_and(|ConnectInfo(addr)| access.peer_allowed(addr.ip())) {
-                        Err(Denial::Peer)
-                    } else if !access.host_allowed(hdr(header::HOST)) {
-                        Err(Denial::Host)
-                    } else if !access.origin_allowed(hdr(header::ORIGIN)) {
-                        Err(Denial::Origin)
-                    } else {
-                        Ok(())
+                    match connect {
+                        Some(ConnectInfo(addr)) if access.peer_allowed(addr.ip()) => {
+                            if !access.host_allowed(hdr(header::HOST)) {
+                                Err(Denial::Host)
+                            } else if !access.origin_allowed(hdr(header::ORIGIN)) {
+                                Err(Denial::Origin)
+                            } else {
+                                Ok(Caller::json_rpc(
+                                    addr.ip(),
+                                    has_proxy_header(headers),
+                                    false,
+                                ))
+                            }
+                        }
+                        _ => Err(Denial::Peer),
                     }
                 };
                 match checked {
-                    Ok(()) => next.run(req).await,
+                    Ok(caller) => {
+                        req.extensions_mut().insert(caller);
+                        next.run(req).await
+                    }
                     Err(denial) => {
                         warn!("RPC request refused: {denial:?}");
                         crate::http::error_page(StatusCode::FORBIDDEN)

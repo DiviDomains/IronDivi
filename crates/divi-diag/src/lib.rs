@@ -22,8 +22,14 @@
 //! [args…]` (B6.5, [`collectors::rpc`]): one allowlisted, clamped call to
 //! the running node, its answer through the same layer. `--capture
 //! <minutes> [--until <event>]` (B6.1, [`collectors::capture`]): a sample
-//! every 10 s before the collection. Not in this crate yet: `--tx`,
-//! `--rpc-clear` and the host package (B6.2).
+//! every 10 s before the collection. `--rpc-clear` (§8.2): after a yes
+//! to the redacted answer, the same call made again and sent in clear on a
+//! second yes. `--tx <txid>` (B6.3, [`txclear`]): one transaction in
+//! clear on its own §8.2 question. `--host <container>` (B6.2, [`host`]):
+//! run on a Docker, LXD, Incus, plain LXC or Proxmox host (the runtime is
+//! detected), the host's view of how a container ended; WSL and Docker
+//! Desktop hosts are not built, nor the shared ticket that pairs it with the
+//! container's own package.
 
 pub mod attach;
 pub mod collectors;
@@ -31,6 +37,7 @@ pub mod consent;
 pub mod ctx;
 pub mod discovery;
 pub mod frame;
+pub mod host;
 pub mod import;
 pub mod mem;
 pub mod oldlog;
@@ -39,6 +46,7 @@ pub mod rpcjson;
 pub mod runner;
 pub mod scanner;
 pub mod tar;
+pub mod txclear;
 pub mod upload;
 pub mod util;
 
@@ -75,18 +83,26 @@ pub struct Options {
     /// `--rpc <method> [args…]`: the method, then every word up to the
     /// next `--` option (B6.5)
     pub rpc: Vec<(String, Vec<String>)>,
+    /// the entries of `rpc` named with `--rpc-clear` (§8.2): asked about
+    /// in clear after a yes to the redacted answer
+    pub rpc_clear: Vec<usize>,
+    /// `--tx <txid>` (B6.3): one transaction in clear, lowercase
+    pub tx: Option<String>,
     /// `--capture <minutes>` (B6.1)
     pub capture: Option<u64>,
     /// `--until <event>[,<event>]`, repeatable (B6.1)
     pub until: Vec<collectors::capture::Until>,
+    /// `--host <container>` (B6.2): the host's view of a container
+    pub host: Option<String>,
 }
 
 const USAGE: &str = "usage: irondivi-cli diag [--datadir DIR] [--conf FILE] [--run|--no-run] \
 [--submit|--no-submit] [--out DIR] [--offline] [--no-fsync-test] [--report-file FILE] \
-[--attach FILE [--attach-method METHOD]]... [--rpc METHOD [ARG...]]... \
-[--capture MINUTES [--until exit|stall|'rss>MB'|'peers<N']...]\n       \
+[--attach FILE [--attach-method METHOD]]... [--rpc|--rpc-clear METHOD [ARG...]]... \
+[--capture MINUTES [--until exit|stall|fork|ban|incident|'rss>MB'|'peers<N']...] [--tx TXID]\n       \
 irondivi-cli diag --import <folder|-> [--keep-raw] [--out DIR] [--no-submit]\n       \
-irondivi-cli diag --send <folder>";
+irondivi-cli diag --send <folder>\n       \
+irondivi-cli diag --host <container> [--out DIR] [--no-submit]";
 
 pub fn parse_options(args: &[String]) -> Result<Options, String> {
     let mut o = Options::default();
@@ -121,8 +137,12 @@ pub fn parse_options(args: &[String]) -> Result<Options, String> {
             "--keep-raw" => o.keep_raw = true,
             "--send" => o.send = Some(value(&mut i)?.into()),
             "--report-file" => o.report_file = Some(value(&mut i)?.into()),
+            "--host" => o.host = Some(value(&mut i)?),
             "--attach" => o.attach.push((value(&mut i)?.into(), None)),
-            "--rpc" => {
+            "--rpc" | "--rpc-clear" => {
+                if key == "--rpc-clear" {
+                    o.rpc_clear.push(o.rpc.len());
+                }
                 let m = value(&mut i)?;
                 let mut words = Vec::new();
                 while i + 1 < args.len() && !args[i + 1].starts_with("--") {
@@ -130,6 +150,13 @@ pub fn parse_options(args: &[String]) -> Result<Options, String> {
                     words.push(args[i].clone());
                 }
                 o.rpc.push((m, words));
+            }
+            "--tx" => {
+                let t = value(&mut i)?;
+                if !txclear::is_txid(&t) {
+                    return Err(format!("--tx {t}: a transaction id is 64 hex digits"));
+                }
+                o.tx = Some(t.to_ascii_lowercase());
             }
             "--capture" => {
                 let v = value(&mut i)?;
@@ -207,6 +234,10 @@ pub fn run(args: &[String]) -> i32 {
                 eprintln!("irondivi-cli diag: --rpc is part of a collection run, not of --import or --send\n{USAGE}");
                 EX_USAGE
             }
+            (i, s) if o.tx.is_some() && (i.is_some() || s.is_some()) => {
+                eprintln!("irondivi-cli diag: --tx is part of a collection run, not of --import or --send\n{USAGE}");
+                EX_USAGE
+            }
             (i, s) if o.capture.is_some() && (i.is_some() || s.is_some()) => {
                 eprintln!("irondivi-cli diag: --capture is part of a collection run, not of --import or --send\n{USAGE}");
                 EX_USAGE
@@ -214,6 +245,20 @@ pub fn run(args: &[String]) -> i32 {
             (i, s) if !o.attach.is_empty() && (i.is_some() || s.is_some()) => {
                 eprintln!("irondivi-cli diag: --attach is part of a collection run, not of --import or --send\n{USAGE}");
                 EX_USAGE
+            }
+            _ if o.host.is_some()
+                && (o.import.is_some()
+                    || o.send.is_some()
+                    || !o.rpc.is_empty()
+                    || o.tx.is_some()
+                    || o.capture.is_some()
+                    || !o.attach.is_empty()) =>
+            {
+                eprintln!("irondivi-cli diag: --host is a package of its own, run on the container host\n{USAGE}");
+                EX_USAGE
+            }
+            (None, None) if o.host.is_some() => {
+                host::host_main(o.host.as_deref().unwrap_or(""), &o)
             }
             (Some(src), None) => import::import_main(&src, &o),
             (None, Some(folder)) => consent::send_main(&folder, &o),
@@ -270,6 +315,32 @@ mod tests {
         );
         assert!(o.offline);
         assert!(parse_options(&s(&["--rpc"])).is_err());
+        let o = parse_options(&s(&[
+            "--rpc",
+            "getblockcount",
+            "--rpc-clear",
+            "getwalletinfo",
+            "--rpc-clear",
+            "listtransactions",
+            "*",
+            "5",
+        ]))
+        .unwrap();
+        assert_eq!(o.rpc.len(), 3);
+        assert_eq!(o.rpc_clear, vec![1, 2]);
+        assert_eq!(o.rpc[2], ("listtransactions".to_string(), s(&["*", "5"])));
+    }
+
+    #[test]
+    fn tx_option() {
+        let t = "AB".repeat(32);
+        assert_eq!(
+            parse_options(&s(&["--tx", &t])).unwrap().tx,
+            Some("ab".repeat(32))
+        );
+        assert!(parse_options(&s(&["--tx", "abc"])).is_err());
+        assert!(parse_options(&s(&["--tx"])).is_err());
+        assert_eq!(run(&s(&["--tx", &t, "--send", "x"])), EX_USAGE);
     }
 
     #[test]
@@ -294,8 +365,23 @@ mod tests {
         assert!(parse_options(&s(&["--until", "exit"]))
             .unwrap_err()
             .contains("--capture"));
-        assert!(parse_options(&s(&["--capture", "5", "--until", "fork"])).is_err());
+        assert_eq!(
+            parse_options(&s(&["--capture", "5", "--until", "fork,ban,incident"]))
+                .unwrap()
+                .until,
+            vec![Until::Fork, Until::Ban, Until::Incident]
+        );
+        assert!(parse_options(&s(&["--capture", "5", "--until", "crash"])).is_err());
         assert_eq!(run(&s(&["--capture", "5", "--send", "x"])), EX_USAGE);
+    }
+
+    #[test]
+    fn host_options() {
+        let o = parse_options(&s(&["--host", "dc1", "--no-submit"])).unwrap();
+        assert_eq!(o.host.as_deref(), Some("dc1"));
+        assert_eq!(run(&s(&["--host", "dc1", "--send", "x"])), EX_USAGE);
+        assert_eq!(run(&s(&["--host", "dc1", "--rpc", "getinfo"])), EX_USAGE);
+        assert!(parse_options(&s(&["--host"])).is_err());
     }
 
     #[test]

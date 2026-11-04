@@ -609,6 +609,24 @@ fn generic(o: &mut Out, r: &Redactor, v: &Value, depth: usize) {
                             .map(|s| r.pseudonym("id", s))
                             .unwrap_or_else(|| "(removed)".into())
                     ),
+                    None if k == "health" && x.is_string() => {
+                        let s = x.as_str().unwrap_or("");
+                        let filtered = crate::oldlog::filter(s, r).render();
+                        outln!(o, "{pad}{k}: {}", r.scrub(filtered.trim_end()));
+                    }
+                    None if k == "debug_ring" && x.is_array() => {
+                        let joined = x
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(Value::as_str)
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        outln!(o, "{pad}{k}:");
+                        for line in crate::oldlog::filter(&joined, r).render().lines() {
+                            outln!(o, "{pad}  {}", r.scrub(line));
+                        }
+                    }
                     None if x.is_object() || x.is_array() => {
                         outln!(o, "{pad}{k}:");
                         generic(o, r, x, depth + 1);
@@ -990,7 +1008,10 @@ pub fn mirror_dir(ctx: &Ctx, d: &DataDir) -> Option<PathBuf> {
 }
 
 /// Run `f` on a detached thread; None when it did not return in `secs`
-fn bounded<T: Send + 'static>(secs: u64, f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+pub(crate) fn bounded<T: Send + 'static>(
+    secs: u64,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let _ = tx.send(f());
