@@ -29,6 +29,7 @@
 //! [`WRITE_TIMEOUT`] (a tenth of that age); one that takes longer is abandoned, its file
 //! removed and never renamed, and the write is an error.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -66,6 +67,10 @@ pub struct Wallet {
     /// disk is not taken back in.
     #[serde(skip)]
     revived: Vec<Outpoint>,
+    /// Fast membership index over `spent` so `refresh` and `mark_spent` stay `O(1)` per input
+    /// instead of scanning tens of thousands of historical block tombstones linearly.
+    #[serde(skip)]
+    spent_set: HashSet<Outpoint>,
 }
 
 impl Wallet {
@@ -84,6 +89,7 @@ impl Wallet {
             }
             _ => Wallet::default(),
         };
+        w.spent_set = w.spent.iter().copied().collect();
         w.path = path;
         Ok(w)
     }
@@ -99,7 +105,7 @@ impl Wallet {
             return;
         };
         for op in disk.spent {
-            if !self.revived.contains(&op) {
+            if !self.spent_set.contains(&op) && !self.revived.contains(&op) {
                 self.mark_spent(op);
             }
         }
@@ -163,8 +169,16 @@ impl Wallet {
     }
 
     /// Learn from a verbose `getrawtransaction`/block-tx JSON: drop coins it spends, add
-    /// outputs paying `spk_hex`. Returns how many coins were added.
+    /// outputs paying `spk_hex`, and persist immediately. Returns how many coins were added.
     pub fn apply_tx(&mut self, tx: &Value, spk_hex: &str) -> Result<usize, SwapError> {
+        let added = self.apply_tx_unpersisted(tx, spk_hex)?;
+        self.persist()?;
+        Ok(added)
+    }
+
+    /// In-memory counterpart to [`Self::apply_tx`] for multi-block batch scans that persist
+    /// once per scan chunk alongside `scanned_height`.
+    pub fn apply_tx_unpersisted(&mut self, tx: &Value, spk_hex: &str) -> Result<usize, SwapError> {
         let txid: Txid = tx["txid"]
             .as_str()
             .ok_or_else(|| SwapError::Other("tx json without txid".into()))?
@@ -198,14 +212,13 @@ impl Wallet {
                 }));
             }
         }
-        self.persist()?;
         Ok(added)
     }
 
     fn add(&mut self, u: Utxo) -> bool {
         let known = self.utxos.iter().any(|k| k.outpoint == u.outpoint)
             || self.reserved.iter().any(|r| r.utxo.outpoint == u.outpoint)
-            || self.spent.contains(&u.outpoint);
+            || self.spent_set.contains(&u.outpoint);
         if !known {
             self.utxos.push(u);
         }
@@ -216,7 +229,7 @@ impl Wallet {
         self.revived.retain(|r| *r != op);
         self.utxos.retain(|u| u.outpoint != op);
         self.reserved.retain(|r| r.utxo.outpoint != op);
-        if !self.spent.contains(&op) {
+        if self.spent_set.insert(op) {
             self.spent.push(op);
         }
     }
@@ -290,6 +303,7 @@ impl Wallet {
     pub fn load_json(&mut self, text: &str) -> Result<(), SwapError> {
         let mut w: Wallet = serde_json::from_str(text)
             .map_err(|e| SwapError::Storage(format!("parse wallet: {e}")))?;
+        w.spent_set = w.spent.iter().copied().collect();
         w.path = self.path.take();
         *self = w;
         self.persist()
@@ -326,8 +340,8 @@ impl Wallet {
         self.reserved.retain(|r| r.utxo.outpoint.txid != txid);
         let mut changed = self.utxos.len() + self.reserved.len() != before;
         for u in inputs {
-            if let Some(i) = self.spent.iter().position(|s| *s == u.outpoint) {
-                self.spent.remove(i);
+            if self.spent_set.remove(&u.outpoint) {
+                self.spent.retain(|s| *s != u.outpoint);
                 self.revived.push(u.outpoint);
                 self.add(*u);
                 changed = true;
@@ -937,5 +951,43 @@ mod stalled_write_tests {
     fn the_write_bound_is_a_minute_well_under_the_sweep_age() {
         assert_eq!(WRITE_TIMEOUT, Duration::from_secs(60));
         assert!(WRITE_TIMEOUT * 10 <= STALE_TEMP_FILE_AGE);
+    }
+
+    #[test]
+    fn batch_scan_with_large_tombstone_set_stays_linear_and_persists_at_chunk_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("w.json");
+        let mut w = Wallet::open(Some(path.clone())).unwrap();
+        for i in 0u32..20_000 {
+            let mut b = [0u8; 32];
+            b[..4].copy_from_slice(&i.to_le_bytes());
+            w.mark_spent(Outpoint {
+                txid: Txid(b),
+                vout: 0,
+            });
+        }
+        w.persist().unwrap();
+
+        let t0 = std::time::Instant::now();
+        let mut reopened = Wallet::open(Some(path.clone())).unwrap();
+        for j in 0u32..500 {
+            let mut b = [0xffu8; 32];
+            b[..4].copy_from_slice(&j.to_le_bytes());
+            let txid = Txid(b).to_rpc_hex();
+            let prev = Txid([0xee; 32]).to_rpc_hex();
+            let tx = serde_json::json!({
+                "txid": txid,
+                "vin": [{"txid": prev, "vout": j}],
+                "vout": [{"n": 0, "valueSat": 1000, "scriptPubKey": {"hex": "76a91400"}}]
+            });
+            reopened.apply_tx_unpersisted(&tx, "76a914ff").unwrap();
+        }
+        reopened.scanned_height = Some(379_000);
+        reopened.record_broadcast(&[], &[]).unwrap();
+        assert!(t0.elapsed() < Duration::from_secs(2), "{:?}", t0.elapsed());
+        assert_eq!(
+            Wallet::open(Some(path)).unwrap().scanned_height,
+            Some(379_000)
+        );
     }
 }

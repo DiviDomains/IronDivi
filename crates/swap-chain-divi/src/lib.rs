@@ -346,7 +346,7 @@ impl DiviBackend {
         for h in from_height..=to_height {
             for txid in self.block_txids(h).await? {
                 let tx = self.get_tx(&txid).await?;
-                self.wallet.lock().apply_tx(&tx, &spk)?;
+                self.wallet.lock().apply_tx_unpersisted(&tx, &spk)?;
             }
         }
         let mut w = self.wallet.lock();
