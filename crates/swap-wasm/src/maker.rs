@@ -8,10 +8,12 @@
 
 //! HTTP client for a `divi-swapd` maker, usable from the browser.
 
-use divi_swap::api::{AcceptRequest, LockNotice, Offer, Quote, SwapView};
+use divi_swap::api::{
+    AcceptReply, AcceptRequest, LockNotice, Offer, Quote, SwapView, SWAP_TOKEN_HEADER,
+    SWAP_TOKEN_SUPPORT_HEADER,
+};
 use divi_swap::{Result, SwapError};
 use serde::de::DeserializeOwned;
-use serde::Serialize;
 
 /// Talks to one maker.
 #[derive(Clone)]
@@ -77,17 +79,6 @@ impl MakerClient {
         Self::decode(resp).await
     }
 
-    async fn post<B: Serialize, T: DeserializeOwned>(&self, path: &str, body: &B) -> Result<T> {
-        let resp = self
-            .http
-            .post(format!("{}{path}", self.base))
-            .json(body)
-            .send()
-            .await
-            .map_err(transient)?;
-        Self::decode(resp).await
-    }
-
     /// The maker's offers.
     pub async fn offers(&self) -> Result<Vec<Offer>> {
         self.get("/offers").await
@@ -100,20 +91,59 @@ impl MakerClient {
             .await
     }
 
-    /// Accept a quote.
-    pub async fn accept(&self, req: &AcceptRequest) -> Result<SwapView> {
-        self.post("/swaps", req).await
+    /// Accept a quote, declaring support for per-swap tokens (`x-swap-token-support: 1`).
+    pub async fn accept(&self, req: &AcceptRequest) -> Result<AcceptReply> {
+        let resp = self
+            .http
+            .post(format!("{}/swaps", self.base))
+            .header(SWAP_TOKEN_SUPPORT_HEADER, "1")
+            .json(req)
+            .send()
+            .await
+            .map_err(transient)?;
+        let status = resp.status();
+        let body = resp.text().await.map_err(transient)?;
+        if !status.is_success() {
+            let body: String = body.chars().take(300).collect();
+            let msg = format!("maker answered {status}: {body}");
+            return Err(if status.is_server_error() || status.as_u16() == 429 {
+                SwapError::Transient(msg)
+            } else {
+                SwapError::Rejected(msg)
+            });
+        }
+        // Never echo `body` on a decode error: a 2xx accept body carries `swap_token`.
+        serde_json::from_str(&body)
+            .map_err(|e| SwapError::Other(format!("maker accept response: {e}")))
     }
 
-    /// Tell the maker where the taker's lock is.
-    pub async fn lock(&self, swap_id: &str, notice: &LockNotice) -> Result<SwapView> {
+    /// Tell the maker where the taker's lock is, authenticating with `token` when present.
+    pub async fn lock(
+        &self,
+        swap_id: &str,
+        token: Option<&str>,
+        notice: &LockNotice,
+    ) -> Result<SwapView> {
         let id = path_id(swap_id)?;
-        self.post(&format!("/swaps/{id}/lock"), notice).await
+        let mut rb = self
+            .http
+            .post(format!("{}/swaps/{id}/lock", self.base))
+            .json(notice);
+        if let Some(t) = token.filter(|t| !t.is_empty()) {
+            rb = rb.header(SWAP_TOKEN_HEADER, t);
+        }
+        let resp = rb.send().await.map_err(transient)?;
+        Self::decode(resp).await
     }
 
-    /// The maker's view of a swap.
-    pub async fn swap(&self, swap_id: &str) -> Result<SwapView> {
+    /// The maker's view of a swap, authenticating with `token` when present.
+    pub async fn swap(&self, swap_id: &str, token: Option<&str>) -> Result<SwapView> {
         let id = path_id(swap_id)?;
-        self.get(&format!("/swaps/{id}")).await
+        let mut rb = self.http.get(format!("{}/swaps/{id}", self.base));
+        if let Some(t) = token.filter(|t| !t.is_empty()) {
+            rb = rb.header(SWAP_TOKEN_HEADER, t);
+        }
+        let resp = rb.send().await.map_err(transient)?;
+        Self::decode(resp).await
     }
 }

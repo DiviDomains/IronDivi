@@ -384,3 +384,178 @@ async fn tick_refunds_locked_swap_when_maker_aborted_without_taker_outpoint() {
     assert_eq!(after_confirm[0].state, TakerState::Done);
     assert!(after_confirm[0].refund_txid.is_some());
 }
+
+#[tokio::test]
+async fn begin_persists_swap_token_encrypted_and_sends_it_after_reopen() {
+    use divi_swap::api::{AcceptReply, AcceptRequest, LegView, SwapView};
+    use divi_swap::{SwapState, TakerState};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let now = divi_swap::rt::unix_now() as u32;
+    let divi = MockChain::new(Chain::Divi, now, 60);
+    let btc = MockChain::new(Chain::Btc, now, 600);
+    let divi_b = Arc::new(divi.backend(21, Amount::from_sat(0)));
+    let btc_b = Arc::new(btc.backend(22, Amount::from_sat(1_000_000)));
+    let btc_pub = btc_b.pubkey();
+
+    let mut q = quote();
+    q.taker_timeout_secs = 7_200;
+    q.maker_timeout_secs = 3_600;
+    let q_for_srv = q.clone();
+    let secret_token = "tok_secret_64hex_deadbeefcafebabe0123456789abcdef";
+    let saw_support = Arc::new(AtomicBool::new(false));
+    let saw_lock_tok = Arc::new(AtomicBool::new(false));
+    let saw_get_tok = Arc::new(AtomicBool::new(false));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (s_sup, s_lock, s_get) = (
+        saw_support.clone(),
+        saw_lock_tok.clone(),
+        saw_get_tok.clone(),
+    );
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
+            let q = q_for_srv.clone();
+            let (s_sup, s_lock, s_get) = (s_sup.clone(), s_lock.clone(), s_get.clone());
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let lower = req.to_ascii_lowercase();
+                let (status, body) = if req.starts_with("GET /offers/divi-btc-testnet/quote") {
+                    ("200 OK", serde_json::to_string(&q).unwrap())
+                } else if req.starts_with("POST /swaps ") {
+                    if lower.contains("x-swap-token-support: 1") {
+                        s_sup.store(true, Ordering::SeqCst);
+                    }
+                    let json_body = req.split("\r\n\r\n").nth(1).unwrap_or("{}");
+                    let ar: AcceptRequest = serde_json::from_str(json_body).unwrap();
+                    let reply = AcceptReply {
+                        view: SwapView {
+                            id: "m-tok".into(),
+                            state: SwapState::Accepted,
+                            quote: q.clone(),
+                            taker_leg: LegView {
+                                htlc: HtlcParams {
+                                    hash: ar.hash,
+                                    claim_pubkey: q.maker_btc_pubkey,
+                                    refund_pubkey: btc_pub,
+                                    locktime: now + q.taker_timeout_secs,
+                                    script_version: divi_swap::ScriptVersion::V1,
+                                },
+                                amount: q.btc_amount,
+                                outpoint: None,
+                                spend_txid: None,
+                            },
+                            maker_leg: None,
+                            preimage: None,
+                            last_error: None,
+                            maker_mtp_at_lock: None,
+                        },
+                        swap_token: Some(secret_token.into()),
+                    };
+                    ("201 Created", serde_json::to_string(&reply).unwrap())
+                } else if req.starts_with("POST /swaps/m-tok/lock ") {
+                    if lower.contains(&format!("x-swap-token: {secret_token}")) {
+                        s_lock.store(true, Ordering::SeqCst);
+                        let view = SwapView {
+                            id: "m-tok".into(),
+                            state: SwapState::TakerLockSeen,
+                            quote: q.clone(),
+                            taker_leg: LegView {
+                                htlc: HtlcParams {
+                                    hash: [1; 32],
+                                    claim_pubkey: q.maker_btc_pubkey,
+                                    refund_pubkey: btc_pub,
+                                    locktime: now + q.taker_timeout_secs,
+                                    script_version: divi_swap::ScriptVersion::V1,
+                                },
+                                amount: q.btc_amount,
+                                outpoint: None,
+                                spend_txid: None,
+                            },
+                            maker_leg: None,
+                            preimage: None,
+                            last_error: None,
+                            maker_mtp_at_lock: None,
+                        };
+                        ("200 OK", serde_json::to_string(&view).unwrap())
+                    } else {
+                        ("404 Not Found", "{\"error\":\"missing token\"}".into())
+                    }
+                } else if req.starts_with("GET /swaps/m-tok ") {
+                    if lower.contains(&format!("x-swap-token: {secret_token}")) {
+                        s_get.store(true, Ordering::SeqCst);
+                    }
+                    ("404 Not Found", "{\"error\":\"done checking\"}".into())
+                } else {
+                    ("404 Not Found", "{}".into())
+                };
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            });
+        }
+    });
+
+    let sink = Arc::new(MemSink::default());
+    let make_engine = |entries: &[Entry], sink: Arc<MemSink>| {
+        let store_enc = Arc::new(EncryptedStore::open(&SEED, entries).unwrap());
+        let sink_dyn: Arc<dyn Sink> = sink;
+        let persister = Arc::new(Persister::new(store_enc.clone(), None, sink_dyn));
+        let swaps = Store::with_backend(store_enc);
+        let taker = Taker::with_counters(divi_b.clone(), vec![btc_b.clone()], swaps.clone());
+        let dummy_divi = Arc::new(
+            swap_chain_divi::DiviBackend::new(
+                "http://127.0.0.1:9",
+                divi_crypto::SecretKey::new_random(),
+                divi_wallet::Network::Testnet,
+                swap_chain_divi::FeePolicy::default(),
+                None,
+            )
+            .unwrap(),
+        );
+        Engine::from_parts(
+            taker,
+            MakerClient::new(&format!("http://{addr}")).unwrap(),
+            swaps,
+            persister,
+            dummy_divi,
+            Addresses {
+                divi: "yTest".into(),
+                btc: "tb1qtest".into(),
+                ltc: "tltc1qtest".into(),
+            },
+        )
+    };
+
+    let engine1 = make_engine(&[], sink.clone());
+    let begun = engine1.begin("divi-btc-testnet", 10_000).await.unwrap();
+    assert_eq!(begun.state, TakerState::Accepted);
+    assert!(saw_support.load(Ordering::SeqCst));
+
+    // Snapshot entries as persisted to chrome.storage.local (dedup newest per key).
+    let mut snapshot_map = std::collections::BTreeMap::new();
+    for e in sink.stored.lock().iter() {
+        assert!(!e.ct.contains(secret_token), "token leaked in ciphertext");
+        assert!(!e.key.contains(secret_token), "token leaked in key");
+        snapshot_map.insert(e.key.clone(), e.clone());
+    }
+    let snapshot: Vec<Entry> = snapshot_map.into_values().collect();
+
+    // Reopen in a fresh Engine (simulating browser close + reopen) and verify lock + tick send token.
+    let engine2 = make_engine(&snapshot, Arc::new(MemSink::default()));
+    let locked = engine2.lock(&begun.id).await.unwrap();
+    assert_eq!(locked.state, TakerState::Locked);
+    assert!(saw_lock_tok.load(Ordering::SeqCst));
+
+    engine2.tick().await.unwrap();
+    assert!(saw_get_tok.load(Ordering::SeqCst));
+}

@@ -24,6 +24,14 @@ use crate::maker::MakerClient;
 use crate::store::EncryptedStore;
 use crate::view::SwapSummary;
 
+/// `Table::Docs` namespace for per-swap hashlock tokens issued by `POST /swaps`.
+const SWAP_TOKEN_DOC: &str = "swap_token";
+
+#[derive(Serialize, Deserialize)]
+struct StoredSwapToken {
+    token: String,
+}
+
 /// Endpoints. Testnet only: the engine derives testnet keys whatever this says.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
@@ -174,8 +182,12 @@ impl Engine {
         }
         let (id, req) = self.taker.prepare(&quote).await?;
         self.persister.save().await?;
-        let view = self.maker.accept(&req).await?;
-        self.taker.accepted(&id, &view).await?;
+        let reply = self.maker.accept(&req).await?;
+        if let Some(token) = reply.swap_token.filter(|t| !t.is_empty()) {
+            self.store
+                .put_doc(SWAP_TOKEN_DOC, &reply.view.id, &StoredSwapToken { token })?;
+        }
+        self.taker.accepted(&id, &reply.view).await?;
         self.persister.save().await?;
         self.summary(&id)
     }
@@ -186,7 +198,8 @@ impl Engine {
         let notice = self.taker.lock(id).await?;
         self.persister.save().await?;
         let maker_id = self.maker_id(id)?;
-        let _ = self.maker.lock(&maker_id, &notice).await;
+        let token = self.swap_token(&maker_id)?;
+        let _ = self.maker.lock(&maker_id, token.as_deref(), &notice).await;
         self.summary(id)
     }
 
@@ -199,8 +212,12 @@ impl Engine {
             ) {
                 continue;
             }
+            let token = match &r.maker_swap_id {
+                Some(m) => self.swap_token(m)?,
+                None => None,
+            };
             let view: Option<SwapView> = match &r.maker_swap_id {
-                Some(m) => self.maker.swap(m).await.ok(),
+                Some(m) => self.maker.swap(m, token.as_deref()).await.ok(),
                 None => None,
             };
             if r.state == TakerState::Locked {
@@ -214,7 +231,12 @@ impl Engine {
                         {
                             if let Ok(notice) = self.taker.lock(&r.id).await {
                                 let _ = self.persister.save().await;
-                                if self.maker.lock(&v.id, &notice).await.is_ok() {
+                                if self
+                                    .maker
+                                    .lock(&v.id, token.as_deref(), &notice)
+                                    .await
+                                    .is_ok()
+                                {
                                     continue;
                                 }
                             }
@@ -276,6 +298,14 @@ impl Engine {
             .get_taker_swap(id)?
             .and_then(|r| r.maker_swap_id)
             .ok_or_else(|| SwapError::InvalidParams(format!("unknown swap {id}")))
+    }
+
+    fn swap_token(&self, maker_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .store
+            .get_doc::<StoredSwapToken>(SWAP_TOKEN_DOC, maker_id)?
+            .map(|d| d.token)
+            .filter(|t| !t.is_empty()))
     }
 
     fn summary(&self, id: &str) -> Result<SwapSummary> {
