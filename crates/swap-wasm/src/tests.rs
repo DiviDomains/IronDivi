@@ -260,3 +260,127 @@ fn seed_buffer_is_zeroized_after_engine_derives_keys_and_drops() {
     assert!(addrs.ltc.starts_with("tltc1q"));
     assert!(prefix.starts_with("swap:"));
 }
+
+#[tokio::test]
+async fn tick_refunds_locked_swap_when_maker_aborted_without_taker_outpoint() {
+    use divi_swap::api::{LegView, SwapView};
+    use divi_swap::{SwapState, TakerState};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let now = divi_swap::rt::unix_now() as u32;
+    let divi = MockChain::new(Chain::Divi, now - 10_000, 60);
+    let btc = MockChain::new(Chain::Btc, now - 10_000, 600);
+    let divi_b = Arc::new(divi.backend(11, Amount::from_sat(0)));
+    let btc_b = Arc::new(btc.backend(12, Amount::from_sat(1_000_000)));
+
+    let mut q = quote();
+    q.taker_timeout_secs = 3_600;
+    q.maker_timeout_secs = 1_800;
+    q.maker_btc_pubkey = [2; 33];
+    q.maker_divi_pubkey = [3; 33];
+
+    let store_enc = Arc::new(EncryptedStore::open(&SEED, &[]).unwrap());
+    let sink: Arc<dyn Sink> = Arc::new(MemSink::default());
+    let persister = Arc::new(Persister::new(store_enc.clone(), None, sink));
+    let swaps = Store::with_backend(store_enc);
+    let taker = Taker::with_counters(divi_b, vec![btc_b.clone()], swaps.clone());
+
+    let (id, _) = taker.prepare(&q).await.unwrap();
+    let rec = swaps.get_taker_swap(&id).unwrap().unwrap();
+    let mtp = btc_b.median_time_past().await.unwrap();
+    let locktime = mtp + q.taker_timeout_secs;
+    let taker_htlc = HtlcParams {
+        hash: rec.hash,
+        claim_pubkey: q.maker_btc_pubkey,
+        refund_pubkey: btc_b.pubkey(),
+        locktime,
+        script_version: divi_swap::ScriptVersion::V1,
+    };
+    let accepted_view = SwapView {
+        id: "m1".into(),
+        state: SwapState::Accepted,
+        quote: q.clone(),
+        taker_leg: LegView {
+            htlc: taker_htlc,
+            amount: q.btc_amount,
+            outpoint: None,
+            spend_txid: None,
+        },
+        maker_leg: None,
+        preimage: None,
+        last_error: None,
+        maker_mtp_at_lock: None,
+    };
+    taker.accepted(&id, &accepted_view).await.unwrap();
+    taker.lock(&id).await.unwrap();
+    btc.mine(1);
+
+    // Advance chain MTP past taker_locktime AND past the current wall clock? Wait:
+    // `Engine::tick` checks `rt::unix_now() < h.locktime`, and here `locktime = (now - 10_000) + 3_600 = now - 6_400`,
+    // so `rt::unix_now() >= locktime` AND mining 10 blocks advances MockChain MTP past `locktime`!
+    btc.mine(10);
+
+    let aborted_body = serde_json::to_string(&SwapView {
+        state: SwapState::Aborted,
+        ..accepted_view
+    })
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
+            let body = aborted_body.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 2048];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let resp = if req.starts_with("GET /swaps/m1 ") {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                } else {
+                    "HTTP/1.1 409 Conflict\r\nContent-Length: 19\r\nConnection: close\r\n\r\n{\"error\":\"aborted\"}".to_string()
+                };
+                let _ = sock.write_all(resp.as_bytes()).await;
+            });
+        }
+    });
+
+    let dummy_divi = Arc::new(
+        swap_chain_divi::DiviBackend::new(
+            "http://127.0.0.1:9",
+            divi_crypto::SecretKey::new_random(),
+            divi_wallet::Network::Testnet,
+            swap_chain_divi::FeePolicy::default(),
+            None,
+        )
+        .unwrap(),
+    );
+    let engine = Engine::from_parts(
+        taker,
+        MakerClient::new(&format!("http://{addr}")).unwrap(),
+        swaps,
+        persister,
+        dummy_divi,
+        Addresses {
+            divi: "yTest".into(),
+            btc: "tb1qtest".into(),
+            ltc: "tltc1qtest".into(),
+        },
+    );
+
+    let after_first = engine.tick().await.unwrap();
+    assert_eq!(after_first[0].state, TakerState::Refunded);
+    assert!(after_first[0].refund_txid.is_some());
+
+    btc.mine(2);
+    let after_confirm = engine.tick().await.unwrap();
+    assert_eq!(after_confirm[0].state, TakerState::Done);
+    assert!(after_confirm[0].refund_txid.is_some());
+}

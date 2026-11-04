@@ -341,18 +341,97 @@ impl DiviBackend {
 
     /// Scan blocks `from_height..=to_height` and persist the cursor (`to_height + 1`) with the
     /// wallet, so a later run can resume there. Returns the next height to scan from.
+    ///
+    /// Blocks are fetched in bounded concurrent batches (24 heights at a time) so high-RTT RPC
+    /// endpoints scan thousands of blocks quickly, then applied to the wallet strictly in
+    /// ascending `(height, tx_index)` order.
     pub async fn scan_range(&self, from_height: u64, to_height: u64) -> Result<u64> {
         let spk = self.spk.to_hex();
-        for h in from_height..=to_height {
-            for txid in self.block_txids(h).await? {
-                let tx = self.get_tx(&txid).await?;
-                self.wallet.lock().apply_tx_unpersisted(&tx, &spk)?;
+        let mut h = from_height;
+        while h <= to_height {
+            let end = h.saturating_add(23).min(to_height);
+            let (b0, b1, b2) = tokio::join!(
+                self.fetch_blocks_up_to_8(h, h.saturating_add(7).min(end)),
+                self.fetch_blocks_up_to_8(h.saturating_add(8), h.saturating_add(15).min(end)),
+                self.fetch_blocks_up_to_8(h.saturating_add(16), end),
+            );
+            let mut wallet = self.wallet.lock();
+            for block_txs in b0?.into_iter().chain(b1?).chain(b2?) {
+                for tx in &block_txs {
+                    wallet.apply_tx_unpersisted(tx, &spk)?;
+                }
             }
+            drop(wallet);
+            let Some(next) = end.checked_add(1) else {
+                break;
+            };
+            h = next;
         }
         let mut w = self.wallet.lock();
         w.scanned_height = Some(to_height + 1);
         w.record_broadcast(&[], &[])?;
         Ok(to_height + 1)
+    }
+
+    async fn fetch_blocks_up_to_8(&self, from: u64, to: u64) -> Result<Vec<Vec<Value>>> {
+        if from > to {
+            return Ok(Vec::new());
+        }
+        let one = |offset: u64| async move {
+            let h = from.saturating_add(offset);
+            let res: Result<Option<Vec<Value>>> = if h <= to {
+                Ok(Some(self.fetch_block_txs(h).await?))
+            } else {
+                Ok(None)
+            };
+            res
+        };
+        let (r0, r1, r2, r3, r4, r5, r6, r7) = tokio::join!(
+            one(0),
+            one(1),
+            one(2),
+            one(3),
+            one(4),
+            one(5),
+            one(6),
+            one(7)
+        );
+        let mut out = Vec::with_capacity((to - from + 1) as usize);
+        for r in [r0, r1, r2, r3, r4, r5, r6, r7] {
+            if let Some(txs) = r? {
+                out.push(txs);
+            }
+        }
+        Ok(out)
+    }
+
+    async fn fetch_block_txs(&self, height: u64) -> Result<Vec<Value>> {
+        let txids = self.block_txids(height).await?;
+        let mut txs = Vec::with_capacity(txids.len());
+        let mut rest = txids.as_slice();
+        while !rest.is_empty() {
+            match rest {
+                [a, b, c, d, tail @ ..] => {
+                    let (ra, rb, rc, rd) = tokio::join!(
+                        self.get_tx(a),
+                        self.get_tx(b),
+                        self.get_tx(c),
+                        self.get_tx(d)
+                    );
+                    txs.push(ra?);
+                    txs.push(rb?);
+                    txs.push(rc?);
+                    txs.push(rd?);
+                    rest = tail;
+                }
+                [a, tail @ ..] => {
+                    txs.push(self.get_tx(a).await?);
+                    rest = tail;
+                }
+                [] => break,
+            }
+        }
+        Ok(txs)
     }
 
     /// The transactions of block `height`. With a fallback both endpoints must list the same

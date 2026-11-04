@@ -204,13 +204,21 @@ impl Engine {
                 None => None,
             };
             if r.state == TakerState::Locked {
-                if let Some(v) = &view {
-                    if v.taker_leg.outpoint.is_none() {
-                        if let Ok(notice) = self.taker.lock(&r.id).await {
-                            let _ = self.persister.save().await;
-                            let _ = self.maker.lock(&v.id, &notice).await;
+                let before_timeout = r
+                    .taker_leg_htlc
+                    .is_some_and(|h| rt::unix_now() < h.locktime as u64);
+                if before_timeout {
+                    if let Some(v) = &view {
+                        if v.taker_leg.outpoint.is_none()
+                            && v.state == divi_swap::SwapState::Accepted
+                        {
+                            if let Ok(notice) = self.taker.lock(&r.id).await {
+                                let _ = self.persister.save().await;
+                                if self.maker.lock(&v.id, &notice).await.is_ok() {
+                                    continue;
+                                }
+                            }
                         }
-                        continue;
                     }
                 }
             }

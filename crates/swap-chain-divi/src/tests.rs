@@ -648,6 +648,92 @@ async fn scan_cursor_persists_with_wallet() {
     assert_eq!(open().scanned_height(), Some(102));
 }
 
+#[tokio::test]
+async fn scan_range_applies_blocks_in_height_order_across_concurrent_batches() {
+    #[derive(Clone)]
+    struct HeightChain {
+        txs: HashMap<String, Value>,
+        blocks: HashMap<u64, Vec<String>>,
+    }
+    impl Respond for HeightChain {
+        fn respond(&self, req: &Request) -> ResponseTemplate {
+            let body: Value = serde_json::from_slice(&req.body).unwrap();
+            let method = body["method"].as_str().unwrap_or("");
+            let params = &body["params"];
+            let res = match method {
+                "getblockhash" => {
+                    let h = params[0].as_u64().unwrap();
+                    json!(format!("{h:064x}"))
+                }
+                "getblock" => {
+                    let hash = params[0].as_str().unwrap();
+                    let h = u64::from_str_radix(hash, 16).unwrap();
+                    let txs = self.blocks.get(&h).cloned().unwrap_or_default();
+                    json!({"tx": txs})
+                }
+                "getrawtransaction" => {
+                    let txid = params[0].as_str().unwrap();
+                    self.txs.get(txid).cloned().unwrap()
+                }
+                _ => unreachable!("unexpected method {method}"),
+            };
+            ResponseTemplate::new(200).set_body_json(json!({"result": res, "error": null, "id": 1}))
+        }
+    }
+
+    let key = SecretKey::new_random();
+    let probe = backend("http://127.0.0.1:9", key.clone());
+    let spk_hex = probe.spk.to_hex();
+
+    let fund1 = txid_n(11);
+    let spend1 = txid_n(12);
+    let fund2 = txid_n(21);
+    let keep = txid_n(31);
+
+    let mut txs = HashMap::new();
+    txs.insert(
+        fund1.to_rpc_hex(),
+        tx_json(&fund1, &[], &[(&spk_hex, 500_000_000)], 10),
+    );
+    txs.insert(
+        spend1.to_rpc_hex(),
+        tx_json(&spend1, &[(&fund1, 0)], &[], 9),
+    );
+    txs.insert(
+        fund2.to_rpc_hex(),
+        tx_json(&fund2, &[], &[(&spk_hex, 700_000_000)], 5),
+    );
+    txs.insert(
+        keep.to_rpc_hex(),
+        tx_json(&keep, &[], &[(&spk_hex, 900_000_000)], 1),
+    );
+    let spend2 = txid_n(22);
+    txs.insert(
+        spend2.to_rpc_hex(),
+        tx_json(&spend2, &[(&fund2, 0)], &[], 4),
+    );
+
+    let mut blocks = HashMap::new();
+    blocks.insert(102, vec![fund1.to_rpc_hex()]);
+    blocks.insert(107, vec![spend1.to_rpc_hex()]); // spent within first 24-block batch
+    blocks.insert(110, vec![fund2.to_rpc_hex()]);
+    blocks.insert(128, vec![spend2.to_rpc_hex(), keep.to_rpc_hex()]); // second 24-block batch
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(HeightChain { txs, blocks })
+        .mount(&server)
+        .await;
+
+    let b = backend(&server.uri(), key);
+    assert_eq!(b.scan_range(100, 130).await.unwrap(), 131);
+    assert_eq!(b.scanned_height(), Some(131));
+    let avail = b.wallet.lock().available();
+    assert_eq!(avail.len(), 1);
+    assert_eq!(avail[0].outpoint.txid, keep);
+    assert_eq!(avail[0].value, 900_000_000);
+}
+
 // --- G2: two DIVI sources -------------------------------------------------------------
 
 /// A cryptoid stand-in: `tx.raw.dws` answers `tx` (or "unknown"), `block.raw.dws` gives
