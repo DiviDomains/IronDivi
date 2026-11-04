@@ -577,8 +577,12 @@ impl Connection {
         loop {
             match self.read_message_handshake().await? {
                 Some(Decoded::Message(NetworkMessage::Version(v))) => return Ok(v),
-                Some(Decoded::Malformed { command, error }) if command == "version" => {
-                    self.reject_malformed(&command, &error).await?;
+                Some(Decoded::Malformed {
+                    command,
+                    error,
+                    head,
+                }) if command == "version" => {
+                    self.reject_malformed(&command, &error, &head).await?;
                 }
                 // Divi Core does not even parse a message that comes before
                 // the version: Misbehaving(1) and ignore it
@@ -599,11 +603,17 @@ impl Connection {
     }
 
     /// Divi Core's answer to a message that does not parse
-    async fn reject_malformed(&mut self, command: &str, error: &str) -> Result<(), NetworkError> {
+    async fn reject_malformed(
+        &mut self,
+        command: &str,
+        error: &str,
+        head: &[u8],
+    ) -> Result<(), NetworkError> {
         debug!(
             "{} from {} does not parse: {}",
             command, self.info.addr, error
         );
+        note_malformed(self.info.addr.ip(), command, error, head);
         match malformed_reject(command) {
             Some(answer) => self.send_message(answer).await,
             None => Ok(()),
@@ -692,6 +702,7 @@ impl Connection {
                 Err(e) => Decoded::Malformed {
                     command,
                     error: e.to_string(),
+                    head: crate::codec::malformed_head(&payload),
                 },
             },
         ))
@@ -827,7 +838,7 @@ impl Connection {
                             }
                             let _ = event_tx.send(duplicate_version(peer_id));
                         }
-                        Ok(Some(Ok(Decoded::Malformed { command, error }))) => {
+                        Ok(Some(Ok(Decoded::Malformed { command, error, head }))) => {
                             let bytes_received = framed.decoder_mut().take_bytes_consumed();
                             info.bytes_recv += bytes_received;
                             info.last_recv = info.clock.now();
@@ -841,6 +852,7 @@ impl Connection {
                                 info.ping_nonce = None;
                                 info.ping_time = None;
                             }
+                            note_malformed(info.addr.ip(), &command, &error, &head);
                             if let Some(answer) = malformed_reject(&command) {
                                 Self::answer_in_turn(&stats, &mut waiting, answer);
                                 if let Err(e) = Self::write_turns(&mut writer, &mut info, magic, &total_bytes_sent, &stats, &mut last_ping_sent, &mut outbound_rx, &mut waiting).await {
@@ -1128,6 +1140,17 @@ fn reject(command: &str, code: u8, reason: &str) -> NetworkMessage {
         reason: reason.to_string(),
         data: Vec::new(),
     })
+}
+
+/// A message that did not parse, for the diag A13 `bad-messages/` record
+fn note_malformed(ip: std::net::IpAddr, command: &str, error: &str, head: &[u8]) {
+    divi_primitives::diag_events::emit(&divi_primitives::diag_events::Event::BadMessage {
+        peer: Some(ip),
+        command,
+        head,
+        error,
+        score: 0,
+    });
 }
 
 /// The `reject` Divi Core sends for a message that does not parse

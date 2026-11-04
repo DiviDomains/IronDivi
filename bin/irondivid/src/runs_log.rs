@@ -23,6 +23,10 @@
 //!
 //! [`RawLine`] and [`raw_exit`] write a record without allocating or taking
 //! a lock, for the signal handler's third stop signal (A3).
+//!
+//! A14: every record is written to the mirror's copy first
+//! ([`crate::mirror`]), then here. Both files are rotated to `runs.log.1`
+//! at start when they are over 1 MB, never during a run.
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -36,6 +40,11 @@ use std::time::Instant;
 static FILE: OnceLock<File> = OnceLock::new();
 /// FILE's descriptor, for [`RawLine`] (-1: not open)
 static RAW_FD: AtomicI32 = AtomicI32::new(-1);
+/// The mirror's runs.log (A14), and its descriptor
+static MIRROR: OnceLock<File> = OnceLock::new();
+static MIRROR_FD: AtomicI32 = AtomicI32::new(-1);
+/// runs.log's size at start above which it is moved to runs.log.1 (A14)
+const CAP: u64 = 1 << 20;
 /// What `note_launch` saw before any fork
 static LAUNCH: OnceLock<Launch> = OnceLock::new();
 /// The pid that was started, and the intermediate one, when -daemon forked
@@ -96,6 +105,9 @@ pub fn open(data_dir: &Path, network: &str, daemon: bool) {
     }
     let launch = LAUNCH.get();
     let run = last_run(&data_dir.join("diag").join("runs.log")) + 1;
+    if let Some(m) = crate::mirror::dir() {
+        open_mirror(&m.join("runs.log"));
+    }
     let _ = RUN.set((run, data_dir.join("diag")));
     let (uid, euid, gid) = unsafe { (libc::getuid(), libc::geteuid(), libc::getgid()) };
     let exe = std::env::current_exe()
@@ -105,7 +117,7 @@ pub fn open(data_dir: &Path, network: &str, daemon: bool) {
         "start",
         &format!(
             "run={} pid={} ppid={} parent={} uid={} euid={} gid={} exe={} version={} \
-             network={} how={} daemon={} pid1={} kernel={}",
+             build-id={} network={} how={} daemon={} pid1={} kernel={}{}",
             run,
             unsafe { libc::getpid() },
             launch.map_or(0, |l| l.ppid),
@@ -115,13 +127,18 @@ pub fn open(data_dir: &Path, network: &str, daemon: bool) {
             gid,
             exe,
             env!("CARGO_PKG_VERSION"),
+            crate::build_id::get(),
             network,
             launch.map_or("other", |l| l.how),
             yes(daemon),
             yes(unsafe { libc::getpid() } == 1),
             quote(&kernel_release()),
+            crate::mirror::start_field(),
         ),
     );
+    if crate::mirror::unavailable() {
+        record("mirror-unavailable", "reason=\"mirror unavailable\"");
+    }
     if daemon {
         let threads = THREADS_AT_FORK.load(Ordering::Relaxed);
         record(
@@ -147,6 +164,7 @@ fn try_open(data_dir: &Path) -> std::io::Result<()> {
     let created = !dir.exists();
     crate::private_files::ensure_private_dir(&dir, true)?;
     let path = dir.join("runs.log");
+    rotate_at_open(&path, CAP);
     let new_file = !path.exists();
     let file = std::fs::OpenOptions::new()
         .create(true)
@@ -168,8 +186,52 @@ fn try_open(data_dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// The highest `run=` of a `start` record near the end of `path`; 0 if none
+/// The mirror's runs.log, rotated like runs.log; a failure leaves it off
+fn open_mirror(path: &Path) {
+    use std::os::unix::fs::OpenOptionsExt;
+    rotate_at_open(path, CAP);
+    let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)
+    else {
+        return;
+    };
+    let fd = file.as_raw_fd();
+    if MIRROR.set(file).is_ok() {
+        MIRROR_FD.store(fd, Ordering::Release);
+    }
+}
+
+/// Move `path` to `path.1` (replacing it) when it is over `cap` bytes:
+/// at open only, so a run's records never move under a reader (A14)
+pub(crate) fn rotate_at_open(path: &Path, cap: u64) {
+    if std::fs::metadata(path).is_ok_and(|m| m.len() > cap) {
+        let mut old = path.as_os_str().to_owned();
+        old.push(".1");
+        let _ = std::fs::rename(path, PathBuf::from(old));
+    }
+}
+
+/// `path.1`'s text followed by `path`'s: a log rotated at open, oldest first
+pub(crate) fn read_with_previous(path: &Path) -> String {
+    let mut old = path.as_os_str().to_owned();
+    old.push(".1");
+    let mut text = std::fs::read_to_string(PathBuf::from(old)).unwrap_or_default();
+    text.push_str(&std::fs::read_to_string(path).unwrap_or_default());
+    text
+}
+
+/// The highest `run=` of a `start` record near the end of `path`, or of
+/// `path.1` when runs.log was just rotated; 0 if none
 fn last_run(path: &Path) -> u64 {
+    let mut old = path.as_os_str().to_owned();
+    old.push(".1");
+    last_run_in(path).max(last_run_in(Path::new(&old)))
+}
+
+fn last_run_in(path: &Path) -> u64 {
     let Ok(mut f) = File::open(path) else {
         return 0;
     };
@@ -204,6 +266,12 @@ pub fn record(kind: &str, fields: &str) {
         return;
     };
     let line = format!("{} mono={} {} {}\n", utc_now(), mono_now(), kind, fields);
+    // The mirror first: it outlives a lost data directory (A14)
+    if let Some(mut m) = MIRROR.get() {
+        if m.write_all(line.as_bytes()).is_ok() {
+            let _ = m.sync_data();
+        }
+    }
     if file.write_all(line.as_bytes()).is_ok() {
         let _ = file.sync_data();
     }
@@ -242,6 +310,11 @@ pub fn phase(name: &'static str) {
     crate::running_marker::phase(name);
 }
 
+/// The phase entered last and when (the A18 start-up bound)
+pub fn current_phase() -> Option<(&'static str, Instant)> {
+    *PHASE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// A stop was asked for, `by` what (`signal=TERM`, `rpc`, ...)
 pub fn stop_requested(by: &str) {
     record("stop-requested", &format!("by={}", by));
@@ -266,14 +339,31 @@ pub fn exit(code: i32, reason: &str) {
             epipes
         ),
     );
-    // The end is on record: the marker goes, last (A2)
+    // The end is on record: the marker goes, last (A2), and the path
+    // record (A14)
     crate::running_marker::remove();
+    crate::mirror::remove_record();
 }
 
 /// The `exit` record, written without allocating or locking (a signal
 /// handler's); the marker is left for the next start, which reads this
 /// record (`verdict=exit-recorded`)
 pub fn raw_exit(code: i32, reason: &str, sigpipes: u64, epipes: u64) {
+    exit_line(code, reason, sigpipes, epipes).write();
+    crate::mirror::remove_record();
+}
+
+/// The mirror's runs.log and the data directory's, as descriptors (-1:
+/// not open), for a record written to one and then the other (A18)
+pub fn fds() -> (i32, i32) {
+    (
+        MIRROR_FD.load(Ordering::Acquire),
+        RAW_FD.load(Ordering::Acquire),
+    )
+}
+
+/// The `exit` record [`raw_exit`] writes, built and not written
+pub fn exit_line(code: i32, reason: &str, sigpipes: u64, epipes: u64) -> RawLine {
     let mut line = RawLine::new("exit");
     line.text(" code=")
         .num(i64::from(code))
@@ -298,7 +388,7 @@ pub fn raw_exit(code: i32, reason: &str, sigpipes: u64, epipes: u64) {
         .num(sigpipes as i64)
         .text(" epipe=")
         .num(epipes as i64);
-    line.write();
+    line
 }
 
 /// A record built in a fixed buffer and written with one `write` and
@@ -361,8 +451,7 @@ impl RawLine {
         self.buf.len() - 1 - self.len
     }
 
-    /// The line so far
-    #[cfg(test)]
+    /// The line so far (the A17 watchdog's incidents, and tests)
     pub fn as_str(&self) -> &str {
         std::str::from_utf8(&self.buf[..self.len]).unwrap_or("")
     }
@@ -412,8 +501,10 @@ impl RawLine {
         self.text(std::str::from_utf8(&digits[d..]).unwrap_or(""))
     }
 
-    /// Append the line to runs.log, then fdatasync; a no-op before it is open
+    /// Append the line to the mirror's runs.log and then to runs.log, each
+    /// followed by fdatasync; a no-op before they are open
     pub fn write(&mut self) {
+        self.write_to(MIRROR_FD.load(Ordering::Acquire));
         self.write_to(RAW_FD.load(Ordering::Acquire));
     }
 
@@ -608,5 +699,22 @@ mod tests {
         )
         .unwrap();
         assert_eq!(last_run(&path), 5);
+    }
+
+    #[test]
+    fn runs_log_is_rotated_at_open_and_the_run_number_survives_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runs.log");
+        std::fs::write(&path, "t mono=1 start run=9 pid=1\n").unwrap();
+        rotate_at_open(&path, 1 << 20);
+        assert!(path.exists(), "under the cap: kept");
+        rotate_at_open(&path, 4);
+        assert!(!path.exists());
+        assert_eq!(last_run(&path), 9);
+        std::fs::write(&path, "t mono=2 exit code=0 run=9\n").unwrap();
+        assert_eq!(
+            read_with_previous(&path),
+            "t mono=1 start run=9 pid=1\nt mono=2 exit code=0 run=9\n"
+        );
     }
 }

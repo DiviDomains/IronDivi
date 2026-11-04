@@ -21,10 +21,14 @@
 //!   irondivid --testnet --datadir=/path/to/data
 //!   irondivid --rpcuser=user --rpcpassword=pass
 
+mod budget;
+mod build_id;
+mod chain_events;
 mod core_files;
 mod counts;
 #[cfg(unix)]
 mod crash;
+mod diaginfo;
 mod events;
 mod health;
 mod incidents;
@@ -32,15 +36,24 @@ mod interfaces;
 mod log_delivery;
 mod log_filter;
 mod masternode_options;
+mod mirror;
 mod private_files;
+mod replay;
+mod rpc_log;
 mod running_marker;
 mod runs_log;
 mod settings;
+#[cfg(feature = "sidechains")]
+mod sidechains;
 #[cfg(unix)]
 mod signals;
 mod snapshot_sig;
 mod startup;
+#[cfg(unix)]
+mod startup_bound;
 mod tasks;
+#[cfg(unix)]
+mod watchdog;
 
 /// System's, with a crash.log line when an allocation fails (A5)
 #[cfg(unix)]
@@ -87,6 +100,14 @@ fn console_line(to_stdout: bool, line: std::fmt::Arguments<'_>) {
             signals::note_epipe();
         }
         if !CONSOLE_LOST.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            events::event(
+                "console-lost",
+                if to_stdout {
+                    "stream=stdout"
+                } else {
+                    "stream=stderr"
+                },
+            );
             // The log line's own timestamp says when
             warn!(
                 "{} lost: {}; console lines are dropped from now on",
@@ -364,7 +385,9 @@ daemon; the default is info; see docs/logging.md)\n  \
 IronDivi's own: -fullnode=<ip> -stakeonstaletip -stakesplitthreshold=<n>\n  \
 -utxocachesize=<n> -expire=<age> -maxlogsize=<MB> -maxlogfiles=<n>\n  \
 -webui -webuiport=<port> -webuibind=<addr> -webuiallowhost=<host>\n  \
--webuiallowremote (the web interface, off unless -webui is given)\n  \
+-webuiallowremote -webuiopen (the web interface: on for a desktop run,\n  \
+off with -daemon, over SSH or without a display; -webui=0 turns it off;\n  \
+-webuiopen=0 keeps the browser from opening at start)\n  \
 -electrum=<addr:port> -electrumtls=<addr:port> -electrumcert=<pem>\n  \
 -electrumkey=<pem> -electrumws=<addr:port> -electrumwss=<addr:port>\n  \
 (an Electrum server, TCP/TLS/WebSocket; needs -txindex -addressindex)\n  \
@@ -641,6 +664,7 @@ const APPLIED: &[&str] = &[
     "forcestart",
     "rpcthreads",
     "alerts",
+    "walletbroadcast",
     "vault",
     // read by masternode_options
     "masternode",
@@ -752,11 +776,13 @@ const APPLIED: &[&str] = &[
 
 /// Options read elsewhere (before the node config is built, or by a command)
 const READ_ELSEWHERE: &[&str] = &[
+    "startuptimeout",
     "webui",
     "webuiport",
     "webuibind",
     "webuiallowremote",
     "webuiallowhost",
+    "webuiopen",
     "electrum",
     "electrumtls",
     "electrumws",
@@ -1842,6 +1868,24 @@ static LOG_FILTER: std::sync::OnceLock<
     tracing_subscriber::reload::Handle<EnvFilter, tracing_subscriber::Registry>,
 > = std::sync::OnceLock::new();
 
+/// The filter of the WebUI in-memory log ring, reloaded alongside `LOG_FILTER`
+static WEBUI_LOG_FILTER: std::sync::OnceLock<
+    tracing_subscriber::reload::Handle<EnvFilter, tracing_subscriber::Registry>,
+> = std::sync::OnceLock::new();
+
+fn reload_log_filters(directives: &str) -> std::result::Result<(), String> {
+    let filter = EnvFilter::try_new(directives).map_err(|e| e.to_string())?;
+    let webui_filter = EnvFilter::try_new(directives).map_err(|e| e.to_string())?;
+    let handle = LOG_FILTER
+        .get()
+        .ok_or_else(|| "logging is not set up".to_string())?;
+    handle.reload(filter).map_err(|e| e.to_string())?;
+    if let Some(wh) = WEBUI_LOG_FILTER.get() {
+        wh.reload(webui_filter).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 /// Change the log levels of the running node (the `setlogconfig` RPC);
 /// returns the levels now in force
 fn set_log_levels(spec: &str) -> std::result::Result<String, String> {
@@ -1850,12 +1894,16 @@ fn set_log_levels(spec: &str) -> std::result::Result<String, String> {
         events::event("setlogconfig-refused", "option=logwalletdetail");
         return Err("logwalletdetail can be set only at start".to_string());
     }
+    if divi_rpc::logctl::control().is_some_and(|c| c.state().env_override) {
+        return Err(
+            "RUST_LOG is set; it decides what is logged until a restart without it".to_string(),
+        );
+    }
     let levels = log_filter::LogLevels::parse_spec(spec)?;
-    let handle = LOG_FILTER
-        .get()
-        .ok_or_else(|| "logging is not set up".to_string())?;
-    let filter = EnvFilter::try_new(levels.directives()).map_err(|e| e.to_string())?;
-    handle.reload(filter).map_err(|e| e.to_string())?;
+    reload_log_filters(&levels.directives())?;
+    if let Some(live) = divi_rpc::logctl::control() {
+        live.sync_state(&levels.base, levels.webui_categories());
+    }
     if !levels.unknown.is_empty() {
         warn!(
             "Unknown log categories {:?} (known: {})",
@@ -1878,11 +1926,29 @@ fn init_logging(log_config: &LogConfig, levels: &log_filter::LogLevels, data_dir
     // -logips: whether log lines name peers by address too (Logging.cpp:202)
     divi_network::peer_log::set_log_ips(log_config.log_ips);
     // RUST_LOG, when set, replaces -loglevel and -debug
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(levels.directives()));
-    let (filter, handle) = tracing_subscriber::reload::Layer::new(filter);
+    let env_override = EnvFilter::try_from_default_env().is_ok();
+    let make_filter = || {
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(levels.directives()))
+    };
+    let (filter, handle) = tracing_subscriber::reload::Layer::new(make_filter());
     let _ = LOG_FILTER.set(handle);
+    let (webui_filter, webui_handle) = tracing_subscriber::reload::Layer::new(make_filter());
+    let _ = WEBUI_LOG_FILTER.set(webui_handle);
+    divi_rpc::logctl::install(
+        |_raw, next| {
+            let parsed = log_filter::LogLevels::parse_spec(&next.spec())?;
+            reload_log_filters(&parsed.directives())
+        },
+        divi_rpc::logctl::LogState {
+            level: levels.base.clone(),
+            categories: levels.webui_categories(),
+            env_override,
+        },
+    );
     let ring: BoxLayer = log_delivery::ring_layer(&log_delivery::RING).boxed();
+    let webui_ring: BoxLayer = divi_rpc::logctl::RingLayer
+        .with_filter(webui_filter)
+        .boxed();
     let console = |filter: tracing_subscriber::reload::Layer<
         EnvFilter,
         tracing_subscriber::Registry,
@@ -1900,7 +1966,7 @@ fn init_logging(log_config: &LogConfig, levels: &log_filter::LogLevels, data_dir
     if log_config.print_to_console && !std_is_log {
         // Log to console only
         tracing_subscriber::registry()
-            .with(vec![console(filter), ring])
+            .with(vec![console(filter), ring, webui_ring])
             .init();
     } else {
         // Log to file (debug.log in data directory) like C++ divid
@@ -1913,7 +1979,7 @@ fn init_logging(log_config: &LogConfig, levels: &log_filter::LogLevels, data_dir
             );
             // Fall back to console logging
             tracing_subscriber::registry()
-                .with(vec![console(filter), ring])
+                .with(vec![console(filter), ring, webui_ring])
                 .init();
             return;
         }
@@ -1940,7 +2006,7 @@ fn init_logging(log_config: &LogConfig, levels: &log_filter::LogLevels, data_dir
                     e
                 );
                 tracing_subscriber::registry()
-                    .with(vec![console(filter), ring])
+                    .with(vec![console(filter), ring, webui_ring])
                     .init();
                 return;
             }
@@ -1958,7 +2024,9 @@ fn init_logging(log_config: &LogConfig, levels: &log_filter::LogLevels, data_dir
             .with_ansi(false) // No ANSI colors in file
             .with_filter(filter)
             .boxed();
-        tracing_subscriber::registry().with(vec![file, ring]).init();
+        tracing_subscriber::registry()
+            .with(vec![file, ring, webui_ring])
+            .init();
 
         // Nothing more on stderr: divid writes there only its warnings and
         // errors (InitWarning, InitError, noui.cpp:38-40), and a -daemon child
@@ -2167,6 +2235,9 @@ struct WalletOptions {
     /// -prunewalletconfs, read as a number: wallet transactions spent that
     /// deep are left out of memory at the start (init.cpp:1574-1577)
     prune_wallet_confs: Option<i64>,
+    /// -walletbroadcast=0 (A18): the wallet's own transactions are neither
+    /// relayed nor resubmitted; they stay in the wallet, unconfirmed
+    skip_broadcast: bool,
 }
 
 /// Divi Core's LoadWallet lines (walletdb.cpp:529-537): the file version a
@@ -2253,6 +2324,7 @@ impl WalletOptions {
                 .map(|v| parse_hex_prefix(v))
                 .collect(),
             prune_wallet_confs: settings.get("prunewalletconfs").map(atoi),
+            skip_broadcast: !settings.get_bool("walletbroadcast", true),
         }
     }
 
@@ -2397,7 +2469,10 @@ fn load_or_restore_wallet_with_seed(
 ) -> Result<Arc<WalletDb>> {
     // Try to open existing wallet (backed up by `backup_wallet_at_start`)
     if wallet_path.exists() {
-        info!("Loading wallet from {:?}", wallet_path);
+        info!(
+            "Loading wallet from {}",
+            divi_primitives::redact::WalletValue(&wallet_path.to_string_lossy())
+        );
         // Only this user may read the wallet (NODE-3)
         if let Err(e) = private_files::ensure_private_dir(wallet_path, true) {
             warn!("Could not check the wallet directory permissions: {}", e);
@@ -2528,7 +2603,10 @@ fn load_or_restore_wallet_with_seed(
 
     // Divi Core loads the empty wallet file before it makes the keys
     log_load_counts(0, 0, 0);
-    info!("Creating new wallet at {:?}", wallet_path);
+    info!(
+        "Creating new wallet at {}",
+        divi_primitives::redact::WalletValue(&wallet_path.to_string_lossy())
+    );
     // Only this user may read the wallet (NODE-3)
     private_files::ensure_private_dir(wallet_path, true)
         .with_context(|| format!("Failed to create wallet directory: {:?}", wallet_path))?;
@@ -2701,7 +2779,7 @@ async fn run_daemon(
     shutdown_tx: broadcast::Sender<()>,
     shutdown_rx: broadcast::Receiver<()>,
     pid_file: PathBuf,
-    webui: Option<divi_webui::WebUiConfig>,
+    webui: Option<WebUi>,
     electrum: Option<divi_electrum::ElectrumConfig>,
 ) -> Result<()> {
     runs_log::phase("datadir");
@@ -2735,11 +2813,21 @@ async fn run_daemon(
     divi_network::timedata::on_clock_warning(divi_rpc::warnings::set_misc_warning);
 
     // -webui: take its port now, so a port in use stops the start at once
-    let webui = webui
-        .map(divi_webui::prepare)
-        .transpose()
-        .bind_or_exit(exit_code::USAGE)?;
+    // (only a warning when the interface is on by default)
+    let webui = match webui {
+        Some(w) => match divi_webui::prepare(w.config) {
+            Ok(p) => Some(p),
+            Err(e) if !w.required => {
+                warn!("Web interface not started: {:#}", e);
+                None
+            }
+            Err(e) => return Err(e).bind_or_exit(exit_code::USAGE),
+        },
+        None => None,
+    };
     let webui_shutdown = shutdown_tx.subscribe();
+    // The web interface's wallets read through the Electrum backend, which needs both indexes
+    let webui_indexed = config.index.txindex && config.index.addressindex;
     // -electrum: the same, for the Electrum server's ports and certificate
     let electrum = electrum
         .map(divi_electrum::prepare)
@@ -2764,6 +2852,31 @@ async fn run_daemon(
     // once the wallet is loaded (init.cpp:1580); here the wallet is loaded
     // after the node starts, so the thread waits until then (below)
     node.hold_import();
+
+    // A12: chain-events.log, before any block or peer comes in
+    chain_events::install();
+    chain_events::watch_tip(node.chain());
+    // A13: replay bundles, written off the event path
+    replay::start(config.data_dir.as_path());
+    let sporks = node.spork_manager().clone();
+    replay::set_sources(
+        node.chain(),
+        Box::new(move || {
+            sporks
+                .active_sporks()
+                .iter()
+                .map(|m| {
+                    format!(
+                        "{} {} {} {}",
+                        m.spork_id,
+                        m.value,
+                        m.time_signed,
+                        hex::encode(m.signature.as_slice())
+                    )
+                })
+                .collect()
+        }),
+    );
 
     // -blocknotify, before any block comes in (init.cpp:1563-1564)
     if let Some(cmd) = config.blocknotify.clone() {
@@ -2838,8 +2951,12 @@ async fn run_daemon(
         block_sync: node.block_sync().clone(),
         peers: node.peer_manager().clone(),
         mempool: node.mempool().clone(),
+        sporks: node.spork_manager().clone(),
         data_dir: config.data_dir.clone(),
     });
+    // A17: hangs, stuck calls, lock waits and snapshot requests
+    #[cfg(unix)]
+    watchdog::start(config.data_dir.clone());
 
     // Get chain and peer manager references for RPC server
     let chain = node.chain().clone();
@@ -2849,6 +2966,9 @@ async fn run_daemon(
     runs_log::phase("wallet-load");
     let wallet = if disable_wallet {
         info!("Wallet disabled!");
+        // A12: no transaction is the wallet's, so every refusal is recorded
+        // unless a local caller sent it (A15)
+        chain_events::set_wallet_check(Box::new(|txid, _| rpc_log::is_sent(txid)));
 
         // Still need mempool cleanup + fee estimation callback even without wallet
         let block_sync = node.block_sync();
@@ -2897,6 +3017,21 @@ async fn run_daemon(
                 warn!("Warning: {}", message);
                 eprintln!("Warning: {}", message);
             }
+            // A12: a refused transaction the wallet knows, pays or spends
+            // from is never recorded (nor is any once the wallet is gone)
+            let own = Arc::downgrade(w);
+            chain_events::set_wallet_check(Box::new(move |txid, tx| {
+                let Some(w) = own.upgrade() else {
+                    return true;
+                };
+                rpc_log::is_sent(txid)
+                    || w.get_transaction(txid).is_some()
+                    || tx.vout.iter().any(|o| w.is_mine_script(&o.script_pubkey))
+                    || tx
+                        .vin
+                        .iter()
+                        .any(|i| w.get_transaction(&i.prevout.txid).is_some())
+            }));
             // Timed unlocks drop their keys when they run out (NODE-6)
             WalletDb::start_auto_lock(w);
             w.set_vault_mode(config.vault);
@@ -3075,7 +3210,10 @@ async fn run_daemon(
                 }
             }
 
-            resubmit_wallet_txs(&node, wallet_arc);
+            // -walletbroadcast=0: nothing of ours goes out (A18)
+            if !wallet_options.skip_broadcast {
+                resubmit_wallet_txs(&node, wallet_arc);
+            }
 
             // -prunewalletconfs, at least 20, once the wallet has caught up
             // with the chain (wallet.cpp:1162-1240, init.cpp:1574-1577)
@@ -3322,6 +3460,9 @@ async fn run_daemon(
         },
         max_request_size: config.rpc.max_request_size,
     };
+    // --features sidechains: the market behind the web interface's Sidechains page
+    #[cfg(feature = "sidechains")]
+    let webui = webui.map(|w| w.with_sidechains(sidechains::router(&config, &rpc_config)));
     // Fail at startup, not on the first request, on a bad rpcauth/rpcwhitelist
     // entry or a non-loopback bind without rpcallowip.
     divi_rpc::rpc_access(&rpc_config)
@@ -3390,6 +3531,7 @@ async fn run_daemon(
         let mempool_for_rpc = node.mempool().clone();
         let mempool_for_electrum = node.mempool().clone();
         let chain_for_electrum = Arc::clone(&chain);
+        let webui_backend = webui_indexed.then(|| (Arc::clone(&chain), node.mempool().clone()));
         let reorg_hook_for_rpc = mempool_reorg_hook(&node, Some(Arc::clone(&wallet)));
         let spork_for_rpc = node.spork_manager().clone();
         let history_for_rpc = node.history_fetcher();
@@ -3420,7 +3562,14 @@ async fn run_daemon(
                 peer_manager,
                 move |rpc_server| {
                     if let Some(webui) = webui {
-                        webui.spawn(Arc::clone(rpc_server), webui_shutdown);
+                        let backend = webui_backend.map(|(chain, mempool)| {
+                            Arc::new(divi_electrum::Backend::new(
+                                chain,
+                                mempool,
+                                Arc::clone(rpc_server),
+                            ))
+                        });
+                        webui.spawn(Arc::clone(rpc_server), backend, webui_shutdown);
                     }
                     if let Some(electrum) = electrum {
                         electrum.spawn(
@@ -3438,6 +3587,9 @@ async fn run_daemon(
                     rpc_server.set_spork_manager(spork_for_rpc);
                     rpc_server.set_log_config(log_config_for_rpc);
                     rpc_server.set_log_levels_callback(Arc::new(set_log_levels));
+                    rpc_server.set_diag_info_callback(Arc::new(|| {
+                        (crate::diaginfo::build(), crate::rpc_log::sent_txids())
+                    }));
 
                     // The masternode RPCs read the node's masternode list
                     rpc_server.set_masternode_manager(mn_for_rpc);
@@ -3479,6 +3631,10 @@ async fn run_daemon(
                         Ok(txid)
                     }));
                     debug!("Transaction submission callback configured");
+                    // -walletbroadcast=0: the wallet's sends stay in the wallet (A18)
+                    rpc_server
+                        .wallet()
+                        .set_broadcast(!wallet_options.skip_broadcast);
 
                     if let Some(ref staker_arc) = staker_ref {
                         let staker_for_status = Arc::clone(staker_arc);
@@ -3603,6 +3759,7 @@ async fn run_daemon(
         let mempool_for_rpc = node.mempool().clone();
         let mempool_for_electrum = node.mempool().clone();
         let chain_for_electrum = Arc::clone(&chain);
+        let webui_backend = webui_indexed.then(|| (Arc::clone(&chain), node.mempool().clone()));
         let reorg_hook_for_rpc = mempool_reorg_hook(&node, None);
         let spork_for_rpc = node.spork_manager().clone();
         let history_for_rpc = node.history_fetcher();
@@ -3630,7 +3787,14 @@ async fn run_daemon(
                 peer_manager,
                 move |rpc_server| {
                     if let Some(webui) = webui {
-                        webui.spawn(Arc::clone(rpc_server), webui_shutdown);
+                        let backend = webui_backend.map(|(chain, mempool)| {
+                            Arc::new(divi_electrum::Backend::new(
+                                chain,
+                                mempool,
+                                Arc::clone(rpc_server),
+                            ))
+                        });
+                        webui.spawn(Arc::clone(rpc_server), backend, webui_shutdown);
                     }
                     if let Some(electrum) = electrum {
                         electrum.spawn(
@@ -3648,6 +3812,9 @@ async fn run_daemon(
                     rpc_server.set_spork_manager(spork_for_rpc);
                     rpc_server.set_log_config(log_config_for_rpc);
                     rpc_server.set_log_levels_callback(Arc::new(set_log_levels));
+                    rpc_server.set_diag_info_callback(Arc::new(|| {
+                        (crate::diaginfo::build(), crate::rpc_log::sent_txids())
+                    }));
 
                     // The masternode RPCs read the node's masternode list
                     rpc_server.set_masternode_manager(mn_for_rpc);
@@ -3817,9 +3984,21 @@ fn electrum_config(
 }
 
 /// `-webui`: the web interface's settings; None when it is off
-fn webui_config(args: &Args, config: &NodeConfig) -> Result<Option<divi_webui::WebUiConfig>> {
+///
+/// Without `-webui` it is on for a desktop run (not `-daemon`, not over SSH,
+/// a display present) and off for a server; `-webui=0` turns it off.
+fn webui_config(args: &Args, config: &NodeConfig) -> Result<Option<WebUi>> {
     let s = &args.settings;
-    if !s.get_bool("webui", false) {
+    let explicit = s.get("webui").is_some();
+    let on = if explicit {
+        s.get_bool("webui", false)
+    } else {
+        !args.daemon
+            && config.rpc.enabled
+            && std::env::var_os("CARGO").is_none()
+            && divi_webui::launch::desktop_session()
+    };
+    if !on {
         return Ok(None);
     }
     if !config.rpc.enabled {
@@ -3863,7 +4042,7 @@ fn webui_config(args: &Args, config: &NodeConfig) -> Result<Option<divi_webui::W
             (k.clone(), values)
         })
         .collect();
-    Ok(Some(divi_webui::WebUiConfig {
+    let webui = divi_webui::WebUiConfig {
         bind: SocketAddr::new(ip, port),
         allow_remote: s.get_bool("webuiallowremote", false),
         allow_hosts: s.get_multi("webuiallowhost").to_vec(),
@@ -3877,7 +4056,19 @@ fn webui_config(args: &Args, config: &NodeConfig) -> Result<Option<divi_webui::W
         .into(),
         chain_mode: if private { "privatedivi" } else { "divi" }.into(),
         cli,
+        open_browser: s.get_bool("webuiopen", true),
+    };
+    Ok(Some(WebUi {
+        config: webui,
+        required: explicit,
     }))
+}
+
+/// The web interface to run, and whether `-webui` asked for it: on by
+/// default, a port in use is a warning, not a failed start
+struct WebUi {
+    config: divi_webui::WebUiConfig,
+    required: bool,
 }
 
 /// Run a notify command as divid's runCommand: through the shell, `%s`
@@ -4386,6 +4577,9 @@ fn crash_leave() {
 }
 
 fn main() {
+    // The build-id every crash.log entry names (A16), read before the
+    // handlers that write them
+    build_id::init();
     // Every panic is recorded from here on (A4)
     // Fatal signals to crash.log, before anything else can fault (A5)
     #[cfg(unix)]
@@ -4633,6 +4827,7 @@ fn exit_after_stop(runtime: tokio::runtime::Runtime, result: Result<()>) -> ! {
         Ok(()) => {
             // The partial hour's count lines (A11)
             counts::flush();
+            events::event("stop", "clean=yes");
             runs_log::exit(0, "stopped");
             flush_log();
             unsafe { libc::_exit(0) }
@@ -4702,10 +4897,23 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
             "main"
         };
         let network = format!("{}/{:?}", network, args.chain_mode()).to_lowercase();
+        // A14: the mirror is chosen before runs.log opens, which names it
+        mirror::open(&data_dir, &config_path(&args));
         runs_log::open(&data_dir, &network, cfg!(unix) && args.daemon);
+        budget::sample_dir(&data_dir);
         tasks::set_data_dir(&data_dir);
         events::set_data_dir(&data_dir);
+        rpc_log::install(&data_dir);
         incidents::set_data_dir(&data_dir);
+        // A17: a lock wait of 1 s or more is an events.log line
+        #[cfg(unix)]
+        watchdog::install_lock_sink();
+        // A12
+        events::event(
+            "start",
+            &format!("version={} network={}", env!("CARGO_PKG_VERSION"), network),
+        );
+        events::note_config(&data_dir, &config_path(&args));
         #[cfg(unix)]
         {
             crash::open(&data_dir);
@@ -4720,6 +4928,13 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
             },
         );
         runs_log::phase("config");
+        // A1's start-up bound; it ends the run only with -startuptimeout (A18)
+        #[cfg(unix)]
+        startup_bound::start(
+            number_option(&args.settings, "startuptimeout", 1..=i64::from(u32::MAX))
+                .map(|s| s as u64),
+            args.regtest,
+        );
     }
 
     // Build configuration
@@ -6819,5 +7034,79 @@ mod notify_tests {
             notify_failed("blocknotify", std::io::ErrorKind::NotFound),
             "runCommand error: blocknotify (entity not found)"
         );
+    }
+}
+
+#[cfg(test)]
+mod option_coverage_tests {
+    use super::*;
+
+    /// Commands and help, not settings: nothing for the web interface to show
+    const COMMAND_ONLY: &[&str] = &[
+        "export-chain",
+        "export-start",
+        "export-end",
+        "export-output",
+        "export-snapshot",
+        "import-snapshot",
+        "snapshot-root",
+        "sign-snapshot",
+        "verify-snapshot",
+        "snapshot-signer",
+        "?",
+        "help",
+        "h",
+        "version",
+        "V",
+    ];
+
+    /// Retired, refused-at-start, dead Divi Core flags, and internal test-only
+    /// hooks: accepted or rejected by startup for Core parity, not user settings
+    const NOT_WEB_SETTINGS: &[&str] = &[
+        "socks",
+        "tor",
+        "debugnet",
+        "benchmark",
+        "masternode",
+        "litemode",
+        "budgetvotemode",
+        "mocktime",
+        "testsafemode",
+        "disablesafemode",
+    ];
+
+    #[test]
+    fn every_option_is_in_the_web_settings() {
+        let missing: Vec<&&str> = APPLIED
+            .iter()
+            .chain(READ_ELSEWHERE)
+            .filter(|k| !COMMAND_ONLY.contains(k) && !NOT_WEB_SETTINGS.contains(k))
+            .filter(|k| divi_webui::schema::find(k).is_none())
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "options the daemon reads but the web interface's settings lack: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn every_option_in_usage_is_read() {
+        for word in USAGE.split_whitespace() {
+            let Some(name) = word.strip_prefix('-') else {
+                continue;
+            };
+            let name = name.trim_start_matches('-');
+            let name: String = name
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+                .collect();
+            if name.is_empty() || name == "name" || name == "noname" {
+                continue;
+            }
+            assert!(
+                APPLIED.contains(&name.as_str()) || READ_ELSEWHERE.contains(&name.as_str()),
+                "-{name} is in the usage text but not read"
+            );
+        }
     }
 }

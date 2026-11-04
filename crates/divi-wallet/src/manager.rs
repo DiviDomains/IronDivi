@@ -18,6 +18,7 @@ use crate::error::WalletError;
 use crate::hd::HdWallet;
 use crate::wallet_db::WalletDb;
 use crate::Network;
+use divi_primitives::redact::{WalletLabel, WalletValue};
 use divi_primitives::ChainMode;
 
 use parking_lot::RwLock;
@@ -116,7 +117,11 @@ impl WalletManager {
             return Err(WalletError::WalletNotFound(normalized_name));
         }
 
-        info!("Loading wallet '{}' from {:?}", normalized_name, wallet_path);
+        info!(
+            "Loading wallet '{}' from {}",
+            WalletLabel(&normalized_name),
+            WalletValue(&wallet_path.to_string_lossy())
+        );
 
         // Open the wallet
         let wallet = WalletDb::open(&wallet_path, self.network)?;
@@ -133,11 +138,14 @@ impl WalletManager {
             let mut default = self.default_wallet.write();
             if default.is_none() {
                 *default = Some(normalized_name.clone());
-                debug!("Set '{}' as default wallet", normalized_name);
+                debug!("Set '{}' as default wallet", WalletLabel(&normalized_name));
             }
         }
 
-        info!("Wallet '{}' loaded successfully", normalized_name);
+        info!(
+            "Wallet '{}' loaded successfully",
+            WalletLabel(&normalized_name)
+        );
         Ok(wallet)
     }
 
@@ -160,7 +168,10 @@ impl WalletManager {
         };
 
         // Save wallet state before unloading
-        info!("Saving wallet '{}' before unload", normalized_name);
+        info!(
+            "Saving wallet '{}' before unload",
+            WalletLabel(&normalized_name)
+        );
         wallet.save()?;
 
         // Update default wallet if needed
@@ -171,14 +182,17 @@ impl WalletManager {
                 let wallets = self.wallets.read();
                 *default = wallets.keys().next().cloned();
                 if let Some(ref new_default) = *default {
-                    debug!("New default wallet: '{}'", new_default);
+                    debug!("New default wallet: '{}'", WalletLabel(new_default));
                 } else {
                     debug!("No default wallet (all wallets unloaded)");
                 }
             }
         }
 
-        info!("Wallet '{}' unloaded successfully", normalized_name);
+        info!(
+            "Wallet '{}' unloaded successfully",
+            WalletLabel(&normalized_name)
+        );
         Ok(())
     }
 
@@ -198,7 +212,7 @@ impl WalletManager {
                 wallets
                     .get(&normalized)
                     .cloned()
-                    .ok_or_else(|| WalletError::WalletNotLoaded(normalized))
+                    .ok_or(WalletError::WalletNotLoaded(normalized))
             }
             None => {
                 let default = self.default_wallet.read();
@@ -206,7 +220,7 @@ impl WalletManager {
                     Some(default_name) => wallets
                         .get(default_name)
                         .cloned()
-                        .ok_or_else(|| WalletError::NoDefaultWallet),
+                        .ok_or(WalletError::NoDefaultWallet),
                     None => Err(WalletError::NoDefaultWallet),
                 }
             }
@@ -249,7 +263,7 @@ impl WalletManager {
         }
 
         *self.default_wallet.write() = Some(normalized.clone());
-        info!("Default wallet set to '{}'", normalized);
+        info!("Default wallet set to '{}'", WalletLabel(&normalized));
         Ok(())
     }
 
@@ -291,8 +305,9 @@ impl WalletManager {
         }
 
         info!(
-            "Creating new wallet '{}' at {:?}",
-            normalized_name, wallet_path
+            "Creating new wallet '{}' at {}",
+            WalletLabel(&normalized_name),
+            WalletValue(&wallet_path.to_string_lossy())
         );
 
         // Create HD wallet
@@ -319,7 +334,10 @@ impl WalletManager {
             }
         }
 
-        info!("Wallet '{}' created successfully", normalized_name);
+        info!(
+            "Wallet '{}' created successfully",
+            WalletLabel(&normalized_name)
+        );
         Ok(wallet)
     }
 
@@ -332,7 +350,7 @@ impl WalletManager {
     pub fn save_all(&self) -> Result<(), WalletError> {
         let wallets = self.wallets.read();
         for (name, wallet) in wallets.iter() {
-            debug!("Saving wallet '{}'", name);
+            debug!("Saving wallet '{}'", WalletLabel(name));
             wallet.save()?;
         }
         Ok(())
@@ -370,7 +388,10 @@ impl WalletManager {
             *default = Some(normalized_name.clone());
         }
 
-        info!("Added wallet '{}' to manager", normalized_name);
+        info!(
+            "Added wallet '{}' to manager",
+            WalletLabel(&normalized_name)
+        );
         Ok(())
     }
 }

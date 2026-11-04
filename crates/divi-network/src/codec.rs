@@ -102,7 +102,17 @@ pub enum Decoded {
         command: String,
         /// Why it did not parse
         error: String,
+        /// The payload's first bytes (diag A13 `bad-messages/`)
+        head: Vec<u8>,
     },
+}
+
+/// The bytes of a payload that did not parse kept for diag A13
+pub(crate) fn malformed_head(payload: &[u8]) -> Vec<u8> {
+    payload[..payload
+        .len()
+        .min(divi_primitives::diag_events::MESSAGE_HEAD)]
+        .to_vec()
 }
 
 impl Decoder for DiviCodec {
@@ -189,6 +199,7 @@ impl DiviCodec {
                                 Decoded::Malformed {
                                     command,
                                     error: e.to_string(),
+                                    head: malformed_head(&payload),
                                 }
                             }
                         },

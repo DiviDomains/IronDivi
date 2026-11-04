@@ -219,6 +219,26 @@ pub struct MasternodeManager {
 }
 
 impl MasternodeManager {
+    /// `masternodes` for reading, timed (diag A17)
+    fn masternodes_r(&self) -> parking_lot::RwLockReadGuard<'_, HashMap<OutPoint, Masternode>> {
+        divi_primitives::diag_lock::timed(
+            divi_primitives::diag_lock::Lock::Masternodes,
+            || self.masternodes.try_read(),
+            || self.masternodes.read(),
+        )
+    }
+
+    /// `masternodes` for writing, timed (diag A17)
+    fn masternodes_w(&self) -> parking_lot::RwLockWriteGuard<'_, HashMap<OutPoint, Masternode>> {
+        divi_primitives::diag_lock::timed(
+            divi_primitives::diag_lock::Lock::Masternodes,
+            || self.masternodes.try_write(),
+            || self.masternodes.write(),
+        )
+    }
+}
+
+impl MasternodeManager {
     pub fn new() -> Self {
         MasternodeManager {
             masternodes: Arc::new(RwLock::new(HashMap::new())),
@@ -287,7 +307,7 @@ impl MasternodeManager {
             let cf = db
                 .cf_handle(CF_MASTERNODES)
                 .ok_or_else(|| MasternodeError::Database("masternodes CF not found".to_string()))?;
-            let map = self.masternodes.read();
+            let map = self.masternodes_r();
             for (outpoint, masternode) in map.iter() {
                 let key = Self::make_key(outpoint);
                 let persistence = MasternodePersistence::from(masternode);
@@ -304,7 +324,7 @@ impl MasternodeManager {
             let cf = db
                 .cf_handle(CF_MASTERNODES)
                 .ok_or_else(|| MasternodeError::Database("masternodes CF not found".to_string()))?;
-            let mut map = self.masternodes.write();
+            let mut map = self.masternodes_w();
             map.clear();
 
             let iter = db.iterator_cf(cf, rocksdb::IteratorMode::Start);
@@ -352,7 +372,7 @@ impl MasternodeManager {
 
     pub fn add(&self, mnb: MasternodeBroadcast) -> Result<(), MasternodeError> {
         let outpoint = mnb.vin;
-        let mut map = self.masternodes.write();
+        let mut map = self.masternodes_w();
 
         if map.contains_key(&outpoint) {
             return Err(MasternodeError::AlreadyExists(outpoint));
@@ -365,7 +385,7 @@ impl MasternodeManager {
     }
 
     pub fn remove(&self, outpoint: OutPoint) -> Result<(), MasternodeError> {
-        let mut map = self.masternodes.write();
+        let mut map = self.masternodes_w();
         map.remove(&outpoint)
             .ok_or(MasternodeError::NotFound(outpoint))?;
         self.remove_from_db(&outpoint)?;
@@ -373,27 +393,27 @@ impl MasternodeManager {
     }
 
     pub fn get(&self, outpoint: OutPoint) -> Option<Masternode> {
-        let map = self.masternodes.read();
+        let map = self.masternodes_r();
         map.get(&outpoint).cloned()
     }
 
     pub fn get_all(&self) -> Vec<Masternode> {
-        let map = self.masternodes.read();
+        let map = self.masternodes_r();
         map.values().cloned().collect()
     }
 
     pub fn get_enabled(&self) -> Vec<Masternode> {
-        let map = self.masternodes.read();
+        let map = self.masternodes_r();
         map.values().filter(|mn| mn.is_enabled()).cloned().collect()
     }
 
     pub fn get_by_tier(&self, tier: MasternodeTier) -> Vec<Masternode> {
-        let map = self.masternodes.read();
+        let map = self.masternodes_r();
         map.values().filter(|mn| mn.tier == tier).cloned().collect()
     }
 
     pub fn get_by_status(&self, status: MasternodeStatus) -> Vec<Masternode> {
-        let map = self.masternodes.read();
+        let map = self.masternodes_r();
         map.values()
             .filter(|mn| mn.status == status)
             .cloned()
@@ -401,17 +421,17 @@ impl MasternodeManager {
     }
 
     pub fn count(&self) -> usize {
-        let map = self.masternodes.read();
+        let map = self.masternodes_r();
         map.len()
     }
 
     pub fn count_enabled(&self) -> usize {
-        let map = self.masternodes.read();
+        let map = self.masternodes_r();
         map.values().filter(|mn| mn.is_enabled()).count()
     }
 
     pub fn count_by_tier(&self, tier: MasternodeTier) -> usize {
-        let map = self.masternodes.read();
+        let map = self.masternodes_r();
         map.values().filter(|mn| mn.tier == tier).count()
     }
 
@@ -420,7 +440,7 @@ impl MasternodeManager {
         outpoint: OutPoint,
         status: MasternodeStatus,
     ) -> Result<(), MasternodeError> {
-        let mut map = self.masternodes.write();
+        let mut map = self.masternodes_w();
         let mn = map
             .get_mut(&outpoint)
             .ok_or(MasternodeError::NotFound(outpoint))?;
@@ -430,7 +450,7 @@ impl MasternodeManager {
     }
 
     pub fn update_last_seen(&self, outpoint: OutPoint, time: i64) -> Result<(), MasternodeError> {
-        let mut map = self.masternodes.write();
+        let mut map = self.masternodes_w();
         let mn = map
             .get_mut(&outpoint)
             .ok_or(MasternodeError::NotFound(outpoint))?;
@@ -440,7 +460,7 @@ impl MasternodeManager {
     }
 
     pub fn mark_as_paid(&self, outpoint: OutPoint, time: i64) -> Result<(), MasternodeError> {
-        let mut map = self.masternodes.write();
+        let mut map = self.masternodes_w();
         let mn = map
             .get_mut(&outpoint)
             .ok_or(MasternodeError::NotFound(outpoint))?;
@@ -450,7 +470,7 @@ impl MasternodeManager {
     }
 
     pub fn clear(&self) {
-        let mut map = self.masternodes.write();
+        let mut map = self.masternodes_w();
         map.clear();
         if let Some(db) = &self.db {
             if let Some(cf) = db.cf_handle(CF_MASTERNODES) {
@@ -467,7 +487,7 @@ impl MasternodeManager {
     }
 
     pub fn contains(&self, outpoint: OutPoint) -> bool {
-        let map = self.masternodes.read();
+        let map = self.masternodes_r();
         map.contains_key(&outpoint)
     }
 
@@ -479,7 +499,7 @@ impl MasternodeManager {
         outpoint: &OutPoint,
         score_increase: i32,
     ) -> Result<bool, MasternodeError> {
-        let mut map = self.masternodes.write();
+        let mut map = self.masternodes_w();
         let mn = map
             .get_mut(outpoint)
             .ok_or(MasternodeError::NotFound(*outpoint))?;
@@ -499,7 +519,7 @@ impl MasternodeManager {
         outpoint: &OutPoint,
         score_decrease: i32,
     ) -> Result<(), MasternodeError> {
-        let mut map = self.masternodes.write();
+        let mut map = self.masternodes_w();
         let mn = map
             .get_mut(outpoint)
             .ok_or(MasternodeError::NotFound(*outpoint))?;
@@ -514,7 +534,7 @@ impl MasternodeManager {
     ///
     /// Returns true if pose_score >= 100
     pub fn check_pose_ban(&self, outpoint: &OutPoint) -> Result<bool, MasternodeError> {
-        let map = self.masternodes.read();
+        let map = self.masternodes_r();
         let mn = map
             .get(outpoint)
             .ok_or(MasternodeError::NotFound(*outpoint))?;
@@ -530,7 +550,7 @@ impl MasternodeManager {
         outpoint: &OutPoint,
         ban_height: u32,
     ) -> Result<(), MasternodeError> {
-        let mut map = self.masternodes.write();
+        let mut map = self.masternodes_w();
         let mn = map
             .get_mut(outpoint)
             .ok_or(MasternodeError::NotFound(*outpoint))?;
@@ -569,7 +589,7 @@ impl MasternodeManager {
             .ok_or(MasternodeError::CollateralNotFound(*outpoint))?;
 
         // Get the masternode to check tier
-        let map = self.masternodes.read();
+        let map = self.masternodes_r();
         let mn = map
             .get(outpoint)
             .ok_or(MasternodeError::NotFound(*outpoint))?;
@@ -617,7 +637,7 @@ impl MasternodeManager {
         _current_height: u64,
     ) -> Vec<OutPoint> {
         let mut spent_collateral = Vec::new();
-        let mut map = self.masternodes.write();
+        let mut map = self.masternodes_w();
 
         for (outpoint, mn) in map.iter_mut() {
             // Skip if already marked as spent
@@ -644,7 +664,11 @@ impl MasternodeManager {
                 }
                 Err(e) => {
                     // Database error - log but don't mark as spent
-                    error!("Error checking UTXO for masternode {}: {}", outpoint, e);
+                    error!(
+                        "Error checking UTXO for masternode {}: {}",
+                        divi_primitives::redact::OwnOutpoint::of(outpoint),
+                        e
+                    );
                 }
             }
         }

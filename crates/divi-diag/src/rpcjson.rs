@@ -603,6 +603,36 @@ impl Walk {
                     continue;
                 }
             }
+            if k == "health" {
+                if let Value::String(s) = &v {
+                    let red = crate::redact::Redactor::new([0; 32], &Default::default());
+                    let filtered = crate::oldlog::filter(s, &red).render();
+                    let trimmed = filtered.trim_end().to_string();
+                    if trimmed != *s {
+                        self.note(&kp, "bucketed (A6)");
+                    }
+                    out.insert(backstop(&k), Value::String(backstop(&trimmed)));
+                    continue;
+                }
+            }
+            if k == "debug_ring" {
+                if let Value::Array(lines) = v {
+                    let red = crate::redact::Redactor::new([0; 32], &Default::default());
+                    let joined = lines
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let filtered: Vec<Value> = crate::oldlog::filter(&joined, &red)
+                        .render()
+                        .lines()
+                        .map(|l| Value::String(backstop(l)))
+                        .collect();
+                    self.note(&kp, "filtered (§6.2)");
+                    out.insert(backstop(&k), Value::Array(filtered));
+                    continue;
+                }
+            }
             let nv = self.value(v, &kp, wallet, false, false);
             out.insert(backstop(&k), nv);
         }
@@ -827,6 +857,90 @@ pub fn treat_block(
     }
 }
 
+/// Is this key one a clear answer never keeps: the [`ALWAYS_DROP`] list,
+/// or `scriptPubKey` (scripts and raw transaction data are never sent in
+/// clear, §8.2)
+pub fn clear_drops_key(k: &str) -> bool {
+    ALWAYS_DROP.contains(&k) || k == "scriptPubKey"
+}
+
+/// An answer the user may send in clear (`--rpc-clear`, `--tx`): amounts,
+/// addresses and ids stay; every [`clear_drops_key`] key is removed at any
+/// depth, except that an object `scriptPubKey` keeps its `type`, `reqSigs`
+/// and `addresses`. Returns the answer and how many keys were dropped.
+pub fn clear(v: Value) -> (Value, usize) {
+    fn go(v: Value, n: &mut usize) -> Value {
+        match v {
+            Value::Object(m) => {
+                let mut out = Map::new();
+                for (k, v) in m {
+                    if k == "scriptPubKey" {
+                        if let Value::Object(spk) = v {
+                            let mut keep = Map::new();
+                            for (sk, sv) in spk {
+                                if matches!(sk.as_str(), "type" | "reqSigs" | "addresses") {
+                                    keep.insert(sk, go(sv, n));
+                                } else {
+                                    *n += 1;
+                                }
+                            }
+                            out.insert(k, Value::Object(keep));
+                        } else {
+                            *n += 1;
+                        }
+                    } else if clear_drops_key(&k) {
+                        *n += 1;
+                    } else {
+                        out.insert(k, go(v, n));
+                    }
+                }
+                Value::Object(out)
+            }
+            Value::Array(a) => Value::Array(a.into_iter().map(|x| go(x, n)).collect()),
+            other => other,
+        }
+    }
+    let mut n = 0;
+    let v = go(v, &mut n);
+    (v, n)
+}
+
+/// The distinct addresses and transaction ids in a clear answer: every
+/// string `is_address` accepts, and every 64-hex string not under a key
+/// naming a block (`blockhash`, `bestblockhash`, `hash` of a block, ...)
+pub fn clear_counts(v: &Value, is_address: &dyn Fn(&str) -> bool) -> (usize, usize) {
+    fn go(
+        v: &Value,
+        key: &str,
+        is_address: &dyn Fn(&str) -> bool,
+        a: &mut std::collections::BTreeSet<String>,
+        t: &mut std::collections::BTreeSet<String>,
+    ) {
+        match v {
+            Value::String(s) => {
+                if is_hex64(s) {
+                    let k = key.to_ascii_lowercase();
+                    if !(k.contains("block")
+                        || k == "bestblock"
+                        || k == "merkleroot"
+                        || k == "chainwork")
+                    {
+                        t.insert(s.to_ascii_lowercase());
+                    }
+                } else if is_address(s) {
+                    a.insert(s.clone());
+                }
+            }
+            Value::Array(x) => x.iter().for_each(|e| go(e, key, is_address, a, t)),
+            Value::Object(m) => m.iter().for_each(|(k, e)| go(e, k, is_address, a, t)),
+            _ => {}
+        }
+    }
+    let (mut a, mut t) = Default::default();
+    go(v, "", is_address, &mut a, &mut t);
+    (a.len(), t.len())
+}
+
 /// Parse an attached file as JSON: one document, or JSON lines (every
 /// non-empty line an object or array). `None` when it is not JSON.
 pub fn parse(data: &[u8]) -> Option<Vec<Value>> {
@@ -883,6 +997,36 @@ pub fn treat_file(docs: Vec<Value>, label: Option<&str>) -> (String, String, Vec
 mod treat_call_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn clear_answers() {
+        let h = "ab".repeat(32);
+        let b = "cd".repeat(32);
+        let v = json!([{"txid": h, "address": "DAddr1x", "amount": 1.5, "label": "rent", "account": "",
+            "scriptPubKey": "76a914", "redeemScript": "52", "blockhash": b,
+            "vout": [{"value": 2, "scriptPubKey": {"hex": "76a9", "asm": "OP_DUP", "type": "pubkeyhash", "reqSigs": 1,
+                "addresses": ["DAddr2y"]}}]}]);
+        let (c, n) = clear(v);
+        assert_eq!(n, 6);
+        let o = &c[0];
+        assert_eq!(o["txid"], h);
+        assert_eq!(o["amount"], 1.5);
+        assert!(
+            o.get("label").is_none()
+                && o.get("account").is_none()
+                && o.get("scriptPubKey").is_none()
+        );
+        assert!(o.get("redeemScript").is_none());
+        assert_eq!(
+            o["vout"][0]["scriptPubKey"],
+            json!({"type": "pubkeyhash", "reqSigs": 1, "addresses": ["DAddr2y"]})
+        );
+        let isa = |s: &str| s.starts_with("DAddr");
+        assert_eq!(clear_counts(&c, &isa), (2, 1));
+        assert!(
+            clear_drops_key("hex") && clear_drops_key("scriptPubKey") && !clear_drops_key("txid")
+        );
+    }
 
     #[test]
     fn call_answers() {

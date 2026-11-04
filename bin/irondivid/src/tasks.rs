@@ -148,10 +148,11 @@ fn record(info: &std::panic::PanicHookInfo<'_>, thread: &str, task: Option<&str>
         .or_else(|| payload.downcast_ref::<String>().cloned())
         .unwrap_or_else(|| "(not text)".to_string());
     let mut entry = format!(
-        "{} panic {} pid={}\nmessage: {}\nbacktrace:\n{}\ndebug ring (A8, oldest first):\n",
+        "{} panic {} pid={} build-id={}\nmessage: {}\nbacktrace:\n{}\ndebug ring (A8, oldest first):\n",
         crate::runs_log::utc_now(),
         fields,
         std::process::id(),
+        crate::build_id::get(),
         crate::runs_log::quote(&message),
         std::backtrace::Backtrace::force_capture()
     );
@@ -161,10 +162,14 @@ fn record(info: &std::panic::PanicHookInfo<'_>, thread: &str, task: Option<&str>
     options.create(true).append(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    if let Ok(mut file) = options.open(path) {
-        use std::io::Write as _;
-        if file.write_all(entry.as_bytes()).is_ok() {
-            let _ = file.sync_data();
+    // The mirror's crash.log first (A14), then the data directory's
+    let mirror = crate::mirror::dir().map(|d| d.join("crash.log"));
+    for path in mirror.iter().chain(std::iter::once(path)) {
+        if let Ok(mut file) = options.open(path) {
+            use std::io::Write as _;
+            if file.write_all(entry.as_bytes()).is_ok() {
+                let _ = file.sync_data();
+            }
         }
     }
 }
@@ -174,7 +179,7 @@ pub fn spawn_critical<F>(name: &'static str, fut: F) -> tokio::task::JoinHandle<
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    tokio::spawn(TASK.scope((name, true), fut))
+    tokio::spawn(TASK.scope((name, true), Named::new(name, fut)))
 }
 
 /// A critical task that can fail: its error ends the node like its panic,
@@ -199,7 +204,7 @@ pub fn spawn_supervised<F>(name: &'static str, fut: F) -> tokio::task::JoinHandl
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    tokio::spawn(TASK.scope((name, false), fut))
+    tokio::spawn(TASK.scope((name, false), Named::new(name, fut)))
 }
 
 /// A supervised task that can fail: its error ends it alone, and is
@@ -232,7 +237,39 @@ where
     R: Send + 'static,
 {
     let critical = TASK.try_with(|t| t.1).unwrap_or(false);
-    tokio::task::spawn_blocking(move || TASK.sync_scope((name, critical), f))
+    tokio::task::spawn_blocking(move || {
+        let _task =
+            divi_primitives::diag_lock::enter_task(divi_primitives::diag_lock::intern(name));
+        TASK.sync_scope((name, critical), f)
+    })
+}
+
+/// A future that is the named task to the A17 lock table while it is
+/// polled, so a lock's holder and waiter are task names
+struct Named<F> {
+    id: u16,
+    fut: std::pin::Pin<Box<F>>,
+}
+
+impl<F> Named<F> {
+    fn new(name: &str, fut: F) -> Named<F> {
+        Named {
+            id: divi_primitives::diag_lock::intern(name),
+            fut: Box::pin(fut),
+        }
+    }
+}
+
+impl<F: Future> Future for Named<F> {
+    type Output = F::Output;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<F::Output> {
+        let _task = divi_primitives::diag_lock::enter_task(self.id);
+        self.fut.as_mut().poll(cx)
+    }
 }
 
 /// Start a named thread

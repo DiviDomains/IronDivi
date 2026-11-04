@@ -312,6 +312,309 @@ and are not re-based.
   is skipped: its `*.log` files are write-ahead logs, not text. Still owed
   by the full §10 item 5 canary: a stake, a masternode collateral, rescan,
   lock and unlock, a supervised-task panic, a crash, and the diag package.
+- A12 events: library crates report through
+  `divi_primitives::diag_events` (a sink in a `OnceLock`, installed by
+  `bin/irondivid/src/chain_events.rs` right after `Node::new`), so no
+  library crate depends on the binary. `sync.rs` reports an invalid block
+  before scoring the peer, `scoring.rs` a ban, `node.rs` a relayed
+  transaction it refuses. Differences from the plan:
+  - Every chain-events kind is capped at 60 records per 10 minutes; the
+    held-back count is written once as `suppressed kind= n=`. The plan
+    sets no cap; without one a peer sending bad blocks fills the 4 MB
+    file in minutes.
+  - The tip record is once per 100 blocks, but once per 10,000 during
+    initial block download: each record is a synced write on the block
+    path.
+  - A reorg whose fork point is more than 2,000 blocks back, or not found,
+    is written `depth=unknown`.
+  - A rejected transaction is dropped from the log when the wallet knows
+    its txid, holds one of its outputs' scripts, or knows a transaction
+    it spends; until a check is installed, and after the wallet is gone,
+    every rejection is dropped. With `-disablewallet` every rejection is
+    written.
+  - The `invalid-block` incident is written at most once per 10 minutes
+    (each one copies 256 KB of `debug.log`); the record itself is not
+    limited beyond the cap above.
+  - `events.log` transitions are read from consecutive health records
+    (one tick apart, default 60 s), so a state that flips and flips back
+    within a tick is not seen. They are: `sync state=`, `wallet state=`
+    (lock and unlock), `disk free=` (bands 100 MB and 1 GB),
+    `memory-pressure psi_mem=over-10|under-10` and `cgroup_high_events=+n`,
+    `time-offset warning=yes|no` (over 300 s), `spork id= signed=`. A field
+    that was not read on either side (`n/a`, macOS) is never a change.
+  - Stakes found: `stakes day=YYYY-MM-DD n=` when the UTC day ends,
+    counted as rises of the staker's last stake time between ticks, so two
+    stakes within one tick count once and the day in progress is lost at a
+    stop. The weekly bucketing in the package is the diag tool's (Part B).
+  - `start version= network=`, `stop clean=yes` (a clean stop only),
+    `console-lost stream=`, `dropped lines=`, and
+    `config changed=first|yes`: the sha256 of the config file (or `none`
+    when it cannot be read) is kept in `diag/config.sha256` and never
+    written to a log.
+  - Not built in A12: masternode status and `mnsync` phase changes and
+    `getdiaginfo` in the incident directory (both with A10), state-changing
+    RPC method names (A15), the watchdog incident (A17), header-chain
+    conflicts, and `setlogconfig` changes beyond the existing refused
+    record. SIGQUIT and SIGUSR1 do not write an incident: their behaviour
+    and wording are pinned by tests and the A9 text.
+- A15 RPC methods: the transports report through
+  `divi_primitives::diag_rpc` (`begin` when a call starts, `Call::finish`
+  when it returns, a sink in a `OnceLock`), installed by
+  `bin/irondivid/src/rpc_log.rs`; the caps, aggregates, reserved lines and
+  error masking are there. Differences from the plan:
+  - **JSON-RPC is not hooked yet.** Its hook belongs in the HTTP
+    middleware in `crates/divi-rpc/src/server.rs`, which another lane owns;
+    it must not go in `handle_request`, which the Web UI and Electrum also
+    call, or their calls would be counted twice. Until it lands, the
+    first-call lines and the local `send*` lines are only written for the
+    Web UI. ZMQ is not hooked either (it carries notifications, not calls).
+    Hooked: the Electrum session (`session.rs` `reply`, the peer address
+    from a task-local set in the accept loop) and the Web UI `/api/rpc`
+    handler (`ConnectInfo`; signed in, so authenticated). The Web UI reaches
+    the recorder through `divi_rpc::diag_rpc`, a re-export, so that no
+    `Cargo.toml` changed.
+  - Method names: a name that is not 1–64 characters of `[A-Za-z0-9._]`,
+    or that the node answered with -32601, is recorded as `unknown`, since
+    a caller can send any text as a method. At most 256 (method,
+    transport) pairs are kept apart in an aggregate interval, the rest
+    share `other`; the last-20-errors list keeps at most 256 methods and
+    drops errors of any further one. Distinct callers are counted up to 10,000 an interval and
+    duration samples up to 4,096 (p50 and p99 are then from the first
+    4,096).
+  - Reserved lines are per-method files in `diag/rpc-methods-reserved/`
+    (`<method>.log`, 0600, 1 MB in all), the plan's "per-method segments"
+    option; when full, the oldest line of the largest file is dropped.
+  - The in-flight table has 64 slots and keeps the method (first 32
+    bytes), the transport and the start time; not the caller kind or the
+    thread. A call that finds every slot taken is still counted.
+  - The intervals close on the next call or on the health tick, so a quiet
+    minute after a busy one is still written.
+  - The A12 `events.log` record `rpc method= transport= result=ok|error`
+    is written for the rare and `import*`/`dump*`/`*passphrase*` methods,
+    by name only, under the same caps as their `rpc-methods.log` lines.
+  - Sent from here: `sendrawtransaction` records the txid as soon as it
+    decodes the transaction, before the accept checks, so a rejected one
+    is recorded too. That covers the JSON-RPC (once hooked), the Web UI
+    and a loopback Electrum client's `blockchain.transaction.broadcast`;
+    a non-loopback Electrum client's broadcast runs under
+    `diag_rpc::as_remote` and is not recorded. `diag/sent-txids` is 0600,
+    one txid (display order) and UTC day per line; past 1 MB the oldest
+    quarter is dropped in one rewrite, so a drop does not rewrite the file
+    on every append. The set is loaded at start. A11 has no runtime "own
+    set" (it types values instead), so "joins the own set" is, as built,
+    the A12 wallet check: a refused transaction that was sent from here is
+    kept out of `chain-events.log`, with or without a wallet. A10's
+    `known_values` and the A13 exclusions read it when those land.
+  - Not built: the `irondivi-cli` mirror of method names and results, and
+    the Web UI's JavaScript error endpoint.
+- A17 lock waits and the watchdog: the five locks are taken through
+  `divi_primitives::diag_lock::timed` (a `try_*` first; only a lock that
+  is busy is timed, in a 64-slot table the watchdog reads without a lock),
+  and `bin/irondivid/src/watchdog.rs` runs the beats, the classifier and
+  the incident writer. Differences from the plan:
+  - The locks timed: `Chain::chain_lock`, the mempool's `txs`, the peer
+    manager's `peers`, the masternode manager's `masternodes` and the
+    wallet's `WalletDb::transactions` (not the wallet scan lock). Only
+    one-line `self.<field>.read()/write()/lock()` call sites are wrapped;
+    a call split over lines (for example `peer_manager.rs` near line 820)
+    is not timed. A wait past the 64 slots is still counted, not listed.
+  - The holder is the last task or thread that took the lock, by name; it
+    is not tracked while the lock is held. Tasks are named to the lock
+    table by a wrapper around `tasks::spawn_critical`/`spawn_supervised`
+    futures and by `enter_task` in `spawn_blocking`.
+  - Waits of 1 s or more are counted per lock in health `lock_waits` (the
+    sum) and in the counts raw copy as `lock_wait_<lock>=N`; there is no
+    `lock_wait_max_ms` health key. Each one writes the A12 event
+    `lock-wait`.
+  - Classes: health-stall, runtime-stall (60 s), rpc-stuck, lock-wait and
+    snapshot; one incident per item per 10 minutes, 10 a day per class,
+    20 snapshots a day at least 10 s apart; an exhausted class writes
+    `incident-budget class=X exhausted` once a day. A late wake (30 s or
+    more) writes `late-wake late_ms= cause=` and is taken off the hang
+    ages. The cause is `stopped` (SIGCONT within the late window),
+    `starved`, `uncertain` (system PSI cpu avg10 of 50 or more) or
+    `frozen`; it does not name who sent SIGCONT.
+  - The incident detail has the /proc thread names and wchan, rusage,
+    hwcaps, the tokio runtime metrics and the counts raw copy. Not built:
+    the per-thread stack sweep and the macOS thread walk (both wait for
+    A16 frame pointers), and the snapshot request through the mirror
+    (waits for A14). The vanished-thread check is Linux only; it writes
+    the `thread-vanished` event and a crash-file note.
+- A13 replay bundles: `bin/irondivid/src/replay.rs`. The event sink only
+  copies the event into a job on a 64-slot queue; a supervised
+  `diag-replay` thread does every chain read and file write, so a bundle
+  never holds a chain lock on the network or staker path. A full queue
+  drops the job and counts it; the next bundle's `state.txt` carries
+  `skipped_before=N`. Parts and caps: `diag/invalid/` 20 MB,
+  `diag/rejected-tx/` 5 MB, `diag/own-invalid/` 20 MB (the plan names no
+  cap for it), `diag/bad-messages/` 5 MB; past a cap the oldest entries
+  go by mtime and the newest always stays. Files are 0600, directories
+  0700. A block bundle has `block.hex`, `headers.txt` (from the parent
+  back to the active chain, at most 2000 lines), `state.txt` (hash,
+  height, reason, code, peer, fork height, the parent's stake modifier,
+  bits and money supply, the lottery winners, network, time, run),
+  `spent.txt` (at most 5000 lines) and `sporks.txt`; a transaction bundle
+  has `tx.hex`, `spent.txt` and `state.txt`. A bundle that exists is not
+  rewritten. `crates/divi-storage/examples/irondivi-replay.rs` reads a
+  bundle and runs the context-free transaction checks, and with a copy of
+  a chain database runs `accept_block` on it. Differences from the plan:
+  - Own versus peer is decided off the log: an invalid block is own when
+    it is proof of stake and the wallet check claims its coinstake; a
+    refused transaction is own by the same wallet check A12 uses (which
+    also reads A15's sent-from-here set). While the wallet check is not
+    yet set, a refused block or transaction counts as own and goes to
+    `own-invalid/`. No log line differs between own and peer: an own
+    transaction still has no `chain-events.log` line (A12), and an own
+    invalid block has the same line as a peer's.
+  - Two new events, bundle only (no log line): `OwnBlockRejected` from the
+    staker when its own block fails `accept_own_block` (no height: the
+    block was never indexed), and `OwnTxRejected` from
+    `sendrawtransaction` (split into `check_and_submit`) for any local
+    refusal except "already in chain". Electrum's
+    `blockchain.transaction.broadcast` reaches the same function; a
+    non-loopback Electrum client's call runs under `diag_rpc::as_remote`
+    (new `diag_rpc::is_remote()`) and keeps no bundle, since the
+    transaction is not the user's. A Web UI or wallet send that does not
+    go through `sendrawtransaction` is not hooked.
+  - "Scored messages" are kept as `bad-messages/<n>.txt` with the command,
+    the peer address, the score, the error and the first 4096 bytes of the
+    payload in hex (`MESSAGE_HEAD`), at most 60 per 10 minutes; a refused
+    one counts in `skipped_before`. The plan's "bytes or command" is
+    therefore both, truncated.
+  - Every 64-hex token in a stored cause is masked to `<hash>`, so a cause
+    cannot carry a txid from elsewhere in the wallet.
+  - `spent.txt` reads the current UTXO set, not the set at the block's
+    height: an output spent since then is listed as missing.
+  - The replay tool is not an isolated replay: it needs a copy of a
+    database near the bundle's height, and accept_block judges against
+    that copy's tip.
+- A10 `getdiaginfo`: `bin/irondivid/src/diaginfo.rs` builds the content,
+  and every A12 incident carries it as `getdiaginfo.json` (the line
+  `getdiaginfo: n/a (not built yet)` in `info.txt` is gone). Differences
+  from the plan:
+  - **`getdiaginfo` is not registered as an RPC.** Its dispatch arm, its
+    help text and the `Caller` that gates `known_values` all live in
+    `crates/divi-rpc/src/server.rs`, which this part does not change; they
+    are owed to whoever changes that file. `diag --rpc getdiaginfo` gets
+    "method not found" until then, and B2.16 falls back as for a pre-A10
+    node. The method is not added to the help tables either.
+  - The builder never waits: the incident writer runs when the node may
+    be hung and from the panic hook. Its sources are the lock-free A15
+    in-flight table and A17 lock tables, the last health record, the A15
+    error table through `try_lock` (`"busy"` when held) and the
+    `/proc/self/task` sample. A test holds all five diag locks and checks
+    that it returns.
+  - So it has only health, calls in flight, the last masked errors per
+    method, the lock-wait statistics (last holder, waits now, waits over
+    1 s and the longest) and the per-thread state and `wchan` sample. The
+    sections behind the chain, mempool, peer, wallet and masternode locks
+    (sync state, chain tips, orphan pools, peers and their misbehaviour,
+    the ban list, the address book, masternode, lottery and treasury
+    state, staking counters, the wallet section) are not built. The
+    output lists them under `not_included`. They come with the RPC, whose
+    caller can wait.
+  - The `diag_key` pseudonym map, the `known_values` pages and the
+    environment page are not built: they need the per-call key and the
+    `Caller` that only the RPC carries, and the map would need the A11
+    types to keep every printed wallet value in memory with nothing to
+    read it. The environment tag stays blocked on §10 item 1.
+  - The A1 binary record, the debug ring and the ZMQ and Electrum
+    counters are not repeated in it: the incident already holds the ring
+    (`ring.txt`), and the rest has no in-process source yet.
+- A14 budget, mirror and path record: `bin/irondivid/src/budget.rs` (the
+  low-disk pause) and `bin/irondivid/src/mirror.rs` (the mirror directory
+  and `running/<pid>`). Differences from the plan:
+  - The free space is sampled at start and on each A6 health tick, not by
+    the writers: a writer reads one flag and never calls `statvfs`. While
+    paused, events.log, chain-events.log, health.log, the RPC logs,
+    startup.txt, incidents and replay bundles write nothing (the sent-txids
+    file catches up after); runs.log and crash.log go on. `diag-paused`
+    and `diag-resumed` are runs.log records with `free_mb` and `floor_mb`.
+  - runs.log and crash.log move to `.1` only at start, when over 1 MB, so
+    either can pass 1 MB within one run. The run number and the
+    unclean-previous check read both files.
+  - The mirror's crash.log is cut to its last 256 KB at each start only.
+    The mirrored events.log is 512 KB × 2, so it holds between 512 KB and
+    1 MB. The mirrored runs.log rotates like the data directory's (1 MB ×
+    2). "mirror unavailable" is both a `mirror-unavailable` record and the
+    start record's `mirror=unavailable` field. The mirror is paused with the
+    rest. Each record goes to the mirror first, then the data directory;
+    the panic entry in crash.log is mirrored too.
+  - The mirror id (`<root>/<id>`) is the first 16 hex digits of the SHA-256
+    of the canonical data directory path; the plan does not define it.
+  - The path record has no `sha256` (there is no A1 binary-hash thread to
+    take it from). On macOS `start` is the launch time in Unix seconds,
+    not a process start time.
+  - `diag/own-invalid/` at 20 MB (A13) is outside the plan's table.
+  - The `_unresolved/` record (a start that fails before the data
+    directory is known) is not built.
+- A16 release symbols: `bin/irondivid/src/build_id.rs` reads the build-id
+  once at start from the loaded image (the ELF `NT_GNU_BUILD_ID` note
+  through `dl_iterate_phdr` on Linux and FreeBSD, `LC_UUID` on macOS) and
+  `tools/release-symbols.sh` keeps and checks the unstripped copies.
+  Differences from the plan:
+  - The build-id is in runs.log's `start` record, the `fatal-signal`
+    record and each panic entry in crash.log, as lowercase hex (`LC_UUID`
+    without dashes); `-` when the binary has none. A17 incident notes in
+    crash.log do not carry it: the run's `start` record does.
+  - `release-symbols.sh keep` copies each unstripped binary to
+    `symbols/<build-id>/<name>` and ships a stripped copy; `check` fails
+    when a shipped binary has no build-id, its kept copy is missing, or
+    the kept copy's build-id differs. Only `build-linux-gnu.sh` (the 7
+    glibc targets) calls it, with `--build-id=sha1` and
+    `CARGO_PROFILE_RELEASE_DEBUG=line-tables-only` from the environment
+    (not `Cargo.toml`). The musl, FreeBSD and macOS builds have no build
+    script in the repository since the Actions workflow was removed
+    (270b2cd7), so nothing calls it for those 5 targets yet; macOS keeps
+    no dSYM. The shipped binaries are now `release/ship/<name>`;
+    `release/<name>` stays unstripped. The §10 item 6 release check is
+    this post-build `check`, not `tools/release-check.sh`, which runs
+    before the build and has no binaries to look at.
+  - The upload to the developer's private release storage is not in the
+    repository: that storage is not either.
+  - Frame pointers (`-C force-frame-pointers=yes`, RocksDB
+    `-fno-omit-frame-pointer`) are not set: the plan puts them in
+    `.cargo/config.toml` target rustflags, which would also rebuild every
+    development and test build on the shared build hosts. They stay open
+    with the stack sweep that needs them (A17).
+  - The macOS `LC_UUID` read is not built or run here (no macOS build
+    host); the Linux read is checked against `readelf -n`.
+- A18 flags: `-walletbroadcast`, `-createwalletbackups` and
+  `-startuptimeout` are read in `bin/irondivid/src/main.rs`, and A1's
+  start-up bound is `bin/irondivid/src/startup_bound.rs`. Differences from
+  the plan:
+  - `-walletbroadcast=0` skips `resubmit_wallet_txs` at start and, in
+    `WalletRpc::sign_and_submit` (`crates/divi-rpc/src/wallet.rs`), the
+    submission callback: the wallet's own send goes into the wallet's
+    unconfirmed list and nowhere else. The gate sits there so that
+    `server.rs` stays unchanged. `sendrawtransaction` still relays, as in
+    Divi Core.
+  - After a restart such a send reads `confirmations` -1, not Divi Core's
+    0: the wallet history gives -1 to a transaction that is in neither the
+    chain nor the mempool. The test accepts any value of 0 or less.
+  - The test is one node with no peer: the send is in the wallet, not in
+    the node's mempool, and a restart with the flag does not put it there.
+    A restart without the flag does. The plan's one-peer test is not built.
+  - `-createwalletbackups` is read as Divi Core's count, where 0 or less
+    turns the start-up copy off; a positive count is not applied (the
+    number of copies kept stays as it is). The monthly backup loop is not
+    gated. The test compares the entry counts of `backups/` and
+    `monthlyBackups/`, not their bytes.
+  - The start-up bound watches the phase from A9's runs.log and, on Linux,
+    the CPU time of the start-up thread from `/proc/self/task/*/stat`; a
+    phase change or new CPU time is progress. On macOS it uses time only.
+    Not built: read I/O as progress, CPU of threads outside Part A's
+    naming before `network`, a separate `network` bound, the 15-minute
+    spin bound, and thread stacks in the incident (thread states only).
+  - With or without `-startuptimeout`, one events.log line per phase
+    (`start-up run=N phase <p> running N min|s`) and one A17 incident of
+    kind `startup-stall`, written from the bound's own thread into the
+    data directory. With the flag the run then writes its `exit` record
+    (code 10, `reason="start-up stalled in <phase>"`) to the mirror first,
+    then the data directory, and ends; the A2 running marker stays.
+  - The bound's default is 300 s; `IRONDIVI_TEST_STARTUP_BOUND_S` changes
+    it on regtest only, for the test. The stall tests (a FIFO as
+    `peers.dat`) run on Linux only.
 
 Part B as built so far: B1 discovery, the B2 collectors (B2.0–B2.19),
 `contrib/diag.sh` (B1.4), `--import` (B6.4), the §6.2 redaction and §6.3
@@ -365,7 +668,7 @@ Tested on hp1, hp2 and hp3 as a user and as root; on macOS only
   `/dev/mapper` names still become placeholders, which costs the
   developer some disk context; they are kept hidden until a rule says
   which are safe.
-- §6.3, canaries not yet testable: `--rpc`, the attach path (B6.2), A10
+- §6.3, canaries not yet testable: `--rpc`, the attach path (B6.6), A10
   `known_values`, A11 counters, `crash.log` and the incident files come
   from parts not built or not runnable on the test hosts; the scanner
   runs over them when they exist, but no canary test covers them yet.
@@ -541,10 +844,47 @@ Tested on hp1, hp2 and hp3 as a user and as root; on macOS only
   getmasternodewinners 100` is refused by the node). Fixed on the way:
   §6.2 wrote a secret-looking JSON key with a bare value
   (`"keypoolsize": 1000`) as `<set>` without quotes, which left the file
-  invalid JSON; the mask is now quoted. Not built: `--rpc-clear`,
-  `--host`, `--tx` (B6.3), the own-staked-block lookup, the call-argument
-  own pseudonym (a `getreceivedbyaddress` address argument shows as
-  `<addr>`), and a preview before consent beyond the summary. The tip
+  invalid JSON; the mask is now quoted. The own-staked-block lookup and
+  the call-argument pseudonyms followed in 36c5f4b5. Built on
+  2026-10-31 (commit signing was unavailable that day, "1Password:
+  agent returned an error", so these pieces and the ones marked
+  "built 2026-10-31" below were held, never committed unsigned, and
+  landed together in order): the consent preview of each
+  `--rpc` answer and `--rpc-clear` (txids, block ids and addresses in
+  clear after their own yes; secrets, keys, hosts, IPs, paths and known
+  values still masked), and `--tx <txid>` (B6.3, one transaction in
+  clear on its own §8.2 question). `--host <container>` (B6.2) is built
+  for Docker only (2026-10-31, `crates/divi-diag/src/host.rs`): run on
+  the host after its own consent question, it packages `docker inspect`,
+  `docker events` for the container's life, the host kernel log lines
+  about the container (seccomp audit records, OOM kills), host memory
+  and storage, every file through the same redaction and final scan,
+  and writes one verdict line ("How the container ended"): docker stop
+  with or without the SIGKILL after the timeout, a seccomp kill with the
+  system call named from the audit record (or from the profile when the
+  kernel logged none), a memory-limit kill, or a host OOM kill. The LXC
+  family followed the same day (`host/lxc.rs`): the runtime is detected
+  (Proxmox `pct`, Incus, LXD, plain LXC, in that order, after Docker), and
+  the package holds the runtime's view (`query /1.0/instances/<name>` and
+  its state plus `info --show-log`; the LXC config, `lxc-info` and log;
+  `pct config`, `pct status` and the Proxmox task index), the container
+  cgroup's memory.events, memory.max, memory.peak (where the kernel has
+  it; 5.15 does not), pids.max and
+  pids.events while the cgroup exists, the kernel log lines for that
+  cgroup (OOM kills, the node's seccomp records, AppArmor denials of the
+  container's profile) and the node's runs.log read through the runtime.
+  LXD, Incus and LXC keep no record of a stop and drop the cgroup with
+  it, so a stopped container's end is read from the kernel log and the
+  runs.log: SIGTERM from the container's init then exit 0 is a clean
+  stop, no exit record is a SIGKILL, and OOM is said only on an oom_kill
+  count above zero or a kernel OOM line for the cgroup. Proven on LXD
+  5.0 (hp3): a 10 MiB `limits.memory` OOM kill (container running, and
+  again after `lxc stop --force`), a `lxc stop --force` and a clean
+  `lxc stop`. Incus takes the LXD path and was not run live. Proxmox and
+  plain LXC (not installed on any host here) are tested only on
+  hand-written fixtures in the real file formats. Not built: WSL, Docker
+  Desktop, and the shared ticket that pairs the host package with the
+  container's own. The tip
   hash in `getblockchaininfo` keeps its `blk:` form, as in live-node.txt
   and chaindb.txt, and is public under A11 even when this wallet staked
   it: every synced node reports the same tip, so a snapshot tip says
@@ -576,8 +916,7 @@ Tested on hp1, hp2 and hp3 as a user and as root; on macOS only
   run prints the tmux, screen and (Linux) `systemd-run --user` command
   lines that keep a capture running after the terminal closes.
   Deviations: one snapshot only (the normal collection runs once, after
-  the capture ends); `fork`, `ban` and `incident` events are not built
-  and are refused at parse time; `stall` is the tip unmoved for 600 s;
+  the capture ends); `stall` is the tip unmoved for 600 s;
   the 200 MB output cap stops writing rather than thinning samples (10 s
   lines over 7 days stay far below it); a free-space shortfall stops the
   capture rather than moving it; Ctrl+C (SIGINT) ends only the capture
@@ -587,8 +926,89 @@ Tested on hp1, hp2 and hp3 as a user and as root; on macOS only
   once, no running node, usage errors, and Ctrl+C under tmux (3 samples
   kept, collection complete); no hostname, user, home path or
   `rpcpassword` reached the package (rerun on hp3: 7 samples, Ctrl+C
-  kept 3, both packages clean). Not tested: the Mac paths
-  (`sysctl vm.loadavg`, `ps` resident memory).
+  kept 3, both packages clean). `fork`, `ban` and `incident` were
+  built 2026-10-31 (B6.5). Each compares against what was there when the capture
+  started, so an old fork, ban or incident never fires: `fork` is a
+  new `getchaintips` tip off the best chain, `ban` a new `listbanned`
+  entry, `incident` a new folder under `diag/incidents/`. Tested for
+  real on hp1 with two mainnet-parameter regtest nodes (dd stakes, dn
+  is captured): a reorg dn received fired `fork` at 30 s ("a new
+  valid-fork tip of 1 block(s) leaves the best chain at height 113")
+  and the capture ended 20 s later; a ban fired `ban`; with dn
+  holding its tip while dd staked ahead, dn's own A12 stall incident
+  (folder 2; folder 1 was there at the start and did not fire) fired
+  `incident` at about 670 s and the capture ended at 690 s with 70
+  samples, the new incident folder in the package.
+  No hostname, user, home path or `rpcpassword` reached any package.
+  The Mac paths (`sysctl vm.loadavg`, `ps` resident memory) are still
+  untested: the Mac run on 2026-10-31 (an aarch64 build cross-compiled
+  on hp3 with zig, every collector ok, no data dir on that Mac) had no
+  running node to capture. That run found macOS `log show` writing
+  paths as `-Users-<name>-code-…`, which §6.2 missed; a hyphen is now a
+  path boundary (built 2026-10-31, B6.5).
+- §10 item 5 on hp1 (2026-10-31), partly. Deviations: a Docker
+  container (Debian 12, glibc build) with `--memory 512m` stands in for
+  the LXC container and the musl build; a SIGSTOP stands in for the
+  forced hang. Results, each read from a package checked by hand (no
+  hostname, user, home path or `rpcpassword` in any):
+  - OOM: the node syncing in the 512 MB container was killed by the
+    kernel. The run table said "no exit record, no crash record" until
+    diag learned A2's rule without a next start: when the start marker
+    `diag/irondivid.running` is the last run's, the boot is the same,
+    and the marker cgroup's `oom_kill` rose, the run ends "memory limit
+    kill probable (cgroup oom_kill 0->4 since start, marker)". A root
+    cgroup path `/` is read only when diag shares the container's
+    cgroup namespace, so from the host the end stays unknown rather than
+    reading the host's counter. Caveat: 3 of those 4 kills were diag's
+    own earlier processes in the same container, so a diag killed in
+    the node's cgroup raises the count for both this rule and A2; the
+    word stays "probable". The diag kills came from hashing the 436 MB
+    debug binary by reading it whole; it now streams the hash (B1.2
+    then took 7.4 s with no new kill), and files over 512 MB were
+    previously hashed on their first 512 MB only. The per-collector
+    1 GB `RLIMIT_DATA` cap does not know the container's `memory.max`,
+    so it does not stop this; not changed. Run on the host as a normal
+    user, diag could not read the root-owned data dir and said so
+    (`Permission denied`, no runs). Both pieces built 2026-10-31 (B6.5).
+  - kill -9: the run table says "no exit record, no crash record", and
+    `diag --run` (B3) recorded the next start's unclean-previous
+    verdict `no-trace`.
+  - crashtest: SIGSEGV and SIGABRT ends come from `crash.log`; a stack
+    overflow shows as SIGSEGV with no overflow marker; a SIGSTOPped
+    node shows as running (pid alive), not hung.
+  - Found on the way: the run table parsed the `mono=` field wrongly and
+    lost run numbers, uptime and peak memory (fixed, built 2026-10-31, B6.5).
+  - Crash cases run for real on hp1 (2026-10-31; node test modes
+    `IRONDIVI_TEST_CRASH`/`IRONDIVI_TEST_PANIC`, kept out of the tree).
+    Before, the run table said only "crash, signal SEGV/ABRT" or "no
+    exit record"; now each names the cause:
+    - SIGSEGV on a tokio worker: "crash, signal SEGV at address 0x0 on
+      thread tokio-rt-worker (crash.log)".
+    - Panic in a critical task, a critical thread, and main: "exit 10
+      (...), after panic in task test-panic on thread tokio-rt-worker at
+      <file:line>", "... after panic on thread test-panic at ...",
+      "exit 101 (...), after panic on thread main at ..."; a panic in a
+      supervised task the node survives is a note "(the node went on)".
+    - Allocation failure: Rust `alloc-null` gives "allocation of N bytes
+      failed, then abort on thread ..."; under `ulimit -v` RocksDB aborts
+      with no Rust record, and the `[rlimits]` start-up section turns
+      "crash, signal ABRT" into "... under an address-space limit
+      (ulimit -v) of 1464 MB: a failed allocation is probable".
+    - Seccomp (fdatasync denied, exit 159): inside, "no exit record, no
+      crash record: ended by something the node cannot catch ...; run
+      `irondivi-cli diag --host <container>`"; the host package says
+      "killed by seccomp (SIGSYS, exit 159): system call 75 (fdatasync)
+      is forbidden by the container's seccomp profile (kernel audit
+      record); not a memory-limit kill (OOMKilled=false)".
+    - docker stop: a node that stops in time records "signal TERM from
+      outside the pid namespace (container runtime or host)" and "exit
+      0 (stopped)"; behind a shell PID 1 that never forwards TERM the
+      host package says "stopped by the container runtime (docker stop:
+      SIGTERM, then SIGKILL after 3 s); exit 137; not a memory-limit
+      kill (OOMKilled=false)".
+  - Not done: the RocksDB overflow, the wallet-lock hang (the hook does
+    not exist), the start-up stall cases, and the host half of the OOM
+    case.
 - §9 receiver and §8.4 upload built (2026-10-31). Hosting decided:
   `diag.irondivi.com` on dnsdivi (15.204.117.157), a plain OVH VM where
   nginx terminates TLS itself, with no CDN, load balancer or provider
@@ -603,8 +1023,9 @@ Tested on hp1, hp2 and hp3 as a user and as root; on macOS only
   upload fails), are in §9 "As built".
 - Smaller: `irondivi-cli --version` exits 1 with the usage text; the
   first divi-diag commit (d3502999) lacks its `Cargo.lock` entry, so
-  `--locked` builds need c83a9dd4 or later; `diag --run` (B3) and the
-  `irondivid --diag` alias are not built.
+  `--locked` builds need c83a9dd4 or later; the `irondivid --diag`
+  alias is not built. (An earlier line here said `diag --run` was not
+  built; it is, see B3.)
 
 ### Revision 15 changes
 

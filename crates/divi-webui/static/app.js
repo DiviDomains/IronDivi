@@ -6,6 +6,8 @@
 let state = {};
 /// A message for the next render of the page, after an action re-draws it
 let flash = null;
+/// The log view's polling timer, stopped whenever the page changes
+let logTimer = null;
 
 // --- helpers ---------------------------------------------------------------
 
@@ -131,7 +133,11 @@ const routes = {
   "security": security,
   "settings": settings,
   "console": consoleView,
+  "logs": logsView,
+  "nft": () => window.irondiviNft({ h, show, rpc, post, getJson, form, field, val, note, state }),
+  "sidechains": () => window.irondiviSidechains({ h, show, post, getJson, form, field, val, note, kv, state: () => state }),
   "wallet": walletView,
+  "wallets": () => window.irondiviWallets({ h, show, post, getJson, form, field, val, note, kv }),
   "staking": () => later("Staking", "Staking status, rewards and the split threshold."),
   "vaults": () => later("Vaults", "Vaults that stake for you but cannot spend."),
   "swaps": () => later("Swaps", "Atomic swaps with other chains."),
@@ -142,6 +148,7 @@ async function route() {
   if (state.setup_required) return setupView();
   if (!state.signed_in) return loginView();
   const view = routes[name] || dashboard;
+  clearTimeout(logTimer);
   document.querySelectorAll("#nav a").forEach((a) =>
     a.classList.toggle("on", a.getAttribute("href") === "#/" + name));
   try {
@@ -154,18 +161,23 @@ async function route() {
 // --- views -------------------------------------------------------------------
 
 function setupView() {
+  // The browser the daemon opened at start is signed in already: no token
+  const launched = state.signed_in;
   show(h("section", { class: "narrow" },
     h("h2", {}, "Set the web interface password"),
-    h("p", {}, "The daemon wrote a one-time setup token to the file ",
-      h("code", {}, "webui-setup-token"), " in its data directory. Paste it here and choose the ",
-      "password this interface will ask for. It is not the wallet passphrase."),
+    launched
+      ? h("p", {}, "The daemon opened this window and signed it in. Choose the password this interface ",
+        "will ask for when you open it any other way. It is not the wallet passphrase.")
+      : h("p", {}, "The daemon wrote a one-time setup token to the file ",
+        h("code", {}, "webui-setup-token"), " in its data directory. Paste it here and choose the ",
+        "password this interface will ask for. It is not the wallet passphrase."),
     form("First sign-in", [
-      field("Setup token", "token", "text"),
+      launched ? null : field("Setup token", "token", "text"),
       field("Password (" + state.min_password + " characters or more)", "password", "password", { autocomplete: "new-password" }),
       field("The password again", "again", "password", { autocomplete: "new-password" }),
     ], "Set password", async (f) => {
       if (val(f, "password") !== val(f, "again")) throw new Error("the passwords differ");
-      const r = await post("/api/setup", { token: val(f, "token"), password: val(f, "password") });
+      const r = await post("/api/setup", { token: launched ? "" : val(f, "token"), password: val(f, "password") });
       state.csrf = r.csrf;
       await refresh();
       location.hash = "#/security";
@@ -702,6 +714,100 @@ function consoleView() {
       return r.error ? "The daemon refused it." : "OK";
     }),
     out));
+}
+
+async function logsView() {
+  const first = await getJson("/api/logs?after=0");
+  let next = 0;
+  const msg = h("p", { class: "note" });
+  const tail = h("pre", { class: "out logs" });
+  const follow = h("input", { type: "checkbox", checked: true });
+  const stats = h("div", { class: "grid" });
+  const env = first.state.env_override;
+
+  const level = h("select", { disabled: env }, first.levels.map((l) => h("option", { value: l }, l)));
+  level.value = first.state.level;
+  const all = first.state.categories.includes("all");
+  const boxes = first.categories.map((c) => {
+    const b = h("input", { type: "checkbox", value: c, disabled: env });
+    b.checked = all || first.state.categories.includes(c);
+    return b;
+  });
+
+  async function apply(categories) {
+    try {
+      const r = await post("/api/logs", { level: level.value, categories: categories ?? boxes.filter((b) => b.checked).map((b) => b.value) });
+      const cats = r.state.categories;
+      boxes.forEach((b) => { b.checked = cats.includes("all") || cats.includes(b.value); });
+      note(msg, "Now logging at " + r.state.level + ", debug: " + (cats.length ? cats.join(", ") : "none") +
+        ". This lasts until the daemon restarts; set debug and loglevel on the Settings page to keep it.", true);
+    } catch (err) {
+      note(msg, err.message, false);
+    }
+  }
+  level.addEventListener("change", () => apply());
+  boxes.forEach((b) => b.addEventListener("change", () => apply()));
+
+  function add(lines) {
+    const atEnd = tail.scrollTop + tail.clientHeight >= tail.scrollHeight - 4;
+    for (const l of lines) {
+      const t = new Date(l.time).toISOString().slice(11, 23);
+      tail.append(h("span", { class: "lvl-" + l.level.toLowerCase() }, t + " " + l.level.padEnd(5) + " " + l.target + ": " + l.message + "\n"));
+    }
+    while (tail.childNodes.length > 2000) tail.firstChild.remove();
+    if (follow.checked || atEnd) tail.scrollTop = tail.scrollHeight;
+  }
+
+  async function loadStats() {
+    const [info, net, mem, up] = await Promise.all([
+      rpc("getinfo").catch(() => ({})), rpc("getnettotals").catch(() => ({})),
+      rpc("getmempoolinfo").catch(() => ({})), rpc("uptime").catch(() => null),
+    ]);
+    const mb = (n) => n === undefined ? undefined : (n / 1048576).toFixed(1) + " MB";
+    stats.replaceChildren(
+      h("div", { class: "card" }, h("h3", {}, "Node"), kv([
+        ["Blocks", info.blocks], ["Connections", info.connections],
+        ["Up", up === null ? undefined : Math.floor(up / 3600) + " h " + Math.floor(up % 3600 / 60) + " min"]])),
+      h("div", { class: "card" }, h("h3", {}, "Network"), kv([
+        ["Received", mb(net.totalbytesrecv)], ["Sent", mb(net.totalbytessent)]])),
+      h("div", { class: "card" }, h("h3", {}, "Mempool"), kv([
+        ["Transactions", mem.size], ["Size", mb(mem.bytes)]])));
+  }
+
+  let ticks = 0;
+  async function poll() {
+    if (!document.body.contains(tail)) return;
+    try {
+      const r = await getJson("/api/logs?after=" + next);
+      add(r.lines);
+      next = r.next;
+      if (ticks++ % 5 === 0) await loadStats();
+    } catch (err) {
+      note(msg, err.message, false);
+    }
+    logTimer = setTimeout(poll, 2000);
+  }
+
+  show(h("section", {},
+    h("h2", {}, "Logs"),
+    stats,
+    h("div", { class: "card" },
+      h("h3", {}, "What is logged"),
+      env ? h("p", { class: "note err" }, "RUST_LOG was set when the daemon started; it decides what is logged until a restart without it.") : null,
+      h("div", { class: "row wrap" }, h("label", {}, "Level ", level),
+        h("button", { type: "button", disabled: env, onclick: () => apply(["all"]) }, "All debug"),
+        h("button", { type: "button", disabled: env, onclick: () => apply([]) }, "No debug")),
+      h("p", { class: "muted small" }, "Debug categories: each one logs its part of the node at debug level."),
+      h("div", { class: "row wrap" }, boxes.map((b) => h("label", { class: "check" }, b, " " + b.value))),
+      msg),
+    h("div", { class: "row wrap" }, h("label", { class: "check" }, follow, " Follow the newest line"),
+      h("span", { class: "muted small" }, "The last 2000 lines the daemon logged, newest at the bottom.")),
+    tail));
+  add(first.lines);
+  next = first.next;
+  await loadStats();
+  ticks = 1;
+  logTimer = setTimeout(poll, 2000);
 }
 
 // --- start ---------------------------------------------------------------------

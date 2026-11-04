@@ -43,7 +43,10 @@ fn call(server: &RpcServer, method: &str, params: Vec<serde_json::Value>) -> Res
 /// Every method name the dispatcher matches on, read from the source of `dispatch`.
 fn dispatched_methods() -> BTreeSet<String> {
     let src = include_str!("../src/server.rs");
-    let start = src.find("fn dispatch(&self").expect("dispatch");
+    let start = src
+        .find("fn dispatch(&self")
+        .or_else(|| src.find("fn dispatch(\n"))
+        .expect("dispatch");
     let end = start + src[start..].find("fn help(&self").expect("help");
     let mut names = BTreeSet::new();
     for line in src[start..end].lines() {

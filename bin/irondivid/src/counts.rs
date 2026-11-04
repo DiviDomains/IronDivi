@@ -144,6 +144,21 @@ fn raw_copy_of(counters: &Counters, mut emit: impl FnMut(&mut RawLine)) {
         }
         line.text(" ").text(key).text("=").num(i64::from(n));
     }
+    // A17: lock waits of 1 s or more since start, by lock
+    for (lock, over, _) in divi_primitives::diag_lock::counts() {
+        if over == 0 {
+            continue;
+        }
+        let key = lock.as_str();
+        if line.room() < key.len() + 32 {
+            emit(&mut line);
+            line = RawLine::new("counts");
+        }
+        line.text(" lock_wait_")
+            .text(key)
+            .text("=")
+            .num(over as i64);
+    }
     emit(&mut line);
 }
 

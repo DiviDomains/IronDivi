@@ -13,6 +13,8 @@ use tempfile::tempdir;
 
 /// The log lines written while `f` runs on this thread
 fn logged<T>(f: impl FnOnce() -> T) -> (T, String) {
+    // Divi Core's exact paths are printed when `-logwalletdetail=1` is on
+    divi_primitives::redact::set_wallet_detail(true);
     #[derive(Clone)]
     struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
     impl std::io::Write for Buf {

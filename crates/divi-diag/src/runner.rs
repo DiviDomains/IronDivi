@@ -13,6 +13,7 @@ use crate::discovery;
 use crate::frame::{read_frame, Frame, Out};
 use crate::redact::Redactor;
 use crate::scanner;
+use crate::txclear;
 use crate::util;
 use crate::Options;
 use std::collections::BTreeMap;
@@ -436,8 +437,14 @@ pub fn parent_main(o: Options) -> i32 {
     let attach = crate::attach::prepare(&o.attach, &mut ctx.known);
     // B6.5: every --rpc call is checked before anything runs; the
     // refusals and clamps are shown now and land in rpc/summary.txt
-    for (m, words) in &o.rpc {
-        match collectors::rpc::check(m, collectors::rpc::params_of(words)) {
+    for (i, (m, words)) in o.rpc.iter().enumerate() {
+        let params = collectors::rpc::params_of(words);
+        let checked = if o.rpc_clear.contains(&i) {
+            collectors::rpc::check_clear(m, params)
+        } else {
+            collectors::rpc::check(m, params)
+        };
+        match checked {
             Ok(r) => {
                 for c in &r.clamps {
                     eprintln!("irondivi-cli diag: --rpc {m}: {c}");
@@ -517,7 +524,7 @@ pub fn parent_main(o: Options) -> i32 {
         p.notes.push("no developer key is compiled into this build: the review can check the folder, but nothing can be sent (§8.4).".into());
     }
     p.notes.push(
-        "not asked (§8.2): own-invalid blocks (A13), --tx, the host package (B6.2), --rpc-clear and the crash \
+        "not asked (§8.2): own-invalid blocks (A13), the host package (B6.2) and the crash \
          stack are not in this version"
             .into(),
     );
@@ -666,10 +673,69 @@ pub fn parent_main(o: Options) -> i32 {
     if (!p.ctx.rpc.is_empty() || !p.ctx.rpc_refused.is_empty()) && !STOP.load(Ordering::SeqCst) {
         let spec = &collectors::RPC;
         p.run_one(spec, Duration::from_secs(spec.secs), None);
+        // §8.2 "One RPC answer": each redacted answer shown and asked
+        // about before diag.log and the summary record what stays; after
+        // a stop nothing is asked, so every answer is deleted
+        let ask = util::is_tty() && !STOP.load(Ordering::SeqCst);
+        let stdin = std::io::stdin();
+        // --rpc-clear: the clear answer is asked about, made and written
+        // here in the parent, never by a collector (every collector frame
+        // goes through the redaction pass)
+        let mut in_clear = Vec::new();
+        let kept = {
+            let (ctx, red, root) = (&p.ctx, p.red.clone(), p.out.clone());
+            let mut clear = |n: usize, inp: &mut dyn std::io::BufRead, out: &mut dyn Write| {
+                let (lines, file) = collectors::rpc::ask_clear(ctx, &red, &root, n, inp, out);
+                in_clear.extend(file);
+                lines
+            };
+            collectors::rpc::consent_answers(
+                &p.out,
+                &mut stdin.lock(),
+                &mut std::io::stdout(),
+                ask,
+                &mut clear,
+            )
+        };
+        for rel in in_clear {
+            p.owners.lock().unwrap().insert(rel, "rpc".into());
+        }
+        p.log
+            .log(&format!("rpc: {kept} answers included by the user"));
         if let Ok(t) = fs::read_to_string(p.out.join("rpc/summary.txt")) {
             for l in t.lines() {
                 p.log.log(&format!("rpc: {l}"));
             }
+        }
+        p.write_summary();
+    }
+    // B6.3: one transaction in clear, made, shown and asked about here in
+    // the parent; the summary and diag.log carry only its redacted lines
+    if let Some(txid) = o.tx.clone() {
+        let lines = if STOP.load(Ordering::SeqCst) {
+            vec!["--tx: not asked: the run was stopped".to_string()]
+        } else if !util::is_tty() {
+            vec!["--tx: not asked: no terminal (R2)".to_string()]
+        } else {
+            let target = observed_target(&p.ctx, &o);
+            let (lines, file) = txclear::ask(
+                &p.ctx,
+                target,
+                &p.red,
+                &p.out,
+                &txid,
+                &mut std::io::stdin().lock(),
+                &mut std::io::stdout(),
+            );
+            if let Some(rel) = file {
+                p.owners.lock().unwrap().insert(rel, "tx".into());
+            }
+            lines
+        };
+        for l in lines {
+            let l = p.red.scrub(&l);
+            p.log.log(&l);
+            p.notes.push(l);
         }
         p.write_summary();
     }
@@ -1276,7 +1342,9 @@ impl Parent {
         if let Ok(t) = fs::read_to_string(self.out.join("rpc/summary.txt")) {
             s.push_str("\n== RPC answers (B6.5) ==\n");
             s.push_str(t.trim_end());
-            s.push_str("\nB6.3 (diag --tx) is the way to show one transaction in clear; it is not in this version.\n");
+            s.push_str(
+                "\nTo send one transaction in clear, run diag again with --tx <txid> (B6.3).\n",
+            );
         }
 
         s.push_str("\n== Collectors (B2.20) ==\n");

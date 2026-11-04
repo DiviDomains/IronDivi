@@ -578,7 +578,7 @@ so every 64-hex string is pseudonymised and every address-shaped token masked.\n
     }
 }
 
-fn write_file(root: &Path, rel: &str, data: &[u8]) -> bool {
+pub(crate) fn write_file(root: &Path, rel: &str, data: &[u8]) -> bool {
     let p = root.join(rel);
     if let Some(parent) = p.parent() {
         if fs::DirBuilder::new()

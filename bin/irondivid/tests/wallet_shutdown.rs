@@ -85,6 +85,11 @@ struct Daemon {
 
 impl Daemon {
     fn start(datadir: &Path) -> Daemon {
+        Daemon::start_with(datadir, &[])
+    }
+
+    /// With more options (diag plan A18's)
+    fn start_with(datadir: &Path, extra: &[&str]) -> Daemon {
         let (child, rpc_port, _) = start_node(
             datadir,
             |rpc_port, p2p_port| {
@@ -97,6 +102,7 @@ impl Daemon {
                     .args(["--bind", "127.0.0.1", "--staking=false"])
                     // RPC always requires credentials; "dGVzdDp0ZXN0" is base64 of test:test
                     .args(["--rpcuser", "test", "--rpcpassword", "test"])
+                    .args(extra)
                     .env("WALLET_MNEMONIC", WALLET_MNEMONIC)
                     .env("WALLET_LOOKAHEAD", "5")
                     .stdout(Stdio::null())
@@ -294,4 +300,94 @@ fn unconfirmed_send_survives_sigint() {
 #[test]
 fn unconfirmed_send_survives_kill_9() {
     send_then_end(End::Signal(libc::SIGKILL));
+}
+
+fn in_mempool(daemon: &Daemon, txid: &str) -> bool {
+    daemon
+        .rpc("getrawmempool", json!([]))
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|t| t == &json!(txid))
+}
+
+/// A18: with -walletbroadcast=0 a send stays in the wallet, unconfirmed,
+/// and is neither in the mempool nor put back there by the next start
+#[test]
+fn walletbroadcast_0_keeps_a_send_in_the_wallet() {
+    let dir = tempfile::tempdir().unwrap();
+    let datadir = dir.path();
+    let daemon = Daemon::start(datadir);
+    daemon.rpc("stop", json!([]));
+    assert!(daemon.wait());
+    mine_offline(datadir, &first_address(WALLET_MNEMONIC), 3);
+    mine_offline(datadir, &first_address(OTHER_MNEMONIC), 22);
+
+    let daemon = Daemon::start_with(datadir, &["-walletbroadcast=0"]);
+    let before = unspent(&daemon);
+    let other = first_address(OTHER_MNEMONIC).to_string();
+    let txid = daemon.rpc("sendtoaddress", json!([other, 10.0]));
+    let txid = txid.as_str().unwrap().to_string();
+    assert_eq!(listed(&daemon, &txid).len(), 1);
+    assert_ne!(unspent(&daemon), before, "the send spends a coin");
+    assert!(
+        !in_mempool(&daemon, &txid),
+        "relayed with -walletbroadcast=0"
+    );
+    daemon.rpc("stop", json!([]));
+    assert!(daemon.wait());
+
+    let daemon = Daemon::start_with(datadir, &["-walletbroadcast=0"]);
+    let rows = listed(&daemon, &txid);
+    assert_eq!(rows.len(), 1, "send lost: {rows:?}");
+    // Unconfirmed: IronDivi reads -1 for a wallet tx in neither the chain
+    // nor the mempool (wallet_history depth), where Divi Core reads 0
+    let confirmations = rows[0]["confirmations"].as_i64().unwrap();
+    assert!(confirmations <= 0, "confirmed: {rows:?}");
+    assert!(
+        !in_mempool(&daemon, &txid),
+        "resubmitted with -walletbroadcast=0"
+    );
+    daemon.rpc("stop", json!([]));
+    assert!(daemon.wait());
+
+    // Without the option the next start resubmits it
+    let daemon = Daemon::start(datadir);
+    assert!(
+        in_mempool(&daemon, &txid),
+        "not resubmitted without the option"
+    );
+}
+
+fn entries(dir: &Path) -> usize {
+    std::fs::read_dir(dir).map_or(0, |d| d.count())
+}
+
+/// A18: -createwalletbackups=0 makes no start-up copy of the wallet
+#[test]
+fn createwalletbackups_0_makes_no_backup_at_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let datadir = dir.path();
+    let counts = || {
+        (
+            entries(&datadir.join("backups")),
+            entries(&datadir.join("monthlyBackups")),
+        )
+    };
+    let start_stop = |extra: &[&str]| {
+        let daemon = Daemon::start_with(datadir, extra);
+        daemon.rpc("stop", json!([]));
+        assert!(daemon.wait());
+    };
+    // The first start creates the wallet, the second has one to copy
+    start_stop(&[]);
+    let first = counts();
+    start_stop(&[]);
+    let second = counts();
+    assert!(
+        second.0 > first.0,
+        "no backup without the option: {first:?} {second:?}"
+    );
+    start_stop(&["-createwalletbackups=0"]);
+    assert_eq!(counts(), second, "a backup with -createwalletbackups=0");
 }
