@@ -31,6 +31,10 @@ chacha20poly1305 = { version = "0.10", default-features = false, features = ["al
 reqwest = { workspace = true }
 # The config file is edited in place, its comments and order kept
 toml_edit = "0.22"
+base64 = "0.22"
+hkdf = "0.12"
+ciborium = "0.2"
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "arithmetic"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

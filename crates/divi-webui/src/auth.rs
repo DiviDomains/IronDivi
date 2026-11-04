@@ -7,10 +7,10 @@
 // by the Free Software Foundation, version 3.
 
 //! Who may use the web interface: one admin password, its Argon2id hash kept
-//! in `<datadir>/webui-auth.json` (never in the config file); a one-time setup
-//! token in `<datadir>/webui-setup-token` until that password is chosen;
-//! sessions held in memory, each with its own CSRF token; and a back-off on
-//! failed logins.
+//! in `<datadir>/webui-auth.json` (never in the config file) alongside optional
+//! WebAuthn P-256 admin sign-in passkeys; a one-time setup token in
+//! `<datadir>/webui-setup-token` until that password is chosen; sessions held
+//! in memory, each with its own CSRF token; and a back-off on failed logins.
 
 use argon2::{Algorithm, Argon2, Params, Version};
 use parking_lot::Mutex;
@@ -31,6 +31,8 @@ pub const SETUP_TOKEN_FILE: &str = "webui-setup-token";
 pub const COOKIE_NAME: &str = "irondivi_webui";
 /// Shortest admin password accepted
 pub const MIN_PASSWORD_LEN: usize = 12;
+/// Maximum admin sign-in passkeys stored
+const MAX_ADMIN_PASSKEYS: usize = 16;
 
 /// A session ends after this long without a request
 const SESSION_IDLE: Duration = Duration::from_secs(30 * 60);
@@ -49,7 +51,42 @@ const ARGON2_M_KIB: u32 = 19 * 1024;
 const ARGON2_T: u32 = 2;
 const ARGON2_P: u32 = 1;
 
-/// The stored password: its Argon2id hash with the salt and costs used
+/// One WebAuthn P-256 credential registered for WebUI admin sign-in
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminPasskey {
+    pub id: String,
+    pub label: String,
+    pub credential_id_b64url: String,
+    pub public_key_sec1_hex: String,
+    pub rp_id: String,
+    pub sign_count: u32,
+    pub created: u64,
+}
+
+/// Public summary of an admin passkey returned to signed-in browsers
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AdminPasskeySummary {
+    pub id: String,
+    pub label: String,
+    pub rp_id: String,
+    pub sign_count: u32,
+    pub created: u64,
+}
+
+impl From<&AdminPasskey> for AdminPasskeySummary {
+    fn from(p: &AdminPasskey) -> Self {
+        AdminPasskeySummary {
+            id: p.id.clone(),
+            label: p.label.clone(),
+            rp_id: p.rp_id.clone(),
+            sign_count: p.sign_count,
+            created: p.created,
+        }
+    }
+}
+
+/// The stored password: its Argon2id hash with the salt and costs used, plus
+/// optional WebAuthn admin sign-in passkeys
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PasswordRecord {
     version: u32,
@@ -58,6 +95,24 @@ struct PasswordRecord {
     m_kib: u32,
     t: u32,
     p: u32,
+    #[serde(default)]
+    passkeys: Vec<AdminPasskey>,
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+pub(crate) fn clean_label(label: &str, fallback: &str) -> Result<String, String> {
+    let trimmed = label.trim();
+    let chosen = if trimmed.is_empty() { fallback } else { trimmed };
+    if chosen.chars().count() > 64 || chosen.chars().any(char::is_control) {
+        return Err("a passkey label is 1 to 64 printable characters".into());
+    }
+    Ok(chosen.to_string())
 }
 
 fn argon2_hash(password: &str, salt: &[u8], m_kib: u32, t: u32, p: u32) -> Option<[u8; 32]> {
@@ -105,7 +160,7 @@ pub fn write_private(path: &Path, content: &[u8]) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
-/// The admin password and the setup token
+/// The admin password, admin passkeys, and the setup token
 pub struct AuthStore {
     path: PathBuf,
     token_path: PathBuf,
@@ -169,7 +224,8 @@ impl AuthStore {
             .is_some_and(|t| constant_time_eq(t, &digest))
     }
 
-    /// Hash and store a new admin password; ends the setup token
+    /// Hash and store a new admin password; preserves any registered passkeys
+    /// and ends the setup token
     pub fn set_password(&self, password: &str) -> anyhow::Result<()> {
         if password.chars().count() < MIN_PASSWORD_LEN {
             anyhow::bail!("The password must be at least {MIN_PASSWORD_LEN} characters");
@@ -178,6 +234,11 @@ impl AuthStore {
         rand::rngs::OsRng.fill_bytes(&mut salt);
         let hash = argon2_hash(password, &salt, ARGON2_M_KIB, ARGON2_T, ARGON2_P)
             .ok_or_else(|| anyhow::anyhow!("password hashing failed"))?;
+        let mut guard = self.record.lock();
+        let existing_passkeys = guard
+            .as_ref()
+            .map(|r| r.passkeys.clone())
+            .unwrap_or_default();
         let record = PasswordRecord {
             version: 1,
             salt: hex::encode(salt),
@@ -185,11 +246,13 @@ impl AuthStore {
             m_kib: ARGON2_M_KIB,
             t: ARGON2_T,
             p: ARGON2_P,
+            passkeys: existing_passkeys,
         };
         let text = serde_json::to_vec_pretty(&record)?;
         write_private(&self.path, &text)
             .map_err(|e| anyhow::anyhow!("cannot write {}: {}", self.path.display(), e))?;
-        *self.record.lock() = Some(record);
+        *guard = Some(record);
+        drop(guard);
         *self.setup_token.lock() = None;
         let _ = std::fs::remove_file(&self.token_path);
         Ok(())
@@ -206,6 +269,112 @@ impl AuthStore {
         };
         argon2_hash(password, &salt, record.m_kib, record.t, record.p)
             .is_some_and(|h| constant_time_eq(&h, &expected))
+    }
+
+    /// Whether at least one admin passkey is enrolled
+    pub fn has_passkey(&self) -> bool {
+        self.record
+            .lock()
+            .as_ref()
+            .is_some_and(|r| !r.passkeys.is_empty())
+    }
+
+    /// Registered admin passkeys (full records for server-side verification)
+    pub fn passkeys(&self) -> Vec<AdminPasskey> {
+        self.record
+            .lock()
+            .as_ref()
+            .map(|r| r.passkeys.clone())
+            .unwrap_or_default()
+    }
+
+    /// Summaries of registered admin passkeys for the Security page
+    pub fn passkey_summaries(&self) -> Vec<AdminPasskeySummary> {
+        self.record
+            .lock()
+            .as_ref()
+            .map(|r| r.passkeys.iter().map(AdminPasskeySummary::from).collect())
+            .unwrap_or_default()
+    }
+
+    /// Store a verified WebAuthn passkey in `webui-auth.json`
+    pub fn add_passkey(
+        &self,
+        label: &str,
+        credential_id_b64url: String,
+        public_key_sec1_hex: String,
+        rp_id: String,
+        sign_count: u32,
+    ) -> Result<AdminPasskeySummary, String> {
+        let label = clean_label(label, "Passkey")?;
+        let mut guard = self.record.lock();
+        let Some(current) = guard.as_ref() else {
+            return Err("set the password first".into());
+        };
+        if current.passkeys.len() >= MAX_ADMIN_PASSKEYS {
+            return Err(format!("at most {MAX_ADMIN_PASSKEYS} passkeys may be added"));
+        }
+        if current
+            .passkeys
+            .iter()
+            .any(|p| p.credential_id_b64url == credential_id_b64url)
+        {
+            return Err("that passkey is already registered".into());
+        }
+        let mut updated = current.clone();
+        let entry = AdminPasskey {
+            id: random_hex(8),
+            label,
+            credential_id_b64url,
+            public_key_sec1_hex,
+            rp_id,
+            sign_count,
+            created: unix_now(),
+        };
+        let summary = AdminPasskeySummary::from(&entry);
+        updated.passkeys.push(entry);
+        let text = serde_json::to_vec_pretty(&updated).map_err(|e| e.to_string())?;
+        write_private(&self.path, &text).map_err(|e| e.to_string())?;
+        *guard = Some(updated);
+        Ok(summary)
+    }
+
+    /// Persist an updated WebAuthn signature counter after a valid sign-in
+    pub fn update_passkey_sign_count(&self, id: &str, sign_count: u32) -> Result<(), String> {
+        let mut guard = self.record.lock();
+        let Some(current) = guard.as_ref() else {
+            return Err("no password record".into());
+        };
+        let mut updated = current.clone();
+        let Some(entry) = updated.passkeys.iter_mut().find(|p| p.id == id) else {
+            return Err("unknown passkey".into());
+        };
+        if entry.sign_count == sign_count {
+            return Ok(());
+        }
+        entry.sign_count = sign_count;
+        let text = serde_json::to_vec_pretty(&updated).map_err(|e| e.to_string())?;
+        write_private(&self.path, &text).map_err(|e| e.to_string())?;
+        *guard = Some(updated);
+        Ok(())
+    }
+
+    /// Remove an admin passkey by `id`
+    pub fn remove_passkey(&self, id: &str) -> Result<bool, String> {
+        let mut guard = self.record.lock();
+        let Some(current) = guard.as_ref() else {
+            return Err("set the password first".into());
+        };
+        let mut updated = current.clone();
+        let before = updated.passkeys.len();
+        updated.passkeys.retain(|p| p.id != id);
+        if updated.passkeys.len() == before {
+            return Ok(false);
+        }
+        let text = serde_json::to_vec_pretty(&updated).map_err(|e| e.to_string())?;
+        write_private(&self.path, &text).map_err(|e| e.to_string())?;
+        *guard = Some(updated);
+        Ok(true)
     }
 }
 
@@ -374,6 +543,53 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+    }
+
+    #[test]
+    fn legacy_auth_json_loads_without_passkeys_and_persists_passkeys() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = r#"{
+            "version": 1,
+            "salt": "00112233445566778899aabbccddeeff",
+            "hash": "0000000000000000000000000000000000000000000000000000000000000000",
+            "m_kib": 19456,
+            "t": 2,
+            "p": 1
+        }"#;
+        write_private(&dir.path().join(AUTH_FILE), legacy.as_bytes()).unwrap();
+        let store = AuthStore::open(dir.path()).unwrap();
+        assert!(!store.setup_required());
+        assert!(!store.has_passkey());
+
+        let added = store
+            .add_passkey(
+                "YubiKey",
+                "cred_abc".into(),
+                "04".repeat(33),
+                "localhost".into(),
+                0,
+            )
+            .unwrap();
+        assert!(store.has_passkey());
+        assert!(store
+            .add_passkey(
+                "Dup",
+                "cred_abc".into(),
+                "04".repeat(33),
+                "localhost".into(),
+                0,
+            )
+            .is_err());
+
+        // Changing password preserves enrolled passkeys
+        store.set_password("new horse battery staple").unwrap();
+        let reopened = AuthStore::open(dir.path()).unwrap();
+        assert!(reopened.has_passkey());
+        assert_eq!(reopened.passkey_summaries().len(), 1);
+        reopened.update_passkey_sign_count(&added.id, 5).unwrap();
+        assert_eq!(reopened.passkey_summaries()[0].sign_count, 5);
+        assert!(reopened.remove_passkey(&added.id).unwrap());
+        assert!(!reopened.has_passkey());
     }
 
     #[test]

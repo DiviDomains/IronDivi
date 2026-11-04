@@ -32,9 +32,9 @@ function show(...nodes) {
   main.replaceChildren(...nodes);
 }
 
-async function post(path, body) {
+async function sendJson(method, path, body) {
   const res = await fetch(path, {
-    method: "POST",
+    method,
     credentials: "same-origin",
     headers: { "Content-Type": "application/json", "X-CSRF-Token": state.csrf || "" },
     body: JSON.stringify(body || {}),
@@ -44,6 +44,14 @@ async function post(path, body) {
   if (res.status === 401) { await refresh(); throw new Error(data.error || "sign in first"); }
   if (!res.ok) throw new Error(data.error || res.statusText);
   return data;
+}
+
+function post(path, body) {
+  return sendJson("POST", path, body);
+}
+
+function del(path, body) {
+  return sendJson("DELETE", path, body);
 }
 
 async function getJson(path) {
@@ -67,9 +75,10 @@ function note(el, text, ok) {
 }
 
 /// A form whose submit runs `work` and reports into its own note line
-function form(title, fields, label, work, extra) {
+function form(title, fields, label, work, extra, extraButtons) {
   const msg = h("p", { class: "note" });
   const button = h("button", { type: "submit" }, label);
+  const rowKids = [button, ...(extraButtons || [])];
   const f = h("form", {
     class: "card",
     onsubmit: async (e) => {
@@ -86,7 +95,8 @@ function form(title, fields, label, work, extra) {
         button.disabled = false;
       }
     },
-  }, h("h3", {}, title), extra || null, fields, h("div", { class: "row" }, button), msg);
+  }, h("h3", {}, title), extra || null, fields, h("div", { class: "row wrap" }, rowKids), msg);
+  f._note = msg;
   return f;
 }
 
@@ -96,6 +106,168 @@ function field(label, name, type, attrs) {
 }
 
 function val(f, name) { return f.elements[name].value; }
+
+// --- WebAuthn & PRF helpers ------------------------------------------------
+
+function bytesToB64url(buf) {
+  const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+  let bin = "";
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+function b64urlToBytes(str) {
+  const norm = String(str).replace(/-/g, "+").replace(/_/g, "/");
+  const pad = norm + "=".repeat((4 - (norm.length % 4)) % 4);
+  const bin = atob(pad);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+function isLoopbackIpHost() {
+  const host = window.location.hostname;
+  return host === "127.0.0.1" || host === "::1" || host === "[::1]";
+}
+
+function localhostHref() {
+  const port = window.location.port ? ":" + window.location.port : "";
+  return "http://localhost" + port + "/" + window.location.hash;
+}
+
+function localhostPasskeyHint() {
+  if (!isLoopbackIpHost()) return null;
+  const href = localhostHref();
+  return h("div", { class: "card warn", "data-testid": "localhost-passkey-hint" },
+    h("strong", {}, "Passkeys need localhost: "),
+    "Browsers block WebAuthn Passkeys on raw IP addresses (" + window.location.hostname + "). Open ",
+    h("a", { href }, href),
+    " to sign in or unlock wallets with a Passkey.");
+}
+
+function ensurePasskeyOrigin() {
+  if (isLoopbackIpHost()) {
+    throw new Error("Browsers reject Passkeys on " + window.location.hostname + "; open " + localhostHref() + " instead.");
+  }
+  if (!window.PublicKeyCredential || !navigator.credentials) {
+    throw new Error("This browser does not support WebAuthn Passkeys in this context.");
+  }
+}
+
+function extractPrfOutputB64(extResults) {
+  const raw = extResults && extResults.prf && extResults.prf.results && extResults.prf.results.first;
+  if (!raw) return null;
+  const view = raw instanceof ArrayBuffer
+    ? new Uint8Array(raw)
+    : ArrayBuffer.isView(raw)
+      ? new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength)
+      : null;
+  if (!view || view.length !== 32) return null;
+  const copy = new Uint8Array(view);
+  const encoded = bytesToB64url(copy);
+  copy.fill(0);
+  view.fill(0);
+  return encoded;
+}
+
+/// Create a new WebAuthn credential with `prf` enabled, then immediately run
+/// `get` with a fresh 32-byte `prfSalt` to verify and obtain its 32-byte PRF output.
+async function enrollPrfPasskey(accountName, displayLabel) {
+  ensurePasskeyOrigin();
+  const rpId = window.location.hostname;
+  const prfSalt = crypto.getRandomValues(new Uint8Array(32));
+  const regChallenge = crypto.getRandomValues(new Uint8Array(32));
+  const userId = crypto.getRandomValues(new Uint8Array(16));
+
+  const created = await navigator.credentials.create({
+    publicKey: {
+      challenge: regChallenge,
+      rp: { id: rpId, name: "IronDivi WebUI" },
+      user: {
+        id: userId,
+        name: accountName,
+        displayName: displayLabel || accountName,
+      },
+      pubKeyCredParams: [
+        { type: "public-key", alg: -7 },
+        { type: "public-key", alg: -257 },
+      ],
+      authenticatorSelection: {
+        residentKey: "preferred",
+        userVerification: "required",
+      },
+      attestation: "none",
+      extensions: { prf: {} },
+      timeout: 60000,
+    },
+  });
+  if (!created) throw new Error("Passkey creation was cancelled.");
+  const createExt = created.getClientExtensionResults ? created.getClientExtensionResults() : {};
+  if (createExt.prf && createExt.prf.enabled === false) {
+    throw new Error("This passkey authenticator does not support the WebAuthn PRF extension.");
+  }
+
+  const getChallenge = crypto.getRandomValues(new Uint8Array(32));
+  const assertion = await navigator.credentials.get({
+    publicKey: {
+      challenge: getChallenge,
+      rpId,
+      allowCredentials: [{ type: "public-key", id: new Uint8Array(created.rawId) }],
+      userVerification: "required",
+      extensions: { prf: { eval: { first: prfSalt } } },
+      timeout: 60000,
+    },
+  });
+  if (!assertion) throw new Error("Passkey verification was cancelled.");
+  const getExt = assertion.getClientExtensionResults ? assertion.getClientExtensionResults() : {};
+  const prfOutput = extractPrfOutputB64(getExt);
+  if (!prfOutput) {
+    throw new Error("Passkey did not return a 32-byte PRF secret; use a PRF-capable passkey.");
+  }
+  return {
+    credential_id: bytesToB64url(created.rawId),
+    prf_salt: bytesToB64url(prfSalt),
+    rp_id: rpId,
+    prf_output: prfOutput,
+  };
+}
+
+/// Evaluate WebAuthn PRF against a chosen passkey slot (or the first slot matching this host).
+async function evalPrfPasskey(slots, chosenSlotId) {
+  ensurePasskeyOrigin();
+  const rpId = window.location.hostname;
+  const matching = (slots || []).filter((s) => s.rp_id === rpId);
+  if (!matching.length) {
+    throw new Error("No passkey is enrolled for host " + rpId + ".");
+  }
+  const slot = (chosenSlotId && matching.find((s) => s.id === chosenSlotId)) || matching[0];
+  const challenge = crypto.getRandomValues(new Uint8Array(32));
+  const prfSalt = b64urlToBytes(slot.prf_salt);
+  const assertion = await navigator.credentials.get({
+    publicKey: {
+      challenge,
+      rpId,
+      allowCredentials: [{ type: "public-key", id: b64urlToBytes(slot.credential_id) }],
+      userVerification: "required",
+      extensions: { prf: { eval: { first: prfSalt } } },
+      timeout: 60000,
+    },
+  });
+  if (!assertion) throw new Error("Passkey prompt was cancelled.");
+  const ext = assertion.getClientExtensionResults ? assertion.getClientExtensionResults() : {};
+  const prfOutput = extractPrfOutputB64(ext);
+  if (!prfOutput) {
+    throw new Error("Passkey did not produce a PRF key.");
+  }
+  return { slot_id: slot.id, prf_output: prfOutput };
+}
+
+const passkeyTools = {
+  enrollPrfPasskey,
+  evalPrfPasskey,
+  localhostPasskeyHint,
+  isLoopbackIpHost,
+};
 
 function walletLabel(w) {
   return {
@@ -137,7 +309,7 @@ const routes = {
   "nft": () => window.irondiviNft({ h, show, rpc, post, getJson, form, field, val, note, state }),
   "sidechains": () => window.irondiviSidechains({ h, show, post, getJson, form, field, val, note, kv, state: () => state }),
   "wallet": walletView,
-  "wallets": () => window.irondiviWallets({ h, show, post, getJson, form, field, val, note, kv }),
+  "wallets": () => window.irondiviWallets({ h, show, post, del, getJson, form, field, val, note, kv, passkey: passkeyTools }),
   "staking": () => later("Staking", "Staking status, rewards and the split threshold."),
   "vaults": () => later("Vaults", "Vaults that stake for you but cannot spend."),
   "swaps": () => later("Swaps", "Atomic swaps with other chains."),
@@ -164,6 +336,7 @@ function setupView() {
   // The browser the daemon opened at start is signed in already: no token
   const launched = state.signed_in;
   show(h("section", { class: "narrow" },
+    localhostPasskeyHint(),
     h("h2", {}, "Set the web interface password"),
     launched
       ? h("p", {}, "The daemon opened this window and signed it in. Choose the password this interface ",
@@ -186,14 +359,58 @@ function setupView() {
 }
 
 function loginView() {
-  show(h("section", { class: "narrow" },
-    form("Sign in", [field("Password", "password", "password", { autocomplete: "current-password", autofocus: true })],
-      "Sign in", async (f) => {
-        const r = await post("/api/login", { password: val(f, "password") });
-        state.csrf = r.csrf;
-        await refresh();
-        route();
-      })));
+  let passkeyBtn = null;
+  const loginForm = form("Sign in", [
+    field("Password", "password", "password", { autocomplete: "current-password", autofocus: true }),
+  ], "Sign in", async (f) => {
+    const r = await post("/api/login", { password: val(f, "password") });
+    state.csrf = r.csrf;
+    await refresh();
+    route();
+  }, null, state.has_passkey ? [
+    (passkeyBtn = h("button", {
+      type: "button",
+      id: "login-passkey-btn",
+      "data-testid": "login-passkey-btn",
+      class: "secondary",
+      onclick: async () => {
+        passkeyBtn.disabled = true;
+        note(loginForm._note, "Waiting for passkey…", true);
+        try {
+          ensurePasskeyOrigin();
+          const start = await post("/api/auth/passkey/login/start", {});
+          const assertion = await navigator.credentials.get({
+            publicKey: {
+              challenge: b64urlToBytes(start.challenge),
+              rpId: start.rp_id,
+              allowCredentials: (start.allow_credentials || []).map((c) => ({
+                type: "public-key",
+                id: b64urlToBytes(c.id),
+              })),
+              userVerification: "required",
+              timeout: 60000,
+            },
+          });
+          if (!assertion) throw new Error("Passkey sign-in was cancelled.");
+          const r = await post("/api/auth/passkey/login/finish", {
+            credential_id: bytesToB64url(assertion.rawId),
+            client_data_json: bytesToB64url(assertion.response.clientDataJSON),
+            authenticator_data: bytesToB64url(assertion.response.authenticatorData),
+            signature: bytesToB64url(assertion.response.signature),
+          });
+          state.csrf = r.csrf;
+          await refresh();
+          route();
+        } catch (err) {
+          note(loginForm._note, err.message, false);
+        } finally {
+          passkeyBtn.disabled = false;
+        }
+      },
+    }, "Sign in with Passkey")),
+  ] : []);
+
+  show(h("section", { class: "narrow" }, localhostPasskeyHint(), loginForm));
 }
 
 function later(title, what) {
@@ -227,10 +444,182 @@ async function dashboard() {
     )));
 }
 
+function adminPasskeysCard() {
+  const enrolled = state.passkeys || [];
+  const msg = h("p", { class: "note" });
+  const pwConfirm = field("Current web interface password (required to add or remove a passkey)", "password", "password", {
+    autocomplete: "current-password",
+  });
+  const labelInput = field("Passkey label (optional)", "label", "text", {
+    maxlength: 64,
+    placeholder: "Touch ID / Security Key",
+  });
+
+  const list = enrolled.length
+    ? h("ul", { class: "pk-list" }, enrolled.map((pk) =>
+      h("li", { class: "pk-item" },
+        h("span", {}, h("strong", {}, pk.label), " ", h("span", { class: "muted small" }, "(" + pk.rp_id + ", added " + new Date(pk.created * 1000).toLocaleDateString() + ")")),
+        h("button", {
+          type: "button",
+          class: "link",
+          onclick: async () => {
+            const password = pwConfirm.querySelector("input").value;
+            if (!password) {
+              note(msg, "Enter your current web interface password below first.", false);
+              return;
+            }
+            if (!confirm("Remove sign-in passkey \"" + pk.label + "\"?")) return;
+            try {
+              await del("/api/auth/passkey/" + pk.id, { password });
+              flash = "Removed sign-in passkey \"" + pk.label + "\".";
+              security();
+            } catch (err) {
+              note(msg, err.message, false);
+            }
+          },
+        }, "Remove"))))
+    : h("p", { class: "muted" }, "No sign-in passkeys enrolled yet.");
+
+  const addBtn = h("button", {
+    type: "submit",
+    "data-testid": "admin-add-passkey-btn",
+  }, "Add Sign-In Passkey");
+
+  const card = h("form", {
+    class: "card",
+    "data-testid": "admin-passkeys-card",
+    onsubmit: async (e) => {
+      e.preventDefault();
+      addBtn.disabled = true;
+      note(msg, "Waiting for passkey…", true);
+      try {
+        ensurePasskeyOrigin();
+        const password = val(card, "password");
+        if (!password) throw new Error("enter your current web interface password");
+        const label = val(card, "label").trim() || "Passkey";
+        const start = await post("/api/auth/passkey/register/start", { password, label });
+        const created = await navigator.credentials.create({
+          publicKey: {
+            challenge: b64urlToBytes(start.challenge),
+            rp: { id: start.rp_id, name: start.rp_name },
+            user: {
+              id: b64urlToBytes(start.user.id),
+              name: start.user.name,
+              displayName: start.user.display_name,
+            },
+            pubKeyCredParams: [{ type: "public-key", alg: -7 }],
+            authenticatorSelection: {
+              residentKey: "preferred",
+              userVerification: "required",
+            },
+            attestation: "none",
+            excludeCredentials: (start.exclude_credentials || []).map((c) => ({
+              type: "public-key",
+              id: b64urlToBytes(c.id),
+            })),
+            timeout: 60000,
+          },
+        });
+        if (!created) throw new Error("Passkey registration was cancelled.");
+        await post("/api/auth/passkey/register/finish", {
+          client_data_json: bytesToB64url(created.response.clientDataJSON),
+          attestation_object: bytesToB64url(created.response.attestationObject),
+        });
+        flash = "Sign-in passkey added.";
+        security();
+      } catch (err) {
+        note(msg, err.message, false);
+      } finally {
+        addBtn.disabled = false;
+      }
+    },
+  },
+    h("h3", {}, "WebUI Sign-In Passkeys"),
+    h("p", { class: "muted" }, "Sign in to this web interface with Touch ID, Windows Hello, or a hardware security key instead of typing the admin password."),
+    list,
+    labelInput,
+    pwConfirm,
+    h("div", { class: "row" }, addBtn),
+    msg);
+  return card;
+}
+
+function nodePasskeysCard() {
+  const slots = state.node_passkeys || [];
+  const msg = h("p", { class: "note" });
+  const list = slots.length
+    ? h("ul", { class: "pk-list" }, slots.map((s) =>
+      h("li", { class: "pk-item" },
+        h("span", {}, h("strong", {}, s.label), " ", h("span", { class: "muted small" }, "(" + s.rp_id + ")")),
+        h("button", {
+          type: "button",
+          class: "link",
+          onclick: async () => {
+            if (!confirm("Remove node wallet passkey \"" + s.label + "\"?")) return;
+            try {
+              await del("/api/node-wallet/passkeys/" + s.id, {});
+              flash = "Removed node wallet passkey \"" + s.label + "\".";
+              security();
+            } catch (err) {
+              note(msg, err.message, false);
+            }
+          },
+        }, "Remove"))))
+    : h("p", { class: "muted" }, "No passkeys enrolled for wallet.dat yet.");
+
+  const addBtn = h("button", {
+    type: "submit",
+    "data-testid": "node-add-passkey-btn",
+  }, "Add Wallet Passkey");
+
+  const card = h("form", {
+    class: "card",
+    "data-testid": "node-passkeys-card",
+    onsubmit: async (e) => {
+      e.preventDefault();
+      addBtn.disabled = true;
+      note(msg, "Waiting for passkey…", true);
+      try {
+        const passphrase = val(card, "passphrase");
+        if (!passphrase) throw new Error("enter the current wallet passphrase");
+        const label = val(card, "label").trim() || "Node Wallet Passkey";
+        const enrolled = await enrollPrfPasskey("irondivi-node-wallet", label);
+        await post("/api/node-wallet/passkeys", {
+          passphrase,
+          label,
+          credential_id: enrolled.credential_id,
+          prf_salt: enrolled.prf_salt,
+          rp_id: enrolled.rp_id,
+          prf_output: enrolled.prf_output,
+        });
+        enrolled.prf_output = "";
+        flash = "Added passkey \"" + label + "\" for unlocking wallet.dat.";
+        security();
+      } catch (err) {
+        note(msg, err.message, false);
+      } finally {
+        addBtn.disabled = false;
+      }
+    },
+  },
+    h("h3", {}, "Node Wallet Passkeys (wallet.dat)"),
+    h("p", { class: "muted" }, "Seal the node's wallet.dat passphrase locally under a WebAuthn PRF passkey so you can unlock staking or sending with a touch. Keep your wallet passphrase and wallet.dat backup safe — passkeys do not replace them."),
+    list,
+    field("Passkey label (optional)", "label", "text", { maxlength: 64, placeholder: "Touch ID" }),
+    field("Current wallet passphrase", "passphrase", "password", { autocomplete: "current-password" }),
+    h("div", { class: "row" }, addBtn),
+    msg);
+  return card;
+}
+
 async function security() {
   await refresh();
   const w = state.wallet;
-  const parts = [h("h2", {}, "Security"), h("p", {}, "Wallet: ", h("strong", {}, walletLabel(w)))];
+  const parts = [
+    localhostPasskeyHint(),
+    h("h2", {}, "Security"),
+    h("p", {}, "Wallet: ", h("strong", {}, walletLabel(w))),
+  ];
   if (flash) {
     parts.push(h("p", { class: "note ok" }, flash));
     flash = null;
@@ -248,17 +637,49 @@ async function security() {
     }, h("p", { class: "muted" }, "Keep the passphrase somewhere safe: without it the coins cannot be spent.")));
   }
   if (w && w !== "unencrypted") {
-    parts.push(form("Unlock for staking only", [field("Wallet passphrase", "p", "password", { autocomplete: "current-password" })],
-      "Unlock for staking", async (f) => {
-        await rpc("walletpassphrase", val(f, "p"), 0, true);
-        flash = "Unlocked for staking. Spending still needs the passphrase.";
-        security();
-      }, h("p", { class: "muted" }, "The wallet stakes, but cannot send, until it is locked again.")));
+    const hostNodeSlots = (state.node_passkeys || []).filter((s) => s.rp_id === location.hostname);
+    let stakingPkBtn = null;
+    const unlockStakingForm = form("Unlock for staking only", [
+      field("Wallet passphrase", "p", "password", { autocomplete: "current-password" }),
+    ], "Unlock for staking", async (f) => {
+      await rpc("walletpassphrase", val(f, "p"), 0, true);
+      flash = "Unlocked for staking. Spending still needs the passphrase.";
+      security();
+    }, h("p", { class: "muted" }, "The wallet stakes, but cannot send, until it is locked again."),
+      hostNodeSlots.length ? [
+        (stakingPkBtn = h("button", {
+          type: "button",
+          class: "secondary",
+          "data-testid": "node-unlock-staking-passkey",
+          onclick: async () => {
+            stakingPkBtn.disabled = true;
+            note(unlockStakingForm._note, "Waiting for passkey…", true);
+            try {
+              const unlocked = await evalPrfPasskey(hostNodeSlots);
+              await post("/api/node-wallet/unlock-passkey", {
+                slot_id: unlocked.slot_id,
+                prf_output: unlocked.prf_output,
+                staking_only: true,
+                timeout: 0,
+              });
+              unlocked.prf_output = "";
+              flash = "Unlocked for staking with Passkey.";
+              security();
+            } catch (err) {
+              note(unlockStakingForm._note, err.message, false);
+            } finally {
+              stakingPkBtn.disabled = false;
+            }
+          },
+        }, "Unlock for staking with Passkey")),
+      ] : []);
+    parts.push(unlockStakingForm);
     parts.push(form("Lock the wallet", [], "Lock", async () => {
       await rpc("walletlock");
       flash = "Locked.";
       security();
     }));
+    parts.push(nodePasskeysCard());
     parts.push(form("Change the wallet passphrase", [
       field("Current passphrase", "old", "password", { autocomplete: "current-password" }),
       field("New passphrase", "p1", "password", { autocomplete: "new-password" }),
@@ -266,9 +687,11 @@ async function security() {
     ], "Change passphrase", async (f) => {
       if (val(f, "p1") !== val(f, "p2")) throw new Error("the passphrases differ");
       await rpc("walletpassphrasechange", val(f, "old"), val(f, "p1"));
-      return "The wallet passphrase is changed.";
+      await refresh();
+      return "The wallet passphrase is changed. Re-add any node wallet passkeys with the new passphrase.";
     }));
   }
+  parts.push(adminPasskeysCard());
   parts.push(form("Change the web interface password", [
     field("Current password", "current", "password", { autocomplete: "current-password" }),
     field("New password", "p1", "password", { autocomplete: "new-password" }),
@@ -451,9 +874,7 @@ async function readQr(source, width, height) {
   return hit && hit.data ? hit.data : null;
 }
 
-/// Ways to read a QR code into `onText`: a picture (a phone's camera works
-/// even over plain HTTP), the live camera or the screen (both need HTTPS or
-/// localhost), or a screenshot pasted from the clipboard
+/// Ways to read a QR code into `onText`
 function scanner(onText) {
   const msg = h("p", { class: "note" });
   const video = h("video", { class: "scan", playsinline: true, hidden: true });
@@ -595,7 +1016,7 @@ async function walletView() {
   await refresh();
   const w = state.wallet;
   if (w === null || w === undefined) {
-    return show(h("section", {}, h("h2", {}, "Wallet"), h("p", { class: "muted" }, "The daemon has no wallet loaded.")));
+    return show(h("section", {}, localhostPasskeyHint(), h("h2", {}, "Wallet"), h("p", { class: "muted" }, "The daemon has no wallet loaded.")));
   }
   const balance = await rpc("getbalance").catch((e) => e.message);
 
@@ -615,14 +1036,12 @@ async function walletView() {
   receive.append(reqBox);
 
   const canSend = w !== "unencrypted";
+  const hostNodeSlots = (state.node_passkeys || []).filter((s) => s.rp_id === location.hostname);
   let request = {};
   const about = h("p", { class: "muted" });
-  const send = form("Pay", [
-    field("Pay to: an address or a divi: link", "to", "text", { spellcheck: "false", placeholder: "D…" }),
-    field("Amount in DIVI", "amount", "text", { inputmode: "decimal" }),
-    field("Note for your records (optional)", "note"),
-    w === "unlocked" ? null : field("Wallet passphrase", "p", "password", { autocomplete: "current-password" }),
-  ], "Send", async (f) => {
+  let sendPasskeyBtn = null;
+
+  async function executeSend(f, viaPasskey) {
     if (!canSend) throw new Error("encrypt the wallet on the Security page before sending");
     const address = val(f, "to").trim();
     const amount = val(f, "amount").trim();
@@ -632,9 +1051,23 @@ async function walletView() {
     if (!v.isvalid) throw new Error("that is not a valid address on " + (state.network || "this network"));
     const before = state.wallet;
     const p = f.elements.p ? f.elements.p.value : "";
-    if (before !== "unlocked" && !p) throw new Error("enter the wallet passphrase");
+    if (!viaPasskey && before !== "unlocked" && !p) throw new Error("enter the wallet passphrase");
     if (!confirm("Send " + amount + " DIVI to " + address + "?")) return "Not sent.";
-    if (before !== "unlocked") await rpc("walletpassphrase", p, 60, false);
+
+    let unlockedPk = null;
+    if (before !== "unlocked") {
+      if (viaPasskey) {
+        unlockedPk = await evalPrfPasskey(hostNodeSlots);
+        await post("/api/node-wallet/unlock-passkey", {
+          slot_id: unlockedPk.slot_id,
+          prf_output: unlockedPk.prf_output,
+          staking_only: false,
+          timeout: 60,
+        });
+      } else {
+        await rpc("walletpassphrase", p, 60, false);
+      }
+    }
     let txid;
     let restore = null;
     try {
@@ -644,9 +1077,17 @@ async function walletView() {
         ? await rpc("sendtoaddress", address, Number(amount), "metadata", comment, to)
         : await rpc("sendtoaddress", address, Number(amount));
     } finally {
-      // put the wallet back the way it was: staking only, or locked
-      const back = before === "unlocked-for-staking" ? rpc("walletpassphrase", p, 0, true)
+      const back = before === "unlocked-for-staking"
+        ? (unlockedPk
+          ? post("/api/node-wallet/unlock-passkey", {
+            slot_id: unlockedPk.slot_id,
+            prf_output: unlockedPk.prf_output,
+            staking_only: true,
+            timeout: 0,
+          })
+          : rpc("walletpassphrase", p, 0, true))
         : before === "locked" ? rpc("walletlock") : null;
+      if (unlockedPk) unlockedPk.prf_output = "";
       if (back) restore = await back.then(() => null, (e) => e.message);
       await refresh();
     }
@@ -655,10 +1096,36 @@ async function walletView() {
     about.textContent = "";
     return "Sent. Transaction " + txid + (restore
       ? ". The wallet could not go back to " + walletLabel(before).toLowerCase() + ": " + restore : ".");
-  }, h("div", {},
+  }
+
+  const send = form("Pay", [
+    field("Pay to: an address or a divi: link", "to", "text", { spellcheck: "false", placeholder: "D…" }),
+    field("Amount in DIVI", "amount", "text", { inputmode: "decimal" }),
+    field("Note for your records (optional)", "note"),
+    w === "unlocked" ? null : field("Wallet passphrase", "p", "password", { autocomplete: "current-password" }),
+  ], "Send", (f) => executeSend(f, false), h("div", {},
     canSend ? null : h("p", { class: "note err" }, "Encrypt the wallet on the Security page before sending."),
     h("p", { class: "muted" }, "Scan the payee's QR code, or type or paste the address."),
-    scanner((text) => fill(text)), about));
+    scanner((text) => fill(text)), about),
+    w !== "unlocked" && hostNodeSlots.length ? [
+      (sendPasskeyBtn = h("button", {
+        type: "button",
+        class: "secondary",
+        "data-testid": "node-send-passkey",
+        onclick: async () => {
+          sendPasskeyBtn.disabled = true;
+          note(send._note, "Waiting for passkey…", true);
+          try {
+            const done = await executeSend(send, true);
+            note(send._note, done, true);
+          } catch (err) {
+            note(send._note, err.message, false);
+          } finally {
+            sendPasskeyBtn.disabled = false;
+          }
+        },
+      }, "Send with Passkey")),
+    ] : []);
 
   function fill(text) {
     let req;
@@ -686,7 +1153,7 @@ async function walletView() {
     if (/^divi:/i.test(send.elements.to.value.trim())) fill(send.elements.to.value);
   });
 
-  show(h("section", {}, h("h2", {}, "Wallet"),
+  show(h("section", {}, localhostPasskeyHint(), h("h2", {}, "Wallet"),
     h("div", { class: "card" }, kv([["Balance", typeof balance === "number" ? balance + " DIVI" : balance],
       ["Encryption", walletLabel(w)]])),
     h("div", { class: "grid" }, receive, send)));

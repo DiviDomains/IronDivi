@@ -91,3 +91,12 @@ h4 { margin: 12px 0 6px; font-size: 14px; }
 details.drawer { margin-top: 10px; }
 details.drawer summary { cursor: pointer; color: var(--accent); }
 .drawer-body { margin-top: 8px; }
+
+/* Passkeys */
+button.secondary { background: var(--bg); color: var(--text); border: 1px solid var(--line); }
+button.secondary:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+button.danger { background: var(--err); color: #fff; }
+.pk-list { list-style: none; padding: 0; margin: 8px 0 12px; border: 1px solid var(--line); border-radius: 8px; }
+.pk-item { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 8px; padding: 8px 12px; border-bottom: 1px solid var(--line); }
+.pk-item:last-child { border-bottom: 0; }
+.pk-divider { margin: 12px 0; border: 0; border-top: 1px solid var(--line); }

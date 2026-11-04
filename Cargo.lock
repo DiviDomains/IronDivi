@@ -3290,13 +3290,17 @@ dependencies = [
  "anyhow",
  "argon2",
  "axum",
+ "base64 0.22.1",
  "chacha20poly1305",
+ "ciborium",
  "divi-electrum",
  "divi-primitives",
  "divi-rpc",
  "divi-script",
  "divi-wallet",
  "hex",
+ "hkdf",
+ "p256",
  "parking_lot",
  "rand 0.8.8",
  "reqwest 0.12.28",
@@ -5668,6 +5672,7 @@ dependencies = [
  "ecdsa 0.16.9",
  "elliptic-curve 0.13.8",
  "primeorder 0.13.6",
+ "sha2 0.10.9",
 ]
 
 [[package]]

@@ -8,18 +8,20 @@
 
 //! IronDivi's optional web interface, on with `-webui`. It listens on the
 //! loopback unless told otherwise, signs in with its own password (set once
-//! with a token from the data directory), and calls the daemon in-process:
-//! the RPC password never reaches the browser. It keeps the wallet's keys
-//! in: no key exports, spending unlocks of ten minutes at most, and nothing
-//! but reads until the wallet is encrypted.
+//! with a token from the data directory) or an enrolled WebAuthn P-256 passkey,
+//! and calls the daemon in-process: the RPC password never reaches the browser.
+//! It keeps the wallet's keys in: no key exports, spending unlocks of ten
+//! minutes at most, and nothing but reads until the wallet is encrypted.
 
 pub mod auth;
 pub mod chainview;
 pub mod conffile;
 pub mod gate;
 pub mod launch;
+pub mod node_passkey;
 pub mod schema;
 pub mod wallets;
+pub mod webauthn;
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -30,13 +32,14 @@ use axum::extract::{ConnectInfo, DefaultBodyLimit, Query, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use divi_rpc::{logctl, Params, RequestId, RpcServer};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, Semaphore};
 use tracing::{info, warn};
+use zeroize::{Zeroize, Zeroizing};
 
 use auth::{AuthStore, LoginLimiter, Sessions, COOKIE_NAME, MIN_PASSWORD_LEN};
 
@@ -120,8 +123,10 @@ pub fn prepare(config: WebUiConfig) -> anyhow::Result<Prepared> {
     })
 }
 
+/// Show `localhost:<port>` for loopback and unspecified binds so browsers treat
+/// the URL as a Potentially Trustworthy Origin where WebAuthn passkeys work.
 fn display_host(addr: &SocketAddr) -> String {
-    if addr.ip().is_unspecified() {
+    if addr.ip().is_unspecified() || addr.ip().is_loopback() {
         format!("localhost:{}", addr.port())
     } else {
         addr.to_string()
@@ -131,6 +136,7 @@ fn display_host(addr: &SocketAddr) -> String {
 struct Shared {
     config: WebUiConfig,
     auth: AuthStore,
+    challenges: webauthn::ChallengeStore,
     sessions: Sessions,
     limiter: LoginLimiter,
     /// Password hashing takes 19 MiB and some tens of milliseconds; two at once
@@ -140,6 +146,7 @@ struct Shared {
     rpc: Arc<RpcServer>,
     launch: launch::LaunchToken,
     wallets: wallets::WalletStore,
+    node_passkeys: node_passkey::NodePasskeyStore,
     /// The node's Electrum backend, which the wallets read; None without
     /// txindex and addressindex
     electrum: Option<Arc<divi_electrum::Backend>>,
@@ -173,8 +180,10 @@ impl Prepared {
                 &config.network,
                 &config.chain_mode,
             ),
+            node_passkeys: node_passkey::NodePasskeyStore::new(&config.data_dir),
             config,
             auth,
+            challenges: webauthn::ChallengeStore::default(),
             sessions: Sessions::default(),
             limiter: LoginLimiter::default(),
             hashing: Semaphore::new(2),
@@ -230,7 +239,10 @@ fn allowed_hosts(config: &WebUiConfig) -> Vec<String> {
     }
     let mut hosts = Vec::new();
     for name in names {
-        hosts.push(format!("{name}:{port}"));
+        let candidate = format!("{name}:{port}");
+        if !hosts.contains(&candidate) {
+            hosts.push(candidate);
+        }
     }
     for name in &config.allow_hosts {
         let name = name.trim().to_lowercase();
@@ -293,6 +305,24 @@ fn router(shared: Arc<Shared>, sidechains: Router) -> Router {
         .route("/app.css", get(app_css))
         .route("/launch", get(launch_in))
         .route("/api/state", get(api_state))
+        .route("/api/auth/status", get(api_auth_status))
+        .route(
+            "/api/auth/passkey/login/start",
+            post(api_passkey_login_start),
+        )
+        .route(
+            "/api/auth/passkey/login/finish",
+            post(api_passkey_login_finish),
+        )
+        .route(
+            "/api/auth/passkey/register/start",
+            post(api_passkey_register_start),
+        )
+        .route(
+            "/api/auth/passkey/register/finish",
+            post(api_passkey_register_finish),
+        )
+        .route("/api/auth/passkey/:id", delete(api_passkey_delete))
         .route("/api/setup", post(api_setup))
         .route("/api/login", post(api_login))
         .route("/api/logout", post(api_logout))
@@ -305,7 +335,23 @@ fn router(shared: Arc<Shared>, sidechains: Router) -> Router {
         .route("/api/wallets/import", post(api_wallet_import))
         .route("/api/wallets/:id", get(api_wallet_show))
         .route("/api/wallets/:id/backup", get(api_wallet_backup))
+        .route(
+            "/api/wallets/:id/passkeys/:slot_id",
+            delete(api_wallet_passkey_delete),
+        )
         .route("/api/wallets/:id/:action", post(api_wallet_action))
+        .route(
+            "/api/node-wallet/passkeys",
+            get(api_node_passkeys_list).post(api_node_passkeys_enroll),
+        )
+        .route(
+            "/api/node-wallet/unlock-passkey",
+            post(api_node_passkeys_unlock),
+        )
+        .route(
+            "/api/node-wallet/passkeys/:slot_id",
+            delete(api_node_passkeys_delete),
+        )
         .route("/api/nft/*path", get(api_nft).post(api_nft))
         .nest_service(
             "/api/sidechains",
@@ -322,8 +368,8 @@ fn router(shared: Arc<Shared>, sidechains: Router) -> Router {
 const CSP: &str = "default-src 'self'; frame-ancestors 'none'; base-uri 'none'; \
                    form-action 'self'; object-src 'none'";
 
-/// Every request: a known Host (no DNS rebinding), a same-origin JSON POST or PUT,
-/// and headers that keep the page out of frames and caches
+/// Every request: a known Host (no DNS rebinding), a same-origin JSON POST,
+/// PUT or DELETE, and headers that keep the page out of frames and caches
 async fn guard(State(s): State<Arc<Shared>>, req: Request, next: Next) -> Response {
     let host = req
         .headers()
@@ -337,7 +383,10 @@ async fn guard(State(s): State<Arc<Shared>>, req: Request, next: Next) -> Respon
         )
             .into_response();
     };
-    if req.method() == Method::POST || req.method() == Method::PUT {
+    if req.method() == Method::POST
+        || req.method() == Method::PUT
+        || req.method() == Method::DELETE
+    {
         let origin = req
             .headers()
             .get(header::ORIGIN)
@@ -528,6 +577,14 @@ fn bad(msg: impl Into<String>) -> ApiError {
 
 type ApiResult = Result<Response, ApiError>;
 
+fn host_rp_id(headers: &HeaderMap) -> Result<String, ApiError> {
+    let host = headers
+        .get(header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("");
+    webauthn::rp_id_from_host(host).map_err(bad)
+}
+
 fn cookie_of(headers: &HeaderMap) -> Option<String> {
     headers
         .get_all(header::COOKIE)
@@ -539,7 +596,7 @@ fn cookie_of(headers: &HeaderMap) -> Option<String> {
         .map(|(_, v)| v.to_string())
 }
 
-/// The signed-in session's cookie; a POST must also carry its CSRF token
+/// The signed-in session's cookie; a write must also carry its CSRF token
 fn signed_in(s: &Shared, headers: &HeaderMap, post: bool) -> Result<String, ApiError> {
     let denied = || ApiError(StatusCode::UNAUTHORIZED, "sign in first".into());
     let cookie = cookie_of(headers).ok_or_else(denied)?;
@@ -603,6 +660,7 @@ async fn api_state(State(s): State<Arc<Shared>>, headers: HeaderMap) -> Response
     let mut state = json!({
         "setup_required": s.auth.setup_required(),
         "signed_in": csrf.is_some(),
+        "has_passkey": s.auth.has_passkey(),
         "network": s.config.network,
         "chain_mode": s.config.chain_mode,
         "version": env!("CARGO_PKG_VERSION"),
@@ -613,8 +671,23 @@ async fn api_state(State(s): State<Arc<Shared>>, headers: HeaderMap) -> Response
         state["csrf"] = json!(csrf);
         state["wallet"] = json!(wallet_status(&s));
         state["conf"] = json!(s.config.conf_path.display().to_string());
+        state["passkeys"] = json!(s.auth.passkey_summaries());
+        state["node_passkeys"] = json!(s.node_passkeys.list());
     }
     Json(state).into_response()
+}
+
+async fn api_auth_status(State(s): State<Arc<Shared>>, headers: HeaderMap) -> Response {
+    let signed = cookie_of(&headers).and_then(|c| s.sessions.touch(&c)).is_some();
+    let mut status = json!({
+        "setup_required": s.auth.setup_required(),
+        "signed_in": signed,
+        "has_passkey": s.auth.has_passkey(),
+    });
+    if signed {
+        status["passkeys"] = json!(s.auth.passkey_summaries());
+    }
+    Json(status).into_response()
 }
 
 /// Run blocking work off the async worker threads
@@ -684,7 +757,7 @@ async fn api_setup(
             "the password needs {MIN_PASSWORD_LEN} characters or more"
         )));
     }
-    let password = zeroize::Zeroizing::new(body.password);
+    let password = Zeroizing::new(body.password);
     hashing(&s, move |a| a.set_password(&password))
         .await?
         .map_err(|e| bad(e.to_string()))?;
@@ -713,7 +786,7 @@ async fn api_login(
         ));
     }
     throttle(&s, peer.ip())?;
-    let password = zeroize::Zeroizing::new(body.password);
+    let password = Zeroizing::new(body.password);
     if !hashing(&s, move |a| a.verify(&password)).await? {
         s.limiter.failed(peer.ip());
         warn!("Web interface: failed sign-in from {}", peer.ip());
@@ -721,6 +794,201 @@ async fn api_login(
     }
     s.limiter.succeeded(peer.ip());
     Ok(started(&s))
+}
+
+async fn api_passkey_login_start(
+    State(s): State<Arc<Shared>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> ApiResult {
+    if s.auth.setup_required() {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "set the password first".into(),
+        ));
+    }
+    throttle(&s, peer.ip())?;
+    let rp_id = host_rp_id(&headers)?;
+    let allow: Vec<Value> = s
+        .auth
+        .passkeys()
+        .into_iter()
+        .filter(|p| p.rp_id == rp_id)
+        .map(|p| json!({ "id": p.credential_id_b64url, "type": "public-key" }))
+        .collect();
+    if allow.is_empty() {
+        return Err(bad("no passkey is registered for this host"));
+    }
+    let challenge = s.challenges.issue(webauthn::Purpose::Login, rp_id.clone());
+    Ok(Json(json!({
+        "challenge": challenge,
+        "rp_id": rp_id,
+        "allow_credentials": allow,
+    }))
+    .into_response())
+}
+
+#[derive(Deserialize)]
+struct PasskeyLoginFinishBody {
+    #[serde(alias = "credentialId")]
+    credential_id: String,
+    #[serde(alias = "clientDataJSON")]
+    client_data_json: String,
+    #[serde(alias = "authenticatorData")]
+    authenticator_data: String,
+    signature: String,
+}
+
+async fn api_passkey_login_finish(
+    State(s): State<Arc<Shared>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Json(body): Json<PasskeyLoginFinishBody>,
+) -> ApiResult {
+    if s.auth.setup_required() {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "set the password first".into(),
+        ));
+    }
+    throttle(&s, peer.ip())?;
+    let passkeys = s.auth.passkeys();
+    let verified = webauthn::verify_assertion(
+        &s.challenges,
+        &s.hosts,
+        &passkeys,
+        &body.credential_id,
+        &body.client_data_json,
+        &body.authenticator_data,
+        &body.signature,
+    );
+    let (cred, new_sign_count) = match verified {
+        Ok(v) => v,
+        Err(msg) => {
+            s.limiter.failed(peer.ip());
+            warn!("Web interface: failed passkey sign-in from {}: {}", peer.ip(), msg);
+            return Err(ApiError(StatusCode::UNAUTHORIZED, msg));
+        }
+    };
+    if let Err(e) = s.auth.update_passkey_sign_count(&cred.id, new_sign_count) {
+        warn!("Web interface: could not update passkey sign_count: {}", e);
+    }
+    s.limiter.succeeded(peer.ip());
+    Ok(started(&s))
+}
+
+#[derive(Deserialize)]
+struct PasskeyRegisterStartBody {
+    password: String,
+    #[serde(default)]
+    label: String,
+}
+
+async fn api_passkey_register_start(
+    State(s): State<Arc<Shared>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<PasskeyRegisterStartBody>,
+) -> ApiResult {
+    signed_in(&s, &headers, true)?;
+    throttle(&s, peer.ip())?;
+    let rp_id = host_rp_id(&headers)?;
+    let label = auth::clean_label(&body.label, "Passkey").map_err(bad)?;
+    let password = Zeroizing::new(body.password);
+    if !hashing(&s, move |a| a.verify(&password)).await? {
+        s.limiter.failed(peer.ip());
+        return Err(ApiError(
+            StatusCode::UNAUTHORIZED,
+            "wrong current password".into(),
+        ));
+    }
+    s.limiter.succeeded(peer.ip());
+    let exclude: Vec<Value> = s
+        .auth
+        .passkeys()
+        .into_iter()
+        .filter(|p| p.rp_id == rp_id)
+        .map(|p| json!({ "id": p.credential_id_b64url, "type": "public-key" }))
+        .collect();
+    let challenge = s
+        .challenges
+        .issue(webauthn::Purpose::Register { label }, rp_id.clone());
+    Ok(Json(json!({
+        "challenge": challenge,
+        "rp_id": rp_id,
+        "rp_name": "IronDivi WebUI",
+        "user": {
+            "id": webauthn::b64url_encode(b"irondivi-webui-admin"),
+            "name": "admin",
+            "display_name": "IronDivi Admin",
+        },
+        "exclude_credentials": exclude,
+    }))
+    .into_response())
+}
+
+#[derive(Deserialize)]
+struct PasskeyRegisterFinishBody {
+    #[serde(alias = "clientDataJSON")]
+    client_data_json: String,
+    #[serde(alias = "attestationObject")]
+    attestation_object: String,
+}
+
+async fn api_passkey_register_finish(
+    State(s): State<Arc<Shared>>,
+    headers: HeaderMap,
+    Json(body): Json<PasskeyRegisterFinishBody>,
+) -> ApiResult {
+    signed_in(&s, &headers, true)?;
+    let verified = webauthn::verify_registration(
+        &s.challenges,
+        &s.hosts,
+        &body.client_data_json,
+        &body.attestation_object,
+    )
+    .map_err(bad)?;
+    let summary = s
+        .auth
+        .add_passkey(
+            &verified.label,
+            verified.credential_id_b64url,
+            verified.public_key_sec1_hex,
+            verified.rp_id,
+            verified.sign_count,
+        )
+        .map_err(bad)?;
+    info!("Web interface registered admin passkey {}", summary.id);
+    Ok(Json(json!({ "ok": true, "passkey": summary })).into_response())
+}
+
+#[derive(Deserialize)]
+struct PasskeyDeleteBody {
+    password: String,
+}
+
+async fn api_passkey_delete(
+    State(s): State<Arc<Shared>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(body): Json<PasskeyDeleteBody>,
+) -> ApiResult {
+    signed_in(&s, &headers, true)?;
+    throttle(&s, peer.ip())?;
+    let password = Zeroizing::new(body.password);
+    if !hashing(&s, move |a| a.verify(&password)).await? {
+        s.limiter.failed(peer.ip());
+        return Err(ApiError(
+            StatusCode::UNAUTHORIZED,
+            "wrong current password".into(),
+        ));
+    }
+    s.limiter.succeeded(peer.ip());
+    if !s.auth.remove_passkey(&id).map_err(bad)? {
+        return Err(ApiError(StatusCode::NOT_FOUND, "no such passkey".into()));
+    }
+    info!("Web interface removed admin passkey {}", id);
+    Ok(Json(json!({ "ok": true })).into_response())
 }
 
 async fn api_logout(State(s): State<Arc<Shared>>, headers: HeaderMap) -> ApiResult {
@@ -753,8 +1021,8 @@ async fn api_password(
             "the password needs {MIN_PASSWORD_LEN} characters or more"
         )));
     }
-    let current = zeroize::Zeroizing::new(body.current);
-    let new = zeroize::Zeroizing::new(body.new);
+    let current = Zeroizing::new(body.current);
+    let new = Zeroizing::new(body.new);
     let changed = hashing(&s, move |a| {
         if !a.verify(&current) {
             return Ok(false);
@@ -822,6 +1090,9 @@ async fn api_rpc(
         true,
         result.as_ref().err().map(|(c, m)| (*c, m.as_str())),
     );
+    if method == "walletpassphrasechange" && result.is_ok() {
+        let _ = s.node_passkeys.clear_all();
+    }
     Ok(match result {
         Ok(result) => Json(json!({ "result": result })),
         Err((code, message)) => Json(json!({ "error": { "code": code, "message": message } })),
@@ -1109,16 +1380,18 @@ async fn sealed<T: Send + 'static>(
         .map_err(bad)
 }
 
-/// A wallet as the page sees it: never its sealed words
+/// A wallet as the page sees it: never its sealed words or sealed_dek
 fn wallet_json(w: &wallets::WalletFile, active: Option<&str>) -> Value {
     json!({
         "id": w.id,
         "name": w.name,
+        "version": w.version,
         "created": w.created,
         "network": w.network,
         "active": active == Some(w.id.as_str()),
         "receive": w.receive.iter().take(w.next_receive as usize).collect::<Vec<_>>(),
         "derived": w.receive.len() + w.change.len(),
+        "passkeys": w.passkey_summaries(),
     })
 }
 
@@ -1168,6 +1441,18 @@ struct WalletCreateBody {
     bip39_passphrase: Option<String>,
 }
 
+impl Drop for WalletCreateBody {
+    fn drop(&mut self) {
+        self.passphrase.zeroize();
+        if let Some(w) = self.words.as_mut() {
+            w.zeroize();
+        }
+        if let Some(p) = self.bip39_passphrase.as_mut() {
+            p.zeroize();
+        }
+    }
+}
+
 /// Make or restore a wallet; new words are in the answer this once, to write down
 async fn api_wallet_create(
     State(s): State<Arc<Shared>>,
@@ -1203,6 +1488,12 @@ struct WalletImportBody {
     /// The backup file's text
     backup: String,
     passphrase: String,
+}
+
+impl Drop for WalletImportBody {
+    fn drop(&mut self) {
+        self.passphrase.zeroize();
+    }
 }
 
 async fn api_wallet_import(
@@ -1284,6 +1575,18 @@ async fn api_wallet_backup(
         .into_response())
 }
 
+#[derive(Deserialize, Clone)]
+struct PasskeyUnlockInput {
+    slot_id: String,
+    prf_output: String,
+}
+
+impl Drop for PasskeyUnlockInput {
+    fn drop(&mut self) {
+        self.prf_output.zeroize();
+    }
+}
+
 #[derive(Deserialize, Default)]
 struct WalletActionBody {
     #[serde(default)]
@@ -1291,12 +1594,51 @@ struct WalletActionBody {
     #[serde(default)]
     passphrase: Option<String>,
     #[serde(default)]
+    passkey: Option<PasskeyUnlockInput>,
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    credential_id: Option<String>,
+    #[serde(default)]
+    prf_salt: Option<String>,
+    #[serde(default)]
+    rp_id: Option<String>,
+    #[serde(default)]
+    prf_output: Option<String>,
+    #[serde(default)]
     to: Option<String>,
     /// DIVI, as a decimal string
     #[serde(default)]
     amount: Option<String>,
     #[serde(default)]
     fee_from_amount: bool,
+}
+
+impl Drop for WalletActionBody {
+    fn drop(&mut self) {
+        if let Some(p) = self.passphrase.as_mut() {
+            p.zeroize();
+        }
+        if let Some(p) = self.prf_output.as_mut() {
+            p.zeroize();
+        }
+    }
+}
+
+fn select_wallet_auth<'a>(
+    passphrase: Option<&'a str>,
+    passkey: Option<&'a PasskeyUnlockInput>,
+) -> Result<wallets::WalletAuth<'a>, String> {
+    if let Some(pk) = passkey {
+        return Ok(wallets::WalletAuth::Passkey {
+            slot_id: &pk.slot_id,
+            prf_output_b64: &pk.prf_output,
+        });
+    }
+    if let Some(p) = passphrase.filter(|p| !p.is_empty()) {
+        return Ok(wallets::WalletAuth::Passphrase(p));
+    }
+    Err("enter the wallet passphrase or use an enrolled passkey".into())
 }
 
 /// DIVI as a decimal string to satoshis
@@ -1324,7 +1666,7 @@ fn parse_divi(text: &str) -> Option<i64> {
         .filter(|v| *v > 0)
 }
 
-/// rename, switch, delete, words, address and send
+/// rename, switch, delete, words, address, send, and passkeys (enroll)
 async fn api_wallet_action(
     State(s): State<Arc<Shared>>,
     headers: HeaderMap,
@@ -1332,7 +1674,6 @@ async fn api_wallet_action(
     Json(body): Json<WalletActionBody>,
 ) -> ApiResult {
     signed_in(&s, &headers, true)?;
-    let pass = body.passphrase.clone().unwrap_or_default();
     let out = match action.as_str() {
         "rename" => {
             let w = s
@@ -1345,19 +1686,59 @@ async fn api_wallet_action(
             s.wallets.set_active(&id).map_err(bad)?;
             json!({ "active": id })
         }
+        "passkeys" => {
+            let host_rp = host_rp_id(&headers)?;
+            if let Some(sent_rp) = body.rp_id.as_deref().filter(|r| !r.is_empty()) {
+                let checked = webauthn::rp_id_from_host(sent_rp).map_err(bad)?;
+                if checked != host_rp {
+                    return Err(bad("passkey rp_id does not match this host"));
+                }
+            }
+            let wallet_id = id.clone();
+            let (w, summary) = sealed(&s, move |store| {
+                store.add_passkey(
+                    &wallet_id,
+                    body.passphrase.as_deref().unwrap_or_default(),
+                    body.label.as_deref().unwrap_or_default(),
+                    body.credential_id.as_deref().unwrap_or_default(),
+                    body.prf_salt.as_deref().unwrap_or_default(),
+                    &host_rp,
+                    body.prf_output.as_deref().unwrap_or_default(),
+                )
+            })
+            .await?;
+            info!("Web interface enrolled passkey {} on wallet {}", summary.id, id);
+            let active = s.wallets.active();
+            json!({
+                "ok": true,
+                "wallet": wallet_json(&w, active.as_deref()),
+                "passkey": summary,
+            })
+        }
         "delete" => {
             let gone = id.clone();
-            sealed(&s, move |store| store.delete(&gone, &pass)).await?;
+            sealed(&s, move |store| {
+                let auth = select_wallet_auth(body.passphrase.as_deref(), body.passkey.as_ref())?;
+                store.delete_with(&gone, auth)
+            })
+            .await?;
             info!("Web interface deleted wallet {}", id);
             json!({ "ok": true })
         }
         "words" => {
-            let words = sealed(&s, move |store| store.words(&id, &pass)).await?;
+            let words = sealed(&s, move |store| {
+                let auth = select_wallet_auth(body.passphrase.as_deref(), body.passkey.as_ref())?;
+                store.words_with(&id, auth)
+            })
+            .await?;
             json!({ "words": words.as_str() })
         }
         "address" => {
-            let pass = body.passphrase.clone();
-            let address = sealed(&s, move |store| store.next_address(&id, pass.as_deref())).await?;
+            let address = sealed(&s, move |store| {
+                let auth = select_wallet_auth(body.passphrase.as_deref(), body.passkey.as_ref()).ok();
+                store.next_address_with(&id, auth)
+            })
+            .await?;
             json!({ "address": address })
         }
         "send" => {
@@ -1378,9 +1759,10 @@ async fn api_wallet_action(
             let tip = tip.as_u64().unwrap_or(0) as u32;
             let fee_from_amount = body.fee_from_amount;
             let (hex, txid, fee) = sealed(&s, move |store| {
-                store.sign_send(
+                let auth = select_wallet_auth(body.passphrase.as_deref(), body.passkey.as_ref())?;
+                store.sign_send_with(
                     &id,
-                    &pass,
+                    auth,
                     &coins,
                     tip,
                     wallets::SendRequest {
@@ -1405,6 +1787,254 @@ async fn api_wallet_action(
         }
     };
     Ok(Json(out).into_response())
+}
+
+#[derive(Deserialize, Default)]
+struct WalletPasskeyDeleteBody {
+    #[serde(default)]
+    passphrase: Option<String>,
+    #[serde(default)]
+    passkey: Option<PasskeyUnlockInput>,
+}
+
+impl Drop for WalletPasskeyDeleteBody {
+    fn drop(&mut self) {
+        if let Some(p) = self.passphrase.as_mut() {
+            p.zeroize();
+        }
+    }
+}
+
+async fn api_wallet_passkey_delete(
+    State(s): State<Arc<Shared>>,
+    headers: HeaderMap,
+    axum::extract::Path((id, slot_id)): axum::extract::Path<(String, String)>,
+    Json(body): Json<WalletPasskeyDeleteBody>,
+) -> ApiResult {
+    signed_in(&s, &headers, true)?;
+    let wallet_id = id.clone();
+    let slot = slot_id.clone();
+    let w = sealed(&s, move |store| {
+        let auth = select_wallet_auth(body.passphrase.as_deref(), body.passkey.as_ref())?;
+        store.remove_passkey(&wallet_id, &slot, auth)
+    })
+    .await?;
+    info!(
+        "Web interface removed passkey {} from wallet {}",
+        slot_id, id
+    );
+    let active = s.wallets.active();
+    Ok(Json(json!({ "ok": true, "wallet": wallet_json(&w, active.as_deref()) })).into_response())
+}
+
+async fn api_node_passkeys_list(State(s): State<Arc<Shared>>, headers: HeaderMap) -> ApiResult {
+    signed_in(&s, &headers, false)?;
+    Ok(Json(json!({
+        "passkeys": s.node_passkeys.list(),
+        "wallet": wallet_status(&s),
+    }))
+    .into_response())
+}
+
+#[derive(Deserialize)]
+struct NodePasskeyEnrollBody {
+    passphrase: String,
+    #[serde(default)]
+    label: String,
+    credential_id: String,
+    prf_salt: String,
+    #[serde(default)]
+    rp_id: String,
+    prf_output: String,
+}
+
+impl Drop for NodePasskeyEnrollBody {
+    fn drop(&mut self) {
+        self.passphrase.zeroize();
+        self.prf_output.zeroize();
+    }
+}
+
+async fn api_node_passkeys_enroll(
+    State(s): State<Arc<Shared>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<NodePasskeyEnrollBody>,
+) -> ApiResult {
+    signed_in(&s, &headers, true)?;
+    throttle(&s, peer.ip())?;
+    let host_rp = host_rp_id(&headers)?;
+    if !body.rp_id.is_empty() {
+        let checked = webauthn::rp_id_from_host(&body.rp_id).map_err(bad)?;
+        if checked != host_rp {
+            return Err(bad("passkey rp_id does not match this host"));
+        }
+    }
+    let Some(before) = wallet_status(&s) else {
+        return Err(bad("the daemon has no wallet loaded"));
+    };
+    if before == "unencrypted" {
+        return Err(bad("encrypt the wallet on the Security page first"));
+    }
+    if body.passphrase.is_empty() {
+        return Err(bad("enter the wallet passphrase"));
+    }
+
+    // Verify the node wallet passphrase against `walletpassphrase` for 1 second
+    // and immediately restore the previous lock / staking-only state.
+    let probe = match before {
+        "unlocked-for-staking" => {
+            call(
+                &s,
+                "walletpassphrase",
+                vec![json!(body.passphrase.as_str()), json!(1), json!(true)],
+            )
+            .await
+        }
+        "unlocked" => {
+            call(
+                &s,
+                "walletpassphrase",
+                vec![json!(body.passphrase.as_str()), json!(60), json!(false)],
+            )
+            .await
+        }
+        _ => {
+            call(
+                &s,
+                "walletpassphrase",
+                vec![json!(body.passphrase.as_str()), json!(1), json!(false)],
+            )
+            .await
+        }
+    };
+    if let Err((_, msg)) = probe {
+        s.limiter.failed(peer.ip());
+        return Err(ApiError(
+            StatusCode::UNAUTHORIZED,
+            format!("wrong wallet passphrase: {msg}"),
+        ));
+    }
+    match before {
+        "unlocked-for-staking" => {
+            let _ = call(
+                &s,
+                "walletpassphrase",
+                vec![json!(body.passphrase.as_str()), json!(0), json!(true)],
+            )
+            .await;
+        }
+        "locked" => {
+            let _ = call(&s, "walletlock", vec![]).await;
+        }
+        _ => {}
+    }
+
+    let summary = s
+        .node_passkeys
+        .enroll(
+            &body.passphrase,
+            &body.label,
+            &body.credential_id,
+            &body.prf_salt,
+            &host_rp,
+            &body.prf_output,
+        )
+        .map_err(bad)?;
+    s.limiter.succeeded(peer.ip());
+    info!("Web interface enrolled node wallet passkey {}", summary.id);
+    Ok(Json(json!({ "ok": true, "passkey": summary })).into_response())
+}
+
+#[derive(Deserialize)]
+struct NodePasskeyUnlockBody {
+    slot_id: String,
+    prf_output: String,
+    #[serde(default)]
+    staking_only: bool,
+    #[serde(default)]
+    timeout: Option<i64>,
+}
+
+impl Drop for NodePasskeyUnlockBody {
+    fn drop(&mut self) {
+        self.prf_output.zeroize();
+    }
+}
+
+async fn api_node_passkeys_unlock(
+    State(s): State<Arc<Shared>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<NodePasskeyUnlockBody>,
+) -> ApiResult {
+    signed_in(&s, &headers, true)?;
+    throttle(&s, peer.ip())?;
+    let timeout = if body.staking_only {
+        body.timeout.unwrap_or(0)
+    } else {
+        body.timeout.unwrap_or(60)
+    };
+    gate::check(
+        "walletpassphrase",
+        &[json!(""), json!(timeout), json!(body.staking_only)],
+        wallet_status(&s),
+    )
+    .map_err(|e| ApiError(StatusCode::FORBIDDEN, e))?;
+
+    let passphrase = match s.node_passkeys.unwrap(&body.slot_id, &body.prf_output) {
+        Ok(p) => p,
+        Err(msg) => {
+            s.limiter.failed(peer.ip());
+            return Err(ApiError(StatusCode::UNAUTHORIZED, msg));
+        }
+    };
+    let transport = divi_rpc::diag_rpc::Transport::WebUi;
+    let watch = divi_rpc::diag_rpc::begin("walletpassphrase", transport);
+    let result = call(
+        &s,
+        "walletpassphrase",
+        vec![
+            json!(passphrase.as_str()),
+            json!(timeout),
+            json!(body.staking_only),
+        ],
+    )
+    .await;
+    drop(passphrase);
+    watch.finish(
+        "walletpassphrase",
+        transport,
+        Some(peer.ip()),
+        true,
+        result.as_ref().err().map(|(c, m)| (*c, m.as_str())),
+    );
+    match result {
+        Ok(_) => {
+            s.limiter.succeeded(peer.ip());
+            Ok(Json(json!({ "ok": true, "wallet": wallet_status(&s) })).into_response())
+        }
+        Err((code, msg)) => {
+            s.limiter.failed(peer.ip());
+            Err(bad(format!("{msg} ({code})")))
+        }
+    }
+}
+
+async fn api_node_passkeys_delete(
+    State(s): State<Arc<Shared>>,
+    headers: HeaderMap,
+    axum::extract::Path(slot_id): axum::extract::Path<String>,
+) -> ApiResult {
+    signed_in(&s, &headers, true)?;
+    if !s.node_passkeys.remove(&slot_id).map_err(bad)? {
+        return Err(ApiError(
+            StatusCode::NOT_FOUND,
+            "no such node wallet passkey".into(),
+        ));
+    }
+    info!("Web interface removed node wallet passkey {}", slot_id);
+    Ok(Json(json!({ "ok": true })).into_response())
 }
 
 #[cfg(test)]
@@ -1434,9 +2064,30 @@ mod tests {
     }
 
     #[test]
+    fn display_host_maps_loopback_and_unspecified_to_localhost() {
+        assert_eq!(
+            display_host(&"127.0.0.1:51482".parse().unwrap()),
+            "localhost:51482"
+        );
+        assert_eq!(
+            display_host(&"[::1]:51482".parse().unwrap()),
+            "localhost:51482"
+        );
+        assert_eq!(
+            display_host(&"0.0.0.0:51482".parse().unwrap()),
+            "localhost:51482"
+        );
+        assert_eq!(
+            display_host(&"192.0.2.10:51482".parse().unwrap()),
+            "192.0.2.10:51482"
+        );
+    }
+
+    #[test]
     fn hosts_are_the_loopback_and_those_allowed() {
         let hosts = allowed_hosts(&config("127.0.0.1:51482", &["Node.Example"]));
         assert!(hosts.contains(&"localhost:51482".to_string()));
+        assert!(hosts.contains(&"127.0.0.1:51482".to_string()));
         assert!(hosts.contains(&"[::1]:51482".to_string()));
         assert!(hosts.contains(&"node.example".to_string()));
         assert!(hosts.contains(&"node.example:51482".to_string()));
