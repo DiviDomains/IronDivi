@@ -460,3 +460,10 @@ run waits only on test ETH (PARKED.md #3). Clean worktree of `46e6b30`, all anvi
     9.999 tDIVI to the soak taker `xy2MorbDhp35NxBHytHjv3LQo7fvHE4y3b`. No refund exists
     (cancel:0's only spender is the punish). The taker stepper reached `Done` at 12:25Z.
     **All §7 tests pass on the Lindell-2017 build.**
+- XMR live stagenet REFUND re-run against shared stagenet sweep address (`divi_xmr_swap_stagenet`), 2026-11-04:
+  - Deployed `dnsdivi` maker (`https://divi.cx/swap`, `divi-swapd 0.2.9`), `hp2` taker `divi-swap 0.2.9` (`sha256: 538ccea6258cee4f94dda9f725b42d065ea098a6b142ccd8552395eaa8f5b8d9`), offer `divi-xmr-stagenet` (`0.002 sXMR` <-> `10.00 tDIVI`), quote `ce2ba5c2-1271-4631-80b4-a37671715865`, taker local swap `736b50bd-b80c-4ed7-9d7a-a15bafd9760f`, maker swap `2f430fa1-725d-4f43-ad38-9b47222af71f`:
+  - DIVI lock (`Tx_lock`): `6a83fc4d63c121901f840ff669040c90becd8697e4309af0ffc069be2883a3ea` (Divi testnet block `379761`).
+  - XMR lock: `a821c8570d2b4b8a72e83c1e305a9e8b0e530be8903f35142b1965da8c606430` (Monero stagenet block `2243461`).
+  - DIVI cancel (`Tx_cancel`, past `t_cancel = 1793818198`): `3e29dc3a3c0329ab1628c50968428c89d83b211956fc53bf347f9769aa341bad` (Divi testnet block `380127`, `40+` confs).
+  - DIVI refund (`Tx_refund`): `63c239138392a5e0389ee8187c1ff8b568b3efb70be8a22b3b182704554b3920` (Divi testnet block `380127`, `40+` confs).
+  - XMR refund sweep (recovered from `s_m` revealed in `Tx_refund` and swept to `59DDm3zbhM1FVcWo9PJJJEZaTv79jH4sD2vsoQrjiChDY1HCwnLuJjr9NKMWFGk1FwQnfMc1GHyQfeMwA3cMR5z1Q9wP5AF`): `c3bae3c015e0ade7f3948463115507961e6a18dee8d69d5d001a82c367320d01` (Monero stagenet block `2243650`, `maker_final_state: "done"`, `taker_final_state: "Done"`, `taker_outcome: "refunded"`).
