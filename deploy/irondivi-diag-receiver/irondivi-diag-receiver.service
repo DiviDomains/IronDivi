@@ -1,0 +1,40 @@
+# /etc/systemd/system/irondivi-diag-receiver.service
+# The §9 receiver for `irondivi-cli diag` (IronDivi docs/plans/diag.md §9).
+# nginx (diag.irondivi.com) is the front; this listens on loopback only.
+# It writes nothing about requests: no log line per request, no client address.
+[Unit]
+Description=IronDivi diag receiver (diag.irondivi.com)
+After=network.target
+
+[Service]
+Type=simple
+User=irondivi-diag
+Group=irondivi-diag
+ExecStart=/usr/local/bin/irondivi-diag-receiver
+Environment=DIAG_LISTEN=127.0.0.1:8795
+# /var/lib/irondivi-diag, mode 0700, owned by the user; $STATE_DIRECTORY
+StateDirectory=irondivi-diag
+StateDirectoryMode=0700
+UMask=0077
+# only the SHA-256 of the developer download token
+LoadCredential=token.sha256:/etc/irondivi-diag/token.sha256
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target
