@@ -227,3 +227,36 @@ async fn summary_never_carries_the_preimage() {
     assert!(!json.contains(&hex::encode(rec.preimage)));
     assert!(json.contains(r#""state":"prepared""#));
 }
+
+#[test]
+fn seed_buffer_is_zeroized_after_engine_derives_keys_and_drops() {
+    use zeroize::{Zeroize, Zeroizing};
+
+    let mut stack_seed = SEED;
+    let raw_buf = stack_seed.to_vec();
+    let ptr = raw_buf.as_ptr();
+    let cfg = Config {
+        maker_url: "https://divi.cx/swap".into(),
+        divi_rpc: "http://127.0.0.1:51475".into(),
+        btc_endpoints: vec!["https://blockstream.info/testnet/api".into()],
+        ltc_endpoints: vec!["https://litecoinspace.org/testnet/api".into()],
+        index: 0,
+    };
+    let (addrs, prefix) = {
+        let seed = Zeroizing::new(raw_buf);
+        assert_eq!(seed.as_ptr(), ptr);
+        let store = Arc::new(EncryptedStore::open(&seed, &[]).unwrap());
+        let prefix = store.prefix().to_string();
+        let sink: Arc<dyn Sink> = Arc::new(MemSink::default());
+        let engine = Engine::new(&seed, &cfg, store, sink).unwrap();
+        let addrs = engine.addresses().clone();
+        drop(engine);
+        (addrs, prefix)
+    };
+    stack_seed.zeroize();
+    assert_eq!(stack_seed, [0u8; 64]);
+    assert!(addrs.divi.starts_with(['x', 'y']), "{}", addrs.divi);
+    assert!(addrs.btc.starts_with("tb1q"));
+    assert!(addrs.ltc.starts_with("tltc1q"));
+    assert!(prefix.starts_with("swap:"));
+}

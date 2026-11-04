@@ -130,6 +130,12 @@ pub struct LtcBackend {
     dual: Option<(EsploraClient, EsploraClient)>,
 }
 
+impl Drop for LtcBackend {
+    fn drop(&mut self) {
+        self.key.non_secure_erase();
+    }
+}
+
 /// The opt-in claim-time tip cross-check (see [`LtcBackend::with_claim_crosscheck`]).
 struct ClaimCrossCheck {
     source: CrossCheckSource,
@@ -210,13 +216,13 @@ impl LtcBackend {
     /// answer stands.
     /// `None` (the default) is off: no extra request and no [`ChainBackend::primary_only`]
     /// view. Mainnet only; the daemon's config enforces that.
-    pub fn with_claim_crosscheck(self, source: Option<CrossCheckSource>) -> Self {
+    pub fn with_claim_crosscheck(mut self, source: Option<CrossCheckSource>) -> Self {
         match source {
             Some(s) => self.with_claim_crosscheck_at(s, s.default_base()),
-            None => Self {
-                claim_check: None,
-                ..self
-            },
+            None => {
+                self.claim_check = None;
+                self
+            }
         }
     }
 
@@ -1201,6 +1207,15 @@ impl ChainBackend for LtcBackend {
             return Ok(None);
         };
         if status["confirmed"].as_bool() != Some(true) {
+            // `litecoinspace.org` Esplora answers `200 {"confirmed":false}` on `/tx/:id/status`
+            // even when `:id` is unknown (`404` on `/tx/:id`). Confirm `:id` exists before `0`.
+            if self
+                .get_json_opt(&format!("/tx/{}", txid.to_rpc_hex()))
+                .await?
+                .is_none()
+            {
+                return Ok(None);
+            }
             return Ok(Some(0));
         }
         let tip = self.tip_height().await?;

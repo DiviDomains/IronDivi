@@ -576,6 +576,31 @@ async fn an_unknown_send_outcome_past_timeout_waits_for_the_node_then_refunds(di
     assert!(r.maker_leg_refund.is_some());
 }
 
+/// Pre-T32 database compatibility (`ded2768f`): a swap persisted in `MakerRefundable` with
+/// `!maker_lock_sent` whose funding transaction is absent on chain and whose refund broadcast is
+/// permanently rejected (`bad-txns-inputs-missingorspent`) aborts cleanly instead of looping.
+async fn an_unsent_refundable_swap_whose_refund_is_rejected_aborts(dir: Direction) {
+    let w = locked_unsent(dir).await;
+    let persisted = w.funding();
+    let locktime = w.rec().maker_leg_htlc.unwrap().locktime;
+    let mut legacy = w.rec();
+    legacy.state = SwapState::MakerRefundable;
+    legacy.maker_lock_sent = false;
+    w.store.put_maker_swap(&legacy).unwrap();
+
+    w.ml(dir).fail_broadcasts_with(Some(SwapError::Rejected(
+        "bad-txns-inputs-missingorspent".into(),
+    )));
+    let delta = locktime.saturating_sub(w.ml(dir).mtp()) + 60;
+    w.ml(dir).advance_time(delta);
+
+    w.maker.tick().await.unwrap();
+    let r = w.rec();
+    assert_eq!(r.state, SwapState::Aborted, "{:?}", r.last_error);
+    assert!(r.maker_leg_refund.is_none());
+    assert_eq!(w.mk.confirmations(&persisted.tx.txid).await.unwrap(), None);
+}
+
 macro_rules! on_both_chains {
     ($divi:ident, $btc:ident, $body:ident) => {
         #[tokio::test]
@@ -633,4 +658,9 @@ on_both_chains!(
     divi_an_unknown_send_outcome_past_timeout_waits_for_the_node_then_refunds,
     btc_an_unknown_send_outcome_past_timeout_waits_for_the_node_then_refunds,
     an_unknown_send_outcome_past_timeout_waits_for_the_node_then_refunds
+);
+on_both_chains!(
+    divi_an_unsent_refundable_swap_whose_refund_is_rejected_aborts,
+    btc_an_unsent_refundable_swap_whose_refund_is_rejected_aborts,
+    an_unsent_refundable_swap_whose_refund_is_rejected_aborts
 );

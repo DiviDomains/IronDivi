@@ -1016,6 +1016,18 @@ impl Maker {
                 // the lock at all means the lock is gone: hand its wallet bookkeeping back.
                 // Never on a mere "not seen" refund error; the backend still wants its own proof.
                 self.release_dead_lock(r, &funding.tx).await;
+                if !r.maker_lock_sent
+                    && self.mk(r)?.confirmations(&funding.tx.txid).await?.is_none()
+                {
+                    let _ = self.mk(r)?.release_built_funding(&funding.tx);
+                    tracing::warn!(
+                        swap = %r.id,
+                        txid = %funding.tx.txid,
+                        %e,
+                        "maker lock never reached the chain before locktime and refund was rejected; aborting"
+                    );
+                    return self.abort(r, &format!("maker lock never reached the chain: {e}"));
+                }
                 return Err(e);
             }
             Err(e) => return Err(e),

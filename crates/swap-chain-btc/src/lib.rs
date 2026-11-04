@@ -145,6 +145,12 @@ impl std::fmt::Debug for BtcBackend {
     }
 }
 
+impl Drop for BtcBackend {
+    fn drop(&mut self) {
+        self.key.non_secure_erase();
+    }
+}
+
 impl BtcBackend {
     /// Keep the inputs of broadcast wallet transactions out of coin selection until they
     /// confirm (see [`InputReservations`]). Without it selection reads the live address
@@ -919,6 +925,15 @@ impl BtcBackend {
             return Ok(None);
         };
         if status["confirmed"].as_bool() != Some(true) {
+            // Real Esplora servers (`blockstream.info`, `mempool.space`) answer `200
+            // {"confirmed":false}` on `/tx/:id/status` even when `:id` is unknown (`404` on
+            // `/tx/:id`). Confirm the transaction itself is present before reporting mempool `0`.
+            if get_json_opt_on(es, &format!("/tx/{}", txid.to_rpc_hex()))
+                .await?
+                .is_none()
+            {
+                return Ok(None);
+            }
             return Ok(Some(0));
         }
         let tip = tip_height_on(es).await?;

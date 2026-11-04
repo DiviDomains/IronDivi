@@ -2234,3 +2234,48 @@ fn quorum_off_has_no_primary_only_view() {
     assert!(b.primary_only().is_none());
     assert!(b.with_quorum_reads(false).unwrap().primary_only().is_none());
 }
+
+/// Real Esplora answers 200 `{"confirmed":false}` on `/tx/:id/status` even for a txid it has
+/// never seen; only `/tx/:id` returns 404. `confirmations` must report `None` (not `Some(0)`),
+/// and a `missingorspent` broadcast rejection must not be masked as already known.
+#[tokio::test]
+async fn unconfirmed_status_without_tx_is_absent_and_does_not_mask_missingorspent() {
+    let server = MockServer::start().await;
+    let (_, hash) = new_preimage();
+    let h = htlc(hash);
+    let b = backend(vec![server.uri()], MAKER_KEY);
+    let refund = b
+        .build_refund(&h, &outpoint(), Amount::from_sat(10_000))
+        .await
+        .unwrap();
+
+    Mock::given(method("GET"))
+        .and(path(format!("/tx/{}/status", refund.txid)))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"confirmed": false})))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/tx"))
+        .respond_with(
+            ResponseTemplate::new(400).set_body_string(
+                r#"sendrawtransaction RPC error: {"code":-25,"message":"bad-txns-inputs-missingorspent"}"#,
+            ),
+        )
+        .mount(&server)
+        .await;
+
+    assert_eq!(b.confirmations(&refund.txid).await.unwrap(), None);
+    let err = b.broadcast(&refund).await.unwrap_err();
+    assert!(matches!(err, SwapError::Rejected(_)), "{err:?}");
+
+    // Once `/tx/:id` exists in the mempool, `confirmations` reports `Some(0)`.
+    Mock::given(method("GET"))
+        .and(path(format!("/tx/{}", refund.txid)))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "txid": refund.txid.to_rpc_hex(),
+            "status": {"confirmed": false}
+        })))
+        .mount(&server)
+        .await;
+    assert_eq!(b.confirmations(&refund.txid).await.unwrap(), Some(0));
+}

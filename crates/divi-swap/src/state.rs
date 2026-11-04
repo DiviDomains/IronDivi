@@ -11,7 +11,7 @@
 //! ```text
 //! Quoted → Accepted → TakerLockSeen → TakerLockConfirmed → MakerLocked → MakerLockConfirmed →
 //!   { TakerClaimed → MakerClaimed → Done | MakerRefundable → MakerRefunded → Done }
-//! Quoted / Accepted / TakerLockSeen / TakerLockConfirmed / MakerLocked → Aborted
+//! Quoted / Accepted / TakerLockSeen / TakerLockConfirmed / MakerLocked / MakerRefundable → Aborted
 //! TakerClaimed / MakerClaimed → Lost            (taker refunded the taker leg first)
 //! ```
 //! `MakerLocked` means "funding tx built and persisted"; broadcast follows (write-ahead).
@@ -114,6 +114,7 @@ impl SwapState {
                 | (MakerLockConfirmed, MakerRefundable)
                 | (MakerRefundable, TakerClaimed)
                 | (MakerRefundable, MakerRefunded)
+                | (MakerRefundable, Aborted)
                 | (TakerClaimed, MakerClaimed)
                 | (TakerClaimed, Lost)
                 | (MakerClaimed, Lost)
