@@ -935,6 +935,37 @@ impl WalletStore {
         }
         Err(format!("{address} is not this wallet's"))
     }
+
+    /// Sign a text message with the compressed P2PKH key of `address` using
+    /// Divi Core's `"DarkNet Signed Message:\n"` magic prefix so `verifymessage`
+    /// on `irondivid` / `divid` verifies the returned base64 signature.
+    pub fn sign_message_with(
+        &self,
+        id: &str,
+        auth: WalletAuth<'_>,
+        address: &str,
+        message: &str,
+    ) -> Result<String> {
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine as _;
+
+        let addr = address.trim();
+        let network = network_of(&self.network);
+        let decoded = Address::from_base58_for_network(addr, network)
+            .map_err(|_| "not an address of this network".to_string())?;
+        if decoded.addr_type != divi_wallet::AddressType::P2PKH {
+            return Err("only P2PKH addresses can sign messages".into());
+        }
+        let w = self.get(id)?;
+        let secret_words = self.open_with(&w, auth)?;
+        let hd = self.hd(&w, &secret_words)?;
+        let ext_key = self.key_for(&w, &hd, addr)?;
+        let secret_key = ext_key.secret_key().map_err(|e| e.to_string())?;
+        let hash = divi_rpc::wallet::message_magic_hash(message.as_bytes());
+        let sig = divi_crypto::sign_hash_recoverable(&secret_key, &hash)
+            .map_err(|e| format!("signing failed: {e}"))?;
+        Ok(STANDARD.encode(sig.to_compact_with_recovery()))
+    }
 }
 
 /// Seal `Secret` under `dek` and wrap `dek` under a fresh Argon2id passphrase slot.
@@ -1230,5 +1261,80 @@ mod tests {
             s.words(&v1.id, "legacy-passphrase").unwrap().as_str(),
             expected_words
         );
+    }
+
+    #[test]
+    fn sign_message_with_passphrase_and_passkey_matches_darknet_verifymessage() {
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let (w, _) = s
+            .create("Signer", "correct horse battery", None, None)
+            .unwrap();
+        let addr = w.receive[0].clone();
+
+        let salt_b64 = b64url_encode(&[0x33u8; 32]);
+        let prf_b64 = b64url_encode(&[0x44u8; 32]);
+        let cred_b64 = b64url_encode(b"signer-passkey-1");
+        let (_, pk) = s
+            .add_passkey(
+                &w.id,
+                "correct horse battery",
+                "Touch ID",
+                &cred_b64,
+                &salt_b64,
+                "localhost",
+                &prf_b64,
+            )
+            .unwrap();
+
+        let msg = "IronDivi Electrum passkey message signing test";
+        let sig_pass = s
+            .sign_message_with(
+                &w.id,
+                WalletAuth::Passphrase("correct horse battery"),
+                &addr,
+                msg,
+            )
+            .unwrap();
+        let sig_pk = s
+            .sign_message_with(
+                &w.id,
+                WalletAuth::Passkey {
+                    slot_id: &pk.id,
+                    prf_output_b64: &prf_b64,
+                },
+                &addr,
+                msg,
+            )
+            .unwrap();
+        assert_eq!(sig_pass, sig_pk);
+
+        // Recover address exactly as WalletRpc::verify_message does
+        let raw = STANDARD.decode(&sig_pk).unwrap();
+        assert_eq!(raw.len(), 65);
+        assert!((31..=34).contains(&raw[0]));
+        let rec = divi_crypto::RecoverableSig::from_compact_with_recovery(&raw).unwrap();
+        let hash = divi_rpc::wallet::message_magic_hash(msg.as_bytes());
+        let pubkey = rec.recover_from_hash(&hash).unwrap();
+        let recovered_addr = Address::from_pubkey_hash(
+            divi_crypto::hash160(&pubkey.to_bytes()),
+            Network::Regtest,
+        )
+        .to_string();
+        assert_eq!(recovered_addr, addr);
+
+        // Delete with passkey PRF
+        s.delete_with(
+            &w.id,
+            WalletAuth::Passkey {
+                slot_id: &pk.id,
+                prf_output_b64: &prf_b64,
+            },
+        )
+        .unwrap();
+        assert!(s.list().is_empty());
     }
 }

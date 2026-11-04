@@ -16,6 +16,7 @@
 pub mod auth;
 pub mod chainview;
 pub mod conffile;
+pub mod explorer;
 pub mod gate;
 pub mod launch;
 pub mod node_passkey;
@@ -302,9 +303,15 @@ fn router(shared: Arc<Shared>, sidechains: Router) -> Router {
             "/sidechains.js",
             get(|| js(include_str!("../static/sidechains.js"))),
         )
+        .route(
+            "/explorer.js",
+            get(|| js(include_str!("../static/explorer.js"))),
+        )
         .route("/app.css", get(app_css))
         .route("/launch", get(launch_in))
         .route("/api/state", get(api_state))
+        .route("/api/explorer/address/:addr", get(api_explorer_address))
+        .route("/api/swaps/status", get(api_swaps_status))
         .route("/api/auth/status", get(api_auth_status))
         .route(
             "/api/auth/passkey/login/start",
@@ -323,10 +330,15 @@ fn router(shared: Arc<Shared>, sidechains: Router) -> Router {
             post(api_passkey_register_finish),
         )
         .route("/api/auth/passkey/:id", delete(api_passkey_delete))
+        .route("/api/auth/change-password", post(api_password))
         .route("/api/setup", post(api_setup))
         .route("/api/login", post(api_login))
         .route("/api/logout", post(api_logout))
         .route("/api/password", post(api_password))
+        .route(
+            "/api/wallet/change-passphrase",
+            post(api_wallet_change_passphrase),
+        )
         .route("/api/rpc", post(api_rpc))
         .route("/api/settings", get(api_settings).post(api_save_settings))
         .route("/api/logs", get(api_logs).post(api_log_filter))
@@ -348,6 +360,7 @@ fn router(shared: Arc<Shared>, sidechains: Router) -> Router {
             "/api/node-wallet/unlock-passkey",
             post(api_node_passkeys_unlock),
         )
+        .route("/api/node-wallet/backup", post(api_node_wallet_backup))
         .route(
             "/api/node-wallet/passkeys/:slot_id",
             delete(api_node_passkeys_delete),
@@ -1004,8 +1017,21 @@ async fn api_logout(State(s): State<Arc<Shared>>, headers: HeaderMap) -> ApiResu
 
 #[derive(Deserialize)]
 struct PasswordBody {
-    current: String,
+    #[serde(default, alias = "current_password")]
+    current: Option<String>,
+    #[serde(alias = "new_password")]
     new: String,
+    #[serde(default)]
+    passkey_assertion: Option<PasskeyLoginFinishBody>,
+}
+
+impl Drop for PasswordBody {
+    fn drop(&mut self) {
+        if let Some(c) = self.current.as_mut() {
+            c.zeroize();
+        }
+        self.new.zeroize();
+    }
 }
 
 async fn api_password(
@@ -1021,27 +1047,149 @@ async fn api_password(
             "the password needs {MIN_PASSWORD_LEN} characters or more"
         )));
     }
-    let current = Zeroizing::new(body.current);
-    let new = Zeroizing::new(body.new);
-    let changed = hashing(&s, move |a| {
-        if !a.verify(&current) {
-            return Ok(false);
+    let new = Zeroizing::new(body.new.clone());
+    if let Some(assertion) = &body.passkey_assertion {
+        let passkeys = s.auth.passkeys();
+        let (cred, new_sign_count) = webauthn::verify_assertion(
+            &s.challenges,
+            &s.hosts,
+            &passkeys,
+            &assertion.credential_id,
+            &assertion.client_data_json,
+            &assertion.authenticator_data,
+            &assertion.signature,
+        )
+        .map_err(|msg| {
+            s.limiter.failed(peer.ip());
+            ApiError(StatusCode::UNAUTHORIZED, msg)
+        })?;
+        if let Err(e) = s.auth.update_passkey_sign_count(&cred.id, new_sign_count) {
+            warn!("Web interface: could not update passkey sign_count: {}", e);
         }
-        a.set_password(&new).map(|_| true)
-    })
-    .await?
-    .map_err(|e| bad(e.to_string()))?;
-    if !changed {
-        s.limiter.failed(peer.ip());
-        return Err(ApiError(
-            StatusCode::UNAUTHORIZED,
-            "wrong current password".into(),
-        ));
+        hashing(&s, move |a| a.set_password(&new))
+            .await?
+            .map_err(|e| bad(e.to_string()))?;
+    } else {
+        let current = Zeroizing::new(body.current.clone().unwrap_or_default());
+        if current.is_empty() {
+            return Err(bad(
+                "enter your current password or authenticate with an admin passkey",
+            ));
+        }
+        let changed = hashing(&s, move |a| {
+            if !a.verify(&current) {
+                return Ok(false);
+            }
+            a.set_password(&new).map(|_| true)
+        })
+        .await?
+        .map_err(|e| bad(e.to_string()))?;
+        if !changed {
+            s.limiter.failed(peer.ip());
+            return Err(ApiError(
+                StatusCode::UNAUTHORIZED,
+                "wrong current password".into(),
+            ));
+        }
     }
+    s.limiter.succeeded(peer.ip());
     // Every other browser signs in again
     s.sessions.remove_all_but(Some(&cookie));
     info!("Web interface password changed");
     Ok(Json(json!({ "ok": true })).into_response())
+}
+
+#[derive(Deserialize)]
+struct WalletChangePassphraseBody {
+    #[serde(default, alias = "old")]
+    old_passphrase: Option<String>,
+    #[serde(alias = "new")]
+    new_passphrase: String,
+    #[serde(default)]
+    passkey: Option<PasskeyUnlockInput>,
+}
+
+impl Drop for WalletChangePassphraseBody {
+    fn drop(&mut self) {
+        if let Some(o) = self.old_passphrase.as_mut() {
+            o.zeroize();
+        }
+        self.new_passphrase.zeroize();
+    }
+}
+
+async fn api_wallet_change_passphrase(
+    State(s): State<Arc<Shared>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<WalletChangePassphraseBody>,
+) -> ApiResult {
+    signed_in(&s, &headers, true)?;
+    throttle(&s, peer.ip())?;
+    if body.new_passphrase.chars().count() < wallets::MIN_PASSPHRASE_LEN {
+        return Err(bad(format!(
+            "use {} characters or more for the new wallet passphrase",
+            wallets::MIN_PASSPHRASE_LEN
+        )));
+    }
+    gate::check(
+        "walletpassphrasechange",
+        &[json!(""), json!("")],
+        wallet_status(&s),
+    )
+    .map_err(|e| ApiError(StatusCode::FORBIDDEN, e))?;
+
+    let old_passphrase: Zeroizing<String> = if let Some(pk) = &body.passkey {
+        match s.node_passkeys.unwrap(&pk.slot_id, &pk.prf_output) {
+            Ok(p) => p,
+            Err(msg) => {
+                s.limiter.failed(peer.ip());
+                return Err(ApiError(StatusCode::UNAUTHORIZED, msg));
+            }
+        }
+    } else {
+        let typed = Zeroizing::new(body.old_passphrase.clone().unwrap_or_default());
+        if typed.is_empty() {
+            return Err(bad(
+                "enter the current wallet passphrase or unlock with an enrolled passkey",
+            ));
+        }
+        typed
+    };
+    let new_passphrase = Zeroizing::new(body.new_passphrase.clone());
+
+    let transport = divi_rpc::diag_rpc::Transport::WebUi;
+    let watch = divi_rpc::diag_rpc::begin("walletpassphrasechange", transport);
+    let result = call(
+        &s,
+        "walletpassphrasechange",
+        vec![
+            json!(old_passphrase.as_str()),
+            json!(new_passphrase.as_str()),
+        ],
+    )
+    .await;
+    drop(old_passphrase);
+    drop(new_passphrase);
+    watch.finish(
+        "walletpassphrasechange",
+        transport,
+        Some(peer.ip()),
+        true,
+        result.as_ref().err().map(|(c, m)| (*c, m.as_str())),
+    );
+    match result {
+        Ok(_) => {
+            s.limiter.succeeded(peer.ip());
+            let _ = s.node_passkeys.clear_all();
+            info!("Web interface changed node wallet passphrase and cleared stale passkey slots");
+            Ok(Json(json!({ "ok": true, "wallet": wallet_status(&s) })).into_response())
+        }
+        Err((code, msg)) => {
+            s.limiter.failed(peer.ip());
+            Err(bad(format!("{msg} ({code})")))
+        }
+    }
 }
 
 /// Call the daemon in-process, as its RPC server would
@@ -1520,6 +1668,19 @@ async fn api_wallet_show(
     signed_in(&s, &headers, false)?;
     let w = s.wallets.get(&id).map_err(bad)?;
     let view = chain_view(&s, &w).await?;
+    let coins: Vec<Value> = view
+        .coins
+        .iter()
+        .map(|c| {
+            json!({
+                "address": c.address,
+                "txid": c.txid,
+                "vout": c.vout,
+                "satoshis": c.value,
+                "height": c.height,
+            })
+        })
+        .collect();
     let history: Vec<Value> = view
         .history
         .iter()
@@ -1529,7 +1690,14 @@ async fn api_wallet_show(
     Ok(Json(json!({
         "wallet": wallet_json(&w, active.as_deref()),
         "balance": { "confirmed": view.confirmed, "pending": view.pending },
-        "coins": view.coins.len(),
+        "coins": coins,
+        "coins_count": view.coins.len(),
+        "addresses": {
+            "receive": w.receive,
+            "change": w.change,
+            "next_receive": w.next_receive,
+            "next_change": w.next_change,
+        },
         "history": history,
     }))
     .into_response())
@@ -1612,6 +1780,10 @@ struct WalletActionBody {
     amount: Option<String>,
     #[serde(default)]
     fee_from_amount: bool,
+    #[serde(default)]
+    address: Option<String>,
+    #[serde(default)]
+    message: Option<String>,
 }
 
 impl Drop for WalletActionBody {
@@ -1740,6 +1912,24 @@ async fn api_wallet_action(
             })
             .await?;
             json!({ "address": address })
+        }
+        "signmessage" => {
+            let addr = body
+                .address
+                .clone()
+                .filter(|a| !a.trim().is_empty())
+                .ok_or_else(|| bad("sign with which address?"))?;
+            let msg = body
+                .message
+                .clone()
+                .ok_or_else(|| bad("enter a message to sign"))?;
+            let addr_out = addr.trim().to_string();
+            let signature = sealed(&s, move |store| {
+                let auth = select_wallet_auth(body.passphrase.as_deref(), body.passkey.as_ref())?;
+                store.sign_message_with(&id, auth, &addr, &msg)
+            })
+            .await?;
+            json!({ "address": addr_out, "signature": signature })
         }
         "send" => {
             let to = body
@@ -2037,6 +2227,216 @@ async fn api_node_passkeys_delete(
     Ok(Json(json!({ "ok": true })).into_response())
 }
 
+#[cfg(unix)]
+fn enforce_backup_permissions(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let meta = std::fs::metadata(path)?;
+    if meta.is_dir() {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            let child = entry.path();
+            if entry.file_type()?.is_dir() {
+                enforce_backup_permissions(&child)?;
+            } else {
+                std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o600))?;
+            }
+        }
+    } else {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn enforce_backup_permissions(_path: &std::path::Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Safe server-side node wallet backup to `<datadir>/backups/wallet-<unix_ts>.dat`
+/// with zero user-supplied path input.
+async fn api_node_wallet_backup(State(s): State<Arc<Shared>>, headers: HeaderMap) -> ApiResult {
+    signed_in(&s, &headers, true)?;
+    if wallet_status(&s).is_none() {
+        return Err(bad("this node has no wallet"));
+    }
+    let data_dir = s.config.data_dir.clone();
+    let (filename, dest) = blocking(move || -> Result<(String, PathBuf), String> {
+        let backups_dir = data_dir.join("backups");
+        std::fs::create_dir_all(&backups_dir)
+            .map_err(|e| format!("failed to create backups directory: {e}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&backups_dir, std::fs::Permissions::from_mode(0o700))
+                .map_err(|e| format!("failed to secure backups directory: {e}"))?;
+        }
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        for suffix in 0u32..1000 {
+            let name = if suffix == 0 {
+                format!("wallet-{ts}.dat")
+            } else {
+                format!("wallet-{ts}-{suffix}.dat")
+            };
+            let candidate = backups_dir.join(&name);
+            if !candidate.exists() {
+                return Ok((name, candidate));
+            }
+        }
+        Err("too many backups in the same second".into())
+    })
+    .await
+    .map_err(|e| bad(e.to_string()))?
+    .map_err(bad)?;
+
+    let dest_str = dest
+        .to_str()
+        .ok_or_else(|| bad("data directory path is not UTF-8"))?
+        .to_string();
+    let transport = divi_rpc::diag_rpc::Transport::WebUi;
+    let watch = divi_rpc::diag_rpc::begin("backupwallet", transport);
+    let res = call(&s, "backupwallet", vec![json!(dest_str)]).await;
+    watch.finish(
+        "backupwallet",
+        transport,
+        None,
+        false,
+        res.as_ref().err().map(|(c, m)| (*c, m.as_str())),
+    );
+    res.map_err(|(c, m)| bad(format!("{m} ({c})")))?;
+
+    let dest_check = dest.clone();
+    blocking(move || enforce_backup_permissions(&dest_check))
+        .await
+        .map_err(|e| bad(e.to_string()))?
+        .map_err(|e| bad(format!("failed to secure backup permissions: {e}")))?;
+
+    info!("Web interface backed up node wallet to backups/{}", filename);
+    Ok(Json(json!({
+        "ok": true,
+        "filename": filename,
+        "path": format!("backups/{filename}"),
+    }))
+    .into_response())
+}
+
+/// `GET /api/explorer/address/:addr`: validate a Divi address against the
+/// active network and read its balance, UTXOs, and history via the Electrum
+/// backend (with JSON-RPC address-index fallback or an indexing hint).
+async fn api_explorer_address(
+    State(s): State<Arc<Shared>>,
+    headers: HeaderMap,
+    axum::extract::Path(addr): axum::extract::Path<String>,
+) -> ApiResult {
+    signed_in(&s, &headers, false)?;
+    let network = wallets::network_of(&s.config.network);
+    let parsed = explorer::parse_address(&addr, network).map_err(bad)?;
+    if let Some(backend) = s.electrum.clone() {
+        let parsed_for_electrum = parsed.clone();
+        let res = blocking(move || {
+            explorer::read_electrum_address(&backend, &parsed_for_electrum, network)
+        })
+        .await
+        .map_err(|e| bad(e.to_string()))?;
+        match res {
+            Ok(val) => return Ok(Json(val).into_response()),
+            Err(msg) if !explorer::is_index_disabled_error(&msg) => return Err(bad(msg)),
+            Err(_) => {}
+        }
+    }
+    let query = vec![json!({ "addresses": [&parsed.address] })];
+    match call(&s, "getaddressbalance", query.clone()).await {
+        Ok(balance) => {
+            let utxos = call(&s, "getaddressutxos", query.clone()).await.ok();
+            let txids = call(&s, "getaddresstxids", query).await.ok();
+            Ok(Json(explorer::format_rpc_address(
+                &parsed,
+                &balance,
+                utxos.as_ref(),
+                txids.as_ref(),
+            ))
+            .into_response())
+        }
+        Err(_) => Ok(Json(explorer::unindexed_response(&parsed)).into_response()),
+    }
+}
+
+fn swaps_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_millis(500))
+            .build()
+            .expect("loopback HTTP client")
+    })
+}
+
+/// `GET /api/swaps/status`: probe a local loopback `divi-swapd` instance with a
+/// short timeout and return its health, public offers, swaps, and supported pairs.
+async fn api_swaps_status(State(s): State<Arc<Shared>>, headers: HeaderMap) -> ApiResult {
+    signed_in(&s, &headers, false)?;
+    let client = swaps_client();
+    let pairs = json!(["BTC", "LTC", "ZEC", "XMR", "USDC"]);
+    for port in [18482u16, 18480, 8480] {
+        let base = format!("http://127.0.0.1:{port}");
+        let Ok(res) = client.get(format!("{base}/healthz")).send().await else {
+            continue;
+        };
+        if !res.status().is_success() {
+            continue;
+        }
+        let Ok(health) = res.json::<Value>().await else {
+            continue;
+        };
+        let offers = match client.get(format!("{base}/offers")).send().await {
+            Ok(r) if r.status().is_success() => {
+                r.json::<Value>().await.unwrap_or_else(|_| json!([]))
+            }
+            _ => json!([]),
+        };
+        let mut operator_token_required = false;
+        let swaps = match client.get(format!("{base}/swaps")).send().await {
+            Ok(r) if r.status().is_success() => {
+                r.json::<Value>().await.unwrap_or_else(|_| json!([]))
+            }
+            Ok(r)
+                if r.status() == StatusCode::NOT_FOUND
+                    || r.status() == StatusCode::UNAUTHORIZED
+                    || r.status() == StatusCode::FORBIDDEN =>
+            {
+                operator_token_required = true;
+                json!([])
+            }
+            _ => json!([]),
+        };
+        return Ok(Json(json!({
+            "online": true,
+            "endpoint": base,
+            "health": health,
+            "offers": offers,
+            "swaps": swaps,
+            "operator_token_required": operator_token_required,
+            "pairs": pairs,
+        }))
+        .into_response());
+    }
+    Ok(Json(json!({
+        "online": false,
+        "endpoint": Value::Null,
+        "health": Value::Null,
+        "offers": [],
+        "swaps": [],
+        "operator_token_required": false,
+        "pairs": pairs,
+        "probed_ports": [18482, 18480, 8480],
+    }))
+    .into_response())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2163,5 +2563,166 @@ mod tests {
         ] {
             assert_eq!(parse_divi(bad), None, "{bad:?}");
         }
+    }
+
+    #[test]
+    fn node_wallet_backup_permissions_enforced() {
+        let dir = tempfile::tempdir().unwrap();
+        let backups = dir.path().join("backups");
+        std::fs::create_dir_all(&backups).unwrap();
+        let file1 = backups.join("wallet-1234567890.dat");
+        std::fs::write(&file1, b"mock-wallet-data").unwrap();
+        let sub = backups.join("subdir");
+        std::fs::create_dir_all(&sub).unwrap();
+        let file2 = sub.join("wallet-inner.dat");
+        std::fs::write(&file2, b"inner-data").unwrap();
+
+        enforce_backup_permissions(&backups).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir_mode = std::fs::metadata(&backups).unwrap().permissions().mode();
+            assert_eq!(dir_mode & 0o777, 0o700);
+            let file1_mode = std::fs::metadata(&file1).unwrap().permissions().mode();
+            assert_eq!(file1_mode & 0o777, 0o600);
+            let sub_mode = std::fs::metadata(&sub).unwrap().permissions().mode();
+            assert_eq!(sub_mode & 0o777, 0o700);
+            let file2_mode = std::fs::metadata(&file2).unwrap().permissions().mode();
+            assert_eq!(file2_mode & 0o777, 0o600);
+        }
+    }
+
+    #[tokio::test]
+    async fn swaps_status_offline_and_mock_response() {
+        let client = swaps_client();
+        let offline_res = client.get("http://127.0.0.1:49999/healthz").send().await;
+        assert!(offline_res.is_err());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mock_app = axum::Router::new()
+            .route(
+                "/healthz",
+                axum::routing::get(|| async {
+                    axum::Json(serde_json::json!({ "status": "ok", "version": "0.1.0" }))
+                }),
+            )
+            .route(
+                "/offers",
+                axum::routing::get(|| async {
+                    axum::Json(serde_json::json!([{ "id": "offer-1", "pair": "DIVI/BTC" }]))
+                }),
+            )
+            .route(
+                "/swaps",
+                axum::routing::get(|| async { axum::Json(serde_json::json!([])) }),
+            );
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, mock_app.into_make_service()).await;
+        });
+
+        let base = format!("http://127.0.0.1:{port}");
+        let health = client.get(format!("{base}/healthz")).send().await.unwrap();
+        assert!(health.status().is_success());
+        let health_json: Value = health.json().await.unwrap();
+        assert_eq!(health_json["status"], "ok");
+
+        let offers = client.get(format!("{base}/offers")).send().await.unwrap();
+        let offers_json: Value = offers.json().await.unwrap();
+        assert_eq!(offers_json.as_array().unwrap().len(), 1);
+        assert_eq!(offers_json[0]["pair"], "DIVI/BTC");
+    }
+
+    #[tokio::test]
+    async fn admin_password_change_with_passkey_assertion() {
+        use p256::ecdsa::signature::Signer;
+        use sha2::Digest;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = AuthStore::open(dir.path()).unwrap();
+        let initial_pass = Zeroizing::new("initial-horse-battery-pass".to_string());
+        store.set_password(&initial_pass).unwrap();
+
+        let mut seed = [7u8; 32];
+        seed[0] = 0x42;
+        let sk = p256::ecdsa::SigningKey::from_bytes((&seed).into()).unwrap();
+        let cred_id = b"admin-passkey-change-test";
+        let cred_id_b64 = webauthn::b64url_encode(cred_id);
+        let summary = store
+            .add_passkey(
+                "YubiKey Admin",
+                cred_id_b64.clone(),
+                hex::encode(sk.verifying_key().to_encoded_point(false).as_bytes()),
+                "localhost".into(),
+                0,
+            )
+            .unwrap();
+
+        let challenges = webauthn::ChallengeStore::default();
+        let chal = challenges.issue(webauthn::Purpose::Login, "localhost".into());
+        let client_data = serde_json::json!({
+            "type": "webauthn.get",
+            "challenge": chal,
+            "origin": "http://localhost:51482",
+        });
+        let client_data_raw = client_data.to_string().into_bytes();
+        let mut auth_data = Vec::new();
+        auth_data.extend_from_slice(&sha2::Sha256::digest(b"localhost"));
+        auth_data.push(0x01 | 0x04);
+        auth_data.extend_from_slice(&1u32.to_be_bytes());
+
+        let mut signed = auth_data.clone();
+        signed.extend_from_slice(&sha2::Sha256::digest(&client_data_raw));
+        let sig: p256::ecdsa::Signature = sk.sign(&signed);
+
+        let passkeys = store.passkeys();
+        let hosts = vec!["localhost:51482".to_string()];
+        let (matched, count) = webauthn::verify_assertion(
+            &challenges,
+            &hosts,
+            &passkeys,
+            &cred_id_b64,
+            &webauthn::b64url_encode(&client_data_raw),
+            &webauthn::b64url_encode(&auth_data),
+            &webauthn::b64url_encode(sig.to_der().as_bytes()),
+        )
+        .unwrap();
+        assert_eq!(matched.id, summary.id);
+        assert_eq!(count, 1);
+
+        let new_pass = Zeroizing::new("super-strong-replacement-pass-2026".to_string());
+        store.set_password(&new_pass).unwrap();
+        assert!(store.verify(&new_pass));
+        assert!(!store.verify(&initial_pass));
+        assert_eq!(store.passkeys().len(), 1);
+    }
+
+    #[test]
+    fn node_wallet_passkey_unwrap_and_clear_on_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = node_passkey::NodePasskeyStore::new(dir.path());
+
+        let salt = webauthn::b64url_encode(&[0x55u8; 32]);
+        let prf = webauthn::b64url_encode(&[0x66u8; 32]);
+        let cred = webauthn::b64url_encode(b"node-change-cred");
+
+        let summary = store
+            .enroll(
+                "old-node-passphrase",
+                "Touch ID Node",
+                &cred,
+                &salt,
+                "localhost",
+                &prf,
+            )
+            .unwrap();
+
+        let unwrapped = store.unwrap(&summary.id, &prf).unwrap();
+        assert_eq!(unwrapped.as_str(), "old-node-passphrase");
+
+        store.clear_all().unwrap();
+        assert!(store.list().is_empty());
+        assert!(store.unwrap(&summary.id, &prf).is_err());
     }
 }

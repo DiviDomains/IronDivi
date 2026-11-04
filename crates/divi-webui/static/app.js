@@ -70,7 +70,8 @@ async function rpc(method, ...params) {
 }
 
 function note(el, text, ok) {
-  el.textContent = text;
+  // text, or a node (a message with explorer links)
+  el.replaceChildren(text instanceof Node ? text : String(text));
   el.className = ok ? "note ok" : "note err";
 }
 
@@ -306,25 +307,27 @@ const routes = {
   "settings": settings,
   "console": consoleView,
   "logs": logsView,
-  "nft": () => window.irondiviNft({ h, show, rpc, post, getJson, form, field, val, note, state }),
+  "explorer": (rest) => window.irondiviExplorer({ h, show, rpc, getJson, kv, note }, rest),
+  "nft": () => window.irondiviNft({ h, show, rpc, post, getJson, form, field, val, note, state, passkey: passkeyTools }),
   "sidechains": () => window.irondiviSidechains({ h, show, post, getJson, form, field, val, note, kv, state: () => state }),
   "wallet": walletView,
-  "wallets": () => window.irondiviWallets({ h, show, post, del, getJson, form, field, val, note, kv, passkey: passkeyTools }),
-  "staking": () => later("Staking", "Staking status, rewards and the split threshold."),
-  "vaults": () => later("Vaults", "Vaults that stake for you but cannot spend."),
-  "swaps": () => later("Swaps", "Atomic swaps with other chains."),
+  "wallets": () => window.irondiviWallets({ h, show, post, del, getJson, form, field, val, note, kv, passkey: passkeyTools, links, rpc }),
+  "staking": stakingView,
+  "vaults": vaultsView,
+  "swaps": swapsView,
 };
 
 async function route() {
-  const name = location.hash.replace(/^#\/?/, "");
+  const raw = location.hash.replace(/^#\/?/, "");
+  const [root, ...rest] = raw.split("/");
   if (state.setup_required) return setupView();
   if (!state.signed_in) return loginView();
-  const view = routes[name] || dashboard;
+  const view = Object.prototype.hasOwnProperty.call(routes, root) ? routes[root] : dashboard;
   clearTimeout(logTimer);
   document.querySelectorAll("#nav a").forEach((a) =>
-    a.classList.toggle("on", a.getAttribute("href") === "#/" + name));
+    a.classList.toggle("on", a.getAttribute("href") === "#/" + root));
   try {
-    await view();
+    await view(rest);
   } catch (err) {
     show(h("p", { class: "note err" }, err.message));
   }
@@ -413,13 +416,201 @@ function loginView() {
   show(h("section", { class: "narrow" }, localhostPasskeyHint(), loginForm));
 }
 
-function later(title, what) {
-  show(h("section", {}, h("h2", {}, title),
-    h("p", { class: "muted" }, what + " This app is coming; it will use the same settings and the same sign-in.")));
+function kv(rows) {
+  return h("dl", { class: "kv" }, rows.flatMap(([k, v]) => [h("dt", {}, k),
+    h("dd", {}, v === undefined || v === null ? "—" : v instanceof Node ? v : String(v))]));
 }
 
-function kv(rows) {
-  return h("dl", { class: "kv" }, rows.flatMap(([k, v]) => [h("dt", {}, k), h("dd", {}, v === undefined || v === null ? "—" : String(v))]));
+// --- deep links into the explorer ----------------------------------------------
+
+const shortId = (s) => (s && s.length > 20 ? s.slice(0, 10) + "…" + s.slice(-8) : s);
+
+function txLink(txid, label) {
+  if (!txid) return "—";
+  return h("a", { href: "#/explorer/tx/" + txid, class: "mono", "data-txid": txid }, label || txid);
+}
+
+function addrLink(address, label) {
+  if (!address) return "—";
+  return h("a", { href: "#/explorer/address/" + encodeURIComponent(address), class: "mono" }, label || address);
+}
+
+function blockLink(hashOrHeight, label) {
+  if (hashOrHeight === undefined || hashOrHeight === null) return "—";
+  return h("a", { href: "#/explorer/block/" + hashOrHeight, class: "mono" }, label === undefined ? String(hashOrHeight) : String(label));
+}
+
+const links = { txLink, addrLink, blockLink, shortId };
+
+/// A table of `rows` (arrays of cells) under `head`
+function table(testid, head, rows) {
+  return h("div", { class: "table-wrap" }, h("table", { class: "table", "data-testid": testid },
+    h("thead", {}, h("tr", {}, head.map((c) => h("th", {}, c)))),
+    h("tbody", {}, rows.map((r) => h("tr", {}, r.map((c) => h("td", {}, c === undefined || c === null ? "—" : c)))))));
+}
+
+/// Any RPC reply, readable: objects as key/value lists, arrays of objects as
+/// tables, txids and addresses as explorer links
+function jsonView(v, testid) {
+  const cell = (x) => {
+    if (x === null || x === undefined) return "—";
+    if (typeof x === "string") {
+      if (/^[0-9a-f]{64}$/.test(x)) return txLink(x, shortId(x));
+      const pair = x.match(/^([1-9A-HJ-NP-Za-km-z]{26,35}):([1-9A-HJ-NP-Za-km-z]{26,35})$/);
+      if (pair) return h("span", {}, addrLink(pair[1]), ":", addrLink(pair[2]));
+      if (/^[1-9A-HJ-NP-Za-km-z]{26,35}$/.test(x) && /[A-Za-z]/.test(x) && /\d/.test(x)) return addrLink(x);
+      return x;
+    }
+    if (typeof x === "object") return jsonView(x);
+    return String(x);
+  };
+  if (Array.isArray(v)) {
+    if (!v.length) return h("p", { class: "muted", "data-testid": testid || null }, "None.");
+    if (v.every((x) => x && typeof x === "object" && !Array.isArray(x))) {
+      const cols = [...new Set(v.flatMap((x) => Object.keys(x)))];
+      return table(testid || null, cols, v.map((x) => cols.map((c) => cell(x[c]))));
+    }
+    return h("ul", { "data-testid": testid || null }, v.map((x) => h("li", {}, cell(x))));
+  }
+  if (v && typeof v === "object") {
+    const dl = kv(Object.entries(v).map(([k, x]) => [k, cell(x)]));
+    if (testid) dl.setAttribute("data-testid", testid);
+    return dl;
+  }
+  return h("span", { "data-testid": testid || null }, cell(v));
+}
+
+// --- the node wallet, unlocked for one action ------------------------------------
+
+function hostNodeSlots() {
+  return (state.node_passkeys || []).filter((s) => s.rp_id === location.hostname);
+}
+
+/// Unlock the node wallet: for a minute of spending, or for staking only. By
+/// the typed passphrase, or with a node wallet passkey (`pk`, from
+/// evalPrfPasskey) whose WebAuthn PRF output unseals the passphrase on the node
+function nodeUnlock(passphrase, pk, stakingOnly) {
+  if (pk) {
+    return post("/api/node-wallet/unlock-passkey", {
+      slot_id: pk.slot_id, prf_output: pk.prf_output, staking_only: stakingOnly, timeout: stakingOnly ? 0 : 60,
+    });
+  }
+  return rpc("walletpassphrase", passphrase, stakingOnly ? 0 : 60, stakingOnly);
+}
+
+/// Run `work` with the node wallet unlocked for spending for a minute, by the
+/// passphrase or an enrolled node wallet passkey, then put it back as it was:
+/// locked, or unlocked for staking only
+async function withNodeUnlocked(passphrase, viaPasskey, work) {
+  await refresh();
+  const before = state.wallet;
+  if (before === "unencrypted") throw new Error("encrypt the wallet on the Security page first");
+  let pk = null;
+  if (before !== "unlocked") {
+    if (viaPasskey) pk = await evalPrfPasskey(hostNodeSlots());
+    else if (!passphrase) throw new Error("enter the wallet passphrase");
+    await nodeUnlock(passphrase, pk, false);
+  }
+  let result;
+  let restore = null;
+  try {
+    result = await work();
+  } finally {
+    const back = before === "unlocked-for-staking" ? nodeUnlock(passphrase, pk, true)
+      : before === "locked" ? rpc("walletlock") : null;
+    if (pk) pk.prf_output = "";
+    if (back) restore = await back.then(() => null, (e) => e.message);
+    await refresh();
+  }
+  return (result || "Done.") + (restore ? " The wallet could not go back to " + walletLabel(before).toLowerCase() + ": " + restore : "");
+}
+
+/// A form whose action needs the wallet unlocked: a passphrase field and, with
+/// a node wallet passkey enrolled for this host, a "… with Passkey" button
+function signingForm(title, fields, label, work, extra, passkeyLabel, testid) {
+  const needsP = state.wallet !== "unlocked";
+  const slots = hostNodeSlots();
+  let pkBtn = null;
+  const run = (f, viaPasskey) => withNodeUnlocked(f.elements.p ? f.elements.p.value : "", viaPasskey, () => work(f));
+  const f = form(title, [...fields,
+    needsP ? field(slots.length ? "Wallet passphrase (or use your passkey)" : "Wallet passphrase", "p", "password", { autocomplete: "current-password" }) : null,
+  ], label, (ff) => run(ff, false), extra,
+  needsP && slots.length ? [(pkBtn = h("button", {
+    type: "button",
+    class: "secondary",
+    "data-testid": testid || null,
+    onclick: async () => {
+      pkBtn.disabled = true;
+      note(f._note, "Waiting for passkey…", true);
+      try {
+        note(f._note, await run(f, true), true);
+        if (f.elements.p) f.elements.p.value = "";
+      } catch (err) {
+        note(f._note, err.message, false);
+      } finally {
+        pkBtn.disabled = false;
+      }
+    },
+  }, passkeyLabel || label + " with Passkey"))] : []);
+  return f;
+}
+
+/// The node wallet's staking unlock: passphrase form plus passkey button
+function unlockForStakingForm(after) {
+  const slots = hostNodeSlots();
+  let btn = null;
+  const f = form("Unlock for staking only", [
+    field("Wallet passphrase", "p", "password", { autocomplete: "current-password" }),
+  ], "Unlock for staking", async (ff) => {
+    await nodeUnlock(val(ff, "p"), null, true);
+    flash = "Unlocked for staking. Spending still needs the passphrase.";
+    after();
+  }, h("p", { class: "muted" }, "The wallet stakes, but cannot send, until it is locked again."),
+  slots.length ? [
+    (btn = h("button", {
+      type: "button",
+      class: "secondary",
+      "data-testid": "node-unlock-staking-passkey",
+      onclick: async () => {
+        btn.disabled = true;
+        note(f._note, "Waiting for passkey…", true);
+        try {
+          const unlocked = await evalPrfPasskey(slots);
+          await nodeUnlock("", unlocked, true);
+          unlocked.prf_output = "";
+          flash = "Unlocked for staking with Passkey.";
+          after();
+        } catch (err) {
+          note(f._note, err.message, false);
+        } finally {
+          btn.disabled = false;
+        }
+      },
+    }, "Unlock for staking with Passkey")),
+  ] : []);
+  return f;
+}
+
+/// An admin passkey assertion, to sign in or to re-authenticate a change
+async function adminAssertion() {
+  ensurePasskeyOrigin();
+  const start = await post("/api/auth/passkey/login/start", {});
+  const assertion = await navigator.credentials.get({
+    publicKey: {
+      challenge: b64urlToBytes(start.challenge),
+      rpId: start.rp_id,
+      allowCredentials: (start.allow_credentials || []).map((c) => ({ type: "public-key", id: b64urlToBytes(c.id) })),
+      userVerification: "required",
+      timeout: 60000,
+    },
+  });
+  if (!assertion) throw new Error("Passkey prompt was cancelled.");
+  return {
+    credential_id: bytesToB64url(assertion.rawId),
+    client_data_json: bytesToB64url(assertion.response.clientDataJSON),
+    authenticator_data: bytesToB64url(assertion.response.authenticatorData),
+    signature: bytesToB64url(assertion.response.signature),
+  };
 }
 
 async function dashboard() {
@@ -433,14 +624,19 @@ async function dashboard() {
     h("h2", {}, "Dashboard"),
     h("div", { class: "grid" },
       h("div", { class: "card" }, h("h3", {}, "Node"), kv([
-        ["Version", info.version], ["Blocks", chain.blocks ?? info.blocks], ["Headers", chain.headers],
+        ["Version", info.version],
+        ["Blocks", (chain.blocks ?? info.blocks) !== undefined
+          ? h("a", { href: "#/explorer/block/" + (chain.blocks ?? info.blocks), "data-testid": "dashboard-blocks-link" }, String(chain.blocks ?? info.blocks))
+          : undefined],
+        ["Headers", chain.headers],
         ["Connections", info.connections], ["Network", state.network],
       ])),
       h("div", { class: "card" }, h("h3", {}, "Wallet"), kv([
         ["Encryption", walletLabel(state.wallet)], ["Balance", info.balance],
       ]), h("p", {}, h("a", { href: "#/security" }, "Security settings"))),
       h("div", { class: "card" }, h("h3", {}, "Staking"), staking.error ? h("p", { class: "muted" }, staking.error) :
-        kv(Object.entries(staking).map(([k, v]) => [k, typeof v === "object" ? JSON.stringify(v) : v]))),
+        kv(Object.entries(staking).map(([k, v]) => [k, typeof v === "object" ? JSON.stringify(v) : v])),
+      h("p", {}, h("a", { href: "#/staking" }, "Staking"), " · ", h("a", { href: "#/explorer" }, "Explorer"))),
     )));
 }
 
@@ -638,69 +834,85 @@ async function security() {
   }
   if (w && w !== "unencrypted") {
     const hostNodeSlots = (state.node_passkeys || []).filter((s) => s.rp_id === location.hostname);
-    let stakingPkBtn = null;
-    const unlockStakingForm = form("Unlock for staking only", [
-      field("Wallet passphrase", "p", "password", { autocomplete: "current-password" }),
-    ], "Unlock for staking", async (f) => {
-      await rpc("walletpassphrase", val(f, "p"), 0, true);
-      flash = "Unlocked for staking. Spending still needs the passphrase.";
-      security();
-    }, h("p", { class: "muted" }, "The wallet stakes, but cannot send, until it is locked again."),
-      hostNodeSlots.length ? [
-        (stakingPkBtn = h("button", {
-          type: "button",
-          class: "secondary",
-          "data-testid": "node-unlock-staking-passkey",
-          onclick: async () => {
-            stakingPkBtn.disabled = true;
-            note(unlockStakingForm._note, "Waiting for passkey…", true);
-            try {
-              const unlocked = await evalPrfPasskey(hostNodeSlots);
-              await post("/api/node-wallet/unlock-passkey", {
-                slot_id: unlocked.slot_id,
-                prf_output: unlocked.prf_output,
-                staking_only: true,
-                timeout: 0,
-              });
-              unlocked.prf_output = "";
-              flash = "Unlocked for staking with Passkey.";
-              security();
-            } catch (err) {
-              note(unlockStakingForm._note, err.message, false);
-            } finally {
-              stakingPkBtn.disabled = false;
-            }
-          },
-        }, "Unlock for staking with Passkey")),
-      ] : []);
-    parts.push(unlockStakingForm);
+    parts.push(unlockForStakingForm(security));
     parts.push(form("Lock the wallet", [], "Lock", async () => {
       await rpc("walletlock");
       flash = "Locked.";
       security();
     }));
     parts.push(nodePasskeysCard());
-    parts.push(form("Change the wallet passphrase", [
-      field("Current passphrase", "old", "password", { autocomplete: "current-password" }),
+    let changePkBtn = null;
+    const changePass = form("Change the wallet passphrase", [
+      field(hostNodeSlots.length ? "Current passphrase (or use your passkey)" : "Current passphrase", "old", "password", { autocomplete: "current-password" }),
       field("New passphrase", "p1", "password", { autocomplete: "new-password" }),
       field("The new passphrase again", "p2", "password", { autocomplete: "new-password" }),
     ], "Change passphrase", async (f) => {
       if (val(f, "p1") !== val(f, "p2")) throw new Error("the passphrases differ");
-      await rpc("walletpassphrasechange", val(f, "old"), val(f, "p1"));
+      if (!val(f, "old")) throw new Error("enter the current passphrase");
+      await post("/api/wallet/change-passphrase", { old_passphrase: val(f, "old"), new_passphrase: val(f, "p1") });
       await refresh();
-      return "The wallet passphrase is changed. Re-add any node wallet passkeys with the new passphrase.";
-    }));
+      return "The wallet passphrase is changed. Node wallet passkeys were cleared; re-add them with the new passphrase.";
+    }, null, hostNodeSlots.length ? [
+      (changePkBtn = h("button", {
+        type: "button",
+        class: "secondary",
+        "data-testid": "node-change-passphrase-passkey",
+        onclick: async () => {
+          changePkBtn.disabled = true;
+          note(changePass._note, "Waiting for passkey…", true);
+          try {
+            if (val(changePass, "p1") !== val(changePass, "p2")) throw new Error("the passphrases differ");
+            if (!val(changePass, "p1")) throw new Error("enter the new passphrase");
+            const pk = await evalPrfPasskey(hostNodeSlots);
+            await post("/api/wallet/change-passphrase", { passkey: pk, new_passphrase: val(changePass, "p1") });
+            pk.prf_output = "";
+            flash = "The wallet passphrase is changed with Passkey. Node wallet passkeys were cleared; re-add them with the new passphrase.";
+            security();
+          } catch (err) {
+            note(changePass._note, err.message, false);
+          } finally {
+            changePkBtn.disabled = false;
+          }
+        },
+      }, "Change with Passkey")),
+    ] : []);
+    parts.push(changePass);
   }
   parts.push(adminPasskeysCard());
-  parts.push(form("Change the web interface password", [
-    field("Current password", "current", "password", { autocomplete: "current-password" }),
+  const hasAdminPasskey = (state.passkeys || []).some((pk) => pk.rp_id === location.hostname);
+  let pwPkBtn = null;
+  const changePw = form("Change the web interface password", [
+    field(hasAdminPasskey ? "Current password (or use your passkey)" : "Current password", "current", "password", { autocomplete: "current-password" }),
     field("New password", "p1", "password", { autocomplete: "new-password" }),
     field("The new password again", "p2", "password", { autocomplete: "new-password" }),
   ], "Change password", async (f) => {
     if (val(f, "p1") !== val(f, "p2")) throw new Error("the passwords differ");
-    await post("/api/password", { current: val(f, "current"), new: val(f, "p1") });
+    await post("/api/auth/change-password", { current_password: val(f, "current"), new_password: val(f, "p1") });
     return "Changed. Other browsers are signed out.";
-  }));
+  }, null, hasAdminPasskey ? [
+    (pwPkBtn = h("button", {
+      type: "button",
+      class: "secondary",
+      "data-testid": "admin-change-password-passkey",
+      onclick: async () => {
+        pwPkBtn.disabled = true;
+        note(changePw._note, "Waiting for passkey…", true);
+        try {
+          if (val(changePw, "p1") !== val(changePw, "p2")) throw new Error("the passwords differ");
+          if (!val(changePw, "p1")) throw new Error("enter the new password");
+          const assertion = await adminAssertion();
+          await post("/api/auth/change-password", { passkey_assertion: assertion, new_password: val(changePw, "p1") });
+          changePw.querySelectorAll("input[type=password]").forEach((i) => (i.value = ""));
+          note(changePw._note, "Changed with Passkey. Other browsers are signed out.", true);
+        } catch (err) {
+          note(changePw._note, err.message, false);
+        } finally {
+          pwPkBtn.disabled = false;
+        }
+      },
+    }, "Change with Passkey")),
+  ] : []);
+  parts.push(changePw);
   show(h("section", {}, parts));
 }
 
@@ -1094,7 +1306,7 @@ async function walletView() {
     f.elements.to.value = f.elements.amount.value = f.elements.note.value = "";
     request = {};
     about.textContent = "";
-    return "Sent. Transaction " + txid + (restore
+    return h("span", {}, "Sent. Transaction ", txLink(txid), restore
       ? ". The wallet could not go back to " + walletLabel(before).toLowerCase() + ": " + restore : ".");
   }
 
@@ -1153,10 +1365,299 @@ async function walletView() {
     if (/^divi:/i.test(send.elements.to.value.trim())) fill(send.elements.to.value);
   });
 
+  const [history, received, unspent] = await Promise.all([
+    rpc("listtransactions", "*", 50, 0, true).catch((e) => e),
+    rpc("listreceivedbyaddress", 0, true).catch((e) => e),
+    rpc("listunspent", 0).catch((e) => e),
+  ]);
+  const when = (t) => (t ? new Date(t * 1000).toLocaleString() : "—");
+  const failed = (r) => (r instanceof Error ? h("p", { class: "note err" }, r.message) : null);
+
+  const historyCard = h("div", { class: "card", "data-testid": "node-wallet-history" }, h("h3", {}, "Recent transactions"),
+    failed(history) || (history.length
+      ? table("node-wallet-history-table", ["Time", "Category", "Amount", "Confirmations", "Address", "Transaction"],
+        [...history].reverse().map((t) => [when(t.time || t.timereceived), t.category, String(t.amount) + " DIVI",
+          String(t.confirmations ?? "—"), t.address ? addrLink(t.address) : "—", txLink(t.txid, shortId(t.txid))]))
+      : h("p", { class: "muted" }, "No transactions yet.")));
+
+  const addressesCard = h("details", { class: "card drawer", "data-testid": "node-wallet-addresses" },
+    h("summary", {}, "Addresses" + (Array.isArray(received) ? " (" + received.length + ")" : "")),
+    h("div", { class: "drawer-body" }, failed(received) || (received.length
+      ? table("node-wallet-addresses-table", ["Address", "Label", "Received", "Confirmations"],
+        received.map((r) => [addrLink(r.address), r.label || r.account || "", String(r.amount) + " DIVI", String(r.confirmations ?? "—")]))
+      : h("p", { class: "muted" }, "No addresses yet."))));
+
+  const utxoCard = h("details", { class: "card drawer", "data-testid": "node-wallet-utxos" },
+    h("summary", {}, "Unspent coins" + (Array.isArray(unspent) ? " (" + unspent.length + ")" : "")),
+    h("div", { class: "drawer-body" }, failed(unspent) || (unspent.length
+      ? table("node-wallet-utxos-table", ["Coin", "Address", "Amount", "Confirmations"],
+        unspent.map((u) => [h("span", {}, txLink(u.txid, shortId(u.txid)), ":" + u.vout), addrLink(u.address), String(u.amount) + " DIVI", String(u.confirmations)]))
+      : h("p", { class: "muted" }, "No unspent coins."))));
+
+  // Sign & verify a message
+  const sigOut = h("textarea", { class: "sig", rows: 3, readonly: true, "data-testid": "node-signature-output" });
+  const addrChoices = Array.isArray(received) ? received.map((r) => r.address) : [];
+  const signCard = signingForm("Sign a message", [
+    h("label", { class: "field" }, h("span", {}, "Address"),
+      h("input", { name: "address", list: "node-sign-addrs", spellcheck: "false", autocomplete: "off", value: addrChoices[0] || "" }),
+      h("datalist", { id: "node-sign-addrs" }, addrChoices.map((a) => h("option", { value: a })))),
+    h("label", { class: "field" }, h("span", {}, "Message"), h("textarea", { name: "message", rows: 3 })),
+  ], "Sign", async (f) => {
+    const address = val(f, "address").trim();
+    const message = f.elements.message.value;
+    if (!address) throw new Error("enter an address of this wallet");
+    const sig = await rpc("signmessage", address, message);
+    sigOut.value = sig;
+    return "Signed.";
+  }, h("p", { class: "muted" }, "Proves you hold an address: anyone can check the signature with verifymessage."),
+  "Sign with Passkey", "node-sign-passkey");
+  signCard.setAttribute("data-testid", "node-sign-message-card");
+  signCard.append(h("label", { class: "field" }, h("span", {}, "Signature"), sigOut));
+
+  const verifyCard = form("Verify a message", [
+    field("Address", "address", "text", { spellcheck: "false" }),
+    field("Signature", "signature", "text", { spellcheck: "false" }),
+    h("label", { class: "field" }, h("span", {}, "Message"), h("textarea", { name: "message", rows: 3 })),
+  ], "Verify", async (f) => {
+    const ok = await rpc("verifymessage", val(f, "address").trim(), val(f, "signature").trim(), f.elements.message.value);
+    if (!ok) throw new Error("The signature does not match that address and message.");
+    return "Valid: the address signed this message.";
+  });
+  verifyCard.setAttribute("data-testid", "node-verify-message-card");
+
+  const backupMsg = h("p", { class: "note" });
+  const backupBtn = h("button", {
+    type: "button",
+    "data-testid": "node-backup-wallet-btn",
+    onclick: async () => {
+      backupBtn.disabled = true;
+      note(backupMsg, "Backing up…", true);
+      try {
+        const r = await post("/api/node-wallet/backup", {});
+        note(backupMsg, "Saved " + r.path + " in the node's data directory (owner-only).", true);
+      } catch (err) {
+        note(backupMsg, err.message, false);
+      } finally {
+        backupBtn.disabled = false;
+      }
+    },
+  }, "Back up wallet.dat");
+  const backupCard = h("div", { class: "card", "data-testid": "node-backup-card" }, h("h3", {}, "Back up"),
+    h("p", { class: "muted" }, "Writes a consistent copy of wallet.dat to backups/ in the node's data directory, readable only by the node's user. Copy it somewhere safe and offline."),
+    h("div", { class: "row" }, backupBtn), backupMsg);
+
   show(h("section", {}, localhostPasskeyHint(), h("h2", {}, "Wallet"),
     h("div", { class: "card" }, kv([["Balance", typeof balance === "number" ? balance + " DIVI" : balance],
-      ["Encryption", walletLabel(w)]])),
-    h("div", { class: "grid" }, receive, send)));
+      ["Encryption", walletLabel(w)]]), h("p", {}, h("a", { href: "#/staking" }, "Staking"), " · ", h("a", { href: "#/vaults" }, "Vaults"))),
+    h("div", { class: "grid" }, receive, send),
+    historyCard, addressesCard, utxoCard,
+    h("div", { class: "grid" }, signCard, verifyCard),
+    backupCard));
+}
+
+// --- staking -----------------------------------------------------------------
+
+async function stakingView() {
+  await refresh();
+  const w = state.wallet;
+  const [status, winfo, threshold, txs] = await Promise.all([
+    rpc("getstakingstatus").catch((e) => ({ error: e.message })),
+    rpc("getwalletinfo").catch((e) => ({ error: e.message })),
+    rpc("getstakesplitthreshold").catch((e) => ({ error: e.message })),
+    rpc("listtransactions", "*", 500, 0, true).catch(() => []),
+  ]);
+  const parts = [localhostPasskeyHint(), h("h2", {}, "Staking")];
+  if (flash) {
+    parts.push(h("p", { class: "note ok" }, flash));
+    flash = null;
+  }
+  const statusCard = h("div", { class: "card", "data-testid": "staking-status" }, h("h3", {}, "Status"),
+    status.error ? h("p", { class: "note err" }, status.error)
+      : kv(Object.entries(status).map(([k, v]) => [k, typeof v === "object" ? JSON.stringify(v) : v])));
+  const walletCard = h("div", { class: "card" }, h("h3", {}, "Wallet"), kv([
+    ["Encryption", walletLabel(w)],
+    ["Balance", winfo.balance !== undefined ? winfo.balance + " DIVI" : winfo.error],
+    ["Immature", winfo.immature_balance], ["Unconfirmed", winfo.unconfirmed_balance],
+    ["Unlocked until", winfo.unlocked_until ? new Date(winfo.unlocked_until * 1000).toLocaleString() : undefined],
+    ["Stake split threshold", threshold && threshold.error ? threshold.error : threshold + " DIVI"],
+  ]));
+  parts.push(h("div", { class: "grid" }, statusCard, walletCard));
+
+  if (w && w !== "unencrypted") {
+    if (w === "locked") parts.push(unlockForStakingForm(stakingView));
+    else {
+      parts.push(form("Lock the wallet", [], "Lock", async () => {
+        await rpc("walletlock");
+        flash = "Locked: the wallet no longer stakes.";
+        stakingView();
+      }, h("p", { class: "muted" }, "Staking needs the wallet unlocked (for staking only is enough).")));
+    }
+  } else if (w === "unencrypted") {
+    parts.push(h("p", { class: "note err" }, "Encrypt the wallet on the Security page first; this interface only reads until then."));
+  }
+
+  const toggleMsg = h("p", { class: "note" });
+  const setStaking = (on) => async () => {
+    try {
+      await rpc("setstaking", on);
+      flash = on ? "Staking enabled." : "Staking disabled.";
+      stakingView();
+    } catch (err) {
+      note(toggleMsg, err.message, false);
+    }
+  };
+  parts.push(h("div", { class: "card", "data-testid": "staking-toggle" }, h("h3", {}, "Staker"),
+    h("p", { class: "muted" }, "Switch this node's staker on or off for this run (the setting staking=0/1 decides it at start-up)."),
+    h("div", { class: "row wrap" },
+      h("button", { type: "button", "data-testid": "staking-enable", onclick: setStaking(true) }, "Enable staking"),
+      h("button", { type: "button", class: "secondary", "data-testid": "staking-disable", onclick: setStaking(false) }, "Disable staking")),
+    toggleMsg));
+
+  const locked = (m) => /unlock|locked|passphrase/i.test(m || "");
+  const slots = hostNodeSlots();
+  let splitPkBtn = null;
+  const applySplit = async (f, viaPasskey) => {
+    const v = val(f, "threshold").trim();
+    if (!/^\d+$/.test(v)) throw new Error("enter a whole number of DIVI");
+    try {
+      if (viaPasskey) throw new Error("locked");
+      await rpc("setstakesplitthreshold", Number(v));
+      return "The stake split threshold is " + v + " DIVI for this run.";
+    } catch (err) {
+      if (!locked(err.message)) throw err;
+      return withNodeUnlocked(f.elements.p ? f.elements.p.value : "", viaPasskey, async () => {
+        await rpc("setstakesplitthreshold", Number(v));
+        return "The stake split threshold is " + v + " DIVI for this run.";
+      });
+    }
+  };
+  const split = form("Stake split threshold", [
+    field("Threshold in whole DIVI", "threshold", "number", { min: 0, step: 1, value: typeof threshold === "number" ? threshold : "" }),
+    w && w !== "unlocked" && w !== "unencrypted" ? field("Wallet passphrase (only if the node asks for it)", "p", "password", { autocomplete: "current-password" }) : null,
+  ], "Set threshold", (f) => applySplit(f, false),
+  h("p", { class: "muted" }, "A stake whose value plus reward exceeds it is paid back as two outputs; smaller coins of the same address are combined up to half of it."),
+  w && w !== "unlocked" && w !== "unencrypted" && slots.length ? [
+    (splitPkBtn = h("button", {
+      type: "button", class: "secondary", "data-testid": "staking-split-passkey",
+      onclick: async () => {
+        splitPkBtn.disabled = true;
+        note(split._note, "Waiting for passkey…", true);
+        try { note(split._note, await applySplit(split, true), true); } catch (err) { note(split._note, err.message, false); }
+        finally { splitPkBtn.disabled = false; }
+      },
+    }, "Set with Passkey")),
+  ] : []);
+  split.setAttribute("data-testid", "staking-split-form");
+  parts.push(split);
+
+  const rewards = (Array.isArray(txs) ? txs : []).filter((t) => t.category === "stake" || t.category === "generate" || t.category === "immature")
+    .reverse().slice(0, 50);
+  parts.push(h("div", { class: "card", "data-testid": "staking-rewards" }, h("h3", {}, "Recent stake rewards"),
+    rewards.length ? table("staking-rewards-table", ["Time", "Kind", "Amount", "Confirmations", "Transaction"],
+      rewards.map((t) => [t.time ? new Date(t.time * 1000).toLocaleString() : "—", t.category, String(t.amount) + " DIVI",
+        String(t.confirmations ?? "—"), txLink(t.txid, shortId(t.txid))]))
+      : h("p", { class: "muted" }, "No stake rewards in the last 500 wallet transactions.")));
+
+  show(h("section", { "data-testid": "staking-view" }, parts));
+}
+
+// --- vaults ------------------------------------------------------------------
+
+async function vaultsView() {
+  await refresh();
+  const w = state.wallet;
+  if (w === null || w === undefined) {
+    return show(h("section", { "data-testid": "vaults-view" }, h("h2", {}, "Vaults"), h("p", { class: "muted" }, "The daemon has no wallet loaded.")));
+  }
+  const avail = await rpc("getcoinavailability", true).catch((e) => ({ error: e.message }));
+  const done = (what) => { setTimeout(vaultsView, 1200); return what; };
+  const amount = (f) => {
+    const a = val(f, "amount").trim();
+    if (!/^\d+(\.\d{1,8})?$/.test(a)) throw new Error("enter the amount in DIVI");
+    return Number(a);
+  };
+
+  const fund = signingForm("Fund a vault", [
+    field("Vault: manager address, or owner:manager", "target", "text", { spellcheck: "false", placeholder: "owner:manager or manager" }),
+    field("Amount in DIVI", "amount", "text", { inputmode: "decimal" }),
+  ], "Fund vault", async (f) => {
+    const target = val(f, "target").trim();
+    if (!target) throw new Error("enter the vault's manager address (and owner, if not a new one of yours)");
+    const r = await rpc("fundvault", target, amount(f));
+    return done("Funded. " + (r && r.txhash ? "Transaction " + r.txhash + "." : JSON.stringify(r)));
+  }, h("p", { class: "muted" }, "Sends coins to a vault script: the manager (a staking service) can stake them but never spend them; you, the owner, can reclaim them."),
+  "Fund with Passkey", "vault-fund-passkey");
+
+  const add = signingForm("Add a managed vault", [
+    field("Vault (owner:manager)", "vault", "text", { spellcheck: "false" }),
+    field("Funding transaction id", "txid", "text", { spellcheck: "false" }),
+  ], "Add vault", async (f) => {
+    const r = await rpc("addvault", val(f, "vault").trim(), val(f, "txid").trim());
+    return done("Added: " + JSON.stringify(r));
+  }, h("p", { class: "muted" }, "For a manager: start staking a vault an owner funded (needs -vault mode)."),
+  "Add with Passkey", "vault-add-passkey");
+
+  const remove = signingForm("Remove a managed vault", [
+    field("Vault (owner:manager)", "vault", "text", { spellcheck: "false" }),
+  ], "Remove vault", async (f) => {
+    const r = await rpc("removevault", val(f, "vault").trim());
+    return done("Removed: " + JSON.stringify(r));
+  }, null, "Remove with Passkey", "vault-remove-passkey");
+
+  const debit = signingForm("Debit a vault by name", [
+    field("Source vault (owner:manager)", "source", "text", { spellcheck: "false" }),
+    field("Destination address", "dest", "text", { spellcheck: "false" }),
+    field("Amount in DIVI", "amount", "text", { inputmode: "decimal" }),
+  ], "Debit vault", async (f) => {
+    if (!confirm("Move " + val(f, "amount") + " DIVI out of " + val(f, "source") + "?")) return "Not sent.";
+    const r = await rpc("debitvaultbyname", val(f, "source").trim(), val(f, "dest").trim(), amount(f));
+    return done("Sent. " + JSON.stringify(r));
+  }, h("p", { class: "muted" }, "For an owner: pay out of one vault to an address."),
+  "Debit with Passkey", "vault-debit-passkey");
+
+  const reclaim = signingForm("Reclaim vault funds", [
+    field("Destination address", "dest", "text", { spellcheck: "false" }),
+    field("Amount in DIVI", "amount", "text", { inputmode: "decimal" }),
+  ], "Reclaim", async (f) => {
+    if (!confirm("Reclaim " + val(f, "amount") + " DIVI from your vaults to " + val(f, "dest") + "?")) return "Not sent.";
+    const r = await rpc("reclaimvaultfunds", val(f, "dest").trim(), amount(f));
+    return done("Reclaimed. " + JSON.stringify(r));
+  }, h("p", { class: "muted" }, "For an owner: take coins back out of your vaults."),
+  "Reclaim with Passkey", "vault-reclaim-passkey");
+
+  show(h("section", { "data-testid": "vaults-view" }, localhostPasskeyHint(), h("h2", {}, "Vaults"),
+    h("p", { class: "muted" }, "Vaults let a staking service (the manager) stake your coins without being able to spend them."),
+    w === "unencrypted" ? h("p", { class: "note err" }, "Encrypt the wallet on the Security page before using vaults.") : null,
+    h("div", { class: "card", "data-testid": "vaults-availability" }, h("h3", {}, "Coin availability"),
+      avail.error ? h("p", { class: "note err" }, avail.error) : jsonView(avail, "vaults-availability-view")),
+    h("div", { class: "grid" }, fund, reclaim),
+    h("div", { class: "grid" }, add, remove, debit)));
+}
+
+// --- swaps -------------------------------------------------------------------
+
+async function swapsView() {
+  const s = await getJson("/api/swaps/status").catch((e) => ({ error: e.message, online: false, pairs: [] }));
+  const pairs = h("div", { class: "row wrap" }, (s.pairs || []).map((p) => h("span", { class: "badge" }, "DIVI ↔ " + p)));
+  const parts = [h("h2", {}, "Swaps"),
+    h("div", { class: "card", "data-testid": "swaps-status" }, h("h3", {}, "Local divi-swapd ",
+      h("span", { class: "badge " + (s.online ? "ok" : "err"), "data-testid": "swaps-online" }, s.online ? "running" : "offline")),
+    s.error ? h("p", { class: "note err" }, s.error) : null,
+    kv([["Endpoint", s.endpoint || (s.probed_ports ? "probed 127.0.0.1:" + s.probed_ports.join(", :") : undefined)]]),
+    s.online && s.health ? jsonView(s.health, "swaps-health") : null,
+    h("h4", {}, "Supported pairs"), pairs)];
+  if (s.online) {
+    parts.push(h("div", { class: "card", "data-testid": "swaps-offers" }, h("h3", {}, "Offers"), jsonView(s.offers, "swaps-offers-table")));
+    parts.push(h("div", { class: "card", "data-testid": "swaps-active" }, h("h3", {}, "Swaps"),
+      s.operator_token_required ? h("p", { class: "muted" }, "Listing swaps needs divi-swapd's operator token; use divi-swap on the command line.") : null,
+      jsonView(s.swaps, "swaps-active-table")));
+  } else {
+    parts.push(h("div", { class: "card", "data-testid": "swaps-offline" }, h("h3", {}, "Start divi-swapd"),
+      h("p", {}, "Atomic swaps run in a separate daemon, divi-swapd, beside this node. Start it on this machine, listening on loopback:"),
+      h("pre", { class: "out" }, "divi-swapd --config ~/.divi-swapd/swapd.toml\n# swapd.toml: listen = \"127.0.0.1:18480\", plus the node's RPC and the other chain's wallet"),
+      h("p", { class: "muted" }, "Then reload this page: it shows the daemon's health, its public offers and your swaps. Use divi-swap (the client) to take an offer.")));
+  }
+  show(h("section", { "data-testid": "swaps-view" }, parts));
 }
 
 // --- console -----------------------------------------------------------------

@@ -10,6 +10,11 @@ window.irondiviWallets = async function (ui) {
   const SAT = 100000000;
   const divi = (sat) => (Number(sat || 0) / SAT).toFixed(8).replace(/\.?0+$/, "") + " DIVI";
   const go = () => window.irondiviWallets(ui);
+  const short = (s) => (s && s.length > 20 ? s.slice(0, 10) + "…" + s.slice(-8) : s);
+  // Explorer deep links (app.js), with plain fallbacks
+  const txLink = (txid, label) => (ui.links ? ui.links.txLink(txid, label) : h("code", {}, label || txid));
+  const addrLink = (a) => (ui.links ? ui.links.addrLink(a) : h("code", {}, a));
+  const sentNote = (r) => h("span", {}, "Sent. Transaction ", txLink(r.txid), ", fee " + divi(r.fee) + ".");
 
   function localhostHint() {
     if (passkey && passkey.localhostPasskeyHint) return passkey.localhostPasskeyHint();
@@ -104,13 +109,13 @@ window.irondiviWallets = async function (ui) {
     const hostSlots = (w.passkeys || []).filter((s) => s.rp_id === window.location.hostname);
 
     const addrBox = h("div");
-    const showAddress = (a) => addrBox.replaceChildren(h("p", {}, h("code", { class: "uri" }, a)));
+    const showAddress = (a) => addrBox.replaceChildren(h("p", {}, addrLink(a)));
     const receive = form("Receive", [field("Passphrase (only once the first 20 addresses are used)", "p", "password", { autocomplete: "current-password" })], "New address", async (f) => {
       const r = await post("/api/wallets/" + id + "/address", { passphrase: f.elements.p ? val(f, "p") || null : null });
       showAddress(r.address);
       return "A fresh address of " + w.name + ".";
     }, h("div", {}, w.receive.length ? h("p", { class: "muted" }, "Last handed out:") : null,
-      w.receive.length ? h("p", {}, h("code", { class: "uri" }, w.receive[w.receive.length - 1])) : null));
+      w.receive.length ? h("p", {}, addrLink(w.receive[w.receive.length - 1])) : null));
     receive.append(addrBox);
 
     let sendPasskeyBtn = null;
@@ -126,7 +131,7 @@ window.irondiviWallets = async function (ui) {
       const r = await post("/api/wallets/" + id + "/send", { to, amount, fee_from_amount: f.elements.sub.checked, passphrase: p });
       f.elements.to.value = f.elements.amount.value = "";
       setTimeout(() => detail(id), 1500);
-      return "Sent. Transaction " + r.txid + ", fee " + divi(r.fee) + ".";
+      return sentNote(r);
     }, null, hostSlots.length ? [
       (sendPasskeyBtn = h("button", {
         type: "button",
@@ -151,7 +156,7 @@ window.irondiviWallets = async function (ui) {
             });
             unlocked.prf_output = "";
             send.elements.to.value = send.elements.amount.value = "";
-            note(send._note, "Sent. Transaction " + r.txid + ", fee " + divi(r.fee) + ".", true);
+            note(send._note, sentNote(r), true);
             setTimeout(() => detail(id), 1500);
           } catch (err) {
             note(send._note, err.message, false);
@@ -285,25 +290,129 @@ window.irondiviWallets = async function (ui) {
       ] : []);
     backup.append(wordsBox);
 
+    let deletePkBtn = null;
     const remove = form("Delete", [field("Passphrase", "p", "password", { autocomplete: "current-password" })], "Delete wallet", async (f) => {
       if (!confirm("Delete " + w.name + " from this node? Only its words or backup file bring it back.")) return "Kept.";
       await post("/api/wallets/" + id + "/delete", { passphrase: val(f, "p") });
       setTimeout(go, 500);
       return "Deleted.";
-    });
+    }, null, hostSlots.length ? [
+      (deletePkBtn = h("button", {
+        type: "button",
+        class: "secondary",
+        "data-testid": "wallet-delete-passkey",
+        onclick: async () => {
+          deletePkBtn.disabled = true;
+          try {
+            if (!confirm("Delete " + w.name + " from this node with Passkey? Only its words or backup file bring it back.")) {
+              note(remove._note, "Kept.", true);
+              return;
+            }
+            note(remove._note, "Waiting for passkey…", true);
+            const unlocked = await passkey.evalPrfPasskey(hostSlots);
+            await post("/api/wallets/" + id + "/delete", { passkey: unlocked });
+            unlocked.prf_output = "";
+            note(remove._note, "Deleted.", true);
+            setTimeout(go, 500);
+          } catch (err) {
+            note(remove._note, err.message, false);
+          } finally {
+            deletePkBtn.disabled = false;
+          }
+        },
+      }, "Delete with Passkey")),
+    ] : []);
+
+    // Sign & verify a message with one of this wallet's addresses
+    const allAddrs = (d.addresses ? [...(d.addresses.receive || []), ...(d.addresses.change || [])] : (w.receive || []));
+    const sigOut = h("textarea", { class: "sig", rows: 3, readonly: true, "data-testid": "wallet-signature-output" });
+    const listId = "wallet-sign-addrs-" + id;
+    const signBody = (f) => {
+      const address = val(f, "address").trim();
+      if (!address) throw new Error("enter an address of this wallet");
+      return { address, message: f.elements.message.value };
+    };
+    let signPkBtn = null;
+    const sign = form("Sign a message", [
+      h("label", { class: "field" }, h("span", {}, "Address"),
+        h("input", { name: "address", list: listId, spellcheck: "false", autocomplete: "off", value: allAddrs[0] || "" }),
+        h("datalist", { id: listId }, allAddrs.map((a) => h("option", { value: a })))),
+      h("label", { class: "field" }, h("span", {}, "Message"), h("textarea", { name: "message", rows: 3 })),
+      field(hostSlots.length ? "Passphrase (or use your passkey)" : "Passphrase", "p", "password", { autocomplete: "current-password" }),
+    ], "Sign", async (f) => {
+      if (!val(f, "p")) throw new Error("enter the wallet passphrase");
+      const r = await post("/api/wallets/" + id + "/signmessage", Object.assign(signBody(f), { passphrase: val(f, "p") }));
+      sigOut.value = r.signature;
+      return "Signed by " + r.address + ".";
+    }, h("p", { class: "muted" }, "A Divi signed message: the node's verifymessage (and Divi Core's) checks it."),
+    hostSlots.length ? [
+      (signPkBtn = h("button", {
+        type: "button",
+        class: "secondary",
+        "data-testid": "wallet-sign-passkey",
+        onclick: async () => {
+          signPkBtn.disabled = true;
+          note(sign._note, "Waiting for passkey…", true);
+          try {
+            const body = signBody(sign);
+            const unlocked = await passkey.evalPrfPasskey(hostSlots);
+            const r = await post("/api/wallets/" + id + "/signmessage", Object.assign(body, { passkey: unlocked }));
+            unlocked.prf_output = "";
+            sigOut.value = r.signature;
+            note(sign._note, "Signed by " + r.address + " with Passkey.", true);
+          } catch (err) {
+            note(sign._note, err.message, false);
+          } finally {
+            signPkBtn.disabled = false;
+          }
+        },
+      }, "Sign with Passkey")),
+    ] : []);
+    sign.setAttribute("data-testid", "wallet-sign-message-card");
+    sign.append(h("label", { class: "field" }, h("span", {}, "Signature"), sigOut));
+
+    const verify = ui.rpc ? form("Verify a message", [
+      field("Address", "address", "text", { spellcheck: "false" }),
+      field("Signature", "signature", "text", { spellcheck: "false" }),
+      h("label", { class: "field" }, h("span", {}, "Message"), h("textarea", { name: "message", rows: 3 })),
+    ], "Verify", async (f) => {
+      const ok = await ui.rpc("verifymessage", val(f, "address").trim(), val(f, "signature").trim(), f.elements.message.value);
+      if (!ok) throw new Error("The signature does not match that address and message.");
+      return "Valid: the address signed this message.";
+    }) : null;
+    if (verify) verify.setAttribute("data-testid", "wallet-verify-message-card");
 
     const history = d.history.length
-      ? h("table", { class: "table" }, h("tr", {}, h("th", {}, "Height"), h("th", {}, "Change"), h("th", {}, "Transaction")),
-        d.history.map((t) => h("tr", {}, h("td", {}, t.height > 0 ? t.height : "pending"), h("td", { class: t.satoshis < 0 ? "neg" : "pos" }, divi(t.satoshis)),
-          h("td", {}, h("code", {}, t.txid)))))
+      ? h("table", { class: "table", "data-testid": "wallet-history" },
+        h("thead", {}, h("tr", {}, h("th", {}, "Height"), h("th", {}, "Change"), h("th", {}, "Transaction"))),
+        h("tbody", {}, d.history.map((t) => h("tr", {}, h("td", {}, t.height > 0 ? t.height : "pending"), h("td", { class: t.satoshis < 0 ? "neg" : "pos" }, divi(t.satoshis)),
+          h("td", {}, txLink(t.txid))))))
       : h("p", { class: "muted" }, chainErr || "No transactions yet.");
+
+    const coinsList = Array.isArray(d.coins) ? d.coins : [];
+    const coins = h("details", { class: "card drawer", "data-testid": "wallet-coins" },
+      h("summary", {}, "Unspent coins (" + coinsList.length + ")"),
+      h("div", { class: "drawer-body" }, coinsList.length
+        ? h("table", { class: "table" },
+          h("thead", {}, h("tr", {}, h("th", {}, "Coin"), h("th", {}, "Address"), h("th", {}, "Value"), h("th", {}, "Height"))),
+          h("tbody", {}, coinsList.map((c) => h("tr", {}, h("td", {}, txLink(c.txid, short(c.txid)), ":" + c.vout),
+            h("td", {}, addrLink(c.address)), h("td", {}, divi(c.satoshis)), h("td", {}, c.height > 0 ? c.height : "pending")))))
+        : h("p", { class: "muted" }, chainErr || "No unspent coins.")));
+
+    const addrRows = (list, kind) => (list || []).map((a, i) => h("tr", {}, h("td", {}, kind + " " + i), h("td", {}, addrLink(a))));
+    const watched = h("details", { class: "card drawer", "data-testid": "wallet-addresses" },
+      h("summary", {}, "Watched addresses (" + allAddrs.length + ")"),
+      h("div", { class: "drawer-body" }, allAddrs.length
+        ? h("table", { class: "table" }, h("tbody", {},
+          d.addresses ? [...addrRows(d.addresses.receive, "receive"), ...addrRows(d.addresses.change, "change")] : addrRows(w.receive, "receive")))
+        : h("p", { class: "muted" }, "No addresses yet.")));
 
     const summaryRows = d.balance
       ? [
         ["Balance", divi(d.balance.confirmed + d.balance.pending)],
         ["Confirmed", divi(d.balance.confirmed)],
         ["Pending, in the mempool", divi(d.balance.pending)],
-        ["Coins", d.coins],
+        ["Coins", d.coins_count ?? coinsList.length],
         ["Addresses watched", w.derived],
         ["Passkeys", (w.passkeys || []).length],
       ]
@@ -323,6 +432,8 @@ window.irondiviWallets = async function (ui) {
       h("div", { class: "grid" }, receive, send),
       passkeysCard,
       h("div", { class: "card" }, h("h3", {}, "History"), history),
+      coins, watched,
+      h("div", { class: "grid" }, sign, verify),
       h("div", { class: "grid" }, backup, rename, remove)));
   }
 

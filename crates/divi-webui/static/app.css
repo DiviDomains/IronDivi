@@ -100,3 +100,12 @@ button.danger { background: var(--err); color: #fff; }
 .pk-item { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 8px; padding: 8px 12px; border-bottom: 1px solid var(--line); }
 .pk-item:last-child { border-bottom: 0; }
 .pk-divider { margin: 12px 0; border: 0; border-top: 1px solid var(--line); }
+
+/* Explorer, wallet tables and deep links */
+table.table { width: 100%; border-collapse: collapse; font-size: 13px; }
+table.table th, table.table td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+table.table th { color: var(--muted); font-weight: 600; }
+.table-wrap { overflow-x: auto; }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; overflow-wrap: anywhere; }
+.explorer-search .row input { flex: 1; }
+textarea.sig { min-height: 4em; }

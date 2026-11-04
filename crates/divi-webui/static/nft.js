@@ -383,18 +383,52 @@ async function unlocked(ctx, f, work) {
   const before = ctx.state.wallet;
   const p = f.elements.p ? f.elements.p.value : "";
   const locked = before === "locked" || before === "unlocked-for-staking";
-  if (locked && !p) throw new Error("enter the wallet passphrase");
-  if (locked) await ctx.rpc("walletpassphrase", p, 600, false);
+  // With the passphrase left blank, an enrolled node wallet passkey (WebAuthn
+  // PRF) unseals it on the node instead
+  const slots = nodeSlots(ctx);
+  let pk = null;
+  if (locked && !p) {
+    if (!slots.length || !ctx.passkey) throw new Error("enter the wallet passphrase");
+    pk = await ctx.passkey.evalPrfPasskey(slots);
+    await ctx.post("/api/node-wallet/unlock-passkey", {
+      slot_id: pk.slot_id, prf_output: pk.prf_output, staking_only: false, timeout: 600,
+    });
+  } else if (locked) {
+    await ctx.rpc("walletpassphrase", p, 600, false);
+  }
   let done;
   let restore = null;
   try {
     done = await work();
   } finally {
-    const back = before === "unlocked-for-staking" ? ctx.rpc("walletpassphrase", p, 0, true)
+    const back = before === "unlocked-for-staking"
+      ? (pk
+        ? ctx.post("/api/node-wallet/unlock-passkey", { slot_id: pk.slot_id, prf_output: pk.prf_output, staking_only: true, timeout: 0 })
+        : ctx.rpc("walletpassphrase", p, 0, true))
       : before === "locked" ? ctx.rpc("walletlock") : null;
+    if (pk) pk.prf_output = "";
     if (back) restore = await back.then(() => null, (e) => e.message);
   }
   return done + (restore ? " The wallet could not go back to " + before + ": " + restore : "");
+}
+
+/// Node wallet passkey slots enrolled for this host
+function nodeSlots(ctx) {
+  return ((ctx.state && ctx.state.node_passkeys) || []).filter((s) => s.rp_id === window.location.hostname);
+}
+
+/// A "… with Passkey" button for a signing form: it submits the form with the
+/// passphrase blank, so `unlocked` unseals the wallet with the passkey
+function passkeyButton(ctx, f, label, testid) {
+  const w = ctx.state.wallet;
+  if (!(w === "locked" || w === "unlocked-for-staking") || !nodeSlots(ctx).length || !ctx.passkey) return null;
+  return ctx.h("button", {
+    type: "button", class: "secondary", "data-testid": testid,
+    onclick: () => {
+      if (f.elements.p) f.elements.p.value = "";
+      f.requestSubmit();
+    },
+  }, label);
 }
 
 /// The wallet address with the most confirmed uncolored coin: the kit pays the
@@ -487,7 +521,17 @@ window.irondiviNft = async function (ctx) {
     : "Minting and listing run on testnet only for now: the NFT service this page uses is the testnet one.";
   /// The passphrase field for forms that sign, when the wallet cannot sign as it is
   const passField = () => w === "locked" || w === "unlocked-for-staking"
-    ? field("Wallet passphrase", "p", "password", { autocomplete: "current-password" }) : null;
+    ? field(nodeSlots(ctx).length ? "Wallet passphrase (or leave blank and use your passkey)" : "Wallet passphrase",
+      "p", "password", { autocomplete: "current-password" }) : null;
+  /// Put a "… with Passkey" button beside a signing form's submit button
+  const withPasskey = (f, label, testid) => {
+    const b = passkeyButton(ctx, f, label, testid);
+    if (b) {
+      b.disabled = !!offNet;
+      f.querySelector("button[type=submit]").after(b);
+    }
+    return f;
+  };
 
   if (!scan) {
     show(h("p", { class: "muted" }, "Reading the wallet for DT/1 assets…"));
@@ -628,7 +672,7 @@ window.irondiviNft = async function (ctx) {
       if (bps > 1000) note(warn, "Above 10 %: every resale owes the creator " + percent(bps) + " of the price (§7.4).", false);
       else warn.textContent = "";
     });
-    return stubbed(h, f, offNet);
+    return stubbed(h, withPasskey(f, "Mint with Passkey", "nft-mint-passkey"), offNet);
   }
 
   // --- list ---
@@ -657,7 +701,7 @@ window.irondiviNft = async function (ctx) {
     f.elements.asset.addEventListener("change", update);
     f.elements.price.addEventListener("input", update);
 
-    return [stubbed(h, f, offNet),
+    return [stubbed(h, withPasskey(f, "List with Passkey", "nft-list-passkey"), offNet),
       h("div", { class: "card" }, h("h3", {}, "Open listings"),
         h("p", { class: "muted" }, "Signed listings go to the NFT service's order book, not to the Divi chain. ",
           "This page posts them; it does not show the book yet."))];

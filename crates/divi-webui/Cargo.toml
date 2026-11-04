@@ -6,6 +6,7 @@ edition.workspace = true
 description = "IronDivi's optional web interface (-webui)"
 
 [dependencies]
+divi-crypto = { workspace = true }
 divi-rpc = { workspace = true }
 divi-electrum = { workspace = true }
 divi-wallet = { workspace = true }
