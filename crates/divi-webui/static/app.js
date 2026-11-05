@@ -290,14 +290,117 @@ function banner() {
   }
 }
 
+// --- theme and hierarchy ----------------------------------------------------
+
+const THEME_KEY = "irondivi_theme";
+let activeSpace = "treasury";
+let activeDeck = "personal";
+
+function getTheme() {
+  return localStorage.getItem(THEME_KEY) || "zen";
+}
+
+function setTheme(theme) {
+  const valid = ["zen", "sanctuary", "ledger", "dock", "modular"];
+  if (!valid.includes(theme)) theme = "zen";
+  localStorage.setItem(THEME_KEY, theme);
+  document.documentElement.setAttribute("data-theme", theme);
+  const sel = document.getElementById("theme-select");
+  if (sel && sel.value !== theme) sel.value = theme;
+  updateNavHierarchy();
+}
+
+function updateNavHierarchy() {
+  const theme = getTheme();
+  const raw = location.hash.replace(/^#\/?/, "");
+  const [root] = raw.split("/");
+
+  const spaceTabs = document.getElementById("space-tabs");
+  const deckToggle = document.getElementById("ledger-deck-toggle");
+
+  if (theme === "zen" || theme === "sanctuary" || theme === "modular") {
+    if (spaceTabs) spaceTabs.hidden = !state.signed_in;
+    if (deckToggle) deckToggle.hidden = true;
+
+    const treasuryRoutes = ["wallet", "wallets", "swaps", "nft"];
+    const networkRoutes = ["", "staking", "sidechains", "vaults", "explorer"];
+    const systemRoutes = ["security", "settings", "logs", "console"];
+    if (treasuryRoutes.includes(root)) activeSpace = "treasury";
+    else if (networkRoutes.includes(root)) activeSpace = "network";
+    else if (systemRoutes.includes(root)) activeSpace = "system";
+
+    document.querySelectorAll(".space-tab").forEach((tab) => {
+      tab.classList.toggle("on", tab.getAttribute("data-space") === activeSpace);
+    });
+
+    if (theme === "zen") {
+      document.querySelectorAll("#nav a").forEach((a) => {
+        const grp = a.getAttribute("data-group");
+        a.style.display = grp === activeSpace ? "" : "none";
+      });
+    } else {
+      document.querySelectorAll("#nav a").forEach((a) => {
+        a.style.display = "";
+      });
+    }
+  } else if (theme === "ledger") {
+    if (spaceTabs) spaceTabs.hidden = true;
+    if (deckToggle) deckToggle.hidden = !state.signed_in;
+
+    document.querySelectorAll(".deck-btn").forEach((btn) => {
+      btn.classList.toggle("on", btn.getAttribute("data-deck") === activeDeck);
+    });
+
+    const opsRoutes = ["explorer", "security", "settings", "logs", "console", "sidechains", "vaults"];
+    if (opsRoutes.includes(root)) activeDeck = "ops";
+
+    document.querySelectorAll("#nav a").forEach((a) => {
+      const isOps = ["security", "settings", "logs", "console", "explorer", "sidechains", "vaults"].some(
+        (p) => a.getAttribute("href") === "#/" + p
+      );
+      a.style.display = activeDeck === "personal" && isOps ? "none" : "";
+    });
+  } else {
+    // dock
+    if (spaceTabs) spaceTabs.hidden = true;
+    if (deckToggle) deckToggle.hidden = true;
+    document.querySelectorAll("#nav a").forEach((a) => {
+      a.style.display = "";
+    });
+  }
+}
+
 // --- state and routing -------------------------------------------------------
 
 async function refresh() {
   state = await getJson("/api/state").catch(() => ({}));
-  document.getElementById("net").textContent =
-    [state.chain_mode === "privatedivi" ? "PrivateDivi" : "Divi", state.network].filter(Boolean).join(" · ");
+  const isTestnet = state.network === "testnet";
+  document.body.classList.toggle("is-testnet", isTestnet);
+  const netEl = document.getElementById("net");
+  netEl.textContent = [state.chain_mode === "privatedivi" ? "PrivateDivi" : "Divi", state.network].filter(Boolean).join(" · ");
+  netEl.className = "badge" + (isTestnet ? " warn" : " live");
   document.getElementById("nav").hidden = !state.signed_in;
   document.getElementById("logout").hidden = !state.signed_in;
+  const themeSelect = document.getElementById("theme-select");
+  if (themeSelect) {
+    themeSelect.value = getTheme();
+    themeSelect.onchange = (e) => setTheme(e.target.value);
+  }
+  document.querySelectorAll(".space-tab").forEach((tab) => {
+    tab.onclick = () => {
+      activeSpace = tab.getAttribute("data-space");
+      document.querySelectorAll(".space-tab").forEach((t) => t.classList.toggle("on", t === tab));
+      updateNavHierarchy();
+    };
+  });
+  document.querySelectorAll(".deck-btn").forEach((btn) => {
+    btn.onclick = () => {
+      activeDeck = btn.getAttribute("data-deck");
+      document.querySelectorAll(".deck-btn").forEach((b) => b.classList.toggle("on", b === btn));
+      updateNavHierarchy();
+    };
+  });
+  setTheme(getTheme());
   banner();
 }
 
@@ -326,6 +429,7 @@ async function route() {
   clearTimeout(logTimer);
   document.querySelectorAll("#nav a").forEach((a) =>
     a.classList.toggle("on", a.getAttribute("href") === "#/" + root));
+  updateNavHierarchy();
   try {
     await view(rest);
   } catch (err) {
@@ -1022,10 +1126,46 @@ async function settings() {
   });
   msg.id = "settings-msg";
 
+  const curTheme = getTheme();
+  const themeCardGrid = h("div", { class: "theme-config-grid" });
+  const themeOptions = [
+    { id: "zen", name: "Zen Spaces", designer: "Camille Chen", desc: "Serene uncluttered progressive disclosure with spacious calm (Default)." },
+    { id: "sanctuary", name: "Tiered Sanctuary", designer: "Astrid Lindholm", desc: "Structured 3-tier hierarchy: Treasury, Network & System." },
+    { id: "ledger", name: "Calm Ledger", designer: "Marcus Vance", desc: "Human-first conversational reassurance with Personal / Node Ops dual deck." },
+    { id: "dock", name: "Sovereign Dock", designer: "Dr. Elena Rostova", desc: "Compact icon rail, dense telemetry, and command clarity." },
+    { id: "modular", name: "Modular Deck", designer: "Torbjörn Berg", desc: "Tactile instrument control units with distinct operational states." },
+  ];
+
+  themeOptions.forEach((opt) => {
+    const card = h("div", {
+      class: "theme-card" + (curTheme === opt.id ? " active" : ""),
+      onclick: () => {
+        setTheme(opt.id);
+        themeCardGrid.querySelectorAll(".theme-card").forEach((c) => c.classList.remove("active"));
+        card.classList.add("active");
+      },
+    },
+      h("div", { class: "theme-card-head" },
+        h("span", { class: "theme-card-name" }, opt.name),
+        h("span", { class: "badge" }, opt.id === "zen" ? "Default" : "Look")
+      ),
+      h("div", { class: "theme-card-designer" }, "Designer: " + opt.designer),
+      h("p", { class: "theme-card-desc" }, opt.desc)
+    );
+    themeCardGrid.append(card);
+  });
+
+  const themeSection = h("div", { class: "card" },
+    h("h3", {}, "Interface Design & Look"),
+    h("p", { class: "muted small" }, "Select which interface look to use. Your choice is saved and active immediately across all pages."),
+    themeCardGrid
+  );
+
   const other = s.file.other.length ? h("p", { class: "muted" },
     "Also in the file, not edited here: " + s.file.other.join(", ")) : null;
   show(h("section", {},
     h("h2", {}, "Settings"),
+    themeSection,
     h("p", { class: "muted" }, "File: ", h("code", {}, s.conf), " (" + s.format + "). A backup of the old file is kept beside it as ",
       h("code", {}, ".bak"), "."),
     locked ? h("p", { class: "note err" }, "Encrypt the wallet on the Security page before changing settings.") : null,

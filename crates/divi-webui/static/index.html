@@ -1,8 +1,9 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="zen">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#0f0f1a">
 <title>IronDivi</title>
 <link rel="stylesheet" href="/app.css">
 <script src="/qrcode.js" defer></script>
@@ -15,24 +16,80 @@
 </head>
 <body>
 <header class="top">
-  <span class="brand">IronDivi</span>
+  <!-- Authentic Brand Mark & Wordmark -->
+  <a href="#/" class="brand-link" title="IronDivi Full Node">
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="28" height="28" class="brand-shield" role="img" aria-label="IronDivi">
+      <defs>
+        <linearGradient id="id-iron-rim" x1="12" y1="4" x2="52" y2="60" gradientUnits="userSpaceOnUse">
+          <stop offset="0" stop-color="#e6e9ed"/>
+          <stop offset="0.5" stop-color="#a3aab2"/>
+          <stop offset="1" stop-color="#5f6770"/>
+        </linearGradient>
+      </defs>
+      <path d="M32 2.5 L58 11.5 V30 C58 45.5 46.5 55.8 32 62 C17.5 55.8 6 45.5 6 30 V11.5 Z" fill="url(#id-iron-rim)"/>
+      <path id="shield-core" d="M32 10 L51 16.6 V30 C51 41.4 42.8 49.3 32 54.2 C21.2 49.3 13 41.4 13 30 V16.6 Z" fill="#E94560" stroke="#262b31" stroke-width="1.2"/>
+      <path d="M18.5 17 H30.6 C39 17 43.8 23 43.8 30.5 C43.8 38 39 44 30.6 44 H20 V30.2 H28 V36.4 H30.4 C33.8 36.4 35.7 34.2 35.7 30.5 C35.7 26.8 33.8 24.6 30.4 24.6 H26.6 C22.8 24.6 19.9 21.6 18.5 17 Z" fill="#ffffff"/>
+    </svg>
+    <span class="brand"><span class="iron-part">Iron</span><span class="divi-part">Divi</span></span>
+  </a>
   <span id="net" class="badge"></span>
+
+  <!-- Category Tabs for Zen & Sanctuary Themes -->
+  <div id="space-tabs" class="space-tabs" hidden>
+    <button type="button" data-space="treasury" class="space-tab on">Treasury</button>
+    <button type="button" data-space="network" class="space-tab">Network</button>
+    <button type="button" data-space="system" class="space-tab">System</button>
+  </div>
+
+  <!-- Dual Deck Toggle for Calm Ledger Theme -->
+  <div id="ledger-deck-toggle" class="ledger-deck-toggle" hidden>
+    <button type="button" data-deck="personal" class="deck-btn on">Personal</button>
+    <button type="button" data-deck="ops" class="deck-btn">Node Ops</button>
+  </div>
+
+  <!-- Main Navigation Links (Categorized for Hierarchical Filtering) -->
   <nav id="nav" hidden>
-    <a href="#/">Dashboard</a>
-    <a href="#/security">Security</a>
-    <a href="#/settings">Settings</a>
-    <a href="#/wallet">Wallet</a>
-    <a href="#/wallets">Wallets</a>
-    <a href="#/explorer">Explorer</a>
-    <a href="#/staking">Staking</a>
-    <a href="#/sidechains">Sidechains</a>
-    <a href="#/vaults">Vaults</a>
-    <a href="#/swaps">Swaps</a>
-    <a href="#/nft">NFTs</a>
-    <a href="#/logs">Logs</a>
-    <a href="#/console">Console</a>
+    <!-- Treasury Group -->
+    <a href="#/wallet" data-group="treasury">Wallet</a>
+    <a href="#/wallets" data-group="treasury">Wallets</a>
+    <a href="#/swaps" data-group="treasury">Swaps</a>
+    <a href="#/nft" data-group="treasury">NFTs</a>
+
+    <!-- Network Group -->
+    <a href="#/" data-group="network">Dashboard</a>
+    <a href="#/staking" data-group="network">Staking</a>
+    <a href="#/sidechains" data-group="network">Sidechains</a>
+    <a href="#/vaults" data-group="network">Vaults</a>
+    <a href="#/explorer" data-group="network">Explorer</a>
+
+    <!-- System Group -->
+    <a href="#/security" data-group="system">Security</a>
+    <a href="#/settings" data-group="system">Settings</a>
+    <a href="#/logs" data-group="system">Logs</a>
+    <a href="#/console" data-group="system">Console</a>
   </nav>
-  <button id="logout" class="link" hidden>Sign out</button>
+
+  <!-- Right Header Utility Cluster -->
+  <div class="top-right">
+    <!-- Enclave Status Indicator -->
+    <div id="enclave-badge" class="enclave-badge" title="Hardware Enclave Passkey Active">
+      <span class="enclave-dot"></span>
+      <span class="enclave-label">Enclave Sealed</span>
+    </div>
+
+    <!-- Interface Design Look Selector -->
+    <div class="theme-select-wrap">
+      <select id="theme-select" title="Switch Design Look">
+        <option value="zen">Look: Zen Spaces (Default)</option>
+        <option value="sanctuary">Look: Tiered Sanctuary</option>
+        <option value="ledger">Look: Calm Ledger</option>
+        <option value="dock">Look: Sovereign Dock</option>
+        <option value="modular">Look: Modular Deck</option>
+      </select>
+    </div>
+
+    <button id="logout" class="link" hidden>Sign out</button>
+  </div>
 </header>
 <div id="banner" class="banner" hidden></div>
 <main id="main"><p class="muted">Loading…</p></main>
