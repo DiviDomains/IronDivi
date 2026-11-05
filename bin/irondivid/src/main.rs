@@ -3764,6 +3764,8 @@ async fn run_daemon(
         let spork_for_rpc = node.spork_manager().clone();
         let history_for_rpc = node.history_fetcher();
         let block_sync_for_rpc = node.block_sync().clone();
+        let mempool_for_tx = node.mempool().clone();
+        let tx_relay_for_tx = node.tx_relay().clone();
         let datadir_for_mn = config.data_dir.clone();
         let mnconf_for_rpc = mn_options.conf_path.clone();
         let pm_for_mn = node.peer_manager().clone();
@@ -3833,6 +3835,25 @@ async fn run_daemon(
                         }
                     }));
                     info!("Masternode manager initialized");
+
+                    // Wire up transaction submission (mempool + relay) so raw
+                    // transaction RPCs (sendrawtransaction) and Electrum
+                    // blockchain.transaction.broadcast work under -disablewallet.
+                    let mempool_for_submit = mempool_for_tx.clone();
+                    let tx_relay_for_submit = tx_relay_for_tx.clone();
+                    rpc_server.wallet().set_tx_submit(Arc::new(move |tx: Transaction| {
+                        let txid = tx.txid();
+                        mempool_for_submit
+                            .add(tx, Amount::ZERO)
+                            .map_err(submit_error)?;
+                        let relay = tx_relay_for_submit.clone();
+                        let txid_copy = txid;
+                        tasks::spawn_supervised("tx-announce", async move {
+                            relay.announce_tx(txid_copy).await;
+                        });
+                        Ok(txid)
+                    }));
+                    debug!("Transaction submission callback configured (-disablewallet)");
                 }
             ) => {
                 match result {

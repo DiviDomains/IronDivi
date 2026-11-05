@@ -379,12 +379,33 @@ fn an_unencrypted_wallet_is_warned_about_unless_allowed() {
 }
 
 /// -disablewallet: Divi Core logs "Wallet disabled!" where it would load the
-/// wallet (init.cpp:1546-1547)
+/// wallet (init.cpp:1546-1547), and raw-transaction submission
+/// (sendrawtransaction / Electrum blockchain.transaction.broadcast) still
+/// reaches the mempool validator instead of failing with "Transaction
+/// submission not configured".
 #[test]
 fn disablewallet_is_logged_as_divid_logs_it() {
     let dir = tempfile::tempdir().unwrap();
     let (rpc_port, p2p_port) = (free_port(), free_port());
     let node = start(dir.path(), rpc_port, p2p_port, &["-disablewallet"]);
+    let raw = "010000000111111111111111111111111111111111111111111111111111111111111111110000000000ffffffff0100e1f505000000001976a914999999999999999999999999999999999999999988ac00000000";
+    let submit = try_rpc(
+        rpc_port,
+        "sendrawtransaction",
+        &json!([raw]),
+        Duration::from_secs(30),
+    )
+    .expect("sendrawtransaction reply");
+    let err_msg = submit["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        !err_msg.contains("Transaction submission not configured"),
+        "sendrawtransaction under -disablewallet must wire tx_submit: {submit}"
+    );
+    assert_eq!(
+        submit["error"]["code"].as_i64(),
+        Some(-26),
+        "expected mempool rejection (-26), got: {submit}"
+    );
     stop(node, rpc_port);
     assert!(
         log(dir.path()).contains("Wallet disabled!"),
