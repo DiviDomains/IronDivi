@@ -293,8 +293,42 @@ function banner() {
 // --- theme and hierarchy ----------------------------------------------------
 
 const THEME_KEY = "irondivi_theme";
-let activeSpace = "treasury";
+let activeSpace = "network";
 let activeDeck = "personal";
+
+const spaceDefinitions = {
+  treasury: {
+    title: "💎 Treasury Space",
+    primary: "#/wallet",
+    links: [
+      { href: "#/wallet", label: "Node Wallet", root: "wallet" },
+      { href: "#/wallets", label: "HD Multi-Wallets", root: "wallets" },
+      { href: "#/swaps", label: "Atomic Swaps", root: "swaps" },
+      { href: "#/nft", label: "NFTs & Market", root: "nft" },
+    ],
+  },
+  network: {
+    title: "🌐 Network Space",
+    primary: "#/",
+    links: [
+      { href: "#/", label: "Dashboard", root: "" },
+      { href: "#/staking", label: "Staking", root: "staking" },
+      { href: "#/sidechains", label: "Sidechains", root: "sidechains" },
+      { href: "#/vaults", label: "Vaults", root: "vaults" },
+      { href: "#/explorer", label: "Block Explorer", root: "explorer" },
+    ],
+  },
+  system: {
+    title: "🛡️ System Space",
+    primary: "#/security",
+    links: [
+      { href: "#/security", label: "Security & Passkeys", root: "security" },
+      { href: "#/settings", label: "Node Settings", root: "settings" },
+      { href: "#/logs", label: "System Logs", root: "logs" },
+      { href: "#/console", label: "RPC Console", root: "console" },
+    ],
+  },
+};
 
 function getTheme() {
   return localStorage.getItem(THEME_KEY) || "zen";
@@ -317,57 +351,135 @@ function updateNavHierarchy() {
 
   const spaceTabs = document.getElementById("space-tabs");
   const deckToggle = document.getElementById("ledger-deck-toggle");
+  const subnav = document.getElementById("subnav");
+  const subnavTitle = document.getElementById("subnav-space-title");
+  const subnavLinks = document.getElementById("subnav-links");
+  const nav = document.getElementById("nav");
 
-  if (theme === "zen" || theme === "sanctuary" || theme === "modular") {
+  // Determine active space from current route
+  const treasuryRoutes = ["wallet", "wallets", "swaps", "nft"];
+  const networkRoutes = ["", "staking", "sidechains", "vaults", "explorer"];
+  const systemRoutes = ["security", "settings", "logs", "console"];
+  if (treasuryRoutes.includes(root)) activeSpace = "treasury";
+  else if (networkRoutes.includes(root)) activeSpace = "network";
+  else if (systemRoutes.includes(root)) activeSpace = "system";
+
+  // Space tabs on/off
+  document.querySelectorAll(".space-tab").forEach((tab) => {
+    tab.classList.toggle("on", tab.getAttribute("data-space") === activeSpace);
+  });
+
+  if (theme === "zen" || theme === "sanctuary") {
     if (spaceTabs) spaceTabs.hidden = !state.signed_in;
     if (deckToggle) deckToggle.hidden = true;
+    if (nav) nav.hidden = true; // Use sleek subnav instead of flat nav
 
-    const treasuryRoutes = ["wallet", "wallets", "swaps", "nft"];
-    const networkRoutes = ["", "staking", "sidechains", "vaults", "explorer"];
-    const systemRoutes = ["security", "settings", "logs", "console"];
-    if (treasuryRoutes.includes(root)) activeSpace = "treasury";
-    else if (networkRoutes.includes(root)) activeSpace = "network";
-    else if (systemRoutes.includes(root)) activeSpace = "system";
-
-    document.querySelectorAll(".space-tab").forEach((tab) => {
-      tab.classList.toggle("on", tab.getAttribute("data-space") === activeSpace);
-    });
-
-    if (theme === "zen") {
-      document.querySelectorAll("#nav a").forEach((a) => {
-        const grp = a.getAttribute("data-group");
-        a.style.display = grp === activeSpace ? "" : "none";
-      });
-    } else {
-      document.querySelectorAll("#nav a").forEach((a) => {
-        a.style.display = "";
-      });
+    if (subnav && subnavTitle && subnavLinks) {
+      subnav.hidden = !state.signed_in;
+      const def = spaceDefinitions[activeSpace] || spaceDefinitions.network;
+      subnavTitle.textContent = def.title;
+      subnavLinks.replaceChildren(...def.links.map((l) => {
+        return h("a", {
+          href: l.href,
+          class: "subnav-link" + (root === l.root ? " on" : ""),
+        }, l.label);
+      }));
     }
   } else if (theme === "ledger") {
     if (spaceTabs) spaceTabs.hidden = true;
     if (deckToggle) deckToggle.hidden = !state.signed_in;
+    if (subnav) subnav.hidden = true;
+    if (nav) nav.hidden = !state.signed_in;
+
+    const opsRoutes = ["explorer", "security", "settings", "logs", "console", "sidechains", "vaults"];
+    if (opsRoutes.includes(root)) activeDeck = "ops";
 
     document.querySelectorAll(".deck-btn").forEach((btn) => {
       btn.classList.toggle("on", btn.getAttribute("data-deck") === activeDeck);
     });
 
-    const opsRoutes = ["explorer", "security", "settings", "logs", "console", "sidechains", "vaults"];
-    if (opsRoutes.includes(root)) activeDeck = "ops";
-
     document.querySelectorAll("#nav a").forEach((a) => {
-      const isOps = ["security", "settings", "logs", "console", "explorer", "sidechains", "vaults"].some(
-        (p) => a.getAttribute("href") === "#/" + p
-      );
+      const isOps = opsRoutes.some((p) => a.getAttribute("href") === "#/" + p);
       a.style.display = activeDeck === "personal" && isOps ? "none" : "";
     });
   } else {
-    // dock
+    // dock & modular
     if (spaceTabs) spaceTabs.hidden = true;
     if (deckToggle) deckToggle.hidden = true;
-    document.querySelectorAll("#nav a").forEach((a) => {
-      a.style.display = "";
-    });
+    if (subnav) subnav.hidden = true;
+    if (nav) {
+      nav.hidden = !state.signed_in;
+      document.querySelectorAll("#nav a").forEach((a) => {
+        a.style.display = "";
+      });
+    }
   }
+}
+
+// --- network drawer & profile switcher ---------------------------------------
+
+function setupNetworkDrawer() {
+  const netBtn = document.getElementById("net");
+  const netDrawer = document.getElementById("net-drawer");
+  const closeBtn = document.getElementById("close-net-drawer");
+  if (!netBtn || !netDrawer) return;
+
+  netBtn.onclick = async (e) => {
+    e.preventDefault();
+    netDrawer.hidden = !netDrawer.hidden;
+    if (!netDrawer.hidden) {
+      const [info, chain] = await Promise.all([
+        rpc("getinfo").catch(() => ({})),
+        rpc("getblockchaininfo").catch(() => ({})),
+      ]);
+      const activeNet = state.network || "regtest";
+      const height = chain.blocks ?? info.blocks ?? "—";
+      const peers = info.connections ?? "—";
+
+      const elNet = document.getElementById("drawer-active-net");
+      if (elNet) elNet.textContent = activeNet.toUpperCase();
+      const elHeight = document.getElementById("drawer-block-height");
+      if (elHeight) elHeight.textContent = String(height);
+      const elPeers = document.getElementById("drawer-peer-count");
+      if (elPeers) elPeers.textContent = String(peers);
+
+      ["regtest", "testnet", "mainnet"].forEach((n) => {
+        const b = document.getElementById("net-switch-" + n);
+        if (b) {
+          b.classList.toggle("active", n === activeNet);
+          b.textContent = (n === activeNet ? "● " : "○ ") + n.charAt(0).toUpperCase() + n.slice(1);
+        }
+      });
+    }
+  };
+
+  if (closeBtn) closeBtn.onclick = () => { netDrawer.hidden = true; };
+
+  async function doSwitchNetwork(targetNet) {
+    const feedback = document.getElementById("net-switch-feedback");
+    if (!feedback) return;
+    note(feedback, "Saving " + targetNet + " profile to divi.conf…", true);
+    try {
+      const regtestVal = targetNet === "regtest" ? ["1"] : [];
+      const testnetVal = targetNet === "testnet" ? ["1"] : [];
+      await post("/api/settings", {
+        edits: {
+          regtest: regtestVal,
+          testnet: testnetVal,
+        },
+      });
+      note(feedback, "Saved to divi.conf! Restart the irondivid daemon to run on " + targetNet + ".", true);
+    } catch (err) {
+      note(feedback, err.message, false);
+    }
+  }
+
+  const bReg = document.getElementById("net-switch-regtest");
+  if (bReg) bReg.onclick = () => doSwitchNetwork("regtest");
+  const bTest = document.getElementById("net-switch-testnet");
+  if (bTest) bTest.onclick = () => doSwitchNetwork("testnet");
+  const bMain = document.getElementById("net-switch-mainnet");
+  if (bMain) bMain.onclick = () => doSwitchNetwork("mainnet");
 }
 
 // --- state and routing -------------------------------------------------------
@@ -376,23 +488,32 @@ async function refresh() {
   state = await getJson("/api/state").catch(() => ({}));
   const isTestnet = state.network === "testnet";
   document.body.classList.toggle("is-testnet", isTestnet);
-  const netEl = document.getElementById("net");
-  netEl.textContent = [state.chain_mode === "privatedivi" ? "PrivateDivi" : "Divi", state.network].filter(Boolean).join(" · ");
-  netEl.className = "badge" + (isTestnet ? " warn" : " live");
-  document.getElementById("nav").hidden = !state.signed_in;
+  const netLabel = document.getElementById("net-label");
+  if (netLabel) {
+    netLabel.textContent = [state.chain_mode === "privatedivi" ? "PrivateDivi" : "Divi", state.network].filter(Boolean).join(" · ");
+  }
+  const netBtn = document.getElementById("net");
+  if (netBtn) {
+    netBtn.className = "badge net-badge" + (isTestnet ? " warn" : " live");
+  }
   document.getElementById("logout").hidden = !state.signed_in;
   const themeSelect = document.getElementById("theme-select");
   if (themeSelect) {
     themeSelect.value = getTheme();
     themeSelect.onchange = (e) => setTheme(e.target.value);
   }
+
+  // Space switcher tabs: click navigates directly to that space
   document.querySelectorAll(".space-tab").forEach((tab) => {
     tab.onclick = () => {
-      activeSpace = tab.getAttribute("data-space");
-      document.querySelectorAll(".space-tab").forEach((t) => t.classList.toggle("on", t === tab));
-      updateNavHierarchy();
+      const s = tab.getAttribute("data-space");
+      activeSpace = s;
+      const def = spaceDefinitions[s] || spaceDefinitions.network;
+      location.hash = def.primary;
     };
   });
+
+  // Deck toggle buttons (Personal vs Node Ops)
   document.querySelectorAll(".deck-btn").forEach((btn) => {
     btn.onclick = () => {
       activeDeck = btn.getAttribute("data-deck");
@@ -400,6 +521,8 @@ async function refresh() {
       updateNavHierarchy();
     };
   });
+
+  setupNetworkDrawer();
   setTheme(getTheme());
   banner();
 }
@@ -724,6 +847,55 @@ async function dashboard() {
     rpc("getblockchaininfo").catch((e) => ({ error: e.message })),
     rpc("getstakingstatus").catch((e) => ({ error: e.message })),
   ]);
+
+  const spacesHub = h("div", { class: "spaces-hub" },
+    h("div", { class: "card space-hub-card" },
+      h("div", { class: "space-hub-head" },
+        h("span", { class: "space-hub-icon" }, "💎"),
+        h("div", {},
+          h("h4", {}, "Treasury"),
+          h("p", { class: "muted small" }, "Balances, wallets, atomic swaps, and NFT collectibles")
+        )
+      ),
+      h("div", { class: "space-hub-links" },
+        h("a", { href: "#/wallet", class: "hub-btn" }, "Node Wallet"),
+        h("a", { href: "#/wallets", class: "hub-btn" }, "HD Multi-Wallets"),
+        h("a", { href: "#/swaps", class: "hub-btn" }, "Atomic Swaps"),
+        h("a", { href: "#/nft", class: "hub-btn" }, "NFTs & Market")
+      )
+    ),
+    h("div", { class: "card space-hub-card" },
+      h("div", { class: "space-hub-head" },
+        h("span", { class: "space-hub-icon" }, "🌐"),
+        h("div", {},
+          h("h4", {}, "Network & Consensus"),
+          h("p", { class: "muted small" }, "PoS minting, sidechain bridges, vaults, and blocks")
+        )
+      ),
+      h("div", { class: "space-hub-links" },
+        h("a", { href: "#/staking", class: "hub-btn" }, "Staking Engine"),
+        h("a", { href: "#/sidechains", class: "hub-btn" }, "Sidechain Hub"),
+        h("a", { href: "#/vaults", class: "hub-btn" }, "Vaults"),
+        h("a", { href: "#/explorer", class: "hub-btn" }, "Block Explorer")
+      )
+    ),
+    h("div", { class: "card space-hub-card" },
+      h("div", { class: "space-hub-head" },
+        h("span", { class: "space-hub-icon" }, "🛡️"),
+        h("div", {},
+          h("h4", {}, "System & Node Engine"),
+          h("p", { class: "muted small" }, "Hardware passkeys, node configuration, and diagnostics")
+        )
+      ),
+      h("div", { class: "space-hub-links" },
+        h("a", { href: "#/security", class: "hub-btn" }, "Security & Passkeys"),
+        h("a", { href: "#/settings", class: "hub-btn" }, "Node Settings"),
+        h("a", { href: "#/logs", class: "hub-btn" }, "System Logs"),
+        h("a", { href: "#/console", class: "hub-btn" }, "RPC Console")
+      )
+    )
+  );
+
   show(h("section", {},
     h("h2", {}, "Dashboard"),
     h("div", { class: "grid" },
@@ -737,11 +909,14 @@ async function dashboard() {
       ])),
       h("div", { class: "card" }, h("h3", {}, "Wallet"), kv([
         ["Encryption", walletLabel(state.wallet)], ["Balance", info.balance],
-      ]), h("p", {}, h("a", { href: "#/security" }, "Security settings"))),
+      ]), h("p", {}, h("a", { href: "#/security", class: "btn secondary small" }, "Manage Passkeys & Security →"))),
       h("div", { class: "card" }, h("h3", {}, "Staking"), staking.error ? h("p", { class: "muted" }, staking.error) :
         kv(Object.entries(staking).map(([k, v]) => [k, typeof v === "object" ? JSON.stringify(v) : v])),
-      h("p", {}, h("a", { href: "#/staking" }, "Staking"), " · ", h("a", { href: "#/explorer" }, "Explorer"))),
-    )));
+      h("p", {}, h("a", { href: "#/staking", class: "btn secondary small" }, "Staking Controls →"))),
+    ),
+    h("h3", { style: "margin-top: 24px;" }, "Platform Directory"),
+    spacesHub
+  ));
 }
 
 function adminPasskeysCard() {
@@ -1161,11 +1336,20 @@ async function settings() {
     themeCardGrid
   );
 
+  const secSection = h("div", { class: "card" },
+    h("h3", {}, "Security & Passkeys"),
+    h("p", { class: "muted small" },
+      "Hardware WebAuthn Touch ID passkeys, wallet.dat encryption, passphrase management, and biometric enrollment live on the Security page."),
+    h("div", { class: "row", style: "margin-top: 8px;" },
+      h("a", { href: "#/security", class: "btn secondary small" }, "Open Security & Passkey Enclave →"))
+  );
+
   const other = s.file.other.length ? h("p", { class: "muted" },
     "Also in the file, not edited here: " + s.file.other.join(", ")) : null;
   show(h("section", {},
     h("h2", {}, "Settings"),
     themeSection,
+    secSection,
     h("p", { class: "muted" }, "File: ", h("code", {}, s.conf), " (" + s.format + "). A backup of the old file is kept beside it as ",
       h("code", {}, ".bak"), "."),
     locked ? h("p", { class: "note err" }, "Encrypt the wallet on the Security page before changing settings.") : null,

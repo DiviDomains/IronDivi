@@ -32,26 +32,32 @@
     </svg>
     <span class="brand"><span class="iron-part">Iron</span><span class="divi-part">Divi</span></span>
   </a>
-  <span id="net" class="badge"></span>
 
-  <!-- Category Tabs for Zen & Sanctuary Themes -->
+  <!-- Interactive Network Badge / Switcher Button -->
+  <button type="button" id="net" class="badge net-badge" title="Click to inspect network or switch profiles">
+    <span class="net-dot"></span>
+    <span id="net-label">Divi</span>
+    <span class="net-arrow">▾</span>
+  </button>
+
+  <!-- Category Space Switcher (Zen Spaces & Sanctuary) -->
   <div id="space-tabs" class="space-tabs" hidden>
-    <button type="button" data-space="treasury" class="space-tab on">Treasury</button>
-    <button type="button" data-space="network" class="space-tab">Network</button>
-    <button type="button" data-space="system" class="space-tab">System</button>
+    <button type="button" data-space="treasury" class="space-tab">💎 Treasury</button>
+    <button type="button" data-space="network" class="space-tab on">🌐 Network</button>
+    <button type="button" data-space="system" class="space-tab">🛡️ System</button>
   </div>
 
-  <!-- Dual Deck Toggle for Calm Ledger Theme -->
+  <!-- Dual Deck Toggle (Calm Ledger) -->
   <div id="ledger-deck-toggle" class="ledger-deck-toggle" hidden>
-    <button type="button" data-deck="personal" class="deck-btn on">Personal</button>
-    <button type="button" data-deck="ops" class="deck-btn">Node Ops</button>
+    <button type="button" data-deck="personal" class="deck-btn on">🌿 Personal</button>
+    <button type="button" data-deck="ops" class="deck-btn">⚙️ Node Ops</button>
   </div>
 
-  <!-- Main Navigation Links (Categorized for Hierarchical Filtering) -->
+  <!-- Main Navigation Links -->
   <nav id="nav" hidden>
     <!-- Treasury Group -->
-    <a href="#/wallet" data-group="treasury">Wallet</a>
-    <a href="#/wallets" data-group="treasury">Wallets</a>
+    <a href="#/wallet" data-group="treasury">Node Wallet</a>
+    <a href="#/wallets" data-group="treasury">HD Multi-Wallets</a>
     <a href="#/swaps" data-group="treasury">Swaps</a>
     <a href="#/nft" data-group="treasury">NFTs</a>
 
@@ -71,11 +77,11 @@
 
   <!-- Right Header Utility Cluster -->
   <div class="top-right">
-    <!-- Enclave Status Indicator -->
-    <div id="enclave-badge" class="enclave-badge" title="Hardware Enclave Passkey Active">
+    <!-- Enclave Status Indicator (Links to #/security) -->
+    <a href="#/security" id="enclave-badge" class="enclave-badge" title="Hardware Enclave Passkey Active — Click to manage">
       <span class="enclave-dot"></span>
       <span class="enclave-label">Enclave Sealed</span>
-    </div>
+    </a>
 
     <!-- Interface Design Look Selector -->
     <div class="theme-select-wrap">
@@ -91,6 +97,48 @@
     <button id="logout" class="link" hidden>Sign out</button>
   </div>
 </header>
+
+<!-- Secondary Sub-Navigation Bar (for Zen Spaces & Tiered Sanctuary) -->
+<div id="subnav" class="subnav" hidden>
+  <div class="subnav-wrap">
+    <div class="subnav-space-title" id="subnav-space-title">Network Space</div>
+    <div class="subnav-links" id="subnav-links"></div>
+  </div>
+</div>
+
+<!-- Interactive Network Switcher Flyout Modal -->
+<div id="net-drawer" class="net-drawer" hidden>
+  <div class="net-drawer-content card">
+    <div class="net-drawer-head">
+      <div class="row">
+        <span class="enclave-dot" id="drawer-dot"></span>
+        <strong id="drawer-net-title">Network & Chain Status</strong>
+      </div>
+      <button type="button" id="close-net-drawer" class="link">✕ Close</button>
+    </div>
+    <div class="net-drawer-body">
+      <dl class="kv">
+        <dt>Active Network</dt><dd id="drawer-active-net">regtest</dd>
+        <dt>Chain Implementation</dt><dd id="drawer-chain-impl">IronDivi Rust Full Node (v0.2.9)</dd>
+        <dt>Current Block Height</dt><dd id="drawer-block-height">—</dd>
+        <dt>Active P2P Peers</dt><dd id="drawer-peer-count">—</dd>
+        <dt>Remote Node Host</dt><dd>hp3:52480 (100.126.75.94)</dd>
+      </dl>
+      <div class="net-switch-box">
+        <h4>Switch Network Profile</h4>
+        <p class="muted small">Select the network profile to configure in <code>divi.conf</code>. A node restart is required after applying.</p>
+        <div class="row wrap">
+          <button type="button" id="net-switch-regtest" class="secondary small">● Regtest (Local Dev)</button>
+          <button type="button" id="net-switch-testnet" class="secondary small">○ Testnet (Public)</button>
+          <button type="button" id="net-switch-mainnet" class="secondary small">○ Mainnet (Production)</button>
+        </div>
+        <p id="net-switch-feedback" class="note"></p>
+        <p class="small" style="margin-top: 8px;"><a href="#/settings">Configure full network ports and seeds in Settings →</a></p>
+      </div>
+    </div>
+  </div>
+</div>
+
 <div id="banner" class="banner" hidden></div>
 <main id="main"><p class="muted">Loading…</p></main>
 </body>

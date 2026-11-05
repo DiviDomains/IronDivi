@@ -608,3 +608,182 @@ canvas.qr { max-width: 260px; height: auto; image-rendering: pixelated; border-r
   color: var(--text-2);
   line-height: 1.4;
 }
+
+/* ==========================================================================
+   Sub-Navigation Bar (Zen Spaces & Tiered Sanctuary)
+   ========================================================================== */
+.subnav {
+  background: var(--raised);
+  border-bottom: 1px solid var(--line);
+  padding: 7px 18px;
+  position: sticky;
+  top: 53px;
+  z-index: 15;
+}
+.subnav-wrap {
+  max-width: 1040px;
+  margin: 0 auto;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.subnav-space-title {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text);
+  letter-spacing: 0.03em;
+}
+.subnav-links {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+.subnav-link {
+  display: inline-block;
+  padding: 4px 11px;
+  border-radius: 6px;
+  font-size: 13px;
+  text-decoration: none;
+  color: var(--text-2);
+  background: transparent;
+  border: 1px solid transparent;
+  transition: all 0.15s ease;
+}
+.subnav-link:hover {
+  background: var(--surface);
+  color: var(--text);
+  text-decoration: none;
+}
+.subnav-link.on {
+  background: var(--surface);
+  color: var(--text);
+  border-color: #6464a0;
+  font-weight: 600;
+  text-decoration: none;
+}
+
+/* ==========================================================================
+   Interactive Network Badge & Flyout Drawer
+   ========================================================================== */
+.net-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  background: var(--raised);
+  border: 1px solid var(--line);
+  padding: 3px 10px;
+  border-radius: 999px;
+  color: var(--text-2);
+  font-size: 12px;
+  font-family: var(--font);
+  font-weight: 500;
+  transition: all 0.15s ease;
+}
+.net-badge:hover {
+  border-color: #6464a0;
+  color: var(--text);
+}
+.net-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  background: var(--ok);
+}
+.badge.warn .net-dot {
+  background: var(--warn);
+}
+.net-arrow {
+  font-size: 9px;
+  color: var(--muted);
+}
+.net-drawer {
+  position: fixed;
+  top: 54px;
+  left: 120px;
+  z-index: 100;
+  width: 90%;
+  max-width: 440px;
+}
+.net-drawer-content {
+  box-shadow: 0 16px 36px rgba(0, 0, 0, 0.6);
+  border: 1px solid #4b4b7a;
+  background: var(--surface);
+}
+.net-drawer-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 10px;
+  margin-bottom: 12px;
+}
+.net-switch-box {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+.net-switch-box button.active {
+  background: var(--raised);
+  border-color: var(--ok);
+  color: var(--ok);
+  font-weight: 700;
+}
+
+/* ==========================================================================
+   Spaces Platform Directory (Dashboard Hub Cards)
+   ========================================================================== */
+.spaces-hub {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 16px;
+  margin: 14px 0 24px;
+}
+.space-hub-card {
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+}
+.space-hub-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+.space-hub-icon {
+  font-size: 24px;
+  line-height: 1;
+}
+.space-hub-head h4 {
+  margin: 0 0 2px;
+  font-size: 15px;
+  color: var(--text);
+}
+.space-hub-head p { margin: 0; }
+.space-hub-links {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+.hub-btn {
+  display: block;
+  text-align: center;
+  padding: 6px 10px;
+  background: var(--raised);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font-size: 12px;
+  color: var(--text);
+  text-decoration: none;
+  font-weight: 600;
+  transition: all 0.15s ease;
+}
+.hub-btn:hover {
+  background: #252544;
+  border-color: #6464a0;
+  text-decoration: none;
+}
