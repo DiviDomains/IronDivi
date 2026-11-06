@@ -78,11 +78,15 @@ def check_manifest():
     entry = app.attrib.get("EntryPoint")
     print(f"    Executable:       {exe} (EntryPoint: {entry})")
 
-    # Verify uap5:Extension Category="windows.appExecutionAlias" (MakeAppx schema requirement)
-    bad_ext = app.findall(".//desktop:Extension[@Category='windows.executionAlias']", ns)
-    if bad_ext:
-        raise ValueError("Invalid desktop:Extension Category='windows.executionAlias'; use uap5:Extension Category='windows.appExecutionAlias'")
-    aliases = [el.attrib.get("Alias") for el in app.findall(".//uap5:ExecutionAlias", ns)]
+    # Verify uap5:Extension Category="windows.appExecutionAlias" (MakeAppx schema requirement: max 1 per Application)
+    for app_el in root.findall(".//m:Application", ns):
+        bad_ext = app_el.findall(".//desktop:Extension[@Category='windows.executionAlias']", ns)
+        if bad_ext:
+            raise ValueError("Invalid desktop:Extension Category='windows.executionAlias'; use uap5:Extension Category='windows.appExecutionAlias'")
+        alias_exts = app_el.findall(".//uap5:Extension[@Category='windows.appExecutionAlias']", ns)
+        if len(alias_exts) > 1:
+            raise ValueError(f"Application {app_el.attrib.get('Id')} has {len(alias_exts)} windows.appExecutionAlias extensions; MakeAppx allows at most 1 per Application")
+    aliases = [el.attrib.get("Alias") for el in root.findall(".//uap5:ExecutionAlias", ns)]
     if "irondivid.exe" not in aliases or "irondivi-cli.exe" not in aliases:
         raise ValueError(f"Missing required uap5:ExecutionAlias entries: {aliases}")
     print(f"    ExecutionAliases: {', '.join(aliases)}")
