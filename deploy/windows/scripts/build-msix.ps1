@@ -275,7 +275,7 @@ if ((Test-Path $CscExe) -and (Test-Path $BootstrapCs) -and (Test-Path $CertCerPa
         }
         Write-Host "[+] Created 1-click Windows Store Installer: $InstallerExePath" -ForegroundColor Green
     } else {
-        Write-Warning "csc.exe failed with exit code $LASTEXITCODE"
+        throw "csc.exe failed with exit code $LASTEXITCODE"
     }
 }
 

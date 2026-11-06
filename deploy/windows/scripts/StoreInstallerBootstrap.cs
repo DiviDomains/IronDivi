@@ -89,16 +89,26 @@ namespace IronDiviInstaller
                 Process.Start(openMsix);
                 return 0;
             }
-            catch (System.ComponentModel.Win32Exception ex) when (ex.NativeErrorCode == 1223)
+            catch (System.ComponentModel.Win32Exception ex)
             {
-                // User cancelled UAC prompt
+                if (ex.NativeErrorCode == 1223)
+                {
+                    // User cancelled UAC prompt
+                    MessageBox.Show(
+                        "Administrator approval is needed once to trust the IronDivi publisher certificate before installing.",
+                        "IronDivi Installer",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Information
+                    );
+                    return 1223;
+                }
                 MessageBox.Show(
-                    "Administrator approval is needed once to trust the IronDivi publisher certificate before installing.",
+                    "IronDivi Installer encountered an error:\n\n" + ex.Message,
                     "IronDivi Installer",
                     MessageBoxButtons.OK,
-                    MessageBoxIcon.Information
+                    MessageBoxIcon.Error
                 );
-                return 1223;
+                return 1;
             }
             catch (Exception ex)
             {
