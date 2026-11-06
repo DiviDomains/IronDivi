@@ -39,6 +39,18 @@ jobs:
 
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
+        with:
+          save-if: "true"
+
+      - name: Pre-validate MSIX Manifest & Store Bootstrapper
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Path "target/precheck-bin" -Force | Out-Null
+          Set-Content -Path "target/precheck-bin/irondivid.exe" -Value "stub"
+          Set-Content -Path "target/precheck-bin/irondivi-cli.exe" -Value "stub"
+          ./deploy/windows/scripts/build-msix.ps1 -BinDir "target/precheck-bin" -OutputDir "target/precheck-msix" -Sign
+          Remove-Item "target/precheck-bin" -Recurse -Force
+          Remove-Item "target/precheck-msix" -Recurse -Force
 
       - name: Build Windows binaries
         run: |

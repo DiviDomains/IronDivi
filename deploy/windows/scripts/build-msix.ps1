@@ -187,13 +187,13 @@ if ($LASTEXITCODE -ne 0) {
 Write-Host "[+] Successfully created MSIX: $OutputMsix" -ForegroundColor Green
 
 # 9. Sign package (if requested)
+$CertThumbprint = $null
 if ($Sign) {
     if (-not $SignTool) {
         Write-Warning "SignTool.exe not found; skipping signing."
     } else {
         if (-not $CertificatePath) {
             # Check or create self-signed test cert
-            $CertThumbprint = $null
             $Subject = $ManifestXml.Package.Identity.Publisher
             $StoreCert = Get-Item "Cert:\CurrentUser\My\*" | Where-Object { $_.Subject -eq $Subject } | Select-Object -First 1
 

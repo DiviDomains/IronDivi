@@ -2,10 +2,11 @@
 <Package
   xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
   xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:uap5="http://schemas.microsoft.com/appx/manifest/uap/windows10/5"
   xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
   xmlns:desktop="http://schemas.microsoft.com/appx/manifest/desktop/windows10"
   xmlns:uap10="http://schemas.microsoft.com/appx/manifest/uap/windows10/10"
-  IgnorableNamespaces="uap rescap desktop uap10">
+  IgnorableNamespaces="uap uap5 rescap desktop uap10">
 
   <Identity
     Name="DiviDomains.IronDivi"
@@ -52,12 +53,16 @@
             <uap:DisplayName>Divi Payment Protocol</uap:DisplayName>
           </uap:Protocol>
         </uap:Extension>
-        <desktop:Extension Category="windows.executionAlias">
-          <desktop:ExecutionAlias Executable="irondivid.exe" Alias="irondivid.exe" />
-        </desktop:Extension>
-        <desktop:Extension Category="windows.executionAlias">
-          <desktop:ExecutionAlias Executable="irondivi-cli.exe" Alias="irondivi-cli.exe" />
-        </desktop:Extension>
+        <uap5:Extension Category="windows.appExecutionAlias" Executable="irondivid.exe" EntryPoint="Windows.FullTrustApplication">
+          <uap5:AppExecutionAlias>
+            <uap5:ExecutionAlias Alias="irondivid.exe" />
+          </uap5:AppExecutionAlias>
+        </uap5:Extension>
+        <uap5:Extension Category="windows.appExecutionAlias" Executable="irondivi-cli.exe" EntryPoint="Windows.FullTrustApplication">
+          <uap5:AppExecutionAlias>
+            <uap5:ExecutionAlias Alias="irondivi-cli.exe" />
+          </uap5:AppExecutionAlias>
+        </uap5:Extension>
       </Extensions>
     </Application>
   </Applications>

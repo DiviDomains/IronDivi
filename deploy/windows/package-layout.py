@@ -37,6 +37,7 @@ def check_manifest():
     ns = {
         "m": "http://schemas.microsoft.com/appx/manifest/foundation/windows10",
         "uap": "http://schemas.microsoft.com/appx/manifest/uap/windows10",
+        "uap5": "http://schemas.microsoft.com/appx/manifest/uap/windows10/5",
         "rescap": "http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities",
         "desktop": "http://schemas.microsoft.com/appx/manifest/desktop/windows10",
     }
@@ -76,7 +77,16 @@ def check_manifest():
     exe = app.attrib.get("Executable")
     entry = app.attrib.get("EntryPoint")
     print(f"    Executable:       {exe} (EntryPoint: {entry})")
-    
+
+    # Verify uap5:Extension Category="windows.appExecutionAlias" (MakeAppx schema requirement)
+    bad_ext = app.findall(".//desktop:Extension[@Category='windows.executionAlias']", ns)
+    if bad_ext:
+        raise ValueError("Invalid desktop:Extension Category='windows.executionAlias'; use uap5:Extension Category='windows.appExecutionAlias'")
+    aliases = [el.attrib.get("Alias") for el in app.findall(".//uap5:ExecutionAlias", ns)]
+    if "irondivid.exe" not in aliases or "irondivi-cli.exe" not in aliases:
+        raise ValueError(f"Missing required uap5:ExecutionAlias entries: {aliases}")
+    print(f"    ExecutionAliases: {', '.join(aliases)}")
+
     return root
 
 def check_assets():
