@@ -28,16 +28,26 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
 
+      - name: Strip private optional sidechain git dependencies for standalone build
+        shell: powershell
+        run: |
+          $cargoToml = "bin/irondivid/Cargo.toml"
+          $content = Get-Content $cargoToml -Raw
+          $content = $content -replace '(?m)^(irondivi-sidechains|dvsm-manifest|dvsc-registry)\s*=.*\r?\n', ''
+          $content = $content -replace 'sidechains\s*=\s*\[[^\]]*\]', 'sidechains = []'
+          Set-Content -Path $cargoToml -Value $content -NoNewline
+
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
 
       - name: Build Windows binaries
         run: |
-          cargo build --release --locked --bin irondivid --bin irondivi-cli
+          cargo build --release --bin irondivid --bin irondivi-cli
         env:
           RUSTFLAGS: "-C link-arg=/DEBUG:NONE"
+          LIBCLANG_PATH: "C:\\Program Files\\LLVM\\bin"
 
-      - name: Package MSIX
+      - name: Package MSIX & Store Bootstrapper
         shell: powershell
         run: |
           $params = @{
@@ -57,14 +67,21 @@ jobs:
         with:
           name: IronDivi-Windows-MSIX
           path: |
+            target/msix/*.exe
             target/msix/*.msix
+            target/msix/*.zip
+            target/msix/*.cer
             target/msix/*.sha256
-            target/msix/*.pfx
+            target/msix/SHA256SUMS-windows.txt
 
       - name: Release Asset (on tag)
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            target/msix/*.msix
+            target/msix/irondivi-x86_64-windows-installer.exe
+            target/msix/irondivi-x86_64-windows.msix
+            target/msix/irondivi-x86_64-windows.zip
+            target/msix/IronDivi-*.msix
             target/msix/*.sha256
+            target/msix/SHA256SUMS-windows.txt

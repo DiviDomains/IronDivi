@@ -207,11 +207,16 @@ if ($Sign) {
                     -CertStoreLocation "Cert:\CurrentUser\My" `
                     -TextExtension @("2.5.29.37={text}1.3.6.1.5.5.7.3.3", "2.5.29.19={text}")
                 
-                # Export PFX for reuse
+                # Export PFX and public CER for reuse & bootstrapper
                 $CertPfx = Join-Path $OutputDir "irondivi-test.pfx"
+                $CertCer = Join-Path $OutputDir "IronDivi.cer"
                 $Pass = ConvertTo-SecureString -String "irondivi" -Force -AsPlainText
                 Export-PfxCertificate -Cert $StoreCert -FilePath $CertPfx -Password $Pass | Out-Null
-                Write-Host "[+] Exported test certificate: $CertPfx (Password: irondivi)" -ForegroundColor Green
+                Export-Certificate -Cert $StoreCert -FilePath $CertCer | Out-Null
+                Write-Host "[+] Exported test certificate: $CertPfx & $CertCer" -ForegroundColor Green
+            } else {
+                $CertCer = Join-Path $OutputDir "IronDivi.cer"
+                Export-Certificate -Cert $StoreCert -FilePath $CertCer | Out-Null
             }
             $CertThumbprint = $StoreCert.Thumbprint
             Write-Host "[*] Signing MSIX with certificate thumbprint: $CertThumbprint" -ForegroundColor Cyan
@@ -233,10 +238,79 @@ if ($Sign) {
     }
 }
 
-# 10. Generate SHA256 checksum
+# 9b. Copy stable release asset name (irondivi-x86_64-windows.msix)
+$StableMsixName = "irondivi-x86_64-windows.msix"
+$StableMsixPath = Join-Path $OutputDir $StableMsixName
+Copy-Item $OutputMsix -Destination $StableMsixPath -Force
+
+# 9c. Build 1-click Store-style Bootstrapper EXE (irondivi-x86_64-windows-installer.exe)
+$CscExe = "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+$BootstrapCs = Join-Path $ScriptDir "StoreInstallerBootstrap.cs"
+$CertCerPath = Join-Path $OutputDir "IronDivi.cer"
+$IcoPath = Join-Path $AssetsSource "iron-mark.ico"
+$InstallerExeName = "irondivi-x86_64-windows-installer.exe"
+$InstallerExePath = Join-Path $OutputDir $InstallerExeName
+
+if ((Test-Path $CscExe) -and (Test-Path $BootstrapCs) -and (Test-Path $CertCerPath)) {
+    Write-Host "[*] Compiling 1-click Windows Store MSIX Installer ($InstallerExeName)..." -ForegroundColor Cyan
+    $CscArgs = @(
+        "/nologo",
+        "/target:winexe",
+        "/optimize+",
+        "/out:$InstallerExePath",
+        "/resource:$CertCerPath,IronDivi.cer",
+        "/resource:$OutputMsix,IronDivi.msix",
+        "/reference:System.dll",
+        "/reference:System.Windows.Forms.dll",
+        "/reference:System.Security.dll"
+    )
+    if (Test-Path $IcoPath) {
+        $CscArgs += "/win32icon:$IcoPath"
+    }
+    $CscArgs += $BootstrapCs
+    & $CscExe @CscArgs
+    if ($LASTEXITCODE -eq 0 -and (Test-Path $InstallerExePath)) {
+        if ($Sign -and $SignTool -and $CertThumbprint) {
+            & $SignTool sign /fd SHA256 /sha1 $CertThumbprint $InstallerExePath | Out-Null
+        }
+        Write-Host "[+] Created 1-click Windows Store Installer: $InstallerExePath" -ForegroundColor Green
+    } else {
+        Write-Warning "csc.exe failed with exit code $LASTEXITCODE"
+    }
+}
+
+# 9d. Create portable ZIP archive (irondivi-x86_64-windows.zip)
+$ZipName = "irondivi-x86_64-windows.zip"
+$ZipPath = Join-Path $OutputDir $ZipName
+$ZipStaging = Join-Path $OutputDir "irondivi-x86_64-windows"
+if (Test-Path $ZipStaging) { Remove-Item $ZipStaging -Recurse -Force }
+New-Item -ItemType Directory -Path $ZipStaging -Force | Out-Null
+if (Test-Path $DaemonExe) { Copy-Item $DaemonExe -Destination $ZipStaging -Force }
+if (Test-Path $CliExe) { Copy-Item $CliExe -Destination $ZipStaging -Force }
+foreach ($Doc in @("LICENSE", "README.md")) {
+    $DocPath = Join-Path $RootDir $Doc
+    if (Test-Path $DocPath) { Copy-Item $DocPath -Destination $ZipStaging -Force }
+}
+if (Test-Path $ZipPath) { Remove-Item $ZipPath -Force }
+Compress-Archive -Path "$ZipStaging\*" -DestinationPath $ZipPath -Force
+Remove-Item $ZipStaging -Recurse -Force
+Write-Host "[+] Created portable archive: $ZipPath" -ForegroundColor Green
+
+# 10. Generate SHA256 checksums
 $Hash = (Get-FileHash -Path $OutputMsix -Algorithm SHA256).Hash.ToLower()
 $HashFile = "$OutputMsix.sha256"
 "$Hash  $MsixFileName" | Out-File -FilePath $HashFile -Encoding ascii
+
+$SumsFile = Join-Path $OutputDir "SHA256SUMS-windows.txt"
+$SumsLines = @()
+foreach ($f in @($InstallerExeName, $StableMsixName, $ZipName, $MsixFileName)) {
+    $fp = Join-Path $OutputDir $f
+    if (Test-Path $fp) {
+        $fh = (Get-FileHash -Path $fp -Algorithm SHA256).Hash.ToLower()
+        $SumsLines += "$fh  $f"
+    }
+}
+$SumsLines | Out-File -FilePath $SumsFile -Encoding ascii
 Write-Host "[+] SHA256: $Hash" -ForegroundColor Green
 
 Write-Host "==========================================================" -ForegroundColor Cyan
