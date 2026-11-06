@@ -1,16 +1,13 @@
-#!/usr/bin/env python3
 """
 package-layout.py — Cross-platform layout validator and preparation tool
-for IronDivi Windows App Store (MSIX) distribution.
+for IronDivi Windows App Store (MSIX) distribution (stdlib-only).
 
 Validates AppxManifest.xml, verifies all visual assets, and stages the layout.
 """
 
 import os
-import sys
-import xml.etree.ElementTree as ET
 import shutil
-import re
+import xml.etree.ElementTree as ET
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, "..", ".."))
