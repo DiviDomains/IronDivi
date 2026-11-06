@@ -48,7 +48,7 @@ pub fn create(diag_dir: &Path, run: u64) {
     }
     let mut fields = BTreeMap::new();
     fields.insert("run".into(), run.to_string());
-    fields.insert("pid".into(), unsafe { libc::getpid() }.to_string());
+    fields.insert("pid".into(), std::process::id().to_string());
     fields.insert("start".into(), crate::runs_log::utc_now());
     fields.insert("boot_id".into(), boot_id());
     fields.insert("pid1_start".into(), pid1_start());
@@ -94,7 +94,6 @@ pub fn remove() {
 }
 
 fn write(state: &mut State) -> std::io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
     for (k, v) in counters() {
         state.fields.insert(k, v);
     }
@@ -103,16 +102,17 @@ fn write(state: &mut State) -> std::io::Result<()> {
         text.push_str(&format!("{}={}\n", k, v));
     }
     let tmp = state.dir.join(format!("{}.tmp", NAME));
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&tmp)?;
+    let mut open = std::fs::OpenOptions::new();
+    open.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut open, 0o600);
+    let mut f = open.open(&tmp)?;
     f.write_all(text.as_bytes())?;
     f.sync_data()?;
     std::fs::rename(&tmp, state.dir.join(NAME))?;
-    File::open(&state.dir)?.sync_all()
+    #[cfg(unix)]
+    File::open(&state.dir)?.sync_all()?;
+    Ok(())
 }
 
 fn parse(text: &str) -> Option<BTreeMap<String, String>> {

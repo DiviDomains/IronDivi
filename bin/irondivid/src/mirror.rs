@@ -30,6 +30,7 @@
 //! directory and config file: `key=value` lines `datadir`, `conf`, `cwd`,
 //! `exe`, `pid`, `start` and `uid`. It is removed when the node exits.
 
+#[cfg(unix)]
 use std::ffi::CString;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -42,6 +43,7 @@ pub enum Status {
 
 static STATUS: OnceLock<Status> = OnceLock::new();
 /// `running/<pid>`, for the exit paths (the signal handler's too)
+#[cfg(unix)]
 static RECORD: OnceLock<CString> = OnceLock::new();
 
 /// `<root>/<id>`, when there is one
@@ -72,21 +74,36 @@ pub fn unavailable() -> bool {
 /// events.log mirror at it. Called once, after the -daemon forks and before
 /// runs.log is opened (which mirrors itself through [`dir`]).
 pub fn open(data_dir: &Path, conf: &Path) {
-    let status = choose_and_create(data_dir);
-    if let Status::At { dir, .. } = &status {
-        crate::events::set_mirror_dir(dir);
-        write_record(dir, data_dir, conf);
+    #[cfg(unix)]
+    {
+        let status = choose_and_create(data_dir);
+        if let Status::At { dir, .. } = &status {
+            crate::events::set_mirror_dir(dir);
+            write_record(dir, data_dir, conf);
+        }
+        let _ = STATUS.set(status);
     }
-    let _ = STATUS.set(status);
+    #[cfg(not(unix))]
+    {
+        let _ = (data_dir, conf);
+        let _ = STATUS.set(Status::Unavailable);
+    }
 }
 
 /// The data directory's id: 16 hex digits of the sha256 of its canonical path
 pub fn id_of(data_dir: &Path) -> String {
-    use std::os::unix::ffi::OsStrExt;
     let canon = std::fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
-    hex::encode(divi_crypto::sha256(canon.as_os_str().as_bytes()))[..16].to_string()
+    #[cfg(unix)]
+    let bytes = {
+        use std::os::unix::ffi::OsStrExt;
+        canon.as_os_str().as_bytes()
+    };
+    #[cfg(not(unix))]
+    let bytes = canon.as_os_str().as_encoded_bytes();
+    hex::encode(divi_crypto::sha256(bytes))[..16].to_string()
 }
 
+#[cfg(unix)]
 fn is_temp_datadir(data_dir: &Path) -> bool {
     let canon = std::fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
     let tmp = std::env::temp_dir();
@@ -104,6 +121,7 @@ fn is_temp_datadir(data_dir: &Path) -> bool {
     false
 }
 
+#[cfg(unix)]
 fn candidates(data_dir: &Path) -> Vec<PathBuf> {
     if let Some(root) = std::env::var_os("IRONDIVI_TEST_MIRROR_ROOT").filter(|p| !p.is_empty()) {
         return vec![PathBuf::from(root)];
@@ -143,6 +161,7 @@ fn candidates(data_dir: &Path) -> Vec<PathBuf> {
 
 /// The first candidate whose device differs from `data_dev`, else the first
 /// usable one with `same_fs`; `None` for an unusable candidate
+#[cfg(any(unix, test))]
 fn choose(devs: &[Option<u64>], data_dev: u64) -> Option<(usize, bool)> {
     if let Some(i) = devs.iter().position(|d| d.is_some_and(|d| d != data_dev)) {
         return Some((i, false));
@@ -153,6 +172,7 @@ fn choose(devs: &[Option<u64>], data_dev: u64) -> Option<(usize, bool)> {
 /// The device a candidate root would be on: its own when it exists (a real
 /// directory owned by us), else its nearest existing ancestor's when that
 /// can be written; `None` when it cannot be used
+#[cfg(unix)]
 fn probe(root: &Path) -> Option<u64> {
     use std::os::unix::fs::MetadataExt;
     if let Ok(meta) = std::fs::symlink_metadata(root) {
@@ -169,12 +189,14 @@ fn probe(root: &Path) -> Option<u64> {
     None
 }
 
+#[cfg(unix)]
 fn writable(dir: &Path) -> bool {
     use std::os::unix::ffi::OsStrExt;
     CString::new(dir.as_os_str().as_bytes())
         .is_ok_and(|c| unsafe { libc::access(c.as_ptr(), libc::W_OK | libc::X_OK) } == 0)
 }
 
+#[cfg(unix)]
 fn choose_and_create(data_dir: &Path) -> Status {
     use std::os::unix::fs::MetadataExt;
     let Ok(data_dev) = std::fs::metadata(data_dir).map(|m| m.dev()) else {
@@ -195,6 +217,7 @@ fn choose_and_create(data_dir: &Path) -> Status {
 
 /// Create `<root>/<id>/running`, each 0700; the root must end up a real
 /// directory owned by us
+#[cfg(unix)]
 fn create(root: &Path, dir: &Path) -> bool {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};
     if !root.exists()
@@ -214,6 +237,7 @@ fn create(root: &Path, dir: &Path) -> bool {
 
 /// Write `<dir>/running/<pid>` through a temporary file, and drop the
 /// records of this data directory's runs whose process is gone
+#[cfg(unix)]
 fn write_record(dir: &Path, data_dir: &Path, conf: &Path) {
     let running = dir.join("running");
     prune(&running);
@@ -228,6 +252,7 @@ fn write_record(dir: &Path, data_dir: &Path, conf: &Path) {
     }
 }
 
+#[cfg(unix)]
 fn record_text(data_dir: &Path, conf: &Path, pid: u32) -> String {
     let one = |p: &Path| p.display().to_string().replace('\n', "?");
     let canon = std::fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
@@ -255,6 +280,7 @@ fn record_text(data_dir: &Path, conf: &Path, pid: u32) -> String {
 
 /// This process's start: `/proc/self/stat` field 22 (clock ticks since
 /// boot) on Linux, the launch time in unix seconds elsewhere
+#[cfg(unix)]
 fn own_start() -> String {
     std::fs::read_to_string("/proc/self/stat")
         .ok()
@@ -270,6 +296,7 @@ fn own_start() -> String {
 }
 
 /// Field 22 (`starttime`) of a `/proc/<pid>/stat` line
+#[cfg(unix)]
 fn stat_start(stat: &str) -> Option<String> {
     let after = &stat[stat.rfind(')')? + 1..];
     after.split_whitespace().nth(19).map(str::to_string)
@@ -277,6 +304,7 @@ fn stat_start(stat: &str) -> Option<String> {
 
 /// Remove the records in `running` whose process is gone (or, on Linux,
 /// is another process with the same pid). Only this data directory's.
+#[cfg(unix)]
 fn prune(running: &Path) {
     let Ok(entries) = std::fs::read_dir(running) else {
         return;
@@ -293,6 +321,7 @@ fn prune(running: &Path) {
     }
 }
 
+#[cfg(unix)]
 fn gone(pid: i32, record: &Path) -> bool {
     if unsafe { libc::kill(pid, 0) } != 0
         && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
@@ -309,6 +338,7 @@ fn gone(pid: i32, record: &Path) -> bool {
 
 /// Remove this run's path record (every exit path; async-signal-safe)
 pub fn remove_record() {
+    #[cfg(unix)]
     if let Some(c) = RECORD.get() {
         unsafe { libc::unlink(c.as_ptr()) };
     }

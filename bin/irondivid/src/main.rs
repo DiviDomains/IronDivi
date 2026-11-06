@@ -177,7 +177,12 @@ fn die(code: i32, reason: std::fmt::Arguments<'_>) -> ! {
         console!("{}", reason);
     }
     flush_log();
-    unsafe { libc::_exit(code) }
+    #[cfg(unix)]
+    unsafe {
+        libc::_exit(code)
+    }
+    #[cfg(not(unix))]
+    std::process::exit(code)
 }
 
 /// `die(code, format_args!(...))`
@@ -4824,7 +4829,12 @@ fn main() {
             runs_log::exit(101, "Error: the node's main task panicked");
             error!("Error: the node's main task panicked");
             flush_log();
-            unsafe { libc::_exit(101) }
+            #[cfg(unix)]
+            unsafe {
+                libc::_exit(101)
+            }
+            #[cfg(not(unix))]
+            std::process::exit(101)
         }
     }
 }
@@ -4851,7 +4861,12 @@ fn exit_after_stop(runtime: tokio::runtime::Runtime, result: Result<()>) -> ! {
             events::event("stop", "clean=yes");
             runs_log::exit(0, "stopped");
             flush_log();
-            unsafe { libc::_exit(0) }
+            #[cfg(unix)]
+            unsafe {
+                libc::_exit(0)
+            }
+            #[cfg(not(unix))]
+            std::process::exit(0)
         }
         // In debug.log as well: on a -daemon node the console is that file,
         // but a foreground node's only record would be a lost terminal (D3)

@@ -41,6 +41,7 @@ static WINDOW: OnceLock<Mutex<Window>> = OnceLock::new();
 /// Seconds on a clock that counts through suspend: CLOCK_BOOTTIME on
 /// Linux; CLOCK_MONOTONIC elsewhere (on macOS it counts through sleep)
 // time_t and c_long are 32 bits on some targets
+#[cfg(unix)]
 #[allow(clippy::unnecessary_cast)]
 fn boot_secs() -> f64 {
     let mut ts = libc::timespec {
@@ -53,6 +54,15 @@ fn boot_secs() -> f64 {
     let id = libc::CLOCK_MONOTONIC;
     unsafe { libc::clock_gettime(id, &mut ts) };
     ts.tv_sec as f64 + ts.tv_nsec as f64 / 1e9
+}
+
+#[cfg(not(unix))]
+fn boot_secs() -> f64 {
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_secs_f64()
 }
 
 fn now() -> Window {

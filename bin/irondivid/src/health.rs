@@ -154,8 +154,8 @@ impl Tick {
     }
 
     fn time(&mut self, f: &mut Fields, h: &Handles) -> Clock {
-        let wall = clock(libc::CLOCK_REALTIME);
-        let mono = clock(libc::CLOCK_MONOTONIC);
+        let wall = wall_clock();
+        let mono = mono_clock();
         let boot = boot_clock();
         f.put("wall", format!("{:.0}", wall));
         f.put("mono", format!("{:.3}", mono));
@@ -244,7 +244,7 @@ impl Tick {
             masternode(f);
             return;
         };
-        let now = clock(libc::CLOCK_REALTIME) as u64;
+        let now = wall_clock() as u64;
         let tip_age = h.chain.tip().map(|t| now.saturating_sub(t.time as u64));
         let reason = staking_reason(&s, h.peers.peer_count(), h.chain.is_ibd(), tip_age);
         if self.reason != Some(reason) {
@@ -490,6 +490,7 @@ impl Fields {
     }
 }
 
+#[cfg(unix)]
 fn clock(id: libc::clockid_t) -> f64 {
     let mut ts = libc::timespec {
         tv_sec: 0,
@@ -497,6 +498,33 @@ fn clock(id: libc::clockid_t) -> f64 {
     };
     unsafe { libc::clock_gettime(id, &mut ts) };
     ts.tv_sec as f64 + ts.tv_nsec as f64 / 1e9
+}
+
+#[cfg(unix)]
+fn wall_clock() -> f64 {
+    clock(libc::CLOCK_REALTIME)
+}
+
+#[cfg(not(unix))]
+fn wall_clock() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
+}
+
+#[cfg(unix)]
+fn mono_clock() -> f64 {
+    clock(libc::CLOCK_MONOTONIC)
+}
+
+#[cfg(not(unix))]
+fn mono_clock() -> f64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_secs_f64()
 }
 
 fn boot_clock() -> Option<f64> {
@@ -642,20 +670,27 @@ fn process(f: &mut Fields) {
     ] {
         f.na_mac(k);
     }
-    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
-    if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) } == 0 {
-        let secs = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
-        f.put(
-            "cpu_s",
-            format!("{:.1}", secs(ru.ru_utime) + secs(ru.ru_stime)),
-        );
-        f.put("major_faults", ru.ru_majflt.to_string());
-        f.put("io_blocks_in", ru.ru_inblock.to_string());
-        f.put("io_blocks_out", ru.ru_oublock.to_string());
-    } else {
-        for k in ["cpu_s", "major_faults", "io_blocks_in", "io_blocks_out"] {
-            f.na(k);
+    #[cfg(unix)]
+    {
+        let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+        if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) } == 0 {
+            let secs = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
+            f.put(
+                "cpu_s",
+                format!("{:.1}", secs(ru.ru_utime) + secs(ru.ru_stime)),
+            );
+            f.put("major_faults", ru.ru_majflt.to_string());
+            f.put("io_blocks_in", ru.ru_inblock.to_string());
+            f.put("io_blocks_out", ru.ru_oublock.to_string());
+        } else {
+            for k in ["cpu_s", "major_faults", "io_blocks_in", "io_blocks_out"] {
+                f.na(k);
+            }
         }
+    }
+    #[cfg(not(unix))]
+    for k in ["cpu_s", "major_faults", "io_blocks_in", "io_blocks_out"] {
+        f.na(k);
     }
     f.na("allocator");
 }
@@ -843,16 +878,25 @@ fn psi(resource: &str) -> Option<String> {
 }
 
 fn disk(f: &mut Fields, h: &Handles) {
-    use std::os::unix::ffi::OsStrExt as _;
-    let path = std::ffi::CString::new(h.data_dir.as_os_str().as_bytes()).ok();
-    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
-    if path.is_some_and(|p| unsafe { libc::statvfs(p.as_ptr(), &mut st) } == 0) {
-        let free = st.f_bavail as u64 * st.f_frsize as u64;
-        // A14: the low-disk pause follows this sample
-        crate::budget::sample(free);
-        f.put("disk_free_mb", (free >> 20).to_string());
-        f.put("inodes_free", (st.f_favail as u64).to_string());
-    } else {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        let path = std::ffi::CString::new(h.data_dir.as_os_str().as_bytes()).ok();
+        let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+        if path.is_some_and(|p| unsafe { libc::statvfs(p.as_ptr(), &mut st) } == 0) {
+            let free = st.f_bavail as u64 * st.f_frsize as u64;
+            // A14: the low-disk pause follows this sample
+            crate::budget::sample(free);
+            f.put("disk_free_mb", (free >> 20).to_string());
+            f.put("inodes_free", (st.f_favail as u64).to_string());
+        } else {
+            f.na("disk_free_mb");
+            f.na("inodes_free");
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = h;
         f.na("disk_free_mb");
         f.na("inodes_free");
     }

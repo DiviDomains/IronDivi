@@ -48,7 +48,10 @@ pub fn build() -> Value {
         },
     );
     out.insert("locks".into(), locks());
+    #[cfg(unix)]
     let (threads, refused) = crate::watchdog::threads();
+    #[cfg(not(unix))]
+    let (threads, refused) = (String::new(), 0usize);
     out.insert(
         "threads".into(),
         json!({

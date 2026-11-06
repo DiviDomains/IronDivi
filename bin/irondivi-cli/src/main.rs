@@ -1068,7 +1068,16 @@ fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     // `irondivi-cli diag ...` (docs/plans/diag.md part B) is not an RPC call
     if argv.first().map(String::as_str) == Some("diag") {
+        #[cfg(unix)]
         std::process::exit(divi_diag::run(&argv[1..]));
+        #[cfg(not(unix))]
+        {
+            let _ = writeln!(
+                io::stderr(),
+                "error: irondivi-cli diag is supported on Unix systems only"
+            );
+            std::process::exit(1);
+        }
     }
     let exit_code = match run(&argv) {
         Ok(output) => {

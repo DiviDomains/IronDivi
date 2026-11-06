@@ -30,6 +30,7 @@
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
+#[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI32, AtomicI64, Ordering};
@@ -70,16 +71,22 @@ struct Launch {
 /// `main`, before the -daemon forks, which would hide the parent and the
 /// terminal; it starts no thread.
 pub fn note_launch() {
-    let ppid = unsafe { libc::getppid() };
-    let how = if std::env::var_os("INVOCATION_ID").is_some() {
-        "systemd"
-    } else if Path::new("/.dockerenv").exists() {
-        "container"
-    } else if unsafe { libc::isatty(0) == 1 || libc::isatty(2) == 1 } {
-        "terminal"
-    } else {
-        "other"
+    #[cfg(unix)]
+    let (ppid, how) = {
+        let ppid = unsafe { libc::getppid() };
+        let how = if std::env::var_os("INVOCATION_ID").is_some() {
+            "systemd"
+        } else if Path::new("/.dockerenv").exists() {
+            "container"
+        } else if unsafe { libc::isatty(0) == 1 || libc::isatty(2) == 1 } {
+            "terminal"
+        } else {
+            "other"
+        };
+        (ppid, how)
     };
+    #[cfg(not(unix))]
+    let (ppid, how) = (0i32, "other");
     let _ = LAUNCH.set(Launch {
         at: Instant::now(),
         ppid,
@@ -90,6 +97,7 @@ pub fn note_launch() {
 
 /// Before the first -daemon fork: the pid that was started and the number
 /// of threads (diag.md §3: no thread may exist before the forks)
+#[cfg(unix)]
 pub fn note_first_fork() {
     FIRST_PID.store(unsafe { libc::getpid() }, Ordering::Relaxed);
     THREADS_AT_FORK.store(thread_count(), Ordering::Relaxed);
@@ -109,7 +117,11 @@ pub fn open(data_dir: &Path, network: &str, daemon: bool) {
         open_mirror(&m.join("runs.log"));
     }
     let _ = RUN.set((run, data_dir.join("diag")));
+    #[cfg(unix)]
     let (uid, euid, gid) = unsafe { (libc::getuid(), libc::geteuid(), libc::getgid()) };
+    #[cfg(not(unix))]
+    let (uid, euid, gid) = (0u32, 0u32, 0u32);
+    let pid = std::process::id();
     let exe = std::env::current_exe()
         .map(|p| quote(&p.display().to_string()))
         .unwrap_or_else(|_| "-".into());
@@ -119,7 +131,7 @@ pub fn open(data_dir: &Path, network: &str, daemon: bool) {
             "run={} pid={} ppid={} parent={} uid={} euid={} gid={} exe={} version={} \
              build-id={} network={} how={} daemon={} pid1={} kernel={}{}",
             run,
-            unsafe { libc::getpid() },
+            pid,
             launch.map_or(0, |l| l.ppid),
             launch.map_or_else(|| "-".to_string(), |l| quote(&l.parent)),
             uid,
@@ -131,7 +143,7 @@ pub fn open(data_dir: &Path, network: &str, daemon: bool) {
             network,
             launch.map_or("other", |l| l.how),
             yes(daemon),
-            yes(unsafe { libc::getpid() } == 1),
+            yes(pid == 1),
             quote(&kernel_release()),
             crate::mirror::start_field(),
         ),
@@ -145,7 +157,7 @@ pub fn open(data_dir: &Path, network: &str, daemon: bool) {
             "daemon",
             &format!(
                 "pid={} first={} middle={} threads_at_fork={}",
-                unsafe { libc::getpid() },
+                pid,
                 FIRST_PID.load(Ordering::Relaxed),
                 MIDDLE_PID.load(Ordering::Relaxed),
                 if threads < 0 {
@@ -159,27 +171,34 @@ pub fn open(data_dir: &Path, network: &str, daemon: bool) {
 }
 
 fn try_open(data_dir: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
     let dir = data_dir.join("diag");
     let created = !dir.exists();
     crate::private_files::ensure_private_dir(&dir, true)?;
     let path = dir.join("runs.log");
     rotate_at_open(&path, CAP);
     let new_file = !path.exists();
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(&path)?;
+    let mut open = std::fs::OpenOptions::new();
+    open.create(true).append(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut open, 0o600);
+    let file = open.open(&path)?;
     // The new entries themselves must survive a power loss, not only the
     // records written into them
-    if new_file {
-        File::open(&dir)?.sync_all()?;
+    #[cfg(unix)]
+    {
+        if new_file {
+            File::open(&dir)?.sync_all()?;
+        }
+        if created {
+            File::open(data_dir)?.sync_all()?;
+        }
     }
-    if created {
-        File::open(data_dir)?.sync_all()?;
-    }
+    #[cfg(not(unix))]
+    let _ = (new_file, created);
+    #[cfg(unix)]
     let fd = file.as_raw_fd();
+    #[cfg(not(unix))]
+    let fd = -1;
     if FILE.set(file).is_ok() {
         RAW_FD.store(fd, Ordering::Release);
     }
@@ -188,17 +207,18 @@ fn try_open(data_dir: &Path) -> std::io::Result<()> {
 
 /// The mirror's runs.log, rotated like runs.log; a failure leaves it off
 fn open_mirror(path: &Path) {
-    use std::os::unix::fs::OpenOptionsExt;
     rotate_at_open(path, CAP);
-    let Ok(file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(path)
-    else {
+    let mut open = std::fs::OpenOptions::new();
+    open.create(true).append(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut open, 0o600);
+    let Ok(file) = open.open(path) else {
         return;
     };
+    #[cfg(unix)]
     let fd = file.as_raw_fd();
+    #[cfg(not(unix))]
+    let fd = -1;
     if MIRROR.set(file).is_ok() {
         MIRROR_FD.store(fd, Ordering::Release);
     }
@@ -324,7 +344,10 @@ pub fn stop_requested(by: &str) {
 /// The process is ending with `code`; `reason` is the line printed for it
 pub fn exit(code: i32, reason: &str) {
     let uptime = LAUNCH.get().map_or(0.0, |l| l.at.elapsed().as_secs_f64());
+    #[cfg(unix)]
     let (sigpipes, epipes) = crate::signals::counts();
+    #[cfg(not(unix))]
+    let (sigpipes, epipes) = (0u64, 0u64);
     record(
         "exit",
         &format!(
@@ -370,7 +393,7 @@ pub fn exit_line(code: i32, reason: &str, sigpipes: u64, epipes: u64) -> RawLine
         .text(" run=")
         .num(RUN.get().map_or(0, |r| r.0 as i64))
         .text(" pid=")
-        .num(i64::from(unsafe { libc::getpid() }));
+        .num(i64::from(std::process::id()));
     if let Some(l) = LAUNCH.get() {
         let ms = l.at.elapsed().as_millis() as i64;
         line.text(" uptime_s=")
@@ -407,12 +430,31 @@ impl RawLine {
             buf: [0; 512],
             len: 0,
         };
-        let mut ts = libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
+        #[cfg(unix)]
+        let (secs, micros, mono_s, mono_us) = {
+            let mut ts = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts) };
+            let secs = ts.tv_sec as i64;
+            let micros = ts.tv_nsec as i64 / 1000;
+            unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+            (secs, micros, ts.tv_sec as i64, ts.tv_nsec as i64 / 1000)
         };
-        unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts) };
-        let secs = ts.tv_sec as i64;
+        #[cfg(not(unix))]
+        let (secs, micros, mono_s, mono_us) = {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            let el = since_launch();
+            (
+                now.as_secs() as i64,
+                i64::from(now.subsec_micros()),
+                el.as_secs() as i64,
+                i64::from(el.subsec_micros()),
+            )
+        };
         let (year, month, day) = civil(secs.div_euclid(86_400));
         let rem = secs.rem_euclid(86_400);
         line.padded(year, 4)
@@ -427,12 +469,11 @@ impl RawLine {
             .text(":")
             .padded(rem % 60, 2)
             .text(".")
-            .padded(ts.tv_nsec as i64 / 1000, 6)
-            .text("Z mono=");
-        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
-        line.num(ts.tv_sec as i64)
+            .padded(micros, 6)
+            .text("Z mono=")
+            .num(mono_s)
             .text(".")
-            .padded(ts.tv_nsec as i64 / 1000, 6)
+            .padded(mono_us, 6)
             .text(" ")
             .text(kind);
         line
@@ -515,12 +556,20 @@ impl RawLine {
             return false;
         }
         self.buf[self.len] = b'\n';
-        unsafe { libc::write(fd, self.buf.as_ptr().cast(), self.len + 1) > 0 }
+        #[cfg(unix)]
+        {
+            unsafe { libc::write(fd, self.buf.as_ptr().cast(), self.len + 1) > 0 }
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
     }
 
     /// Append the line to `fd`, then fdatasync; a no-op when `fd` is -1
     pub fn write_to(&mut self, fd: i32) {
         if self.write_unsynced(fd) {
+            #[cfg(unix)]
             unsafe {
                 #[cfg(any(target_os = "linux", target_os = "android"))]
                 libc::fdatasync(fd);
@@ -594,35 +643,57 @@ fn civil(days: i64) -> (i64, i64, i64) {
 
 /// The monotonic clock, seconds with microseconds
 pub(crate) fn mono_now() -> String {
-    let mut ts = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
-    format!("{}.{:06}", ts.tv_sec, ts.tv_nsec / 1000)
+    #[cfg(unix)]
+    {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+        format!("{}.{:06}", ts.tv_sec, ts.tv_nsec / 1000)
+    }
+    #[cfg(not(unix))]
+    {
+        let el = since_launch();
+        format!("{}.{:06}", el.as_secs(), el.subsec_micros())
+    }
 }
 
 /// Peak resident set size in KiB (ru_maxrss is KiB on Linux, bytes on macOS)
 fn peak_rss_kb() -> i64 {
-    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
-    if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) } != 0 {
-        return 0;
+    #[cfg(unix)]
+    {
+        let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+        if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) } != 0 {
+            return 0;
+        }
+        if cfg!(target_os = "macos") {
+            ru.ru_maxrss as i64 / 1024
+        } else {
+            ru.ru_maxrss as i64
+        }
     }
-    if cfg!(target_os = "macos") {
-        ru.ru_maxrss as i64 / 1024
-    } else {
-        ru.ru_maxrss as i64
+    #[cfg(not(unix))]
+    {
+        0
     }
 }
 
 fn kernel_release() -> String {
-    let mut u: libc::utsname = unsafe { std::mem::zeroed() };
-    if unsafe { libc::uname(&mut u) } != 0 {
-        return "-".into();
+    #[cfg(unix)]
+    {
+        let mut u: libc::utsname = unsafe { std::mem::zeroed() };
+        if unsafe { libc::uname(&mut u) } != 0 {
+            return "-".into();
+        }
+        unsafe { std::ffi::CStr::from_ptr(u.release.as_ptr()) }
+            .to_string_lossy()
+            .into_owned()
     }
-    unsafe { std::ffi::CStr::from_ptr(u.release.as_ptr()) }
-        .to_string_lossy()
-        .into_owned()
+    #[cfg(not(unix))]
+    {
+        "-".into()
+    }
 }
 
 /// A process's command name (Linux); "-" elsewhere
@@ -633,6 +704,7 @@ fn comm(pid: i32) -> String {
 }
 
 /// Threads in this process (Linux); -1 elsewhere
+#[cfg(unix)]
 fn thread_count() -> i64 {
     std::fs::read_dir("/proc/self/task").map_or(-1, |d| d.count() as i64)
 }
