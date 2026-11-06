@@ -42,11 +42,6 @@ tracing-subscriber = { workspace = true }
 tracing-appender = "0.2"
 tempfile = { workspace = true }
 
-# Daemonization (Unix only)
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
-signal-hook-registry = "1.4.8"
-
 # Utilities
 dirs = "5.0"
 serde = { workspace = true }
@@ -60,6 +55,11 @@ axum = { workspace = true, optional = true }
 irondivi-sidechains = { git = "ssh://git@github.com/bshuler/irondivi-sidechain-market.git", rev = "52fbd26928e6417ab9980863aa99de4e3b24392c", optional = true }
 dvsm-manifest = { git = "ssh://git@github.com/bshuler/irondivi-sidechain-market.git", rev = "52fbd26928e6417ab9980863aa99de4e3b24392c", optional = true }
 dvsc-registry = { git = "ssh://git@github.com/bshuler/irondivi-sidechain-market.git", rev = "52fbd26928e6417ab9980863aa99de4e3b24392c", optional = true }
+
+# Daemonization (Unix only)
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+signal-hook-registry = "1.4.8"
 
 [features]
 fault-injection = ["divi-storage/fault-injection"]
