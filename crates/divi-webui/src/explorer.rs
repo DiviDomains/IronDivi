@@ -225,9 +225,13 @@ mod tests {
 
     #[test]
     fn is_index_disabled_error_matching() {
-        assert!(is_index_disabled_error("Address index is off: enable addressindex=1"));
+        assert!(is_index_disabled_error(
+            "Address index is off: enable addressindex=1"
+        ));
         assert!(is_index_disabled_error("Transaction index not enabled"));
-        assert!(is_index_disabled_error("No information available for address"));
+        assert!(is_index_disabled_error(
+            "No information available for address"
+        ));
         assert!(!is_index_disabled_error("Invalid parameters"));
         assert!(!is_index_disabled_error("Connection refused"));
     }

@@ -22,7 +22,9 @@ use sha2::Sha256;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::auth::{clean_label, random_hex, write_private};
-use crate::webauthn::{b64url_decode, b64url_encode, decode_prf_salt, decode_prf_secret, rp_id_from_host};
+use crate::webauthn::{
+    b64url_decode, b64url_encode, decode_prf_salt, decode_prf_secret, rp_id_from_host,
+};
 
 pub const NODE_PASSKEY_FILE: &str = "webui-node-passkey.json";
 const MAX_NODE_SLOTS: usize = 16;
@@ -188,7 +190,9 @@ impl NodePasskeyStore {
         let _g = self.lock.lock();
         let mut file = self.read_unlocked()?;
         if file.slots.len() >= MAX_NODE_SLOTS {
-            return Err(format!("at most {MAX_NODE_SLOTS} node passkeys may be added"));
+            return Err(format!(
+                "at most {MAX_NODE_SLOTS} node passkeys may be added"
+            ));
         }
         if file.slots.iter().any(|s| s.credential_id == credential_id) {
             return Err("that passkey is already enrolled for the node wallet".into());
@@ -284,7 +288,14 @@ mod tests {
         let cred = b64url_encode(b"node-cred-1");
 
         let summary = store
-            .enroll("my-node-wallet-secret", "Mac Touch ID", &cred, &salt, "localhost", &prf)
+            .enroll(
+                "my-node-wallet-secret",
+                "Mac Touch ID",
+                &cred,
+                &salt,
+                "localhost",
+                &prf,
+            )
             .unwrap();
         assert_eq!(store.list().len(), 1);
 

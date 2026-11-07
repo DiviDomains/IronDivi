@@ -496,8 +496,7 @@ impl WalletStore {
         };
         let mut dek = Zeroizing::new([0u8; 32]);
         rand::rngs::OsRng.fill_bytes(&mut dek[..]);
-        let (sealed, pass_slot) =
-            seal_v2(&self.network, coin_type, passphrase, &dek, &secret)?;
+        let (sealed, pass_slot) = seal_v2(&self.network, coin_type, passphrase, &dek, &secret)?;
         let w = WalletFile {
             version: VERSION_V2,
             id: new_id(),
@@ -982,11 +981,7 @@ fn seal_v2(
     let mut salt = [0u8; 16];
     rand::rngs::OsRng.fill_bytes(&mut salt);
     let pass_key = derive_key(&KDF, passphrase, &salt)?;
-    let sealed_dek = aead_encrypt(
-        &pass_key,
-        dek,
-        &aad_v2_passphrase_slot(network, coin_type),
-    )?;
+    let sealed_dek = aead_encrypt(&pass_key, dek, &aad_v2_passphrase_slot(network, coin_type))?;
     let slot = PassphraseSlot {
         kind: "argon2id".into(),
         kdf: KDF,
@@ -1319,11 +1314,9 @@ mod tests {
         let rec = divi_crypto::RecoverableSig::from_compact_with_recovery(&raw).unwrap();
         let hash = divi_rpc::wallet::message_magic_hash(msg.as_bytes());
         let pubkey = rec.recover_from_hash(&hash).unwrap();
-        let recovered_addr = Address::from_pubkey_hash(
-            divi_crypto::hash160(&pubkey.to_bytes()),
-            Network::Regtest,
-        )
-        .to_string();
+        let recovered_addr =
+            Address::from_pubkey_hash(divi_crypto::hash160(&pubkey.to_bytes()), Network::Regtest)
+                .to_string();
         assert_eq!(recovered_addr, addr);
 
         // Delete with passkey PRF

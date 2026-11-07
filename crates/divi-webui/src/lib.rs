@@ -396,9 +396,7 @@ async fn guard(State(s): State<Arc<Shared>>, req: Request, next: Next) -> Respon
         )
             .into_response();
     };
-    if req.method() == Method::POST
-        || req.method() == Method::PUT
-        || req.method() == Method::DELETE
+    if req.method() == Method::POST || req.method() == Method::PUT || req.method() == Method::DELETE
     {
         let origin = req
             .headers()
@@ -691,7 +689,9 @@ async fn api_state(State(s): State<Arc<Shared>>, headers: HeaderMap) -> Response
 }
 
 async fn api_auth_status(State(s): State<Arc<Shared>>, headers: HeaderMap) -> Response {
-    let signed = cookie_of(&headers).and_then(|c| s.sessions.touch(&c)).is_some();
+    let signed = cookie_of(&headers)
+        .and_then(|c| s.sessions.touch(&c))
+        .is_some();
     let mut status = json!({
         "setup_required": s.auth.setup_required(),
         "signed_in": signed,
@@ -878,7 +878,11 @@ async fn api_passkey_login_finish(
         Ok(v) => v,
         Err(msg) => {
             s.limiter.failed(peer.ip());
-            warn!("Web interface: failed passkey sign-in from {}: {}", peer.ip(), msg);
+            warn!(
+                "Web interface: failed passkey sign-in from {}: {}",
+                peer.ip(),
+                msg
+            );
             return Err(ApiError(StatusCode::UNAUTHORIZED, msg));
         }
     };
@@ -1879,7 +1883,10 @@ async fn api_wallet_action(
                 )
             })
             .await?;
-            info!("Web interface enrolled passkey {} on wallet {}", summary.id, id);
+            info!(
+                "Web interface enrolled passkey {} on wallet {}",
+                summary.id, id
+            );
             let active = s.wallets.active();
             json!({
                 "ok": true,
@@ -1907,7 +1914,8 @@ async fn api_wallet_action(
         }
         "address" => {
             let address = sealed(&s, move |store| {
-                let auth = select_wallet_auth(body.passphrase.as_deref(), body.passkey.as_ref()).ok();
+                let auth =
+                    select_wallet_auth(body.passphrase.as_deref(), body.passkey.as_ref()).ok();
                 store.next_address_with(&id, auth)
             })
             .await?;
@@ -2314,7 +2322,10 @@ async fn api_node_wallet_backup(State(s): State<Arc<Shared>>, headers: HeaderMap
         .map_err(|e| bad(e.to_string()))?
         .map_err(|e| bad(format!("failed to secure backup permissions: {e}")))?;
 
-    info!("Web interface backed up node wallet to backups/{}", filename);
+    info!(
+        "Web interface backed up node wallet to backups/{}",
+        filename
+    );
     Ok(Json(json!({
         "ok": true,
         "filename": filename,

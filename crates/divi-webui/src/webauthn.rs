@@ -120,7 +120,9 @@ pub fn check_origin(origin: &str, rp_id: &str, allowed_hosts: &[String]) -> Resu
         return Err("unexpected WebAuthn origin".into());
     }
     let host_allowed = allowed_hosts.iter().any(|h| h == host_port)
-        || (!https && !host_port.contains(':') && allowed_hosts.contains(&format!("{host_port}:80")))
+        || (!https
+            && !host_port.contains(':')
+            && allowed_hosts.contains(&format!("{host_port}:80")))
         || (https
             && !host_port.contains(':')
             && allowed_hosts.contains(&format!("{host_port}:443")));
@@ -347,7 +349,8 @@ pub fn verify_registration(
     if flags & FLAG_AT == 0 {
         return Err("passkey attested credential data missing".into());
     }
-    let sign_count = u32::from_be_bytes([auth_data[33], auth_data[34], auth_data[35], auth_data[36]]);
+    let sign_count =
+        u32::from_be_bytes([auth_data[33], auth_data[34], auth_data[35], auth_data[36]]);
     let cred_len = u16::from_be_bytes([auth_data[53], auth_data[54]]) as usize;
     if cred_len == 0 || cred_len > 1023 || auth_data.len() <= 55 + cred_len {
         return Err("invalid passkey credential ID length".into());
@@ -478,8 +481,14 @@ mod tests {
 
         let cose = CborValue::Map(vec![
             (CborValue::Integer(1.into()), CborValue::Integer(2.into())),
-            (CborValue::Integer(3.into()), CborValue::Integer((-7).into())),
-            (CborValue::Integer((-1).into()), CborValue::Integer(1.into())),
+            (
+                CborValue::Integer(3.into()),
+                CborValue::Integer((-7).into()),
+            ),
+            (
+                CborValue::Integer((-1).into()),
+                CborValue::Integer(1.into()),
+            ),
             (
                 CborValue::Integer((-2).into()),
                 CborValue::Bytes(x.to_vec()),
@@ -503,13 +512,19 @@ mod tests {
         if with_ext {
             let ext = CborValue::Map(vec![(
                 CborValue::Text("prf".into()),
-                CborValue::Map(vec![(CborValue::Text("enabled".into()), CborValue::Bool(true))]),
+                CborValue::Map(vec![(
+                    CborValue::Text("enabled".into()),
+                    CborValue::Bool(true),
+                )]),
             )]);
             ciborium::into_writer(&ext, &mut auth_data).unwrap();
         }
 
         let att = CborValue::Map(vec![
-            (CborValue::Text("fmt".into()), CborValue::Text("none".into())),
+            (
+                CborValue::Text("fmt".into()),
+                CborValue::Text("none".into()),
+            ),
             (CborValue::Text("attStmt".into()), CborValue::Map(vec![])),
             (
                 CborValue::Text("authData".into()),
@@ -524,7 +539,10 @@ mod tests {
     #[test]
     fn rp_id_rejects_ip_and_accepts_localhost_or_domain() {
         assert_eq!(rp_id_from_host("localhost:51482").unwrap(), "localhost");
-        assert_eq!(rp_id_from_host("Node.Example:8443").unwrap(), "node.example");
+        assert_eq!(
+            rp_id_from_host("Node.Example:8443").unwrap(),
+            "node.example"
+        );
         assert!(rp_id_from_host("127.0.0.1:51482").is_err());
         assert!(rp_id_from_host("[::1]:51482").is_err());
     }

@@ -108,7 +108,11 @@ fn unix_now() -> u64 {
 
 pub(crate) fn clean_label(label: &str, fallback: &str) -> Result<String, String> {
     let trimmed = label.trim();
-    let chosen = if trimmed.is_empty() { fallback } else { trimmed };
+    let chosen = if trimmed.is_empty() {
+        fallback
+    } else {
+        trimmed
+    };
     if chosen.chars().count() > 64 || chosen.chars().any(char::is_control) {
         return Err("a passkey label is 1 to 64 printable characters".into());
     }
@@ -312,7 +316,9 @@ impl AuthStore {
             return Err("set the password first".into());
         };
         if current.passkeys.len() >= MAX_ADMIN_PASSKEYS {
-            return Err(format!("at most {MAX_ADMIN_PASSKEYS} passkeys may be added"));
+            return Err(format!(
+                "at most {MAX_ADMIN_PASSKEYS} passkeys may be added"
+            ));
         }
         if current
             .passkeys
