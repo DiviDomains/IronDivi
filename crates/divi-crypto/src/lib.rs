@@ -19,6 +19,7 @@ pub mod error;
 pub mod genesis;
 pub mod hash;
 pub mod keys;
+pub mod pq;
 pub mod quark;
 pub mod signature;
 
