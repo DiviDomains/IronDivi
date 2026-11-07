@@ -132,6 +132,11 @@ impl PqSchemeId {
         }
     }
 
+    /// Parse a 1-byte `scheme_id` tag (`0x01`–`0x04`), alias for [`Self::from_u8`].
+    pub const fn from_byte(byte: u8) -> Result<Self, PqError> {
+        Self::from_u8(byte)
+    }
+
     /// Return the canonical 1-byte wire identifier (`0x01`–`0x04`).
     pub const fn as_u8(self) -> u8 {
         self as u8
@@ -256,6 +261,17 @@ impl PqDomainTag {
             Self::TxSigV1 => "Divi-PQ-TxSig-v1",
             Self::BlockSigV1 => "Divi-PQ-BlockSig-v1",
             Self::SporkV1 => "Divi-PQ-Spork-v1",
+        }
+    }
+
+    /// Parse a canonical domain-separation tag string (`"Divi-PQ-TxSig-v1"`,
+    /// `"Divi-PQ-BlockSig-v1"`, or `"Divi-PQ-Spork-v1"`).
+    pub fn from_tag(tag: &str) -> Option<Self> {
+        match tag {
+            "Divi-PQ-TxSig-v1" => Some(Self::TxSigV1),
+            "Divi-PQ-BlockSig-v1" => Some(Self::BlockSigV1),
+            "Divi-PQ-Spork-v1" => Some(Self::SporkV1),
+            _ => None,
         }
     }
 }
@@ -863,6 +879,9 @@ impl PqMasterKey {
     /// Rejects `index >= 0x8000_0000` if callers use `derive_child_hardened` with an out-of-range
     /// unmasked index; accepts unmasked indices in `0..0x8000_0000`.
     pub fn derive_child_hardened(&self, unhardened_index: u32) -> Result<Self, PqError> {
+        if (unhardened_index & HARDENED_INDEX_BIT) != 0 {
+            return Err(PqError::NonHardenedPqDerivationForbidden(unhardened_index));
+        }
         self.derive_child_raw(unhardened_index | HARDENED_INDEX_BIT)
     }
 }
@@ -966,6 +985,11 @@ pub fn derive_pq_leaf_from_master(
     scheme_id: PqSchemeId,
     index: u32,
 ) -> Result<PqLeafKey, PqError> {
+    for unhardened in [coin_type, account, index] {
+        if (unhardened & HARDENED_INDEX_BIT) != 0 {
+            return Err(PqError::NonHardenedPqDerivationForbidden(unhardened));
+        }
+    }
     let path = [
         PQ_BIP44_PURPOSE | HARDENED_INDEX_BIT,
         coin_type | HARDENED_INDEX_BIT,

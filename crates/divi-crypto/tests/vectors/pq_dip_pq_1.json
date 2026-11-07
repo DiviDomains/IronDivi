@@ -1,0 +1,455 @@
+{
+  "schema_version": 1,
+  "dip": "DIP-PQ-1",
+  "title": "Divi & IronDivi Post-Quantum Cryptographic Primitives, Domain-Separated Prehashing, BIP39 PQ HD Derivation, and LMS-SHA256-M32-H10 Differential Test Vectors",
+  "track": "Track 7C Phase 1 P1.3b",
+  "vector_1_key_hashes": [
+    {
+      "id": "v1-mldsa44-key-hashes",
+      "description": "ML-DSA-44 (0x01, 1312 B) PQKeyHash256 (prehash binding) and PQAddressKeyHash256 (script/address commitment)",
+      "scheme_id": 1,
+      "scheme_name": "ML-DSA-44",
+      "pubkey_len": 1312,
+      "pubkey_hex": "205ea462c081255c0000093ca36c98f7bd5172db7b2ef329804bdf3990d9e3bfb48b95b3d61278da0c95f4e8e6a3f74d6fd58542092bf595e7d6a640e43f6908e3fbad735d900d1e832a0d7097cfd8435ae4e530404aee235b3a3cb2de048747b930a8542aefd81935d2f1caefbb04a759367e187fff2624ceabf0dedf3fd3aba8001c0c218f0053a596181316f23eff525a0e6b98e496af5c0ca37200a83ca79634d0f909b17c18ac769bdc516dae116a397a53823338a28a3f37b1e9540478e890f825626aa5860d5322a42eb2b2b1ddea94fd317a49359c63d9d1956b54fa0406ec192f328bb05dc8cd6ffe83c491217da25570df9fb964f9309394e1b507b9970b4bf01cfb0a74f7f306bc73bede715622bc162777107f8e779d23c01121b6d9e6e783acb84486e9d2408a4e0e448a54bb5386cec357a16f786afccbcc9477ba0f8500d5f76d9292ea22af01be99f0ea855fed5141cc75a3698fb013fbeaaeb50c6210cb9d8feb453e420ba762538d6a121b227a31837c2e7f87abe0d4ad4f239b9018074d88fa8d6894d77716d34c6acbb289fb4b7a0e5e9c6a115bca71080698801b39a5cbba762c191e1df94cd405e132f446651ad6375366e1607a770ad2480430a7251737c4c756d055a9b8ec38306baa9eaa3bcff027f83ea9f21b5b681db39cbb8672184c305e69ca3e160ab6a898025560fac77f5b8e2b256322f57a2d63a4a3528cde7f223289b52e91e2e665e94b59ec9c17bd2bcc5ebbc881f5f601e7f6e13af435a019cf5d4c405708505a923980fcc02cc8bceba6c29a9a369fd6bc89859d4ee3d148e747e825fad0c42a656c9f26152a449091095a4fb1e0765011d9944ccc9d970f202b60a4d2d42be469abe681414b2d638cd4e9b4fef487c3bb4d105b29abd045fe54c1df0cfa64c8c59bd90ad7813b9abbc136836211564ff84d143c82308658e0d2927ef18002541f9406db3ff82818387ae54485d94aec4905fce82a4699d23e8825ddb0eacedd2d41971884f54ceecb287571946115dcc32dad56015ef098160dc0cf736d47264b34674ec557d52b3423eafbf5b436ed3ed792dd7b2b6f1457a84fbf37f3619af7d191d15f0d6eb4e03045a9c8207c42d1fff3f918c1215288f22d9610f5af62061eade59462ec19c804ea9babb9a7e8ed593ef56c72872410b3b31996c802caf107723d43c184e14e40dbb524b24176758c72fd2766bb29430674c4e77f66c16b1eaa731bf2ce1a8909ff7adadc52bc17cbb2b7bcc484f94f0ccb974ae00a50d94a1c08fe3d35aa919a0c675d97adf7a752d67aef45b99d1f648522ac9d93557bda44cff4f5688f53a28ff057a96be77eb683ab016f4e3f59aecdbc75ea82283b0d14a9e54a3d819bd157c5e0f70c068e7b5478ff29359209d875a2b179d216939be424f13c8711608a92d305a0a2b15c8840f5a3d9a2412ffce095030f23df4bae2d52c55961b2e2204aab8d67626894ddad1640c248107592710f97779b77cb79d58d181945726aeb5e20da551db8c1f32fdc420196986733a778fb9f1f633d65d5d03a6d8e7764b754234e533da32a897550c25daa31fa57ae4cf59f988e2ab588a456b1a65e264bcf014e8d47cb90911c07ac4c9388f16dd9d870126985d1ab676097643c27d22b4b807d02d49ed7f900d62211ded143ff6953d11ed8b9deed4e8ee632801f30af02b4064182497cc486976270d35d99b85f45c11452b5d120eaeaab1c26798c208df91ccf6fdcc8acea2d794dc55cf206cda92503a54e081c03a444c99884ebc9e80cf8f521ab7738e43c12c00fd3a768b3789abdac8cf651b6fb65bedf0e8efd5b2cee",
+      "pq_key_hash_256_hex": "8151eb8bee64a21b7de032cf5704b15702e20854ab6c0f661d5a9e522c57e41d",
+      "pq_address_key_hash_256_hex": "6b6789d1ccdfe2ca5c3a0b772e490985a302ed5a67cffad7ace50eacd86f4976"
+    },
+    {
+      "id": "v1-fndsa512-key-hashes",
+      "description": "FN-DSA-512 (0x02, 897 B canonical header 0x09) PQKeyHash256 and PQAddressKeyHash256",
+      "scheme_id": 2,
+      "scheme_name": "FN-DSA-512",
+      "pubkey_len": 897,
+      "pubkey_hex": "090000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+      "pq_key_hash_256_hex": "be06745554b3a4b99a7c18b6162d2621e230e304e2fec37364f59e361a4ddd55",
+      "pq_address_key_hash_256_hex": "1f087e7f8ac41a72c4976c01f764f68c57948b631301f5b251bf541328d374ae"
+    },
+    {
+      "id": "v1-slhdsa128s-key-hashes",
+      "description": "SLH-DSA-128s (0x03, 32 B) PQKeyHash256 and PQAddressKeyHash256",
+      "scheme_id": 3,
+      "scheme_name": "SLH-DSA-128s",
+      "pubkey_len": 32,
+      "pubkey_hex": "f11b6af4d424344c4522942c3123320a174afcfa7a602f825d51ca7307d9b273",
+      "pq_key_hash_256_hex": "5a3f4e05d0763eba15ad8219d4792605ecaaed7f1b19148368c894bb30f91944",
+      "pq_address_key_hash_256_hex": "53e3862c0bae770a8cf1c3ecf2a728c7ebb91d8073f32e9586f66a3d2f7d0c49"
+    },
+    {
+      "id": "v1-lms-sha256-m32-h10-key-hashes",
+      "description": "LMS-SHA256-M32-H10 (0x04, 60 B derived at m/44'/301'/0'/4'/0') PQKeyHash256 and PQAddressKeyHash256",
+      "scheme_id": 4,
+      "scheme_name": "LMS-SHA256-M32-H10",
+      "pubkey_len": 60,
+      "pubkey_hex": "0000000600000003bf2fd2b1a59e04f9b9da4243bb4b78d6a2cccf5a07cc294fd61b762122616dc1884927cfeb3f340e5a6949502bd4a60100000000",
+      "pq_key_hash_256_hex": "03bfb33bb7ba3eaba95c8ac9abf5c55bb5c6030f1dd28879d2c70f804826cc02",
+      "pq_address_key_hash_256_hex": "42d30d5f77c2435ce1888d77fc87f9cfdfbdd82e0eff2e12f4bc46a10697f81c"
+    }
+  ],
+  "vector_2_hd_derivation": {
+    "mnemonic": "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art",
+    "passphrase": "",
+    "bip39_seed_hex": "408b285c123836004f4b8842c89324c1f01382450c0d439af345ba7fc49acf705489c6fc77dbd4e3dc1dd8cc6bc9f043db8ada1e243c4a0eafb290d399480840",
+    "master_domain_key_ascii": "Divi PQ seed v1",
+    "k_master_hex": "47cd0fc16effbec1c630f59b2f3aae6924a13d6058d7fab33395829e21fe7a37",
+    "c_master_hex": "80b033237fd0594e16a0b3afaa608abbdf86f03cff7bf4c2ca248fbf95f9a77a",
+    "leaves": [
+      {
+        "id": "v2-divi-mainnet-mldsa44",
+        "network": "divi-mainnet",
+        "path": "m/44'/301'/0'/1'/0'",
+        "coin_type": 301,
+        "account": 0,
+        "scheme_id": 1,
+        "scheme_name": "ML-DSA-44",
+        "index": 0,
+        "k_leaf_hex": "eb2660d9798dde6a7dfd99da787fdcc470b3a19270fa04a708986c282904b8a8",
+        "c_leaf_hex": "abce2677b924f115d859de017055629b07357fcd1d6772e4dc7dd6bddf3e1e9e",
+        "algorithm_seed_len": 32,
+        "algorithm_seed_hex": "5453ad6e329dfd732cffdd3f9adaa808682f8c6597100bb7912b03116c26f38a",
+        "keygen_stream_64_hex": "5453ad6e329dfd732cffdd3f9adaa808682f8c6597100bb7912b03116c26f38a20a2a8f18860a1ae440eae38b21af9a36ae65680f430fe5b4684a4e68a9ef9a1"
+      },
+      {
+        "id": "v2-divi-mainnet-fndsa512",
+        "network": "divi-mainnet",
+        "path": "m/44'/301'/0'/2'/0'",
+        "coin_type": 301,
+        "account": 0,
+        "scheme_id": 2,
+        "scheme_name": "FN-DSA-512",
+        "index": 0,
+        "k_leaf_hex": "59d356d84afc5b11ec409c8485c8c4cc63f85e7035a25d36fcf19cbec285f8f2",
+        "c_leaf_hex": "951f0c084b45664df19555b13fbbc391f0af07fb27d403db2a2b65de85d3dd97",
+        "algorithm_seed_len": 64,
+        "algorithm_seed_hex": "61644f3db169e2dd7a7750f58c032b525fdf6d8afbc0a3243ac01606ace6d5ae2d2865aba8d5f1cf73d359389b5a28a92e279794c3bcad50405d743b7a83ee67",
+        "keygen_stream_64_hex": "61644f3db169e2dd7a7750f58c032b525fdf6d8afbc0a3243ac01606ace6d5ae2d2865aba8d5f1cf73d359389b5a28a92e279794c3bcad50405d743b7a83ee67"
+      },
+      {
+        "id": "v2-divi-mainnet-slhdsa128s",
+        "network": "divi-mainnet",
+        "path": "m/44'/301'/0'/3'/0'",
+        "coin_type": 301,
+        "account": 0,
+        "scheme_id": 3,
+        "scheme_name": "SLH-DSA-128s",
+        "index": 0,
+        "k_leaf_hex": "6ef5a0ac7cf91103ade416d58fa8c26887bd0c489757aeb3cff9e40acd8af5af",
+        "c_leaf_hex": "18c4307336d7e9cad796e51355c38692fca7a4cc7bd8d230fd2b032f28ed34b3",
+        "algorithm_seed_len": 48,
+        "algorithm_seed_hex": "1c9107b4294ea04d121061281585ea22b78f0dddc6c4dc588448f2eee2287c70f11b6af4d424344c4522942c3123320a",
+        "keygen_stream_64_hex": "1c9107b4294ea04d121061281585ea22b78f0dddc6c4dc588448f2eee2287c70f11b6af4d424344c4522942c3123320afcc6388d5fd34044be7de4b27ebae070"
+      },
+      {
+        "id": "v2-divi-mainnet-lms-h10",
+        "network": "divi-mainnet",
+        "path": "m/44'/301'/0'/4'/0'",
+        "coin_type": 301,
+        "account": 0,
+        "scheme_id": 4,
+        "scheme_name": "LMS-SHA256-M32-H10",
+        "index": 0,
+        "k_leaf_hex": "40454acf8491c7e178e9417993e1b48fc1b9cbe703569c9515cf783d4e57721c",
+        "c_leaf_hex": "0c175a7c66ac8f3d6bd514f4eef0daa0f70b59aab0ce8ee599c8f67b7923b3c9",
+        "algorithm_seed_len": 48,
+        "algorithm_seed_hex": "bf2fd2b1a59e04f9b9da4243bb4b78d64d4fc0255e0916ff0fc4e1ebcf26d65b45cc4c47717afc7cecb68799b5c3d981",
+        "keygen_stream_64_hex": "bf2fd2b1a59e04f9b9da4243bb4b78d64d4fc0255e0916ff0fc4e1ebcf26d65b45cc4c47717afc7cecb68799b5c3d981fb006f81a30900b4aad420f844dbe611"
+      },
+      {
+        "id": "v2-divi-testnet-mldsa44",
+        "network": "divi-testnet",
+        "path": "m/44'/1'/0'/1'/0'",
+        "coin_type": 1,
+        "account": 0,
+        "scheme_id": 1,
+        "scheme_name": "ML-DSA-44",
+        "index": 0,
+        "k_leaf_hex": "279ea392e7ca0264cfcc9e78568e9cfaaa8e402ae0b42151bbd1a659105ea819",
+        "c_leaf_hex": "92a323683917ed6642ed3398404b179e69e239d28287b81617d17406db588b71",
+        "algorithm_seed_len": 32,
+        "algorithm_seed_hex": "866b3335fad05491e55b4c8b95dc87a249d01beb8d6d6bd190eb6e2836d1def2",
+        "keygen_stream_64_hex": "866b3335fad05491e55b4c8b95dc87a249d01beb8d6d6bd190eb6e2836d1def249947bdd026fc9a652ec8a0598b361d155d8c91dee8af79a4381733c17fb7afb"
+      },
+      {
+        "id": "v2-divi-testnet-fndsa512",
+        "network": "divi-testnet",
+        "path": "m/44'/1'/0'/2'/0'",
+        "coin_type": 1,
+        "account": 0,
+        "scheme_id": 2,
+        "scheme_name": "FN-DSA-512",
+        "index": 0,
+        "k_leaf_hex": "7ff90f6fce9a57374b2710535ad02b6488920672660b6724d8243703048b3129",
+        "c_leaf_hex": "5aea993007c60acd66214359a79585fabec67d68e3a2e652e8bc41e2a85e9a3c",
+        "algorithm_seed_len": 64,
+        "algorithm_seed_hex": "50445157b207c1bfaab9424832fd7c6150fccf5c1a47a794e9e67b17cd028e12f9705b5085a0ffa39cad73069f38de124dfde5618dd2c3119f9ffdb4566662bf",
+        "keygen_stream_64_hex": "50445157b207c1bfaab9424832fd7c6150fccf5c1a47a794e9e67b17cd028e12f9705b5085a0ffa39cad73069f38de124dfde5618dd2c3119f9ffdb4566662bf"
+      },
+      {
+        "id": "v2-divi-testnet-slhdsa128s",
+        "network": "divi-testnet",
+        "path": "m/44'/1'/0'/3'/0'",
+        "coin_type": 1,
+        "account": 0,
+        "scheme_id": 3,
+        "scheme_name": "SLH-DSA-128s",
+        "index": 0,
+        "k_leaf_hex": "4992d2229534627c91f76ac109b8184be9f3f14d00b88661493d5bbe464e3381",
+        "c_leaf_hex": "7efd83729b322fe65296b93135753c1268f64a69e982f0d33fe49df766b0d0ac",
+        "algorithm_seed_len": 48,
+        "algorithm_seed_hex": "b95d1de8bf60554c4aacfde74b089df9a9f864ead8aeb1b414c588eb30938ebf75d4265cb0232d4407ea48a4eb007410",
+        "keygen_stream_64_hex": "b95d1de8bf60554c4aacfde74b089df9a9f864ead8aeb1b414c588eb30938ebf75d4265cb0232d4407ea48a4eb007410fa06c49ecd14e307f1d25e00134f063b"
+      },
+      {
+        "id": "v2-privatedivi-mainnet-mldsa44",
+        "network": "privatedivi-mainnet",
+        "path": "m/44'/801'/0'/1'/0'",
+        "coin_type": 801,
+        "account": 0,
+        "scheme_id": 1,
+        "scheme_name": "ML-DSA-44",
+        "index": 0,
+        "k_leaf_hex": "1d61da22286da2de751a8e2bc126a3bc79606a194e68ac23507814d95888760d",
+        "c_leaf_hex": "69966d43af748806b5dfe98a925dbf06562d9a8dec2f44be446493ce4994eb7a",
+        "algorithm_seed_len": 32,
+        "algorithm_seed_hex": "a1eba3460aeb33c7c46ebf4957cab8761fd8e5f305141d1e8617657655ad9206",
+        "keygen_stream_64_hex": "a1eba3460aeb33c7c46ebf4957cab8761fd8e5f305141d1e8617657655ad92068a88cfc5974164fb68905c7943f491a7929c0328e304f4da784837dd72450c42"
+      },
+      {
+        "id": "v2-privatedivi-mainnet-fndsa512",
+        "network": "privatedivi-mainnet",
+        "path": "m/44'/801'/0'/2'/0'",
+        "coin_type": 801,
+        "account": 0,
+        "scheme_id": 2,
+        "scheme_name": "FN-DSA-512",
+        "index": 0,
+        "k_leaf_hex": "e65d154600b909d212bb021bbddbcc9735c873fd6fff15f5016babd8eb34ac44",
+        "c_leaf_hex": "5d98e512dab6a10e894227ac5d0ef0d9707272c0e1d5dc30cab26408310178f9",
+        "algorithm_seed_len": 64,
+        "algorithm_seed_hex": "dce9645ea47022a68e272ced7fd5fb13bc85469a160c4708075c3871d56ec37ccac0b82553b86f81dccb635fa5f26e2d0f1524f0bcf318ca203dfe715e3ee658",
+        "keygen_stream_64_hex": "dce9645ea47022a68e272ced7fd5fb13bc85469a160c4708075c3871d56ec37ccac0b82553b86f81dccb635fa5f26e2d0f1524f0bcf318ca203dfe715e3ee658"
+      },
+      {
+        "id": "v2-privatedivi-mainnet-slhdsa128s",
+        "network": "privatedivi-mainnet",
+        "path": "m/44'/801'/0'/3'/0'",
+        "coin_type": 801,
+        "account": 0,
+        "scheme_id": 3,
+        "scheme_name": "SLH-DSA-128s",
+        "index": 0,
+        "k_leaf_hex": "1e32c077f1d7c8e349f0bac9e3ea309eb0e7691f0f84bbac34e5ece18413c3ec",
+        "c_leaf_hex": "014f0802e64e72ab72d9bdc84137fd02a465f08b9546a3c21900de305175baee",
+        "algorithm_seed_len": 48,
+        "algorithm_seed_hex": "a43ff3bedb8c7680e5593915ca4d1dd64d63e436e196a611461dead2840e63bb58dae11e2f98c854bb6b3da355a11add",
+        "keygen_stream_64_hex": "a43ff3bedb8c7680e5593915ca4d1dd64d63e436e196a611461dead2840e63bb58dae11e2f98c854bb6b3da355a11add4b36d0bbc4a2a714aad1a25483a49ae2"
+      }
+    ]
+  },
+  "vector_3_signing_prehashes": [
+    {
+      "id": "v3-tx-input-divi-mainnet",
+      "role": "tx-input",
+      "domain_tag": "Divi-PQ-TxSig-v1",
+      "network": "divi-mainnet",
+      "network_magic_hex": "dff0c8f3",
+      "scheme_id": 1,
+      "pk_hash256_hex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "ctx_payload_hex": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "preimage_hex": "10446976692d50512d54785369672d7631dff0c8f301aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "prehash_sha512_hex": "35a53a5300c86e71a0ca916cbbb5000fa2f06dca1b6bd6938a0945c92d00c9dcef28976fbd763b535da1683a0ca12e0cf65592666751bb2eb4bf97bf1201132f"
+    },
+    {
+      "id": "v3-coinstake-kernel-divi-mainnet",
+      "role": "coinstake-kernel",
+      "domain_tag": "Divi-PQ-TxSig-v1",
+      "network": "divi-mainnet",
+      "network_magic_hex": "dff0c8f3",
+      "scheme_id": 2,
+      "pk_hash256_hex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "ctx_payload_hex": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "preimage_hex": "10446976692d50512d54785369672d7631dff0c8f302aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "prehash_sha512_hex": "715b0f9f72cb7031723ccdb38633a48fedd9b7f6e44a4043461d727546028509b94300a802c24d5c736b6f1cbb524d23e0e8eb6aabf849e3ac73378a2e94a1af"
+    },
+    {
+      "id": "v3-pos-block-divi-mainnet",
+      "role": "pos-block",
+      "domain_tag": "Divi-PQ-BlockSig-v1",
+      "network": "divi-mainnet",
+      "network_magic_hex": "dff0c8f3",
+      "scheme_id": 2,
+      "pk_hash256_hex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "ctx_payload_hex": "ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "preimage_hex": "13446976692d50512d426c6f636b5369672d7631dff0c8f302aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "prehash_sha512_hex": "c87bc21802e2ceaba45c471cf9d4911b808223789d053b77e096378e6d2b85483af8e1b04a9022e10f336ab571205852de60ac31f965af19c52312380ec8ab9c"
+    },
+    {
+      "id": "v3-spork-divi-mainnet",
+      "role": "spork",
+      "domain_tag": "Divi-PQ-Spork-v1",
+      "network": "divi-mainnet",
+      "network_magic_hex": "dff0c8f3",
+      "scheme_id": 4,
+      "pk_hash256_hex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "ctx_payload_hex": "1c2700008023a5f20000000000f1536500000000",
+      "preimage_hex": "10446976692d50512d53706f726b2d7631dff0c8f304aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1c2700008023a5f20000000000f1536500000000",
+      "prehash_sha512_hex": "fc80064a5487fc3a9f9152ff6002fca7b6f14f159f4b67be058b3df72e78982018b4bd345b0b77bc89e42db3a9817c6f75cd28b6caf877f963fc2bc7d0bd2783"
+    },
+    {
+      "id": "v3-tx-input-privatedivi-mainnet",
+      "role": "tx-input",
+      "domain_tag": "Divi-PQ-TxSig-v1",
+      "network": "privatedivi-mainnet",
+      "network_magic_hex": "b7dc624e",
+      "scheme_id": 1,
+      "pk_hash256_hex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "ctx_payload_hex": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "preimage_hex": "10446976692d50512d54785369672d7631b7dc624e01aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "prehash_sha512_hex": "2ecf58a20b5288ec72b82e19a64517167bd6d6f8c8d50b91d89025b3afe37352ac95683e3dbe3f0281a78359809da62cd7e43bd14864419a0a63e637ff7ac275"
+    }
+  ],
+  "vector_4_lms_sha256_m32_h10": {
+    "id": "v4-lms-spork-q0-and-q1",
+    "path": "m/44'/301'/0'/4'/0'",
+    "scheme_id": 4,
+    "lms_typecode_u32be": 6,
+    "lmots_typecode_u32be": 3,
+    "tree_height": 10,
+    "num_leaves": 1024,
+    "tree_id_hex": "bf2fd2b1a59e04f9b9da4243bb4b78d6",
+    "master_seed_hex": "4d4fc0255e0916ff0fc4e1ebcf26d65b45cc4c47717afc7cecb68799b5c3d981",
+    "merkle_root_hex": "a2cccf5a07cc294fd61b762122616dc1884927cfeb3f340e5a6949502bd4a601",
+    "public_key_hex": "0000000600000003bf2fd2b1a59e04f9b9da4243bb4b78d6a2cccf5a07cc294fd61b762122616dc1884927cfeb3f340e5a6949502bd4a60100000000",
+    "pq_key_hash_256_hex": "03bfb33bb7ba3eaba95c8ac9abf5c55bb5c6030f1dd28879d2c70f804826cc02",
+    "pq_address_key_hash_256_hex": "42d30d5f77c2435ce1888d77fc87f9cfdfbdd82e0eff2e12f4bc46a10697f81c",
+    "domain_tag": "Divi-PQ-Spork-v1",
+    "network_magic_hex": "dff0c8f3",
+    "spork_payload_hex": "1c2700008023a5f20000000000f1536500000000",
+    "signing_prehash_hex": "e067c584d789507d56132a2e42d1fa487a20bd2fb92a8308c7634e8dba1e74cfbe1d87e8e80c31b5a758522aee02b610aa09e385b493dfc58607efe356fd6e90",
+    "sig_q0_leaf_index": 0,
+    "sig_q0_hex": "0000000000000003fc3b4d2cd996e12410ef99e49bef25bde718689049d623ef8bbd9e8ed52e2cc2ed4f2f6517bc7c7a9a6ca9c9a7e1b62e106c3f100c8496380f634fce5910480f9df01e78edc187820cb22f64af5baeff1d0c5c0ce939aca3527efa399348f6335e468be20f675bbd09607350a6068c4d666e5027a815971f4916a629728b5cee9553c0b7441f4460dc6d71b5f6f863a437b0ef0d387d1d61723581ac2f5506206904bbba567b417134ebd297dc811eeabadab623dd06e7ec533600332e9f4d20c3eb20391edd869e3496cbda8435e34d0260d1096138e37be6d76b77adc1bf33a01d2c05588c8890694a0847f8f69cb57cf03c920c4f375d1e944512c670b58684e1c53d0eebe322b87d60b260c693704d36875cd78c351c8324980116729cc33f04d455d7c52cd3590844333759ced63ae8c3de4d86a1649c4c05bc8ee2a1769dcbf18d9c3e2893e2890c269bf6298f26c9105d113b35dd1b9bf6f6b9773cef97a507ea39d4627553079316786bfed9fd696a99449ebe55dbf3dd0c3dad74a295d6a58b449c3633e9da49b809506778e4b44a3cf7e1a06de48564cdbce6e9bec01dc3fc28c6322bd756171507b7565c2b31004208a8339398f72ce1c23679250c878f8ee0f21b95c531739a7d2f8c0c73c48524b50747abb00eda3f96822249c1734d0ccc84fb161c3490dfb980d5fdf9e5adb3d35477d430092923b99243f32a89f210b468ff28061ad395290bebab8e3b4546f84ea9a7957248d5e2179340322570934769945705fbfa5d7ac714a861c4f9e5068c4886477a5ee1003507ab12060f9f323c00e454c94ade72234b1fc5bd530d175a261a5a83c9168cba270113f5b1f486461195098327de769092b88cc2db2dbbee387f122a69cd70d25845549eeabf3410e166fced2f88fb1600c7dde0961b14e8653d889b7ad4609307612ff8a3913155459fd44f0e000071c0eb4a089b06382cd0c1e375de975b9f40688a09c1791226859d64734b7c39b08b56f83bd920c158b2bdf1a5b5064d0b35f9cc56d85a9abe82e13ad04fb02f499184de79eb2fbdb0719fa354b9d3580d32161ebee1c65726096382e1956cb045fa24a8bc74445f9ad4c4a4f53a2bd189034daa6ba64934bf48563ea31cad703dcfc3d42604ea94bb94927b74455b59b3af14fdfc2ce0254a64d994d8b354f8c1b4eab22bed15eccf6520aa2221bb15b92311706668281cae32591e09728d52e667a4e064afb377d049f9d0194fa851d63a075c82d35e635327657ea9333cdcba8d11a142d5f052f77eea0b355ad77e98ee62e530264f853d600c80cf184e8b43076fed39355623c2b3a7cfa540406f542c33248601fabf798a5ba9f3681967f6af0cf529de6a9eeefbc008f648d54b44bb2b581c13112e80c46227b86a97f3333c3385b8feb7848c00495e6096deb733d3c9cd1d6c3409b0b8bdf4fba16b586c447c1b8608b29488b7c541cde710388474060796f904af28c8cbddcf790d193212e2d976e7b6b0de941e5d54e646e12ee41792104469ee722c0918b3b4263edb326a0cdb94e4a3c7ccbfe81c86f7b17b9141fdf4e8d92eb6e0ec51b891a01beeb7655091a4142e8c7e565578e9a1d23d1e74e23468844410a0cbd96a770f9b506904aa238655f504862d5d3af50a54f79130328f9449416fbf409c8dc511bf7f5865984b3e1d8e0daa381e617b1b0072d07f3a3dc08da51e670109d69a96b9561575141f66b2354b057e641f06257c8361a0cd5177f81f944871d56dceb7f29667548001277894f555b1cc81e16c8160368e4e6d519b82de47c1f99ff51a26c2ca1d0e6bbc22f3e23a7988444877380425a939c2b0a9c5ecc7c32a4c39874d6cf7faf7b31ae21fe30c7c3c14262f933b21dabe9b70328fc14ff29891ae53fc9d77211305883ca48e2225b8c6e5c403c003159b53b3f4080687c430ec570e1bfc87a8e5f0725236c2fbdcbea1f10f5cb1abb370e3af6360f7a563d666d6d5bbcdd0f15a9c995b2a97c833097fdf0febaf572462e579ed7d3888fee33ea01157199b2edfceff8f41a5c2ded713990f71e579c2b47bf11e6880100495a3d8b2a369d85c1024ab59fc7db1c8f5e4bf2f441e3294408536f7c27d3fe2e98d0e86f38879e1732338038f424060873c3e3b2a2f71be6fc4d2008581b6de45ca6579b7e11d17070579b452a00bf7ce2330181d008b55882c362984af365d24ca7547a77e432a653fc2efade8becf77555005d0d30b2eeafc106156c46fd8bfd033a6dcb58658818da389895bf0efbd85c0d903d22ddec0d054e50e9450cc9f600f774ceaf32b979a78398b58a05fd5631a0c9d5c3936d36ddfc3a8057b0717ead705af2e5a5cd46b070065f0886c45d03df80307a20910ba8f79bd34a5630bcebaabaa8a1aca67c3e5ea24beb816f90216ccac744990953ee0027dc8fc8466053048ea2e63c82271b1693723a03e7eaee89a373deafef0e1b991e894a529a16bd938624dd26e456c7daf8ff88f842803983ba850138a56e1b3656a2267d0b93a4cec8987bb4ed69b65609ab4fc2b49760e5e914400b958a1f559161b28910aef710cded7effc5c189123b389d60d35e788fe099638b09ca403c53fdc62261f14194922dc055f5779a2b3040ec7694bee0b7310a1b7d82bd63a80a192fac0a38a77eb3a13899cc5a5ae24f236e1be21672a7cf5b77a0df45c3252bc3675c3d389c0ba154a366d6b359f7a8db202061910a17176bcd9157012660512def6127b9f35ffa6cd119caa9fac29699874915b340e88cb8655d304e1132dd810d9a88bb6706486e5a974d616b49f3e0a2e4a1ab4ede749010ac126a7759e86c2283d812a6fe3773ddbdde4e54c5aa0d9bf9cfe4e1e91670f78a5793908c2502bb524fc9bd711a37396e749ddf8d2e82c166c5b36cf856c627d0c7a49771a12469c2eff57d8ede26215e74f21762bc0cdf80f9bcdcfea543a12d7b47d8a29b86947a686b3c47de9163e65886236c1b14d7db3615a80fab2dca14563b2741689637ad6240a3871e571a28fd5363a586d60f8b997d768f1124268770000000600862b89085a78e571fe3ce5e52a28380e87418f30268ab3bb00349bb4aabe6e291503d0fad11a6f1fee98805f925a0bb6ae3a9567261efda488a58e6497f14b82208f56c749af6b0dea4825bc30dd3fb947b6bace220923353a24e81706a4b85ab6d1682cf3b90d86f92f0b2857c318a9ebbccc23358314fb9041d6b61f8dbe0f1bae0acdce124ddb48394afadea06c1d9c02f31781e5f8ad7bc7f59678cd3a46e5cda4bed80b53ad84a3e96195107e81a59cfa895a0049f4fb57f6065d723ce9dac1c65a481b4580e7a06374782f32d6d99787528755ac3e04c5735035415c3a685b1aa470c94cadb076cd5eec709c2cf804db7bd6fa5e68180929ef1b0d4b42cf403e62437286e9e336a47eae8185d6b35df070b48abbe5fc881dc24159b3161a45b505ce606c67d08182c5d02fa9432814aac7c9e9b411f233a626cbf0d900000000",
+    "sig_q0_sha256_hex": "9a6074c3c72e95c23d7391f4c5f7273ffc859b626170ace4ebebb60320f895d1",
+    "sig_q1_leaf_index": 1,
+    "sig_q1_hex": "0000000100000003baeddb24a2d61059c23387a526d33700e14ab082246bf1fb9ff1a9bf035163645f197aece51b83dcb4a8948a0be8c90e1065f8f16252f30789da5a2c03249b99113819d5f60d2ac3a9764c4127deeab15f26110e3919b9d850b45a2e5da44688fa822dbfd797319795b4ccdc226879feeefb802ab335ece26935a7b0985b82cc1c6568909fd95ba13fff6c2484eeed3d27d0a2865ccfd4b536eaa160186da3eb0c0e48b8bcb0356ed2fac80bcf6555f08a24a3083c8c314aaefda2e061977caa041b475aa2b435275b11f5772e2771909db107871cfa14d0d76199e56b0de14af9ebef00b2bbf6057907cb3b425ae84847de6b26b9e30ad2b8abfc6cdb808388442a61aea3d82f9015763fd4e9d501e444b60f02b2f8a41f7d5e19d2abc26e06d950ed1567664baad270ce61ec2346e4837335b044220f9de9054f1e9b476f7e9c37ceeaedbda8dcd7df208637755e7d2b9e55562b0c33204b2239f0a44fea91f6157a7de5165c4b78b7a084d63e42dcab8cb44f59173642f911c88d0903ae04ae6ca1f7f2aa30533e6dffc39c2f08177d6ca69918683181082111938cdb6f6e76892001f61d7d32420cac1499d51f618b8cc17c11e1cae1c43b9378ea883453f43011e241039c4b79004d34709f162eb34c956c61a01cd00d4a0370c6b8f1e0ed1944825e999cc8cd5f47334bf18642207713e0d8094203026bed6d9ab9d7d581bb304f4697ea719f4a1b7cab253b2fd7ee36e52e3911300a2d52d0c4161fb8ffffcb129caa34543ebfe133294e5924be7366f8c580c67d11d4eb421bf0ce418cb735e9eedd2562abb47735ffb77618f7542fbc0ec1a5486c78c619994658a78fa1a59121ee8e7869872d58f655b3a0fe2ddd8912b526e7432f38f8f97e49e60e3cc65ba96c34b898eb17d935a2ed1db4fc495cf91e20b095209ce079f75681a98e92aec6c99d133a05c6504c14b7a4f6e0edb55596f6693c6ee9f0b8edabea5999a037c97df16684cf6703fabf52b31e3d4e0c03588dab71eae1c06992dfac522cd36754d733138cba48cf9cec1ef720fc2e920c2e39f3bc5002f572ebad05e61cb7fd7e2800384e6e66675156e649d3b39f8d7fac8a60989cb1777a8b70a2ba000c42f5ed4a184437d2c931bc44eb35da46801a3da22b5a6bc192ea14a97ed0ccfa53629ce3ba6ac193881e382f2f3b7ea85cd72d8b04563df99815b7c8f4b79858250e4dd486f59d757ced22fded93eec0b89c6f74d59850461f0328af82199a911d5b2141750e1ff9e5f0f941c1d883ea0b0d20a6a5ab2f0159a73cd2c1b228c4f50e8e12362014a46a97f2f7c9c9eb733242e5b745cf0707c7c59306781a4f2250887cee54a44f7087013296a76c4930305ee3f8df0c4621247d0ce7e023ba2e745e2213e5cfc9a9c1b20a542b58fd0e6947ffc8d5738c9dc69d65d2ee86246b5e665ca0672d490e117b82e9085e06212822db031c70b69e28fffb48efe6c535a7a262d9ae40e175bf28d1f5c98810f13141b1b30dafbe0f1cbf8793c469f022357e439ef02f68e749980043ecaaf48ead212b04a0f6760f6f688632f6755979b33fdb5da388b943abfd04fca15cb42305a4685492a54d2429da76d3c3f569c77968cd7faf1b2b42a1d34429809741f7c525023b19f585da3e227adc9fcc51aeed325f6e98b6ff77dfde4ef654c80082f06e39bd7cf966bedd6cdc8a527b4b3f83e03cf5f14b4869278aae4e170ac64668f53d17ec9a233117d09a92384500ad137e2f2dcfc76f924a232619f2b965ba018facea7b51dc07c4370a388129683570dd4dfa2b9d1d5a9bd5e423a0974aa86d68978f012459ef209841b1b9795e9d454b4ca9a1e58252a4614287b0b81cd7357161f4431179acc43525a7347a01789ca6c804e23dc3289a41a060e5917d7b6da585e2807a91cc94d91ceca82851d213c14ab0596f1ad47601f57365484e64954515390312b4d0fa831bf8e10b7e277083b9c87c6dae35b14b6daf4d361d159aae56756d980f2f1d5cb316804d54d1ac50d1ee57921b05eedf7ed3d703c7c31fe83f44e41083898edfe0a0b4042311760f0fdbb9a425af79703e019898560bb240d24c46b0729d1755a92d1e91e58984ce8ae15d2e10b59deeb48d8349973e8a1e3058b8af48471bbca5d86eed0af24554ba08311b5cba105902db44f4fe2b3b00de64b2581b6f7eb8bdd249e8493513672b7a9f5a60334f057b996ef2630a1fe308346aa32f47b6c9bbd83b0f0fc8dd87da9bd0eeb64b9f8dc116edf3d091ff0b9bf83f8297dac93e535bbaf0233da4e6384e8f16dd8d4f40f9334b3298dedcf8829f56f902dc7ea257f16ec3d7f160d30d0a29786f08f58ea7e8833dbb2d24afe4a4973cf3358be74dfa2ccd75f2d3368ffe3f134fa7356062c1562e7d8e6e9da8514481f9c6307de3959a5d9b674abab2eceba8c80967f9ff1d1ef2cedfb17f1c022503cca3b1678a19461c7d7a5a55fbb578ba60bdcd044b275f9d9239c2b49215846cb01130ac508675ae0326a75fef4a6dc760da8c3ff6f53d49cb1848a6170cb69012b85a0576f790abd17e6129d9488d08d64c1deeaa126ceec82e0a188f8d75ea3f176753196d9b8cb6574f3ac4d13e4a9a7abc8a54765b14edb7367b9dd2988a306f73a18e25b609504d8960227a2c6c05c6e47882651e4f5dee071015c3f9f3b75b996dfd726b80e65f0fd47bd45c76633d6326d210bde6cdf526d53cf4b8227283bc1d31ba6b991d638a56bc3da6971c81d84259c0c848aebeb0290406a06745c2b01979eb6da20f4f1a8dd2da0dda75d79c5c751d629d9d622753e81e76fce882e31ae825972338052c758ade4d8236bc145a8d5cbb14d4ec1ba5b9fd54ce97b0e5a7711963a101520eadc9f49a3166dd6ac3f061a273a60402c8d1a43a47fb50a3209bbebec0906c34cbe2b8865e15b9df040f0e85d65aff32145d5793c485b0460d67f3d23633bb7a2bfea2eb1374840159cb42a8d297171f39150a938f995fd9961f8cffc645407032c4711f6874c4d1f18831db9a07f4380cb3c429e180150eb2a2e97100000006414563b4566c2411ad8014a39c077efe5237844844e1bcdd981b7fb93df8da37291503d0fad11a6f1fee98805f925a0bb6ae3a9567261efda488a58e6497f14b82208f56c749af6b0dea4825bc30dd3fb947b6bace220923353a24e81706a4b85ab6d1682cf3b90d86f92f0b2857c318a9ebbccc23358314fb9041d6b61f8dbe0f1bae0acdce124ddb48394afadea06c1d9c02f31781e5f8ad7bc7f59678cd3a46e5cda4bed80b53ad84a3e96195107e81a59cfa895a0049f4fb57f6065d723ce9dac1c65a481b4580e7a06374782f32d6d99787528755ac3e04c5735035415c3a685b1aa470c94cadb076cd5eec709c2cf804db7bd6fa5e68180929ef1b0d4b42cf403e62437286e9e336a47eae8185d6b35df070b48abbe5fc881dc24159b3161a45b505ce606c67d08182c5d02fa9432814aac7c9e9b411f233a626cbf0d900000000",
+    "sig_q1_sha256_hex": "993e7ec64374c5cf0c73aa0a06016addc208b3991888353bfada61d6ba7ff241"
+  },
+  "negative_vectors": [
+    {
+      "id": "neg-01-lms-sig-trailing-garbage-byte",
+      "category": "InvalidSignatureLength",
+      "description": "1-byte trailing garbage (0x00) appended to valid 2512-byte LMS-SHA256-M32-H10 signature",
+      "mutation": "append_sig_hex",
+      "append_hex": "00",
+      "expected_error": "InvalidSignatureLength"
+    },
+    {
+      "id": "neg-02-lms-pk-trailing-garbage-byte",
+      "category": "InvalidPublicKeyLength",
+      "description": "1-byte trailing garbage (0xff) appended to valid 60-byte LMS-SHA256-M32-H10 public key",
+      "mutation": "append_pk_hex",
+      "append_hex": "ff",
+      "expected_error": "InvalidPublicKeyLength"
+    },
+    {
+      "id": "neg-03-lms-pk-truncated-56-bytes",
+      "category": "InvalidPublicKeyLength",
+      "description": "RFC 8554 unpadded 56-byte LMS public key missing 4-byte DIP-PQ-1 reserved zero epoch tail",
+      "mutation": "truncate_pk_len",
+      "truncate_len": 56,
+      "expected_error": "InvalidPublicKeyLength"
+    },
+    {
+      "id": "neg-04-lms-pk-wrong-lms-typecode",
+      "category": "InvalidAlgorithmTypecode",
+      "description": "Wrong u32be LMS typecode (0x00000005 LMS_SHA256_M32_H5 instead of 0x00000006 LMS_SHA256_M32_H10) in pk[0..4]",
+      "mutation": "overwrite_pk_u32be",
+      "byte_offset": 0,
+      "u32be_value": 5,
+      "expected_error": "InvalidAlgorithmTypecode"
+    },
+    {
+      "id": "neg-05-lms-pk-wrong-lmots-typecode",
+      "category": "InvalidAlgorithmTypecode",
+      "description": "Wrong u32be LMOTS typecode (0x00000004 LMOTS_SHA256_N32_W8 instead of 0x00000003 LMOTS_SHA256_N32_W4) in pk[4..8]",
+      "mutation": "overwrite_pk_u32be",
+      "byte_offset": 4,
+      "u32be_value": 4,
+      "expected_error": "InvalidAlgorithmTypecode"
+    },
+    {
+      "id": "neg-06-lms-sig-wrong-lmots-typecode",
+      "category": "InvalidAlgorithmTypecode",
+      "description": "Wrong u32be LMOTS typecode (0x00000002 LMOTS_SHA256_N32_W2 instead of 0x00000003) in sig[4..8]",
+      "mutation": "overwrite_sig_u32be",
+      "byte_offset": 4,
+      "u32be_value": 2,
+      "expected_error": "InvalidAlgorithmTypecode"
+    },
+    {
+      "id": "neg-07-lms-sig-wrong-lms-typecode",
+      "category": "InvalidAlgorithmTypecode",
+      "description": "Wrong u32be LMS tree typecode (0x00000007 LMS_SHA256_M32_H15 instead of 0x00000006) in sig[2184..2188]",
+      "mutation": "overwrite_sig_u32be",
+      "byte_offset": 2184,
+      "u32be_value": 7,
+      "expected_error": "InvalidAlgorithmTypecode"
+    },
+    {
+      "id": "neg-08-lms-sig-leaf-index-q-1024",
+      "category": "InvalidLeafIndex",
+      "description": "Leaf index q = 1024 (2^10) out of range in sig[0..4]",
+      "mutation": "overwrite_sig_u32be",
+      "byte_offset": 0,
+      "u32be_value": 1024,
+      "expected_error": "InvalidLeafIndex"
+    },
+    {
+      "id": "neg-09-lms-sig-leaf-index-q-u32max",
+      "category": "InvalidLeafIndex",
+      "description": "Leaf index q = 0xFFFFFFFF out of range in sig[0..4]",
+      "mutation": "overwrite_sig_u32be",
+      "byte_offset": 0,
+      "u32be_value": 4294967295,
+      "expected_error": "InvalidLeafIndex"
+    },
+    {
+      "id": "neg-10-lms-sig-bitflip-lmots-chain-y0",
+      "category": "BitFlippedLmotsChain",
+      "description": "Single-bit flip in LMOTS chain value y[0] (sig byte offset 40, XOR 0x01)",
+      "mutation": "xor_sig_byte",
+      "byte_offset": 40,
+      "xor_mask": 1,
+      "expected_error": "VerificationFailed"
+    },
+    {
+      "id": "neg-11-lms-sig-bitflip-lmots-chain-y66",
+      "category": "BitFlippedLmotsChain",
+      "description": "Single-bit flip in LMOTS checksum chain value y[66] (sig byte offset 2152, XOR 0x80)",
+      "mutation": "xor_sig_byte",
+      "byte_offset": 2152,
+      "xor_mask": 128,
+      "expected_error": "VerificationFailed"
+    },
+    {
+      "id": "neg-12-lms-sig-bitflip-merkle-path-h0",
+      "category": "BitFlippedMerklePath",
+      "description": "Single-bit flip in LMS Merkle authentication path leaf sibling path[0] (sig byte offset 2188, XOR 0x01)",
+      "mutation": "xor_sig_byte",
+      "byte_offset": 2188,
+      "xor_mask": 1,
+      "expected_error": "VerificationFailed"
+    },
+    {
+      "id": "neg-13-lms-sig-bitflip-merkle-path-h9",
+      "category": "BitFlippedMerklePath",
+      "description": "Single-bit flip in LMS Merkle authentication path root-child sibling path[9] (sig byte offset 2476, XOR 0x40)",
+      "mutation": "xor_sig_byte",
+      "byte_offset": 2476,
+      "xor_mask": 64,
+      "expected_error": "VerificationFailed"
+    },
+    {
+      "id": "neg-14-domain-mismatch-spork-vs-tx-input",
+      "category": "DomainTagMismatch",
+      "description": "Valid Spork signature verified under tx-input domain tag (Divi-PQ-TxSig-v1 vs Divi-PQ-Spork-v1)",
+      "mutation": "domain_tag_mismatch",
+      "verify_domain_tag": "Divi-PQ-TxSig-v1",
+      "verify_network_magic_hex": "dff0c8f3",
+      "expected_error": "DomainTagMismatch"
+    },
+    {
+      "id": "neg-15-network-mismatch-divi-vs-privatedivi",
+      "category": "DomainTagMismatch",
+      "description": "Valid Divi Mainnet (dff0c8f3) Spork signature verified under PrivateDivi Mainnet (b7dc624e) magic",
+      "mutation": "network_magic_mismatch",
+      "verify_domain_tag": "Divi-PQ-Spork-v1",
+      "verify_network_magic_hex": "b7dc624e",
+      "expected_error": "VerificationFailed"
+    },
+    {
+      "id": "neg-16-hd-unhardened-child-index",
+      "category": "UnhardenedIndexError",
+      "description": "Out-of-range child index (index >= 0x80000000 passed to derive_pq_leaf and unhardened raw index 44 < 0x80000000 passed to derive_child_raw)",
+      "mutation": "unhardened_hd_index",
+      "leaf_index_u32": 2147483648,
+      "raw_child_index_u32": 44,
+      "expected_error": "UnhardenedIndexError"
+    },
+    {
+      "id": "neg-17-unknown-scheme-ids",
+      "category": "UnknownSchemeId",
+      "description": "Unknown scheme IDs (0x00, 0x05, 0xFF) rejected by PqSchemeId::from_byte and scheme 0x04 rejected in non-Spork wallet/tx/block domain",
+      "mutation": "unknown_scheme_id",
+      "invalid_scheme_bytes": [
+        0,
+        5,
+        255
+      ],
+      "spork_only_scheme_byte": 4,
+      "forbidden_domains": [
+        "Divi-PQ-TxSig-v1",
+        "Divi-PQ-BlockSig-v1"
+      ],
+      "expected_error": "UnknownSchemeId"
+    }
+  ]
+}
