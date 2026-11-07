@@ -17,8 +17,15 @@ serde_json = { workspace = true }
 toml = { workspace = true }
 regex = "1.12"
 libc = "0.2"
-# §8.4: the package is zstd-compressed, then encrypted with age
+# §8.4: the package is zstd-compressed, then encrypted with age (hybrid X25519 + ML-KEM-768 or classical X25519)
 age = "=0.11.1"
+age-core = "=0.11.0"
+ml-kem = { version = "0.2.1", features = ["deterministic", "zeroize"] }
+x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
+bech32 = "0.9"
+base64 = "0.22"
+subtle = "2.6"
+zeroize = { workspace = true }
 zstd = "0.13.4"
 # §8.4 upload to the §9 receiver: Mozilla roots built in, plus the system store
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "rustls-tls-native-roots"] }

@@ -32,6 +32,7 @@
 //! container's own package.
 
 pub mod attach;
+pub mod bundle;
 pub mod collectors;
 pub mod consent;
 pub mod ctx;

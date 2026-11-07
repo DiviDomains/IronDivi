@@ -19,7 +19,7 @@ use parking_lot::Mutex;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::auth::{clean_label, random_hex, write_private};
 use crate::webauthn::{
@@ -35,7 +35,7 @@ struct NodePasskeyFile {
     slots: Vec<NodePasskeySlot>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct NodePasskeySlot {
     pub id: String,
     pub label: String,
@@ -319,5 +319,8 @@ mod tests {
         assert!(store.remove(&summary.id).unwrap());
         assert!(store.list().is_empty());
         assert!(!dir.path().join(NODE_PASSKEY_FILE).exists());
+
+        fn assert_zeroize_on_drop<T: Zeroize + ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<NodePasskeySlot>();
     }
 }

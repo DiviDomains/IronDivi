@@ -441,7 +441,7 @@ pub fn verify_assertion<'a>(
     let sig =
         Signature::from_der(&sig_der).map_err(|_| "invalid passkey ECDSA signature".to_string())?;
     // WebAuthn authenticators emit both low-S and high-S DER ECDSA signatures.
-    let sig = sig.normalize_s().unwrap_or(sig);
+    let sig = sig.normalize_s();
 
     let client_hash = Sha256::digest(&client_data_raw);
     let mut signed = Vec::with_capacity(auth_data.len() + 32);
@@ -475,7 +475,7 @@ mod tests {
         with_ext: bool,
     ) -> String {
         let vk = sk.verifying_key();
-        let point = vk.to_encoded_point(false);
+        let point = vk.to_sec1_point(false);
         let x = point.x().unwrap().as_slice();
         let y = point.y().unwrap().as_slice();
 

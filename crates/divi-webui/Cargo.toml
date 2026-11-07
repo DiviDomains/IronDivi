@@ -35,7 +35,7 @@ toml_edit = "0.22"
 base64 = "0.22"
 hkdf = "0.12"
 ciborium = "0.2"
-p256 = { version = "0.13", default-features = false, features = ["ecdsa", "arithmetic"] }
+p256 = { version = "0.14", default-features = false, features = ["ecdsa", "arithmetic"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

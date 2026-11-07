@@ -21,7 +21,7 @@
 use crate::error::WalletError;
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 /// Associated data for the sealed master key, followed by the KDF record and salt
 pub(crate) const MASTER_KEY_AAD: &[u8] = b"encrypted_master_key";
@@ -115,6 +115,20 @@ pub(crate) struct MasterKey {
     pub aead: bool,
 }
 
+impl Zeroize for MasterKey {
+    fn zeroize(&mut self) {
+        self.key.zeroize();
+    }
+}
+
+impl Drop for MasterKey {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for MasterKey {}
+
 impl MasterKey {
     /// Encrypt a record stored under `record_key`
     pub fn seal_record(&self, record_key: &[u8], plaintext: &[u8]) -> Vec<u8> {
@@ -137,7 +151,7 @@ impl MasterKey {
         } else {
             legacy::decrypt_blob(blob, &self.key)
         };
-        plain.map(Zeroizing::new).ok_or_else(|| {
+        plain.ok_or_else(|| {
             WalletError::Storage(format!(
                 "encrypted wallet record {} is corrupt or has been changed",
                 describe_record(record_key)
@@ -182,7 +196,6 @@ pub(crate) fn open_master_key(
 ) -> Result<Zeroizing<Vec<u8>>, WalletError> {
     let key = params.derive(passphrase, salt)?;
     let plain = open(&key[..], &master_key_aad(params, salt), sealed)
-        .map(Zeroizing::new)
         .ok_or(WalletError::WrongPassphrase)?;
     if plain.len() != 32 {
         return Err(WalletError::WrongPassphrase);
@@ -211,7 +224,7 @@ fn seal(key: &[u8], aad: &[u8], plaintext: &[u8]) -> Vec<u8> {
 }
 
 /// Inverse of `seal`; None if the key, the data or the associated data differ
-fn open(key: &[u8], aad: &[u8], sealed: &[u8]) -> Option<Vec<u8>> {
+fn open(key: &[u8], aad: &[u8], sealed: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
     if sealed.len() < 24 + 16 {
         return None;
     }
@@ -220,6 +233,7 @@ fn open(key: &[u8], aad: &[u8], sealed: &[u8]) -> Option<Vec<u8>> {
     cipher
         .decrypt(XNonce::from_slice(nonce), Payload { msg: body, aad })
         .ok()
+        .map(Zeroizing::new)
 }
 
 /// The format of wallets written before `kdf_params`: PBKDF2-HMAC-SHA512 at
@@ -257,7 +271,7 @@ pub(crate) mod legacy {
     /// Open a sealed master key; any wrong key yields `WrongPassphrase`
     pub fn open_master_key(sealed: &[u8], key: &[u8]) -> Result<Zeroizing<Vec<u8>>, WalletError> {
         use sha2::{Digest, Sha256};
-        let plain = Zeroizing::new(decrypt_blob(sealed, key).ok_or(WalletError::WrongPassphrase)?);
+        let plain = decrypt_blob(sealed, key).ok_or(WalletError::WrongPassphrase)?;
         if plain.len() != 36 || Sha256::digest(&plain[..32])[..4] != plain[32..] {
             return Err(WalletError::WrongPassphrase);
         }
@@ -282,7 +296,7 @@ pub(crate) mod legacy {
     }
 
     /// Inverse of `encrypt_blob`; None on a bad length, key or padding
-    pub fn decrypt_blob(encrypted: &[u8], key: &[u8]) -> Option<Vec<u8>> {
+    pub fn decrypt_blob(encrypted: &[u8], key: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
         use aes::Aes256;
         use cbc::cipher::{BlockDecryptMut, KeyIvInit};
 
@@ -295,7 +309,7 @@ pub(crate) mod legacy {
         let decrypted = cipher
             .decrypt_padded_mut::<cbc::cipher::block_padding::Pkcs7>(&mut buffer)
             .ok()?;
-        Some(decrypted.to_vec())
+        Some(Zeroizing::new(decrypted.to_vec()))
     }
 }
 
@@ -395,5 +409,19 @@ mod tests {
         };
         let blob = master.seal_record(b"ignored", b"abc");
         assert_eq!(&master.open_record(b"other", &blob).unwrap()[..], b"abc");
+    }
+
+    #[test]
+    fn master_key_zeroizes_on_drop() {
+        fn assert_zeroize_on_drop<T: Zeroize + ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<MasterKey>();
+
+        let mut mk = MasterKey {
+            key: Zeroizing::new(vec![0xAA; 32]),
+            aead: true,
+        };
+        assert_eq!(&mk.key[..], &[0xAA; 32]);
+        mk.zeroize();
+        assert!(mk.key.is_empty());
     }
 }

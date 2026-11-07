@@ -9,6 +9,7 @@
 use crate::redact::{Known, Redactor};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use zeroize::{Zeroize, Zeroizing};
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Node {
@@ -72,15 +73,22 @@ pub struct Ctx {
     pub capture: crate::collectors::capture::Plan,
 }
 
+impl Zeroize for Ctx {
+    fn zeroize(&mut self) {
+        self.salt.zeroize();
+        self.known.zeroize();
+    }
+}
+
 impl Ctx {
     pub fn redactor(&self) -> Redactor {
-        let mut salt = [0u8; 32];
-        if let Ok(b) = hex::decode(&self.salt) {
+        let mut salt = Zeroizing::new([0u8; 32]);
+        if let Ok(b) = hex::decode(&self.salt).map(Zeroizing::new) {
             if b.len() == 32 {
                 salt.copy_from_slice(&b);
             }
         }
-        Redactor::new(salt, &self.known)
+        Redactor::new(*salt, &self.known)
     }
 
     pub fn node_for(&self, d: &DataDir) -> Option<&Node> {

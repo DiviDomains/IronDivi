@@ -18,6 +18,7 @@ use crate::hash::{double_sha256, hash160};
 use divi_primitives::hash::Hash160;
 use secp256k1::{Message, Secp256k1};
 use std::fmt;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 /// A secp256k1 secret key (32 bytes)
 #[derive(Clone)]
@@ -47,7 +48,7 @@ impl SecretKey {
 
     /// Create a secret key from hex string
     pub fn from_hex(hex_str: &str) -> Result<Self, CryptoError> {
-        let bytes = hex::decode(hex_str)?;
+        let bytes = Zeroizing::new(hex::decode(hex_str)?);
         Self::from_bytes(&bytes)
     }
 
@@ -74,12 +75,20 @@ impl SecretKey {
     }
 }
 
-impl Drop for SecretKey {
-    fn drop(&mut self) {
+impl Zeroize for SecretKey {
+    fn zeroize(&mut self) {
         // Overwrite the key bytes so they do not linger in freed memory
         self.inner.non_secure_erase();
     }
 }
+
+impl Drop for SecretKey {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for SecretKey {}
 
 impl fmt::Debug for SecretKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -224,6 +233,14 @@ impl fmt::Debug for KeyPair {
     }
 }
 
+impl Zeroize for KeyPair {
+    fn zeroize(&mut self) {
+        self.secret.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for KeyPair {}
+
 /// Create a message hash for signing (double SHA256)
 pub fn message_hash(data: &[u8]) -> Message {
     let hash = double_sha256(data);
@@ -237,6 +254,10 @@ mod tests {
     /// NODE-10: dropping a secret key overwrites its bytes.
     #[test]
     fn node10_dropped_secret_key_is_erased() {
+        fn assert_zeroize_on_drop<T: Zeroize + ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<SecretKey>();
+        assert_zeroize_on_drop::<KeyPair>();
+
         assert_eq!(std::mem::size_of::<SecretKey>(), 32);
         let mut slot = std::mem::MaybeUninit::new(SecretKey::from_bytes(&[7u8; 32]).unwrap());
         let before = unsafe { std::ptr::read(slot.as_ptr() as *const [u8; 32]) };
@@ -244,6 +265,11 @@ mod tests {
         unsafe { slot.assume_init_drop() };
         let after = unsafe { std::ptr::read(slot.as_ptr() as *const [u8; 32]) };
         assert_ne!(after, [7u8; 32]);
+
+        let mut kp = KeyPair::from_secret_bytes(&[9u8; 32]).unwrap();
+        assert_eq!(kp.secret_key().as_bytes(), &[9u8; 32]);
+        kp.zeroize();
+        assert_ne!(kp.secret_key().as_bytes(), &[9u8; 32]);
     }
 
     #[test]

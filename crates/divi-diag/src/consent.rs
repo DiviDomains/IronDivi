@@ -31,7 +31,12 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
+pub use crate::bundle::{
+    open as open_sealed_bundle, open_with_identity, BundleRecipient, HybridIdentity,
+    HybridRecipient,
+};
 use crate::redact::Redactor;
 use crate::scanner::{self, Scanner, Secret};
 use crate::{discovery, oldlog, util, Options};
@@ -41,10 +46,11 @@ pub const MANIFEST: &str = "02-manifest.txt";
 pub const SUMMARY: &str = "00-SUMMARY.txt";
 pub const PREVIEW_OK: &str = "preview.ok";
 
-/// §8.4: the developer's `age` recipient and its fingerprint
+/// §8.4 / `DIP-PQ-0` `P0.1`: the developer's `age` recipient (`age1pq1…` hybrid
+/// `X25519 + ML-KEM-768` or classical `age1…` `X25519`) and its fingerprint
 #[derive(Clone, Copy, Debug)]
 pub struct DevKey {
-    /// an `age` X25519 recipient, `age1…`
+    /// an `age1pq1…` hybrid (`X25519 + ML-KEM-768`) or `age1…` (`X25519`) recipient
     pub recipient: &'static str,
     /// the first 16 hex characters of the SHA-256 of `recipient`, printed
     /// at send so the user can check it against the published one
@@ -57,9 +63,6 @@ pub const DEV_KEY: Option<DevKey> = Some(DevKey {
     recipient: "age10r8rlmzg5c3n8c0cslzzpa9vjq879pq32fghv2skmfu3twzl4vmqt7lq0j",
     fingerprint: "9274ffc0368679fe",
 });
-
-/// zstd level for the package: well compressed, still quick on a Pi
-const ZSTD_LEVEL: i32 = 12;
 
 /// §8.3 step 1, said always (adversarial AC3, privacy N3)
 pub const BY_HAND: &str =
@@ -415,6 +418,24 @@ pub struct ScanCtx<'a> {
     /// the run's salt, or empty when it is gone (`--send`, `--import`)
     pub salt: Vec<u8>,
 }
+
+impl Zeroize for ScanCtx<'_> {
+    fn zeroize(&mut self) {
+        for s in &mut self.secrets {
+            s.zeroize();
+        }
+        self.secrets.clear();
+        self.salt.zeroize();
+    }
+}
+
+impl Drop for ScanCtx<'_> {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for ScanCtx<'_> {}
 
 #[derive(Debug, PartialEq)]
 pub enum Outcome {
@@ -924,26 +945,12 @@ pub fn pack(root: &Path, send: &[Entry], manifest: &str) -> Result<Vec<u8>, Stri
     w.finish().map_err(|e| e.to_string())
 }
 
-/// §8.4: zstd, then `age` (binary format, X25519) to `recipient`. Only
-/// the holder of the matching identity can open it; a changed byte makes
-/// it fail to open rather than open to something else.
+/// §8.4 / `DIP-PQ-0` `P0.1`: zstd, then `age` (binary format, hybrid
+/// `X25519 + ML-KEM-768` for `age1pq1…` or classical `X25519` for `age1…`) to
+/// `recipient`. Only the holder of the matching identity can open it; a changed
+/// byte makes it fail to open rather than open to something else.
 pub fn seal(recipient: &str, tar: &[u8]) -> Result<Vec<u8>, String> {
-    let r: age::x25519::Recipient = recipient
-        .parse()
-        .map_err(|e| format!("the developer key does not parse: {e}"))?;
-    let z =
-        zstd::bulk::compress(tar, ZSTD_LEVEL).map_err(|e| format!("compressing: {}", e.kind()))?;
-    let enc = age::Encryptor::with_recipients(std::iter::once(&r as &dyn age::Recipient))
-        .map_err(|e| format!("encrypting: {e}"))?;
-    let mut out = Vec::with_capacity(z.len() + 512);
-    let mut w = enc
-        .wrap_output(&mut out)
-        .map_err(|e| format!("encrypting: {}", e.kind()))?;
-    w.write_all(&z)
-        .map_err(|e| format!("encrypting: {}", e.kind()))?;
-    w.finish()
-        .map_err(|e| format!("encrypting: {}", e.kind()))?;
-    Ok(out)
+    crate::bundle::seal(recipient, tar)
 }
 
 // ----------------------------------------------------------- entry points
@@ -1452,5 +1459,60 @@ mod tests {
             String::from_utf8_lossy(&got[MANIFEST]).contains(REPORT),
             "the manifest names the excluded file"
         );
+    }
+
+    #[test]
+    fn review_yes_seals_hybrid_pq_bundle() {
+        let d = tempfile::tempdir().unwrap();
+        folder(d.path());
+        let r = red();
+        let id = HybridIdentity::generate();
+        let recip = id.to_public();
+        let fp: &'static str = Box::leak(recip.fingerprint().into_boxed_str());
+        let pk: &'static str = Box::leak(recip.to_string().into_boxed_str());
+        let (o, out) = io_run("s\nyes\n", |io| {
+            let mut rv = Review::open(
+                d.path(),
+                ScanCtx {
+                    red: &r,
+                    secrets: vec![],
+                    salt: vec![0x42; 32],
+                },
+            )
+            .unwrap();
+            rv.key = Some(DevKey {
+                recipient: pk,
+                fingerprint: fp,
+            });
+            rv.run(io)
+        });
+        let Outcome::Sealed(path) = o else {
+            panic!("not sealed: {out}")
+        };
+        assert!(out.contains(fp), "{out}");
+        let ct = fs::read(&path).unwrap();
+        let _ = fs::remove_file(&path);
+        let got = members(&open_with_identity(&ct, &id).unwrap());
+        assert_eq!(got["host/host.txt"], b"uptime 3 days\n");
+        assert_eq!(got[REPORT], b"The user's own report\n");
+    }
+
+    #[test]
+    fn scan_ctx_zeroizes_on_drop() {
+        fn assert_zeroize_on_drop<T: Zeroize + ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<ScanCtx<'_>>();
+
+        let r = red();
+        let mut ctx = ScanCtx {
+            red: &r,
+            secrets: vec![Secret {
+                value: "rpcpassword123".into(),
+                label: "rpcpassword".into(),
+            }],
+            salt: vec![0xAB; 32],
+        };
+        ctx.zeroize();
+        assert!(ctx.secrets.is_empty());
+        assert!(ctx.salt.iter().all(|&b| b == 0));
     }
 }

@@ -26,7 +26,7 @@ use bip39::Mnemonic;
 use divi_crypto::keys::{PublicKey, SecretKey};
 use divi_primitives::ChainMode;
 use rand::RngCore;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 /// Divi coin type for BIP44 derivation
 pub const DIVI_COIN_TYPE: u32 = 301;
@@ -124,8 +124,8 @@ impl ExtendedPrivateKey {
 
     /// Get the secret key
     pub fn secret_key(&self) -> Result<SecretKey, WalletError> {
-        SecretKey::from_bytes(&self.private_key_bytes())
-            .map_err(|e| WalletError::KeyDerivation(e.to_string()))
+        let raw = Zeroizing::new(self.private_key_bytes());
+        SecretKey::from_bytes(&*raw).map_err(|e| WalletError::KeyDerivation(e.to_string()))
     }
 
     /// Get the public key
@@ -135,6 +135,8 @@ impl ExtendedPrivateKey {
         })
     }
 }
+
+impl ZeroizeOnDrop for ExtendedPrivateKey {}
 
 /// Source material (seed bytes, master `ExtendedPrivateKey`, or `HdWallet`) for
 /// `derive_hardened_bip44_key`.
@@ -289,6 +291,31 @@ pub struct HdWallet {
     /// -hdseed); a mnemonic wallet's seed comes from its words
     seed: Option<zeroize::Zeroizing<Vec<u8>>>,
 }
+
+impl Zeroize for HdWallet {
+    fn zeroize(&mut self) {
+        if let Some(m) = self.mnemonic.as_mut() {
+            m.zeroize();
+        }
+        self.mnemonic = None;
+        if let Some(p) = self.passphrase.as_mut() {
+            p.zeroize();
+        }
+        self.passphrase = None;
+        if let Some(s) = self.seed.as_mut() {
+            s.zeroize();
+        }
+        self.seed = None;
+    }
+}
+
+impl Drop for HdWallet {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for HdWallet {}
 
 impl HdWallet {
     /// Create a new HD wallet with random 24-word mnemonic
@@ -985,6 +1012,20 @@ mod tests {
     fn test_invalid_mnemonic_rejected() {
         let result = HdWallet::from_mnemonic("not a valid mnemonic at all", None, ChainMode::Divi);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_hd_wallet_and_xprv_zeroize_on_drop() {
+        fn assert_zeroize_on_drop<T: ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<ExtendedPrivateKey>();
+        assert_zeroize_on_drop::<HdWallet>();
+
+        let mut wallet = HdWallet::from_seed(&[0x55u8; 64], ChainMode::Divi).unwrap();
+        assert!(wallet.seed().is_some());
+        wallet.zeroize();
+        assert!(wallet.seed().is_none());
+        assert!(wallet.mnemonic().is_none());
+        assert!(wallet.mnemonic_passphrase().is_none());
     }
 
     #[test]

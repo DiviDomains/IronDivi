@@ -40,7 +40,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, Semaphore};
 use tracing::{info, warn};
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use auth::{AuthStore, LoginLimiter, Sessions, COOKIE_NAME, MIN_PASSWORD_LEN};
 
@@ -736,7 +736,7 @@ fn throttle(s: &Shared, ip: IpAddr) -> Result<(), ApiError> {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Zeroize, ZeroizeOnDrop)]
 struct SetupBody {
     #[serde(default)]
     token: String,
@@ -770,7 +770,7 @@ async fn api_setup(
             "the password needs {MIN_PASSWORD_LEN} characters or more"
         )));
     }
-    let password = Zeroizing::new(body.password);
+    let password = Zeroizing::new(body.password.clone());
     hashing(&s, move |a| a.set_password(&password))
         .await?
         .map_err(|e| bad(e.to_string()))?;
@@ -782,7 +782,7 @@ async fn api_setup(
     Ok(started(&s))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Zeroize, ZeroizeOnDrop)]
 struct LoginBody {
     password: String,
 }
@@ -799,7 +799,7 @@ async fn api_login(
         ));
     }
     throttle(&s, peer.ip())?;
-    let password = Zeroizing::new(body.password);
+    let password = Zeroizing::new(body.password.clone());
     if !hashing(&s, move |a| a.verify(&password)).await? {
         s.limiter.failed(peer.ip());
         warn!("Web interface: failed sign-in from {}", peer.ip());
@@ -893,7 +893,7 @@ async fn api_passkey_login_finish(
     Ok(started(&s))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Zeroize, ZeroizeOnDrop)]
 struct PasskeyRegisterStartBody {
     password: String,
     #[serde(default)]
@@ -910,7 +910,7 @@ async fn api_passkey_register_start(
     throttle(&s, peer.ip())?;
     let rp_id = host_rp_id(&headers)?;
     let label = auth::clean_label(&body.label, "Passkey").map_err(bad)?;
-    let password = Zeroizing::new(body.password);
+    let password = Zeroizing::new(body.password.clone());
     if !hashing(&s, move |a| a.verify(&password)).await? {
         s.limiter.failed(peer.ip());
         return Err(ApiError(
@@ -978,7 +978,7 @@ async fn api_passkey_register_finish(
     Ok(Json(json!({ "ok": true, "passkey": summary })).into_response())
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Zeroize, ZeroizeOnDrop)]
 struct PasskeyDeleteBody {
     password: String,
 }
@@ -992,7 +992,7 @@ async fn api_passkey_delete(
 ) -> ApiResult {
     signed_in(&s, &headers, true)?;
     throttle(&s, peer.ip())?;
-    let password = Zeroizing::new(body.password);
+    let password = Zeroizing::new(body.password.clone());
     if !hashing(&s, move |a| a.verify(&password)).await? {
         s.limiter.failed(peer.ip());
         return Err(ApiError(
@@ -2664,7 +2664,7 @@ mod tests {
             .add_passkey(
                 "YubiKey Admin",
                 cred_id_b64.clone(),
-                hex::encode(sk.verifying_key().to_encoded_point(false).as_bytes()),
+                hex::encode(sk.verifying_key().to_sec1_point(false).as_bytes()),
                 "localhost".into(),
                 0,
             )

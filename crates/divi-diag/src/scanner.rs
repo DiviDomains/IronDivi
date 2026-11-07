@@ -23,6 +23,7 @@ use regex::bytes::Regex;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// One reason a file is left out
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -36,9 +37,10 @@ pub struct Hit {
 }
 
 /// A value that must not appear, with a label safe to show
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Zeroize, ZeroizeOnDrop)]
 pub struct Secret {
     pub value: String,
+    #[zeroize(skip)]
     pub label: String,
 }
 
@@ -54,6 +56,23 @@ pub struct Scanner<'a> {
     re: Option<Regex>,
     needles: HashMap<Vec<u8>, Needle>,
 }
+
+impl Zeroize for Scanner<'_> {
+    fn zeroize(&mut self) {
+        self.re = None;
+        for (mut k, _) in std::mem::take(&mut self.needles) {
+            k.zeroize();
+        }
+    }
+}
+
+impl Drop for Scanner<'_> {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for Scanner<'_> {}
 
 /// Files the scanner does not read: the manifest is a list of hashes
 /// written after the scan, `preview.ok` is the review's own record and is
@@ -734,5 +753,20 @@ mod tests {
         let v: Vec<&str> = s.iter().map(|x| x.value.as_str()).collect();
         assert!(v.contains(&"dtpass99") && v.contains(&"alicerpc") && v.contains(&"abc123abc123"));
         assert!(v.contains(&base64(b"alicerpc:dtpass99").as_str()));
+    }
+
+    #[test]
+    fn scanner_secret_and_needles_zeroize_on_drop() {
+        fn assert_zeroize_on_drop<T: Zeroize + ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<Secret>();
+        assert_zeroize_on_drop::<Scanner<'_>>();
+
+        let mut sec = Secret {
+            value: "topsecretpassword".into(),
+            label: "rpcpassword".into(),
+        };
+        sec.zeroize();
+        assert!(sec.value.is_empty());
+        assert_eq!(sec.label, "rpcpassword");
     }
 }

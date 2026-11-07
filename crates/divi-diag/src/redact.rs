@@ -14,9 +14,10 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::collections::HashSet;
 use std::net::{Ipv4Addr, Ipv6Addr};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// Values known to be private on this machine (§6.2 step 1)
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Zeroize)]
 pub struct Known {
     pub hostnames: Vec<String>,
     pub users: Vec<String>,
@@ -355,6 +356,25 @@ pub struct Redactor {
     re_home: Regex,
     re_dev: Regex,
 }
+
+impl Zeroize for Redactor {
+    fn zeroize(&mut self) {
+        self.key.zeroize();
+        self.known_re = None;
+        for (mut k, _) in std::mem::take(&mut self.known_kind) {
+            k.zeroize();
+        }
+        self.users.clear();
+    }
+}
+
+impl Drop for Redactor {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for Redactor {}
 
 /// Dotted names under these suffixes are hostnames (§6.2 step 2); the
 /// project's own seed and service names are kept
@@ -1100,5 +1120,18 @@ mod tests {
         assert!(r
             .scrub("malice and alicetown")
             .contains("malice and alicetown"));
+    }
+
+    #[test]
+    fn redactor_and_known_zeroize_on_drop() {
+        fn assert_zeroize<T: Zeroize>() {}
+        fn assert_zeroize_on_drop<T: Zeroize + ZeroizeOnDrop>() {}
+        assert_zeroize::<Known>();
+        assert_zeroize_on_drop::<Redactor>();
+
+        let mut red = r();
+        assert_eq!(red.key, [7u8; 32]);
+        red.zeroize();
+        assert_eq!(red.key, [0u8; 32]);
     }
 }

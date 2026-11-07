@@ -42,6 +42,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use tokio::io::AsyncWriteExt;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// The largest body taken: 100 MiB
 pub const CAP: u64 = 100 * 1024 * 1024;
@@ -134,6 +135,20 @@ pub struct Limiter {
     key: [u8; 32],
     buckets: Mutex<HashMap<[u8; 16], Bucket>>,
 }
+
+impl Zeroize for Limiter {
+    fn zeroize(&mut self) {
+        self.key.zeroize();
+    }
+}
+
+impl Drop for Limiter {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for Limiter {}
 
 impl Default for Limiter {
     fn default() -> Self {
@@ -265,6 +280,23 @@ pub struct Config {
     /// SHA-256 of the developer token; `None` turns the developer routes off
     pub token_sha256: Option<[u8; 32]>,
 }
+
+impl Zeroize for Config {
+    fn zeroize(&mut self) {
+        if let Some(ref mut h) = self.token_sha256 {
+            h.zeroize();
+        }
+        self.token_sha256 = None;
+    }
+}
+
+impl Drop for Config {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for Config {}
 
 pub struct AppState {
     pub cfg: Config,
@@ -873,5 +905,24 @@ mod tests {
             r.oneshot(q).await.unwrap().status(),
             StatusCode::UNAUTHORIZED
         );
+    }
+
+    #[test]
+    fn limiter_and_config_zeroize_on_drop() {
+        fn assert_zeroize_on_drop<T: Zeroize + ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<Limiter>();
+        assert_zeroize_on_drop::<Config>();
+
+        let mut lim = Limiter::new();
+        assert_ne!(lim.key, [0u8; 32]);
+        lim.zeroize();
+        assert_eq!(lim.key, [0u8; 32]);
+
+        let mut cfg = Config {
+            data: PathBuf::new(),
+            token_sha256: Some([0xAA; 32]),
+        };
+        cfg.zeroize();
+        assert!(cfg.token_sha256.is_none());
     }
 }
