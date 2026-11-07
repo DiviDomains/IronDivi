@@ -14,6 +14,7 @@
 
 pub mod backend;
 pub mod session;
+pub mod tls;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -85,13 +86,7 @@ fn tls_acceptor(config: &TlsConfig) -> anyhow::Result<TlsAcceptor> {
     }
     let key = PrivateKeyDer::from_pem_file(&config.key)
         .with_context(|| format!("electrum: cannot read a key from {}", config.key.display()))?;
-    let server = rustls::ServerConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()?
-    .with_no_client_auth()
-    .with_single_cert(certs, key)
-    .context("electrum: the TLS certificate and key do not match")?;
+    let server = tls::server_config(certs, key)?;
     Ok(TlsAcceptor::from(Arc::new(server)))
 }
 

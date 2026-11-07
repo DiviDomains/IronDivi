@@ -137,6 +137,9 @@ pub mod services {
 
     /// This node supports bloom but doesn't want masternode messages
     pub const NODE_BLOOM_WITHOUT_MN: u64 = 1 << 4;
+
+    /// This node supports capability-negotiated v2 encrypted P2P transport (BIP-324 / Tier B)
+    pub const NODE_P2P_V2: u64 = 1 << 11;
 }
 
 /// Service bits to advertise: a node that prunes (or will prune) block bodies
