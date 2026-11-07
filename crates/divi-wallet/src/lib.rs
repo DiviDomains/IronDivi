@@ -75,9 +75,19 @@ pub use address::{decode_wif, encode_wif, Address, AddressType, Network, WifKey}
 #[cfg(not(target_arch = "wasm32"))]
 pub use coin_selection::{CoinSelector, SelectionResult};
 #[cfg(not(target_arch = "wasm32"))]
-pub use coinstake::CoinstakeBuilder;
+pub use coinstake::{
+    classify_utxo_staking_posture, summarize_utxos_staking_posture, CoinstakeBuilder,
+};
+pub use divi_script::{
+    classify_staking_script_posture, summarize_staking_posture, StakingQuantumPosture,
+};
 pub use error::WalletError;
-pub use hd::{core_coin_type, ExtendedPrivateKey, ExtendedPublicKey, HdWallet, DIVI_COIN_TYPE};
+pub use hd::{
+    core_coin_type, derive_hardened_bip44_key, hardened_bip44_indices, ExtendedPrivateKey,
+    ExtendedPublicKey, HardenedBip44Source, HdWallet, WalletKeyHygiene, BIP44_PURPOSE_HARDENED,
+    BRANCH_EXTERNAL_HARDENED, BRANCH_INTERNAL_HARDENED, BRANCH_VAULT_MANAGER_HARDENED,
+    BRANCH_VAULT_OWNER_HARDENED, DIVI_COIN_TYPE, HARDENED_INDEX_BIT,
+};
 pub use keystore::{HdPublicIds, KeyEntry, KeyStore, PoolState};
 #[cfg(not(target_arch = "wasm32"))]
 pub use manager::WalletManager;

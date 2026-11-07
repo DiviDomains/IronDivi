@@ -55,4 +55,7 @@ pub use standard::{
     extract_destination, extract_destinations, extract_script_type, get_script_type_name,
     is_multisig, is_null_data, is_p2pk, is_p2pkh, is_p2sh, Destination, ScriptType,
 };
-pub use vault::{is_staking_vault_script, StakingVaultScript};
+pub use vault::{
+    classify_staking_script_posture, get_vault_pubkey_hashes, is_staking_vault_script,
+    summarize_staking_posture, StakingQuantumPosture, StakingVaultScript,
+};

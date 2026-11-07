@@ -328,6 +328,23 @@ fn double_sha256(data: &[u8]) -> [u8; 32] {
     result
 }
 
+/// Classify a staking `WalletUtxo` into its post-quantum staking posture (`DIP-PQ-0` §3.1–3.2).
+///
+/// Returns `StakingQuantumPosture::VaultInsulated { owner_hash160, manager_hash160 }` when the
+/// UTXO is locked by a 2-key `STAKING_VAULT` script, or `StakingQuantumPosture::DirectPubKeyExposed`
+/// when staking directly from `P2PKH` (where `vchBlockSig` exposes the spending `CPubKey` on-chain).
+pub fn classify_utxo_staking_posture(utxo: &WalletUtxo) -> divi_script::StakingQuantumPosture {
+    divi_script::classify_staking_script_posture(&utxo.script_pubkey)
+}
+
+/// Summarize aggregate `vault_insulation` telemetry across staking UTXOs (`DIP-PQ-0` §3.2).
+///
+/// Returns `"vault_only"` when all staking UTXOs are `STAKING_VAULT` scripts (and at least one
+/// UTXO is present), or `"mixed_or_direct_p2pkh"` if any direct `P2PKH` UTXO is present.
+pub fn summarize_utxos_staking_posture(utxos: &[WalletUtxo]) -> &'static str {
+    divi_script::summarize_staking_posture(utxos.iter().map(|u| &u.script_pubkey))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -657,5 +674,49 @@ mod tests {
         let r2 = b2.build();
         assert!(r1.is_err());
         assert!(r2.is_err());
+    }
+
+    #[test]
+    fn test_utxo_staking_quantum_posture_classifier() {
+        let owner_hash = [0x11u8; 20];
+        let manager_hash = [0x22u8; 20];
+
+        let vault_script = StakingVaultScript::new(owner_hash, manager_hash).to_script();
+        let p2pkh_script = Script::new_p2pkh(&owner_hash);
+
+        let vault_utxo = WalletUtxo::new(
+            Hash256::from_bytes([0x01; 32]),
+            0,
+            Amount::from_divi(10_000),
+            vault_script,
+            "DTestVault".to_string(),
+        );
+        let p2pkh_utxo = WalletUtxo::new(
+            Hash256::from_bytes([0x02; 32]),
+            1,
+            Amount::from_divi(10_000),
+            p2pkh_script,
+            "DTestP2pkh".to_string(),
+        );
+
+        assert_eq!(
+            classify_utxo_staking_posture(&vault_utxo),
+            divi_script::StakingQuantumPosture::VaultInsulated {
+                owner_hash160: owner_hash,
+                manager_hash160: manager_hash,
+            }
+        );
+        assert_eq!(
+            classify_utxo_staking_posture(&p2pkh_utxo),
+            divi_script::StakingQuantumPosture::DirectPubKeyExposed
+        );
+        assert_eq!(
+            summarize_utxos_staking_posture(std::slice::from_ref(&vault_utxo)),
+            "vault_only"
+        );
+        assert_eq!(
+            summarize_utxos_staking_posture(&[vault_utxo, p2pkh_utxo]),
+            "mixed_or_direct_p2pkh"
+        );
     }
 }

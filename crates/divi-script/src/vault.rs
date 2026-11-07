@@ -221,6 +221,96 @@ pub fn get_vault_pubkey_hashes(script: &Script) -> Option<([u8; 20], [u8; 20])> 
     StakingVaultScript::from_script(script).map(|v| (v.owner_pubkey_hash, v.vault_pubkey_hash))
 }
 
+/// Post-quantum staking key-exposure classification (`DIP-PQ-0` §3.1–3.2).
+///
+/// Every Proof-of-Stake block carries a compact recoverable `secp256k1` signature (`vchBlockSig`),
+/// revealing the full 33-byte signing `CPubKey` on the first minted block:
+/// - When staking via a 2-key `STAKING_VAULT`, only the hot coinstake-restricted manager key
+///   (`manager_hash160`) signs `vchBlockSig`; the owner key (`owner_hash160`) stays hidden
+///   behind `Hash160` (`RIPEMD160(SHA256(ownerPubKey))`) and consensus rules prevent coinstake
+///   transactions from redirecting vault principal or rewards away from the vault script.
+/// - When staking directly with `P2PKH` (or `P2PK`), `vchBlockSig` exposes the spending
+///   `CPubKey` on-chain to offline Shor discrete-logarithm recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StakingQuantumPosture {
+    /// Two-key `STAKING_VAULT` output with `Hash160`-insulated cold owner key and
+    /// `OP_REQUIRE_COINSTAKE`-restricted hot manager key.
+    VaultInsulated {
+        /// Cold owner `Hash160` (`OP_IF` spending branch; unrevealed during staking)
+        owner_hash160: [u8; 20],
+        /// Hot manager `Hash160` (`OP_ELSE OP_REQUIRE_COINSTAKE` coinstake branch)
+        manager_hash160: [u8; 20],
+    },
+    /// Direct `P2PKH` (or other non-vault) staking output where `vchBlockSig` exposes the
+    /// spending `secp256k1` `CPubKey` directly on-chain.
+    DirectPubKeyExposed,
+}
+
+impl StakingQuantumPosture {
+    /// Classify a `Script` into its post-quantum staking posture.
+    pub fn from_script(script: &Script) -> Self {
+        if let Some(vault) = StakingVaultScript::from_script(script) {
+            StakingQuantumPosture::VaultInsulated {
+                owner_hash160: vault.owner_pubkey_hash,
+                manager_hash160: vault.vault_pubkey_hash,
+            }
+        } else {
+            StakingQuantumPosture::DirectPubKeyExposed
+        }
+    }
+
+    /// Classify raw script bytes into their post-quantum staking posture.
+    pub fn from_script_bytes(script_bytes: &[u8]) -> Self {
+        let script = Script::from_bytes(script_bytes.to_vec());
+        Self::from_script(&script)
+    }
+
+    /// Returns `true` if the staking output insulates the owner key via `STAKING_VAULT`.
+    pub fn is_vault_insulated(&self) -> bool {
+        matches!(self, StakingQuantumPosture::VaultInsulated { .. })
+    }
+
+    /// Returns `true` if staking with this output directly exposes the spending `CPubKey`.
+    pub fn is_direct_pubkey_exposed(&self) -> bool {
+        matches!(self, StakingQuantumPosture::DirectPubKeyExposed)
+    }
+
+    /// Telemetry advisory label for `getstakingstatus` / `getdiaginfo` (`DIP-PQ-0` §3.2).
+    pub fn advisory_label(&self) -> &'static str {
+        match self {
+            StakingQuantumPosture::VaultInsulated { .. } => "vault_only",
+            StakingQuantumPosture::DirectPubKeyExposed => "mixed_or_direct_p2pkh",
+        }
+    }
+}
+
+/// Classify a staking UTXO `scriptPubKey` for post-quantum insulation (`DIP-PQ-0` §3.1–3.2).
+pub fn classify_staking_script_posture(script: &Script) -> StakingQuantumPosture {
+    StakingQuantumPosture::from_script(script)
+}
+
+/// Summarize aggregate `vault_insulation` telemetry across a collection of staking scripts.
+///
+/// Returns `"vault_only"` when all inspected scripts are `STAKING_VAULT` outputs (and at least
+/// one script is present), or `"mixed_or_direct_p2pkh"` if any non-vault script is present.
+pub fn summarize_staking_posture<'a, I>(scripts: I) -> &'static str
+where
+    I: IntoIterator<Item = &'a Script>,
+{
+    let mut saw_any = false;
+    for script in scripts {
+        saw_any = true;
+        if !classify_staking_script_posture(script).is_vault_insulated() {
+            return "mixed_or_direct_p2pkh";
+        }
+    }
+    if saw_any {
+        "vault_only"
+    } else {
+        "mixed_or_direct_p2pkh"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,5 +379,72 @@ mod tests {
         let (parsed_owner, parsed_vault) = get_vault_pubkey_hashes(&script).unwrap();
         assert_eq!(parsed_owner, owner_hash);
         assert_eq!(parsed_vault, vault_hash);
+    }
+
+    #[test]
+    fn test_dip_pq_0_vector_3_vault_script_and_posture() {
+        let owner_bytes = hex::decode("101112131415161718191a1b1c1d1e1f20212223").unwrap();
+        let vault_bytes = hex::decode("a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3").unwrap();
+        let mut owner_hash = [0u8; 20];
+        let mut vault_hash = [0u8; 20];
+        owner_hash.copy_from_slice(&owner_bytes);
+        vault_hash.copy_from_slice(&vault_bytes);
+
+        let vault = StakingVaultScript::new(owner_hash, vault_hash);
+        let script = vault.to_script();
+        assert_eq!(
+            hex::encode(script.as_bytes()),
+            "6314101112131415161718191a1b1c1d1e1f2021222367b914a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b36878a988ac"
+        );
+
+        let posture = classify_staking_script_posture(&script);
+        assert_eq!(
+            posture,
+            StakingQuantumPosture::VaultInsulated {
+                owner_hash160: owner_hash,
+                manager_hash160: vault_hash,
+            }
+        );
+        assert!(posture.is_vault_insulated());
+        assert!(!posture.is_direct_pubkey_exposed());
+        assert_eq!(posture.advisory_label(), "vault_only");
+    }
+
+    #[test]
+    fn test_staking_quantum_posture_p2pkh_vs_vault() {
+        let owner_hash = [0x11; 20];
+        let manager_hash = [0x22; 20];
+
+        let vault_script = StakingVaultScript::new(owner_hash, manager_hash).to_script();
+        let p2pkh_script = Script::new_p2pkh(&owner_hash);
+
+        let vault_posture = StakingQuantumPosture::from_script(&vault_script);
+        assert_eq!(
+            vault_posture,
+            StakingQuantumPosture::VaultInsulated {
+                owner_hash160: owner_hash,
+                manager_hash160: manager_hash,
+            }
+        );
+        assert_eq!(
+            StakingQuantumPosture::from_script_bytes(vault_script.as_bytes()),
+            vault_posture
+        );
+
+        let p2pkh_posture = classify_staking_script_posture(&p2pkh_script);
+        assert_eq!(p2pkh_posture, StakingQuantumPosture::DirectPubKeyExposed);
+        assert!(p2pkh_posture.is_direct_pubkey_exposed());
+        assert!(!p2pkh_posture.is_vault_insulated());
+        assert_eq!(p2pkh_posture.advisory_label(), "mixed_or_direct_p2pkh");
+
+        assert_eq!(summarize_staking_posture([&vault_script]), "vault_only");
+        assert_eq!(
+            summarize_staking_posture([&vault_script, &p2pkh_script]),
+            "mixed_or_direct_p2pkh"
+        );
+        assert_eq!(
+            summarize_staking_posture([&p2pkh_script]),
+            "mixed_or_direct_p2pkh"
+        );
     }
 }

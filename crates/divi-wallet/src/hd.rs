@@ -37,6 +37,34 @@ pub const PRIVATEDIVI_COIN_TYPE: u32 = 801;
 /// Coin type Divi Core derives with on testnet and regtest
 pub const TEST_COIN_TYPE: u32 = 1;
 
+/// BIP44 purpose index (`44'`)
+pub const BIP44_PURPOSE_HARDENED: u32 = 44;
+
+/// Hardened external (receiving) change branch (`m/44'/coin'/account'/0'/index'`, `DIP-PQ-0` §3.3)
+pub const BRANCH_EXTERNAL_HARDENED: u32 = 0;
+
+/// Hardened internal (change) branch (`m/44'/coin'/account'/1'/index'`, `DIP-PQ-0` §3.3)
+pub const BRANCH_INTERNAL_HARDENED: u32 = 1;
+
+/// Hardened cold Staking Vault owner branch (`m/44'/coin'/account'/2'/index'`, `DIP-PQ-0` §3.3)
+pub const BRANCH_VAULT_OWNER_HARDENED: u32 = 2;
+
+/// Hardened hot Staking Vault manager branch (`m/44'/coin'/account'/3'/index'`, `DIP-PQ-0` §3.3)
+pub const BRANCH_VAULT_MANAGER_HARDENED: u32 = 3;
+
+/// Hardened BIP32 child index flag (`2^31`)
+pub const HARDENED_INDEX_BIT: u32 = 0x8000_0000;
+
+/// Wallet HD key-derivation hygiene mode (`DIP-PQ-0` §3.3)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WalletKeyHygiene {
+    /// Classical BIP44 (`m/44'/coin'/account'/change/index`) with non-hardened change/index
+    #[default]
+    StandardBip44,
+    /// Hardened-Only BIP44 (`m/44'/coin'/account'/change'/index'`, `-hdhardenedonly=1`)
+    HardenedOnly,
+}
+
 /// Extended private key wrapper
 #[derive(Clone)]
 pub struct ExtendedPrivateKey {
@@ -59,10 +87,11 @@ impl ExtendedPrivateKey {
         Ok(ExtendedPrivateKey { inner: child })
     }
 
-    /// Derive hardened child
+    /// Derive hardened child (`index | 0x8000_0000`)
     pub fn derive_hardened(&self, index: u32) -> Result<Self, WalletError> {
-        let child_number =
-            ChildNumber::new(index, true).map_err(|e| WalletError::KeyDerivation(e.to_string()))?;
+        let unmasked = index & !HARDENED_INDEX_BIT;
+        let child_number = ChildNumber::new(unmasked, true)
+            .map_err(|e| WalletError::KeyDerivation(e.to_string()))?;
         self.derive_child(child_number)
     }
 
@@ -73,9 +102,24 @@ impl ExtendedPrivateKey {
         self.derive_child(child_number)
     }
 
-    /// Get the private key bytes
+    /// Get the private key bytes (`I_L`, 32 bytes)
     pub fn private_key_bytes(&self) -> [u8; 32] {
         self.inner.private_key().to_bytes().into()
+    }
+
+    /// Get the BIP32 chain code bytes (`I_R`, 32 bytes)
+    pub fn chain_code_bytes(&self) -> [u8; 32] {
+        self.inner.attrs().chain_code
+    }
+
+    /// Get the derivation depth (`0` for master `m`, `5` for `m/44'/coin'/account'/change'/index'`)
+    pub fn depth(&self) -> u8 {
+        self.inner.attrs().depth
+    }
+
+    /// Get the child number at this derivation depth
+    pub fn child_number(&self) -> ChildNumber {
+        self.inner.attrs().child_number
     }
 
     /// Get the secret key
@@ -90,6 +134,113 @@ impl ExtendedPrivateKey {
             inner: self.inner.public_key(),
         })
     }
+}
+
+/// Source material (seed bytes, master `ExtendedPrivateKey`, or `HdWallet`) for
+/// `derive_hardened_bip44_key`.
+pub trait HardenedBip44Source {
+    /// Obtain or derive the master `ExtendedPrivateKey` (`m`).
+    fn resolve_master_key(&self) -> Result<ExtendedPrivateKey, WalletError>;
+}
+
+impl HardenedBip44Source for ExtendedPrivateKey {
+    fn resolve_master_key(&self) -> Result<ExtendedPrivateKey, WalletError> {
+        Ok(self.clone())
+    }
+}
+
+impl HardenedBip44Source for &ExtendedPrivateKey {
+    fn resolve_master_key(&self) -> Result<ExtendedPrivateKey, WalletError> {
+        Ok((*self).clone())
+    }
+}
+
+impl HardenedBip44Source for HdWallet {
+    fn resolve_master_key(&self) -> Result<ExtendedPrivateKey, WalletError> {
+        Ok(self.master.clone())
+    }
+}
+
+impl HardenedBip44Source for &HdWallet {
+    fn resolve_master_key(&self) -> Result<ExtendedPrivateKey, WalletError> {
+        Ok(self.master.clone())
+    }
+}
+
+impl HardenedBip44Source for [u8] {
+    fn resolve_master_key(&self) -> Result<ExtendedPrivateKey, WalletError> {
+        ExtendedPrivateKey::from_seed(self)
+    }
+}
+
+impl HardenedBip44Source for &[u8] {
+    fn resolve_master_key(&self) -> Result<ExtendedPrivateKey, WalletError> {
+        ExtendedPrivateKey::from_seed(self)
+    }
+}
+
+impl<const N: usize> HardenedBip44Source for [u8; N] {
+    fn resolve_master_key(&self) -> Result<ExtendedPrivateKey, WalletError> {
+        ExtendedPrivateKey::from_seed(self.as_slice())
+    }
+}
+
+impl<const N: usize> HardenedBip44Source for &[u8; N] {
+    fn resolve_master_key(&self) -> Result<ExtendedPrivateKey, WalletError> {
+        ExtendedPrivateKey::from_seed(self.as_slice())
+    }
+}
+
+impl HardenedBip44Source for Vec<u8> {
+    fn resolve_master_key(&self) -> Result<ExtendedPrivateKey, WalletError> {
+        ExtendedPrivateKey::from_seed(self.as_slice())
+    }
+}
+
+impl HardenedBip44Source for &Vec<u8> {
+    fn resolve_master_key(&self) -> Result<ExtendedPrivateKey, WalletError> {
+        ExtendedPrivateKey::from_seed(self.as_slice())
+    }
+}
+
+/// Return the 5 hardened BIP32 child indices `[44', coin_type', account', change_branch', index']`
+/// with `0x8000_0000` set on every path component (`DIP-PQ-0` §3.3).
+pub const fn hardened_bip44_indices(
+    coin_type: u32,
+    account: u32,
+    change_branch: u32,
+    index: u32,
+) -> [u32; 5] {
+    [
+        (BIP44_PURPOSE_HARDENED & !HARDENED_INDEX_BIT) | HARDENED_INDEX_BIT,
+        (coin_type & !HARDENED_INDEX_BIT) | HARDENED_INDEX_BIT,
+        (account & !HARDENED_INDEX_BIT) | HARDENED_INDEX_BIT,
+        (change_branch & !HARDENED_INDEX_BIT) | HARDENED_INDEX_BIT,
+        (index & !HARDENED_INDEX_BIT) | HARDENED_INDEX_BIT,
+    ]
+}
+
+/// Derive a hardened-only BIP44 leaf key at `m/44'/coin_type'/account'/change_branch'/index'`
+/// (`DIP-PQ-0` §3.3).
+///
+/// Every level uses hardened `HMAC-SHA512(Key = c_par, Data = 0x00 || ser256(k_par) || ser32(i | 0x8000_0000))`
+/// derivation so that no non-hardened parent `xpub` or sibling key is ever exposed to Shor's
+/// algorithm if a leaf public key is revealed on-chain.
+pub fn derive_hardened_bip44_key<S: HardenedBip44Source + ?Sized>(
+    seed_or_master: &S,
+    coin_type: u32,
+    account: u32,
+    change_branch: u32,
+    index: u32,
+) -> Result<ExtendedPrivateKey, WalletError> {
+    let master = seed_or_master.resolve_master_key()?;
+    let indices = hardened_bip44_indices(coin_type, account, change_branch, index);
+    let mut current = master;
+    for raw_idx in indices {
+        debug_assert_ne!(raw_idx & HARDENED_INDEX_BIT, 0);
+        current = current.derive_hardened(raw_idx)?;
+    }
+    Ok(current)
 }
 
 /// Extended public key wrapper
@@ -299,6 +450,63 @@ impl HdWallet {
     pub fn get_master_pubkey(&self) -> Result<divi_crypto::keys::PublicKey, WalletError> {
         let secret = self.master.secret_key()?;
         Ok(secret.public_key())
+    }
+
+    /// Reference to the master extended private key (`m`)
+    pub fn master_key(&self) -> &ExtendedPrivateKey {
+        &self.master
+    }
+
+    /// Derive a hardened-only BIP44 key (`m/44'/coin'/account'/change_branch'/index'`)
+    pub fn derive_hardened_bip44(
+        &self,
+        account: u32,
+        change_branch: u32,
+        index: u32,
+    ) -> Result<ExtendedPrivateKey, WalletError> {
+        derive_hardened_bip44_key(
+            &self.master,
+            self.coin_type(),
+            account,
+            change_branch,
+            index,
+        )
+    }
+
+    /// Derive hardened external (receiving) key (`m/44'/coin'/account'/0'/index'`)
+    pub fn derive_hardened_receiving(
+        &self,
+        account: u32,
+        index: u32,
+    ) -> Result<ExtendedPrivateKey, WalletError> {
+        self.derive_hardened_bip44(account, BRANCH_EXTERNAL_HARDENED, index)
+    }
+
+    /// Derive hardened internal (change) key (`m/44'/coin'/account'/1'/index'`)
+    pub fn derive_hardened_change(
+        &self,
+        account: u32,
+        index: u32,
+    ) -> Result<ExtendedPrivateKey, WalletError> {
+        self.derive_hardened_bip44(account, BRANCH_INTERNAL_HARDENED, index)
+    }
+
+    /// Derive hardened cold Staking Vault owner key (`m/44'/coin'/account'/2'/index'`)
+    pub fn derive_hardened_vault_owner(
+        &self,
+        account: u32,
+        index: u32,
+    ) -> Result<ExtendedPrivateKey, WalletError> {
+        self.derive_hardened_bip44(account, BRANCH_VAULT_OWNER_HARDENED, index)
+    }
+
+    /// Derive hardened hot Staking Vault manager key (`m/44'/coin'/account'/3'/index'`)
+    pub fn derive_hardened_vault_manager(
+        &self,
+        account: u32,
+        index: u32,
+    ) -> Result<ExtendedPrivateKey, WalletError> {
+        self.derive_hardened_bip44(account, BRANCH_VAULT_MANAGER_HARDENED, index)
     }
 }
 
@@ -853,5 +1061,150 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Canonical DIP-PQ-0 §6 Vector 4 test for Hardened-Only HD derivation (`P0.3b`).
+    #[test]
+    fn test_dip_pq_0_vector_4_hardened_only_hd_derivation() {
+        const MNEMONIC_24: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art";
+        // Empty-passphrase ("") BIP39 64-byte seed and master HMAC-SHA512("Bitcoin seed", seed)
+        const EXPECTED_EMPTY_PASS_SEED_HEX: &str = "408b285c123836004f4b8842c89324c1f01382450c0d439af345ba7fc49acf705489c6fc77dbd4e3dc1dd8cc6bc9f043db8ada1e243c4a0eafb290d399480840";
+        const EXPECTED_EMPTY_PASS_MASTER_SECRET_HEX: &str =
+            "235b34cd7c9f6d7e4595ffe9ae4b1cb5606df8aca2b527d20a07c8f56b2342f4";
+        const EXPECTED_EMPTY_PASS_MASTER_CHAIN_CODE_HEX: &str =
+            "f40eaad21641ca7cb5ac00f9ce21cac9ba070bb673a237f7bce57acda54386a4";
+        // Trezor reference ("TREZOR" passphrase) BIP39 64-byte seed and master HMAC-SHA512
+        const EXPECTED_TREZOR_SEED_HEX: &str = "bda85446c68413707090a52022edd26a1c9462295029f2e60cd7c4f2bbd3097170af7a4d73245cafa9c3cca8d561a7c3de6f5d4a10be8ed2a5e608d68f92fcc8";
+        const EXPECTED_TREZOR_MASTER_SECRET_HEX: &str =
+            "c8b4073ccfcc63475c3d5202c6594484ee4e77b867cde3c3b46432fd71b467ae";
+        const EXPECTED_TREZOR_MASTER_CHAIN_CODE_HEX: &str =
+            "61ccb2bbe7d2a4fccd5f418ee931db7cbac9a153ec43b0ae3759ff991e4d23d1";
+
+        assert_eq!(BRANCH_EXTERNAL_HARDENED, 0);
+        assert_eq!(BRANCH_INTERNAL_HARDENED, 1);
+        assert_eq!(BRANCH_VAULT_OWNER_HARDENED, 2);
+        assert_eq!(BRANCH_VAULT_MANAGER_HARDENED, 3);
+
+        // 1. Verify BIP39 64-byte seeds and Master XPrv (I_L, I_R) for both "" and "TREZOR"
+        let mnemonic: Mnemonic = MNEMONIC_24.parse().unwrap();
+        let seed = mnemonic.to_seed("");
+        assert_eq!(hex::encode(seed), EXPECTED_EMPTY_PASS_SEED_HEX);
+
+        let master = ExtendedPrivateKey::from_seed(&seed).unwrap();
+        assert_eq!(
+            hex::encode(master.private_key_bytes()),
+            EXPECTED_EMPTY_PASS_MASTER_SECRET_HEX
+        );
+        assert_eq!(
+            hex::encode(master.chain_code_bytes()),
+            EXPECTED_EMPTY_PASS_MASTER_CHAIN_CODE_HEX
+        );
+        assert_eq!(master.depth(), 0);
+
+        let trezor_seed = mnemonic.to_seed("TREZOR");
+        assert_eq!(hex::encode(trezor_seed), EXPECTED_TREZOR_SEED_HEX);
+        let trezor_master = ExtendedPrivateKey::from_seed(&trezor_seed).unwrap();
+        assert_eq!(
+            hex::encode(trezor_master.private_key_bytes()),
+            EXPECTED_TREZOR_MASTER_SECRET_HEX
+        );
+        assert_eq!(
+            hex::encode(trezor_master.chain_code_bytes()),
+            EXPECTED_TREZOR_MASTER_CHAIN_CODE_HEX
+        );
+
+        // 2. Verify hardened BIP32 indices for m/44'/301'/0'/branch'/0'
+        assert_eq!(
+            hardened_bip44_indices(DIVI_COIN_TYPE, 0, BRANCH_EXTERNAL_HARDENED, 0),
+            [0x8000002C, 0x8000012D, 0x80000000, 0x80000000, 0x80000000]
+        );
+        assert_eq!(
+            hardened_bip44_indices(DIVI_COIN_TYPE, 0, BRANCH_VAULT_OWNER_HARDENED, 0),
+            [0x8000002C, 0x8000012D, 0x80000000, 0x80000002, 0x80000000]
+        );
+        assert_eq!(
+            hardened_bip44_indices(DIVI_COIN_TYPE, 0, BRANCH_VAULT_MANAGER_HARDENED, 0),
+            [0x8000002C, 0x8000012D, 0x80000000, 0x80000003, 0x80000000]
+        );
+
+        // 3. Derive Standard Spend Leaf (m/44'/301'/0'/0'/0'), Cold Vault Owner Leaf (m/44'/301'/0'/2'/0'),
+        //    and Hot Vault Manager Leaf (m/44'/301'/0'/3'/0') from both seed and master
+        let wallet = HdWallet::from_mnemonic(MNEMONIC_24, None, ChainMode::Divi).unwrap();
+
+        let spend_from_seed =
+            derive_hardened_bip44_key(&seed, DIVI_COIN_TYPE, 0, BRANCH_EXTERNAL_HARDENED, 0)
+                .unwrap();
+        let spend_from_master =
+            derive_hardened_bip44_key(&master, DIVI_COIN_TYPE, 0, BRANCH_EXTERNAL_HARDENED, 0)
+                .unwrap();
+        let spend_from_wallet = wallet.derive_hardened_receiving(0, 0).unwrap();
+        assert_eq!(
+            spend_from_seed.private_key_bytes(),
+            spend_from_master.private_key_bytes()
+        );
+        assert_eq!(
+            spend_from_master.private_key_bytes(),
+            spend_from_wallet.private_key_bytes()
+        );
+        assert_eq!(spend_from_master.depth(), 5);
+        assert!(spend_from_master.child_number().is_hardened());
+
+        let change_leaf = wallet.derive_hardened_change(0, 0).unwrap();
+        let owner_leaf =
+            derive_hardened_bip44_key(&master, DIVI_COIN_TYPE, 0, BRANCH_VAULT_OWNER_HARDENED, 0)
+                .unwrap();
+        let manager_leaf =
+            derive_hardened_bip44_key(&master, DIVI_COIN_TYPE, 0, BRANCH_VAULT_MANAGER_HARDENED, 0)
+                .unwrap();
+
+        assert_eq!(
+            owner_leaf.private_key_bytes(),
+            wallet
+                .derive_hardened_vault_owner(0, 0)
+                .unwrap()
+                .private_key_bytes()
+        );
+        assert_eq!(
+            manager_leaf.private_key_bytes(),
+            wallet
+                .derive_hardened_vault_manager(0, 0)
+                .unwrap()
+                .private_key_bytes()
+        );
+
+        // Every leaf must be hardened at depth 5 and distinct from one another and from non-hardened BIP44
+        for leaf in [&spend_from_master, &change_leaf, &owner_leaf, &manager_leaf] {
+            assert_eq!(leaf.depth(), 5);
+            assert!(leaf.child_number().is_hardened());
+        }
+        assert_ne!(
+            spend_from_master.private_key_bytes(),
+            change_leaf.private_key_bytes()
+        );
+        assert_ne!(
+            spend_from_master.private_key_bytes(),
+            owner_leaf.private_key_bytes()
+        );
+        assert_ne!(
+            owner_leaf.private_key_bytes(),
+            manager_leaf.private_key_bytes()
+        );
+
+        // Hardened m/44'/301'/0'/0'/0' MUST differ from classical non-hardened m/44'/301'/0'/0/0
+        let non_hardened_recv0 = wallet.derive_receiving(0, 0).unwrap();
+        assert_ne!(
+            spend_from_master.private_key_bytes(),
+            non_hardened_recv0.private_key_bytes()
+        );
+        assert!(!non_hardened_recv0.child_number().is_hardened());
+
+        // Passing pre-hardened (0x8000_0000 | idx) or unmasked idx produces the exact same hardened key
+        let pre_masked =
+            derive_hardened_bip44_key(&master, 0x8000012D, 0x80000000, 0x80000002, 0x80000000)
+                .unwrap();
+        assert_eq!(
+            pre_masked.private_key_bytes(),
+            owner_leaf.private_key_bytes()
+        );
     }
 }

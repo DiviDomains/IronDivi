@@ -260,14 +260,22 @@ Both `divid` (`divi/src/test/crypter_tests.cpp`) and `irondivid` (`crates/divi-w
 
 - **BIP39 24-Word Mnemonic:**
   `abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art`
-- **BIP39 Passphrase:** `""` (empty)
-- **BIP39 64-Byte Seed (hex):**
-  ```text
-  bda85446c68413707090a52022edd26a1c9462295029f2e60cd7c4f2bbd3097170af7a4d73245cafa9c3cca8d561a7c3de6f5d4a10be8ed2a5e608d68f92fcc8
-  ```
-- **Master `XPrv` Chain Code & Secret Key (`HMAC-SHA512("Bitcoin seed", seed)`):**
-  - `secret_key` (`I_L`): `224212c95a6321a6085c9d2b07119c70e251a1d88d06c192b114d9f160855130`
-  - `chain_code` (`I_R`): `c80c07232c19101a08415b20092691e27c6c563a2a125293be1650f2912b54d8`
+- **BIP39 Passphrase Variant A (`""` empty passphrase):**
+  - **BIP39 64-Byte Seed (hex):**
+    ```text
+    408b285c123836004f4b8842c89324c1f01382450c0d439af345ba7fc49acf705489c6fc77dbd4e3dc1dd8cc6bc9f043db8ada1e243c4a0eafb290d399480840
+    ```
+  - **Master `XPrv` Chain Code & Secret Key (`HMAC-SHA512("Bitcoin seed", seed)`):**
+    - `secret_key` (`I_L`): `235b34cd7c9f6d7e4595ffe9ae4b1cb5606df8aca2b527d20a07c8f56b2342f4`
+    - `chain_code` (`I_R`): `f40eaad21641ca7cb5ac00f9ce21cac9ba070bb673a237f7bce57acda54386a4`
+- **BIP39 Passphrase Variant B (`"TREZOR"` reference vector passphrase):**
+  - **BIP39 64-Byte Seed (hex):**
+    ```text
+    bda85446c68413707090a52022edd26a1c9462295029f2e60cd7c4f2bbd3097170af7a4d73245cafa9c3cca8d561a7c3de6f5d4a10be8ed2a5e608d68f92fcc8
+    ```
+  - **Master `XPrv` Chain Code & Secret Key (`HMAC-SHA512("Bitcoin seed", seed)`):**
+    - `secret_key` (`I_L`): `c8b4073ccfcc63475c3d5202c6594484ee4e77b867cde3c3b46432fd71b467ae`
+    - `chain_code` (`I_R`): `61ccb2bbe7d2a4fccd5f418ee931db7cbac9a153ec43b0ae3759ff991e4d23d1`
 - **Hardened-Only Derivation Paths:**
   - Standard Spend Leaf: `m/44'/301'/0'/0'/0'` (indices `[0x8000002C, 0x8000012D, 0x80000000, 0x80000000, 0x80000000]`)
   - Cold Vault Owner Leaf: `m/44'/301'/0'/2'/0'` (indices `[0x8000002C, 0x8000012D, 0x80000000, 0x80000002, 0x80000000]`)
