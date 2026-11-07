@@ -48,4 +48,25 @@ fn main() {
     println!("cargo:rerun-if-changed={crypto_dir}/sph_types.h");
     println!("cargo:rerun-if-changed={crypto_dir}/wasm-sysroot/string.h");
     println!("cargo:rerun-if-changed=build.rs");
+
+    // Self-contained C99 reference PQ implementation (DIP-PQ-1, Track 7C Phase 1 P1.3c).
+    let pq_c99_dir = "c99_ref";
+    let mut pq_build = cc::Build::new();
+    if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("wasm32") {
+        pq_build
+            .include(format!("{crypto_dir}/wasm-sysroot"))
+            .flag("-ffreestanding");
+    }
+    pq_build
+        .file(format!("{pq_c99_dir}/divi_pqcrypto.c"))
+        .include(pq_c99_dir)
+        .flag_if_supported("-std=c99")
+        .flag_if_supported("-fno-fast-math")
+        .flag_if_supported("-Wall")
+        .flag_if_supported("-Wextra")
+        .flag_if_supported("-Werror")
+        .compile("divi_pqcrypto_c99");
+
+    println!("cargo:rerun-if-changed={pq_c99_dir}/divi_pqcrypto.c");
+    println!("cargo:rerun-if-changed={pq_c99_dir}/divi_pqcrypto.h");
 }
