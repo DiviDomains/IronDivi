@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """The divid 3.0.0 options no other script compares, Divi Core divid and
 irondivid side by side on regtest.
 
@@ -31,7 +30,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "lib"))
-import node_ports  # noqa: E402  (scripts/lib: a node whose ports were taken starts again on new ones)
+import node_ports  # (scripts/lib: a node whose ports were taken starts again on new ones)
 
 IRONDIVID, DIVID, PORT_BASE, WORK = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
 HOST = "127.0.0.2"
@@ -60,8 +59,7 @@ KNOWN = {
 
 
 def unsupported(option):
-    return lambda c, i: c == ("ok", []) and i == ("ok", [f"WARNING: Option -{option} is not supported by irondivid; "
-                                                         "ignored"])
+    return lambda c, i: c == ("ok", []) and i == ("ok", [f"WARNING: Option -{option} is not supported by irondivid; ignored"])
 
 
 def aborts(c, i):
@@ -181,7 +179,7 @@ class Node:
     def answers(self):
         try:
             return self.call("getblockcount")[0] == "ok"
-        except Exception:
+        except (OSError, ValueError, RuntimeError):
             return False
 
     def start(self, *args):
@@ -259,8 +257,8 @@ class Node:
             return
         try:
             self.call("stop")
-        except Exception:
-            pass
+        except (OSError, ValueError, RuntimeError) as _stop_err:
+            del _stop_err
         if self.proc is not None:
             try:
                 self.proc.wait(timeout=90)
@@ -409,7 +407,7 @@ OPTIONS = [
 
 for _option, _typical, _forms, _during, _after in OPTIONS:
     for _label in labels(_option, _typical, _forms):
-        if _option in ("accountlabels", "activeversion", "manual_fork", "override_mnpayee", "stakeupdatetime"):
+        if _option in ("accountlabels", "activeversion", "override_mnpayee", "stakeupdatetime"):
             KNOWN[f"{_label}: log lines naming -{_option}"] = (AIDS, unsupported(_option))
         if _option == "socks" or (_option == "tor" and _label not in ("-tor=0", "-tor=abc")):
             KNOWN[f"{_label}: start"] = (ABORT, aborts)
@@ -509,7 +507,7 @@ def help_lines(binary, *args):
     home = os.path.join(WORK, "home")
     os.makedirs(home, exist_ok=True)
     out = subprocess.run([binary, *args], capture_output=True, text=True, timeout=60,
-                         env=dict(os.environ, HOME=home), cwd=WORK)
+                         env=dict(os.environ, HOME=home), cwd=WORK, check=False)
     return out.returncode, [ln for ln in out.stdout.splitlines() if ln.lstrip().startswith("-")]
 
 

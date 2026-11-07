@@ -22,6 +22,52 @@
 //! Reference: Divi/divi/src/ForkActivation.cpp:1-61
 
 use crate::block_index::BlockIndex;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+
+/// Whether a regtest `-manual_fork` timestamp override is currently active.
+static MANUAL_FORK_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// The regtest `-manual_fork` timestamp override (`ForkActivation.cpp:50-55`).
+static MANUAL_FORK_TIMESTAMP: AtomicI64 = AtomicI64::new(0);
+
+/// Sets or clears the process-wide `-manual_fork` timestamp override.
+///
+/// Only takes effect when `is_regtest` is `true`; on mainnet and testnet the
+/// override is cleared and ignored so live-network fork schedules remain
+/// strictly immutable.
+///
+/// Reference: Divi/divi/src/ForkActivation.cpp:21, :50-55
+pub fn set_manual_fork(timestamp: Option<i64>, is_regtest: bool) -> bool {
+    match (timestamp, is_regtest) {
+        (Some(ts), true) => {
+            MANUAL_FORK_TIMESTAMP.store(ts, Ordering::Release);
+            MANUAL_FORK_ENABLED.store(true, Ordering::Release);
+            true
+        }
+        _ => {
+            MANUAL_FORK_ENABLED.store(false, Ordering::Release);
+            MANUAL_FORK_TIMESTAMP.store(0, Ordering::Release);
+            false
+        }
+    }
+}
+
+/// Returns the active regtest `-manual_fork` timestamp override, if set.
+pub fn manual_fork() -> Option<i64> {
+    if MANUAL_FORK_ENABLED.load(Ordering::Acquire) {
+        Some(MANUAL_FORK_TIMESTAMP.load(Ordering::Acquire))
+    } else {
+        None
+    }
+}
+
+/// Returns whether `fork` is in Divi Core's `manualOverrides` set
+/// (`CheckLockTimeVerify` and `DeprecateMasternodes`).
+///
+/// Reference: Divi/divi/src/ForkActivation.cpp:21
+pub fn supports_manual_override(fork: Fork) -> bool {
+    matches!(fork, Fork::CheckLockTimeVerify | Fork::DeprecateMasternodes)
+}
 
 /// The list of consensus changes ("forks") that have been introduced
 /// on the network since its launch.
@@ -85,6 +131,7 @@ fn requires_block_index_context(fork: Fork) -> bool {
 pub struct ActivationState {
     block_time: i64,
     median_time_past: i64,
+    manual_fork_override: Option<i64>,
 }
 
 impl ActivationState {
@@ -98,6 +145,7 @@ impl ActivationState {
         Self {
             block_time: block_index.time as i64,
             median_time_past: 0, // Not computed yet, will be computed on demand if needed
+            manual_fork_override: manual_fork(),
         }
     }
 
@@ -109,7 +157,18 @@ impl ActivationState {
         Self {
             block_time: block_index.time as i64,
             median_time_past,
+            manual_fork_override: manual_fork(),
         }
+    }
+
+    /// Returns a copy of this activation state with an explicit `-manual_fork`
+    /// override applied only when `is_regtest` is `true`.
+    ///
+    /// When `is_regtest` is `false` (mainnet or testnet), `timestamp` is ignored
+    /// and any override is cleared so live-network fork schedules remain immutable.
+    pub fn with_manual_fork(mut self, timestamp: Option<i64>, is_regtest: bool) -> Self {
+        self.manual_fork_override = if is_regtest { timestamp } else { None };
+        self
     }
 
     /// Returns true if the indicated fork should be considered active
@@ -117,6 +176,15 @@ impl ActivationState {
     ///
     /// Reference: Divi/divi/src/ForkActivation.cpp:48-60
     pub fn is_active(&self, fork: Fork) -> bool {
+        // C++ ForkActivation.cpp:50-55: when -manual_fork is set (regtest-only in
+        // IronDivi) and the fork is in manualOverrides (CheckLockTimeVerify,
+        // DeprecateMasternodes), compare the block's nTime against the override.
+        if let Some(timestamp_override) = self.manual_fork_override {
+            if supports_manual_override(fork) {
+                return self.block_time >= timestamp_override;
+            }
+        }
+
         // For most forks, we use the block's timestamp directly.
         // For certain forks (CheckLockTimeVerify, DeprecateMasternodes, LimitTransferVerify),
         // we use the Median Time Past instead.
@@ -151,6 +219,9 @@ mod tests {
     use crate::block_index::{BlockIndex, BlockStatus};
     use divi_primitives::lottery::LotteryWinners;
     use divi_primitives::Hash256;
+    use std::sync::Mutex;
+
+    static MANUAL_FORK_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     /// Helper to create a test block index with a specific timestamp
     fn create_test_block_index(block_time: i64, _median_time_past: i64) -> BlockIndex {
@@ -179,6 +250,7 @@ mod tests {
 
     #[test]
     fn test_hardened_stake_modifier_not_active_before_activation() {
+        let _guard = MANUAL_FORK_TEST_LOCK.lock().unwrap();
         let block = create_test_block_index(1609459198, 1609459198);
         let state = ActivationState::new(&block);
         assert!(!state.is_hardened_stake_modifier_active());
@@ -186,6 +258,7 @@ mod tests {
 
     #[test]
     fn test_hardened_stake_modifier_active_at_activation() {
+        let _guard = MANUAL_FORK_TEST_LOCK.lock().unwrap();
         let block = create_test_block_index(1609459199, 1609459199);
         let state = ActivationState::new(&block);
         assert!(state.is_hardened_stake_modifier_active());
@@ -193,6 +266,7 @@ mod tests {
 
     #[test]
     fn test_hardened_stake_modifier_active_after_activation() {
+        let _guard = MANUAL_FORK_TEST_LOCK.lock().unwrap();
         let block = create_test_block_index(1609459200, 1609459200);
         let state = ActivationState::new(&block);
         assert!(state.is_hardened_stake_modifier_active());
@@ -200,6 +274,7 @@ mod tests {
 
     #[test]
     fn test_fork_activation_uses_block_time_for_hardened_modifier() {
+        let _guard = MANUAL_FORK_TEST_LOCK.lock().unwrap();
         let block = create_test_block_index(1609459200, 1609459000);
         let state = ActivationState::new(&block);
         assert!(state.is_active(Fork::HardenedStakeModifier));
@@ -207,6 +282,7 @@ mod tests {
 
     #[test]
     fn test_fork_activation_uses_mtp_for_checklocktimeverify() {
+        let _guard = MANUAL_FORK_TEST_LOCK.lock().unwrap();
         let block = create_test_block_index(1692792001, 1692791999);
         let state = ActivationState::new_with_mtp(&block, 1692791999);
         assert!(!state.is_active(Fork::CheckLockTimeVerify));
@@ -214,6 +290,7 @@ mod tests {
 
     #[test]
     fn test_fork_activation_uses_mtp_for_deprecate_masternodes() {
+        let _guard = MANUAL_FORK_TEST_LOCK.lock().unwrap();
         let block = create_test_block_index(1692792001, 1692792001);
         let state = ActivationState::new_with_mtp(&block, 1692792001);
         assert!(state.is_active(Fork::DeprecateMasternodes));
@@ -221,6 +298,7 @@ mod tests {
 
     #[test]
     fn test_uniform_lottery_winners_same_activation_as_hardened_modifier() {
+        let _guard = MANUAL_FORK_TEST_LOCK.lock().unwrap();
         let block_before = create_test_block_index(1609459198, 1609459198);
         let state_before = ActivationState::new(&block_before);
         assert!(!state_before.is_active(Fork::UniformLotteryWinners));
@@ -232,8 +310,71 @@ mod tests {
 
     #[test]
     fn test_test_fork_activation() {
+        let _guard = MANUAL_FORK_TEST_LOCK.lock().unwrap();
         let block = create_test_block_index(1000000001, 1000000001);
         let state = ActivationState::new(&block);
         assert!(state.is_active(Fork::TestByTimestamp));
+    }
+
+    #[test]
+    fn test_regtest_manual_fork_pre_boundary_and_post_activation() {
+        let _guard = MANUAL_FORK_TEST_LOCK.lock().unwrap();
+        let fork_ts = 1_800_000_000_i64;
+
+        // Pre-fork: block_time < fork_ts (even if MTP >= Aug 23 2023 default)
+        let pre_block = create_test_block_index(fork_ts - 1, 1_750_000_000);
+        let pre_state = ActivationState::new_with_mtp(&pre_block, 1_750_000_000)
+            .with_manual_fork(Some(fork_ts), true);
+        assert!(!pre_state.is_active(Fork::CheckLockTimeVerify));
+        assert!(!pre_state.is_active(Fork::DeprecateMasternodes));
+        // LimitTransferVerify is not in ForkActivation.cpp:21 manualOverrides
+        assert!(pre_state.is_active(Fork::LimitTransferVerify));
+
+        // Exact activation boundary: block_time == fork_ts
+        let boundary_block = create_test_block_index(fork_ts, 1_600_000_000);
+        let boundary_state = ActivationState::new_with_mtp(&boundary_block, 1_600_000_000)
+            .with_manual_fork(Some(fork_ts), true);
+        assert!(boundary_state.is_active(Fork::CheckLockTimeVerify));
+        assert!(boundary_state.is_active(Fork::DeprecateMasternodes));
+
+        // Post-fork: block_time > fork_ts
+        let post_block = create_test_block_index(fork_ts + 60, 1_600_000_000);
+        let post_state = ActivationState::new_with_mtp(&post_block, 1_600_000_000)
+            .with_manual_fork(Some(fork_ts), true);
+        assert!(post_state.is_active(Fork::CheckLockTimeVerify));
+        assert!(post_state.is_active(Fork::DeprecateMasternodes));
+    }
+
+    #[test]
+    fn test_mainnet_and_testnet_schedules_remain_immutable_under_manual_fork() {
+        let _guard = MANUAL_FORK_TEST_LOCK.lock().unwrap();
+        // Attempting to set a manual fork on mainnet/testnet (is_regtest = false) is refused
+        assert!(!set_manual_fork(Some(4_102_444_800), false));
+        assert_eq!(manual_fork(), None);
+
+        // A block after Aug 23 2023 keeps CheckLockTimeVerify and DeprecateMasternodes active
+        // on mainnet/testnet even if a caller passes a year-2100 manual_fork timestamp
+        let post_aug_2023 = create_test_block_index(1_700_000_000, 1_700_000_000);
+        let state = ActivationState::new_with_mtp(&post_aug_2023, 1_700_000_000)
+            .with_manual_fork(Some(4_102_444_800), false);
+        assert!(state.is_active(Fork::CheckLockTimeVerify));
+        assert!(state.is_active(Fork::DeprecateMasternodes));
+
+        // A block before Aug 23 2023 keeps CheckLockTimeVerify and DeprecateMasternodes inactive
+        // on mainnet/testnet even if a caller passes manual_fork = 0
+        let pre_aug_2023 = create_test_block_index(1_650_000_000, 1_650_000_000);
+        let state_early = ActivationState::new_with_mtp(&pre_aug_2023, 1_650_000_000)
+            .with_manual_fork(Some(0), false);
+        assert!(!state_early.is_active(Fork::CheckLockTimeVerify));
+        assert!(!state_early.is_active(Fork::DeprecateMasternodes));
+
+        // Process-wide set_manual_fork works on regtest and resets cleanly
+        assert!(set_manual_fork(Some(2_000_000_000), true));
+        assert_eq!(manual_fork(), Some(2_000_000_000));
+        let regtest_state = ActivationState::new_with_mtp(&post_aug_2023, 1_700_000_000);
+        assert!(!regtest_state.is_active(Fork::CheckLockTimeVerify));
+        assert!(!regtest_state.is_active(Fork::DeprecateMasternodes));
+        set_manual_fork(None, false);
+        assert_eq!(manual_fork(), None);
     }
 }

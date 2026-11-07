@@ -551,6 +551,10 @@ impl Node {
             ))
         };
         divi_storage::script_check::set_threads(config.script_check_threads);
+        divi_storage::fork_activation::set_manual_fork(
+            config.manual_fork,
+            config.network.network_type == crate::config::NetworkType::Regtest,
+        );
         let mut chain = Chain::new(db.clone(), chain_params.clone()).map_err(damaged)?;
 
         // C++ checks the newest blocks at every start (-checkblocks); a damaged

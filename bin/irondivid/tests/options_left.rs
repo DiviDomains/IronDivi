@@ -223,12 +223,12 @@ fn divid_s_test_aids_are_named_as_not_supported() {
     let options = [
         "accountlabels",
         "activeversion",
-        "manual_fork",
         "override_mnpayee",
         "stakeupdatetime",
     ];
     let dir = tempfile::tempdir().unwrap();
-    let args: Vec<String> = options.iter().map(|o| format!("-{o}=1")).collect();
+    let mut args: Vec<String> = options.iter().map(|o| format!("-{o}=1")).collect();
+    args.push("-manual_fork=1700000000".into());
     let (node, _) = start(dir.path(), &args);
     drop(node);
     let log = debug_log(dir.path());
@@ -236,6 +236,10 @@ fn divid_s_test_aids_are_named_as_not_supported() {
         let line = format!("Option -{o} is not supported by irondivid; ignored");
         assert!(log.contains(&line), "no {line:?}: {log}");
     }
+    assert!(
+        !log.contains("Option -manual_fork"),
+        "-manual_fork should be accepted on regtest without warning: {log}"
+    );
 }
 
 /// -mocktime sets the node's clock at the start (divid.cpp:140-143): a block

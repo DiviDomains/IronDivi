@@ -69,6 +69,12 @@ pub struct NodeConfig {
     #[serde(default)]
     pub script_check_threads: usize,
 
+    /// Regtest-only `-manual_fork=<timestamp>` override (`ForkActivation.cpp:50-55`)
+    /// for `CheckLockTimeVerify` and `DeprecateMasternodes`. Ignored on mainnet
+    /// and testnet.
+    #[serde(default)]
+    pub manual_fork: Option<i64>,
+
     /// Refuse a block this many blocks or more below the tip (C++ `-maxreorg`;
     /// unset = the network's depth, 100 on Divi)
     #[serde(default)]
@@ -182,6 +188,7 @@ impl Default for NodeConfig {
             check_blocks: DEFAULT_CHECK_BLOCKS,
             max_reorg: None,
             script_check_threads: 0,
+            manual_fork: None,
             resync: false,
             load_block: Vec::new(),
             bootstrap_dir: None,

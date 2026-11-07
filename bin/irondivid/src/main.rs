@@ -595,13 +595,11 @@ fn resolve_args(mut args: Args) -> Result<Args> {
 /// Among them divid's test aids for parts irondivid has but does not let an
 /// option change: -accountlabels (the default account's coins in every send,
 /// rpcwallet.cpp:445-467, :715), -activeversion (the masternode protocol,
-/// version.cpp:11-17), -manual_fork (two fork times, ForkActivation.cpp:50-55),
-/// -override_mnpayee (BlockIncentivesPopulator.cpp:224) and -stakeupdatetime
-/// (PoSTransactionCreator.cpp:116)
+/// version.cpp:11-17), -override_mnpayee (BlockIncentivesPopulator.cpp:224)
+/// and -stakeupdatetime (PoSTransactionCreator.cpp:116)
 const UNSUPPORTED_OPTIONS: &[&str] = &[
     "accountlabels",
     "activeversion",
-    "manual_fork",
     "override_mnpayee",
     "stakeupdatetime",
     "checklevel",
@@ -766,6 +764,7 @@ const APPLIED: &[&str] = &[
     "utxocachesize",
     "dbcache",
     "par",
+    "manual_fork",
     "forcednsseed",
     "expire",
     "blocknotify",
@@ -1303,6 +1302,21 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     if regtest {
         if let Some(text) = s.get("blockversion") {
             config.staking.block_version = Some(atoi(text) as i32);
+        }
+    }
+    // -manual_fork: overrides CheckLockTimeVerify and DeprecateMasternodes
+    // activation timestamps on regtest only (ForkActivation.cpp:21, :50-55);
+    // mainnet and testnet fork schedules remain immutable.
+    if s.is_set("manual_fork") {
+        if regtest {
+            config.manual_fork = Some(atoi(s.get("manual_fork").unwrap_or("0")));
+        } else {
+            config.manual_fork = None;
+            warn!(
+                "Option -{} is regtest-only; ignored on {:?}",
+                s.written_name("manual_fork"),
+                config.network.network_type
+            );
         }
     }
     // Divi Core reads these with atoi64 into an unsigned int, never refusing
@@ -6711,6 +6725,7 @@ mod divid_option_tests {
         // applied as divid applies it
         assert_eq!(option_warning(&s, "dbcache"), None);
         assert_eq!(option_warning(&s, "par"), None);
+        assert_eq!(option_warning(&s, "manual_fork"), None);
         assert_eq!(option_warning(&s, "peerbloomfilters"), None);
         assert!(option_warning(&s, "accountlabels")
             .unwrap()
@@ -6718,6 +6733,41 @@ mod divid_option_tests {
         assert!(option_warning(&s, "nosuchoption")
             .unwrap()
             .starts_with("Unknown option"));
+    }
+
+    #[test]
+    fn manual_fork_applies_on_regtest_and_keeps_mainnet_testnet_immutable() {
+        let reg = cfg_in(
+            "irondivi.conf",
+            "rpcuser=x\n",
+            &["-regtest", "-manual_fork=1700000000"],
+        )
+        .unwrap();
+        assert_eq!(reg.manual_fork, Some(1_700_000_000));
+
+        let reg_default = cfg_in(
+            "irondivi.conf",
+            "rpcuser=x\n",
+            &["-regtest", "-manual_fork"],
+        )
+        .unwrap();
+        assert_eq!(reg_default.manual_fork, Some(0));
+
+        let main = cfg_in(
+            "irondivi.conf",
+            "rpcuser=x\nrpcpassword=y\n",
+            &["-manual_fork=1700000000"],
+        )
+        .unwrap();
+        assert_eq!(main.manual_fork, None);
+
+        let test = cfg_in(
+            "irondivi.conf",
+            "rpcuser=x\nrpcpassword=y\n",
+            &["-testnet", "-manual_fork=1700000000"],
+        )
+        .unwrap();
+        assert_eq!(test.manual_fork, None);
     }
 
     /// divid's own check and test-aid options are taken without a warning
