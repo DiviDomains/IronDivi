@@ -26,11 +26,12 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::str::FromStr;
 
+use divi_diag::bundle::{self, HybridIdentity};
 use divi_diag::tar::{read_all, Member};
 use irondivi_diag_receiver::is_ticket;
 use sha2::{Digest, Sha256};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 const DEFAULT_URL: &str = "https://diag.irondivi.com";
 const IDENTITY: (&str, &str) = (
@@ -118,12 +119,15 @@ fn secret_get(name: &str, op_ref: &str) -> String {
             out.status.code()
         ));
     }
-    String::from_utf8(out.stdout)
-        .unwrap_or_else(|_| die("the secret is not text"))
-        .trim()
-        .to_string()
+    let raw = Zeroizing::new(String::from_utf8(out.stdout).unwrap_or_else(|e| {
+        let mut bad = e.into_bytes();
+        bad.zeroize();
+        die("the secret is not text")
+    }));
+    raw.trim().to_string()
 }
 
+#[derive(Zeroize, ZeroizeOnDrop)]
 struct Secrets {
     identity: Option<String>,
     token: Option<String>,
@@ -131,7 +135,7 @@ struct Secrets {
 
 fn secrets(a: &Args, need_identity: bool, need_token: bool) -> Secrets {
     if a.stdin {
-        let mut s = String::new();
+        let mut s = Zeroizing::new(String::new());
         std::io::stdin()
             .read_to_string(&mut s)
             .unwrap_or_else(|_| die("cannot read stdin"));
@@ -193,7 +197,7 @@ fn main() {
         let s = secrets(&a, false, true);
         let r = client()
             .get(dev(&a.url, ""))
-            .bearer_auth(s.token.unwrap_or_default())
+            .bearer_auth(s.token.as_deref().unwrap_or_default())
             .send();
         let r = r.unwrap_or_else(|e| die(&format!("{e}")));
         let code = r.status();
@@ -211,7 +215,7 @@ fn main() {
         let s = secrets(&a, false, true);
         let r = client()
             .delete(dev(&a.url, &format!("/{t}")))
-            .bearer_auth(s.token.unwrap_or_default())
+            .bearer_auth(s.token.as_deref().unwrap_or_default())
             .send();
         let r = r.unwrap_or_else(|e| die(&format!("{e}")));
         let code = r.status();
@@ -279,15 +283,11 @@ fn main() {
     };
 
     // the stored identity is a whole age key file: comments, then the key
-    let key_line = s
-        .identity
-        .as_deref()
-        .unwrap_or_default()
-        .lines()
-        .map(str::trim)
-        .find(|l| l.starts_with("AGE-SECRET-KEY-"));
-    let identity = age::x25519::Identity::from_str(key_line.unwrap_or_default())
-        .unwrap_or_else(|_| die("the age identity does not parse (expected AGE-SECRET-KEY-1…)"));
+    // (supports both AGE-SECRET-KEY-PQ-1… hybrid and AGE-SECRET-KEY-1… classical identities)
+    let identity = bundle::parse_identity_text(s.identity.as_deref().unwrap_or_default())
+        .unwrap_or_else(|_| {
+            die("the age identity does not parse (expected AGE-SECRET-KEY-PQ-1… or AGE-SECRET-KEY-1…)")
+        });
     drop(s);
     let tar = open_package(&ciphertext, &identity).unwrap_or_else(|e| die(&e));
     let members = read_all(&mut tar.as_slice(), PER_FILE, TOTAL)
@@ -339,20 +339,9 @@ fn main() {
     std::process::exit(if ok { 0 } else { 3 });
 }
 
-/// age (X25519) → zstd → the tar bytes
-fn open_package(ciphertext: &[u8], identity: &age::x25519::Identity) -> Result<Vec<u8>, String> {
-    let d = age::Decryptor::new(ciphertext).map_err(|e| format!("not an age file: {e}"))?;
-    let mut r = d
-        .decrypt(std::iter::once(identity as &dyn age::Identity))
-        .map_err(|e| format!("decrypt failed (wrong key, or damaged): {e}"))?;
-    let mut z = Vec::new();
-    r.read_to_end(&mut z)
-        .map_err(|e| format!("decrypt failed (damaged): {}", e.kind()))?;
-    let mut tar = Vec::new();
-    zstd::stream::read::Decoder::new(z.as_slice())
-        .and_then(|mut dec| dec.read_to_end(&mut tar))
-        .map_err(|e| format!("decompressing: {}", e.kind()))?;
-    Ok(tar)
+/// age (hybrid X25519-MLKEM768 or classical X25519) → zstd → the tar bytes
+fn open_package(ciphertext: &[u8], identity: &HybridIdentity) -> Result<Vec<u8>, String> {
+    bundle::open_with_identity(ciphertext, identity)
 }
 
 /// Every manifest line against the unpacked bytes. `true` when all match.
@@ -432,4 +421,48 @@ fn which(prog: &str) -> Option<PathBuf> {
                 .find(|c| c.is_file())
         })
         .unwrap_or(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn open_package_decrypts_hybrid_and_classical_bundles() {
+        let hybrid_id = HybridIdentity::generate();
+        let hybrid_recip = hybrid_id.to_public().to_string();
+        let classical_recip = hybrid_id.to_classical_public().to_string();
+
+        let ct_hybrid = bundle::seal(&hybrid_recip, b"hybrid-tar-bytes").unwrap();
+        let ct_classical = bundle::seal(&classical_recip, b"classical-tar-bytes").unwrap();
+
+        let key_file = format!(
+            "# created: 2026-11-07\n# public key: {hybrid_recip}\n{}\n",
+            *hybrid_id.to_secret_string()
+        );
+        let parsed = bundle::parse_identity_text(&key_file).unwrap();
+
+        assert_eq!(
+            open_package(&ct_hybrid, &parsed).unwrap(),
+            b"hybrid-tar-bytes"
+        );
+        assert_eq!(
+            open_package(&ct_classical, &parsed).unwrap(),
+            b"classical-tar-bytes"
+        );
+    }
+
+    #[test]
+    fn secrets_zeroize_on_drop() {
+        fn assert_zeroize_on_drop<T: Zeroize + ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<Secrets>();
+
+        let mut s = Secrets {
+            identity: Some("AGE-SECRET-KEY-PQ-1SECRET".into()),
+            token: Some("bearer-token-secret".into()),
+        };
+        s.zeroize();
+        assert!(s.identity.is_none());
+        assert!(s.token.is_none());
+    }
 }

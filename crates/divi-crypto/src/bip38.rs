@@ -27,7 +27,7 @@ use crate::keys::{PublicKey, SecretKey};
 use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
 use aes::Aes256;
 use scrypt::{scrypt, Params as ScryptParams};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 /// BIP38 magic bytes for non-EC-multiply encrypted keys
 const BIP38_MAGIC_NON_EC: [u8; 2] = [0x01, 0x42];
@@ -85,8 +85,8 @@ pub fn encrypt(
     let derivedhalf2 = &derived[32..64];
 
     // 4. XOR private key with derivedhalf1
-    let mut encrypted_half1 = [0u8; 16];
-    let mut encrypted_half2 = [0u8; 16];
+    let mut encrypted_half1 = Zeroizing::new([0u8; 16]);
+    let mut encrypted_half2 = Zeroizing::new([0u8; 16]);
 
     for i in 0..16 {
         encrypted_half1[i] = private_key[i] ^ derivedhalf1[i];
@@ -97,8 +97,8 @@ pub fn encrypt(
     let cipher = Aes256::new_from_slice(derivedhalf2)
         .map_err(|e| CryptoError::Custom(format!("AES key error: {}", e)))?;
 
-    let mut block1 = aes::Block::from(encrypted_half1);
-    let mut block2 = aes::Block::from(encrypted_half2);
+    let mut block1 = aes::Block::from(*encrypted_half1);
+    let mut block2 = aes::Block::from(*encrypted_half2);
 
     cipher.encrypt_block(&mut block1);
     cipher.encrypt_block(&mut block2);
@@ -207,14 +207,16 @@ pub fn decrypt(
     cipher.decrypt_block(&mut block2);
 
     // 7. XOR with derivedhalf1 to recover private key
-    let mut private_key = [0u8; 32];
+    let mut private_key = Zeroizing::new([0u8; 32]);
     for i in 0..16 {
         private_key[i] = block1[i] ^ derivedhalf1[i];
         private_key[i + 16] = block2[i] ^ derivedhalf1[i + 16];
     }
+    block1.as_mut_slice().zeroize();
+    block2.as_mut_slice().zeroize();
 
     // 8. Verify the decryption was successful by checking address hash
-    let secret = SecretKey::from_bytes(&private_key)?;
+    let secret = SecretKey::from_bytes(&*private_key)?;
     let pubkey = secret.public_key();
     let address = compute_address(&pubkey, compressed, pubkey_version);
 
@@ -225,7 +227,7 @@ pub fn decrypt(
         ));
     }
 
-    Ok((private_key, compressed))
+    Ok((*private_key, compressed))
 }
 
 /// The P2PKH address string of a public key for the network whose address

@@ -38,7 +38,7 @@ use parking_lot::Mutex;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::auth::clean_label;
 use crate::webauthn::{
@@ -179,19 +179,10 @@ pub enum WalletAuth<'a> {
     },
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 struct Secret {
     words: String,
     bip39_passphrase: Option<String>,
-}
-
-impl Drop for Secret {
-    fn drop(&mut self) {
-        self.words.zeroize();
-        if let Some(p) = self.bip39_passphrase.as_mut() {
-            p.zeroize();
-        }
-    }
 }
 
 /// The store's errors are sentences for the page
@@ -1329,5 +1320,19 @@ mod tests {
         )
         .unwrap();
         assert!(s.list().is_empty());
+    }
+
+    #[test]
+    fn wallet_secret_zeroizes_on_drop() {
+        fn assert_zeroize_on_drop<T: Zeroize + ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<Secret>();
+
+        let mut sec = Secret {
+            words: "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".into(),
+            bip39_passphrase: Some("my-bip39-pass".into()),
+        };
+        sec.zeroize();
+        assert!(sec.words.is_empty());
+        assert!(sec.bip39_passphrase.is_none());
     }
 }

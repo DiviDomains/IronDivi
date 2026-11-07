@@ -259,6 +259,7 @@ impl WalletDatabase {
 
     /// Load the mnemonic
     pub fn load_mnemonic(&self) -> Result<Option<String>, WalletError> {
+        use zeroize::Zeroize;
         let cf = self.db.cf_handle(CF_METADATA).unwrap();
         match self
             .db
@@ -266,8 +267,12 @@ impl WalletDatabase {
             .map_err(|e| self.storage_error(e))?
         {
             Some(data) => {
-                let mnemonic =
-                    String::from_utf8(data).map_err(|e| WalletError::Storage(e.to_string()))?;
+                let mnemonic = String::from_utf8(data).map_err(|e| {
+                    let msg = e.utf8_error().to_string();
+                    let mut raw = e.into_bytes();
+                    raw.zeroize();
+                    WalletError::Storage(msg)
+                })?;
                 Ok(Some(mnemonic))
             }
             None => Ok(None),
@@ -284,15 +289,19 @@ impl WalletDatabase {
 
     /// Load the BIP39 passphrase of an unencrypted wallet's seed
     pub fn load_mnemonic_passphrase(&self) -> Result<Option<String>, WalletError> {
+        use zeroize::Zeroize;
         let cf = self.db.cf_handle(CF_METADATA).unwrap();
         match self
             .db
             .get_cf(cf, KEY_MNEMONIC_PASSPHRASE)
             .map_err(|e| self.storage_error(e))?
         {
-            Some(data) => String::from_utf8(data)
-                .map(Some)
-                .map_err(|e| WalletError::Storage(e.to_string())),
+            Some(data) => String::from_utf8(data).map(Some).map_err(|e| {
+                let msg = e.utf8_error().to_string();
+                let mut raw = e.into_bytes();
+                raw.zeroize();
+                WalletError::Storage(msg)
+            }),
             None => Ok(None),
         }
     }

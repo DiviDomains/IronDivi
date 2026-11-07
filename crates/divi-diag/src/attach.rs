@@ -132,7 +132,7 @@ pub fn prepare(list: &[(PathBuf, Option<String>)], known: &mut Known) -> Prepare
         .into_iter()
         .map(|s| Secret {
             label: s.label.replace("an imported", "an attached"),
-            ..s
+            value: s.value.clone(),
         })
         .collect();
     p

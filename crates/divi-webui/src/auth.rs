@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 /// The password file in the data directory
 pub const AUTH_FILE: &str = "webui-auth.json";
@@ -87,7 +87,7 @@ impl From<&AdminPasskey> for AdminPasskeySummary {
 
 /// The stored password: its Argon2id hash with the salt and costs used, plus
 /// optional WebAuthn admin sign-in passkeys
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 struct PasswordRecord {
     version: u32,
     salt: String,
@@ -96,6 +96,7 @@ struct PasswordRecord {
     t: u32,
     p: u32,
     #[serde(default)]
+    #[zeroize(skip)]
     passkeys: Vec<AdminPasskey>,
 }
 
@@ -119,11 +120,17 @@ pub(crate) fn clean_label(label: &str, fallback: &str) -> Result<String, String>
     Ok(chosen.to_string())
 }
 
-fn argon2_hash(password: &str, salt: &[u8], m_kib: u32, t: u32, p: u32) -> Option<[u8; 32]> {
+fn argon2_hash(
+    password: &str,
+    salt: &[u8],
+    m_kib: u32,
+    t: u32,
+    p: u32,
+) -> Option<Zeroizing<[u8; 32]>> {
     let params = Params::new(m_kib, t, p, Some(32)).ok()?;
-    let mut out = [0u8; 32];
+    let mut out = Zeroizing::new([0u8; 32]);
     Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
-        .hash_password_into(password.as_bytes(), salt, &mut out)
+        .hash_password_into(password.as_bytes(), salt, &mut out[..])
         .ok()?;
     Some(out)
 }
@@ -137,9 +144,9 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 pub(crate) fn random_hex(bytes: usize) -> String {
-    let mut buf = vec![0u8; bytes];
+    let mut buf = Zeroizing::new(vec![0u8; bytes]);
     rand::rngs::OsRng.fill_bytes(&mut buf);
-    hex::encode(buf)
+    hex::encode(&*buf)
 }
 
 /// Write `content` to `path` readable by the owner alone, replacing it whole
@@ -271,8 +278,9 @@ impl AuthStore {
         else {
             return false;
         };
+        let expected = Zeroizing::new(expected);
         argon2_hash(password, &salt, record.m_kib, record.t, record.p)
-            .is_some_and(|h| constant_time_eq(&h, &expected))
+            .is_some_and(|h| constant_time_eq(&h[..], &expected))
     }
 
     /// Whether at least one admin passkey is enrolled
@@ -384,10 +392,12 @@ impl AuthStore {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Zeroize, ZeroizeOnDrop)]
 struct Session {
     csrf: String,
+    #[zeroize(skip)]
     created: Instant,
+    #[zeroize(skip)]
     last_seen: Instant,
 }
 
@@ -398,6 +408,7 @@ pub struct Sessions {
 }
 
 /// A new session's cookie value and CSRF token
+#[derive(Zeroize, ZeroizeOnDrop)]
 pub struct NewSession {
     pub cookie: String,
     pub csrf: String,
@@ -624,5 +635,21 @@ mod tests {
         assert!(limiter.wait(ip).is_some());
         limiter.succeeded(ip);
         assert!(limiter.wait(ip).is_none());
+    }
+
+    #[test]
+    fn auth_secret_types_zeroize_on_drop() {
+        fn assert_zeroize_on_drop<T: Zeroize + ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<PasswordRecord>();
+        assert_zeroize_on_drop::<Session>();
+        assert_zeroize_on_drop::<NewSession>();
+
+        let mut ns = NewSession {
+            cookie: "secret-cookie".into(),
+            csrf: "secret-csrf".into(),
+        };
+        ns.zeroize();
+        assert!(ns.cookie.is_empty());
+        assert!(ns.csrf.is_empty());
     }
 }
