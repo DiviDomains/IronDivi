@@ -66,6 +66,7 @@ pub mod error;
 pub mod lottery;
 pub mod pos_calculator;
 pub mod pos_generator;
+pub mod pq_block_sig;
 pub mod spork_values;
 pub mod stake_modifier;
 pub mod staking_data;
@@ -89,6 +90,15 @@ pub use pos_calculator::{
     ProofOfStakeCalculator, MAXIMUM_COIN_AGE_WEIGHT_FOR_STAKING, N_HASH_DRIFT,
 };
 pub use pos_generator::ProofOfStakeGenerator;
+pub use pq_block_sig::{
+    classify_block_sig_format, compute_pos_block_payload_hash, compute_pos_block_signing_prehash,
+    is_classical_coinstake_script, parse_pq_coinstake_script, serialize_pos_block_payload_preimage,
+    verify_block_sig_envelope_binding, BlockSigFormat, CoinstakeStakerBinding, PosBlockAuthPolicy,
+    PqBlockSigEnvelope, PqBlockSigError, VerifiedBlockSigBinding, CLASSICAL_COMPACT_BLOCK_SIG_LEN,
+    FN_DSA_512_BLOCK_SIG_ENVELOPE_LEN, ML_DSA_44_BLOCK_SIG_ENVELOPE_LEN, POS_BLOCK_PAYLOAD_DOMAIN,
+    POS_BLOCK_PAYLOAD_PREIMAGE_LEN, PQ_BLOCK_SIG_HEADER_LEN, PQ_BLOCK_SIG_MAGIC,
+    PQ_BLOCK_SIG_VERSION_V1,
+};
 pub use stake_modifier::{
     get_stake_modifier_selection_interval, get_stake_modifier_selection_interval_section,
     MockStakeModifierService, SimpleStakeModifierService, StakeModifierService, MODIFIER_INTERVAL,
