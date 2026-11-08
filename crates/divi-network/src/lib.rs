@@ -110,7 +110,12 @@ pub use peer_manager::{
 };
 pub use relay::{TxRelay, TxRelayEvent, TxRelayStats};
 pub use scoring::{BanEntry, Misbehavior, MisbehaviourOutcome, PeerScoring, PeerStats};
-pub use spork::{SporkManager, SporkSyncProgress, SporkSyncState};
+pub use spork::{
+    sign_hybrid_spork_lms, spork_pq_payload_hash, spork_pq_payload_hash_i64,
+    spork_pq_signing_prehash, SporkAuthKind, SporkAuthPolicy, SporkManager, SporkSigStatus,
+    SporkSyncProgress, SporkSyncState, SporkVerifyError, CLASSICAL_SPORK_SIG_LEN,
+    HYBRID_SPORK_SIG_LEN, PQ_LMS_SPORK_PUBKEY_LEN, PQ_LMS_SPORK_SIG_LEN, SPORK_PQ_PAYLOAD_DOMAIN,
+};
 pub use subnet::Subnet;
 pub use sync::{
     log_block_connect_failed, log_block_connected, BlockConnectedCallback, BlockSync,
