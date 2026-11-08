@@ -56,6 +56,16 @@ pub use standard::{
     is_multisig, is_null_data, is_p2pk, is_p2pkh, is_p2sh, Destination, ScriptType,
 };
 pub use vault::{
-    classify_staking_script_posture, get_vault_pubkey_hashes, is_staking_vault_script,
-    summarize_staking_posture, StakingQuantumPosture, StakingVaultScript,
+    classify_staking_quantum_posture, classify_staking_script_posture, compute_pq_tx_weight,
+    compute_witness_merkle_root, compute_wtxid, create_p2pqpkh_script,
+    create_pq_staking_vault_script, decode_pq_bech32m_address, encode_p2pqpkh_address,
+    encode_pq_bech32m_address, encode_pq_vault_address, get_pq_vault_pubkey_hashes,
+    get_vault_pubkey_hashes, is_p2pqpkh_script, is_pq_staking_vault_script,
+    is_staking_vault_script, pq_address_to_script_pubkey, script_pubkey_to_pq_address,
+    summarize_staking_posture, validate_pq_block_weight, validate_pq_witness_limits,
+    PqAddressError, PqAddressHrp, PqInputWitness, PqStakingVaultScript, PqTxWitness,
+    PqWitnessError, PqWitnessStack, StakingQuantumPosture, StakingVaultScript, BECH32M_CONST,
+    MAX_PQ_BLOCK_RAW_BYTES, MAX_PQ_BLOCK_WEIGHT, MAX_PQ_TX_WITNESS_BYTES, MAX_PQ_WITNESS_ITEM_SIZE,
+    MAX_PQ_WITNESS_STACK_ITEMS, P2PQPKH_SCRIPT_LEN, PQ_STAKING_VAULT_SCRIPT_LEN,
+    PQ_WITNESS_SCALE_FACTOR, PQ_WITNESS_VERSION_P2PQPKH, PQ_WITNESS_VERSION_VAULT,
 };
