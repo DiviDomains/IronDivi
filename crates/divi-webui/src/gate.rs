@@ -22,7 +22,7 @@ pub const MAX_FULL_UNLOCK_SECS: i64 = 600;
 fn reads(method: &str) -> bool {
     const PREFIXES: &[&str] = &["get", "list", "validate", "verify", "decode", "estimate"];
     PREFIXES.iter().any(|p| method.starts_with(p))
-        || matches!(method, "help" | "ping" | "encryptwallet")
+        || matches!(method, "help" | "ping" | "encryptwallet" | "planpqsweep")
 }
 
 /// Whether the call may go to the daemon, given the wallet's

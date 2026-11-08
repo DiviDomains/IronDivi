@@ -624,6 +624,16 @@ impl RpcServer {
         }
     }
 
+    /// Create an [`RpcServer`] backed by a temporary chain in `dir` and `wallet`.
+    pub fn new_regtest_with_wallet(dir: &std::path::Path, wallet: Arc<WalletDb>) -> Self {
+        use divi_storage::{ChainDatabase, ChainParams};
+        let chain_db =
+            Arc::new(ChainDatabase::open(dir.join("chain")).expect("open test chain db"));
+        let chain =
+            Arc::new(Chain::new(chain_db, ChainParams::default()).expect("init test chain"));
+        Self::with_wallet(chain, wallet)
+    }
+
     /// Create a new RPC server with peer manager
     pub fn with_peer_manager(chain: Arc<Chain>, peer_manager: Arc<PeerManager>) -> Self {
         RpcServer {
@@ -1516,6 +1526,8 @@ impl RpcServer {
             "loadwallet" => self.wallet.load_wallet(params),
             "getlotteryblockwinners" => self.blockchain.get_lottery_block_winners(params),
             "allocatefunds" => self.wallet.allocate_funds(params),
+            "getpqposture" => self.wallet.get_pq_posture(params),
+            "planpqsweep" => self.wallet.plan_pq_sweep(params),
 
             // Raw transaction methods
             "createrawtransaction" => self.wallet.create_raw_transaction(params),
@@ -1728,6 +1740,8 @@ impl RpcServer {
                 "addmultisigaddress" => "addmultisigaddress nrequired [\"key\",...] ( \"account\" )\n\nAdd a nrequired-to-sign multisignature address to the wallet.\nEach key is a DIVI address or hex-encoded public key.\nIf 'account' is specified, assign address to that account.\n\nArguments:\n1. nrequired      (numeric, required) The number of required signatures out of the n keys\n2. \"keys\"        (array, required) A json array of divi addresses or hex-encoded public keys\n     [\n       \"address\"  (string) divi address or hex-encoded public key\n       ...,\n     ]\n3. \"account\"     (string, optional) An account to assign the addresses to\n\nResult:\n\"diviaddress\"  (string) A divi address associated with the keys.",
                 "keypoolrefill" => "keypoolrefill ( newsize )\n\nFills the keypool.\n\nArguments:\n1. newsize  (numeric, optional, default=100) The new keypool size",
                 "getkeypoolsize" => "getkeypoolsize\n\nReturns the number of keys in the keypool.\n\nResult:\n  n    (numeric) The number of pre-generated but unused keys in the keypool",
+                "getpqposture" => "getpqposture\n\nReturns a deterministic post-quantum key-exposure report over the active wallet's unspent outputs.",
+                "planpqsweep" => "planpqsweep \"destination\" ( fee_per_kb_sat include_unexposed_p2pkh )\n\nPlan a deterministic, voluntary post-quantum or vault sweep over the active wallet's UTXOs without broadcasting or mutating wallet state.\n\nArguments:\n1. \"destination\"             (string or object, required) Bech32m P2PQPKH/PQ_STAKING_VAULT address, owner:vault pair, or destination spec object\n2. fee_per_kb_sat            (numeric, optional, default=10000) Fee rate in satoshis per 1,000 virtual bytes\n3. include_unexposed_p2pkh   (boolean, optional, default=true) Whether to include unexposed classical P2PKH outputs",
                 "decodescript" => "decodescript \"hexstring\"\n\nDecode a hex-encoded script.\n\nArguments:\n1. \"hexstring\"  (string) the hex encoded script\n\nResult:\n{\n  \"asm\":\"asm\",      (string) Script public key\n  \"hex\":\"hex\",      (string) hex encoded public key\n  \"type\":\"type\",    (string) The output type\n  \"reqSigs\": n,      (numeric) The required signatures\n  \"addresses\": [     (json array of string)\n     \"address\"       (string) divi address\n     ,...\n  ],\n  \"p2sh\":\"address\"   (string) address of P2SH script wrapping this redeem script\n}",
                 // Address index
                 "getaddressdeltas" => "getaddressdeltas <address>|<addresses> (only_vaults)\n\nReturns all changes for an address (requires addressindex to be enabled).\n\nArguments:\naddress: (string) The base58check encoded address\n\"addresses\": (optional JSON object) An object with fields:\n               (1) '\"addresses\"' (required) array of base58check encoded addresses\n               (2) '\"start\"' (optional field) integer block height to start at\n               (3) '\"end\"' (optional field) integer block height to stop at\n               (4) '\"chainInfo\"' (optional field) bool flag to include chain info\n\"only_vaults\" (boolean, optional) Only return utxos spendable by the specified addresses\n\nResult:\n[\n  {\n    \"satoshis\"  (number) The difference of satoshis\n    \"txid\"  (string) The related txid\n    \"index\"  (number) The related input or output index\n    \"height\"  (number) The block height\n    \"address\"  (string) The base58check encoded address\n  }\n]\n\nExamples:\n> divi-cli getaddressdeltas '{\"addresses\": [\"12c6DSiU4Rq3P4ZxziKxzrL5LmMBrzjrJX\"]}'\n> curl --user myusername --data-binary '{\"jsonrpc\": \"1.0\", \"id\":\"curltest\", \"method\": \"getaddressdeltas\", \"params\": [{\"addresses\": [\"12c6DSiU4Rq3P4ZxziKxzrL5LmMBrzjrJX\"]}] }' -H 'content-type: text/plain;' http://127.0.0.1:51473/",
@@ -1872,6 +1886,7 @@ impl RpcServer {
                 "getimmaturebalance",
                 "getlotteryblockwinners",
                 "getnewaddress",
+                "getpqposture",
                 "getrawchangeaddress",
                 "getreceivedbyaccount",
                 "getreceivedbyaddress",
@@ -1889,6 +1904,7 @@ impl RpcServer {
                 "listtransactions",
                 "listunspent",
                 "loadwallet",
+                "planpqsweep",
                 "rescanblockchain",
                 "sendfrom",
                 "sendmany",
@@ -2062,6 +2078,7 @@ const WALLET_CALLS: &[&str] = &[
     "getbalance",
     "getcoinavailability",
     "getnewaddress",
+    "getpqposture",
     "getrawchangeaddress",
     "getreceivedbyaccount",
     "getreceivedbyaddress",
@@ -2081,6 +2098,7 @@ const WALLET_CALLS: &[&str] = &[
     "listunspent",
     "loadwallet",
     "lockunspent",
+    "planpqsweep",
     "reclaimvaultfunds",
     "removevault",
     "sendfrom",

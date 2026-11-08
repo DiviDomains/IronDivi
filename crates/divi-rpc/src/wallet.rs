@@ -5298,6 +5298,704 @@ impl WalletRpc {
     pub fn list_received_by_account(&self, params: &Params) -> Result<serde_json::Value, Error> {
         self.list_received(params, true)
     }
+
+    /// Classify all unspent outputs in `wallet` as [`divi_wallet::pq_sweep::TrackableWalletUtxo`]
+    /// entries in deterministic `(txid, vout)` order for `getpqposture` and `planpqsweep`.
+    fn collect_trackable_utxos(
+        &self,
+        wallet: &WalletDb,
+    ) -> Vec<divi_wallet::pq_sweep::TrackableWalletUtxo> {
+        use divi_wallet::pq_sweep::TrackableWalletUtxo;
+
+        let height = self.current_height();
+        let maturity = wallet.coinbase_maturity();
+        let mut utxos = wallet.get_utxos();
+        utxos.sort_by_key(|u| (u.txid.to_string(), u.vout));
+
+        let unspent_outpoints: HashSet<OutPoint> = utxos.iter().map(|u| u.outpoint()).collect();
+        let mut spend_counts: std::collections::HashMap<String, u32> =
+            std::collections::HashMap::new();
+        let mut staked_addresses: HashSet<String> = HashSet::new();
+
+        for received in wallet.received_outputs() {
+            if !received.address.is_empty() {
+                if !unspent_outpoints.contains(&received.outpoint()) {
+                    let entry = spend_counts.entry(received.address.clone()).or_insert(0);
+                    *entry = entry.saturating_add(1);
+                }
+                if received.is_coinstake
+                    && !divi_script::is_staking_vault_script(&received.script_pubkey)
+                    && divi_script::is_pq_staking_vault_script(&received.script_pubkey).is_none()
+                    && divi_script::is_p2pqpkh_script(&received.script_pubkey).is_none()
+                {
+                    staked_addresses.insert(received.address);
+                }
+            }
+        }
+
+        let is_collateral_value = |sat: i64| {
+            matches!(
+                sat,
+                10_000_000_000_000
+                    | 30_000_000_000_000
+                    | 100_000_000_000_000
+                    | 300_000_000_000_000
+                    | 1_000_000_000_000_000
+            )
+        };
+
+        utxos
+            .iter()
+            .map(|u| {
+                let spend_count = spend_counts.get(&u.address).copied().unwrap_or(0);
+                let has_staked = staked_addresses.contains(&u.address);
+                let is_mn_account = Address::from_base58(&u.address)
+                    .ok()
+                    .filter(|a| wallet.in_address_book(a))
+                    .is_some_and(|a| {
+                        let acct = wallet.get_account(&a);
+                        acct.starts_with("alloc->") || acct.starts_with("reserved->")
+                    });
+                let is_legacy_mn = is_mn_account
+                    || (wallet.is_coin_locked(&u.outpoint())
+                        && is_collateral_value(u.value.as_sat())
+                        && !divi_script::is_staking_vault_script(&u.script_pubkey)
+                        && divi_script::is_pq_staking_vault_script(&u.script_pubkey).is_none()
+                        && divi_script::is_p2pqpkh_script(&u.script_pubkey).is_none());
+                TrackableWalletUtxo::from_wallet_utxo(
+                    u,
+                    height,
+                    maturity,
+                    spend_count,
+                    has_staked,
+                    is_legacy_mn,
+                )
+            })
+            .collect()
+    }
+
+    /// getpqposture - Return a deterministic post-quantum key-exposure report over the active wallet's UTXOs.
+    pub fn get_pq_posture(&self, params: &Params) -> Result<serde_json::Value, Error> {
+        use divi_wallet::pq_sweep::QuantumExposureReason;
+
+        if !params.is_empty() {
+            return Err(RpcError::invalid_params("getpqposture takes no arguments").into());
+        }
+
+        let wallet = self.get_wallet()?;
+        let trackable = self.collect_trackable_utxos(&wallet);
+
+        let mut total_utxos = 0usize;
+        let mut total_value_sat = 0i64;
+        let mut exposed_utxos = 0usize;
+        let mut exposed_value_sat = 0i64;
+        let mut unexposed_p2pkh_utxos = 0usize;
+        let mut unexposed_p2pkh_value_sat = 0i64;
+        let mut classical_vault_utxos = 0usize;
+        let mut classical_vault_value_sat = 0i64;
+        let mut pq_native_utxos = 0usize;
+        let mut pq_native_value_sat = 0i64;
+
+        let mut p2pk_utxos = 0usize;
+        let mut p2pk_value_sat = 0i64;
+        let mut pos_staker_utxos = 0usize;
+        let mut pos_staker_value_sat = 0i64;
+        let mut legacy_mn_utxos = 0usize;
+        let mut legacy_mn_value_sat = 0i64;
+        let mut reused_p2pkh_utxos = 0usize;
+        let mut reused_p2pkh_value_sat = 0i64;
+
+        let mut utxo_entries = Vec::with_capacity(trackable.len());
+
+        for u in &trackable {
+            let sat = u.value.as_sat();
+            let reason = u.classify_exposure();
+            total_utxos += 1;
+            total_value_sat = total_value_sat.saturating_add(sat);
+
+            if reason.is_shor_exposed_immediately() {
+                exposed_utxos += 1;
+                exposed_value_sat = exposed_value_sat.saturating_add(sat);
+            }
+
+            match reason {
+                QuantumExposureReason::DirectPubKeyExposedP2PK => {
+                    p2pk_utxos += 1;
+                    p2pk_value_sat = p2pk_value_sat.saturating_add(sat);
+                }
+                QuantumExposureReason::DirectPubKeyExposedPosStaker => {
+                    pos_staker_utxos += 1;
+                    pos_staker_value_sat = pos_staker_value_sat.saturating_add(sat);
+                }
+                QuantumExposureReason::LegacyMasternodeCollateral => {
+                    legacy_mn_utxos += 1;
+                    legacy_mn_value_sat = legacy_mn_value_sat.saturating_add(sat);
+                }
+                QuantumExposureReason::ReusedAddressP2PKH => {
+                    reused_p2pkh_utxos += 1;
+                    reused_p2pkh_value_sat = reused_p2pkh_value_sat.saturating_add(sat);
+                }
+                QuantumExposureReason::UnexposedClassicalP2PKH => {
+                    unexposed_p2pkh_utxos += 1;
+                    unexposed_p2pkh_value_sat = unexposed_p2pkh_value_sat.saturating_add(sat);
+                }
+                QuantumExposureReason::ClassicalVaultInsulated => {
+                    classical_vault_utxos += 1;
+                    classical_vault_value_sat = classical_vault_value_sat.saturating_add(sat);
+                }
+                QuantumExposureReason::PostQuantumNative => {
+                    pq_native_utxos += 1;
+                    pq_native_value_sat = pq_native_value_sat.saturating_add(sat);
+                }
+            }
+
+            utxo_entries.push(serde_json::json!({
+                "txid": u.txid.to_string(),
+                "vout": u.vout,
+                "address": u.address,
+                "value_sat": sat,
+                "is_mature": u.is_mature,
+                "address_spend_count": u.address_spend_count,
+                "has_staked_pos_block": u.has_staked_pos_block,
+                "is_legacy_masternode_collateral": u.is_legacy_masternode_collateral,
+                "category": pq_exposure_category_label(reason),
+                "shor_exposed_immediately": reason.is_shor_exposed_immediately(),
+            }));
+        }
+
+        let quantum_ready = exposed_utxos == 0 && unexposed_p2pkh_utxos == 0;
+        let staking_posture =
+            divi_script::summarize_staking_posture(trackable.iter().map(|u| &u.script_pubkey));
+
+        Ok(serde_json::json!({
+            "total_utxos": total_utxos,
+            "total_value_sat": total_value_sat,
+            "exposed_utxos": exposed_utxos,
+            "exposed_value_sat": exposed_value_sat,
+            "unexposed_p2pkh_utxos": unexposed_p2pkh_utxos,
+            "unexposed_p2pkh_value_sat": unexposed_p2pkh_value_sat,
+            "classical_vault_utxos": classical_vault_utxos,
+            "classical_vault_value_sat": classical_vault_value_sat,
+            "pq_native_utxos": pq_native_utxos,
+            "pq_native_value_sat": pq_native_value_sat,
+            "quantum_ready": quantum_ready,
+            "staking_posture": staking_posture,
+            "categories": {
+                "direct_pubkey_exposed_p2pk": {
+                    "utxos": p2pk_utxos,
+                    "value_sat": p2pk_value_sat,
+                },
+                "direct_pubkey_exposed_pos_staker": {
+                    "utxos": pos_staker_utxos,
+                    "value_sat": pos_staker_value_sat,
+                },
+                "legacy_masternode_collateral": {
+                    "utxos": legacy_mn_utxos,
+                    "value_sat": legacy_mn_value_sat,
+                },
+                "reused_address_p2pkh": {
+                    "utxos": reused_p2pkh_utxos,
+                    "value_sat": reused_p2pkh_value_sat,
+                },
+                "unexposed_classical_p2pkh": {
+                    "utxos": unexposed_p2pkh_utxos,
+                    "value_sat": unexposed_p2pkh_value_sat,
+                },
+                "classical_vault_insulated": {
+                    "utxos": classical_vault_utxos,
+                    "value_sat": classical_vault_value_sat,
+                },
+                "post_quantum_native": {
+                    "utxos": pq_native_utxos,
+                    "value_sat": pq_native_value_sat,
+                },
+            },
+            "utxos": utxo_entries,
+        }))
+    }
+
+    /// planpqsweep - Plan a deterministic voluntary post-quantum / vault sweep without broadcasting or mutating wallet state.
+    pub fn plan_pq_sweep(&self, params: &Params) -> Result<serde_json::Value, Error> {
+        use divi_wallet::pq_sweep::{
+            plan_voluntary_pq_sweep, PqSweepError, PqSweepPlanConfig, DEFAULT_SWEEP_FEE_PER_KB_SAT,
+        };
+
+        if params.is_empty() || params.len() > 3 {
+            return Err(RpcError::invalid_params(
+                "planpqsweep \"destination\" ( fee_per_kb_sat include_unexposed_p2pkh )",
+            )
+            .into());
+        }
+
+        let wallet = self.get_wallet()?;
+        let dest_val = params
+            .get(0)
+            .ok_or_else(|| RpcError::invalid_params("destination required"))?;
+
+        let (primary_destination, sub_threshold_policy, include_classical_vaults) =
+            self.parse_pq_sweep_destination(dest_val)?;
+
+        let fee_per_kb_sat = match params.get(1) {
+            None | Some(serde_json::Value::Null) => DEFAULT_SWEEP_FEE_PER_KB_SAT,
+            Some(serde_json::Value::Number(n)) => {
+                n.as_u64().filter(|&v| v > 0).ok_or_else(|| {
+                    RpcError::new(
+                        codes::INVALID_PARAMETER,
+                        "fee_per_kb_sat must be a positive integer",
+                    )
+                })?
+            }
+            Some(_) => {
+                return Err(RpcError::new(
+                    codes::TYPE_ERROR,
+                    "fee_per_kb_sat must be a positive integer",
+                )
+                .into())
+            }
+        };
+
+        let include_unexposed_classical = match params.get(2) {
+            None | Some(serde_json::Value::Null) => true,
+            Some(serde_json::Value::Bool(b)) => *b,
+            Some(_) => {
+                return Err(RpcError::new(
+                    codes::TYPE_ERROR,
+                    "include_unexposed_p2pkh must be a boolean",
+                )
+                .into())
+            }
+        };
+
+        let mut config = match primary_destination {
+            divi_wallet::pq_sweep::PqSweepDestination::PqStakingVault {
+                owner_key_hash32,
+                vault_key_hash32,
+            } => PqSweepPlanConfig::new_pq_vault(
+                owner_key_hash32,
+                vault_key_hash32,
+                sub_threshold_policy,
+            ),
+            divi_wallet::pq_sweep::PqSweepDestination::PqSingleKey { addr_key_hash32 } => {
+                PqSweepPlanConfig::new_pq_single_key(addr_key_hash32)
+            }
+            divi_wallet::pq_sweep::PqSweepDestination::ClassicalStakingVault { .. } => {
+                let mut cfg =
+                    PqSweepPlanConfig::new_pq_vault([1u8; 32], [2u8; 32], sub_threshold_policy);
+                cfg.primary_destination = primary_destination;
+                cfg
+            }
+        };
+        config.fee_per_kb_sat = fee_per_kb_sat;
+        config.include_unexposed_classical = include_unexposed_classical;
+        config.include_classical_vaults = include_classical_vaults;
+
+        let trackable = self.collect_trackable_utxos(&wallet);
+        let plan = plan_voluntary_pq_sweep(&trackable, &config).map_err(|e| match e {
+            PqSweepError::InvalidConfiguration(msg) => {
+                RpcError::new(codes::INVALID_PARAMETER, msg.to_string())
+            }
+            PqSweepError::DegenerateVaultKeys => {
+                RpcError::new(codes::INVALID_PARAMETER, e.to_string())
+            }
+            PqSweepError::NoEligibleUtxosToSweep
+            | PqSweepError::BelowMinimumVaultThreshold { .. }
+            | PqSweepError::InsufficientValueForFee { .. } => {
+                RpcError::new(codes::WALLET_INSUFFICIENT_FUNDS, e.to_string())
+            }
+        })?;
+
+        let batches: Vec<serde_json::Value> = plan
+            .batches
+            .iter()
+            .map(|b| {
+                let raw_tx_hex = hex::encode(serialize(&b.unsigned_tx));
+                serde_json::json!({
+                    "batch_index": b.batch_index,
+                    "txid": b.unsigned_tx.txid().to_string(),
+                    "raw_tx_hex": raw_tx_hex,
+                    "input_count": b.inputs.len(),
+                    "input_total_sat": b.input_total_sat,
+                    "output_total_sat": b.output_total_sat,
+                    "fee_sat": b.fee_sat,
+                    "estimated_base_bytes": b.estimated_base_bytes,
+                    "estimated_witness_bytes": b.estimated_witness_bytes,
+                    "estimated_weight": b.estimated_weight,
+                    "vault_output_count": b.vault_output_count,
+                    "p2pqpkh_output_count": b.p2pqpkh_output_count,
+                    "inputs": b.inputs.iter().map(|u| {
+                        let reason = u.classify_exposure();
+                        serde_json::json!({
+                            "txid": u.txid.to_string(),
+                            "vout": u.vout,
+                            "address": u.address,
+                            "value_sat": u.value.as_sat(),
+                            "category": pq_exposure_category_label(reason),
+                            "shor_exposed_immediately": reason.is_shor_exposed_immediately(),
+                        })
+                    }).collect::<Vec<_>>(),
+                    "outputs": b.unsigned_tx.vout.iter().enumerate().map(|(vout, o)| {
+                        serde_json::json!({
+                            "vout": vout,
+                            "value_sat": o.value.as_sat(),
+                            "script_pubkey": o.script_pubkey.to_hex(),
+                        })
+                    }).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+
+        let skipped_utxos: Vec<serde_json::Value> = plan
+            .skipped_utxos
+            .iter()
+            .map(|u| {
+                serde_json::json!({
+                    "txid": u.txid.to_string(),
+                    "vout": u.vout,
+                    "address": u.address,
+                    "value_sat": u.value.as_sat(),
+                    "is_mature": u.is_mature,
+                    "category": pq_exposure_category_label(u.classify_exposure()),
+                })
+            })
+            .collect();
+
+        Ok(serde_json::json!({
+            "swept_input_count": plan.swept_input_count,
+            "exposed_input_count": plan.exposed_input_count,
+            "skipped_utxo_count": plan.skipped_utxos.len(),
+            "total_input_value_sat": plan.total_input_value_sat,
+            "insulated_output_value_sat": plan.insulated_output_value_sat,
+            "total_fee_sat": plan.total_fee_sat,
+            "pre_sweep_posture": plan.pre_sweep_posture,
+            "post_sweep_posture": plan.post_sweep_posture,
+            "batches": batches,
+            "skipped_utxos": skipped_utxos,
+        }))
+    }
+
+    fn parse_pq_sweep_destination(
+        &self,
+        dest_val: &serde_json::Value,
+    ) -> Result<
+        (
+            divi_wallet::pq_sweep::PqSweepDestination,
+            divi_wallet::pq_sweep::SubThresholdVaultPolicy,
+            bool,
+        ),
+        Error,
+    > {
+        use divi_wallet::pq_sweep::{PqSweepDestination, SubThresholdVaultPolicy};
+
+        let parse_hash32_or_pq_addr = |s: &str| -> Option<[u8; 32]> {
+            if s.len() == 64 {
+                if let Ok(bytes) = hex::decode(s) {
+                    if let Ok(arr) = <[u8; 32]>::try_from(bytes.as_slice()) {
+                        return Some(arr);
+                    }
+                }
+            }
+            if let Ok((_hrp, witness_version, program)) = divi_script::decode_pq_bech32m_address(s)
+            {
+                if witness_version == divi_script::PQ_WITNESS_VERSION_P2PQPKH && program.len() == 32
+                {
+                    if let Ok(arr) = <[u8; 32]>::try_from(program.as_slice()) {
+                        return Some(arr);
+                    }
+                }
+            }
+            None
+        };
+
+        let parse_hash20_or_p2pkh = |s: &str| -> Option<[u8; 20]> {
+            if s.len() == 40 {
+                if let Ok(bytes) = hex::decode(s) {
+                    if let Ok(arr) = <[u8; 20]>::try_from(bytes.as_slice()) {
+                        return Some(arr);
+                    }
+                }
+            }
+            if let Ok(addr) = self.decode_address(s) {
+                if addr.addr_type == divi_wallet::address::AddressType::P2PKH {
+                    return Some(*addr.hash.as_bytes());
+                }
+            }
+            None
+        };
+
+        match dest_val {
+            serde_json::Value::String(s) => {
+                let s = s.trim();
+                if s.is_empty() {
+                    return Err(RpcError::new(
+                        codes::INVALID_ADDRESS_OR_KEY,
+                        "Destination address or specification must not be empty",
+                    )
+                    .into());
+                }
+                if let Some((owner_str, vault_str)) = s.split_once(':') {
+                    if owner_str.is_empty() || vault_str.is_empty() || vault_str.contains(':') {
+                        return Err(RpcError::new(
+                            codes::INVALID_ADDRESS_OR_KEY,
+                            "Invalid owner:vault destination specification",
+                        )
+                        .into());
+                    }
+                    if let (Some(owner_key_hash32), Some(vault_key_hash32)) = (
+                        parse_hash32_or_pq_addr(owner_str),
+                        parse_hash32_or_pq_addr(vault_str),
+                    ) {
+                        let dest = PqSweepDestination::PqStakingVault {
+                            owner_key_hash32,
+                            vault_key_hash32,
+                        };
+                        dest.validate_non_degenerate()
+                            .map_err(|e| RpcError::new(codes::INVALID_PARAMETER, e.to_string()))?;
+                        return Ok((
+                            dest,
+                            SubThresholdVaultPolicy::FallbackToPqSingleKey {
+                                fallback_addr_key_hash32: owner_key_hash32,
+                            },
+                            true,
+                        ));
+                    }
+                    if let (Some(owner_pubkey_hash20), Some(vault_pubkey_hash20)) = (
+                        parse_hash20_or_p2pkh(owner_str),
+                        parse_hash20_or_p2pkh(vault_str),
+                    ) {
+                        let dest = PqSweepDestination::ClassicalStakingVault {
+                            owner_pubkey_hash20,
+                            vault_pubkey_hash20,
+                        };
+                        dest.validate_non_degenerate()
+                            .map_err(|e| RpcError::new(codes::INVALID_PARAMETER, e.to_string()))?;
+                        return Ok((dest, SubThresholdVaultPolicy::RejectBelowMinimum, false));
+                    }
+                    return Err(RpcError::new(
+                        codes::INVALID_ADDRESS_OR_KEY,
+                        "Invalid owner:vault destination pair",
+                    )
+                    .into());
+                }
+
+                let (_hrp, witness_version, program) = divi_script::decode_pq_bech32m_address(s)
+                    .map_err(|e| {
+                        RpcError::new(
+                            codes::INVALID_ADDRESS_OR_KEY,
+                            format!("Invalid Bech32m post-quantum destination address: {e}"),
+                        )
+                    })?;
+
+                match (witness_version, program.as_slice()) {
+                    (divi_script::PQ_WITNESS_VERSION_P2PQPKH, prog) if prog.len() == 32 => {
+                        let mut addr_key_hash32 = [0u8; 32];
+                        addr_key_hash32.copy_from_slice(prog);
+                        Ok((
+                            PqSweepDestination::PqSingleKey { addr_key_hash32 },
+                            SubThresholdVaultPolicy::FallbackToPqSingleKey {
+                                fallback_addr_key_hash32: addr_key_hash32,
+                            },
+                            false,
+                        ))
+                    }
+                    (divi_script::PQ_WITNESS_VERSION_VAULT, prog) if prog.len() == 64 => {
+                        let mut owner_key_hash32 = [0u8; 32];
+                        let mut vault_key_hash32 = [0u8; 32];
+                        owner_key_hash32.copy_from_slice(&prog[0..32]);
+                        vault_key_hash32.copy_from_slice(&prog[32..64]);
+                        let dest = PqSweepDestination::PqStakingVault {
+                            owner_key_hash32,
+                            vault_key_hash32,
+                        };
+                        dest.validate_non_degenerate()
+                            .map_err(|e| RpcError::new(codes::INVALID_PARAMETER, e.to_string()))?;
+                        Ok((
+                            dest,
+                            SubThresholdVaultPolicy::FallbackToPqSingleKey {
+                                fallback_addr_key_hash32: owner_key_hash32,
+                            },
+                            true,
+                        ))
+                    }
+                    _ => Err(RpcError::new(
+                        codes::INVALID_ADDRESS_OR_KEY,
+                        "Unsupported Bech32m witness version or program length",
+                    )
+                    .into()),
+                }
+            }
+            serde_json::Value::Object(obj) => {
+                let dest_type = obj.get("type").and_then(|v| v.as_str()).ok_or_else(|| {
+                    RpcError::new(
+                        codes::INVALID_PARAMETER,
+                        "Destination object requires a string 'type' field",
+                    )
+                })?;
+
+                match dest_type {
+                    "pq_vault" | "pq_staking_vault" => {
+                        let owner_str = obj
+                            .get("owner_hash32")
+                            .and_then(|v| v.as_str())
+                            .ok_or_else(|| {
+                                RpcError::new(
+                                    codes::INVALID_PARAMETER,
+                                    "pq_vault destination requires 'owner_hash32'",
+                                )
+                            })?;
+                        let vault_str = obj
+                            .get("vault_hash32")
+                            .and_then(|v| v.as_str())
+                            .ok_or_else(|| {
+                                RpcError::new(
+                                    codes::INVALID_PARAMETER,
+                                    "pq_vault destination requires 'vault_hash32'",
+                                )
+                            })?;
+                        let owner_key_hash32 =
+                            parse_hash32_or_pq_addr(owner_str).ok_or_else(|| {
+                                RpcError::new(
+                                    codes::INVALID_ADDRESS_OR_KEY,
+                                    "Invalid owner_hash32 (expected 64-char hex or Bech32m P2PQPKH address)",
+                                )
+                            })?;
+                        let vault_key_hash32 =
+                            parse_hash32_or_pq_addr(vault_str).ok_or_else(|| {
+                                RpcError::new(
+                                    codes::INVALID_ADDRESS_OR_KEY,
+                                    "Invalid vault_hash32 (expected 64-char hex or Bech32m P2PQPKH address)",
+                                )
+                            })?;
+                        let dest = PqSweepDestination::PqStakingVault {
+                            owner_key_hash32,
+                            vault_key_hash32,
+                        };
+                        dest.validate_non_degenerate()
+                            .map_err(|e| RpcError::new(codes::INVALID_PARAMETER, e.to_string()))?;
+
+                        let reject_below_min = obj
+                            .get("reject_below_minimum")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        let policy = if reject_below_min {
+                            SubThresholdVaultPolicy::RejectBelowMinimum
+                        } else if let Some(fb_str) =
+                            obj.get("fallback_addr_key_hash32").and_then(|v| v.as_str())
+                        {
+                            let fb = parse_hash32_or_pq_addr(fb_str).ok_or_else(|| {
+                                RpcError::new(
+                                    codes::INVALID_ADDRESS_OR_KEY,
+                                    "Invalid fallback_addr_key_hash32",
+                                )
+                            })?;
+                            SubThresholdVaultPolicy::FallbackToPqSingleKey {
+                                fallback_addr_key_hash32: fb,
+                            }
+                        } else {
+                            SubThresholdVaultPolicy::FallbackToPqSingleKey {
+                                fallback_addr_key_hash32: owner_key_hash32,
+                            }
+                        };
+                        let include_classical_vaults = obj
+                            .get("include_classical_vaults")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(true);
+                        Ok((dest, policy, include_classical_vaults))
+                    }
+                    "pq_single_key" | "p2pqpkh" => {
+                        let hash_str = obj
+                            .get("addr_key_hash32")
+                            .and_then(|v| v.as_str())
+                            .ok_or_else(|| {
+                                RpcError::new(
+                                    codes::INVALID_PARAMETER,
+                                    "pq_single_key destination requires 'addr_key_hash32'",
+                                )
+                            })?;
+                        let addr_key_hash32 =
+                            parse_hash32_or_pq_addr(hash_str).ok_or_else(|| {
+                                RpcError::new(
+                                    codes::INVALID_ADDRESS_OR_KEY,
+                                    "Invalid addr_key_hash32 (expected 64-char hex or Bech32m P2PQPKH address)",
+                                )
+                            })?;
+                        Ok((
+                            PqSweepDestination::PqSingleKey { addr_key_hash32 },
+                            SubThresholdVaultPolicy::FallbackToPqSingleKey {
+                                fallback_addr_key_hash32: addr_key_hash32,
+                            },
+                            false,
+                        ))
+                    }
+                    "classical_vault" | "staking_vault" => {
+                        let owner_str = obj
+                            .get("owner_hash20")
+                            .and_then(|v| v.as_str())
+                            .ok_or_else(|| {
+                                RpcError::new(
+                                    codes::INVALID_PARAMETER,
+                                    "classical_vault destination requires 'owner_hash20'",
+                                )
+                            })?;
+                        let vault_str = obj
+                            .get("vault_hash20")
+                            .and_then(|v| v.as_str())
+                            .ok_or_else(|| {
+                                RpcError::new(
+                                    codes::INVALID_PARAMETER,
+                                    "classical_vault destination requires 'vault_hash20'",
+                                )
+                            })?;
+                        let owner_pubkey_hash20 =
+                            parse_hash20_or_p2pkh(owner_str).ok_or_else(|| {
+                                RpcError::new(
+                                    codes::INVALID_ADDRESS_OR_KEY,
+                                    "Invalid owner_hash20 (expected 40-char hex or Base58 P2PKH address)",
+                                )
+                            })?;
+                        let vault_pubkey_hash20 =
+                            parse_hash20_or_p2pkh(vault_str).ok_or_else(|| {
+                                RpcError::new(
+                                    codes::INVALID_ADDRESS_OR_KEY,
+                                    "Invalid vault_hash20 (expected 40-char hex or Base58 P2PKH address)",
+                                )
+                            })?;
+                        let dest = PqSweepDestination::ClassicalStakingVault {
+                            owner_pubkey_hash20,
+                            vault_pubkey_hash20,
+                        };
+                        dest.validate_non_degenerate()
+                            .map_err(|e| RpcError::new(codes::INVALID_PARAMETER, e.to_string()))?;
+                        Ok((dest, SubThresholdVaultPolicy::RejectBelowMinimum, false))
+                    }
+                    other => Err(RpcError::new(
+                        codes::INVALID_PARAMETER,
+                        format!("Unsupported sweep destination type: {other}"),
+                    )
+                    .into()),
+                }
+            }
+            _ => Err(RpcError::new(
+                codes::TYPE_ERROR,
+                "Destination must be an address string or specification object",
+            )
+            .into()),
+        }
+    }
+}
+
+fn pq_exposure_category_label(
+    reason: divi_wallet::pq_sweep::QuantumExposureReason,
+) -> &'static str {
+    use divi_wallet::pq_sweep::QuantumExposureReason;
+    match reason {
+        QuantumExposureReason::DirectPubKeyExposedP2PK => "direct_pubkey_exposed_p2pk",
+        QuantumExposureReason::DirectPubKeyExposedPosStaker => "direct_pubkey_exposed_pos_staker",
+        QuantumExposureReason::LegacyMasternodeCollateral => "legacy_masternode_collateral",
+        QuantumExposureReason::ReusedAddressP2PKH => "reused_address_p2pkh",
+        QuantumExposureReason::UnexposedClassicalP2PKH => "unexposed_classical_p2pkh",
+        QuantumExposureReason::ClassicalVaultInsulated => "classical_vault_insulated",
+        QuantumExposureReason::PostQuantumNative => "post_quantum_native",
+    }
 }
 
 impl Default for WalletRpc {
@@ -7589,5 +8287,314 @@ mod allocate_funds {
         let dest = Address::from_base58(account.as_str().unwrap()).unwrap();
         assert_eq!(tx.vout[vout].script_pubkey, dest.script_pubkey());
         assert_eq!(reply.as_object().unwrap().len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod pq_posture_and_sweep {
+    use super::*;
+    use divi_primitives::ChainMode;
+    use divi_script::{
+        create_p2pqpkh_script, create_pq_staking_vault_script, encode_pq_bech32m_address,
+        PqAddressHrp, PQ_WITNESS_VERSION_P2PQPKH,
+    };
+    use divi_wallet::HdWallet;
+
+    fn p(values: &[serde_json::Value]) -> Params {
+        Params::Array(values.to_vec())
+    }
+
+    fn err_code(result: Result<serde_json::Value, Error>) -> i32 {
+        match result {
+            Err(Error::Rpc(r)) => r.code,
+            other => panic!("expected an RPC error, got {:?}", other),
+        }
+    }
+
+    fn mixed_wallet_rpc() -> (WalletRpc, Arc<WalletDb>) {
+        let db = Arc::new(WalletDb::with_hd_wallet(
+            Network::Testnet,
+            HdWallet::new(ChainMode::Divi).unwrap(),
+        ));
+        let reused_addr = db.new_receiving_address().unwrap();
+        let unexposed_addr = db.new_receiving_address().unwrap();
+        let staker_addr = db.new_receiving_address().unwrap();
+
+        // 1. Spent UTXO on `reused_addr` so remaining UTXO on `reused_addr` is ReusedAddressP2PKH
+        let spent_op = OutPoint::new(Hash256::from_bytes([1; 32]), 0);
+        db.add_utxo(divi_wallet::WalletUtxo {
+            txid: spent_op.txid,
+            vout: spent_op.vout,
+            value: Amount::from_divi(100),
+            script_pubkey: Script::new_p2pkh(reused_addr.hash.as_bytes()),
+            height: Some(10),
+            is_coinbase: false,
+            is_coinstake: false,
+            address: reused_addr.to_string(),
+        });
+        db.spend_utxo_at_height(&spent_op, Some(20));
+
+        // 2. Unspent UTXO on `reused_addr` (5,000 DIVI) -> exposed (reused_address_p2pkh)
+        db.add_utxo(divi_wallet::WalletUtxo {
+            txid: Hash256::from_bytes([2; 32]),
+            vout: 0,
+            value: Amount::from_divi(5_000),
+            script_pubkey: Script::new_p2pkh(reused_addr.hash.as_bytes()),
+            height: Some(30),
+            is_coinbase: false,
+            is_coinstake: false,
+            address: reused_addr.to_string(),
+        });
+
+        // 3. Coinstake P2PKH UTXO on `staker_addr` (10,000 DIVI) -> exposed (direct_pubkey_exposed_pos_staker)
+        db.add_utxo(divi_wallet::WalletUtxo {
+            txid: Hash256::from_bytes([3; 32]),
+            vout: 1,
+            value: Amount::from_divi(10_000),
+            script_pubkey: Script::new_p2pkh(staker_addr.hash.as_bytes()),
+            height: Some(40),
+            is_coinbase: false,
+            is_coinstake: true,
+            address: staker_addr.to_string(),
+        });
+
+        // 4. Unexposed P2PKH UTXO on `unexposed_addr` (2,000 DIVI) -> unexposed_classical_p2pkh
+        db.add_utxo(divi_wallet::WalletUtxo {
+            txid: Hash256::from_bytes([4; 32]),
+            vout: 0,
+            value: Amount::from_divi(2_000),
+            script_pubkey: Script::new_p2pkh(unexposed_addr.hash.as_bytes()),
+            height: Some(50),
+            is_coinbase: false,
+            is_coinstake: false,
+            address: unexposed_addr.to_string(),
+        });
+
+        // 5. Classical vault UTXO (15,000 DIVI) -> classical_vault_insulated
+        db.add_utxo(divi_wallet::WalletUtxo {
+            txid: Hash256::from_bytes([5; 32]),
+            vout: 0,
+            value: Amount::from_divi(15_000),
+            script_pubkey: StakingVaultScript::new([0x11; 20], [0x22; 20]).to_script(),
+            height: Some(60),
+            is_coinbase: false,
+            is_coinstake: false,
+            address: String::new(),
+        });
+
+        // 6. Post-quantum native P2PQPKH UTXO (3,000 DIVI) -> post_quantum_native
+        db.add_utxo(divi_wallet::WalletUtxo {
+            txid: Hash256::from_bytes([6; 32]),
+            vout: 0,
+            value: Amount::from_divi(3_000),
+            script_pubkey: create_p2pqpkh_script(&[0x33; 32]),
+            height: Some(70),
+            is_coinbase: false,
+            is_coinstake: false,
+            address: String::new(),
+        });
+
+        let rpc = WalletRpc::with_wallet(db.clone());
+        rpc.set_height(200);
+        (rpc, db)
+    }
+
+    #[test]
+    fn getpqposture_reports_exposed_classical_vault_and_pq_native_utxos() {
+        let (rpc, _db) = mixed_wallet_rpc();
+        let report = rpc.get_pq_posture(&p(&[])).unwrap();
+
+        assert_eq!(report["total_utxos"], json!(5));
+        assert_eq!(
+            report["total_value_sat"],
+            json!(Amount::from_divi(35_000).as_sat())
+        );
+        assert_eq!(report["exposed_utxos"], json!(2));
+        assert_eq!(
+            report["exposed_value_sat"],
+            json!(Amount::from_divi(15_000).as_sat())
+        );
+        assert_eq!(report["unexposed_p2pkh_utxos"], json!(1));
+        assert_eq!(
+            report["unexposed_p2pkh_value_sat"],
+            json!(Amount::from_divi(2_000).as_sat())
+        );
+        assert_eq!(report["classical_vault_utxos"], json!(1));
+        assert_eq!(
+            report["classical_vault_value_sat"],
+            json!(Amount::from_divi(15_000).as_sat())
+        );
+        assert_eq!(report["pq_native_utxos"], json!(1));
+        assert_eq!(
+            report["pq_native_value_sat"],
+            json!(Amount::from_divi(3_000).as_sat())
+        );
+        assert_eq!(report["quantum_ready"], json!(false));
+        assert_eq!(
+            report["categories"]["reused_address_p2pkh"]["utxos"],
+            json!(1)
+        );
+        assert_eq!(
+            report["categories"]["direct_pubkey_exposed_pos_staker"]["utxos"],
+            json!(1)
+        );
+        assert_eq!(
+            report["categories"]["unexposed_classical_p2pkh"]["utxos"],
+            json!(1)
+        );
+        assert_eq!(
+            report["categories"]["classical_vault_insulated"]["utxos"],
+            json!(1)
+        );
+        assert_eq!(
+            report["categories"]["post_quantum_native"]["utxos"],
+            json!(1)
+        );
+        assert_eq!(
+            err_code(rpc.get_pq_posture(&p(&[json!("extra")]))),
+            codes::MISC_ERROR
+        );
+    }
+
+    #[test]
+    fn getpqposture_becomes_quantum_ready_when_only_vault_or_pq_utxos_remain() {
+        let db = Arc::new(WalletDb::with_hd_wallet(
+            Network::Testnet,
+            HdWallet::new(ChainMode::Divi).unwrap(),
+        ));
+        db.add_utxo(divi_wallet::WalletUtxo {
+            txid: Hash256::from_bytes([9; 32]),
+            vout: 0,
+            value: Amount::from_divi(20_000),
+            script_pubkey: create_pq_staking_vault_script(&[0xaa; 32], &[0xbb; 32]),
+            height: Some(50),
+            is_coinbase: false,
+            is_coinstake: false,
+            address: String::new(),
+        });
+        let rpc = WalletRpc::with_wallet(db);
+        rpc.set_height(100);
+        let report = rpc.get_pq_posture(&p(&[])).unwrap();
+        assert_eq!(report["total_utxos"], json!(1));
+        assert_eq!(report["exposed_utxos"], json!(0));
+        assert_eq!(report["pq_native_utxos"], json!(1));
+        assert_eq!(report["quantum_ready"], json!(true));
+    }
+
+    #[test]
+    fn planpqsweep_accepts_bech32m_p2pqpkh_owner_vault_pair_and_json_spec_without_mutating_wallet()
+    {
+        let (rpc, db) = mixed_wallet_rpc();
+        let before_utxos = db.get_utxos().len();
+
+        // 1. Bech32m P2PQPKH destination address (tdivi1...)
+        let pq_addr = encode_pq_bech32m_address(
+            PqAddressHrp::DiviTestnet,
+            PQ_WITNESS_VERSION_P2PQPKH,
+            &[0x44; 32],
+        )
+        .unwrap();
+        let plan_single = rpc
+            .plan_pq_sweep(&p(&[json!(pq_addr), json!(10_000), json!(false)]))
+            .unwrap();
+        // With include_unexposed_p2pkh = false and single-key dest (include_classical_vaults = false),
+        // only the 2 exposed UTXOs (5,000 + 10,000 = 15,000 DIVI) are swept.
+        assert_eq!(plan_single["swept_input_count"], json!(2));
+        assert_eq!(plan_single["exposed_input_count"], json!(2));
+        assert_eq!(
+            plan_single["total_input_value_sat"],
+            json!(Amount::from_divi(15_000).as_sat())
+        );
+        assert_eq!(plan_single["batches"][0]["p2pqpkh_output_count"], json!(1));
+        assert_eq!(plan_single["batches"][0]["vault_output_count"], json!(0));
+
+        // 2. owner:vault pair of Bech32m P2PQPKH addresses
+        let owner_pq = encode_pq_bech32m_address(
+            PqAddressHrp::DiviMainnet,
+            PQ_WITNESS_VERSION_P2PQPKH,
+            &[0x55; 32],
+        )
+        .unwrap();
+        let vault_pq = encode_pq_bech32m_address(
+            PqAddressHrp::DiviMainnet,
+            PQ_WITNESS_VERSION_P2PQPKH,
+            &[0x66; 32],
+        )
+        .unwrap();
+        let pair_spec = format!("{owner_pq}:{vault_pq}");
+        let plan_pair = rpc
+            .plan_pq_sweep(&p(&[json!(pair_spec), json!(10_000), json!(true)]))
+            .unwrap();
+        // Sweeps 2 exposed + 1 unexposed + 1 classical vault = 4 inputs (32,000 DIVI), skipping 1 PQ native UTXO
+        assert_eq!(plan_pair["swept_input_count"], json!(4));
+        assert_eq!(plan_pair["exposed_input_count"], json!(2));
+        assert_eq!(plan_pair["skipped_utxo_count"], json!(1));
+        assert_eq!(plan_pair["batches"][0]["vault_output_count"], json!(1));
+        assert_eq!(plan_pair["post_sweep_posture"], json!("vault_only"));
+
+        // 3. Explicit JSON object {"type":"pq_vault","owner_hash32":"...","vault_hash32":"..."}
+        let spec_obj = json!({
+            "type": "pq_vault",
+            "owner_hash32": hex::encode([0x55u8; 32]),
+            "vault_hash32": hex::encode([0x66u8; 32]),
+        });
+        let plan_obj = rpc
+            .plan_pq_sweep(&p(&[spec_obj, json!(10_000), json!(true)]))
+            .unwrap();
+        assert_eq!(plan_obj, plan_pair);
+
+        // Zero mutation of wallet state
+        assert_eq!(db.get_utxos().len(), before_utxos);
+    }
+
+    #[test]
+    fn planpqsweep_rejects_invalid_destination_specs_and_bad_parameters() {
+        let (rpc, _db) = mixed_wallet_rpc();
+
+        // Missing destination
+        assert_eq!(err_code(rpc.plan_pq_sweep(&p(&[]))), codes::MISC_ERROR);
+
+        // Empty or malformed destination string
+        assert_eq!(
+            err_code(rpc.plan_pq_sweep(&p(&[json!("")]))),
+            codes::INVALID_ADDRESS_OR_KEY
+        );
+        assert_eq!(
+            err_code(rpc.plan_pq_sweep(&p(&[json!("not-a-valid-address")]))),
+            codes::INVALID_ADDRESS_OR_KEY
+        );
+        assert_eq!(
+            err_code(rpc.plan_pq_sweep(&p(&[json!("bad:owner:vault")]))),
+            codes::INVALID_ADDRESS_OR_KEY
+        );
+
+        // Degenerate vault keys (owner == vault)
+        let same_hash = hex::encode([0x77u8; 32]);
+        assert_eq!(
+            err_code(rpc.plan_pq_sweep(&p(&[json!({
+                "type": "pq_vault",
+                "owner_hash32": same_hash,
+                "vault_hash32": same_hash,
+            })]))),
+            codes::INVALID_PARAMETER
+        );
+
+        // Unsupported type in object
+        assert_eq!(
+            err_code(rpc.plan_pq_sweep(&p(&[json!({"type": "unknown_type"})]))),
+            codes::INVALID_PARAMETER
+        );
+
+        // Zero fee rate
+        let pq_addr = encode_pq_bech32m_address(
+            PqAddressHrp::DiviRegtest,
+            PQ_WITNESS_VERSION_P2PQPKH,
+            &[0x44; 32],
+        )
+        .unwrap();
+        assert_eq!(
+            err_code(rpc.plan_pq_sweep(&p(&[json!(pq_addr), json!(0)]))),
+            codes::INVALID_PARAMETER
+        );
     }
 }

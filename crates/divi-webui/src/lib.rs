@@ -340,6 +340,8 @@ fn router(shared: Arc<Shared>, sidechains: Router) -> Router {
             post(api_wallet_change_passphrase),
         )
         .route("/api/rpc", post(api_rpc))
+        .route("/api/pq/posture", get(api_pq_posture))
+        .route("/api/pq/sweep-plan", post(api_pq_sweep_plan))
         .route("/api/settings", get(api_settings).post(api_save_settings))
         .route("/api/logs", get(api_logs).post(api_log_filter))
         .route("/api/wallets", get(api_wallets))
@@ -1250,6 +1252,67 @@ async fn api_rpc(
         Err((code, message)) => Json(json!({ "error": { "code": code, "message": message } })),
     }
     .into_response())
+}
+
+#[derive(Deserialize)]
+struct PqSweepPlanBody {
+    destination: Value,
+    #[serde(default)]
+    fee_per_kb_sat: Option<u64>,
+    #[serde(default)]
+    include_unexposed_p2pkh: Option<bool>,
+}
+
+async fn api_pq_posture(
+    State(s): State<Arc<Shared>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> ApiResult {
+    signed_in(&s, &headers, false)?;
+    let transport = divi_rpc::diag_rpc::Transport::WebUi;
+    let watch = divi_rpc::diag_rpc::begin("getpqposture", transport);
+    let result = call(&s, "getpqposture", Vec::new()).await;
+    watch.finish(
+        "getpqposture",
+        transport,
+        Some(peer.ip()),
+        true,
+        result.as_ref().err().map(|(c, m)| (*c, m.as_str())),
+    );
+    match result {
+        Ok(posture) => Ok(Json(posture).into_response()),
+        Err((code, msg)) => Err(bad(format!("{msg} ({code})"))),
+    }
+}
+
+async fn api_pq_sweep_plan(
+    State(s): State<Arc<Shared>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<PqSweepPlanBody>,
+) -> ApiResult {
+    signed_in(&s, &headers, true)?;
+    let params = vec![
+        body.destination,
+        body.fee_per_kb_sat.map(|f| json!(f)).unwrap_or(Value::Null),
+        body.include_unexposed_p2pkh
+            .map(|b| json!(b))
+            .unwrap_or(Value::Null),
+    ];
+    let transport = divi_rpc::diag_rpc::Transport::WebUi;
+    let watch = divi_rpc::diag_rpc::begin("planpqsweep", transport);
+    let result = call(&s, "planpqsweep", params).await;
+    watch.finish(
+        "planpqsweep",
+        transport,
+        Some(peer.ip()),
+        true,
+        result.as_ref().err().map(|(c, m)| (*c, m.as_str())),
+    );
+    match result {
+        Ok(plan) => Ok(Json(plan).into_response()),
+        Err((code, msg)) => Err(bad(format!("{msg} ({code})"))),
+    }
 }
 
 /// Option values for the page: a secret's value never leaves, only that it is set
@@ -2735,5 +2798,194 @@ mod tests {
         store.clear_all().unwrap();
         assert!(store.list().is_empty());
         assert!(store.unwrap(&summary.id, &prf).is_err());
+    }
+
+    #[test]
+    fn gate_allows_getpqposture_and_planpqsweep_on_unencrypted_wallet() {
+        assert_eq!(
+            gate::check("getpqposture", &[], Some("unencrypted")),
+            Ok(())
+        );
+        assert_eq!(
+            gate::check(
+                "planpqsweep",
+                &[json!({"type": "pq_single_key", "addr_key_hash32": "11".repeat(32)})],
+                Some("unencrypted")
+            ),
+            Ok(())
+        );
+    }
+
+    #[tokio::test]
+    async fn pq_posture_and_sweep_plan_endpoints_require_session_and_return_reports() {
+        use divi_primitives::{Amount, ChainMode, Hash256, Script};
+        use divi_wallet::{HdWallet, Network, WalletDb, WalletUtxo};
+
+        let dir = tempfile::tempdir().unwrap();
+        let wallet = Arc::new(WalletDb::with_hd_wallet(
+            Network::Regtest,
+            HdWallet::new(ChainMode::Divi).unwrap(),
+        ));
+        let addr = wallet.new_receiving_address().unwrap();
+        let spent_op = divi_primitives::OutPoint::new(Hash256::from_bytes([0x10; 32]), 0);
+        wallet.add_utxo(WalletUtxo {
+            txid: spent_op.txid,
+            vout: spent_op.vout,
+            value: Amount::from_divi(100),
+            script_pubkey: Script::new_p2pkh(addr.hash.as_bytes()),
+            height: Some(0),
+            is_coinbase: false,
+            is_coinstake: false,
+            address: addr.to_string(),
+        });
+        wallet.spend_utxo_at_height(&spent_op, Some(0));
+        wallet.add_utxo(WalletUtxo {
+            txid: Hash256::from_bytes([0x11; 32]),
+            vout: 0,
+            value: Amount::from_divi(25_000),
+            script_pubkey: Script::new_p2pkh(addr.hash.as_bytes()),
+            height: Some(0),
+            is_coinbase: false,
+            is_coinstake: false,
+            address: addr.to_string(),
+        });
+
+        let rpc = Arc::new(RpcServer::new_regtest_with_wallet(dir.path(), wallet));
+        let config = WebUiConfig {
+            bind: "127.0.0.1:51482".parse().unwrap(),
+            allow_remote: false,
+            allow_hosts: Vec::new(),
+            open_browser: false,
+            data_dir: dir.path().to_path_buf(),
+            conf_path: dir.path().join("divi.conf"),
+            cli: conffile::Values::default(),
+            network: "regtest".into(),
+            chain_mode: "divi".into(),
+        };
+        let auth = AuthStore::open(dir.path()).unwrap();
+        auth.set_password(&Zeroizing::new("correct-horse-battery-staple".to_string()))
+            .unwrap();
+        let shared = Arc::new(Shared {
+            hosts: allowed_hosts(&config),
+            wallets: wallets::WalletStore::new(
+                &config.data_dir,
+                &config.network,
+                &config.chain_mode,
+            ),
+            node_passkeys: node_passkey::NodePasskeyStore::new(&config.data_dir),
+            config,
+            auth,
+            challenges: webauthn::ChallengeStore::default(),
+            sessions: Sessions::default(),
+            limiter: LoginLimiter::default(),
+            hashing: Semaphore::new(2),
+            rpc,
+            launch: launch::LaunchToken::default(),
+            electrum: None,
+        });
+
+        let peer: SocketAddr = "127.0.0.1:55555".parse().unwrap();
+
+        // 1. Unauthenticated GET /api/pq/posture -> 401
+        let unauth_res = api_pq_posture(
+            State(Arc::clone(&shared)),
+            ConnectInfo(peer),
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(unauth_res.err().unwrap().0, StatusCode::UNAUTHORIZED);
+
+        // 2. Signed-in GET /api/pq/posture -> 200 with deterministic posture JSON
+        let session = shared.sessions.create();
+        let mut get_headers = HeaderMap::new();
+        get_headers.insert(
+            header::COOKIE,
+            HeaderValue::from_str(&format!("{COOKIE_NAME}={}", session.cookie)).unwrap(),
+        );
+        let posture_res = match api_pq_posture(
+            State(Arc::clone(&shared)),
+            ConnectInfo(peer),
+            get_headers.clone(),
+        )
+        .await
+        {
+            Ok(res) => res,
+            Err(ApiError(code, msg)) => panic!("unexpected ApiError({code}, {msg})"),
+        };
+        assert_eq!(posture_res.status(), StatusCode::OK);
+        let posture_bytes = axum::body::to_bytes(posture_res.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let posture_json: Value = serde_json::from_slice(&posture_bytes).unwrap();
+        assert_eq!(posture_json["total_utxos"], json!(1));
+        assert_eq!(posture_json["exposed_utxos"], json!(1));
+        assert_eq!(posture_json["quantum_ready"], json!(false));
+
+        // 3. POST /api/pq/sweep-plan without CSRF -> 403
+        let no_csrf_res = api_pq_sweep_plan(
+            State(Arc::clone(&shared)),
+            ConnectInfo(peer),
+            get_headers.clone(),
+            Json(PqSweepPlanBody {
+                destination: json!({
+                    "type": "pq_vault",
+                    "owner_hash32": "22".repeat(32),
+                    "vault_hash32": "33".repeat(32),
+                }),
+                fee_per_kb_sat: Some(10_000),
+                include_unexposed_p2pkh: Some(true),
+            }),
+        )
+        .await;
+        assert_eq!(no_csrf_res.err().unwrap().0, StatusCode::FORBIDDEN);
+
+        // 4. POST /api/pq/sweep-plan with CSRF -> 200 with deterministic sweep plan JSON
+        let mut post_headers = get_headers;
+        post_headers.insert(
+            "x-csrf-token",
+            HeaderValue::from_str(&session.csrf).unwrap(),
+        );
+        let plan_res = match api_pq_sweep_plan(
+            State(Arc::clone(&shared)),
+            ConnectInfo(peer),
+            post_headers.clone(),
+            Json(PqSweepPlanBody {
+                destination: json!({
+                    "type": "pq_vault",
+                    "owner_hash32": "22".repeat(32),
+                    "vault_hash32": "33".repeat(32),
+                }),
+                fee_per_kb_sat: Some(10_000),
+                include_unexposed_p2pkh: Some(true),
+            }),
+        )
+        .await
+        {
+            Ok(res) => res,
+            Err(ApiError(code, msg)) => panic!("unexpected ApiError({code}, {msg})"),
+        };
+        assert_eq!(plan_res.status(), StatusCode::OK);
+        let plan_bytes = axum::body::to_bytes(plan_res.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let plan_json: Value = serde_json::from_slice(&plan_bytes).unwrap();
+        assert_eq!(plan_json["swept_input_count"], json!(1));
+        assert_eq!(plan_json["exposed_input_count"], json!(1));
+        assert_eq!(plan_json["batches"][0]["vault_output_count"], json!(1));
+        assert_eq!(plan_json["post_sweep_posture"], json!("vault_only"));
+
+        // 5. Invalid destination returns 400 Bad Request
+        let bad_res = api_pq_sweep_plan(
+            State(Arc::clone(&shared)),
+            ConnectInfo(peer),
+            post_headers,
+            Json(PqSweepPlanBody {
+                destination: json!("invalid-bech32m"),
+                fee_per_kb_sat: None,
+                include_unexposed_p2pkh: None,
+            }),
+        )
+        .await;
+        assert_eq!(bad_res.err().unwrap().0, StatusCode::BAD_REQUEST);
     }
 }
