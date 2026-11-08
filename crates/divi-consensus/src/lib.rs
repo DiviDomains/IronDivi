@@ -67,6 +67,7 @@ pub mod lottery;
 pub mod pos_calculator;
 pub mod pos_generator;
 pub mod pq_block_sig;
+pub mod pq_epoch_gauntlet;
 pub mod spork_values;
 pub mod stake_modifier;
 pub mod staking_data;
@@ -98,6 +99,12 @@ pub use pq_block_sig::{
     FN_DSA_512_BLOCK_SIG_ENVELOPE_LEN, ML_DSA_44_BLOCK_SIG_ENVELOPE_LEN, POS_BLOCK_PAYLOAD_DOMAIN,
     POS_BLOCK_PAYLOAD_PREIMAGE_LEN, PQ_BLOCK_SIG_HEADER_LEN, PQ_BLOCK_SIG_MAGIC,
     PQ_BLOCK_SIG_VERSION_V1,
+};
+pub use pq_epoch_gauntlet::{
+    is_any_staking_vault_script, validate_gauntlet_block_weight, ConnectedEpochBlockSummary,
+    GauntletBlockCandidate, GauntletChainState, GauntletError, PqConsensusEpoch, PqEpochConfig,
+    ReorgExecutionReport, GAUNTLET_WITNESS_SCALE_FACTOR, MAX_GAUNTLET_BLOCK_RAW_BYTES,
+    MAX_GAUNTLET_BLOCK_WEIGHT, MIN_VAULT_FUNDING_SAT,
 };
 pub use stake_modifier::{
     get_stake_modifier_selection_interval, get_stake_modifier_selection_interval_section,

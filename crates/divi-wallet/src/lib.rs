@@ -65,6 +65,7 @@ pub mod keystore;
 pub mod manager;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod persistence;
+pub mod pq_sweep;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod send;
 pub mod signer;
@@ -93,6 +94,12 @@ pub use keystore::{HdPublicIds, KeyEntry, KeyStore, PoolState};
 pub use manager::WalletManager;
 #[cfg(not(target_arch = "wasm32"))]
 pub use persistence::WalletDatabase;
+pub use pq_sweep::{
+    plan_voluntary_pq_sweep, PqSweepBatchTx, PqSweepDestination, PqSweepError, PqSweepPlan,
+    PqSweepPlanConfig, QuantumExposureReason, SubThresholdVaultPolicy, TrackableWalletUtxo,
+    DEFAULT_MAX_SWEEP_INPUTS_PER_TX, DEFAULT_MAX_SWEEP_TX_WEIGHT, DEFAULT_SWEEP_FEE_PER_KB_SAT,
+    MIN_NON_DUST_OUTPUT_SAT, MIN_VAULT_SWEEP_OUTPUT_SAT,
+};
 pub use signer::{sighash, sign_input, TransactionBuilder, TransactionSigner};
 #[cfg(not(target_arch = "wasm32"))]
 pub use wallet_db::{
