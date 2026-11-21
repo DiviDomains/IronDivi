@@ -301,10 +301,13 @@ run_direction() {
     return 0
   fi
 
-  local out="$state/taker-run.log" local_id
+  local out="$state/taker-run.log" res="$state/taker-run.result" local_id
+  # `run` prints its result (`<swap id> <state>`) on stdout and its logs on stderr. Keep them
+  # apart: under RUST_LOG=trace a log line can come after the result and would be read as the id.
   "${taker[@]}" run --maker "$base" --offer "$offer" --btc-sats "$ltc_sats" \
-    --timeout-secs "$timeout_secs" ${taker_flags[@]+"${taker_flags[@]}"} 2>&1 | tee "$out"
-  local_id="$(tail -1 "$out" | awk '{print $1}')"
+    --timeout-secs "$timeout_secs" ${taker_flags[@]+"${taker_flags[@]}"} 2>&1 >"$res" | tee "$out"
+  tee -a "$out" <"$res"
+  local_id="$(tail -1 "$res" | awk '{print $1}')"
   [[ -n "$local_id" ]] || die "[$scenario/$direction] taker run printed no swap id"
 
   local txids=""
