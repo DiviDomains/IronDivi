@@ -655,10 +655,8 @@ impl Maker {
     /// refunds, and counter-chain locks proceed while the DIVI wallet catches up on startup.
     pub async fn tick_with_divi_ready(&self, divi_ready: bool) -> Result<()> {
         let ready = divi_ready && (self.divi_ready)();
-        for rec in self.store.list_maker_swaps()? {
-            if !rec.state.is_terminal() {
-                let _ = self.step_inner(&rec.id, ready).await;
-            }
+        for rec in self.store.maker_tick_records()? {
+            let _ = self.step_inner(&rec.id, ready).await;
         }
         for e in &self.engines {
             let _ = e.tick().await; // errors are recorded on that engine's swaps

@@ -403,6 +403,13 @@ pub trait StoreBackend: MaybeSendSync {
     fn get(&self, table: Table<'_>, id: &str) -> Result<Option<String>>;
     /// All documents in `table`, newest first by first insertion.
     fn list(&self, table: Table<'_>) -> Result<Vec<String>>;
+    /// Candidate records for a maker tick, in backend list order.
+    fn maker_tick_records(&self) -> Result<Vec<MakerRecord>> {
+        self.list(Table::MakerSwaps)?
+            .into_iter()
+            .map(|row| serde_json::from_str(&row).map_err(storage))
+            .collect()
+    }
     /// Drop document `id` from `table` (a no-op for an unknown id).
     fn delete(&self, table: Table<'_>, id: &str) -> Result<()>;
 }
@@ -499,6 +506,13 @@ impl Store {
         // Backends list by insertion; a stable sort keeps that as the tie-break.
         recs.sort_by_key(|r| std::cmp::Reverse(r.created_at));
         Ok(recs)
+    }
+
+    pub(crate) fn maker_tick_records(&self) -> Result<Vec<MakerRecord>> {
+        let mut records = self.backend.maker_tick_records()?;
+        records.retain(|r| !r.state.is_terminal());
+        records.sort_by_key(|r| std::cmp::Reverse(r.created_at));
+        Ok(records)
     }
 
     // ---- taker swaps ----
@@ -723,6 +737,7 @@ CREATE TABLE IF NOT EXISTS docs (
     /// The SQLite backend (native default): one statement per write.
     pub(super) struct SqliteBackend {
         conn: parking_lot::Mutex<Connection>,
+        validated_version: parking_lot::Mutex<Option<i64>>,
     }
 
     impl SqliteBackend {
@@ -786,6 +801,7 @@ CREATE TABLE IF NOT EXISTS docs (
             check_marker(&conn)?;
             Ok(SqliteBackend {
                 conn: parking_lot::Mutex::new(conn),
+                validated_version: Default::default(),
             })
         }
 
@@ -804,6 +820,7 @@ CREATE TABLE IF NOT EXISTS docs (
             }
             Ok(SqliteBackend {
                 conn: parking_lot::Mutex::new(conn),
+                validated_version: Default::default(),
             })
         }
     }
@@ -876,6 +893,51 @@ CREATE TABLE IF NOT EXISTS docs (
             }
             .optional()
             .map_err(storage)
+        }
+
+        fn maker_tick_records(&self) -> Result<Vec<super::MakerRecord>> {
+            // This private connection writes maker metadata only through put_maker_swap.
+            // Recheck any externally changed snapshot before trusting its terminal tags.
+            let mut conn = self.conn.lock();
+            let tx = conn.transaction().map_err(storage)?;
+            let version: i64 = tx
+                .pragma_query_value(None, "data_version", |r| r.get(0))
+                .map_err(storage)?;
+            let mut validated = self.validated_version.lock();
+            let trusted = *validated == Some(version);
+            let sql = if trusted {
+                "SELECT state,json FROM maker_swaps WHERE state NOT IN (?1,?2,?3)
+                 ORDER BY created_at DESC,rowid DESC"
+            } else {
+                "SELECT state,json FROM maker_swaps ORDER BY created_at DESC,rowid DESC"
+            };
+            use crate::SwapState::{Aborted, Done, Lost};
+            let terminal = [Aborted.as_str(), Done.as_str(), Lost.as_str()];
+            let mut stmt = tx.prepare(sql).map_err(storage)?;
+            let mut rows = stmt
+                .query(rusqlite::params_from_iter(if trusted {
+                    &terminal[..]
+                } else {
+                    &[]
+                }))
+                .map_err(storage)?;
+            let mut result = Vec::new();
+            let mut consistent = true;
+            while let Some(row) = rows.next().map_err(storage)? {
+                let json: String = row.get(1).map_err(storage)?;
+                let record: super::MakerRecord = serde_json::from_str(&json).map_err(storage)?;
+                if !trusted {
+                    let tag = row.get_ref(0).map_err(storage)?.as_str().ok();
+                    consistent &= Some(record.state.as_str()) == tag;
+                }
+                if !record.state.is_terminal() {
+                    result.push(record);
+                }
+            }
+            if consistent {
+                *validated = Some(version);
+            }
+            Ok(result)
         }
 
         fn list(&self, table: Table<'_>) -> Result<Vec<String>> {
@@ -1007,6 +1069,83 @@ fn is_zero(n: &u32) -> bool {
 mod tests {
     use super::sqlite::{SCHEMA, UNIQUE_HASH_INDEX};
     use super::*;
+
+    fn p8_record() -> MakerRecord {
+        serde_json::from_str(include_str!(
+            "../tests/fixtures/maker-forward-done-happy.json"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn tick_selection_matches_history_after_each_transition() {
+        let memory = Store::with_backend(Arc::new(MemoryBackend::default()));
+        for store in [memory, Store::in_memory().unwrap()] {
+            let mut r = p8_record();
+            for (n, state) in SwapState::ALL.into_iter().enumerate() {
+                r.id = n.to_string();
+                r.hash[0] = n as u8;
+                r.state = state;
+                store.put_maker_swap(&r).unwrap();
+            }
+            for state in SwapState::ALL {
+                r.state = state;
+                store.put_maker_swap(&r).unwrap();
+                let expected: Vec<_> = store
+                    .list_maker_swaps()
+                    .unwrap()
+                    .into_iter()
+                    .filter(|r| !r.state.is_terminal())
+                    .map(|r| r.id)
+                    .collect();
+                let actual: Vec<_> = store
+                    .maker_tick_records()
+                    .unwrap()
+                    .into_iter()
+                    .map(|r| r.id)
+                    .collect();
+                assert_eq!(actual, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn external_changes_and_restart_revalidate_terminal_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        for mode in [None, Some(DaemonMode::Mock)] {
+            let path = dir.path().join(if mode.is_some() {
+                "mock.db"
+            } else {
+                "legacy.db"
+            });
+            let open = || match mode {
+                Some(m) => Store::open_daemon(&path, m).unwrap(),
+                None => Store::open(&path).unwrap(),
+            };
+            let store = open();
+            store.put_maker_swap(&p8_record()).unwrap();
+            assert!(store.maker_tick_records().unwrap().is_empty());
+            let writer = rusqlite::Connection::open(&path).unwrap();
+            writer
+                .execute(
+                    "UPDATE maker_swaps SET json=json_set(json,'$.state','MakerRefunded')",
+                    [],
+                )
+                .unwrap();
+            assert_eq!(
+                store.maker_tick_records().unwrap()[0].state,
+                SwapState::MakerRefunded
+            );
+            for sql in [
+                "UPDATE maker_swaps SET json=json_set(json,'$.state','Unknown')",
+                "UPDATE maker_swaps SET json='{}'",
+            ] {
+                writer.execute(sql, []).unwrap();
+                assert!(store.maker_tick_records().is_err());
+                assert!(open().maker_tick_records().is_err());
+            }
+        }
+    }
 
     #[test]
     fn interrupted_backend_binding_is_atomic() {
