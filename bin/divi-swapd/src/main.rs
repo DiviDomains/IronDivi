@@ -998,7 +998,11 @@ async fn main() -> Result<()> {
     if kind == BackendKind::Live && (cfg.divi.is_none() || cfg.btc.is_none()) {
         bail!("live startup requires both [divi] and [btc] sections; restore the live configuration for recovery, or use --backend mock with a separate simulation database");
     }
-    let store = Store::open(&cfg.db_path).context("opening swap database")?;
+    let mode = match kind {
+        BackendKind::Live => divi_swap::store::DaemonMode::Live,
+        BackendKind::Mock => divi_swap::store::DaemonMode::Mock,
+    };
+    let store = Store::open_daemon(&cfg.db_path, mode).context("opening swap database")?;
     // Counter chains of swaps still under way: their backends start even if every offer on
     // that chain has since been switched off.
     let in_flight: BTreeSet<Chain> = store

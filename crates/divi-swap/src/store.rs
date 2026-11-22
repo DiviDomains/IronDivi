@@ -31,10 +31,18 @@ use crate::types::{Amount, Funding, Outpoint, SignedTx};
 /// Schema version this binary writes and understands, kept in SQLite's `PRAGMA user_version`
 /// (a header integer: no table, no `SCHEMA` change, and a pre-marker binary ignores it).
 /// 0 = no marker; 1 = before V1 scripts; 2 = V1 scripts; 3 = chain-only taker binding;
-/// 4 = maker and taker USDC chain, token and HTLC binding.
+/// 4 = maker and taker USDC chain, token and HTLC binding; 5 = daemon backend binding.
 /// A binary refuses a database stamped with a larger number, because an older reader silently
 /// drops fields it does not know (a V1 `script_version` becomes a V0 script: wrong address).
-pub const STORE_SCHEMA_VERSION: u32 = 4;
+pub const STORE_SCHEMA_VERSION: u32 = 5;
+const UNBOUND_SCHEMA_VERSION: u32 = 4;
+
+/// SQLite application IDs marking a daemon store's backend from its first launch.
+#[derive(Clone, Copy)]
+pub enum DaemonMode {
+    Live = 0x53574c56,
+    Mock = 0x53574d4b,
+}
 
 /// Swap database handle. Cheap to clone.
 #[derive(Clone)]
@@ -409,7 +417,16 @@ impl Store {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn open(path: &std::path::Path) -> Result<Self> {
         Ok(Self::with_backend(Arc::new(sqlite::SqliteBackend::open(
+            path, None,
+        )?)))
+    }
+
+    /// Open a maker store after atomically establishing or checking its backend identity.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn open_daemon(path: &std::path::Path, mode: DaemonMode) -> Result<Self> {
+        Ok(Self::with_backend(Arc::new(sqlite::SqliteBackend::open(
             path,
+            Some(mode),
         )?)))
     }
 
@@ -709,14 +726,50 @@ CREATE TABLE IF NOT EXISTS docs (
     }
 
     impl SqliteBackend {
-        pub(super) fn open(path: &Path) -> Result<Self> {
+        pub(super) fn open(path: &Path, mode: Option<super::DaemonMode>) -> Result<Self> {
             if !path.exists() {
                 create_private(path)?;
             }
             super::tighten_existing(path)?;
-            let conn = Connection::open(path).map_err(storage)?;
+            let mut conn = Connection::open(path).map_err(storage)?;
             // Before any pragma or schema write: a too-new file must be left untouched.
             check_marker(&conn)?;
+            {
+                let tx = conn
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .map_err(storage)?;
+                let version = check_marker(&tx)?;
+                let id: i64 = tx
+                    .pragma_query_value(None, "application_id", |r| r.get(0))
+                    .map_err(storage)?;
+                if let Some(mode) = mode {
+                    if id == 0 {
+                        let objects: i64 = tx
+                            .query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get(0))
+                            .map_err(storage)?;
+                        if version != 0 || objects != 0 {
+                            return Err(storage("unbound existing swap database: preserve the store and reservations, stop writers and inspect offline: python3 deploy/divi-swapd/store-binding.py inspect DATABASE. After verifying original mode: python3 deploy/divi-swapd/store-binding.py bind DATABASE --mode MODE --attest-original-mode MODE"));
+                        }
+                        tx.pragma_update(None, "application_id", mode as i64)
+                            .map_err(storage)?;
+                        tx.pragma_update(None, "user_version", STORE_SCHEMA_VERSION)
+                            .map_err(storage)?;
+                    } else if id != mode as i64 || version != STORE_SCHEMA_VERSION {
+                        return Err(storage("swap database backend binding mismatch: verify the original backend and store path"));
+                    }
+                } else {
+                    if id != 0 || version == STORE_SCHEMA_VERSION {
+                        return Err(storage("bound daemon store requires a mode-aware writer"));
+                    }
+                    // Claim an empty generic store before a racing daemon can bind it.
+                    tx.execute_batch(SCHEMA).map_err(storage)?;
+                    if version < super::UNBOUND_SCHEMA_VERSION {
+                        tx.pragma_update(None, "user_version", super::UNBOUND_SCHEMA_VERSION)
+                            .map_err(storage)?;
+                    }
+                }
+                tx.commit().map_err(storage)?;
+            }
             conn.pragma_update(None, "journal_mode", "WAL")
                 .map_err(storage)?;
             conn.pragma_update(None, "synchronous", "FULL")
@@ -745,8 +798,8 @@ CREATE TABLE IF NOT EXISTS docs (
             conn.execute_batch(SCHEMA).map_err(storage)?;
             ensure_unique_hash(&conn)?;
             // Unmarked (0) or older: stamp in place. Safe, V0 records stay V0.
-            if found != STORE_SCHEMA_VERSION {
-                conn.pragma_update(None, "user_version", STORE_SCHEMA_VERSION)
+            if found < super::UNBOUND_SCHEMA_VERSION {
+                conn.pragma_update(None, "user_version", super::UNBOUND_SCHEMA_VERSION)
                     .map_err(storage)?;
             }
             Ok(SqliteBackend {
@@ -885,7 +938,12 @@ CREATE TABLE IF NOT EXISTS docs (
 
     #[cfg(not(unix))]
     fn create_private(path: &Path) -> Result<()> {
-        std::fs::File::create(path).map(|_| ()).map_err(storage)
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map(|_| ())
+            .map_err(storage)
     }
 }
 
@@ -949,6 +1007,32 @@ fn is_zero(n: &u32) -> bool {
 mod tests {
     use super::sqlite::{SCHEMA, UNIQUE_HASH_INDEX};
     use super::*;
+
+    #[test]
+    fn interrupted_backend_binding_is_atomic() {
+        const CHILD: &str = "DIVI_SWAP_TEST_BINDING_CRASH_PATH";
+        if let Some(path) = std::env::var_os(CHILD) {
+            let conn = rusqlite::Connection::open(path).unwrap();
+            conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+            conn.pragma_update(None, "application_id", DaemonMode::Mock as i64)
+                .unwrap();
+            std::process::exit(73);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("crash.db");
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "store::tests::interrupted_backend_binding_is_atomic",
+            ])
+            .env(CHILD, &path)
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(73));
+        Store::open_daemon(&path, DaemonMode::Live).unwrap();
+        assert!(Store::open_daemon(&path, DaemonMode::Mock).is_err());
+    }
+
     use rusqlite::{params, Connection};
     use std::path::Path;
 
@@ -1273,7 +1357,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("swap.db");
         drop(Store::open(&path).unwrap());
-        assert_eq!(marker(&path), i64::from(STORE_SCHEMA_VERSION));
+        assert_eq!(marker(&path), i64::from(UNBOUND_SCHEMA_VERSION));
     }
 
     #[test]
@@ -1285,7 +1369,7 @@ mod tests {
         let s = Store::open(&path).unwrap();
         assert_eq!(s.list_maker_swaps().unwrap().len(), 1);
         drop(s);
-        assert_eq!(marker(&path), i64::from(STORE_SCHEMA_VERSION));
+        assert_eq!(marker(&path), i64::from(UNBOUND_SCHEMA_VERSION));
     }
 
     #[test]
@@ -1295,9 +1379,9 @@ mod tests {
         old_db(&path, &[]);
         stamp(&path, 2);
         drop(Store::open(&path).unwrap());
-        assert_eq!(marker(&path), i64::from(STORE_SCHEMA_VERSION));
+        assert_eq!(marker(&path), i64::from(UNBOUND_SCHEMA_VERSION));
         drop(Store::open(&path).unwrap());
-        assert_eq!(marker(&path), i64::from(STORE_SCHEMA_VERSION));
+        assert_eq!(marker(&path), i64::from(UNBOUND_SCHEMA_VERSION));
     }
 
     #[test]

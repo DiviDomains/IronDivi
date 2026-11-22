@@ -1,6 +1,18 @@
 # divi-swapd deployment (dnsdivi, testnet POC)
 
-Daemon startup defaults to live and requires both `[divi]` and `[btc]`. When upgrading a simulation, add `--backend mock` and use its own database. For live recovery, restore the original configuration and database path. Database inspection commands take no backend flag.
+Daemon startup defaults to live and requires both `[divi]` and `[btc]`. Use a dedicated database and `--backend mock` for simulation. The first daemon open of a new database atomically stamps the selected backend and schema 5. Each restart checks the stamp before opening reservations or starting recovery. Read-only inspection commands take no backend flag.
+
+Before upgrading an existing maker, inspect its outstanding swaps and reservations with the original installation. Keep the original binary, configuration, and an SQLite-consistent backup. An existing schema without a backend stamp requires a provenance-reviewed migration even when its tables are empty. Stop all processes and disable automatic restarts for the entire maintenance window, including CLI writers. Take and verify a consistent SQLite backup (use the SQLite backup API, including committed WAL data). Record the prior executable, launch arguments, service environment and configuration used with this exact database. From the matching source release run:
+
+```sh
+python3 deploy/divi-swapd/store-binding.py inspect "$DB"
+python3 deploy/divi-swapd/store-binding.py bind "$DB" --mode live --attest-original-mode live
+python3 deploy/divi-swapd/store-binding.py inspect "$DB"
+```
+
+For a verified original simulation use `mock` in both arguments. Legacy BTC/DIVI records cannot establish their original backend. USDC admission can contradict a declaration but cannot establish the provenance of other swaps. Compare counts and confirm the binding before restarting. If provenance is uncertain, leave the headers intact and investigate the original installation before resuming recovery. Generic store opens retain schema 4 on unbound stores.
+
+Schema-4 binaries refuse bound databases. Binaries predating the schema-version check do not provide this protection and must remain offline. After activity on schema 5, use a binding-aware recovery binary against the current database. Restoring an earlier snapshot can discard funding transactions and reservations.
 
 Runs the maker daemon as a hardened systemd service behind the existing nginx. The plan is
 `docs/plans/atomic-swap-poc.md` §5 Wave 3. SSH uses only the `dnsdivi` host alias.

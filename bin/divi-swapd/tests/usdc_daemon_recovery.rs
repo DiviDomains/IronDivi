@@ -16,25 +16,35 @@ use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 #[tokio::test]
 async fn disabled_usdc_offer_recovers_local_funding_on_daemon_restart() {
-    recovery(None).await;
+    recovery(None, false).await;
 }
 
 #[tokio::test]
 async fn changed_usdc_endpoint_permits_only_local_recovery() {
-    recovery(Some("0x1")).await;
+    recovery(Some("0x1"), false).await;
 }
 
 #[tokio::test]
 async fn unavailable_usdc_endpoint_permits_only_local_recovery() {
-    recovery(Some("down")).await;
+    recovery(Some("down"), false).await;
 }
 
-async fn recovery(counter_reply: Option<&'static str>) {
+#[tokio::test]
+async fn unbound_funded_store_preserves_recovery_and_reservations() {
+    recovery(None, true).await;
+}
+
+async fn recovery(counter_reply: Option<&'static str>, legacy: bool) {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("swaps.db");
     let wallet = dir.path().join("wallet.json");
-    let store = Store::open(&db).unwrap();
+    let store = if legacy {
+        Store::open(&db)
+    } else {
+        Store::open_daemon(&db, divi_swap::store::DaemonMode::Live)
+    }
+    .unwrap();
     let node = MockServer::start().await;
     let url = node.uri();
     let seen = Arc::new(Mutex::new(HashMap::<String, u32>::new()));
@@ -146,7 +156,7 @@ async fn recovery(counter_reply: Option<&'static str>) {
     let taker = Taker::new(
         Arc::new(divi.backend(3, Amount(2000000000))),
         Arc::new(usdc.backend(4, Amount(2000000000))),
-        store.clone(),
+        Store::in_memory().unwrap(),
     );
     let mut ids = Vec::new();
     for _ in 0..2 {
@@ -257,6 +267,74 @@ key = "credential:key"
         )
         .unwrap();
     }
+    let held = res.list_all().unwrap();
+    for mode in if legacy {
+        &["mock", "live"][..]
+    } else {
+        &["mock"][..]
+    } {
+        let output = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::process::Command::new(env!("CARGO_BIN_EXE_divi-swapd"))
+                .arg("--config")
+                .arg(&cfg)
+                .args(["--backend", mode])
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let reason = if legacy {
+            "unbound existing"
+        } else {
+            "backend binding mismatch"
+        };
+        assert!(
+            !output.status.success() && String::from_utf8_lossy(&output.stderr).contains(reason)
+        );
+        let inspect = Store::open_read_only(&db).unwrap();
+        assert_eq!(
+            inspect.get_maker_swap(&record.id).unwrap(),
+            Some(record.clone())
+        );
+        assert_eq!(
+            inspect.get_maker_swap(&unfunded.id).unwrap(),
+            Some(unfunded.clone())
+        );
+        assert_eq!(res.list_all().unwrap(), held);
+    }
+    drop(res);
+    if legacy {
+        let tool = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../deploy/divi-swapd/store-binding.py"
+        );
+        let snapshot = || {
+            let output = std::process::Command::new("python3")
+                .args([
+                    "-c",
+                    "import sqlite3,sys; print(list(sqlite3.connect(sys.argv[1]).iterdump()))",
+                ])
+                .arg(&db)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            output.stdout
+        };
+        let before = snapshot();
+        for mode in ["mock", "live"] {
+            let output = std::process::Command::new("python3")
+                .args([tool, "bind"])
+                .arg(&db)
+                .args(["--mode", mode, "--attest-original-mode", mode])
+                .output()
+                .unwrap();
+            assert_eq!(output.status.success(), mode == "live", "{:?}", output);
+            assert_eq!(snapshot(), before);
+        }
+    }
+    let res = InputReservations::open(&db).unwrap();
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_divi-swapd"))
         .arg("--config")
         .arg(cfg)

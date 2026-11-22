@@ -59,3 +59,64 @@ fn backend_flag_conflicts_with_store_commands() {
         assert!(String::from_utf8_lossy(&result.stderr).contains("cannot be used with"));
     }
 }
+
+#[test]
+fn backend_is_durable_and_legacy_stores_require_review() {
+    use divi_swap::store::DaemonMode::{Live, Mock};
+    let dir = tempfile::tempdir().unwrap();
+    for (name, mode, other) in [("live", Live, Mock), ("mock", Mock, Live)] {
+        let db = dir.path().join(name);
+        drop(Store::open_daemon(&db, mode).unwrap());
+        drop(Store::open_daemon(&db, mode).unwrap());
+        let before = fs::read(&db).unwrap();
+        assert!(Store::open_daemon(&db, other).is_err());
+        assert!(Store::open(&db).is_err());
+        assert_eq!(fs::read(&db).unwrap(), before);
+        Store::open_read_only(&db).unwrap();
+    }
+    let db = dir.path().join("legacy");
+    drop(Store::open(&db).unwrap());
+    let before = fs::read(&db).unwrap();
+    for mode in [Live, Mock] {
+        assert!(Store::open_daemon(&db, mode).is_err());
+        assert_eq!(fs::read(&db).unwrap(), before);
+    }
+}
+
+#[test]
+fn racing_backends_cannot_both_acquire_an_empty_database() {
+    use divi_swap::store::DaemonMode::{Live, Mock};
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("race.db");
+    let gate = std::sync::Barrier::new(2);
+    let attempt = |mode| {
+        gate.wait();
+        Store::open_daemon(&db, mode).is_ok()
+    };
+    let (live, mock) = std::thread::scope(|scope| {
+        let live = scope.spawn(|| attempt(Live));
+        let mock = attempt(Mock);
+        (live.join().unwrap(), mock)
+    });
+    assert_ne!(live, mock);
+    assert!(Store::open_daemon(&db, if live { Live } else { Mock }).is_ok());
+}
+
+#[cfg(unix)]
+#[test]
+fn write_failure_leaves_an_empty_file_retryable() {
+    use divi_swap::store::DaemonMode::{Live, Mock};
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("readonly.db");
+    fs::write(&db, []).unwrap();
+    fs::set_permissions(&db, fs::Permissions::from_mode(0o400)).unwrap();
+    // A privileged test runner can write through these permissions.
+    if fs::OpenOptions::new().write(true).open(&db).is_ok() {
+        return;
+    }
+    assert!(Store::open_daemon(&db, Mock).is_err());
+    assert!(fs::read(&db).unwrap().is_empty());
+    fs::set_permissions(&db, fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(Store::open_daemon(&db, Live).is_ok());
+}
