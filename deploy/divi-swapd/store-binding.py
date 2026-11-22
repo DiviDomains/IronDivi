@@ -101,8 +101,9 @@ def main():
     db = sqlite3.connect(uri, uri=True)
     try:
         with db:
-            if mode:
-                db.execute("PRAGMA locking_mode=EXCLUSIVE")
+            # Keep normal connection locking: EXCLUSIVE locking_mode can retain
+            # competing shared locks while both binders wait for an upgrade.
+            # The transaction itself serializes review and both header writes.
             db.execute("BEGIN EXCLUSIVE" if mode else "BEGIN")
             report = review(db, mode)
             if mode:

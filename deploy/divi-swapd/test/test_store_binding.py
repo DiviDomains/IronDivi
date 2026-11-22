@@ -37,7 +37,8 @@ class BindingTest(unittest.TestCase):
     def test_race_and_immutable_binding(self):
         with concurrent.futures.ThreadPoolExecutor(2) as pool:
             results = list(pool.map(self.bind, ("mock", "live")))
-        self.assertEqual(sum(r.returncode == 0 for r in results), 1)
+        self.assertEqual(sum(r.returncode == 0 for r in results), 1,
+                         [(r.returncode, r.stderr) for r in results])
         for mode in ("mock", "live"):
             self.assertNotEqual(self.bind(mode).returncode, 0)
         self.assertEqual(self.invoke("inspect").returncode, 0)
