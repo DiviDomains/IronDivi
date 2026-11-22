@@ -150,7 +150,7 @@ struct DirtyFlags {
     utxos: bool,
     spent: bool,
     transactions: bool,
-    addresses: bool,
+    addresses: HashSet<String>,
     accounts: bool,
     scripts: bool,
     vaults: bool,
@@ -163,7 +163,7 @@ impl DirtyFlags {
             || self.utxos
             || self.spent
             || self.transactions
-            || self.addresses
+            || !self.addresses.is_empty()
             || self.accounts
             || self.scripts
             || self.vaults
@@ -176,7 +176,7 @@ impl DirtyFlags {
         self.utxos |= taken.utxos;
         self.spent |= taken.spent;
         self.transactions |= taken.transactions;
-        self.addresses |= taken.addresses;
+        self.addresses.extend(taken.addresses.iter().cloned());
         self.accounts |= taken.accounts;
         self.scripts |= taken.scripts;
         self.vaults |= taken.vaults;
@@ -1854,10 +1854,8 @@ impl WalletDb {
             }
         }
 
-        if flags.addresses {
-            for addr in self.used_addresses.read().iter() {
-                batch.put_cf(db.cf_addresses(), addr.as_bytes(), [1]);
-            }
+        for addr in &flags.addresses {
+            batch.put_cf(db.cf_addresses(), addr.as_bytes(), [1]);
         }
 
         if flags.accounts {
@@ -3165,7 +3163,7 @@ impl WalletDb {
             return;
         }
         self.used_addresses.write().insert(address.to_string());
-        self.dirty.write().addresses = true;
+        self.dirty.write().addresses.insert(address.to_owned());
     }
 
     fn observe_address(

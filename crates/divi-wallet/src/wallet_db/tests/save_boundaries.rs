@@ -95,7 +95,7 @@ fn failed_incremental_save_keeps_changes_dirty() {
     fault::arm("wallet incremental batch built", 0);
     assert!(wallet.save_incremental().is_err());
     fault::disarm();
-    assert!(wallet.dirty.read().addresses);
+    assert!(wallet.dirty.read().addresses.contains("owed"));
 
     wallet.save_incremental().unwrap();
     assert!(!wallet.dirty.read().any_dirty());
@@ -207,4 +207,30 @@ fn encryption_written_but_not_flushed_stays_encrypted() {
     assert_eq!(wallet.db().unwrap().load_mnemonic().unwrap(), None);
     wallet.unlock("pw", 0).unwrap();
     assert_eq!(wallet.mnemonic().as_deref(), Some(TEST_MNEMONIC));
+}
+
+#[test]
+fn failed_incremental_save_merges_addresses_marked_during_write() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("wallet");
+    let wallet = new_wallet(&path);
+    wallet.mark_address_used("before");
+    let pause = fault::pause_at(&*wallet, "wallet incremental batch built");
+    let saver = {
+        let wallet = Arc::clone(&wallet);
+        std::thread::spawn(move || {
+            fault::arm("wallet incremental batch built", 0);
+            let result = wallet.save_incremental();
+            fault::disarm();
+            result
+        })
+    };
+    pause.reached();
+    wallet.mark_address_used("during");
+    pause.resume();
+    assert!(saver.join().unwrap().is_err());
+    wallet.save_incremental().unwrap();
+    let wallet = reopen(wallet, &path);
+    assert!(wallet.is_address_used("before"));
+    assert!(wallet.is_address_used("during"));
 }
