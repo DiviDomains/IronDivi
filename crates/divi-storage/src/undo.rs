@@ -85,6 +85,24 @@ impl BlockUndo {
         buf
     }
 
+    /// Decode the disk record for reversal. A zero-length record is the
+    /// writer's compact representation of a block with no spent inputs.
+    pub(crate) fn coins(
+        data: &[u8],
+    ) -> Result<std::collections::HashMap<OutPoint, Utxo>, crate::error::StorageError> {
+        let mut coins = std::collections::HashMap::new();
+        if !data.is_empty() {
+            for entry in Self::from_bytes(data)?.entries {
+                if coins.insert(entry.outpoint, entry.prev_utxo).is_some() {
+                    return Err(crate::error::StorageError::ChainState(
+                        "duplicate undo outpoint".into(),
+                    ));
+                }
+            }
+        }
+        Ok(coins)
+    }
+
     /// Deserialize from bytes
     pub fn from_bytes(data: &[u8]) -> Result<Self, crate::error::StorageError> {
         let mut cursor = std::io::Cursor::new(data);
@@ -120,6 +138,11 @@ impl BlockUndo {
             });
         }
 
+        if cursor.position() != data.len() as u64 {
+            return Err(crate::error::StorageError::Deserialization(
+                "trailing bytes in undo record".into(),
+            ));
+        }
         Ok(Self { entries })
     }
 }
@@ -155,6 +178,12 @@ mod tests {
                 true,
             ),
         );
+        // Extend the framed coin itself, keeping the outer record complete.
+        let mut invalid = undo.to_bytes();
+        let size = u32::try_from(invalid.len() - 44).unwrap() + 5;
+        invalid[40..44].copy_from_slice(&size.to_le_bytes());
+        invalid.extend_from_slice(&[0; 5]);
+        assert!(BlockUndo::from_bytes(&invalid).is_err());
         undo.push(
             OutPoint::new(txid, 0),
             Utxo::new(

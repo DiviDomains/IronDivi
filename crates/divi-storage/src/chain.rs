@@ -1644,15 +1644,12 @@ impl Chain {
             else {
                 break;
             };
-            let mut undo: HashMap<OutPoint, Utxo> = if undo.is_empty() {
-                HashMap::new()
-            } else {
-                BlockUndo::from_bytes(&undo)?
-                    .entries
-                    .into_iter()
-                    .map(|e| (e.outpoint, e.prev_utxo))
-                    .collect()
-            };
+            let mut undo = BlockUndo::coins(&undo)?;
+            let created: std::collections::HashSet<_> = block
+                .transactions
+                .iter()
+                .map(|tx| self.compute_txid(tx))
+                .collect();
             for tx in block.transactions.iter().rev() {
                 let txid = self.compute_txid(tx);
                 for (vout, out) in tx.vout.iter().enumerate() {
@@ -1691,6 +1688,13 @@ impl Chain {
                             ),
                         )
                     })?;
+                    let same_block = created.contains(&input.prevout.txid);
+                    if !money_range(prev.value, self.max_money())
+                        || (same_block && prev.height != height)
+                        || (!same_block && prev.height >= height)
+                    {
+                        return Err(damaged(height, "invalid undo height or value".into()));
+                    }
                     let present = match view.get(&input.prevout) {
                         Some(entry) => entry.is_some(),
                         None => self.db.get_utxo(&input.prevout)?.is_some(),
@@ -1706,6 +1710,9 @@ impl Chain {
                     }
                     view.insert(input.prevout, Some(prev));
                 }
+            }
+            if !undo.is_empty() {
+                return Err(damaged(height, "extraneous undo outpoint".into()));
             }
             height -= 1;
         }
@@ -3493,78 +3500,115 @@ impl Chain {
             }
         }
 
-        // Value the block's inputs spent, known when its undo data is
-        let mut undo_spent: Option<i64> = None;
-
-        // Restore spent UTXOs from undo data
-        if let Some(ref undo_bytes) = undo_data {
-            if undo_bytes.is_empty() {
-                // the block had no non-coinbase inputs, nothing to restore
-                undo_spent = Some(0);
-            } else {
-                let block_undo = BlockUndo::from_bytes(undo_bytes)?;
-                trace!(
-                    "  ├─ Restoring {} spent UTXOs from undo data",
-                    block_undo.entries.len()
-                );
-                // A coin created and spent in this block goes with the block:
-                // Divi Core undoes the spender (putting the coin back) and then
-                // the creator (taking it away again)
-                let created: std::collections::HashSet<Hash256> = block
-                    .transactions
-                    .iter()
-                    .map(|tx| self.compute_txid(tx))
-                    .collect();
-                undo_spent = Some(
-                    block_undo
-                        .entries
-                        .iter()
-                        .map(|e| e.prev_utxo.value.as_sat())
-                        .sum(),
-                );
-                for entry in block_undo.entries {
-                    if !created.contains(&entry.outpoint.txid) {
-                        utxo_batch.add(entry.outpoint, entry.prev_utxo);
+        let damaged = |reason: &str| {
+            StorageError::ChainState(format!("cannot disconnect {}: {reason}", index.hash))
+        };
+        let mut recorded = undo_data.as_deref().map(BlockUndo::coins).transpose()?;
+        let mut earlier = HashMap::<Hash256, &Transaction>::new();
+        let mut spent = 0i128;
+        for tx in &block.transactions {
+            if !tx.is_coinbase() {
+                for input in &tx.vin {
+                    let point = input.prevout;
+                    if tx.is_coinstake() && point.is_null() {
+                        continue;
+                    }
+                    let local = earlier.get(&point.txid);
+                    let from_output = |source: &Transaction, height| {
+                        let out = source
+                            .vout
+                            .get(point.vout as usize)
+                            .ok_or_else(|| damaged("previous output index is absent"))?;
+                        Ok::<_, StorageError>(
+                            Utxo::new(
+                                out.value,
+                                out.script_pubkey.clone(),
+                                height,
+                                source.is_coinbase(),
+                                source.is_coinstake(),
+                            )
+                            .with_version(source.version),
+                        )
+                    };
+                    let coin = if let Some(coins) = &mut recorded {
+                        let coin = coins
+                            .remove(&point)
+                            .ok_or_else(|| damaged("missing undo outpoint"))?;
+                        if let Some(source) = local {
+                            if coin != from_output(source, index.height)? {
+                                return Err(damaged("same-block undo differs from source output"));
+                            }
+                        } else if coin.height >= index.height
+                            || !money_range(coin.value, self.max_money())
+                        {
+                            return Err(damaged("invalid undo height or value"));
+                        }
+                        coin
+                    } else if let Some(source) = local {
+                        from_output(source, index.height)?
+                    } else {
+                        let (source, height, _, _) = self
+                            .find_transaction_from(&point.txid, &block.header.prev_block)?
+                            .ok_or_else(|| damaged("previous transaction is absent"))?;
+                        from_output(&source, height)?
+                    };
+                    spent += i128::from(coin.value.as_sat());
+                    if local.is_none() {
+                        if self.db.has_utxo(&point)? {
+                            return Err(damaged("spent external output is already unspent"));
+                        }
+                        utxo_batch.add(point, coin);
                     }
                 }
             }
-        } else {
-            // Fallback for blocks connected before undo data was implemented:
-            // Use the old brute-force search method
-            warn!(
-                "No undo data for block {} at height {} - using legacy disconnect",
-                index.hash, index.height
-            );
-            for tx in block.transactions.iter().rev() {
-                let is_coinbase = tx.is_coinbase();
-                let is_coinstake = tx.is_coinstake();
-                if !is_coinbase {
-                    for input in &tx.vin {
-                        if is_coinstake && input.prevout.is_null() {
-                            continue;
-                        }
-                        if let Some(prev_tx_data) = self
-                            .find_transaction_from(&input.prevout.txid, &block.header.prev_block)?
-                        {
-                            let (prev_tx, prev_height, prev_is_coinbase, prev_is_coinstake) =
-                                prev_tx_data;
-                            if let Some(output) = prev_tx.vout.get(input.prevout.vout as usize) {
-                                let utxo = Utxo::new(
-                                    output.value,
-                                    output.script_pubkey.clone(),
-                                    prev_height,
-                                    prev_is_coinbase,
-                                    prev_is_coinstake,
-                                )
-                                .with_version(prev_tx.version);
-                                utxo_batch.add(input.prevout, utxo);
-                            }
-                        } else {
-                            warn!(
-                                "Could not find transaction {} to restore UTXO during disconnect",
-                                input.prevout.txid
-                            );
-                        }
+            earlier.insert(self.compute_txid(tx), tx);
+        }
+        if recorded.as_ref().is_some_and(|coins| !coins.is_empty()) {
+            return Err(damaged("extraneous undo outpoint"));
+        }
+
+        // Read each retained origin block once to check the value, script and
+        // provenance of external coins before publishing any restored UTXO.
+        if recorded.is_some() {
+            let mut origins = HashMap::<u32, Vec<_>>::new();
+            for (point, coin) in &utxo_batch.adds {
+                origins.entry(coin.height).or_default().push((point, coin));
+            }
+            let optional_to = self
+                .db
+                .prune_height()
+                .max(self.db.snapshot_base().map_or(0, |(h, _)| h));
+            for (height, coins) in origins {
+                let body = match self.db.get_height_mapping(height)? {
+                    Some(hash) => self.db.get_block(&hash)?,
+                    None => None,
+                };
+                let Some(body) = body else {
+                    if height <= optional_to {
+                        continue;
+                    }
+                    return Err(damaged("undo origin block is missing"));
+                };
+                let sources: HashMap<_, _> = body
+                    .transactions
+                    .iter()
+                    .map(|tx| (self.compute_txid(tx), tx))
+                    .collect();
+                for (point, coin) in coins {
+                    let tx = sources
+                        .get(&point.txid)
+                        .ok_or_else(|| damaged("undo origin transaction is missing"))?;
+                    let out = tx
+                        .vout
+                        .get(point.vout as usize)
+                        .ok_or_else(|| damaged("undo origin output is missing"))?;
+                    if coin.value != out.value
+                        || coin.script_pubkey != out.script_pubkey
+                        || coin.is_coinbase != tx.is_coinbase()
+                        || coin.is_coinstake != tx.is_coinstake()
+                        || coin.version != tx.version
+                    {
+                        return Err(damaged("undo coin differs from source output"));
                     }
                 }
             }
@@ -3607,15 +3651,18 @@ impl Chain {
             .ok_or_else(|| StorageError::BlockNotFound(block.header.prev_block.to_string()))?;
         // A parent connected before the block index kept a supply gets it from
         // this block's: Divi Core's rule (TransactionInputChecker.cpp:79-80) run backwards
-        let parent_supply = match (parent.money_supply, index.money_supply, undo_spent) {
-            (None, Some(supply), Some(spent)) if parent.height > 0 => {
-                let created: i64 = block
+        let parent_supply = match (parent.money_supply, index.money_supply) {
+            (None, Some(supply)) if parent.height > 0 => {
+                let created: i128 = block
                     .transactions
                     .iter()
                     .flat_map(|tx| tx.vout.iter())
-                    .map(|o| o.value.as_sat())
+                    .map(|o| i128::from(o.value.as_sat()))
                     .sum();
-                Some(supply - created + spent)
+                Some(
+                    i64::try_from(i128::from(supply) - created + spent)
+                        .map_err(|_| damaged("parent supply overflow"))?,
+                )
             }
             _ => None,
         };
@@ -3748,8 +3795,7 @@ impl Chain {
         };
 
         // Search backwards through the chain
-        for _ in 0..10000 {
-            // Increased search depth for deep reorgs
+        for _ in 0..=current.height {
             if let Some(block) = self.db.get_block(&current.hash)? {
                 for tx in &block.transactions {
                     let tx_hash = self.compute_txid(tx);

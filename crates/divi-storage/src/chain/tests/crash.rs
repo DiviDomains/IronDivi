@@ -210,8 +210,19 @@ fn reorg_moves_address_index_with_the_chain() {
 /// disconnected (Divi Core undoes the spender, then the creator)
 #[test]
 fn disconnect_does_not_bring_back_coin_created_and_spent_in_block() {
+    recover_snapshot_reorg(false);
+}
+
+#[test]
+fn legacy_disconnect_reconstructs_external_and_same_block_spends() {
+    recover_snapshot_reorg(true);
+}
+
+fn recover_snapshot_reorg(legacy: bool) {
     let dir = tempdir().unwrap();
-    let chain = open_chain(dir.path(), false, false);
+    let chain = open_chain(dir.path(), true, false);
+    let reference_dir = tempdir().unwrap();
+    let reference = open_chain(reference_dir.path(), true, false);
     let (g, gt) = get_genesis_info(&chain);
     let anyone = Script::from_bytes(vec![0x51]);
     let spend = |coin: OutPoint, value: i64| Transaction {
@@ -227,6 +238,7 @@ fn disconnect_does_not_bring_back_coin_created_and_spent_in_block() {
         block.transactions[0].vout[0].script_pubkey = anyone.clone();
         seal(&mut block);
         let hash = chain.accept_block(block.clone()).unwrap().hash;
+        reference.accept_block(block.clone()).unwrap();
         coin.get_or_insert(OutPoint::new(block.transactions[0].txid(), 0));
         parent = (hash, block.header.time);
     }
@@ -237,15 +249,156 @@ fn disconnect_does_not_bring_back_coin_created_and_spent_in_block() {
     a22.transactions.push(t1.clone());
     a22.transactions.push(t2.clone());
     seal(&mut a22);
-    chain.accept_block(a22).unwrap();
+    let tip = chain.accept_block(a22.clone()).unwrap().hash;
+    // Exercise both sides of a real snapshot import. The fixture's short
+    // chain retains the history needed to reconstruct a legacy disconnect.
+    drop(chain);
+    let params = ChainParams::for_network(NetworkType::Regtest, ChainMode::Divi);
+    let snapshot = dir.path().join("snapshot");
+    let (manifest, hash) = crate::snapshot::export_snapshot_with_state(
+        &dir.path().join("chain"),
+        &snapshot,
+        params.clone(),
+    )
+    .unwrap();
+    let imported = dir.path().join("imported");
+    std::fs::create_dir(&imported).unwrap();
+    let base = crate::snapshot::KnownState {
+        chain_mode: ChainMode::Divi,
+        network: NetworkType::Regtest,
+        height: 22,
+        block_hash: Box::leak(tip.to_string().into_boxed_str()),
+        state_hash: Box::leak(hash.into_boxed_str()),
+    };
+    crate::snapshot::import_snapshot_with(
+        &snapshot,
+        &imported.join("chain"),
+        params,
+        Some(&manifest.root_hash),
+        &[base],
+    )
+    .unwrap();
+    let chain = open_chain(&imported, true, false);
+    assert_eq!(chain.snapshot_base(), Some((22, tip)));
+    let state = |c: &Chain| {
+        let db = c.db.inner_db();
+        // The Electrum script-to-address dictionary retains disconnected scripts.
+        // Only the following column families describe the active branch.
+        let rows: Vec<_> = ["utxo", "address_delta", "address_unspent", "spent_index"]
+            .iter()
+            .map(|cf| {
+                db.iterator_cf(db.cf_handle(cf).unwrap(), rocksdb::IteratorMode::Start)
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap()
+            })
+            .collect();
+        (
+            rows,
+            c.db.get_best_block().unwrap(),
+            (0..=c.db.get_chain_height().unwrap().unwrap())
+                .map(|height| {
+                    let index = c.db.get_block_index_by_height(height).unwrap().unwrap();
+                    (index.hash, index.status, index.money_supply)
+                })
+                .collect::<Vec<_>>(),
+        )
+    };
+    let before = state(&chain);
+    let raw = chain.db.get_undo_data(&tip).unwrap().unwrap();
+    let valid = BlockUndo::from_bytes(&raw).unwrap();
+    assert_eq!(chain.verify_recent_blocks(1).unwrap(), 2);
+    for (point, height, value) in [
+        (coin.unwrap(), 1, -1),
+        (coin.unwrap(), 22, 1),
+        (coin.unwrap(), 23, 1),
+        (OutPoint::new(t1.txid(), 0), 21, 1),
+    ] {
+        let mut damaged = valid.clone();
+        let prev = &mut damaged
+            .entries
+            .iter_mut()
+            .find(|e| e.outpoint == point)
+            .unwrap()
+            .prev_utxo;
+        prev.height = height;
+        prev.value = Amount::from_sat(value);
+        chain.db.store_undo_data(&tip, &damaged.to_bytes()).unwrap();
+        let error = chain.verify_recent_blocks(1).unwrap_err();
+        assert!(
+            error.to_string().contains("invalid undo height or value"),
+            "{error}"
+        );
+    }
+    let mut missing = valid.clone();
+    missing.entries.remove(0);
+    let mut duplicate = valid.clone();
+    duplicate.entries.push(valid.entries[0].clone());
+    let mut extra = valid.clone();
+    extra.push(
+        OutPoint::new(t2.txid(), 0),
+        valid.entries[0].prev_utxo.clone(),
+    );
+    let mut changed = valid.clone();
+    changed.entries[1].prev_utxo.value = Amount::from_sat(1);
+    let mut wrong_value = valid.clone();
+    wrong_value.entries[0].prev_utxo.value = Amount::from_sat(1);
+    for bytes in [
+        wrong_value.to_bytes(),
+        vec![],
+        missing.to_bytes(),
+        duplicate.to_bytes(),
+        extra.to_bytes(),
+        changed.to_bytes(),
+    ] {
+        chain.db.store_undo_data(&tip, &bytes).unwrap();
+        assert!(matches!(
+            chain.disconnect_block(&a22, &mut chain.tip().unwrap()),
+            Err(StorageError::ChainState(_))
+        ));
+        assert_eq!(state(&chain), before);
+        assert_eq!(chain.db.get_height_mapping(22).unwrap(), Some(tip));
+    }
+    chain.db.delete_undo_data(&tip).unwrap();
+    for point in [
+        OutPoint::new(Hash256::zero(), 0),
+        OutPoint::new(coin.unwrap().txid, 99),
+    ] {
+        let mut broken = a22.clone();
+        broken.transactions[1].vin[0].prevout = point;
+        assert!(matches!(
+            chain.disconnect_block(&broken, &mut chain.tip().unwrap()),
+            Err(StorageError::ChainState(_))
+        ));
+        assert_eq!(state(&chain), before);
+    }
     assert!(!chain.has_utxo(&OutPoint::new(t1.txid(), 0)).unwrap());
 
-    let mut parent = (fork.0, fork.1 + 1);
-    for _ in 0..2 {
-        let (hash, time, _) = accept(&chain, parent, 0x2b);
-        parent = (hash, time);
+    accept(&chain, (tip, a22.header.time), 0x3a);
+    let (b1, time, block) = accept(&chain, (fork.0, fork.1 + 1), 0x2b);
+    reference.accept_block(block).unwrap();
+    let b2 = create_child_block_with_pubkey(b1, time, [0x2c; 20]);
+    let b2_hash = reference.accept_block(b2.clone()).unwrap().hash;
+    chain.accept_block(b2.clone()).unwrap();
+    let b3 = create_child_block_with_pubkey(b2_hash, b2.header.time, [0x2d; 20]);
+    reference.accept_block(b3.clone()).unwrap();
+    chain.db.store_undo_data(&tip, &missing.to_bytes()).unwrap();
+    assert!(matches!(
+        chain.accept_block(b3),
+        Err(StorageError::ChainState(_))
+    ));
+    assert_eq!(state(&chain), before);
+    drop(chain);
+    let chain = open_chain(&imported, true, false);
+    assert!(chain.finish_interrupted_reorg().is_err());
+    assert_eq!(state(&chain), before);
+    if legacy {
+        chain.db.delete_undo_data(&tip).unwrap();
+    } else {
+        chain.db.store_undo_data(&tip, &raw).unwrap();
     }
-    assert_eq!(chain.height(), 23);
+    assert!(chain.finish_interrupted_reorg().unwrap().is_some());
+    assert_eq!(state(&chain), state(&reference));
+    assert_eq!(chain.height(), 24);
     assert!(
         !chain.has_utxo(&OutPoint::new(t1.txid(), 0)).unwrap(),
         "a coin spent inside the disconnected block came back"

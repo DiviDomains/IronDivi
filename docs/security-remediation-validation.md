@@ -21,3 +21,9 @@ No deployment or real-fund transaction is part of this change. This validation c
 ## Standard compact block-signature key encoding
 
 The P2PKH and vault checks now hash the recovered key using the encoding selected by standard compact headers: 27–30 uncompressed, 31–34 compressed. This follows the pinned C++ Divi checker at `1b553a3b`. Storage and crypto suites passed 629 tests with one ignored test. Independent checks reran both focused regressions and the C++ historical checker. Mainnet block 2,000,000 has the same block hash and accepted signature in both clients. Historical coverage is one block; chain-wide replay, nonstandard headers, script classification, P2PK signature-policy parity and signing for uncompressed stake keys remain outside this correction.
+
+## Undo integrity and restart recovery
+
+Disconnect and startup verification reject missing, duplicate or extraneous undo coins and invalid coin heights or values. Retained origin outputs are checked before disconnect publication; legacy reconstruction fails when required history or an output is unavailable. Embedded UTXO decoding accepts only the historical versionless form or a four-byte version suffix. Versionless records default to version 1; a missing non-1 version cannot be recovered from those bytes alone.
+
+The combined A1 and undo source passed 523 storage tests. Four targeted assertions failed with the prior verifier/decoder restored. Disposable snapshot-boundary tests cover refusal with coherent persisted state, restart, repair or legacy reconstruction, and comparison with clean replay. One real-chain test required an external database and was skipped. Pruned auxiliary provenance and persistent side-branch storage bounds remain open.

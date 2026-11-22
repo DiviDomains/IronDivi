@@ -122,6 +122,8 @@ impl Utxo {
         buf
     }
 
+    /// Versionless records decode as version 1. An older writer that omitted
+    /// another transaction version left no way to recover it from this record.
     /// Deserialize from bytes
     pub fn from_bytes(data: &[u8]) -> Result<Self, crate::error::StorageError> {
         let mut cursor = std::io::Cursor::new(data);
@@ -144,10 +146,14 @@ impl Utxo {
         let is_coinbase = (flags & 1) != 0;
         let is_coinstake = (flags & 2) != 0;
 
-        let version = if (cursor.position() as usize) < data.len() {
-            cursor.read_i32::<LittleEndian>()?
-        } else {
-            1
+        let version = match data.len() - cursor.position() as usize {
+            0 => 1,
+            4 => cursor.read_i32::<LittleEndian>()?,
+            _ => {
+                return Err(crate::error::StorageError::Deserialization(
+                    "invalid UTXO version length".into(),
+                ))
+            }
         };
 
         Ok(Utxo {
@@ -228,6 +234,11 @@ mod tests {
         assert_eq!(v2.to_bytes().len(), v1.to_bytes().len() + 4);
         assert_eq!(Utxo::from_bytes(&v1.to_bytes()).unwrap().version, 1);
         assert_eq!(Utxo::from_bytes(&v2.to_bytes()).unwrap(), v2);
+        for extra in [1, 2, 3, 5] {
+            let mut bytes = v1.to_bytes();
+            bytes.resize(bytes.len() + extra, 0);
+            assert!(Utxo::from_bytes(&bytes).is_err());
+        }
     }
 
     #[test]
