@@ -209,7 +209,9 @@ connections (loopback exempt); request headers must arrive within 30 s, an idle
 keep-alive connection is closed after 30 s, and a request body or reply that
 makes no progress for 30 s ends the connection. Divi Core has no such timeouts
 (it keeps `-rpcthreads=4` connections for as long as they last); these are a
-deliberate IronDivi difference. Authenticated calls are otherwise unchanged.
+deliberate IronDivi difference. The wallet RPC uses HTTP. Keep it on loopback or use an encrypted
+tunnel for remote access. The address allowlist and RPC credentials control
+access but do not encrypt wallet passphrases in transit.
 
 Not covered: a reconnecting client starts with a new budget (ElectrumX groups
 cost by subnet; IronDivi does not), there is no connection-rate or TLS

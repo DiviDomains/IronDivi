@@ -410,6 +410,17 @@ pub fn import_snapshot_with(
     expect_root: Option<&str>,
     known: &[KnownState],
 ) -> Result<SnapshotManifest, StorageError> {
+    import_with_staging(snapshot_dir, dest, params, expect_root, known, |_| {})
+}
+
+fn import_with_staging(
+    snapshot_dir: &Path,
+    dest: &Path,
+    params: ChainParams,
+    expect_root: Option<&str>,
+    known: &[KnownState],
+    on_staged: impl FnOnce(&Path),
+) -> Result<SnapshotManifest, StorageError> {
     let manifest = SnapshotManifest::read(snapshot_dir)?;
     if let Some(want) = expect_root {
         if !want.eq_ignore_ascii_case(&manifest.root_hash) {
@@ -433,16 +444,14 @@ pub fn import_snapshot_with(
         )));
     }
 
-    let mut tmp_name = dest
-        .file_name()
-        .ok_or_else(|| err("destination has no name"))?
-        .to_os_string();
-    tmp_name.push(".importing");
-    let tmp = dest.with_file_name(tmp_name);
-    if tmp.exists() {
-        std::fs::remove_dir_all(&tmp)?;
-    }
-    std::fs::create_dir_all(&tmp)?;
+    dest.file_name().ok_or_else(|| err("destination has no name"))?;
+    let parent = dest.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    // Each attempt owns a private staging directory. Never remove another
+    // import's staging tree, including one left behind by an interrupted run.
+    let staging = tempfile::Builder::new().prefix(".snapshot-import-").tempdir_in(parent)?;
+    let tmp = staging.path();
+    on_staged(tmp);
 
     let result = (|| -> Result<(), StorageError> {
         let src_data = snapshot_dir.join(DATA_DIR);
@@ -451,11 +460,14 @@ pub fn import_snapshot_with(
                 return Err(err(format!("unsafe file name {}", f.name)));
             }
             let from = src_data.join(&f.name);
-            let (size, sha) = hash_file(&from)?;
+            let copied = tmp.join(&f.name);
+            std::fs::copy(&from, &copied)?;
+            // Authenticate the private staged bytes that will actually be installed.
+            // The source directory may change while the import is in progress.
+            let (size, sha) = hash_file(&copied)?;
             if size != f.size || sha != f.sha256 {
                 return Err(err(format!("{} does not match the manifest", f.name)));
             }
-            std::fs::copy(&from, tmp.join(&f.name))?;
         }
         let db = Arc::new(ChainDatabase::open(&tmp)?);
         let chain = Chain::new(db.clone(), params.clone())?;
@@ -508,10 +520,7 @@ pub fn import_snapshot_with(
             std::fs::rename(&tmp, dest)?;
             Ok(manifest)
         }
-        Err(e) => {
-            let _ = std::fs::remove_dir_all(&tmp);
-            Err(e)
-        }
+        Err(e) => Err(e),
     }
 }
 
@@ -596,6 +605,33 @@ mod tests {
         assert_eq!(h, m.tip_height);
         assert_eq!(hash.to_string(), m.tip_hash);
         assert!(!work.path().join("dest.importing").exists());
+    }
+
+    #[test]
+    fn overlapping_imports_preserve_owned_staging_and_installed_database() {
+        let work = tempdir().unwrap();
+        let src = work.path().join("src");
+        let snap = work.path().join("snap");
+        let dest = work.path().join("dest");
+        let legacy = work.path().join("dest.importing");
+        std::fs::create_dir(&legacy).unwrap();
+        std::fs::write(legacy.join("sentinel"), b"legacy").unwrap();
+        make_source(&src);
+        let manifest = export_snapshot(&src, &snap, params()).unwrap();
+        let import = import_with_staging(&snap, &dest, params(), None, KNOWN_STATES, |outer| {
+            let marker = outer.join("outer-marker");
+            std::fs::write(&marker, b"outer").unwrap();
+            import_with_staging(&snap, &dest, params(), None, KNOWN_STATES, |inner| {
+                assert_ne!(outer, inner);
+            }).unwrap();
+            assert_eq!(std::fs::read(marker).unwrap(), b"outer");
+            std::fs::write(dest.join("winner-marker"), b"winner").unwrap();
+        });
+        assert!(import.is_err());
+        assert_eq!(std::fs::read(legacy.join("sentinel")).unwrap(), b"legacy");
+        assert_eq!(std::fs::read(dest.join("winner-marker")).unwrap(), b"winner");
+        let db = ChainDatabase::open(&dest).unwrap();
+        assert_eq!(db.snapshot_base().unwrap().1.to_string(), manifest.tip_hash);
     }
 
     /// Rewrite a snapshot's manifest so it matches whatever its files now hold: a

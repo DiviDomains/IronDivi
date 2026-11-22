@@ -398,7 +398,8 @@ off with -daemon, over SSH or without a display; -webui=0 turns it off;\n  \
 (an Electrum server, TCP/TLS/WebSocket; needs -txindex -addressindex)\n  \
 --export-chain --export-start N --export-end N --export-output DIR\n  \
 --export-snapshot DIR --import-snapshot DIR [--snapshot-root HEX]\n  \
---sign-snapshot DIR --verify-snapshot DIR --snapshot-signer ADDRESS\n";
+--sign-snapshot DIR --verify-snapshot DIR --snapshot-signer ADDRESS\n  \
+(verify-snapshot authenticates the manifest root signature only; import checks the payload)\n";
 
 impl Args {
     fn chain_mode(&self) -> ChainMode {
@@ -4459,7 +4460,7 @@ fn snapshot_command(config: &NodeConfig, args: &Args) -> Result<()> {
         let signer = args.snapshot_signer.as_deref().unwrap_or_default();
         let m = snapshot_sig::verify_dir(dir, signer)?;
         console_out!(
-            "OK: root_hash {} ({}, tip {}) is signed by {}",
+            "Manifest root signature verified: {} ({}, tip {}) signed by {}. Snapshot payload not checked.",
             m.root_hash,
             m.network,
             m.tip_height,
@@ -4493,10 +4494,16 @@ fn snapshot_command(config: &NodeConfig, args: &Args) -> Result<()> {
             state_hash
         );
     } else if let Some(dir) = &args.import_snapshot {
+        let mut authenticated_root = None;
         if let Some(signer) = &args.snapshot_signer {
             let signed = snapshot_sig::verify_dir(dir, signer)?;
+            if let Some(expected) = args.snapshot_root.as_deref() {
+                anyhow::ensure!(expected.eq_ignore_ascii_case(&signed.root_hash),
+                    "signed snapshot root does not match the requested root");
+            }
+            authenticated_root = Some(signed.root_hash.clone());
             console_out!(
-                "signature OK: root_hash {} signed by {}",
+                "Manifest root signature verified: {} signed by {}. Checking payload during import.",
                 signed.root_hash,
                 signer
             );
@@ -4505,7 +4512,7 @@ fn snapshot_command(config: &NodeConfig, args: &Args) -> Result<()> {
             dir,
             &config.chainstate_path(),
             storage_params(config),
-            args.snapshot_root.as_deref(),
+            authenticated_root.as_deref().or(args.snapshot_root.as_deref()),
         )
         .context("snapshot import failed")?;
         console_out!(

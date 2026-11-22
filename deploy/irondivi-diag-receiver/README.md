@@ -51,3 +51,9 @@ irondivi-diag-open <TICKET> --out /tmp/diag-<TICKET>
 # Close and delete a ticket from the receiver:
 irondivi-diag-open --close <TICKET>
 ```
+
+Run one receiver per private data directory. IPv4 clients share a quota by address
+and IPv6 clients by /64. Upload bodies have a ten-minute deadline. Received bytes count toward the daily allowance even when an upload is interrupted. The Unix receiver admits four concurrent uploads, counts
+existing files against 10 GiB, and reserves space for four maximum-size uploads
+and 1 GiB of free filesystem space. Other processes can consume filesystem space
+after admission. Busy receivers return 503 and storage refusals return 507.

@@ -1674,11 +1674,9 @@ impl WalletRpc {
         }))
     }
 
-    /// walletpassphrase as Divi Core's (rpcwallet.cpp:2573-2625): the
-    /// passphrase and the staking-only flag are read, the wallet unlocked, and
-    /// only then the timeout read (get_int64): a timeout that is no integer is
-    /// refused with the wallet left unlocked and unlocked_until as it was, and
-    /// one of 0 or less unlocks with no timer, unlocked_until now plus it
+    /// Validate the signed timeout before unlocking. This intentionally differs
+    /// from Divi Core's ordering for malformed input. Valid zero and negative
+    /// timeouts retain the Core behavior of unlocking without a timer.
     pub fn wallet_passphrase(&self, params: &Params) -> Result<serde_json::Value, Error> {
         let wallet = self.get_wallet()?;
         if !wallet.is_encrypted() {
@@ -1701,6 +1699,10 @@ impl WalletRpc {
             )
             .into());
         }
+        let timeout = params
+            .get(1)
+            .and_then(serde_json::Value::as_i64)
+            .ok_or_else(|| spirit_type_error(params.get(1), "int"))?;
         // A timer of a wallet unlocked for staking only goes back to staking
         let revert_to_staking = wallet.is_unlocked_for_staking_only();
         wallet
@@ -1716,12 +1718,6 @@ impl WalletRpc {
                 e @ divi_wallet::WalletError::Storage(_) => key_write_error(&wallet, e),
                 other => RpcError::new(codes::WALLET_ERROR, other.to_string()),
             })?;
-        let timeout = match params.get(1) {
-            Some(serde_json::Value::Number(n)) if n.is_i64() || n.is_u64() => n
-                .as_i64()
-                .unwrap_or_else(|| n.as_u64().unwrap_or_default() as i64),
-            other => return Err(spirit_type_error(other, "int")),
-        };
         wallet.set_unlock_timeout(timeout, revert_to_staking);
         Ok(serde_json::Value::Null)
     }

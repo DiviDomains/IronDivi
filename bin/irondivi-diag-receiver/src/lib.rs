@@ -103,6 +103,7 @@ struct Bucket {
     uploads: VecDeque<u64>,
     /// (time, bytes) in the last day
     bytes: VecDeque<(u64, u64)>,
+    day_bytes: u64,
 }
 
 impl Bucket {
@@ -119,11 +120,10 @@ impl Bucket {
             .front()
             .is_some_and(|(t, _)| now.saturating_sub(*t) >= DAY)
         {
-            self.bytes.pop_front();
+            if let Some((_, expired)) = self.bytes.pop_front() {
+                self.day_bytes -= expired;
+            }
         }
-    }
-    fn day_bytes(&self) -> u64 {
-        self.bytes.iter().map(|(_, b)| b).sum()
     }
     fn is_empty(&self) -> bool {
         self.uploads.is_empty() && self.bytes.is_empty()
@@ -132,6 +132,7 @@ impl Bucket {
 
 /// Keyed hash of a client address → its windows. Memory only.
 pub struct Limiter {
+    writers: Arc<tokio::sync::Semaphore>,
     key: [u8; 32],
     buckets: Mutex<HashMap<[u8; 16], Bucket>>,
 }
@@ -161,6 +162,7 @@ impl Limiter {
         let mut key = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut key);
         Limiter {
+            writers: Arc::new(tokio::sync::Semaphore::new(MAX_WRITERS)),
             key,
             buckets: Mutex::new(HashMap::new()),
         }
@@ -170,7 +172,11 @@ impl Limiter {
     pub fn peer(&self, addr: &str) -> [u8; 16] {
         let mut h = Sha256::new();
         h.update(self.key);
-        h.update(addr.as_bytes());
+        match addr.parse::<std::net::IpAddr>().map(|ip| ip.to_canonical()) {
+            Ok(std::net::IpAddr::V4(ip)) => h.update(ip.octets()),
+            Ok(std::net::IpAddr::V6(ip)) => h.update(&ip.octets()[..8]),
+            Err(_) => h.update([]),
+        }
         let d = h.finalize();
         let mut k = [0u8; 16];
         k.copy_from_slice(&d[..16]);
@@ -185,27 +191,26 @@ impl Limiter {
         if b.uploads.len() >= PER_HOUR {
             return Err("rate limited: 10 uploads an hour from one address; try again later");
         }
-        if b.day_bytes() + declared > PER_DAY_BYTES {
+        if b.day_bytes.saturating_add(declared) > PER_DAY_BYTES {
             return Err("rate limited: 1 GB a day from one address; try again tomorrow");
         }
         b.uploads.push_back(now);
         Ok(())
     }
 
-    /// Bytes received so far today, `extra` included; `false` = over the day's cap
-    pub fn within_day(&self, peer: [u8; 16], extra: u64, now: u64) -> bool {
+    /// Charge received bytes before writing, including incomplete uploads.
+    fn charge(&self, peer: [u8; 16], n: u64, now: u64) -> bool {
         let mut m = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
         let b = m.entry(peer).or_default();
         b.prune(now);
-        b.day_bytes() + extra <= PER_DAY_BYTES
-    }
-
-    pub fn record_bytes(&self, peer: [u8; 16], n: u64, now: u64) {
-        if n == 0 {
-            return;
+        b.day_bytes = b.day_bytes.saturating_add(n);
+        let allowed = b.day_bytes <= PER_DAY_BYTES;
+        if let Some((_, bytes)) = b.bytes.back_mut().filter(|(t, _)| *t == now) {
+            *bytes = bytes.saturating_add(n);
+        } else if n > 0 {
+            b.bytes.push_back((now, n));
         }
-        let mut m = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
-        m.entry(peer).or_default().bytes.push_back((now, n));
+        allowed
     }
 
     /// Forget every window that has passed
@@ -332,6 +337,41 @@ struct Receipt<'a> {
     retention_days: u64,
 }
 
+// Include room for every concurrent writer, its sidecar and block rounding.
+const MAX_WRITERS: usize = 4;
+const WRITE_HEADROOM: u64 = MAX_WRITERS as u64 * (CAP + 8192);
+const STORE_LIMIT: u64 = 10 << 30;
+const FREE_FLOOR: u64 = 1 << 30;
+
+#[cfg(unix)]
+fn has_space(dir: &Path) -> io::Result<bool> {
+    let fs = rustix::fs::statvfs(dir)?;
+    space_with_available(dir, fs.f_bavail.saturating_mul(fs.f_frsize))
+}
+
+#[cfg(unix)]
+fn space_with_available(dir: &Path, available: u64) -> io::Result<bool> {
+    if available < FREE_FLOOR + WRITE_HEADROOM {
+        return Ok(false);
+    }
+    let mut used = WRITE_HEADROOM;
+    for entry in std::fs::read_dir(dir)? {
+        let bytes = entry?.metadata()?.len();
+        used = used.saturating_add(bytes.max(4096));
+        if used > STORE_LIMIT {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+#[cfg(not(unix))]
+fn has_space(_dir: &Path) -> io::Result<bool> {
+    Err(io::Error::other(
+        "receiver requires filesystem space accounting",
+    ))
+}
+
 async fn upload(State(st): State<Arc<AppState>>, headers: HeaderMap, body: Body) -> Response {
     let t0 = now();
     // the address is hashed and not kept
@@ -354,7 +394,20 @@ async fn upload(State(st): State<Arc<AppState>>, headers: HeaderMap, body: Body)
     if let Err(why) = st.limiter.admit(peer, declared.unwrap_or(0), t0) {
         return refuse(StatusCode::TOO_MANY_REQUESTS, why);
     }
-    let r = receive(&st, peer, body).await;
+    let Ok(permit) = st.limiter.writers.clone().try_acquire_owned() else {
+        return refuse(StatusCode::SERVICE_UNAVAILABLE, "uploads busy; retry later");
+    };
+    let data = st.cfg.data.clone();
+    let Ok((Ok(true), _permit)) =
+        tokio::task::spawn_blocking(move || (has_space(&data), permit)).await
+    else {
+        return refuse(
+            StatusCode::INSUFFICIENT_STORAGE,
+            "receiver storage unavailable",
+        );
+    };
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(600);
+    let r = receive(&st, peer, body, deadline).await;
     match r {
         Ok((ticket, meta)) => {
             let receipt = Receipt {
@@ -375,18 +428,37 @@ async fn receive(
     st: &AppState,
     peer: [u8; 16],
     body: Body,
+    deadline: tokio::time::Instant,
 ) -> Result<(String, Meta), (StatusCode, &'static str)> {
     let dir = &st.cfg.data;
     let mut stream = body.into_data_stream();
     let mut head: Vec<u8> = Vec::with_capacity(AGE_HEADER.len());
     let mut pending: Vec<bytes_vec::Chunk> = Vec::new();
     let mut total: u64 = 0;
+    let timeout = (StatusCode::REQUEST_TIMEOUT, "upload timed out");
     let lost = (StatusCode::BAD_REQUEST, "the upload was cut off");
     // the header check comes before anything touches the disk
     while head.len() < AGE_HEADER.len() {
-        match stream.next().await {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(timeout);
+        }
+        match tokio::time::timeout_at(deadline, stream.next())
+            .await
+            .map_err(|_| timeout)?
+        {
             Some(Ok(c)) => {
-                total += c.len() as u64;
+                if c.is_empty() {
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                let allowed = st.limiter.charge(peer, c.len() as u64, now());
+                total = total.saturating_add(c.len() as u64);
+                if total > CAP {
+                    return Err((StatusCode::PAYLOAD_TOO_LARGE, "upload exceeds 100 MiB"));
+                }
+                if !allowed {
+                    return Err((StatusCode::TOO_MANY_REQUESTS, "daily upload limit exceeded"));
+                }
                 let need = AGE_HEADER.len() - head.len();
                 head.extend_from_slice(&c[..need.min(c.len())]);
                 pending.push(c);
@@ -401,16 +473,18 @@ async fn receive(
             "refused: not an age-encrypted file (no age header)",
         ));
     }
-    let tmp = dir.join(format!(
-        "{INCOMING}{}",
-        hex::encode(rand::random::<[u8; 8]>())
-    ));
-    let mut f = open_private(&tmp).await.map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "the receiver cannot store it now",
-        )
-    })?;
+    let incoming = tempfile::Builder::new()
+        .prefix(INCOMING)
+        .tempfile_in(dir)
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the receiver cannot store it now",
+            )
+        })?;
+    let (file, temp_path) = incoming.into_parts();
+    let mut f = tokio::fs::File::from_std(file);
+    let tmp = temp_path.to_path_buf();
     let mut h = Sha256::new();
     let fail = |code, msg| {
         let tmp = tmp.clone();
@@ -429,23 +503,29 @@ async fn receive(
             .await;
         }
     }
-    let now0 = now();
-    while let Some(c) = stream.next().await {
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            return fail(timeout.0, timeout.1).await;
+        }
+        let c = match tokio::time::timeout_at(deadline, stream.next()).await {
+            Ok(Some(c)) => c,
+            Ok(None) => break,
+            Err(_) => return fail(timeout.0, timeout.1).await,
+        };
         let c = match c {
             Ok(c) => c,
             Err(_) => return fail(lost.0, lost.1).await,
         };
-        total += c.len() as u64;
+        let allowed = st.limiter.charge(peer, c.len() as u64, now());
+        total = total.saturating_add(c.len() as u64);
         if total > CAP {
-            st.limiter.record_bytes(peer, total, now0);
             return fail(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "too large: the limit is 100 MiB; diag splits larger packages",
             )
             .await;
         }
-        if !st.limiter.within_day(peer, total, now0) {
-            st.limiter.record_bytes(peer, total, now0);
+        if !allowed {
             return fail(
                 StatusCode::TOO_MANY_REQUESTS,
                 "rate limited: 1 GB a day from one address; try again tomorrow",
@@ -461,7 +541,6 @@ async fn receive(
             .await;
         }
     }
-    st.limiter.record_bytes(peer, total, now0);
     if f.sync_all().await.is_err() {
         return fail(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -636,6 +715,20 @@ mod tests {
     use axum::http::Request;
     use tower::ServiceExt;
 
+    #[cfg(unix)]
+    #[test]
+    fn storage_admission_counts_existing_files_and_reserves_free_space() {
+        let dir = tempfile::tempdir().unwrap();
+        let minimum = FREE_FLOOR + WRITE_HEADROOM;
+        assert!(!space_with_available(dir.path(), minimum - 1).unwrap());
+        assert!(space_with_available(dir.path(), minimum).unwrap());
+        let existing = std::fs::File::create(dir.path().join("existing")).unwrap();
+        existing.set_len(STORE_LIMIT - WRITE_HEADROOM).unwrap();
+        assert!(space_with_available(dir.path(), minimum).unwrap());
+        std::fs::write(dir.path().join("sidecar"), b"x").unwrap();
+        assert!(!space_with_available(dir.path(), minimum).unwrap());
+    }
+
     #[test]
     fn alphabet_is_32_distinct_letters() {
         let mut v = ALPHABET.to_vec();
@@ -661,6 +754,9 @@ mod tests {
     #[test]
     fn limiter_10_an_hour_then_forgets() {
         let l = Limiter::new();
+        assert_eq!(l.peer("::ffff:192.0.2.1"), l.peer("192.0.2.1"));
+        assert_eq!(l.peer("2001:db8::1"), l.peer("2001:db8::ffff"));
+        assert_ne!(l.peer("2001:db8::1"), l.peer("2001:db8:0:1::1"));
         let p = l.peer("192.0.2.1");
         assert_ne!(p, l.peer("192.0.2.2"));
         for i in 0..10 {
@@ -679,10 +775,10 @@ mod tests {
     fn limiter_1gb_a_day() {
         let l = Limiter::new();
         let p = l.peer("198.51.100.7");
-        l.record_bytes(p, PER_DAY_BYTES - 10, 5);
+        assert!(l.charge(p, PER_DAY_BYTES - 10, 5));
         assert!(l.admit(p, 11, 6).unwrap_err().contains("1 GB"));
-        assert!(l.within_day(p, 10, 6));
-        assert!(!l.within_day(p, 11, 6));
+        assert!(l.charge(p, 10, 6));
+        assert!(!l.charge(p, 11, 6));
         assert!(l.admit(p, 11, 5 + DAY).is_ok());
     }
 
@@ -745,6 +841,70 @@ mod tests {
             .collect();
         v.sort();
         v
+    }
+
+    #[tokio::test]
+    async fn stalled_body_expires_before_or_after_header() {
+        let d = tempfile::tempdir().unwrap();
+        let (_, st) = app(d.path());
+        for prefix in [b"".as_slice(), AGE_HEADER] {
+            let chunks =
+                futures::stream::iter([Ok::<_, io::Error>(axum::body::Bytes::from_static(prefix))]);
+            let body = Body::from_stream(chunks.chain(futures::stream::pending()));
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(50);
+            let result = receive(&st, st.limiter.peer("127.0.0.1"), body, deadline).await;
+            assert_eq!(result.unwrap_err().0, StatusCode::REQUEST_TIMEOUT);
+            assert!(files(d.path()).is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_four_pending_bodies_releases_files_and_permits() {
+        let d = tempfile::tempdir().unwrap();
+        let (r, st) = app(d.path());
+        let mut requests = Vec::new();
+        for _ in 0..MAX_WRITERS {
+            let header = futures::stream::iter([Ok::<_, io::Error>(
+                axum::body::Bytes::from_static(AGE_HEADER),
+            )]);
+            let body = Body::from_stream(header.chain(futures::stream::pending()));
+            requests.push(tokio::spawn(
+                r.clone()
+                    .oneshot(Request::put("/v1/upload").body(body).unwrap()),
+            ));
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while files(d.path()).len() < MAX_WRITERS {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            put_body(&r, AGE_HEADER.to_vec(), "192.0.2.42").await.0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        for req in requests {
+            req.abort();
+            assert!(req.await.unwrap_err().is_cancelled());
+        }
+        assert_eq!(st.limiter.writers.available_permits(), MAX_WRITERS);
+        assert!(files(d.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn first_chunk_obeys_daily_quota_before_storage() {
+        let d = tempfile::tempdir().unwrap();
+        let (r, st) = app(d.path());
+        let addr = "192.0.2.10";
+        assert!(st
+            .limiter
+            .charge(st.limiter.peer(addr), PER_DAY_BYTES - 1, now()));
+        assert_eq!(
+            put_body(&r, AGE_HEADER.to_vec(), addr).await.0,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert!(files(d.path()).is_empty());
     }
 
     #[tokio::test]
@@ -868,6 +1028,19 @@ mod tests {
             r.clone().oneshot(req).await.unwrap().status(),
             StatusCode::PAYLOAD_TOO_LARGE
         );
+        // A single first chunk must be bounded before opening a file, too.
+        let mut first = vec![0u8; CAP as usize + 1];
+        first[..AGE_HEADER.len()].copy_from_slice(AGE_HEADER);
+        let req = Request::put("/v1/upload")
+            .body(Body::from_stream(futures::stream::iter([
+                Ok::<_, io::Error>(axum::body::Bytes::from(first)),
+            ])))
+            .unwrap();
+        assert_eq!(
+            r.clone().oneshot(req).await.unwrap().status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        assert!(files(d.path()).is_empty());
         // no Content-Length: counted while streaming
         let chunks = (0..=(CAP / (1 << 20))).map(|i| {
             let mut c = vec![0u8; 1 << 20];

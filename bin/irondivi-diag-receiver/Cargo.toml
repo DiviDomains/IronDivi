@@ -18,6 +18,7 @@ name = "irondivi-diag-open"
 path = "src/open.rs"
 
 [dependencies]
+tempfile = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
@@ -35,6 +36,8 @@ zstd = "0.13.4"
 # tar::read_all and the manifest format; no RocksDB
 divi-diag = { path = "../../crates/divi-diag", default-features = false }
 
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs"] }
+
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }
-tempfile = { workspace = true }
