@@ -49,6 +49,33 @@ pub const DEFAULT_LOCK_WAIT_SECS: u64 = 1800;
 /// quote expiry, and fails with a retryable error the taker can answer with a new quote.
 pub const GATE_BOUND_SECS: u64 = 20;
 
+/// Bound only a chain-time observation. Keep the timer outside held-read fallback
+/// so expiry cannot enter its wall-clock decision as a backend error.
+async fn observe_mtp(
+    bound: Duration,
+    read: impl std::future::Future<Output = Result<u32>>,
+) -> Result<u32> {
+    crate::rt::timeout(bound, read)
+        .await
+        .map_err(|_| SwapError::Transient(format!("maker chain-time read exceeded {bound:?}")))?
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn observation_preserves_answers_and_retries_elapsed_reads() {
+    use std::future::{pending, ready};
+    let bound = Duration::from_secs(1);
+    assert_eq!(observe_mtp(bound, ready(Ok(42))).await.unwrap(), 42);
+    assert!(matches!(
+        observe_mtp(bound, ready(Err(SwapError::Held("source".into())))).await,
+        Err(SwapError::Held(reason)) if reason == "source"
+    ));
+    assert!(matches!(
+        observe_mtp(Duration::ZERO, pending()).await,
+        Err(SwapError::Transient(_))
+    ));
+}
+
 /// Upper bound on transitions one `step` call performs (a swap has far fewer).
 const MAX_TRANSITIONS_PER_STEP: usize = 32;
 
@@ -788,7 +815,7 @@ impl Maker {
     }
 
     async fn taker_window_too_short(&self, r: &MakerRecord) -> Result<bool> {
-        let mtp = self.tk(r)?.median_time_past().await?;
+        let mtp = observe_mtp(self.gate_bound, self.tk(r)?.median_time_past()).await?;
         let remaining = r.taker_leg_htlc.locktime.saturating_sub(mtp) as u64;
         let needed = r.quote.maker_timeout_secs as u64 + self.cfg.claim_margin_secs as u64;
         Ok(remaining < needed)
@@ -899,7 +926,7 @@ impl Maker {
             return Ok(Flow::Idle);
         }
         let mb = self.mk(r)?.clone();
-        let mtp = mb.median_time_past().await?;
+        let mtp = observe_mtp(self.gate_bound, mb.median_time_past()).await?;
         let htlc = HtlcParams {
             hash: r.hash,
             claim_pubkey: r.taker_maker_leg_pubkey,
@@ -1058,7 +1085,9 @@ impl Maker {
         if confs.is_some_and(|c| c >= self.maker_leg_confs(r)) {
             return Ok(Flow::Idle);
         }
-        let remaining = htlc.locktime.saturating_sub(mk.median_time_past().await?);
+        let remaining = htlc
+            .locktime
+            .saturating_sub(observe_mtp(self.gate_bound, mk.median_time_past()).await?);
         if remaining < self.cfg.claim_margin_secs {
             return self.enter(r, SwapState::MakerRefundable);
         }
@@ -1368,7 +1397,11 @@ impl Maker {
         let (htlc, _) = self.maker_leg(r)?;
         let mk = self.mk(r)?;
         let at = self.maker_refund_read(r)?;
-        let mtp = hold::median_time_past(mk.as_ref(), &at, "refund: maker-leg MTP read").await?;
+        let mtp = observe_mtp(
+            self.gate_bound,
+            hold::median_time_past(mk.as_ref(), &at, "refund: maker-leg MTP read"),
+        )
+        .await?;
         Ok(mk.refund_final(mtp, htlc.locktime))
     }
 
