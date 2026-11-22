@@ -51,3 +51,9 @@ The preceding candidate passed 957 wallet, staking and RPC tests and a daemon co
 Four maker chain-time reads now use the existing 20-second gate budget. The refund eligibility read shares that budget across the held-read decision and primary-only retry; expiry returns a retryable error before eligibility is evaluated. Existing backend errors retain their existing policy. No new timer surrounds transaction construction, broadcast, reservation mutations, confirmations or spend scans. This is a bound on cooperative observation waits, not on total step duration or recovery deadlines.
 
 The native engine, held-read, pending-cursor, coin-race, admission and adapter reservation suites passed 384 tests. The applied maker source hash matches the tested source. The focused helper test verifies successful values, preserved backend errors and retryable timeout mapping. No production latency or scheduler fairness guarantee is established.
+
+## Explicit swap simulation selection
+
+The daemon defaults to live operation and rejects missing DIVI or BTC configuration before opening the swap store. Simulation requires `--backend mock`; existing simulation launchers must add it and use a separate database. Fully configured live launchers retain their command line. Backend selection flags conflict with store inspection and reservation-release commands. This does not bind a database to a backend identity: an explicit mock invocation can still select an inappropriate store.
+
+The patched source passed 43 daemon tests, two startup/CLI tests and three funded USDC recovery scenarios using default live selection. Missing and partial configurations were checked against fresh and existing stores. All four changed source hashes matched the applied tree. No live service was restarted or deployed.

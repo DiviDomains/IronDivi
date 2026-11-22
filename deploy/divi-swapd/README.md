@@ -1,5 +1,7 @@
 # divi-swapd deployment (dnsdivi, testnet POC)
 
+Daemon startup defaults to live and requires both `[divi]` and `[btc]`. When upgrading a simulation, add `--backend mock` and use its own database. For live recovery, restore the original configuration and database path. Database inspection commands take no backend flag.
+
 Runs the maker daemon as a hardened systemd service behind the existing nginx. The plan is
 `docs/plans/atomic-swap-poc.md` §5 Wave 3. SSH uses only the `dnsdivi` host alias.
 

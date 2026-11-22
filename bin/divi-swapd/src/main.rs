@@ -43,9 +43,8 @@ struct Args {
     /// Path to the TOML config file.
     #[arg(long)]
     config: PathBuf,
-    /// Override the backend: `mock` runs every chain in-process (local/CI, with LTC and ZEC
-    /// offers added), `live` uses the public testnets.
-    #[arg(long, value_parser = parse_backend)]
+    /// Use live chains (default), or explicitly select mock for an isolated simulation.
+    #[arg(long, value_parser = parse_backend, conflicts_with_all = ["xmr_inflight", "reservations", "release_reservation"])]
     backend: Option<BackendKind>,
     /// Print the XMR swaps still in flight, read straight from the swap store, and exit.
     /// Read-only: nothing is created or written, no chain or key is touched, no HTTP.
@@ -995,13 +994,10 @@ async fn main() -> Result<()> {
         .init();
 
     let cfg = DaemonConfig::load(&args.config)?;
-    let kind = args
-        .backend
-        .unwrap_or(if cfg.divi.is_some() && cfg.btc.is_some() {
-            BackendKind::Live
-        } else {
-            BackendKind::Mock
-        });
+    let kind = args.backend.unwrap_or(BackendKind::Live);
+    if kind == BackendKind::Live && (cfg.divi.is_none() || cfg.btc.is_none()) {
+        bail!("live startup requires both [divi] and [btc] sections; restore the live configuration for recovery, or use --backend mock with a separate simulation database");
+    }
     let store = Store::open(&cfg.db_path).context("opening swap database")?;
     // Counter chains of swaps still under way: their backends start even if every offer on
     // that chain has since been switched off.

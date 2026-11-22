@@ -258,7 +258,7 @@ key = "credential:key"
         .unwrap();
     }
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_divi-swapd"))
-        .args(["--backend", "live", "--config"])
+        .arg("--config")
         .arg(cfg)
         .env("CREDENTIALS_DIRECTORY", dir.path())
         .kill_on_drop(true)
