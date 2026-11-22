@@ -287,7 +287,12 @@ async fn scan_hidden_coin_is_held() {
     let d = dual(&a.uri(), &b.uri());
     // The fallback knows a coin the primary hides.
     pay_to_us(&cb, &d, 1, 7_000, 50);
-    ca.lock().blocks.insert(50, vec![]);
+    let coinbase = txid(7).to_rpc_hex();
+    for chain in [&ca, &cb] {
+        let mut c = chain.lock();
+        c.blocks.entry(50).or_default().push(coinbase.clone());
+        c.txs.insert(coinbase.clone(), json!({"txid":coinbase,"vin":[{"coinbase":"01"}],"vout":[]}));
+    }
     let s = single(&a.uri());
     s.scan_range(50, 50).await.unwrap();
     assert_eq!(

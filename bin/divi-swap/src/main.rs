@@ -23,7 +23,9 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use divi_swap::mock::MockChain;
-use divi_swap::{Amount, Chain, ChainBackend, InputReservations, Store, Taker};
+use divi_swap::{
+    Amount, Chain, ChainBackend, Direction, InputReservations, QuoteIntent, Store, Taker,
+};
 use divi_swap_cli::{flow, ClaimGate, ClaimPolicy, MakerClient, RunOpts, Sessions};
 use swap_chain_btc::BtcBackend;
 use swap_chain_divi::DiviBackend;
@@ -171,8 +173,8 @@ struct Cli {
     #[arg(long, global = true)]
     usdc_key: Option<String>,
     /// Which EVM network: `sepolia` (default), `base-sepolia`, or the mainnets `ethereum` and
-    /// `base` (only with `--allow-mainnet`). Only picks defaults for
-    /// `--usdc-rpc-url`/`--usdc-token` below when they are left unset.
+    /// `base` (only with `--allow-mainnet`). Picks endpoint/token defaults; new funding
+    /// requires the endpoint's reported chain id to match the accepted network.
     #[arg(long, global = true, default_value = "sepolia")]
     usdc_network: String,
     /// EVM JSON-RPC URL. Defaults to a free public endpoint for `--usdc-network`.
@@ -262,6 +264,16 @@ fn parse_profile(s: &str) -> Result<divi_swap::Profile, String> {
     }
 }
 
+fn parse_direction(s: &str) -> Result<Direction, String> {
+    match s {
+        "taker-pays-btc" | "taker_pays_btc" => Ok(Direction::TakerPaysBtc),
+        "taker-pays-divi" | "taker_pays_divi" => Ok(Direction::TakerPaysDivi),
+        other => Err(format!(
+            "direction must be taker-pays-btc (buy DIVI) or taker-pays-divi (sell DIVI), got {other:?}"
+        )),
+    }
+}
+
 fn parse_counter_chain(s: &str) -> Result<Chain, String> {
     match s.parse::<Chain>() {
         Ok(c) if c.is_counter() => Ok(c),
@@ -293,6 +305,43 @@ struct DealArgs {
     /// Counter-chain amount (BTC, LTC, …), in satoshis.
     #[arg(long)]
     btc_sats: u64,
+    /// `taker-pays-btc` (buy DIVI) or `taker-pays-divi` (sell DIVI); a quote in the other
+    /// direction is refused. Required by `accept` and `run`.
+    #[arg(long, value_parser = parse_direction)]
+    direction: Option<Direction>,
+    /// Worst acceptable price in DIVI sats per counter coin: the least DIVI received when
+    /// buying DIVI, the most DIVI paid when selling. Required by `accept` and `run`: the
+    /// maker's offer list and quote are the maker's word, so funds are only committed
+    /// against a limit the user chose.
+    #[arg(long)]
+    limit_price: Option<u64>,
+    /// Seconds of quote validity that must be left when the quote is accepted.
+    #[arg(long, default_value_t = divi_swap::intent::DEFAULT_MIN_REMAINING_SECS)]
+    min_quote_secs: u64,
+    /// Longest taker-leg timeout to lock funds under. Default: twice the `--profile`
+    /// taker timeout (hashlock flow; the XMR flow has its own fixed timelocks).
+    #[arg(long)]
+    max_taker_timeout_secs: Option<u32>,
+}
+
+impl DealArgs {
+    /// What `accept` and `run` hold the maker's quote to: this offer, amount, `counter`
+    /// chain (the taker's `--counter-chain`), direction and price limit. `quote` needs none
+    /// of it: printing a quote commits nothing.
+    fn intent(&self, counter: Chain) -> Result<QuoteIntent> {
+        let (Some(direction), Some(limit)) = (self.direction, self.limit_price) else {
+            bail!(
+                "accept/run commit funds: pass --direction and --limit-price (the worst price \
+                 you accept, in DIVI sats per {counter} coin); a maker's offer page is not \
+                 a trusted source of terms"
+            );
+        };
+        Ok(
+            QuoteIntent::with_limit(&self.offer, self.btc_sats, counter, direction, limit)?
+                .with_min_remaining_secs(self.min_quote_secs)
+                .with_max_taker_timeout_secs(self.max_taker_timeout_secs),
+        )
+    }
 }
 
 #[derive(Subcommand)]
@@ -496,7 +545,14 @@ fn live_usdc_backend(cli: &Cli) -> Result<Arc<swap_chain_evm::UsdcBackend>> {
         .parse()
         .map_err(|_| anyhow::anyhow!("usdc key is not a valid secp256k1 hex key"))?;
     drop(hex_key);
-    let (_network, rpc_url, token) = usdc_endpoints(cli)?;
+    usdc_backend_with_key(cli, key)
+}
+
+fn usdc_backend_with_key(
+    cli: &Cli,
+    key: swap_chain_evm::PrivateKeySigner,
+) -> Result<Arc<swap_chain_evm::UsdcBackend>> {
+    let (network, rpc_url, token) = usdc_endpoints(cli)?;
     let htlc = cli
         .usdc_htlc
         .as_deref()
@@ -507,7 +563,45 @@ fn live_usdc_backend(cli: &Cli) -> Result<Arc<swap_chain_evm::UsdcBackend>> {
         .parse()
         .map_err(|e| anyhow::anyhow!("--usdc-token: {e}"))?;
     let backend = swap_chain_evm::UsdcBackend::new(&rpc_url, key, htlc, token)?;
+    // New fundings only (`lock`, and the lock inside `run`): closed for a held (mainnet)
+    // label, otherwise open only while the endpoint reports `network`'s chain id. `claim`,
+    // `refund` and `balance` are not gated: a funded swap must stay recoverable.
+    let backend = match usdc_label_hold(cli) {
+        Some(why) => backend.with_funding_closed(why),
+        None => backend.with_funding_chain_id(network.chain_id()),
+    };
     Ok(Arc::new(with_usdc_fallback(cli, &rpc_url, backend)?))
+}
+
+/// The advisory hold `--usdc-network` puts on new USDC swaps, judged by the label alone.
+fn usdc_label_hold(cli: &Cli) -> Option<String> {
+    divi_swap::config::check_advisory_hold(&[(Chain::Usdc, cli.usdc_network.as_str(), None)]).err()
+}
+
+/// Whether `cmd` opens a new swap (admission-gated) rather than recovering or reading one:
+/// `claim`, `refund`, `status`, `balance` and `tip` are never held.
+fn starts_new_swap(cmd: &Cmd) -> bool {
+    matches!(cmd, Cmd::Accept(_) | Cmd::Run { .. })
+}
+
+/// `accept` and `run` on a live `--counter-chain usdc` start a swap whose lock this process
+/// will fund: refuse before the maker is contacted unless the label is not held and the
+/// endpoint(s) report that network's chain id. Mock backends and other chains pass.
+async fn require_usdc_admission(cli: &Cli) -> Result<()> {
+    if !is_usdc_live(cli) {
+        return Ok(());
+    }
+    // Before any key is read.
+    if let Some(why) = usdc_label_hold(cli) {
+        bail!("new usdc swaps are held: {why}");
+    }
+    live_usdc_backend(cli)?
+        .usdc_admission()
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!("new usdc swaps are held: the network could not be authenticated: {e}")
+        })?;
+    Ok(())
 }
 
 /// Apply `--usdc-fallback-rpc-url` to a USDC backend on `rpc_url`. Unset or blank leaves it
@@ -1316,11 +1410,25 @@ async fn ready_backends(cli: &Cli) -> Result<Backends> {
 }
 
 async fn taker(cli: &Cli) -> Result<Taker> {
-    let b = ready_backends(cli).await?;
-    with_claim_fees(
-        Taker::new(b.divi, b.btc, Store::open(&cli.db)?).with_profile_floor(cli.profile),
+    configured_taker(cli, &ready_backends(cli).await?)
+}
+
+fn configured_taker(cli: &Cli, b: &Backends) -> Result<Taker> {
+    let taker = with_claim_fees(
+        Taker::new(b.divi.clone(), b.btc.clone(), Store::open(&cli.db)?)
+            .with_profile_floor(cli.profile),
         cli,
-    )
+    )?;
+    Ok(with_usdc_admission_hold(taker, cli))
+}
+
+/// A held label can veto new USDC funding. An unheld label cannot authorize it:
+/// the engine must still authenticate the counter in the persisted quote.
+fn with_usdc_admission_hold(taker: Taker, cli: &Cli) -> Taker {
+    match usdc_label_hold(cli) {
+        Some(why) => taker.with_admission_hold(Chain::Usdc, why),
+        None => taker,
+    }
 }
 
 /// `claim`, `refund` and `run` on the prepared backends `b`, then [`sweep_locks`] whether
@@ -1334,11 +1442,7 @@ async fn finishing(cli: &Cli, sessions: &Sessions, b: Backends, now: u32) -> Res
 }
 
 async fn finish(cli: &Cli, sessions: &Sessions, b: Backends) -> Result<String> {
-    let taker = with_claim_fees(
-        Taker::new(b.divi.clone(), b.btc.clone(), Store::open(&cli.db)?)
-            .with_profile_floor(cli.profile),
-        cli,
-    )?;
+    let taker = configured_taker(cli, &b)?;
     match &cli.cmd {
         Cmd::Claim { swap } => {
             let client = MakerClient::new(&sessions.get(swap)?.maker_url);
@@ -1370,12 +1474,11 @@ async fn finish(cli: &Cli, sessions: &Sessions, b: Backends) -> Result<String> {
                 divi: b.divi,
                 btc: b.btc,
             };
-            let (local, state) = flow::run_swap_gated(
+            let (local, state) = flow::run_swap_intent(
                 &taker,
                 &MakerClient::new(&deal.maker.maker),
                 sessions,
-                &deal.offer,
-                deal.btc_sats,
+                &deal.intent(cli.counter_chain)?,
                 &opts,
                 &mut || {},
                 Some(&gate),
@@ -1404,6 +1507,10 @@ async fn main() -> Result<()> {
     if cli.counter_chain == Chain::Xmr {
         return xmr_main(&cli, &sessions).await;
     }
+    // `accept` and `run` start a swap; `claim`, `refund`, `status`, `balance` recover or read.
+    if starts_new_swap(&cli.cmd) {
+        require_usdc_admission(&cli).await?;
+    }
 
     match &cli.cmd {
         Cmd::Quote(d) => {
@@ -1413,12 +1520,12 @@ async fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&quote)?);
         }
         Cmd::Accept(d) => {
-            let local = flow::begin(
+            let intent = d.intent(cli.counter_chain)?;
+            let local = flow::begin_with_intent(
                 &taker(&cli).await?,
                 &MakerClient::new(&d.maker.maker),
                 &sessions,
-                &d.offer,
-                d.btc_sats,
+                &intent,
             )
             .await?;
             println!("{local}");
@@ -1546,6 +1653,12 @@ async fn live_xmr_taker(cli: &Cli) -> Result<divi_swap_xmr::XmrTaker> {
     )
     .await
     .map_err(|e| anyhow::anyhow!("{e}"))?;
+    // Real-value xmr is held for *new* swaps (RUSTSEC-2026-0387, RUSTSEC-2025-0127): the taker
+    // below refuses to start one or lock XMR, but `claim` and `refund` of a swap already under
+    // way still run. The monerod check above is what authenticates the network.
+    let hold =
+        divi_swap::config::check_advisory_hold(&[(Chain::Xmr, cli.xmr_network.as_str(), None)])
+            .err();
     let wallet_rpc_password = match &cli.xmr_wallet_rpc_password {
         Some(_) => secret_hex(
             &cli.xmr_wallet_rpc_password,
@@ -1585,13 +1698,26 @@ async fn live_xmr_taker(cli: &Cli) -> Result<divi_swap_xmr::XmrTaker> {
     divi_swap_xmr::check_divi_chain(&divi, live::divi_chain_name(network))
         .await
         .map_err(|e| anyhow::anyhow!("--xmr-divi-rpc-url: {e}"))?;
-    Ok(divi_swap_xmr::XmrTaker::new(
+    let taker = divi_swap_xmr::XmrTaker::new(
         profile,
         Arc::new(divi),
         Arc::new(xmr),
         Store::open(&cli.db)?,
     )?
-    .with_profile_floor(cli.profile))
+    .with_profile_floor(cli.profile);
+    Ok(match hold {
+        Some(why) => taker.with_admission_hold(why),
+        None => taker,
+    })
+}
+
+/// Fail a new xmr swap (`accept`, `run`) under an admission hold before the maker is contacted
+/// or any Paillier prime is generated.
+fn require_xmr_admission(taker: &divi_swap_xmr::XmrTaker) -> Result<()> {
+    match taker.admission_hold() {
+        Some(why) => bail!("new xmr swaps are held: {why}"),
+        None => Ok(()),
+    }
 }
 
 /// `--counter-chain xmr`: the adaptor-swap taker (`divi_swap_cli::xmr_flow`).
@@ -1605,15 +1731,12 @@ async fn xmr_main(cli: &Cli, sessions: &Sessions) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&quote)?);
         }
         Cmd::Accept(d) => {
+            let intent = d.intent(Chain::Xmr)?;
             let taker = xmr_taker(cli).await?;
-            let local = xmr_flow::begin(
-                &taker,
-                &MakerClient::new(&d.maker.maker),
-                sessions,
-                &d.offer,
-                d.btc_sats,
-            )
-            .await?;
+            require_xmr_admission(&taker)?;
+            let local =
+                xmr_flow::begin(&taker, &MakerClient::new(&d.maker.maker), sessions, &intent)
+                    .await?;
             println!("{local}");
         }
         Cmd::Status { swap } => {
@@ -1638,16 +1761,18 @@ async fn xmr_main(cli: &Cli, sessions: &Sessions) -> Result<()> {
             if claim_not_before.is_some() || *never_claim {
                 bail!("--claim-not-before / --never-claim are hashlock-only");
             }
+            let intent = deal.intent(Chain::Xmr)?;
             let opts = RunOpts {
                 timeout: Duration::from_secs(*timeout_secs),
                 poll: Duration::from_secs(*poll_secs),
             };
+            let taker = xmr_taker(cli).await?;
+            require_xmr_admission(&taker)?;
             let (local, outcome) = xmr_flow::run(
-                &xmr_taker(cli).await?,
+                &taker,
                 &MakerClient::new(&deal.maker.maker),
                 sessions,
-                &deal.offer,
-                deal.btc_sats,
+                &intent,
                 &opts,
                 &mut || {},
             )
@@ -1665,6 +1790,65 @@ async fn xmr_main(cli: &Cli, sessions: &Sessions) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cli_of(cmd: &[&str]) -> Cli {
+        let mut argv = vec!["divi-swap"];
+        argv.extend_from_slice(cmd);
+        Cli::parse_from(argv)
+    }
+
+    /// Only `accept` and `run` are new swaps; recovery and read commands are never held.
+    #[test]
+    fn only_accept_and_run_start_a_new_swap() {
+        let deal = [
+            "--maker",
+            "http://m",
+            "--offer",
+            "o",
+            "--btc-sats",
+            "1",
+            "--direction",
+            "taker-pays-btc",
+            "--limit-price",
+            "1",
+        ];
+        for verb in ["accept", "run"] {
+            let mut a = vec![verb];
+            a.extend_from_slice(&deal);
+            assert!(starts_new_swap(&cli_of(&a).cmd), "{verb}");
+        }
+        for a in [
+            &["claim", "--swap", "s"][..],
+            &["refund", "--swap", "s"],
+            &["status", "--swap", "s"],
+            &["balance"],
+        ] {
+            assert!(!starts_new_swap(&cli_of(a).cmd), "{a:?}");
+        }
+    }
+
+    /// A held xmr taker refuses a new swap before the maker is contacted; one without a hold
+    /// (the recovery `claim`/`refund` path never calls this) is admitted.
+    #[test]
+    fn a_held_xmr_taker_refuses_new_swaps_only_when_held() {
+        use divi_swap_xmr::mock::{MockDiviChain, MockMoneroChain};
+        let divi = MockDiviChain::new(1_800_000_000, 60);
+        let xmr = MockMoneroChain::new();
+        let taker = || {
+            divi_swap_xmr::XmrTaker::new(
+                divi_swap_xmr::XmrConfig::testnet(),
+                Arc::new(divi.wallet(2)),
+                Arc::new(xmr.wallet("taker", 0)),
+                Store::in_memory().unwrap(),
+            )
+            .unwrap()
+        };
+        assert!(require_xmr_admission(&taker()).is_ok());
+        let err = require_xmr_admission(&taker().with_admission_hold("advisory"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("held") && err.contains("advisory"), "{err}");
+    }
 
     fn tip_cli(extra: &[&str]) -> Cli {
         let mut argv = vec!["divi-swap"];
@@ -2051,6 +2235,81 @@ mod tests {
             "1",
         ]);
         Cli::try_parse_from(argv).unwrap()
+    }
+
+    fn deal(extra: &[&str]) -> std::result::Result<Cli, clap::Error> {
+        let mut argv = vec![
+            "divi-swap",
+            "--counter-chain",
+            "ltc",
+            "accept",
+            "--maker",
+            "http://x",
+            "--offer",
+            "o",
+            "--btc-sats",
+            "5",
+        ];
+        argv.extend_from_slice(extra);
+        Cli::try_parse_from(argv)
+    }
+
+    #[test]
+    fn deal_flags_become_the_quote_intent() {
+        // Without a direction and a limit nothing can be accepted, on any counter chain.
+        let c = deal(&[]).unwrap();
+        let Cmd::Accept(d) = &c.cmd else {
+            panic!("not accept")
+        };
+        for chain in [Chain::Ltc, Chain::Xmr] {
+            let e = d.intent(chain).unwrap_err().to_string();
+            assert!(e.contains("--direction and --limit-price"), "{e}");
+        }
+        let c = deal(&["--limit-price", "7"]).unwrap();
+        let Cmd::Accept(d) = &c.cmd else {
+            panic!("not accept")
+        };
+        assert!(
+            d.intent(c.counter_chain).is_err(),
+            "a limit needs a direction"
+        );
+
+        let c = deal(&[
+            "--direction",
+            "taker-pays-divi",
+            "--limit-price",
+            "7000000000",
+            "--min-quote-secs",
+            "20",
+            "--max-taker-timeout-secs",
+            "30000",
+        ])
+        .unwrap();
+        let Cmd::Accept(d) = &c.cmd else {
+            panic!("not accept")
+        };
+        let i = d.intent(c.counter_chain).unwrap();
+        assert_eq!(
+            i,
+            QuoteIntent::with_limit("o", 5, Chain::Ltc, Direction::TakerPaysDivi, 7_000_000_000)
+                .unwrap()
+                .with_min_remaining_secs(20)
+                .with_max_taker_timeout_secs(Some(30_000))
+        );
+        assert_eq!(
+            i.divi_bound,
+            Amount(350),
+            "5 sats at 70 DIVI per LTC, at most"
+        );
+        // The XMR flow is held to the same flags, on the XMR chain.
+        assert_eq!(d.intent(Chain::Xmr).unwrap().counter_chain, Chain::Xmr);
+        // A limit that rounds to no DIVI cannot be agreed to.
+        let c = deal(&["--direction", "taker-pays-btc", "--limit-price", "7"]).unwrap();
+        let Cmd::Accept(d) = &c.cmd else {
+            panic!("not accept")
+        };
+        assert!(d.intent(c.counter_chain).is_err());
+        assert!(deal(&["--direction", "sideways"]).is_err());
     }
 
     #[test]
@@ -2533,6 +2792,10 @@ mod tests {
     /// An EVM JSON-RPC node that answers `eth_getBlockByNumber` with a latest block at
     /// `timestamp`, and refuses everything else.
     async fn evm_node(timestamp: u64) -> wiremock::MockServer {
+        evm_node_with_id(timestamp, None).await
+    }
+
+    async fn evm_node_with_id(timestamp: u64, chain_id: Option<u64>) -> wiremock::MockServer {
         let zero = format!("0x{}", "0".repeat(64));
         let block = serde_json::json!({
             "hash": format!("0x{}", "bc".repeat(32)), "parentHash": zero, "sha3Uncles": zero,
@@ -2548,8 +2811,11 @@ mod tests {
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .respond_with(move |req: &wiremock::Request| {
                 let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
-                let mut reply = match body["method"].as_str() {
-                    Some("eth_getBlockByNumber") => serde_json::json!({"result": block}),
+                let mut reply = match (body["method"].as_str(), chain_id) {
+                    (Some("eth_chainId"), Some(id)) => {
+                        serde_json::json!({"result": format!("{id:#x}")})
+                    }
+                    (Some("eth_getBlockByNumber"), _) => serde_json::json!({"result": block}),
                     _ => serde_json::json!({"error": {"code": -32601, "message": "unmocked"}}),
                 };
                 reply["jsonrpc"] = "2.0".into();
@@ -2617,6 +2883,234 @@ mod tests {
             err.contains("--usdc-fallback-rpc-url") && err.contains("--usdc-rpc-url"),
             "{err}"
         );
+    }
+
+    #[tokio::test]
+    async fn usdc_binding_survives_cli_restart_in_both_directions() {
+        use divi_swap::{api::Offer, backend::UsdcAdmission, Maker, Profile, SwapConfig};
+        const NOW: u32 = 1_800_000_000;
+        let base = evm_node_with_id(NOW.into(), Some(84_532)).await;
+        let sep = evm_node_with_id(NOW.into(), Some(11_155_111)).await;
+        let unreadable = evm_node(NOW.into()).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("session.db");
+        let store = Store::open(&db).unwrap();
+        let divi = MockChain::new(Chain::Divi, NOW, 60);
+        let counter = MockChain::new(Chain::Usdc, NOW, 60);
+        let funds = Amount(2_000_000_000);
+        let payer = Arc::new(divi.backend(3, funds));
+        let configured =
+            |node: &MockServer, network: Option<&str>, htlc: &str, token: Option<&str>| {
+                let mut flags = vec![
+                    "--backend",
+                    "live",
+                    "--counter-chain",
+                    "usdc",
+                    "--db",
+                    db.to_str().unwrap(),
+                    "--usdc-htlc",
+                    htlc,
+                ];
+                if let Some(token) = token {
+                    flags.extend(["--usdc-token", token]);
+                }
+                let uri = node.uri();
+                flags.extend(["--usdc-rpc-url", &uri]);
+                if let Some(net) = network {
+                    flags.extend(["--usdc-network", net]);
+                }
+                flags.extend(["lock", "--swap", "s"]);
+                let c = cli_of(&flags);
+                let key = hex::encode([0x33; 32]).parse().unwrap();
+                configured_taker(
+                    &c,
+                    &Backends {
+                        divi: payer.clone(),
+                        btc: usdc_backend_with_key(&c, key).unwrap(),
+                        live: None,
+                    },
+                )
+                .unwrap()
+            };
+        let contract = "0x1111111111111111111111111111111111111111";
+        let other = "0x2222222222222222222222222222222222222222";
+        let engine =
+            |node: &MockServer, network: Option<&str>| configured(node, network, contract, None);
+        let default_cli = cli_of(&[
+            "--backend",
+            "live",
+            "--db",
+            db.to_str().unwrap(),
+            "lock",
+            "--swap",
+            "s",
+        ]);
+        let missing = configured_taker(
+            &default_cli,
+            &Backends {
+                divi: payer.clone(),
+                btc: Arc::new(MockChain::new(Chain::Btc, NOW, 600).backend(4, funds)),
+                live: None,
+            },
+        )
+        .unwrap();
+        let mock = configured_taker(
+            &cli(&[
+                "--backend",
+                "mock",
+                "--counter-chain",
+                "usdc",
+                "--db",
+                db.to_str().unwrap(),
+            ]),
+            &Backends {
+                divi: payer.clone(),
+                btc: Arc::new(counter.backend(4, funds)),
+                live: None,
+            },
+        )
+        .unwrap();
+        for direction in [Direction::TakerPaysBtc, Direction::TakerPaysDivi] {
+            let maker = Maker::new(
+                SwapConfig::profile(Profile::Testnet),
+                Arc::new(divi.backend(1, funds)),
+                Arc::new(counter.backend(1, funds)),
+                store.clone(),
+                vec![Offer {
+                    id: "o".into(),
+                    direction,
+                    counter_chain: Chain::Usdc,
+                    divi_sats_per_btc: 50_000_000_000,
+                    min_btc_sats: 10_000,
+                    max_btc_sats: 5_000_000,
+                }],
+            )
+            .unwrap();
+            let quote = maker.quote("o", 1_000_000).await.unwrap();
+            let admitted = engine(&base, Some("base-sepolia"));
+            let (id, req) = admitted.prepare(&quote).await.unwrap();
+            admitted
+                .accepted(&id, &maker.accept(req).await.unwrap())
+                .await
+                .unwrap();
+            let rec = store.get_taker_swap(&id).unwrap().unwrap();
+            assert_eq!(
+                rec.usdc_admission,
+                Some(UsdcAdmission::EvmContracts {
+                    chain_id: 84_532,
+                    token: hex::decode(&swap_chain_evm::UsdcNetwork::BaseSepolia.usdc_token()[2..])
+                        .unwrap()
+                        .try_into()
+                        .unwrap(),
+                    htlc: [0x11; 20]
+                })
+            );
+
+            for (restart, reason) in [
+                (
+                    &configured(&base, Some("base-sepolia"), other, None),
+                    "differs from accepted quote",
+                ),
+                (
+                    &configured(&base, Some("base-sepolia"), contract, Some(other)),
+                    "differs from accepted quote",
+                ),
+                (&engine(&sep, None), "differs from accepted quote"),
+                (&engine(&base, None), "configured network"),
+                (&engine(&unreadable, Some("base-sepolia")), "get_chain_id"),
+                (&missing, "no usdc backend"),
+                (&mock, "differs from accepted quote"),
+            ] {
+                let err = restart.lock(&id).await.unwrap_err().to_string();
+                assert!(err.contains(reason), "{err}");
+                assert_eq!(store.get_taker_swap(&id).unwrap().unwrap(), rec);
+                assert_eq!(payer.funding_calls(), 0);
+            }
+            let mut legacy = rec.clone();
+            legacy.usdc_admission = None;
+            store.put_taker_swap(&legacy).unwrap();
+            assert!(admitted
+                .lock(&id)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("fresh quote"));
+            // An earlier schema recorded only the chain ID. Even the same chain
+            // cannot prove which token or HTLC the operator previously accepted.
+            legacy.usdc_admission = Some(serde_json::from_str(r#"{"Evm":84532}"#).unwrap());
+            store.put_taker_swap(&legacy).unwrap();
+            assert!(admitted
+                .lock(&id)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("differs from accepted quote"));
+            assert_eq!(payer.funding_calls(), 0);
+            store.put_taker_swap(&rec).unwrap();
+
+            if direction == Direction::TakerPaysBtc {
+                let mock_quote = maker.quote("o", 1_000_000).await.unwrap();
+                let (mid, req) = mock.prepare(&mock_quote).await.unwrap();
+                mock.accepted(&mid, &maker.accept(req).await.unwrap())
+                    .await
+                    .unwrap();
+                assert!(admitted
+                    .lock(&mid)
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("differs from accepted quote"));
+                assert!(mock.lock(&mid).await.is_ok());
+            }
+
+            if direction == Direction::TakerPaysDivi {
+                // A different endpoint on the same authenticated network is allowed.
+                let replacement = evm_node_with_id(NOW.into(), Some(84_532)).await;
+                let restarted = engine(&replacement, Some("base-sepolia"));
+                restarted.halt_after(Some(TakerState::Locked));
+                assert!(restarted
+                    .lock(&id)
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("halted"));
+                let signed = store
+                    .get_taker_swap(&id)
+                    .unwrap()
+                    .unwrap()
+                    .taker_leg_funding
+                    .unwrap();
+                for err in [
+                    missing.lock(&id).await.unwrap_err(),
+                    missing.step(&id, None).await.unwrap_err(),
+                ] {
+                    assert!(err.to_string().contains("not known sent"), "{err}");
+                }
+                assert!(!divi.contains(&signed.tx.txid));
+                // Model a crash after broadcast but before the sent marker.
+                payer.broadcast(&signed.tx).await.unwrap();
+                let recovery = engine(&unreadable, Some("base-sepolia"));
+                let reads = requests(&unreadable).await;
+                recovery.step(&id, None).await.unwrap();
+                assert!(store.get_taker_swap(&id).unwrap().unwrap().taker_leg_sent);
+                recovery.lock(&id).await.unwrap();
+                assert_eq!(requests(&unreadable).await, reads);
+                missing.lock(&id).await.unwrap();
+                divi.mine(1);
+                divi.advance_time(quote.taker_timeout_secs + 600);
+                assert_eq!(missing.refund(&id).await.unwrap(), TakerState::Refunded);
+                assert_eq!(payer.funding_calls(), 1);
+            }
+        }
+        for node in [&base, &sep, &unreadable] {
+            for req in node.received_requests().await.unwrap() {
+                let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+                assert!(matches!(
+                    body["method"].as_str(),
+                    Some("eth_chainId" | "eth_getBlockByNumber")
+                ));
+            }
+        }
     }
 
     // ---- lock-input reservations: two takers on one wallet and one --db ----
@@ -2795,6 +3289,8 @@ mod tests {
             maker_leg_amount: None,
             maker_leg_claim: None,
             taker_leg_refund: None,
+            taker_leg_sent: false,
+            usdc_admission: None,
             claim_declined: None,
             claim_base_feerate: None,
             claim_feerate: None,
@@ -3436,6 +3932,10 @@ mod tests {
                 "o",
                 "--btc-sats",
                 "5000",
+                "--direction",
+                "taker-pays-btc",
+                "--limit-price",
+                "100000000",
             ],
         );
         let divi: Arc<dyn ChainBackend> =
@@ -3755,6 +4255,10 @@ mod tests {
                 "o",
                 "--btc-sats",
                 "5000",
+                "--direction",
+                "taker-pays-btc",
+                "--limit-price",
+                "100000000",
             ],
         );
         let sessions = Sessions::beside(&db);

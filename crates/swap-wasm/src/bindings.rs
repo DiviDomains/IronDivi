@@ -20,7 +20,8 @@ use wasm_bindgen_futures::{future_to_promise, JsFuture};
 use zeroize::Zeroizing;
 
 use crate::durable::Sink;
-use crate::engine::{CoinIn, Config, Engine};
+use crate::engine::{CoinIn, Config, Engine, IntentSpec};
+use crate::selection::SelectionSpec;
 use crate::store::{store_prefix, EncryptedStore, Entry};
 
 /// Calls the host's `persist(entriesJson)`, which returns a Promise.
@@ -60,15 +61,6 @@ fn err(e: impl std::fmt::Display) -> JsValue {
 
 fn json<T: Serialize>(v: &T) -> Result<JsValue, JsValue> {
     serde_json::to_string(v).map(JsValue::from).map_err(err)
-}
-
-/// Satoshi amounts arrive as JS numbers; refuse anything that is not an exact integer.
-fn sats(v: f64) -> Result<u64, JsValue> {
-    if v.fract() == 0.0 && v > 0.0 && v <= 9_007_199_254_740_991.0 {
-        Ok(v as u64)
-    } else {
-        Err(err(format!("bad amount {v}")))
-    }
 }
 
 /// The swap taker for one wallet seed.
@@ -116,18 +108,41 @@ impl WasmTaker {
         serde_json::to_string(&self.engine.swaps().map_err(err)?).map_err(err)
     }
 
-    /// The maker's offers this taker can take.
+    /// The maker's offers this taker can take, each with `exact`: its price and range as
+    /// decimal strings (the plain numbers round in JS past 2^53 - 1), and `selection`: the
+    /// token `beginSelected` takes for exactly these terms (`null`, with `ambiguous: true`,
+    /// when the maker lists the id more than once). A later call never changes what an
+    /// earlier token selects.
     pub fn offers(&self) -> Promise {
         let e = self.engine.clone();
         future_to_promise(async move { json(&e.offers().await.map_err(err)?) })
     }
 
-    /// Quote and accept; nothing is locked.
-    pub fn begin(&self, offer_id: String, btc_sats: f64) -> Promise {
+    /// Quote and accept on a selected offer, held to the terms its token pins:
+    /// `{selection, offer_id, direction, counter_chain, divi_sats_per_btc, min_btc_sats,
+    /// max_btc_sats, btc_sats, min_remaining_secs?, max_taker_timeout_secs?}` (snake_case;
+    /// u64 terms as canonical decimal strings; unknown keys refused). Every displayed term
+    /// must match the selection. A missing, stale or ambiguous selection is refused. Nothing
+    /// is locked.
+    #[wasm_bindgen(js_name = beginSelected)]
+    pub fn begin_selected(&self, selection_json: String) -> Promise {
         let e = self.engine.clone();
         future_to_promise(async move {
-            let s = sats(btc_sats)?;
-            json(&e.begin(&offer_id, s).await.map_err(err)?)
+            let spec = SelectionSpec::parse(&selection_json).map_err(err)?;
+            json(&e.begin_selected(&spec).await.map_err(err)?)
+        })
+    }
+
+    /// Quote and accept per `intentJson`, explicit limits ([`IntentSpec`]):
+    /// `{offer_id, btc_sats, counter_chain, direction, limit_divi_sats_per_btc,
+    /// min_remaining_secs?, max_taker_timeout_secs?}` (snake_case; unknown keys are refused;
+    /// amounts as decimal strings, or integers up to 2^53 - 1). Nothing is locked.
+    #[wasm_bindgen(js_name = beginWithIntent)]
+    pub fn begin_with_intent(&self, intent_json: String) -> Promise {
+        let e = self.engine.clone();
+        future_to_promise(async move {
+            let intent = IntentSpec::parse(&intent_json).map_err(err)?;
+            json(&e.begin_with_intent(&intent).await.map_err(err)?)
         })
     }
 

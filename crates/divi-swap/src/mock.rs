@@ -26,7 +26,9 @@ use crate::backend::{ChainBackend, ClaimSizes, FeeBump, TipHeader};
 use crate::error::{Result, SwapError};
 use crate::htlc::{HtlcParams, LOCKTIME_THRESHOLD, REFUND_SEQUENCE};
 use crate::reservation::InputReservations;
-use crate::types::{Amount, Chain, Funding, LockedOutput, Outpoint, SignedTx, SpendInfo, Txid};
+use crate::types::{
+    Amount, Chain, Funding, LockedOutput, Outpoint, ScanMark, SignedTx, SpendInfo, SpendScan, Txid,
+};
 
 /// Flat fee every mock funding and refund pays, and a claim at [`MOCK_FEERATE`].
 pub const MOCK_FEE: Amount = Amount(1_000);
@@ -200,6 +202,10 @@ struct ChainState {
     /// The most unconfirmed transactions any accepted tx has had in its chain, itself
     /// included.
     longest_chain: u64,
+    /// Blocks one [`ChainBackend::scan_spend`] pass reads (0: through the tip, as an index).
+    scan_window: u64,
+    /// Bounded [`ChainBackend::scan_spend`] passes made.
+    scan_passes: u64,
 }
 
 /// The kind of a mock transaction.
@@ -876,6 +882,19 @@ impl MockChain {
         self.block_hash(self.height())
     }
 
+    /// Make [`ChainBackend::scan_spend`] read at most `blocks` blocks per pass from the
+    /// height it is given, as the ZEC compact-block scan and the BTC/LTC block-scan
+    /// fallback do (0, the default: answer through the tip and the mempool, as an index).
+    /// A bounded pass sees mined spends only. Test-only.
+    pub fn set_scan_window(&self, blocks: u64) {
+        self.state.lock().scan_window = blocks;
+    }
+
+    /// Bounded [`ChainBackend::scan_spend`] passes made so far.
+    pub fn scan_passes(&self) -> u64 {
+        self.state.lock().scan_passes
+    }
+
     /// The fake hash of the main-chain block at `height` (see [`Self::tip_hash`]).
     pub fn block_hash(&self, height: u64) -> String {
         let branch = self
@@ -1192,6 +1211,10 @@ fn htlc_amount(s: &ChainState, htlc: &HtlcParams, at: &Outpoint) -> Option<Amoun
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl ChainBackend for MockBackend {
+    async fn usdc_admission(&self) -> Result<crate::backend::UsdcAdmission> {
+        Ok(crate::backend::UsdcAdmission::Mock)
+    }
+
     fn chain(&self) -> Chain {
         self.chain.chain
     }
@@ -1703,6 +1726,53 @@ impl ChainBackend for MockBackend {
             script_sig: Vec::new(),
             witness,
         }))
+    }
+
+    async fn scan_spend(
+        &self,
+        outpoint: &Outpoint,
+        from_height: u64,
+        resume: Option<&ScanMark>,
+    ) -> Result<SpendScan> {
+        let window = self.chain.state.lock().scan_window;
+        if window == 0 {
+            return Ok(match self.find_spend(outpoint, from_height).await? {
+                Some(s) => SpendScan::Spent(s),
+                None => SpendScan::NotYet {
+                    through: None,
+                    complete: true,
+                },
+            });
+        }
+        // Holds and the online check as a whole read.
+        let found = self.find_spend(outpoint, from_height).await?;
+        let tip = {
+            let mut s = self.chain.state.lock();
+            s.scan_passes += 1;
+            s.height
+        };
+        if let Some(m) = resume {
+            if m.height > tip || self.chain.block_hash(m.height) != m.hash {
+                return Ok(SpendScan::Reorged);
+            }
+        }
+        if from_height > tip {
+            return Ok(SpendScan::NotYet {
+                through: None,
+                complete: true,
+            });
+        }
+        let last = tip.min(from_height + window - 1);
+        if let Some(s) = found.filter(|s| s.height.is_some_and(|h| h <= last)) {
+            return Ok(SpendScan::Spent(s));
+        }
+        Ok(SpendScan::NotYet {
+            through: Some(ScanMark {
+                height: last,
+                hash: self.chain.block_hash(last),
+            }),
+            complete: last == tip,
+        })
     }
 }
 

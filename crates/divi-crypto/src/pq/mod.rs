@@ -20,6 +20,11 @@
 //! and the pure-integer `LMS-SHA256-M32-H10` (`LMOTS-SHA256-N32-W4`) stateful
 //! Spork signature reference implementation, with zero active consensus call sites
 //! until `DIP-PQ-2..4` fork activation.
+//!
+//! `LMS` key generation, public-key derivation and verification are always available.
+//! Signing consumes a one-time leaf, and this crate has no durable, exclusive leaf
+//! reservation, so it is compiled only with the test-only `lms-volatile-test-signer`
+//! feature (`DIP-PQ-2` §5.1).
 
 use sha2::{Digest, Sha256, Sha512};
 use thiserror::Error;
@@ -1163,7 +1168,16 @@ impl LmsPublicKey {
 
 /// Stateful `LMS-SHA256-M32-H10` + `LMOTS-SHA256-N32-W4` private key for Spork governance
 /// signing (`DIP-PQ-1` §2.1 #4, §3.5, §5.4).
-#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+///
+/// Not `Clone`: a copy would carry its own leaf counter. Every constructor starts at leaf
+/// `0`, so re-deriving a key (from a seed, mnemonic or backup) cannot tell which leaves
+/// were already used. Signing is therefore only compiled with the
+/// `lms-volatile-test-signer` feature, whose counter lives in memory only (`DIP-PQ-2` §5.1).
+#[derive(Zeroize, ZeroizeOnDrop)]
+#[cfg_attr(
+    not(any(test, feature = "lms-volatile-test-signer")),
+    allow(dead_code) // `master_seed` and `nodes` are read only by the gated signer
+)]
 pub struct LmsPrivateKey {
     tree_id: [u8; 16],
     master_seed: [u8; 32],
@@ -1239,10 +1253,10 @@ impl LmsPrivateKey {
         }
         let stream = leaf.keygen_stream_64();
         let mut tree_id = [0u8; 16];
-        let mut master_seed = [0u8; 32];
+        let mut master_seed = Zeroizing::new([0u8; 32]);
         tree_id.copy_from_slice(&stream[0..16]);
         master_seed.copy_from_slice(&stream[16..48]);
-        Ok(Self::from_seed(tree_id, master_seed))
+        Ok(Self::from_seed(tree_id, *master_seed))
     }
 
     /// Return the 60-byte `LmsPublicKey`.
@@ -1257,7 +1271,8 @@ impl LmsPrivateKey {
         &self.public_key
     }
 
-    /// Return the next unused one-time signature leaf index $q \in [0, 1024]$.
+    /// Return this in-memory key's next leaf index $q \in [0, 1024]$. It is `0` after every
+    /// construction and is not evidence that leaves below it are unused elsewhere.
     pub const fn next_leaf_index(&self) -> u32 {
         self.next_leaf_q
     }
@@ -1269,6 +1284,9 @@ impl LmsPrivateKey {
 
     /// Sign a 64-byte `prehash_msg` using the next available one-time leaf $q$, advancing the
     /// internal leaf counter by 1 (`DIP-PQ-1` §2.1 #4, §3.5).
+    ///
+    /// Test-only: the counter is neither persisted nor exclusive (`DIP-PQ-2` §5.1).
+    #[cfg(any(test, feature = "lms-volatile-test-signer"))]
     pub fn sign_prehash(&mut self, prehash_msg: &[u8; 64]) -> Result<[u8; 2512], PqError> {
         let q = self.next_leaf_q;
         if q >= LMS_NUM_LEAVES {
@@ -1320,6 +1338,9 @@ impl LmsPrivateKey {
     }
 
     /// Sign a Spork governance payload in the `"Divi-PQ-Spork-v1"` domain (`DIP-PQ-1` §3.1 #2, §4).
+    ///
+    /// Test-only, like [`LmsPrivateKey::sign_prehash`].
+    #[cfg(any(test, feature = "lms-volatile-test-signer"))]
     pub fn sign_spork(
         &mut self,
         network_magic: [u8; 4],
@@ -1911,6 +1932,21 @@ mod tests {
                 actual: 2513,
             })
         ));
+    }
+
+    #[test]
+    fn test_lms_rederived_key_does_not_know_used_leaves() {
+        // Why signing is test-only: a key re-derived from the same seed (restart, restore,
+        // second machine) has the same public key but starts again at leaf 0.
+        let seed = hex::decode(BIP39_SEED_HEX).unwrap();
+        let leaf = derive_pq_leaf(&seed, 301, 0, PqSchemeId::LmsSha256M32H10, 0).unwrap();
+        let mut first = LmsPrivateKey::from_pq_leaf(&leaf).unwrap();
+        first.sign_spork(DIVI_MAINNET_MAGIC, b"payload").unwrap();
+        assert_eq!(first.next_leaf_index(), 1);
+
+        let rederived = LmsPrivateKey::from_pq_leaf(&leaf).unwrap();
+        assert_eq!(rederived.public_key_bytes(), first.public_key_bytes());
+        assert_eq!(rederived.next_leaf_index(), 0);
     }
 
     #[test]

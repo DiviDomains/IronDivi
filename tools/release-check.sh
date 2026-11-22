@@ -35,6 +35,19 @@ done
 echo "release-check: Cargo.lock is current"
 cargo metadata --locked --format-version 1 >/dev/null || fail=1
 
+echo "release-check: no test-only feature in a shipped binary"
+# lms-volatile-test-signer signs LMS without durable leaf reservation (DIP-PQ-2 §5.1)
+for bin in $SHIPPED; do
+  if ! features=$(cargo tree --locked -p "$bin" -e normal,build,features --target all \
+      --prefix none --format '{p} {f}'); then
+    echo "release-check: cargo tree -e features failed for $bin" >&2
+    fail=1
+  elif grep -q 'lms-volatile-test-signer' <<<"$features"; then
+    echo "release-check: $bin enables lms-volatile-test-signer" >&2
+    fail=1
+  fi
+done
+
 echo "release-check: cargo deny check bans licenses sources"
 cargo deny check bans licenses sources || fail=1
 

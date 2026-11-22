@@ -26,7 +26,14 @@ hmac = "0.12"
 sha2 = { workspace = true }
 divi-consensus = { workspace = true }
 
+[features]
+# Lets sign_hybrid_spork_lms / attach_lms_signature consume LMS leaves from an in-memory
+# counter. Test-only, like divi-crypto's feature of the same name: no shipped binary may
+# enable it (tools/release-check.sh).
+lms-volatile-test-signer = ["divi-crypto/lms-volatile-test-signer"]
+
 [dev-dependencies]
+divi-crypto = { workspace = true, features = ["lms-volatile-test-signer"] }
 divi-test-support = { workspace = true }
 tempfile = { workspace = true }
 tokio-test = "0.4"

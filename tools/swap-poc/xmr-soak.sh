@@ -81,20 +81,38 @@ taker() { # taker <db> <args...>
   if [ "$dry" = 1 ]; then echo "would run: ${cmd[*]}"; else "${cmd[@]}"; fi
 }
 
+# `accept`/`run` commit funds only under the user's own direction and price limit. This
+# harness drives the operator's own maker, so its listed terms are the intent; set
+# TAKER_LIMIT_PRICE to hold the quote to a different worst price (DIVI sats per coin).
+intent_flags() { # intent_flags <maker base> <offer id>: prints --direction D --limit-price P
+  curl -sf -m 10 "$1/offers" | python3 -c '
+import json, os, sys
+o = next(o for o in json.load(sys.stdin) if o["id"] == sys.argv[1])
+print("--direction", o["direction"].replace("_", "-"),
+      "--limit-price", os.environ.get("TAKER_LIMIT_PRICE") or o["divi_sats_per_btc"])' "$2"
+}
+if [ "$dry" = 1 ]; then
+  ifl=(--direction taker-pays-btc --limit-price "${TAKER_LIMIT_PRICE:-<from $maker/offers>}")
+else
+  ifl_s=$(intent_flags "$maker" "$offer") \
+    || { echo "xmr-soak: offer $offer is not listed at $maker" >&2; exit 1; }
+  read -r -a ifl <<<"$ifl_s"
+fi
+
 one() { # one <n>: run swap n of the chosen scenario in its own db
   local n=$1 dir="$out/swap-$1" t0 rc=0 res lid="" outcome=""
   mkdir -p "$dir"; t0=$(date +%s)
   case "$scenario" in
     happy)
-      res=$(taker "$dir/taker.db" run --maker "$maker" --offer "$offer" --btc-sats "$btc_sats" \
+      res=$(taker "$dir/taker.db" run --maker "$maker" --offer "$offer" --btc-sats "$btc_sats" "${ifl[@]}" \
         --poll-secs 30 --timeout-secs 7200 2>"$dir/log") || rc=$?
       lid=${res%% *}; outcome=${res#* } ;;
     accept-only)
-      lid=$(taker "$dir/taker.db" accept --maker "$maker" --offer "$offer" --btc-sats "$btc_sats" \
+      lid=$(taker "$dir/taker.db" accept --maker "$maker" --offer "$offer" --btc-sats "$btc_sats" "${ifl[@]}" \
         2>"$dir/log") || rc=$?
       outcome=accepted-left ;;
     lock-only)
-      lid=$(taker "$dir/taker.db" accept --maker "$maker" --offer "$offer" --btc-sats "$btc_sats" \
+      lid=$(taker "$dir/taker.db" accept --maker "$maker" --offer "$offer" --btc-sats "$btc_sats" "${ifl[@]}" \
         2>"$dir/log") || rc=$?
       outcome=lock-pending
       if [ "$rc" = 0 ] && [ "$dry" = 0 ]; then

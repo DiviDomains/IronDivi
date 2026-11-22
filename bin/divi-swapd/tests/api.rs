@@ -138,7 +138,7 @@ async fn post_swaps_accepts_quote() {
     let client = MakerClient::new(&d.base);
     let sessions = Sessions::beside(&dir.path().join("t.db"));
 
-    let local = flow::begin(&taker, &client, &sessions, OFFER_ID, BTC_SATS)
+    let local = flow::begin(&taker, &client, &sessions, &offer(OFFER_ID), BTC_SATS)
         .await
         .unwrap();
     let session = sessions.get(&local).unwrap();
@@ -177,7 +177,7 @@ async fn get_swap_never_leaks_keys() {
     let taker = w.taker(&dir.path().join("t.db"));
     let client = MakerClient::new(&d.base);
     let sessions = Sessions::beside(&dir.path().join("t.db"));
-    let local = flow::begin(&taker, &client, &sessions, OFFER_ID, BTC_SATS)
+    let local = flow::begin(&taker, &client, &sessions, &offer(OFFER_ID), BTC_SATS)
         .await
         .unwrap();
     let session = sessions.get(&local).unwrap();
@@ -236,7 +236,7 @@ async fn lock_notice_advances() {
     let taker = w.taker(&dir.path().join("t.db"));
     let client = MakerClient::new(&d.base);
     let sessions = Sessions::beside(&dir.path().join("t.db"));
-    let local = flow::begin(&taker, &client, &sessions, OFFER_ID, BTC_SATS)
+    let local = flow::begin(&taker, &client, &sessions, &offer(OFFER_ID), BTC_SATS)
         .await
         .unwrap();
     let id = sessions.get(&local).unwrap().maker_swap_id;
@@ -283,7 +283,7 @@ async fn scheduler_resumes_on_restart() {
     // First life: no scheduler, so the swap is parked right after the lock notice.
     let d1 = serve(&w, w.maker(Store::open(&db).unwrap()), None).await;
     let client = MakerClient::new(&d1.base);
-    let local = flow::begin(&taker, &client, &sessions, OFFER_ID, BTC_SATS)
+    let local = flow::begin(&taker, &client, &sessions, &offer(OFFER_ID), BTC_SATS)
         .await
         .unwrap();
     flow::lock(&taker, &client, &sessions, &local)

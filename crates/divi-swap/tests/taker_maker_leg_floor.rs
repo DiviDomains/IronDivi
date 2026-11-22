@@ -240,3 +240,45 @@ async fn without_a_profile_floor_a_short_maker_lock_is_unchanged() {
     let rec = store.get_taker_swap(&tid).unwrap().unwrap();
     assert!(rec.claim_declined.is_none() && rec.maker_leg_claim.is_some());
 }
+
+/// Under a profile floor the taker does not fund an accepted swap whose taker-leg window has
+/// shrunk below what the maker needs to lock (`maker_timeout + claim margin`) plus the lock's
+/// own confirmations: testnet 10800 + 1800 + 2 × 150 = 12900 s of LTC MTP.
+#[tokio::test]
+async fn a_stale_accepted_swap_is_not_funded_under_a_profile_floor() {
+    for (late, funds) in [(8_700, true), (8_701, false)] {
+        let w = world();
+        let store = Store::in_memory().unwrap();
+        let maker = maker(&w, &store, Profile::Testnet);
+        let taker = taker(&w, &store, Some(Profile::Testnet));
+        let q = maker.quote("o", 1_000_000).await.unwrap();
+        let (tid, req) = taker.prepare(&q).await.unwrap();
+        let v = maker.accept(req).await.unwrap();
+        taker.accepted(&tid, &v).await.unwrap();
+        assert_eq!(v.taker_leg.htlc.locktime, w.ltc.mtp() + 6 * 3600);
+        w.ltc.advance_time(late);
+        let res = taker.lock(&tid).await;
+        let rec = store.get_taker_swap(&tid).unwrap().unwrap();
+        if funds {
+            res.unwrap();
+            assert_eq!(rec.state, TakerState::Locked);
+        } else {
+            let e = res.unwrap_err().to_string();
+            assert!(e.contains("not funding"), "{e}");
+            assert_eq!(rec.state, TakerState::Accepted);
+            assert!(rec.taker_leg_funding.is_none(), "nothing signed");
+            assert_eq!(w.ltc.balance(&w.tltc.pubkey()), Amount(FUNDS));
+        }
+    }
+    // Without a floor the core engine keeps its old behaviour (callers decide).
+    let w = world();
+    let store = Store::in_memory().unwrap();
+    let maker = maker(&w, &store, Profile::Testnet);
+    let taker = taker(&w, &store, None);
+    let q = maker.quote("o", 1_000_000).await.unwrap();
+    let (tid, req) = taker.prepare(&q).await.unwrap();
+    let v = maker.accept(req).await.unwrap();
+    taker.accepted(&tid, &v).await.unwrap();
+    w.ltc.advance_time(8_701);
+    taker.lock(&tid).await.unwrap();
+}

@@ -30,6 +30,20 @@
 //!   hot `vault_hash_256` key and explicitly forbidding the cold `owner_hash_256` key)
 //!   and `P2PQPKH` (`34` bytes, `addr_key_hash_256`), and
 //! - Phased cutoff enforcement via [`PosBlockAuthPolicy`].
+//!
+//! # Verification status
+//!
+//! This workspace contains no `FN-DSA-512`, `ML-DSA-44` or `SLH-DSA` verifier. Nothing in this
+//! module checks `signature_bytes` against a public key and message. The `check_*` functions
+//! decode the envelope, check canonical encodings, apply the cutoff policy and bind the staker
+//! key hash to the coinstake output; their success is reported as an
+//! [`UnverifiedBlockSigBinding`] and is never evidence that a block was signed.
+//! [`verify_pq_block_signature`] is the only path to a [`VerifiedPqBlockSignature`], and it fails
+//! closed with [`PqBlockSigError::PostQuantumSignatureVerifierUnavailable`] until a reviewed
+//! verifier, test vectors and cross-client agreement exist.
+//!
+//! Classical `secp256k1` block signatures are checked by `divi-storage`, not here; the classical
+//! outcome of this module records the wire format only.
 
 use divi_crypto::pq::{
     compute_pq_signing_prehash, pq_address_key_hash_256, pq_key_hash_256, PqDomainTag, PqError,
@@ -134,6 +148,9 @@ pub enum PqBlockSigError {
         expected: [u8; 32],
         actual: [u8; 32],
     },
+
+    #[error("no {scheme:?} signature verifier is available; post-quantum block signatures cannot be verified")]
+    PostQuantumSignatureVerifierUnavailable { scheme: PqSchemeId },
 
     #[error("post-quantum cryptographic validation error: {0}")]
     Crypto(#[from] PqError),
@@ -284,11 +301,13 @@ impl PqBlockSigEnvelope {
         pq_key_hash_256(self.scheme_id, &self.pubkey_bytes)
     }
 
-    /// Verify canonical encoding AND bind `self.staker_key_hash_256()` against `coinstake.vout[1].scriptPubKey`
+    /// Check canonical encoding AND bind `self.staker_key_hash_256()` against `coinstake.vout[1].scriptPubKey`
     /// (`DIP-PQ-4` §3.2).
     ///
     /// Strictly forbids a `PQ_STAKING_VAULT`'s cold `owner_hash_256` from signing `vchBlockSig`.
-    pub fn verify_structural_and_staker_binding(
+    ///
+    /// This does **not** verify `signature_bytes`: any canonically encoded signature passes.
+    pub fn check_structural_and_staker_binding(
         &self,
         coinstake_script_pubkey: &Script,
     ) -> Result<CoinstakeStakerBinding, PqBlockSigError> {
@@ -357,20 +376,79 @@ pub enum PosBlockAuthPolicy {
     },
 }
 
-/// Result of verifying a PoS block's `vchBlockSig` format, cutoff policy, coinstake key binding,
+/// Outcome of checking a PoS block's `vchBlockSig` format, cutoff policy, coinstake key binding,
 /// and domain-separated signing prehash (`DIP-PQ-4` §3–§5).
+///
+/// **No signature has been verified.** The signature bytes were only checked for canonical
+/// encoding; a block carrying this outcome may be forged. [`verify_pq_block_signature`] is the
+/// cryptographic check, and it fails closed in this release.
+#[must_use = "an unverified binding is not a signature check"]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum VerifiedBlockSigBinding {
-    /// Classical `secp256k1` block signature on a classical coinstake output (`P2PKH`, `STAKING_VAULT`, or `P2PK`).
-    ClassicalSecp256k1,
-    /// Post-quantum `DIP-PQ-4` `v1` envelope verified against a 256-bit `PQ_STAKING_VAULT` or `P2PQPKH` coinstake output.
-    PostQuantumV1 {
+pub enum UnverifiedBlockSigBinding {
+    /// Classical `secp256k1` wire format on a classical coinstake output (`P2PKH`, `STAKING_VAULT`,
+    /// or `P2PK`). The signature itself is not checked here.
+    ClassicalFormatOnly,
+    /// Canonically encoded post-quantum `DIP-PQ-4` `v1` envelope whose public key is bound to a
+    /// 256-bit `PQ_STAKING_VAULT` or `P2PQPKH` coinstake output. The signature is not verified.
+    PostQuantumV1BindingOnly {
         scheme_id: PqSchemeId,
         staker_key_hash_256: [u8; 32],
         coinstake_binding: CoinstakeStakerBinding,
         payload_hash_256: [u8; 32],
         signing_prehash_512: [u8; 64],
     },
+}
+
+/// A post-quantum block signature that a cryptographic verifier accepted.
+///
+/// Only [`verify_pq_block_signature`] can produce this value, and no verifier exists yet, so no
+/// value of this type can be created in this release.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedPqBlockSignature {
+    scheme_id: PqSchemeId,
+    staker_key_hash_256: [u8; 32],
+    signing_prehash_512: [u8; 64],
+}
+
+impl VerifiedPqBlockSignature {
+    /// Scheme of the verified signature.
+    pub const fn scheme_id(&self) -> PqSchemeId {
+        self.scheme_id
+    }
+
+    /// `DIP-PQ-1` §5.5 key commitment of the verified signer.
+    pub const fn staker_key_hash_256(&self) -> [u8; 32] {
+        self.staker_key_hash_256
+    }
+
+    /// `BlockSigV1` signing prehash the signature was verified over.
+    pub const fn signing_prehash_512(&self) -> [u8; 64] {
+        self.signing_prehash_512
+    }
+}
+
+/// Cryptographically verify `envelope.signature_bytes` over `signing_prehash_512`.
+///
+/// Fails closed: the scheme and encodings are checked as by [`PqBlockSigEnvelope::new`], and
+/// every permitted scheme then returns
+/// [`PqBlockSigError::PostQuantumSignatureVerifierUnavailable`], because no reviewed `FN-DSA-512`
+/// or `ML-DSA-44` verifier exists in this workspace. Wiring a verifier in here needs reviewed
+/// primitives, vectors, C++ Divi Core agreement and a separate activation decision.
+pub fn verify_pq_block_signature(
+    envelope: &PqBlockSigEnvelope,
+    signing_prehash_512: &[u8; 64],
+) -> Result<VerifiedPqBlockSignature, PqBlockSigError> {
+    let _ = signing_prehash_512;
+    let scheme = envelope.scheme_id;
+    if !scheme.is_allowed_in_domain(PqDomainTag::BlockSigV1) {
+        return Err(PqBlockSigError::Crypto(PqError::SchemeForbiddenInDomain {
+            scheme,
+            domain: PqDomainTag::BlockSigV1,
+        }));
+    }
+    scheme.validate_pubkey_encoding(&envelope.pubkey_bytes)?;
+    scheme.validate_signature_encoding(&envelope.signature_bytes)?;
+    Err(PqBlockSigError::PostQuantumSignatureVerifierUnavailable { scheme })
 }
 
 /// Parse a `DIP-PQ-3` post-quantum coinstake `scriptPubKey` (`74`-byte `PQ_STAKING_VAULT` or `34`-byte `P2PQPKH`).
@@ -531,9 +609,11 @@ pub fn compute_pos_block_signing_prehash(
     ))
 }
 
-/// Verify a Proof-of-Stake block's `vchBlockSig` envelope, cutoff policy, coinstake key binding,
+/// Check a Proof-of-Stake block's `vchBlockSig` envelope, cutoff policy, coinstake key binding,
 /// and domain-separated `BlockSigV1` signing prehash (`DIP-PQ-4` §2–§5).
-pub fn verify_block_sig_envelope_binding(
+///
+/// Success is an [`UnverifiedBlockSigBinding`]: the signature bytes are **not** verified.
+pub fn check_block_sig_envelope_binding(
     vch_block_sig: &[u8],
     coinstake_script_pubkey: &Script,
     block_hash: &[u8; 32],
@@ -541,7 +621,7 @@ pub fn verify_block_sig_envelope_binding(
     coinstake_vout: u32,
     block_time: u32,
     policy: &PosBlockAuthPolicy,
-) -> Result<VerifiedBlockSigBinding, PqBlockSigError> {
+) -> Result<UnverifiedBlockSigBinding, PqBlockSigError> {
     let format = classify_block_sig_format(vch_block_sig)?;
     let is_pq_output = parse_pq_coinstake_script(coinstake_script_pubkey).is_some();
 
@@ -554,12 +634,12 @@ pub fn verify_block_sig_envelope_binding(
                 if is_pq_output || !is_classical_coinstake_script(coinstake_script_pubkey) {
                     return Err(PqBlockSigError::UnsupportedCoinstakeScriptForClassicalBlockSig);
                 }
-                Ok(VerifiedBlockSigBinding::ClassicalSecp256k1)
+                Ok(UnverifiedBlockSigBinding::ClassicalFormatOnly)
             }
         },
         PosBlockAuthPolicy::DualAllowed { network_magic }
         | PosBlockAuthPolicy::PqRequiredForPqOutputs { network_magic } => {
-            verify_dual_or_pq_output_policy(
+            check_dual_or_pq_output_policy(
                 format,
                 coinstake_script_pubkey,
                 block_hash,
@@ -580,7 +660,7 @@ pub fn verify_block_sig_envelope_binding(
                     cutoff_block_time: *cutoff_block_time,
                 });
             }
-            verify_dual_or_pq_output_policy(
+            check_dual_or_pq_output_policy(
                 format,
                 coinstake_script_pubkey,
                 block_hash,
@@ -592,14 +672,14 @@ pub fn verify_block_sig_envelope_binding(
     }
 }
 
-fn verify_dual_or_pq_output_policy(
+fn check_dual_or_pq_output_policy(
     format: BlockSigFormat,
     coinstake_script_pubkey: &Script,
     block_hash: &[u8; 32],
     coinstake_txid: &[u8; 32],
     coinstake_vout: u32,
     network_magic: [u8; 4],
-) -> Result<VerifiedBlockSigBinding, PqBlockSigError> {
+) -> Result<UnverifiedBlockSigBinding, PqBlockSigError> {
     let is_pq_output = parse_pq_coinstake_script(coinstake_script_pubkey).is_some();
     match format {
         BlockSigFormat::ClassicalSecp256k1 => {
@@ -609,11 +689,11 @@ fn verify_dual_or_pq_output_policy(
             if !is_classical_coinstake_script(coinstake_script_pubkey) {
                 return Err(PqBlockSigError::UnsupportedCoinstakeScriptForClassicalBlockSig);
             }
-            Ok(VerifiedBlockSigBinding::ClassicalSecp256k1)
+            Ok(UnverifiedBlockSigBinding::ClassicalFormatOnly)
         }
         BlockSigFormat::PostQuantumV1(env) => {
             let coinstake_binding =
-                env.verify_structural_and_staker_binding(coinstake_script_pubkey)?;
+                env.check_structural_and_staker_binding(coinstake_script_pubkey)?;
             let staker_key_hash_256 = env.staker_key_hash_256();
             let payload_hash_256 =
                 compute_pos_block_payload_hash(block_hash, coinstake_txid, coinstake_vout);
@@ -625,7 +705,7 @@ fn verify_dual_or_pq_output_policy(
                 coinstake_txid,
                 coinstake_vout,
             )?;
-            Ok(VerifiedBlockSigBinding::PostQuantumV1 {
+            Ok(UnverifiedBlockSigBinding::PostQuantumV1BindingOnly {
                 scheme_id: env.scheme_id,
                 staker_key_hash_256,
                 coinstake_binding,
@@ -1034,7 +1114,7 @@ mod tests {
         // 1. Hot vault key (FN-DSA-512) signing vchBlockSig is ACCEPTED
         let hot_env = PqBlockSigEnvelope::new(PqSchemeId::FnDsa512, vault_pk, vault_sig).unwrap();
         let binding = hot_env
-            .verify_structural_and_staker_binding(&vault_script)
+            .check_structural_and_staker_binding(&vault_script)
             .unwrap();
         assert_eq!(
             binding,
@@ -1048,7 +1128,7 @@ mod tests {
         // 2. Cold owner key (ML-DSA-44) attempting to sign vchBlockSig is STRICTLY FORBIDDEN
         let cold_env = PqBlockSigEnvelope::new(PqSchemeId::MlDsa44, owner_pk, owner_sig).unwrap();
         assert_eq!(
-            cold_env.verify_structural_and_staker_binding(&vault_script),
+            cold_env.check_structural_and_staker_binding(&vault_script),
             Err(PqBlockSigError::ColdOwnerKeyForbiddenForBlockSigning {
                 owner_hash_256,
                 vault_hash_256,
@@ -1058,7 +1138,7 @@ mod tests {
         // 3. Degenerate vault where owner_hash_256 == vault_hash_256 is ALSO rejected as ColdOwnerKeyForbiddenForBlockSigning
         let degenerate_script = build_pq_staking_vault_script(&vault_hash_256, &vault_hash_256);
         assert_eq!(
-            hot_env.verify_structural_and_staker_binding(&degenerate_script),
+            hot_env.check_structural_and_staker_binding(&degenerate_script),
             Err(PqBlockSigError::ColdOwnerKeyForbiddenForBlockSigning {
                 owner_hash_256: vault_hash_256,
                 vault_hash_256,
@@ -1071,7 +1151,7 @@ mod tests {
         let other_hash_256 = pq_address_key_hash_256(PqSchemeId::FnDsa512, &other_pk);
         let other_env = PqBlockSigEnvelope::new(PqSchemeId::FnDsa512, other_pk, other_sig).unwrap();
         assert_eq!(
-            other_env.verify_structural_and_staker_binding(&vault_script),
+            other_env.check_structural_and_staker_binding(&vault_script),
             Err(PqBlockSigError::StakerKeyHashMismatch {
                 expected: vault_hash_256,
                 actual: other_hash_256,
@@ -1088,7 +1168,7 @@ mod tests {
 
         let env = PqBlockSigEnvelope::new(PqSchemeId::FnDsa512, staker_pk, staker_sig).unwrap();
         let binding = env
-            .verify_structural_and_staker_binding(&p2pqpkh_script)
+            .check_structural_and_staker_binding(&p2pqpkh_script)
             .unwrap();
         assert_eq!(
             binding,
@@ -1099,7 +1179,7 @@ mod tests {
         // Wrong key hash in P2PQPKH output -> StakerKeyHashMismatch
         let wrong_script = build_p2pqpkh_script(&[0xeeu8; 32]);
         assert_eq!(
-            env.verify_structural_and_staker_binding(&wrong_script),
+            env.check_structural_and_staker_binding(&wrong_script),
             Err(PqBlockSigError::StakerKeyHashMismatch {
                 expected: [0xeeu8; 32],
                 actual: addr_key_hash_256,
@@ -1223,7 +1303,7 @@ mod tests {
 
         // Stage 1: ClassicalOnly
         assert_eq!(
-            verify_block_sig_envelope_binding(
+            check_block_sig_envelope_binding(
                 &classical_sig,
                 &classical_vault,
                 &block_hash,
@@ -1233,10 +1313,10 @@ mod tests {
                 &PosBlockAuthPolicy::ClassicalOnly,
             )
             .unwrap(),
-            VerifiedBlockSigBinding::ClassicalSecp256k1
+            UnverifiedBlockSigBinding::ClassicalFormatOnly
         );
         assert_eq!(
-            verify_block_sig_envelope_binding(
+            check_block_sig_envelope_binding(
                 &pq_sig_bytes,
                 &pq_vault,
                 &block_hash,
@@ -1253,7 +1333,7 @@ mod tests {
             network_magic: DIVI_MAINNET_MAGIC,
         };
         assert_eq!(
-            verify_block_sig_envelope_binding(
+            check_block_sig_envelope_binding(
                 &classical_sig,
                 &classical_p2pkh,
                 &block_hash,
@@ -1263,11 +1343,11 @@ mod tests {
                 &pq_policy,
             )
             .unwrap(),
-            VerifiedBlockSigBinding::ClassicalSecp256k1
+            UnverifiedBlockSigBinding::ClassicalFormatOnly
         );
         // Classical sig on PQ vault must fail with MissingPostQuantumBlockSigForPqOutput
         assert_eq!(
-            verify_block_sig_envelope_binding(
+            check_block_sig_envelope_binding(
                 &classical_sig,
                 &pq_vault,
                 &block_hash,
@@ -1280,7 +1360,7 @@ mod tests {
         );
         // PQ sig on classical vault must fail with UnsupportedCoinstakeScriptForPqBlockSig
         assert_eq!(
-            verify_block_sig_envelope_binding(
+            check_block_sig_envelope_binding(
                 &pq_sig_bytes,
                 &classical_vault,
                 &block_hash,
@@ -1292,7 +1372,7 @@ mod tests {
             Err(PqBlockSigError::UnsupportedCoinstakeScriptForPqBlockSig)
         );
         // PQ sig on PQ vault succeeds and returns full binding + prehash
-        let verified = verify_block_sig_envelope_binding(
+        let checked = check_block_sig_envelope_binding(
             &pq_sig_bytes,
             &pq_vault,
             &block_hash,
@@ -1303,8 +1383,8 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            verified,
-            VerifiedBlockSigBinding::PostQuantumV1 {
+            checked,
+            UnverifiedBlockSigBinding::PostQuantumV1BindingOnly {
                 scheme_id: PqSchemeId::FnDsa512,
                 staker_key_hash_256,
                 ..
@@ -1318,7 +1398,7 @@ mod tests {
         };
         // Pre-cutoff (1_899_999_999): classical still allowed on classical output
         assert_eq!(
-            verify_block_sig_envelope_binding(
+            check_block_sig_envelope_binding(
                 &classical_sig,
                 &classical_vault,
                 &block_hash,
@@ -1328,11 +1408,11 @@ mod tests {
                 &cutoff_policy,
             )
             .unwrap(),
-            VerifiedBlockSigBinding::ClassicalSecp256k1
+            UnverifiedBlockSigBinding::ClassicalFormatOnly
         );
         // At cutoff (1_900_000_000): classical rejected with MissingPostQuantumBlockSigAfterCutoff
         assert_eq!(
-            verify_block_sig_envelope_binding(
+            check_block_sig_envelope_binding(
                 &classical_sig,
                 &classical_vault,
                 &block_hash,
@@ -1348,7 +1428,7 @@ mod tests {
         );
         // Post-cutoff PQ vault + PQ sig accepted
         assert!(matches!(
-            verify_block_sig_envelope_binding(
+            check_block_sig_envelope_binding(
                 &pq_sig_bytes,
                 &pq_vault,
                 &block_hash,
@@ -1358,7 +1438,7 @@ mod tests {
                 &cutoff_policy,
             )
             .unwrap(),
-            VerifiedBlockSigBinding::PostQuantumV1 { .. }
+            UnverifiedBlockSigBinding::PostQuantumV1BindingOnly { .. }
         ));
     }
 
@@ -1372,7 +1452,7 @@ mod tests {
 
         let env = PqBlockSigEnvelope::new(PqSchemeId::MlDsa44, vault_pk, vault_sig).unwrap();
         let binding = env
-            .verify_structural_and_staker_binding(&vault_script)
+            .check_structural_and_staker_binding(&vault_script)
             .unwrap();
         assert_eq!(
             binding,
@@ -1392,7 +1472,7 @@ mod tests {
 
         let env = PqBlockSigEnvelope::new(PqSchemeId::MlDsa44, staker_pk, staker_sig).unwrap();
         let binding = env
-            .verify_structural_and_staker_binding(&p2pqpkh_script)
+            .check_structural_and_staker_binding(&p2pqpkh_script)
             .unwrap();
         assert_eq!(
             binding,
@@ -1414,7 +1494,7 @@ mod tests {
         let env =
             PqBlockSigEnvelope::new(PqSchemeId::FnDsa512, fndsa_vault_pk, fndsa_vault_sig).unwrap();
         assert_eq!(
-            env.verify_structural_and_staker_binding(&script).unwrap(),
+            env.check_structural_and_staker_binding(&script).unwrap(),
             CoinstakeStakerBinding::PqStakingVault {
                 owner_hash_256,
                 vault_hash_256,
@@ -1435,7 +1515,7 @@ mod tests {
         let env =
             PqBlockSigEnvelope::new(PqSchemeId::MlDsa44, mldsa_vault_pk, mldsa_vault_sig).unwrap();
         assert_eq!(
-            env.verify_structural_and_staker_binding(&script).unwrap(),
+            env.check_structural_and_staker_binding(&script).unwrap(),
             CoinstakeStakerBinding::PqStakingVault {
                 owner_hash_256,
                 vault_hash_256,
@@ -1534,7 +1614,7 @@ mod tests {
         let pq_sig = pq_env.encode();
 
         assert_eq!(
-            verify_block_sig_envelope_binding(
+            check_block_sig_envelope_binding(
                 &classical_sig,
                 &non_standard,
                 &[0x11u8; 32],
@@ -1546,7 +1626,7 @@ mod tests {
             Err(PqBlockSigError::UnsupportedCoinstakeScriptForClassicalBlockSig)
         );
         assert_eq!(
-            verify_block_sig_envelope_binding(
+            check_block_sig_envelope_binding(
                 &pq_sig,
                 &non_standard,
                 &[0x11u8; 32],
@@ -1571,7 +1651,7 @@ mod tests {
         classical_sig[0] = 0x1d;
 
         assert_eq!(
-            verify_block_sig_envelope_binding(
+            check_block_sig_envelope_binding(
                 &classical_sig,
                 &classical_p2pkh,
                 &[0x11u8; 32],
@@ -1581,7 +1661,7 @@ mod tests {
                 &policy,
             )
             .unwrap(),
-            VerifiedBlockSigBinding::ClassicalSecp256k1
+            UnverifiedBlockSigBinding::ClassicalFormatOnly
         );
 
         let pk = sample_fndsa512_pubkey(0x88);
@@ -1592,7 +1672,7 @@ mod tests {
             .encode();
 
         assert!(matches!(
-            verify_block_sig_envelope_binding(
+            check_block_sig_envelope_binding(
                 &pq_sig,
                 &p2pqpkh,
                 &[0x11u8; 32],
@@ -1602,7 +1682,7 @@ mod tests {
                 &policy,
             )
             .unwrap(),
-            VerifiedBlockSigBinding::PostQuantumV1 {
+            UnverifiedBlockSigBinding::PostQuantumV1BindingOnly {
                 scheme_id: PqSchemeId::FnDsa512,
                 ..
             }
@@ -1620,7 +1700,7 @@ mod tests {
         let p2pqpkh = build_p2pqpkh_script(&[0x55u8; 32]);
 
         assert_eq!(
-            verify_block_sig_envelope_binding(
+            check_block_sig_envelope_binding(
                 &classical_sig,
                 &p2pqpkh,
                 &[0x11u8; 32],
@@ -1688,5 +1768,101 @@ mod tests {
                 actual: 3736,
             })
         );
+    }
+
+    /// F2: two different canonical signatures under one key both pass the binding check, so the
+    /// check cannot be a signature verification; the verifier fails closed for both schemes.
+    #[test]
+    fn test_binding_check_is_not_verification_and_verifier_fails_closed() {
+        let cases = [
+            (
+                PqSchemeId::FnDsa512,
+                sample_fndsa512_pubkey(0x5a),
+                sample_fndsa512_signature(0x01),
+                sample_fndsa512_signature(0xfe),
+            ),
+            (
+                PqSchemeId::MlDsa44,
+                sample_mldsa44_pubkey(0x5a),
+                sample_mldsa44_signature(0x01),
+                sample_mldsa44_signature(0xfe),
+            ),
+        ];
+        let block_hash = [0x11u8; 32];
+        let coinstake_txid = [0x22u8; 32];
+        let policy = PosBlockAuthPolicy::PqRequiredForPqOutputs {
+            network_magic: DIVI_MAINNET_MAGIC,
+        };
+        for (scheme, pk, sig_a, sig_b) in cases {
+            assert_ne!(sig_a, sig_b);
+            let script = build_p2pqpkh_script(&pq_address_key_hash_256(scheme, &pk));
+            let expected_prehash = compute_pos_block_signing_prehash(
+                DIVI_MAINNET_MAGIC,
+                scheme,
+                &pk,
+                &block_hash,
+                &coinstake_txid,
+                1,
+            )
+            .unwrap();
+            for sig in [sig_a, sig_b] {
+                let env = PqBlockSigEnvelope::new(scheme, pk.clone(), sig).unwrap();
+                let checked = check_block_sig_envelope_binding(
+                    &env.encode(),
+                    &script,
+                    &block_hash,
+                    &coinstake_txid,
+                    1,
+                    1_750_000_000,
+                    &policy,
+                )
+                .unwrap();
+                let UnverifiedBlockSigBinding::PostQuantumV1BindingOnly {
+                    scheme_id,
+                    signing_prehash_512,
+                    ..
+                } = checked
+                else {
+                    panic!("expected a post-quantum binding for {scheme:?}");
+                };
+                assert_eq!(scheme_id, scheme);
+                assert_eq!(signing_prehash_512, expected_prehash);
+                assert_eq!(
+                    verify_pq_block_signature(&env, &signing_prehash_512),
+                    Err(PqBlockSigError::PostQuantumSignatureVerifierUnavailable { scheme })
+                );
+            }
+        }
+    }
+
+    /// F2: the fail-closed verifier still reports forbidden schemes and non-canonical encodings,
+    /// so offline diagnosis keeps its specific errors.
+    #[test]
+    fn test_verify_pq_block_signature_reports_encoding_errors_before_unavailability() {
+        let prehash = [0u8; 64];
+        let forbidden = PqBlockSigEnvelope {
+            scheme_id: PqSchemeId::SlhDsa128s,
+            pubkey_bytes: vec![0x11u8; 32],
+            signature_bytes: vec![0x22u8; 7856],
+        };
+        assert_eq!(
+            verify_pq_block_signature(&forbidden, &prehash),
+            Err(PqBlockSigError::Crypto(PqError::SchemeForbiddenInDomain {
+                scheme: PqSchemeId::SlhDsa128s,
+                domain: PqDomainTag::BlockSigV1,
+            }))
+        );
+
+        let mut bad_sig = sample_fndsa512_signature(0x07);
+        bad_sig[0] = 0x00;
+        let non_canonical = PqBlockSigEnvelope {
+            scheme_id: PqSchemeId::FnDsa512,
+            pubkey_bytes: sample_fndsa512_pubkey(0x07),
+            signature_bytes: bad_sig,
+        };
+        assert!(matches!(
+            verify_pq_block_signature(&non_canonical, &prehash),
+            Err(PqBlockSigError::Crypto(_))
+        ));
     }
 }

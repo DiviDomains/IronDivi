@@ -512,95 +512,74 @@ impl ChainDatabase {
 
     /// Add a UTXO
     ///
-    /// If UTXO cache is enabled, the entry is added to cache and marked dirty.
-    /// Otherwise, it's written directly to the database.
+    /// Written to the database; with the UTXO cache enabled the cache is
+    /// updated in the same serialized step (write-through, see `utxo_cache`).
     pub fn add_utxo(&self, outpoint: &OutPoint, utxo: &Utxo) -> Result<(), StorageError> {
-        // Always write to RocksDB for durability
         let cf = self.db.cf_handle(CF_UTXO).unwrap();
-        let key = utxo_key(outpoint);
-        let value = utxo.to_bytes();
-        self.db.put_cf(cf, key, value)?;
-
-        // Also populate cache for fast reads
-        if let Some(ref cache) = self.utxo_cache {
-            cache.insert(*outpoint, utxo.clone());
+        let write = || -> Result<(), StorageError> {
+            self.db.put_cf(cf, utxo_key(outpoint), utxo.to_bytes())?;
+            Ok(())
+        };
+        match self.utxo_cache {
+            Some(ref cache) => cache.write_through(vec![(*outpoint, Some(utxo.clone()))], write),
+            None => write(),
         }
-        Ok(())
     }
 
     /// Get a UTXO
     ///
-    /// If UTXO cache is enabled, checks cache first and populates on miss.
+    /// If UTXO cache is enabled, checks cache first and, on a miss, caches the
+    /// value read unless a write may have made it stale meanwhile.
     pub fn get_utxo(&self, outpoint: &OutPoint) -> Result<Option<Utxo>, StorageError> {
         if let Some(ref cache) = self.utxo_cache {
-            // Check cache first
             if let Some(result) = cache.get(outpoint) {
                 return Ok(result);
             }
-            // Cache miss: fetch from DB and populate cache
-            let cf = self.db.cf_handle(CF_UTXO).unwrap();
-            let key = utxo_key(outpoint);
-            match self.db.get_cf(cf, key)? {
-                Some(data) => {
-                    let utxo = Utxo::from_bytes(&data)?;
-                    cache.populate_from_db(*outpoint, Some(utxo.clone()));
-                    Ok(Some(utxo))
-                }
-                None => Ok(None),
-            }
+            let ticket = cache.fill_ticket();
+            let utxo = self.get_utxo_direct(outpoint)?;
+            cache.sched_point("utxo fill");
+            cache.fill(ticket, *outpoint, utxo.clone());
+            Ok(utxo)
         } else {
-            // No cache: fetch directly from DB
-            let cf = self.db.cf_handle(CF_UTXO).unwrap();
-            let key = utxo_key(outpoint);
-            match self.db.get_cf(cf, key)? {
-                Some(data) => Ok(Some(Utxo::from_bytes(&data)?)),
-                None => Ok(None),
-            }
+            self.get_utxo_direct(outpoint)
         }
     }
 
     /// Remove a UTXO
     ///
-    /// If UTXO cache is enabled, marks as deleted (tombstone) in cache.
-    /// Otherwise, deletes directly from database.
+    /// Deleted from the database; with the UTXO cache enabled a tombstone is
+    /// cached in the same serialized step (write-through).
     pub fn remove_utxo(&self, outpoint: &OutPoint) -> Result<(), StorageError> {
-        // Always delete from RocksDB for durability
         let cf = self.db.cf_handle(CF_UTXO).unwrap();
-        let key = utxo_key(outpoint);
-        self.db.delete_cf(cf, key)?;
-
-        // Also update cache
-        if let Some(ref cache) = self.utxo_cache {
-            cache.remove(*outpoint);
+        let write = || -> Result<(), StorageError> {
+            self.db.delete_cf(cf, utxo_key(outpoint))?;
+            Ok(())
+        };
+        match self.utxo_cache {
+            Some(ref cache) => cache.write_through(vec![(*outpoint, None)], write),
+            None => write(),
         }
-        Ok(())
     }
 
     /// Check if a UTXO exists
     ///
-    /// If UTXO cache is enabled, checks cache first.
+    /// If UTXO cache is enabled, checks cache first (validated fill on a miss).
     pub fn has_utxo(&self, outpoint: &OutPoint) -> Result<bool, StorageError> {
+        let cf = self.db.cf_handle(CF_UTXO).unwrap();
         if let Some(ref cache) = self.utxo_cache {
-            // Check cache first
             if let Some(exists) = cache.contains(outpoint) {
                 return Ok(exists);
             }
-            // Cache miss: check DB
-            let cf = self.db.cf_handle(CF_UTXO).unwrap();
-            let key = utxo_key(outpoint);
-            let exists = self.db.get_cf(cf, key)?.is_some();
-            // Populate cache on miss if the UTXO exists
-            if exists {
-                if let Ok(Some(utxo)) = self.get_utxo_direct(outpoint) {
-                    cache.populate_from_db(*outpoint, Some(utxo));
-                }
+            let ticket = cache.fill_ticket();
+            let data = self.db.get_cf(cf, utxo_key(outpoint))?;
+            cache.sched_point("utxo fill");
+            let exists = data.is_some();
+            if let Some(Ok(utxo)) = data.map(|d| Utxo::from_bytes(&d)) {
+                cache.fill(ticket, *outpoint, Some(utxo));
             }
             Ok(exists)
         } else {
-            // No cache: check DB directly
-            let cf = self.db.cf_handle(CF_UTXO).unwrap();
-            let key = utxo_key(outpoint);
-            Ok(self.db.get_cf(cf, key)?.is_some())
+            Ok(self.db.get_cf(cf, utxo_key(outpoint))?.is_some())
         }
     }
 
@@ -647,10 +626,6 @@ impl ChainDatabase {
         }
     }
 
-    /// Flush the UTXO cache to database
-    ///
-    /// Should be called periodically during sync and before shutdown.
-    /// Returns the number of entries flushed, or 0 if cache is not enabled.
     /// The directory the database lives in
     pub fn path(&self) -> &Path {
         self.db.path()
@@ -661,6 +636,12 @@ impl ChainDatabase {
         self.utxo_cache.as_ref().map_or(0, |c| c.dirty_count())
     }
 
+    /// Flush the UTXO cache to database
+    ///
+    /// Every UTXO write made through this database is written through, so the
+    /// cache it owns never holds dirty entries and this returns 0; it is kept
+    /// for callers that flush before shutdown. Returns the number of entries
+    /// flushed, or 0 if cache is not enabled.
     pub fn flush_utxo_cache(&self) -> Result<usize, StorageError> {
         if let Some(ref cache) = self.utxo_cache {
             cache.flush(&self.db)
@@ -952,6 +933,44 @@ impl ChainDatabase {
         Ok(pruned)
     }
 
+    /// Write `wb`, which holds `batch`'s UTXO changes (intra-block spends
+    /// skipped), and with the UTXO cache enabled update the cache to match in
+    /// the same serialized step, so no fill or flush can interleave between
+    /// the database write and the cache update (see `utxo_cache`).
+    fn write_utxo_batch(
+        &self,
+        wb: WriteBatch,
+        batch: &BatchedUtxoWriter,
+        removed_set: &std::collections::HashSet<&OutPoint>,
+        added_set: &std::collections::HashSet<&OutPoint>,
+    ) -> Result<(), StorageError> {
+        let write = || -> Result<(), StorageError> {
+            self.db.write(wb)?;
+            Ok(())
+        };
+        let Some(ref cache) = self.utxo_cache else {
+            return write();
+        };
+        let mut changes = Vec::with_capacity(batch.removes.len() + batch.adds.len());
+        for outpoint in &batch.removes {
+            if !added_set.contains(outpoint) {
+                changes.push((*outpoint, None));
+            }
+        }
+        for (outpoint, utxo) in &batch.adds {
+            if !removed_set.contains(outpoint) {
+                changes.push((*outpoint, Some(utxo.clone())));
+            }
+        }
+        cache.write_through(changes, write)
+    }
+
+    /// The UTXO cache, for tests that force interleavings on it
+    #[cfg(test)]
+    pub(crate) fn utxo_cache_ref(&self) -> Option<&UtxoCache> {
+        self.utxo_cache.as_ref()
+    }
+
     /// Atomically flush UTXO changes + undo data + tip update in a single WriteBatch.
     /// This is the C++ pattern: all state changes for a connected block are atomic.
     /// `extra` adds the block's other entries (address and spent index) to the
@@ -1011,22 +1030,8 @@ impl ChainDatabase {
         );
         extra(&mut wb)?;
 
-        // Single atomic write
-        self.db.write(wb)?;
-
-        // Update in-memory caches
-        if let Some(ref cache) = self.utxo_cache {
-            for outpoint in &utxo_batch.removes {
-                if !added_set.contains(outpoint) {
-                    cache.remove(*outpoint);
-                }
-            }
-            for (outpoint, utxo) in &utxo_batch.adds {
-                if !removed_set.contains(outpoint) {
-                    cache.insert(*outpoint, utxo.clone());
-                }
-            }
-        }
+        // Single atomic write; the UTXO cache follows it in the same step
+        self.write_utxo_batch(wb, utxo_batch, &removed_set, &added_set)?;
 
         // Update block index caches
         self.block_index_cache
@@ -1082,20 +1087,7 @@ impl ChainDatabase {
         wb.put_cf(&cf_metadata, KEY_CHAIN_HEIGHT, new_tip.height.to_le_bytes());
         extra(&mut wb)?;
 
-        self.db.write(wb)?;
-
-        if let Some(ref cache) = self.utxo_cache {
-            for outpoint in &utxo_batch.removes {
-                if !added_set.contains(outpoint) {
-                    cache.remove(*outpoint);
-                }
-            }
-            for (outpoint, utxo) in &utxo_batch.adds {
-                if !removed_set.contains(outpoint) {
-                    cache.insert(*outpoint, utxo.clone());
-                }
-            }
-        }
+        self.write_utxo_batch(wb, utxo_batch, &removed_set, &added_set)?;
         self.block_index_cache.insert(index.hash, index.clone());
         self.height_to_hash_cache.invalidate(&index.height);
         Ok(())
@@ -1166,8 +1158,8 @@ impl ChainDatabase {
 
     /// Flush a batch of UTXO operations atomically
     ///
-    /// If UTXO cache is enabled, operations go to the cache (deferred write).
-    /// Otherwise, they are written directly to the database.
+    /// Written to the database in one batch; with the UTXO cache enabled the
+    /// cache is updated in the same serialized step (write-through).
     pub fn flush_utxo_batch(&self, batch: &BatchedUtxoWriter) -> Result<(), StorageError> {
         // Build a set of removed outpoints so we can detect intra-block spends
         // (UTXOs created and spent within the same block should be a no-op)
@@ -1194,21 +1186,8 @@ impl ChainDatabase {
             }
         }
 
-        self.db.write(wb)?;
-
-        // Also update cache for fast reads (same deduplication logic)
-        if let Some(ref cache) = self.utxo_cache {
-            for outpoint in &batch.removes {
-                if !added_set.contains(outpoint) {
-                    cache.remove(*outpoint);
-                }
-            }
-            for (outpoint, utxo) in &batch.adds {
-                if !removed_set.contains(outpoint) {
-                    cache.insert(*outpoint, utxo.clone());
-                }
-            }
-        }
+        // The UTXO cache follows the write in the same step (same deduplication)
+        self.write_utxo_batch(wb, batch, &removed_set, &added_set)?;
 
         Ok(())
     }

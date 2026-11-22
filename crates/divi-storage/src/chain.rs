@@ -6250,6 +6250,7 @@ fn script_failure(
 mod tests {
     mod crash;
     mod disk_space;
+    mod durability;
 
     use super::*;
 

@@ -52,6 +52,17 @@ usage() {
 }
 die() { echo "zec-live: $*" >&2; exit 1; }
 
+# `accept`/`run` commit funds only under the user's own direction and price limit. This
+# harness drives the operator's own maker, so its listed terms are the intent; set
+# TAKER_LIMIT_PRICE to hold the quote to a different worst price (DIVI sats per coin).
+intent_flags() { # intent_flags <maker base> <offer id>: prints --direction D --limit-price P
+  curl -sf -m 10 "$1/offers" | python3 -c '
+import json, os, sys
+o = next(o for o in json.load(sys.stdin) if o["id"] == sys.argv[1])
+print("--direction", o["direction"].replace("_", "-"),
+      "--limit-price", os.environ.get("TAKER_LIMIT_PRICE") or o["divi_sats_per_btc"])' "$2"
+}
+
 scenario_arg=all
 direction_arg=both
 backend=live
@@ -322,6 +333,9 @@ run_direction() {
   fi
 
   echo "zec-live: [$scenario/$direction] offer=$offer dry_run=$dry_run"
+  local ifl_s ifl
+  ifl_s="$(intent_flags "$base" "$offer")" || die "[$scenario/$direction] offer $offer is not listed at $base"
+  read -r -a ifl <<<"$ifl_s"
 
   if ((dry_run)); then
     # `run` does quote+accept+lock+poll as one swap; a dry run instead stops right after
@@ -329,7 +343,7 @@ run_direction() {
     # calls lock — never creates the swap `run` would go on to use.
     "${taker[@]}" quote --maker "$base" --offer "$offer" --btc-sats "$zec_zats"
     local local_id
-    local_id="$("${taker[@]}" accept --maker "$base" --offer "$offer" --btc-sats "$zec_zats" | tail -1)"
+    local_id="$("${taker[@]}" accept --maker "$base" --offer "$offer" --btc-sats "$zec_zats" "${ifl[@]}" | tail -1)"
     [[ -n "$local_id" ]] || die "[$scenario/$direction] accept printed no swap id"
     echo "zec-live: [$scenario/$direction] accepted $local_id (no broadcast yet)"
     echo "zec-live: [$scenario/$direction] --dry-run: stopping before lock (first broadcast). OK."
@@ -337,7 +351,7 @@ run_direction() {
   fi
 
   local out="$state/taker-run.log" local_id
-  "${taker[@]}" run --maker "$base" --offer "$offer" --btc-sats "$zec_zats" \
+  "${taker[@]}" run --maker "$base" --offer "$offer" --btc-sats "$zec_zats" "${ifl[@]}" \
     --timeout-secs "$timeout_secs" ${taker_flags[@]+"${taker_flags[@]}"} 2>&1 | tee "$out"
   local_id="$(tail -1 "$out" | awk '{print $1}')"
   [[ -n "$local_id" ]] || die "[$scenario/$direction] taker run printed no swap id"

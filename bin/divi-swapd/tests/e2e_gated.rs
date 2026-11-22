@@ -80,7 +80,7 @@ async fn late_btc_claim_inside_the_btc_margin_is_refused_before_locking() {
         &taker,
         &client,
         &sessions,
-        REV_OFFER_ID,
+        &offer(REV_OFFER_ID),
         BTC_SATS,
         &opts,
         &mut || {
@@ -133,7 +133,7 @@ async fn late_btc_claim_above_the_btc_margin_goes_through() {
         &taker,
         &client,
         &sessions,
-        REV_OFFER_ID,
+        &offer(REV_OFFER_ID),
         BTC_SATS,
         &fast(),
         &mut || {
@@ -184,7 +184,7 @@ async fn late_claim_waits_then_both_sides_finish() {
         &taker,
         &client,
         &sessions,
-        OFFER_ID,
+        &offer(OFFER_ID),
         BTC_SATS,
         &fast(),
         &mut || {
@@ -251,7 +251,7 @@ async fn never_claim_ends_in_refunds() {
         &taker,
         &client,
         &sessions,
-        OFFER_ID,
+        &offer(OFFER_ID),
         BTC_SATS,
         &fast(),
         &mut || {
@@ -311,7 +311,7 @@ async fn never_claim_survives_a_transient_backend_error() {
         &taker,
         &client,
         &sessions,
-        OFFER_ID,
+        &offer(OFFER_ID),
         BTC_SATS,
         &fast(),
         &mut || {

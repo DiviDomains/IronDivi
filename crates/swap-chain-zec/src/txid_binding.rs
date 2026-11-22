@@ -384,3 +384,126 @@ async fn find_spend_refuses_a_spender_that_spends_something_else() {
         );
     }
 }
+
+// ---- scan_spend (H2) ------------------------------------------------------------------------
+
+/// The mark `scan_spend` gives the stub's block at `height`: its wire-order hash.
+fn wire_mark(p: &Lightwalletd, height: u64) -> divi_swap::ScanMark {
+    let mut wire = hex::decode(p.hash_at(height)).unwrap();
+    wire.reverse();
+    divi_swap::ScanMark {
+        height,
+        hash: hex::encode(wire),
+    }
+}
+
+/// A spend more than one window past the scan's start: the first pass stops short of the
+/// tip ("not seen yet", never "unspent"), the pass resumed from its mark finds it.
+#[tokio::test]
+async fn scan_spend_resumes_past_one_window_to_a_late_spend() {
+    use divi_swap::SpendScan;
+    let p = Lightwalletd::start(450);
+    let s = p.put_honest(spend_raw(5, watched(), ZAT - 2_000), 300);
+    block_names(&p, 300, s, watched());
+    let b = p.backend();
+    let first = b.scan_spend(&watched(), 10, None).await.unwrap();
+    let mark = wire_mark(&p, 10 + crate::MAX_SCAN_BLOCKS - 1);
+    assert_eq!(
+        first,
+        SpendScan::NotYet {
+            through: Some(mark.clone()),
+            complete: false
+        }
+    );
+    // The one-shot read is no proof of absence; only the resumed pass reaches the spend.
+    assert_eq!(b.find_spend(&watched(), 10).await.unwrap(), None);
+    match b
+        .scan_spend(&watched(), mark.height, Some(&mark))
+        .await
+        .unwrap()
+    {
+        SpendScan::Spent(info) => assert_eq!((info.txid, info.height), (Txid(s), Some(300))),
+        other => panic!("want the spend, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn scan_spend_retries_a_tip_replaced_after_latest_block() {
+    use divi_swap::SpendScan;
+    let p = Lightwalletd::start(TIP);
+    let b = p.backend();
+    let start = wire_mark(&p, TIP - 1);
+    p.after_latest(crate::lwd_stub::Move::ReorgTip);
+    assert!(matches!(
+        b.scan_spend(&watched(), start.height, Some(&start)).await,
+        Err(SwapError::Transient(_))
+    ));
+    assert_eq!(
+        b.scan_spend(&watched(), start.height, Some(&start))
+            .await
+            .unwrap(),
+        SpendScan::NotYet {
+            through: Some(wire_mark(&p, TIP)),
+            complete: true
+        }
+    );
+}
+
+/// A pass that reaches the tip is `complete`; after a shallow reorg replaces the marked
+/// block, or the tip falls below the mark, the resumed pass reports the reorg.
+#[tokio::test]
+async fn scan_spend_reports_a_reorg_under_its_mark() {
+    use divi_swap::SpendScan;
+    let p = Lightwalletd::start(TIP);
+    let b = p.backend();
+    let tip = wire_mark(&p, TIP);
+    assert_eq!(
+        b.scan_spend(&watched(), TIP - 5, None).await.unwrap(),
+        SpendScan::NotYet {
+            through: Some(tip.clone()),
+            complete: true
+        }
+    );
+    assert_eq!(
+        b.scan_spend(&watched(), TIP, Some(&tip)).await.unwrap(),
+        SpendScan::NotYet {
+            through: Some(tip.clone()),
+            complete: true
+        }
+    );
+    p.reorg(2);
+    assert_eq!(
+        b.scan_spend(&watched(), TIP, Some(&tip)).await.unwrap(),
+        SpendScan::Reorged
+    );
+    let above = divi_swap::ScanMark {
+        height: TIP + 1,
+        ..tip
+    };
+    assert_eq!(
+        b.scan_spend(&watched(), TIP + 1, Some(&above))
+            .await
+            .unwrap(),
+        SpendScan::Reorged
+    );
+}
+
+/// The compact block names a spender the server cannot return in full: that block is not
+/// counted as read, so the mark stops before it and the next pass reads it again.
+#[tokio::test]
+async fn scan_spend_does_not_pass_a_block_whose_spender_is_missing() {
+    use divi_swap::SpendScan;
+    let p = Lightwalletd::start(TIP);
+    let s = txid_of(&spend_raw(5, watched(), ZAT - 2_000));
+    block_names(&p, TIP - 3, s, watched());
+    assert_eq!(
+        p.backend()
+            .scan_spend(&watched(), TIP - 5, None)
+            .await
+            .unwrap(),
+        SpendScan::NotYet {
+            through: Some(wire_mark(&p, TIP - 4)),
+            complete: false
+        }
+    );
+}

@@ -10,17 +10,20 @@
 
 use std::sync::Arc;
 
-use divi_swap::api::{Offer, SwapView};
+use divi_swap::api::{Direction, Offer, SwapView};
 use divi_swap::store::{StoreBackend, Table};
 use divi_swap::{
-    rt, Chain, ChainBackend, Outpoint, Result, Store, SwapError, Taker, TakerState, Txid,
+    rt, Chain, ChainBackend, Outpoint, Profile, QuoteIntent, Result, Store, SwapError, Taker,
+    TakerState, Txid,
 };
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use swap_chain_divi::{DiviBackend, Utxo};
 use swap_keys::{Net, SwapKeys};
 
 use crate::durable::{Durable, Persister, Sink, WALLET_DOC};
 use crate::maker::MakerClient;
+use crate::selection::{SelectionSpec, Selections};
 use crate::store::EncryptedStore;
 use crate::view::SwapSummary;
 
@@ -42,6 +45,114 @@ pub struct Config {
     /// Address index of the swap keys (the extension's own DIVI address is 0).
     #[serde(default)]
     pub index: u32,
+    /// The timeout and confirmation floor a maker's terms are held to before anything is
+    /// accepted or locked ([`Taker::with_profile_floor`]). Default `testnet`; `mainnet` is
+    /// only ever stricter.
+    #[serde(default = "testnet")]
+    pub profile: Profile,
+}
+
+fn testnet() -> Profile {
+    Profile::Testnet
+}
+
+/// Largest integer a JS number holds exactly (`Number.MAX_SAFE_INTEGER`).
+pub const MAX_SAFE_JS_INTEGER: u64 = (1 << 53) - 1;
+
+/// An offer as the UI shows it: the offer itself (JSON numbers, which JS rounds past
+/// [`MAX_SAFE_JS_INTEGER`]) plus its amounts as exact decimal strings, and the selection
+/// token that pins exactly these terms ([`crate::selection`]). `selection` is `null` and
+/// `ambiguous` true when the maker listed the id more than once: such an offer cannot be
+/// taken.
+#[derive(Debug, Clone, Serialize)]
+pub struct OfferView {
+    #[serde(flatten)]
+    pub offer: Offer,
+    pub exact: ExactTerms,
+    pub selection: Option<String>,
+    pub ambiguous: bool,
+}
+
+/// An offer's u64 terms as decimal strings.
+#[derive(Debug, Clone, Serialize)]
+pub struct ExactTerms {
+    pub divi_sats_per_btc: String,
+    pub min_btc_sats: String,
+    pub max_btc_sats: String,
+}
+
+impl OfferView {
+    fn new(offer: Offer, selection: Option<String>) -> Self {
+        OfferView {
+            exact: ExactTerms {
+                divi_sats_per_btc: offer.divi_sats_per_btc.to_string(),
+                min_btc_sats: offer.min_btc_sats.to_string(),
+                max_btc_sats: offer.max_btc_sats.to_string(),
+            },
+            ambiguous: selection.is_none(),
+            selection,
+            offer,
+        }
+    }
+}
+
+/// The extension's explicit limits for `beginWithIntent`. Every u64 is a decimal string or
+/// a JSON integer no larger than [`MAX_SAFE_JS_INTEGER`]; unknown keys are refused.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IntentSpec {
+    pub offer_id: String,
+    pub btc_sats: serde_json::Value,
+    pub counter_chain: Chain,
+    pub direction: Direction,
+    pub limit_divi_sats_per_btc: serde_json::Value,
+    #[serde(default)]
+    pub min_remaining_secs: Option<serde_json::Value>,
+    #[serde(default)]
+    pub max_taker_timeout_secs: Option<u32>,
+}
+
+impl IntentSpec {
+    /// Parse `json` into the [`QuoteIntent`] it describes.
+    pub fn parse(json: &str) -> Result<QuoteIntent> {
+        let spec: IntentSpec = serde_json::from_str(json)
+            .map_err(|e| SwapError::InvalidParams(format!("bad intent: {e}")))?;
+        spec.intent()
+    }
+
+    pub fn intent(&self) -> Result<QuoteIntent> {
+        let mut intent = QuoteIntent::with_limit(
+            &self.offer_id,
+            exact_u64("btc_sats", &self.btc_sats)?,
+            self.counter_chain,
+            self.direction,
+            exact_u64("limit_divi_sats_per_btc", &self.limit_divi_sats_per_btc)?,
+        )?
+        .with_max_taker_timeout_secs(self.max_taker_timeout_secs);
+        if let Some(v) = &self.min_remaining_secs {
+            intent = intent.with_min_remaining_secs(exact_u64("min_remaining_secs", v)?);
+        }
+        Ok(intent)
+    }
+}
+
+/// A u64 from JS without rounding: a decimal string of digits, or a JSON integer JS can hold
+/// exactly. Fractions, exponents, negatives and unsafe integers are refused.
+pub fn exact_u64(name: &str, v: &serde_json::Value) -> Result<u64> {
+    let bad = || SwapError::InvalidParams(format!("{name}: not an exact amount: {v}"));
+    match v {
+        serde_json::Value::String(s) => {
+            if s.is_empty() || s.len() > 20 || !s.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(bad());
+            }
+            s.parse().map_err(|_| bad())
+        }
+        serde_json::Value::Number(n) => n
+            .as_u64()
+            .filter(|&n| n <= MAX_SAFE_JS_INTEGER)
+            .ok_or_else(bad),
+        _ => Err(bad()),
+    }
 }
 
 /// A DIVI coin as the extension's address index reports it (`getaddressutxos`).
@@ -69,6 +180,10 @@ pub struct Engine {
     persister: Arc<Persister>,
     divi: Arc<DiviBackend>,
     addresses: Addresses,
+    /// Every offer selection [`offers`](Self::offers) issued, by token: what
+    /// [`begin_selected`](Self::begin_selected) holds a quote to. Never rewritten by a later
+    /// listing.
+    selections: Mutex<Selections>,
 }
 
 impl Engine {
@@ -118,7 +233,8 @@ impl Engine {
             durable(divi.clone()),
             vec![durable(Arc::new(btc)), durable(Arc::new(ltc))],
             swaps.clone(),
-        );
+        )
+        .with_profile_floor(cfg.profile);
         Ok(Engine {
             taker,
             maker: MakerClient::new(&cfg.maker_url)?,
@@ -126,10 +242,12 @@ impl Engine {
             persister,
             divi,
             addresses,
+            selections: Mutex::new(Selections::random()?),
         })
     }
 
-    /// Assemble from parts (tests drive mock chains through this).
+    /// Assemble from parts (tests drive mock chains through this). `taker` keeps whatever
+    /// profile floor it was built with.
     pub fn from_parts(
         taker: Taker,
         maker: MakerClient,
@@ -137,15 +255,21 @@ impl Engine {
         persister: Arc<Persister>,
         divi: Arc<DiviBackend>,
         addresses: Addresses,
-    ) -> Self {
-        Engine {
+    ) -> Result<Self> {
+        Ok(Engine {
             taker,
             maker,
             store,
             persister,
             divi,
             addresses,
-        }
+            selections: Mutex::new(Selections::random()?),
+        })
+    }
+
+    /// The profile floor quotes are held to, if any.
+    pub fn profile_floor(&self) -> Option<Profile> {
+        self.taker.profile_floor()
     }
 
     /// The taker's addresses.
@@ -153,35 +277,71 @@ impl Engine {
         &self.addresses
     }
 
-    /// The maker's offers for chains this taker holds a key on.
-    pub async fn offers(&self) -> Result<Vec<Offer>> {
+    /// The maker's offers for chains this taker holds a key on, each with a selection token
+    /// for exactly the terms returned. Each call is a new listing: it adds tokens and never
+    /// changes what an earlier token selects, so another view or a refresh cannot alter the
+    /// terms a user is looking at. An id the maker lists more than once (on any chain) gets
+    /// no token.
+    pub async fn offers(&self) -> Result<Vec<OfferView>> {
         let chains = self.taker.counter_chains();
-        let offers = self.maker.offers().await?;
+        let listed = self.maker.offers().await?;
+        let offers: Vec<Offer> = listed
+            .iter()
+            .filter(|o| chains.contains(&o.counter_chain))
+            .cloned()
+            .collect();
+        let tokens = self.selections.lock().record(
+            listed.iter().map(|o| o.id.as_str()),
+            &offers,
+            rt::unix_now(),
+        )?;
         Ok(offers
             .into_iter()
-            .filter(|o| chains.contains(&o.counter_chain))
+            .zip(tokens)
+            .map(|(o, t)| OfferView::new(o, t))
             .collect())
     }
 
-    /// Quote and accept `btc_sats` of the counter coin on `offer_id`. Nothing is locked yet.
-    pub async fn begin(&self, offer_id: &str, btc_sats: u64) -> Result<SwapSummary> {
-        let quote = self.maker.quote(offer_id, btc_sats).await?;
-        if quote.offer_id != offer_id || quote.btc_amount.to_sat() != btc_sats {
-            return Err(SwapError::Rejected(
-                "the maker quoted something other than what was asked".into(),
-            ));
-        }
-        if quote.expires_at <= rt::unix_now() {
-            return Err(SwapError::Rejected("the quote has already expired".into()));
-        }
-        if !self.taker.counter_chains().contains(&quote.counter_chain) {
+    /// Quote and accept on the offer `spec.selection` names, held to the terms that listing
+    /// returned for it ([`QuoteIntent::for_offer`]). `spec` repeats every term the UI showed
+    /// and must match them exactly. Refused without a request when the selection is unknown
+    /// (never issued, or forgotten across a restart or lock), stale, or for an ambiguous id.
+    /// Nothing is locked yet.
+    pub async fn begin_selected(&self, spec: &SelectionSpec) -> Result<SwapSummary> {
+        let offer = self
+            .selections
+            .lock()
+            .get(&spec.selection, rt::unix_now())?;
+        self.begin_with_intent(&spec.intent(&offer)?).await
+    }
+
+    /// Age every selection by `secs` (tests only).
+    #[cfg(test)]
+    pub(crate) fn age_selections(&self, secs: u64) {
+        self.selections.lock().age(secs);
+    }
+
+    /// Quote and accept per `intent`: the maker's quote must honour it
+    /// ([`QuoteIntent::check_quote`]) and, under the profile floor, its HTLC timing must be
+    /// workable ([`QuoteIntent::check_htlc_terms`]) before a preimage is generated; it must
+    /// still have `intent.min_remaining_secs` to run after the swap is persisted, right
+    /// before it is accepted. Nothing is locked yet.
+    pub async fn begin_with_intent(&self, intent: &QuoteIntent) -> Result<SwapSummary> {
+        intent.validate()?;
+        if !self.taker.counter_chains().contains(&intent.counter_chain) {
             return Err(SwapError::InvalidParams(format!(
                 "no key for {}",
-                quote.counter_chain.as_str()
+                intent.counter_chain.as_str()
             )));
+        }
+        let quote = self.maker.quote(&intent.offer_id, intent.btc_sats).await?;
+        intent.check_quote(&quote, rt::unix_now())?;
+        if let Some(p) = self.taker.profile_floor() {
+            intent.check_htlc_terms(&quote, p, &|c| self.taker.claim_deadline(c))?;
         }
         let (id, req) = self.taker.prepare(&quote).await?;
         self.persister.save().await?;
+        intent.check_deadline(&quote, rt::unix_now())?;
         let reply = self.maker.accept(&req).await?;
         if let Some(token) = reply.swap_token.filter(|t| !t.is_empty()) {
             self.store

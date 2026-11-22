@@ -58,6 +58,22 @@ const FIRST_DATA_TIMEOUT: Duration = Duration::from_secs(60);
 /// Timeout for reading a message
 const READ_TIMEOUT: Duration = Duration::from_secs(90);
 
+/// One deadline for the entire frame, including flush; never resume a partial frame.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(90);
+
+async fn write_frame<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    bytes: &[u8],
+) -> Result<(), NetworkError> {
+    timeout(WRITE_TIMEOUT, async {
+        writer.write_all(bytes).await?;
+        writer.flush().await
+    })
+    .await
+    .map_err(|_| NetworkError::Timeout)??;
+    Ok(())
+}
+
 /// Divi Core's PING_INTERVAL (Node.cpp:1045): a keepalive ping goes out this
 /// long after the last ping was sent, when none is unanswered
 const PING_INTERVAL: Duration = Duration::from_secs(2 * 60);
@@ -384,7 +400,7 @@ impl Connection {
 
         // Divi Core's "receive version message" line (main.cpp:456-461)
         info!(
-            "receive version message: {}: version {}, blocks={}, us={}, {}",
+            "receive version message: {:?}: version {}, blocks={}, us={}, {}",
             self.info.user_agent().unwrap_or("unknown"),
             self.info.version.as_ref().map_or(0, |v| v.version),
             self.info.start_height,
@@ -442,7 +458,7 @@ impl Connection {
         let their_version = self.recv_version().await?;
 
         debug!(
-            "Received version from {}: height={}, user_agent={}",
+            "Received version from {}: height={}, user_agent={:?}",
             self.info.addr, their_version.start_height, their_version.user_agent
         );
 
@@ -759,6 +775,11 @@ impl Connection {
                     crate::peer_log::peer(peer_id, info.addr),
                     e
                 );
+                let _ = event_tx.send(PeerEvent::Disconnected {
+                    peer_id,
+                    reason: e.to_string(),
+                });
+                return Err(e);
             }
         }
 
@@ -772,9 +793,7 @@ impl Connection {
             // limits (Divi Core IsAvailableToReceive, Node.cpp:335-339)
             let can_receive = stats.can_receive();
             tokio::select! {
-                biased;
-
-                // Check for shutdown signal (highest priority)
+                // The outer stop also interrupts writes. Poll reads and sends fairly.
                 _ = shutdown_rx.recv() => {
                     debug!("Shutdown signal received, disconnecting from {}", crate::peer_log::peer(peer_id, info.addr));
                     break;
@@ -879,6 +898,7 @@ impl Connection {
                             );
                             if let Err(e) = Self::write_turns(&mut writer, &mut info, magic, &total_bytes_sent, &stats, &mut last_ping_sent, &mut outbound_rx, &mut waiting).await {
                                 warn!("Error answering {}: {}", crate::peer_log::peer(peer_id, info.addr), e);
+                                break;
                             }
                         }
                         Ok(Some(Err(e))) => {
@@ -924,12 +944,10 @@ impl Connection {
         size: u64,
     ) {
         match &msg {
-            // The peer's verack: nothing waits for it, but a peer we dialled
-            // is marked currently connected (main.cpp:498-507)
+            // Staking requires verack in either direction. Only outbound
+            // finalization uses this flag to update the address book.
             NetworkMessage::Verack => {
-                if info.direction == PeerDirection::Outbound {
-                    stats.verack_received.store(true, Ordering::Release);
-                }
+                stats.verack_received.store(true, Ordering::Release);
             }
             // Divi Core: one version per connection
             NetworkMessage::Version(_) => {
@@ -1009,7 +1027,11 @@ impl Connection {
                 Some((handed, _)) if *handed <= taken => {}
                 _ => return Ok(()),
             }
-            while let Ok(msg) = outbound_rx.try_recv() {
+            // Only the already queued prefix can answer an earlier message.
+            for _ in 0..outbound_rx.len() {
+                let Ok(msg) = outbound_rx.try_recv() else {
+                    break;
+                };
                 Self::write_queued(
                     writer,
                     info,
@@ -1063,12 +1085,9 @@ impl Connection {
         msg: NetworkMessage,
     ) -> Result<(), NetworkError> {
         let queued = msg.wire_size();
-        if stats.holds_back(&msg) {
-            // Divi Core keeps these for a peer whose sporks are out
-            stats.send_written(queued);
-            stats.hold(msg);
+        let Some(msg) = stats.hold_if_waiting(msg)? else {
             return Ok(());
-        }
+        };
         let msg = match msg {
             NetworkMessage::Ping(_) => {
                 let nonce = rand::random();
@@ -1094,8 +1113,7 @@ impl Connection {
     ) -> Result<(), NetworkError> {
         let bytes = msg.to_bytes(magic)?;
 
-        writer.write_all(&bytes).await?;
-        writer.flush().await?;
+        write_frame(writer, &bytes).await?;
 
         // Update stats
         let bytes_sent = bytes.len() as u64;
@@ -1113,8 +1131,7 @@ impl Connection {
     async fn send_message(&mut self, msg: NetworkMessage) -> Result<(), NetworkError> {
         let bytes = msg.to_bytes(self.magic)?;
 
-        self.stream.write_all(&bytes).await?;
-        self.stream.flush().await?;
+        write_frame(&mut self.stream, &bytes).await?;
 
         let bytes_sent = bytes.len() as u64;
         self.info.bytes_sent += bytes_sent;
@@ -1263,6 +1280,20 @@ mod tests {
     #[test]
     fn test_connect_timeout() {
         assert_eq!(connect_timeout(), Duration::from_millis(5000));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn partial_frame_expires_on_the_write_deadline() {
+        let (mut writer, _reader) = tokio::io::duplex(1);
+        let start = tokio::time::Instant::now();
+        assert!(matches!(
+            write_frame(&mut writer, b"ping").await,
+            Err(NetworkError::Timeout)
+        ));
+        // Tokio's timer wheel rounds a deadline up to the millisecond.
+        assert!(
+            (WRITE_TIMEOUT..=WRITE_TIMEOUT + Duration::from_millis(1)).contains(&start.elapsed())
+        );
     }
 
     /// Before its version, Divi Core drops a peer 60 s after the connection

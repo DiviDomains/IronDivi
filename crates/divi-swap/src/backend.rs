@@ -18,7 +18,9 @@ use async_trait::async_trait;
 
 use crate::error::{Result, SwapError};
 use crate::htlc::HtlcParams;
-use crate::types::{Amount, Chain, Funding, LockedOutput, Outpoint, SignedTx, SpendInfo, Txid};
+use crate::types::{
+    Amount, Chain, Funding, LockedOutput, Outpoint, ScanMark, SignedTx, SpendInfo, SpendScan, Txid,
+};
 
 /// The best block as one backend sees it: every field is read from the same block.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,6 +85,20 @@ pub struct ClaimSizes {
     pub dust: u64,
 }
 
+/// USDC counter network admitted for a new taker swap. Simulated swaps cannot be
+/// promoted to live swaps by reopening their store with a different backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum UsdcAdmission {
+    Mock,
+    /// Schema 3 recorded only the chain. Read it for recovery.
+    Evm(u64),
+    EvmContracts {
+        chain_id: u64,
+        token: [u8; 20],
+        htlc: [u8; 20],
+    },
+}
+
 /// One chain, one engine key. A backend owns exactly one secp256k1 key (resolved from
 /// 1Password at startup): it funds HTLCs from that key's coins, and claims / refunds to it.
 // clippy >= 1.99 flags the `#[must_use]` that `async_trait` adds to the boxed futures.
@@ -92,6 +108,13 @@ pub struct ClaimSizes {
 pub trait ChainBackend: Send + Sync {
     /// Which chain this is.
     fn chain(&self) -> Chain;
+
+    /// Freshly verify the allowed USDC network, not just its configured label.
+    async fn usdc_admission(&self) -> Result<UsdcAdmission> {
+        Err(SwapError::InvalidParams(
+            "no authenticated USDC backend".into(),
+        ))
+    }
 
     /// Compressed pubkey of this backend's key — the `claim_pubkey` or `refund_pubkey`
     /// to put in an HTLC this side may spend.
@@ -191,6 +214,30 @@ pub trait ChainBackend: Send + Sync {
     /// tip and then the mempool where the backend can. Must not rely on address or spent
     /// indexes (plan §2: missing on the DIVI testnet proxy).
     async fn find_spend(&self, outpoint: &Outpoint, from_height: u64) -> Result<Option<SpendInfo>>;
+
+    /// One pass of [`find_spend`](Self::find_spend) that says how far it read (H2).
+    ///
+    /// Scans from `from_height`. With `resume` (a mark an earlier pass returned, at
+    /// `from_height`), the backend first checks that the block at `resume.height` still has
+    /// `resume.hash` and returns [`SpendScan::Reorged`] if not, or if the tip is below it.
+    ///
+    /// A bare absence carries no coverage evidence. Implementations that can establish
+    /// full coverage report it explicitly.
+    async fn scan_spend(
+        &self,
+        outpoint: &Outpoint,
+        from_height: u64,
+        resume: Option<&ScanMark>,
+    ) -> Result<SpendScan> {
+        let _ = resume;
+        Ok(match self.find_spend(outpoint, from_height).await? {
+            Some(s) => SpendScan::Spent(s),
+            None => SpendScan::NotYet {
+                through: None,
+                complete: false,
+            },
+        })
+    }
 
     /// The swap that read the lock at `at` through [`ChainBackend::htlc_output`] has reached
     /// a terminal state: drop anything kept for that lock. Only the ZEC backend keeps

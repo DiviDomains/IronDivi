@@ -821,7 +821,7 @@ impl Staker {
 
     /// Whether a peer is connected to receive a staked block
     fn has_peers(&self) -> bool {
-        self.peer_manager.peer_count() > 0
+        self.peer_manager.has_handshaken_peer()
     }
 
     /// Connect a block we built ourselves, then tell the wallet and peers.

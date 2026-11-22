@@ -483,7 +483,7 @@ fn test_json_vector_4_lms_sha256_m32_h10_deterministic_keygen_sign_and_verify() 
     // Derive from BIP39 leaf m/44'/301'/0'/4'/0' and directly from (I, SEED)
     let lms_leaf =
         derive_pq_leaf(&bip39_seed, 301, 0, PqSchemeId::LmsSha256M32H10, 0).expect("LMS HD leaf");
-    let mut sk_from_leaf = LmsPrivateKey::from_pq_leaf(&lms_leaf).expect("LMS keygen from leaf");
+    let sk_from_leaf = LmsPrivateKey::from_pq_leaf(&lms_leaf).expect("LMS keygen from leaf");
     let sk_from_seed = LmsPrivateKey::from_seed(tree_id, master_seed);
 
     assert_eq!(sk_from_leaf.public_key_bytes(), &expected_pk);
@@ -505,28 +505,38 @@ fn test_json_vector_4_lms_sha256_m32_h10_deterministic_keygen_sign_and_verify() 
         v4.get("pq_address_key_hash_256_hex").as_str()
     );
 
-    // Sign leaf q = 0
-    assert_eq!(sk_from_leaf.next_leaf_index(), 0);
-    let sig_q0 = sk_from_leaf
-        .sign_spork(network_magic, &spork_payload)
-        .expect("q=0 Spork signature");
-    assert_eq!(sk_from_leaf.next_leaf_index(), 1);
-    assert_eq!(hex::encode(sig_q0), v4.get("sig_q0_hex").as_str());
+    // Stored q = 0 and q = 1 signatures; verification needs no signer
+    let sig_q0: [u8; 2512] = decode_hex_array(v4.get("sig_q0_hex").as_str());
+    let sig_q1: [u8; 2512] = decode_hex_array(v4.get("sig_q1_hex").as_str());
     assert_eq!(
         hex::encode(sha256(&sig_q0)),
         v4.get("sig_q0_sha256_hex").as_str()
     );
-
-    // Sign leaf q = 1
-    let sig_q1 = sk_from_leaf
-        .sign_spork(network_magic, &spork_payload)
-        .expect("q=1 Spork signature");
-    assert_eq!(sk_from_leaf.next_leaf_index(), 2);
-    assert_eq!(hex::encode(sig_q1), v4.get("sig_q1_hex").as_str());
     assert_eq!(
         hex::encode(sha256(&sig_q1)),
         v4.get("sig_q1_sha256_hex").as_str()
     );
+    assert_eq!(&sig_q0[..4], &0u32.to_be_bytes());
+    assert_eq!(&sig_q1[..4], &1u32.to_be_bytes());
+
+    // Regenerating them needs the test-only signer (DIP-PQ-2 §5.1)
+    #[cfg(feature = "lms-volatile-test-signer")]
+    {
+        let mut sk_from_leaf = sk_from_leaf;
+        assert_eq!(sk_from_leaf.next_leaf_index(), 0);
+        let regenerated_q0 = sk_from_leaf
+            .sign_spork(network_magic, &spork_payload)
+            .expect("q=0 Spork signature");
+        assert_eq!(sk_from_leaf.next_leaf_index(), 1);
+        assert_eq!(regenerated_q0, sig_q0);
+        let regenerated_q1 = sk_from_leaf
+            .sign_spork(network_magic, &spork_payload)
+            .expect("q=1 Spork signature");
+        assert_eq!(sk_from_leaf.next_leaf_index(), 2);
+        assert_eq!(regenerated_q1, sig_q1);
+    }
+    #[cfg(not(feature = "lms-volatile-test-signer"))]
+    assert_eq!(sk_from_leaf.next_leaf_index(), 0);
 
     // Verify both signatures via domain wrapper and raw prehash verifier
     verify_lms_with_domain(

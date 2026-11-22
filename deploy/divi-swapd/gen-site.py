@@ -72,12 +72,13 @@ page("how-to-swap", "How to swap", '''<h1>How to swap (testnet)</h1>
 <p>For an offer on Litecoin, Zcash, Monero or USDC add <code>--counter-chain ltc</code> (or <code>zec</code>, <code>xmr</code>, <code>usdc</code>) as well. The command needs your own test keys, given as <code>--divi-key</code> and the key flag for the other coin; run <code>divi-swap --help</code> for the full list. The default network settings are the test networks.</p>
 
 <p>To do the whole swap in one command:</p>
-<pre>divi-swap run --maker https://divi.cx/swap --offer OFFER_ID --btc-sats AMOUNT</pre>
+<pre>divi-swap run --maker https://divi.cx/swap --offer OFFER_ID --btc-sats AMOUNT --direction DIRECTION --limit-price PRICE</pre>
+<p><code>run</code> and <code>accept</code> commit your coins, so they need your own limits: <code>--direction taker-pays-btc</code> to get DIVI for the other coin (or <code>taker-pays-divi</code> to pay DIVI), and <code>--limit-price</code>, the worst price you accept in DIVI units per whole other coin. A quote for fewer DIVI (or, paying DIVI, more DIVI) than that is refused before anything is accepted.</p>
 
 <p>Or one step at a time:</p>
 <ol>
 <li><code>quote</code> &ndash; prints a fresh price. Quotes expire after 60 seconds.</li>
-<li><code>accept --maker &hellip; --offer &hellip; --btc-sats &hellip;</code> &ndash; takes a new quote and accepts it. It prints a swap id.</li>
+<li><code>accept --maker &hellip; --offer &hellip; --btc-sats &hellip; --direction &hellip; --limit-price &hellip;</code> &ndash; takes a new quote and accepts it if it is within your limits. It prints a swap id.</li>
 <li><code>lock --swap SWAP_ID</code> &ndash; puts your coins into the swap lock and tells the maker.</li>
 <li><code>status --swap SWAP_ID</code> &ndash; shows what the maker sees.</li>
 <li><code>claim --swap SWAP_ID</code> &ndash; once the maker has locked its side and it is confirmed, collects your new coins.</li>

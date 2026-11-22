@@ -50,6 +50,11 @@ impl Script {
         &self.0
     }
 
+    /// Allocated script bytes, including spare capacity, for cache accounting.
+    pub fn allocated_bytes(&self) -> usize {
+        self.0.capacity()
+    }
+
     /// Get the script as a mutable byte vector
     pub fn into_bytes(self) -> Vec<u8> {
         self.0

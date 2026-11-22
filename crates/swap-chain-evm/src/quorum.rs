@@ -390,6 +390,18 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn incomplete_evm_spend_evidence_is_retryable() {
+        let mut missing_lock = with_lock(110);
+        missing_lock.receipts.get_mut(&LOCK_TX).unwrap()["logs"] = json!([]);
+        let mut missing_hash = claimed(with_lock(110));
+        missing_hash.logs[0].as_object_mut().unwrap().remove("transactionHash");
+        for node in [ChainNode::new(110), missing_lock, missing_hash] {
+            let (_p, _s, backend) = pair(&node, &node).await;
+            assert!(backend.scan_spend(&lock_outpoint(), 100, None).await.is_err());
+        }
+    }
+
     /// Two nodes that both show the claim agree: the claim, with its preimage.
     #[tokio::test]
     async fn find_spend_seen_by_both_is_the_claim() {

@@ -9,7 +9,7 @@
 //! Reviewer question 5: no shipped entry point builds a taker without the profile floor.
 //! Pins today's answer by scanning the non-test source of every binary and library crate:
 //! each `Taker::new(` / `XmrTaker::new(` call must chain `.with_profile_floor(` and the set of
-//! call sites is exactly the four in `bin/divi-swap/src/main.rs`. A new construction site, or one
+//! call sites is exactly the three in `bin/divi-swap/src/main.rs`. A new construction site, or one
 //! that drops the floor, fails here and needs this list (and the review answer) updated.
 
 use std::fs;
@@ -69,7 +69,7 @@ fn every_shipped_taker_construction_applies_the_profile_floor() {
             m
         });
     let expect: std::collections::BTreeMap<String, usize> =
-        [("bin/divi-swap/src/main.rs".to_string(), 4)].into();
+        [("bin/divi-swap/src/main.rs".to_string(), 3)].into();
     assert_eq!(
         by_file, expect,
         "taker construction sites changed: {sites:?}"

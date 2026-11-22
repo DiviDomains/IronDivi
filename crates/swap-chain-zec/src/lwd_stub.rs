@@ -103,6 +103,10 @@ impl Chain {
         Some(CompactBlock {
             height,
             hash: hash.to_vec(),
+            prev_hash: height
+                .checked_sub(1)
+                .map_or([0; 32], |h| self.blocks[h as usize].0)
+                .to_vec(),
             time,
             vtx: self.vtx.get(&height).cloned().unwrap_or_default(),
         })

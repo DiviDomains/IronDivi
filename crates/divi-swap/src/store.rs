@@ -30,10 +30,11 @@ use crate::types::{Amount, Funding, Outpoint, SignedTx};
 
 /// Schema version this binary writes and understands, kept in SQLite's `PRAGMA user_version`
 /// (a header integer: no table, no `SCHEMA` change, and a pre-marker binary ignores it).
-/// 0 = no marker; 1 = everything before V1 scripts (what an unmarked DB is); 2 = this marker.
+/// 0 = no marker; 1 = before V1 scripts; 2 = V1 scripts; 3 = chain-only taker binding;
+/// 4 = maker and taker USDC chain, token and HTLC binding.
 /// A binary refuses a database stamped with a larger number, because an older reader silently
 /// drops fields it does not know (a V1 `script_version` becomes a V0 script: wrong address).
-pub const STORE_SCHEMA_VERSION: u32 = 2;
+pub const STORE_SCHEMA_VERSION: u32 = 4;
 
 /// Swap database handle. Cheap to clone.
 #[derive(Clone)]
@@ -108,6 +109,8 @@ pub struct MakerRecord {
     /// re-selects coins. Absent in older records (read as unsent, as before).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub maker_lock_sent: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usdc_admission: Option<crate::backend::UsdcAdmission>,
     /// Fee history of `taker_leg_claim` (keys at the top level, as in [`TakerRecord`]).
     /// Absent in older records.
     #[serde(flatten)]
@@ -142,6 +145,9 @@ pub struct ClaimFees {
 /// The taker's persisted view of one swap (role-based legs, see [`MakerRecord`]).
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TakerRecord {
+    /// Local admission evidence; old records have none and cannot start USDC funding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usdc_admission: Option<crate::backend::UsdcAdmission>,
     /// Local swap id.
     pub id: String,
     /// Current state.
@@ -175,6 +181,14 @@ pub struct TakerRecord {
     /// The signed taker-leg refund tx (persisted before broadcast).
     #[serde(alias = "btc_refund")]
     pub taker_leg_refund: Option<SignedTx>,
+    /// Persisted the first time the taker-leg funding is known to have left (a broadcast
+    /// returned `Ok`, or [`crate::Taker::lock`] under an admission hold observed it on
+    /// chain). Absent in records written before the field existed, which read as `false`
+    /// (unsent) — see [`crate::Taker::with_admission_hold`] for why that is the safe default:
+    /// a persisted `Locked` funding tx from before this field existed is treated the same as
+    /// one never confirmed to have been sent, never as proof it was.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub taker_leg_sent: bool,
     /// Set once the taker decided never to claim the maker leg (its locktime was too close
     /// to claim safely when the lock confirmed). Terminal for the claim path: the swap only
     /// waits out the taker-leg refund. Absent in records written before the field existed.
@@ -238,6 +252,7 @@ impl std::fmt::Debug for MakerRecord {
             taker_leg_claim,
             last_error,
             maker_lock_dropped,
+            usdc_admission,
             maker_lock_sent,
             claim_fees,
         } = self;
@@ -260,6 +275,7 @@ impl std::fmt::Debug for MakerRecord {
             .field("taker_leg_claim", taker_leg_claim)
             .field("last_error", last_error)
             .field("maker_lock_dropped", maker_lock_dropped)
+            .field("usdc_admission", usdc_admission)
             .field("maker_lock_sent", maker_lock_sent)
             .field("claim_fees", claim_fees)
             .finish()
@@ -269,6 +285,7 @@ impl std::fmt::Debug for MakerRecord {
 impl std::fmt::Debug for TakerRecord {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let TakerRecord {
+            usdc_admission,
             id,
             state,
             quote,
@@ -282,6 +299,7 @@ impl std::fmt::Debug for TakerRecord {
             maker_leg_amount,
             maker_leg_claim,
             taker_leg_refund,
+            taker_leg_sent,
             claim_declined,
             claim_base_feerate,
             claim_feerate,
@@ -292,6 +310,7 @@ impl std::fmt::Debug for TakerRecord {
             last_error,
         } = self;
         f.debug_struct("TakerRecord")
+            .field("usdc_admission", usdc_admission)
             .field("id", id)
             .field("state", state)
             .field("quote", quote)
@@ -305,6 +324,7 @@ impl std::fmt::Debug for TakerRecord {
             .field("maker_leg_amount", maker_leg_amount)
             .field("maker_leg_claim", maker_leg_claim)
             .field("taker_leg_refund", taker_leg_refund)
+            .field("taker_leg_sent", taker_leg_sent)
             .field("claim_declined", claim_declined)
             .field("claim_base_feerate", claim_base_feerate)
             .field("claim_feerate", claim_feerate)
@@ -498,6 +518,11 @@ impl Store {
     /// All documents of `kind`, newest first.
     pub fn list_docs<T: DeserializeOwned>(&self, kind: &str) -> Result<Vec<T>> {
         self.list_json(Table::Docs(kind))
+    }
+
+    /// Drop a document of `kind` (a no-op for an unknown id).
+    pub fn delete_doc(&self, kind: &str, id: &str) -> Result<()> {
+        self.backend.delete(Table::Docs(kind), id)
     }
 
     // ---- helpers ----
@@ -972,6 +997,7 @@ mod tests {
             last_error: None,
             maker_lock_dropped: false,
             maker_lock_sent: false,
+            usdc_admission: None,
             claim_fees: Default::default(),
         }
     }
@@ -1247,8 +1273,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("swap.db");
         drop(Store::open(&path).unwrap());
-        assert_eq!(marker(&path), 2);
-        assert_eq!(STORE_SCHEMA_VERSION, 2);
+        assert_eq!(marker(&path), i64::from(STORE_SCHEMA_VERSION));
     }
 
     #[test]
@@ -1260,7 +1285,7 @@ mod tests {
         let s = Store::open(&path).unwrap();
         assert_eq!(s.list_maker_swaps().unwrap().len(), 1);
         drop(s);
-        assert_eq!(marker(&path), 2);
+        assert_eq!(marker(&path), i64::from(STORE_SCHEMA_VERSION));
     }
 
     #[test]
@@ -1268,11 +1293,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("swap.db");
         old_db(&path, &[]);
-        stamp(&path, 1);
+        stamp(&path, 2);
         drop(Store::open(&path).unwrap());
-        assert_eq!(marker(&path), 2);
+        assert_eq!(marker(&path), i64::from(STORE_SCHEMA_VERSION));
         drop(Store::open(&path).unwrap());
-        assert_eq!(marker(&path), 2);
+        assert_eq!(marker(&path), i64::from(STORE_SCHEMA_VERSION));
     }
 
     #[test]
@@ -1280,25 +1305,28 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("swap.db");
         old_db(&path, &[with_hash("a", 1, [1; 32])]);
-        stamp(&path, 3);
+        let future = STORE_SCHEMA_VERSION + 1;
+        stamp(&path, i64::from(future));
         let before = std::fs::read(&path).unwrap();
         let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
 
         let want = SwapError::StoreTooNew {
-            found: 3,
-            supported: 2,
+            found: future,
+            supported: STORE_SCHEMA_VERSION,
         };
         assert_eq!(Store::open(&path).err().unwrap(), want);
         assert_eq!(Store::open_read_only(&path).err().unwrap(), want);
 
         assert_eq!(std::fs::read(&path).unwrap(), before, "file bytes changed");
         assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), mtime);
-        assert_eq!(marker(&path), 3);
+        assert_eq!(marker(&path), i64::from(future));
         // No sidecar was created by the refused opens.
         assert!(!dir.path().join("swap.db-wal").exists());
         let msg = want.to_string();
         assert!(
-            msg.contains("newer") && msg.contains('3') && msg.contains('2'),
+            msg.contains("newer")
+                && msg.contains(&future.to_string())
+                && msg.contains(&STORE_SCHEMA_VERSION.to_string()),
             "{msg}"
         );
     }

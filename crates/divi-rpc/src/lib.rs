@@ -53,6 +53,7 @@ pub use divi_primitives::diag_rpc;
 pub mod access;
 pub mod auth_cookie;
 pub mod blockchain;
+pub mod conn_policy;
 pub mod core_help;
 pub mod error;
 mod flat_file;

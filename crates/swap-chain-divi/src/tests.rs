@@ -305,6 +305,8 @@ async fn find_spend_scans_blocks() {
     let other = txid_n(0x33);
     let server = MockServer::start().await;
     struct Chain {
+        fault: u8,
+        reads: std::sync::atomic::AtomicUsize,
         spender: Txid,
         other: Txid,
         target: Txid,
@@ -314,8 +316,16 @@ async fn find_spend_scans_blocks() {
             let body: Value = serde_json::from_slice(&req.body).unwrap();
             let r = match body["method"].as_str().unwrap() {
                 "getblockcount" => json!(102),
-                "getblockhash" => json!("00".repeat(32)),
-                "getblock" => json!({"tx": [self.other.to_rpc_hex(), self.spender.to_rpc_hex()]}),
+                "getblockhash" => {
+                    let h = body["params"][0].as_u64().unwrap();
+                    let replaced = self.fault == 2 && h == 102 && self.reads.fetch_add(1,std::sync::atomic::Ordering::SeqCst) > 0;
+                    json!(format!("{:064x}", h + u64::from(replaced)))
+                },
+                "getblock" => {
+                    let hash = body["params"][0].as_str().unwrap();
+                    let h = u64::from_str_radix(hash,16).unwrap();
+                    json!({"hash":hash,"height":h,"previousblockhash":if self.fault == 3 { String::new() } else { format!("{:064x}",if self.fault == 1 {0} else {h-1}) },"tx":[self.other.to_rpc_hex(),self.spender.to_rpc_hex()]})
+                },
                 "getrawmempool" => json!([]),
                 "getrawtransaction" => {
                     let id = body["params"][0].as_str().unwrap();
@@ -332,6 +342,7 @@ async fn find_spend_scans_blocks() {
     }
     Mock::given(method("POST"))
         .respond_with(Chain {
+            fault:0, reads: Default::default(),
             spender,
             other,
             target,
@@ -366,6 +377,12 @@ async fn find_spend_scans_blocks() {
         .await
         .unwrap();
     assert!(none.is_none());
+    for fault in [1, 2, 3] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).respond_with(Chain {fault, reads: Default::default(), spender,other,target}).mount(&server).await;
+        let b = backend(&server.uri(), SecretKey::new_random());
+        assert!(b.scan_spend(&Outpoint { txid: target, vout:5 },101,None).await.is_err());
+    }
 }
 
 #[tokio::test]
@@ -626,7 +643,7 @@ fn txid_byte_order_round_trips() {
 async fn scan_cursor_persists_with_wallet() {
     let (server, node) = mock().await;
     node.result("getblockhash", json!("00".repeat(32)))
-        .result("getblock", json!({"tx": []}));
+        .result("getblock", json!({"tx":[txid_n(1).to_rpc_hex()]})).result("getrawtransaction", tx_json(&txid_n(1), &[], &[], 2));
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("wallet.json");
     let key = SecretKey::new_random();
@@ -668,12 +685,12 @@ async fn scan_range_applies_blocks_in_height_order_across_concurrent_batches() {
                 "getblock" => {
                     let hash = params[0].as_str().unwrap();
                     let h = u64::from_str_radix(hash, 16).unwrap();
-                    let txs = self.blocks.get(&h).cloned().unwrap_or_default();
+                    let txs = self.blocks.get(&h).cloned().unwrap_or_else(|| vec![txid_n(0).to_rpc_hex()]);
                     json!({"tx": txs})
                 }
                 "getrawtransaction" => {
                     let txid = params[0].as_str().unwrap();
-                    self.txs.get(txid).cloned().unwrap()
+                    self.txs.get(txid).cloned().unwrap_or_else(|| tx_json(&txid_n(0), &[], &[], 1))
                 }
                 _ => unreachable!("unexpected method {method}"),
             };
@@ -1460,4 +1477,19 @@ async fn with_a_fallback_the_tip_header_and_best_chain_must_agree() {
         json!({"hash": "00".repeat(32), "height": 9, "time": 1_800_000_000u32}),
     );
     assert!(matches!(b.tip_header().await, Err(SwapError::Held(_))));
+}
+
+#[test]
+fn incomplete_block_transaction_lists_are_retryable() {
+    let id = txid_n(1).to_rpc_hex();
+    for list in [
+        Value::Null,
+        json!({}),
+        json!([]),
+        json!([id, 7]),
+        json!(["bad"]),
+        json!([id, id]),
+    ] {
+        assert!(matches!(txids(&list, false), Err(SwapError::Transient(_))));
+    }
 }

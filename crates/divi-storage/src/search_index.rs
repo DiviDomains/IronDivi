@@ -608,6 +608,23 @@ impl SearchIndex {
         start: u32,
         end: u32,
     ) -> Result<Vec<(AddressDeltaKey, i64)>, StorageError> {
+        let mut out = Vec::new();
+        self.visit_deltas(address_type, hash, start, end, usize::MAX, |key, amount| {
+            out.push((key, amount));
+        })?;
+        Ok(out)
+    }
+
+    /// Visit at most `limit` index rows; false means the scan was incomplete.
+    pub fn visit_deltas(
+        &self,
+        address_type: u8,
+        hash: &[u8; 20],
+        start: u32,
+        end: u32,
+        limit: usize,
+        mut visit: impl FnMut(AddressDeltaKey, i64),
+    ) -> Result<bool, StorageError> {
         let ranged = start > 0 && end > 0;
         let mut prefix = vec![address_type];
         prefix.extend_from_slice(hash);
@@ -616,30 +633,33 @@ impl SearchIndex {
             seek.extend_from_slice(&start.to_be_bytes());
         }
         let cf = self.cf(CF_ADDRESS_DELTA)?;
-        let mut out = Vec::new();
         let iter = self.db.inner_db().iterator_cf(
             cf,
             rocksdb::IteratorMode::From(&seek, rocksdb::Direction::Forward),
         );
-        for item in iter {
+        for (row, item) in iter.enumerate() {
             let (key, value) = item.map_err(StorageError::Database)?;
             if !key.starts_with(&prefix) {
                 break;
             }
-            let Some(key) = AddressDeltaKey::from_bytes(&key) else {
-                continue;
-            };
-            if ranged && key.height > end {
+            let key = AddressDeltaKey::from_bytes(&key);
+            if ranged && key.as_ref().is_some_and(|k| k.height > end) {
                 break;
             }
-            let amount = i64::from_le_bytes(
-                value[..8]
-                    .try_into()
-                    .map_err(|_| StorageError::Deserialization("address delta value".into()))?,
-            );
-            out.push((key, amount));
+            if row == limit {
+                return Ok(false);
+            }
+            let Some(key) = key else {
+                continue;
+            };
+            let bytes = value
+                .get(..8)
+                .and_then(|bytes| bytes.try_into().ok())
+                .ok_or_else(|| StorageError::Deserialization("address delta value".into()))?;
+            let amount = i64::from_le_bytes(bytes);
+            visit(key, amount);
         }
-        Ok(out)
+        Ok(true)
     }
 
     /// An address's unspent outputs in key order (Core `ReadAddressUnspentIndex`)
@@ -648,27 +668,44 @@ impl SearchIndex {
         address_type: u8,
         hash: &[u8; 20],
     ) -> Result<Vec<(AddressUnspentKey, AddressUnspentValue)>, StorageError> {
+        let mut out = Vec::new();
+        self.visit_unspent(address_type, hash, usize::MAX, |key, value| {
+            out.push((key, value))
+        })?;
+        Ok(out)
+    }
+
+    /// Visit at most `limit` index rows; false means the scan was incomplete.
+    pub fn visit_unspent(
+        &self,
+        address_type: u8,
+        hash: &[u8; 20],
+        limit: usize,
+        mut visit: impl FnMut(AddressUnspentKey, AddressUnspentValue),
+    ) -> Result<bool, StorageError> {
         let mut prefix = vec![address_type];
         prefix.extend_from_slice(hash);
         let cf = self.cf(CF_ADDRESS_UNSPENT)?;
-        let mut out = Vec::new();
         let iter = self.db.inner_db().iterator_cf(
             cf,
             rocksdb::IteratorMode::From(&prefix, rocksdb::Direction::Forward),
         );
-        for item in iter {
+        for (row, item) in iter.enumerate() {
             let (key, value) = item.map_err(StorageError::Database)?;
             if !key.starts_with(&prefix) {
                 break;
+            }
+            if row == limit {
+                return Ok(false);
             }
             if let (Some(key), Some(value)) = (
                 AddressUnspentKey::from_bytes(&key),
                 AddressUnspentValue::from_bytes(&value),
             ) {
-                out.push((key, value));
+                visit(key, value);
             }
         }
-        Ok(out)
+        Ok(true)
     }
 
     /// The spent index entry of an output (Core `ReadSpentIndex`)
@@ -878,6 +915,55 @@ mod tests {
             Script::new_p2sh(&[3; 20]).as_bytes()
         );
         assert_eq!(script_of_address(3, &[1; 20]), None);
+    }
+
+    #[test]
+    fn bounded_index_visits_stop_without_reporting_partial_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(ChainDatabase::open(dir.path()).unwrap());
+        let index = SearchIndex::new(db, true, true);
+        let mut updates = IndexUpdates::default();
+        for i in 0..3 {
+            // Three deltas for the same transaction still cost three rows.
+            let (mut k, v) = delta(1, 0, false);
+            k.index = i;
+            updates.deltas.push((k, v));
+            let (mut k, v) = unspent(1, [7; 20], Script::new_p2pkh(&[7; 20]));
+            k.index = i;
+            updates.unspent.push((k, v));
+        }
+        index.apply_connect(&updates).unwrap();
+        for limit in [0, 2, 3] {
+            let mut deltas = Vec::new();
+            let mut outputs = Vec::new();
+            assert_eq!(
+                index
+                    .visit_deltas(1, &[7; 20], 0, 0, limit, |k, _| deltas.push(k.index))
+                    .unwrap(),
+                limit == 3
+            );
+            assert_eq!(
+                index
+                    .visit_unspent(1, &[7; 20], limit, |k, _| outputs.push(k.index))
+                    .unwrap(),
+                limit == 3
+            );
+            assert_eq!(deltas, (0..limit as u32).collect::<Vec<_>>());
+            assert_eq!(outputs, deltas);
+        }
+        assert_eq!(index.read_unspent(1, &[7; 20]).unwrap().len(), 3);
+        // The lookahead row must not be decoded or returned as a result.
+        let (bad, _) = delta(2, 0, false);
+        index
+            .db
+            .inner_db()
+            .put_cf(index.cf(CF_ADDRESS_DELTA).unwrap(), bad.to_bytes(), [0u8])
+            .unwrap();
+        assert!(!index.visit_deltas(1, &[7; 20], 0, 0, 3, |_, _| {}).unwrap());
+        assert!(matches!(
+            index.read_deltas(1, &[7; 20], 0, 0),
+            Err(StorageError::Deserialization(_))
+        ));
     }
 
     /// A connected output files its script hash under its address, and a

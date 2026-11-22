@@ -142,10 +142,9 @@ irondivid -txindex=1 -addressindex=1 -electrum=127.0.0.1:50001
 2. **Bind TLS publicly and TCP locally**, for example
    `-electrumtls=0.0.0.0:50002 -electrum=127.0.0.1:50001`, and open only 50002
    in the firewall (`ufw allow 50002/tcp`). Keep the RPC port closed.
-3. **Limits.** The server takes up to 1000 connections at once and refuses
-   more. Each connection polls the tip and mempool once a second, and mempool
-   lookups scan the whole mempool. Put a reverse proxy or connection-rate
-   limits in front if you expect abuse.
+3. **Limits.** See [Limits](#limits). They bound what one client can cost,
+   but they do not replace a firewall or a connection-rate limit in front if
+   you expect a determined flood.
 4. **Trust.** Clients cannot check proof of stake or hash legacy headers, so
    a client trusts its server about which chain is best. It can still check
    that a confirmed transaction is in a v4 block's merkle root. Tell users
@@ -155,6 +154,82 @@ irondivid -txindex=1 -addressindex=1 -electrum=127.0.0.1:50001
    (`basicswap/interface/divi/checkpoints/<network>.json`).
    For mainnet a recent checkpoint saves the full sync and pins the legacy
    blocks; add one with each BasicSwap release.
+
+### Limits
+
+Where a value comes from ElectrumX (spesmilo/electrumx master, `env.py` and
+`session.py`) it is the same; the others are IronDivi's own. All are constants
+in `crates/divi-electrum/src/limits.rs` and `lib.rs`.
+
+| Limit | Value | Source |
+|---|---|---|
+| Connections, all listeners | 1000, the last 100 only for peers holding fewer than 4 | ElectrumX `MAX_SESSIONS`; the reserve is IronDivi's |
+| Connections per peer | 32 (loopback exempt; IPv6 counted per /64) | IronDivi (ElectrumX has none) |
+| Request size | 1,000,000 bytes (line or WebSocket message) | ElectrumX `MAX_RECV` |
+| Reply size | 8,100,000 bytes; larger becomes an error | ElectrumX `MAX_SEND` |
+| History / unspent per script | 81,817 entries, `(MAX_SEND-100)/99` | ElectrumX |
+| Requests per batch | 1000; a larger batch is refused whole | IronDivi (ElectrumX has none) |
+| Subscriptions | 20,000 per connection, 250,000 per server | IronDivi |
+| Request time | 30 s, then an error reply | ElectrumX `REQUEST_TIMEOUT` |
+| Idle | 600 s without a complete message | ElectrumX `SESSION_TIMEOUT` |
+| Write to a client | 30 s, then the connection ends | IronDivi |
+| Calls into chain/mempool at once | 7 request slots and 1 notification slot, shared by all sessions | IronDivi |
+
+Each connection has a cost budget as in ElectrumX: it starts at 5, each request
+adds its cost (header methods 0.5, a blank keepalive line 0.1, others as in
+`limits::method_cost`), and the bytes sent and received add 1 per 5000. The
+budget decays by 10000 / (10000 + 5 x subscriptions) per second. Above 1000 a
+request is delayed, up to 2.5 s as the cost nears 10000; at 10000 the
+connection is sent an error and closed. Header requests are not charged for
+bytes, so a header sync from genesis is not slowed. A status pass starts
+when the fingerprint changes, at least one second plus 2 ms per subscription
+after the previous pass finishes. After 120 seconds without a pass, the server
+rechecks statuses even if the fingerprint is unchanged. This corrects statuses
+observed during a temporary tip or mempool change. Each one-second tick allows up to 64 chunks
+of four scripts (256 scripts); a pass over 20,000 scripts needs at least 79
+ticks. A changed header is sent before the first chunk, and changed statuses
+are sent after each chunk. When requests and notification work are both
+ready, the session alternates between one message and one notification turn.
+Eligible sessions queue in arrival order for the notification slot. Each session
+keeps one waiter across requests and ticks. A grant covers at most one header
+check and one chunk, including their writes, before another session can run. A failed status check
+closes the connection rather than leaving the wallet with a stale status.
+
+Each Electrum address-index scan visits at most 81,817 rows plus one lookahead.
+Rows count before transaction deduplication, vault script filtering, or
+mempool spends, so even a small final result can get a limit error. The
+non-Electrum address-index reads remain unrestricted. The reply limit counts
+encoded JSON bytes, including escaped text, IDs, and batch punctuation.
+A stopped batch reserves room for an error. An oversize single reply retains
+its ID if the error fits; otherwise the error uses a null ID.
+
+The RPC server (`-rpcport`) has its own policy: a peer not in `-rpcallowip`
+gets its 403 without taking a slot; a peer may hold at most `max(2, threads/2)`
+connections (loopback exempt); request headers must arrive within 30 s, an idle
+keep-alive connection is closed after 30 s, and a request body or reply that
+makes no progress for 30 s ends the connection. Divi Core has no such timeouts
+(it keeps `-rpcthreads=4` connections for as long as they last); these are a
+deliberate IronDivi difference. Authenticated calls are otherwise unchanged.
+
+Not covered: a reconnecting client starts with a new budget (ElectrumX groups
+cost by subnet; IronDivi does not), there is no connection-rate or TLS
+handshake limit, a client sending a byte every few seconds is held until the
+idle limit, many source addresses still add up to the total, and each
+session still computes its own mempool fingerprint and script queries still
+inspect a pool-wide snapshot. RPC-backed verbose results are materialized
+before the bounded JSON encoder. Put a firewall or rate limit in front of a
+public server.
+
+Tests (no node needed except the last):
+
+```
+cargo test -p divi-electrum limits
+cargo test -p divi-electrum --lib session::tests
+cargo test -p divi-storage --lib search_index::tests
+cargo test -p divi-rpc conn_policy
+cargo test -p divi-rpc server::tests
+cargo test -p irondivid --test electrum   # existing end-to-end suite
+```
 
 ### Connecting BasicSwap
 

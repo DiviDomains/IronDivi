@@ -254,8 +254,14 @@ class Run:
         return r.stdout.strip()
 
     def accept(self):
+        # The maker is the one this driver launched, so its listed terms are the user's
+        # intent: `accept` holds the quote to that direction and price.
+        offers = json.loads(http("GET", f"{self.maker}/offers"))
+        o = next(o for o in offers if o["id"] == self.a.offer)
         return self.taker("accept", "--maker", self.maker, "--offer", self.a.offer,
-                          "--btc-sats", str(self.a.btc_sats)).splitlines()[-1].strip()
+                          "--btc-sats", str(self.a.btc_sats),
+                          "--direction", o["direction"].replace("_", "-"),
+                          "--limit-price", str(o["divi_sats_per_btc"])).splitlines()[-1].strip()
 
     def claim_loop(self, local):
         def go():

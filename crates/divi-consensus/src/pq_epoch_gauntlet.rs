@@ -28,7 +28,8 @@
 //!   `>= 10,000 DIVI` (`1_000_000_000_000` sat) per-output vault split enforcement across both
 //!   classical `STAKING_VAULT` (`50 B`) and post-quantum `PQ_STAKING_VAULT` (`74 B`) outputs,
 //! - `DIP-PQ-4` `vchBlockSig` staker key binding, cold-owner vault key prohibition, and 64-byte
-//!   `SHA-512` `BlockSigV1` signing prehash verification,
+//!   `SHA-512` `BlockSigV1` signing prehash comparison (a model: block signature bytes are
+//!   format-checked only and never cryptographically verified, see [`UnverifiedBlockSigBinding`]),
 //! - Lottery and Treasury superblock coexistence across classical and PQ epochs, and
 //! - Atomic rollback and cross-fork reorg validation (`apply_reorg_across_fork_boundary`) without state leakage.
 
@@ -36,8 +37,8 @@ use crate::lottery::{
     is_coinstake_valid_for_lottery, update_lottery_winners, LOTTERY_TICKET_MINIMUM,
 };
 use crate::pq_block_sig::{
-    is_classical_coinstake_script, parse_pq_coinstake_script, verify_block_sig_envelope_binding,
-    CoinstakeStakerBinding, PosBlockAuthPolicy, PqBlockSigError, VerifiedBlockSigBinding,
+    check_block_sig_envelope_binding, is_classical_coinstake_script, parse_pq_coinstake_script,
+    CoinstakeStakerBinding, PosBlockAuthPolicy, PqBlockSigError, UnverifiedBlockSigBinding,
 };
 use crate::treasury::{superblock_payout, SuperblockPayout};
 use divi_primitives::{Hash256, LotteryWinners, Script, Transaction};
@@ -228,7 +229,8 @@ pub struct GauntletBlockCandidate {
     pub header_witness_merkle_root: [u8; 32],
     /// 32-byte witness Merkle root computed over the block's transaction `PqTxWitness` stacks.
     pub computed_witness_merkle_root: [u8; 32],
-    /// Optional expected 64-byte `DIP-PQ-4` `BlockSigV1` signing prehash for cryptographic binding verification.
+    /// Optional expected 64-byte `DIP-PQ-4` `BlockSigV1` signing prehash, compared against the
+    /// prehash derived from the bound key (not a signature verification).
     pub expected_signing_prehash_512: Option<[u8; 64]>,
 }
 
@@ -255,8 +257,9 @@ pub struct ConnectedEpochBlockSummary {
     pub is_exact_activation_timestamp: bool,
     /// Computed `DIP-PQ-3` block weight (`base_block_bytes * 4 + witness_bytes`).
     pub block_weight: usize,
-    /// Verified `vchBlockSig` binding (`None` for PoW blocks).
-    pub verified_sig_binding: Option<VerifiedBlockSigBinding>,
+    /// `vchBlockSig` format/binding check outcome (`None` for PoW blocks). The signature itself
+    /// is not verified.
+    pub sig_binding_check: Option<UnverifiedBlockSigBinding>,
     /// Superblock payout status at this height (`Treasury`, `Lottery`, or `None`).
     pub superblock_payout: SuperblockPayout,
     /// Whether this block's coinstake qualified for the lottery pool (`> 10,000 DIVI`).
@@ -452,7 +455,7 @@ impl GauntletChainState {
             crossed_activation_boundary: false,
             is_exact_activation_timestamp: false,
             block_weight: 320,
-            verified_sig_binding: None,
+            sig_binding_check: None,
             superblock_payout: SuperblockPayout::None,
             lottery_eligible: false,
         };
@@ -581,7 +584,7 @@ impl GauntletChainState {
         let is_exact_activation_timestamp =
             candidate.block_time == self.config.effective_pq_witness_vault_time();
 
-        let (verified_sig_binding, lottery_eligible, next_lottery_winners) = match epoch {
+        let (sig_binding_check, lottery_eligible, next_lottery_winners) = match epoch {
             PqConsensusEpoch::ProofOfWork => {
                 if candidate.is_proof_of_stake {
                     return Err(GauntletError::InvalidProofOfWorkBlock {
@@ -678,7 +681,7 @@ impl GauntletChainState {
 
                 let policy = self.config.pos_block_auth_policy_at(candidate.block_time);
                 let coinstake_txid = coinstake_tx.txid();
-                let verified = verify_block_sig_envelope_binding(
+                let checked = check_block_sig_envelope_binding(
                     &candidate.vch_block_sig,
                     coinstake_script,
                     candidate.block_hash.as_bytes(),
@@ -689,8 +692,8 @@ impl GauntletChainState {
                 )?;
 
                 if let Some(expected_prehash) = candidate.expected_signing_prehash_512 {
-                    match &verified {
-                        VerifiedBlockSigBinding::PostQuantumV1 {
+                    match &checked {
+                        UnverifiedBlockSigBinding::PostQuantumV1BindingOnly {
                             signing_prehash_512,
                             ..
                         } => {
@@ -702,7 +705,7 @@ impl GauntletChainState {
                                 });
                             }
                         }
-                        VerifiedBlockSigBinding::ClassicalSecp256k1 => {
+                        UnverifiedBlockSigBinding::ClassicalFormatOnly => {
                             return Err(GauntletError::SigningPrehashMismatch {
                                 height: candidate.height,
                                 expected: expected_prehash.to_vec(),
@@ -751,7 +754,7 @@ impl GauntletChainState {
                         base_winners
                     };
 
-                (Some(verified), eligible, updated_winners)
+                (Some(checked), eligible, updated_winners)
             }
         };
 
@@ -778,16 +781,16 @@ impl GauntletChainState {
             crossed_activation_boundary,
             is_exact_activation_timestamp,
             block_weight,
-            verified_sig_binding,
+            sig_binding_check,
             superblock_payout: sp_payout,
             lottery_eligible,
         };
 
-        match &summary.verified_sig_binding {
-            Some(VerifiedBlockSigBinding::ClassicalSecp256k1) => {
+        match &summary.sig_binding_check {
+            Some(UnverifiedBlockSigBinding::ClassicalFormatOnly) => {
                 self.classical_pos_blocks_connected += 1;
             }
-            Some(VerifiedBlockSigBinding::PostQuantumV1 { .. }) => {
+            Some(UnverifiedBlockSigBinding::PostQuantumV1BindingOnly { .. }) => {
                 self.pq_pos_blocks_connected += 1;
             }
             None => {}
@@ -810,12 +813,12 @@ impl GauntletChainState {
         let popped = self.blocks.pop().expect("checked len > 1");
         self.lottery_winners_history.pop();
 
-        match &popped.verified_sig_binding {
-            Some(VerifiedBlockSigBinding::ClassicalSecp256k1) => {
+        match &popped.sig_binding_check {
+            Some(UnverifiedBlockSigBinding::ClassicalFormatOnly) => {
                 self.classical_pos_blocks_connected =
                     self.classical_pos_blocks_connected.saturating_sub(1);
             }
-            Some(VerifiedBlockSigBinding::PostQuantumV1 { .. }) => {
+            Some(UnverifiedBlockSigBinding::PostQuantumV1BindingOnly { .. }) => {
                 self.pq_pos_blocks_connected = self.pq_pos_blocks_connected.saturating_sub(1);
             }
             None => {}

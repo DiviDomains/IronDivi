@@ -21,7 +21,7 @@ use divi_swap::backend::TipHeader;
 use divi_swap::store::{StoreBackend, Table};
 use divi_swap::{
     Amount, Chain, ChainBackend, ClaimSizes, FeeBump, Funding, HtlcParams, LockedOutput, Outpoint,
-    Result, SignedTx, SpendInfo, SwapError, Txid,
+    Result, ScanMark, SignedTx, SpendInfo, SpendScan, SwapError, Txid,
 };
 use parking_lot::Mutex;
 use swap_chain_divi::DiviBackend;
@@ -186,6 +186,15 @@ impl ChainBackend for Durable {
 
     async fn find_spend(&self, outpoint: &Outpoint, from_height: u64) -> Result<Option<SpendInfo>> {
         self.inner.find_spend(outpoint, from_height).await
+    }
+
+    async fn scan_spend(
+        &self,
+        outpoint: &Outpoint,
+        from_height: u64,
+        resume: Option<&ScanMark>,
+    ) -> Result<SpendScan> {
+        self.inner.scan_spend(outpoint, from_height, resume).await
     }
 
     fn lock_finished(&self, at: &Outpoint) {

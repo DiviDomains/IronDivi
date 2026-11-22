@@ -47,6 +47,16 @@ macro_rules! stop_point {
     };
 }
 
+/// A point where a test can hold the thread running an operation of `$owner`
+/// while another thread acts (see `fault::pause_at`); nothing outside test builds
+#[cfg(not(target_arch = "wasm32"))]
+macro_rules! pause_point {
+    ($owner:expr, $point:expr) => {
+        #[cfg(test)]
+        crate::fault::pause(($owner) as *const _ as usize, $point);
+    };
+}
+
 pub mod address;
 #[cfg(not(target_arch = "wasm32"))]
 mod at_rest;
@@ -95,7 +105,9 @@ pub use manager::WalletManager;
 #[cfg(not(target_arch = "wasm32"))]
 pub use persistence::WalletDatabase;
 pub use pq_sweep::{
-    plan_voluntary_pq_sweep, PqSweepBatchTx, PqSweepDestination, PqSweepError, PqSweepPlan,
+    estimate_voluntary_pq_sweep, is_pq_output_script, plan_requires_pq_outputs,
+    plan_voluntary_pq_sweep, PqOutputActivation, PqSweepBatchEstimate, PqSweepBatchTx,
+    PqSweepDestination, PqSweepError, PqSweepEstimate, PqSweepOutputKind, PqSweepPlan,
     PqSweepPlanConfig, QuantumExposureReason, SubThresholdVaultPolicy, TrackableWalletUtxo,
     DEFAULT_MAX_SWEEP_INPUTS_PER_TX, DEFAULT_MAX_SWEEP_TX_WEIGHT, DEFAULT_SWEEP_FEE_PER_KB_SAT,
     MIN_NON_DUST_OUTPUT_SAT, MIN_VAULT_SWEEP_OUTPUT_SAT,

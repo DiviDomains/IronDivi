@@ -33,6 +33,128 @@ use tracing::warn;
 
 /// Maximum transactions to track per peer
 const MAX_TX_PER_PEER: usize = 5000;
+const MAX_PENDING: usize = 4096;
+const MAX_PENDING_PER_PEER: usize = 256;
+const MAX_FLIGHT_PER_PEER: usize = 32;
+
+/// Recent inventory hints, never an authoritative record of accepted objects.
+/// Dropping a hint can cause a redundant announcement, not a validation decision.
+pub struct PeerInventory {
+    peers: HashMap<PeerId, RecentInventory>,
+    per_peer: usize,
+    max_peers: usize,
+    ttl: Duration,
+}
+
+#[derive(Default)]
+struct RecentInventory {
+    order: VecDeque<(Instant, Hash256)>,
+    items: HashMap<Hash256, Instant>,
+}
+
+impl PeerInventory {
+    /// Bound both the number of peers retained across churn and each peer's hints.
+    pub fn new(per_peer: usize, max_peers: usize, ttl: Duration) -> Self {
+        assert!(per_peer > 0 && max_peers > 0);
+        Self {
+            peers: HashMap::new(),
+            per_peer,
+            max_peers,
+            ttl,
+        }
+    }
+
+    pub fn note(&mut self, peer: PeerId, hash: Hash256, now: Instant) {
+        if self.peers.len() == self.max_peers && !self.peers.contains_key(&peer) {
+            if let Some(oldest) = self
+                .peers
+                .iter()
+                .min_by_key(|(id, inv)| (inv.order.back().map(|e| e.0), **id))
+                .map(|(id, _)| *id)
+            {
+                self.peers.remove(&oldest);
+            }
+        }
+        let inv = self.peers.entry(peer).or_default();
+        inv.expire(now, self.ttl);
+        if inv.items.contains_key(&hash) {
+            return;
+        }
+        if inv.order.len() == self.per_peer {
+            let (_, old) = inv.order.pop_front().unwrap();
+            inv.items.remove(&old);
+        }
+        inv.items.insert(hash, now);
+        inv.order.push_back((now, hash));
+    }
+
+    pub fn knows(&self, peer: PeerId, hash: &Hash256, now: Instant) -> bool {
+        self.peers
+            .get(&peer)
+            .and_then(|inv| inv.items.get(hash))
+            .is_some_and(|at| now.saturating_duration_since(*at) < self.ttl)
+    }
+
+    pub fn remove_peer(&mut self, peer: PeerId) {
+        self.peers.remove(&peer);
+    }
+
+    pub fn expire(&mut self, now: Instant) {
+        self.peers.retain(|_, inv| {
+            inv.expire(now, self.ttl);
+            !inv.order.is_empty()
+        });
+    }
+
+    fn alternate(&self, hash: &Hash256, except: PeerId, now: Instant) -> Option<PeerId> {
+        self.peers
+            .keys()
+            .copied()
+            .filter(|id| *id != except && self.knows(*id, hash, now))
+            .min_by_key(|id| (*id < except, *id))
+    }
+}
+
+impl RecentInventory {
+    fn expire(&mut self, now: Instant, ttl: Duration) {
+        while self
+            .order
+            .front()
+            .is_some_and(|entry| now.saturating_duration_since(entry.0) >= ttl)
+        {
+            let (_, old) = self.order.pop_front().unwrap();
+            self.items.remove(&old);
+        }
+    }
+}
+
+#[derive(Default)]
+struct Requests {
+    queued: HashMap<PeerId, VecDeque<Hash256>>,
+    queued_ids: HashMap<Hash256, PeerId>,
+    ready: VecDeque<PeerId>,
+    flight: HashMap<Hash256, TxRequest>,
+}
+
+impl Requests {
+    fn enqueue(&mut self, hash: Hash256, peer: PeerId) {
+        if self.queued_ids.len() == MAX_PENDING
+            || self.flight.contains_key(&hash)
+            || self.queued_ids.contains_key(&hash)
+        {
+            return;
+        }
+        let q = self.queued.entry(peer).or_default();
+        if q.len() == MAX_PENDING_PER_PEER {
+            return;
+        }
+        if q.is_empty() {
+            self.ready.push_back(peer);
+        }
+        q.push_back(hash);
+        self.queued_ids.insert(hash, peer);
+    }
+}
 
 /// Maximum transactions to have in flight
 const MAX_TX_IN_FLIGHT: usize = 100;
@@ -75,19 +197,13 @@ pub struct TxRelay {
     peer_manager: Arc<PeerManager>,
 
     /// Transactions we know each peer has (peer -> set of txids)
-    peer_inventory: RwLock<HashMap<PeerId, HashSet<Hash256>>>,
-
-    /// Peers that have each transaction (txid -> set of peers)
-    tx_sources: RwLock<HashMap<Hash256, HashSet<PeerId>>>,
+    peer_inventory: RwLock<PeerInventory>,
 
     /// Transactions we've already seen/processed
     seen_txs: RwLock<HashSet<Hash256>>,
 
     /// Transactions currently being requested
-    txs_in_flight: RwLock<HashMap<Hash256, TxRequest>>,
-
-    /// Queue of transactions to request
-    request_queue: RwLock<VecDeque<(Hash256, PeerId)>>,
+    requests: RwLock<Requests>,
 
     /// Recently announced transactions (to avoid re-announcing)
     recently_announced: RwLock<HashMap<Hash256, Instant>>,
@@ -122,11 +238,13 @@ impl TxRelay {
 
         Arc::new(TxRelay {
             peer_manager,
-            peer_inventory: RwLock::new(HashMap::new()),
-            tx_sources: RwLock::new(HashMap::new()),
+            peer_inventory: RwLock::new(PeerInventory::new(
+                MAX_TX_PER_PEER,
+                256,
+                Duration::from_secs(900),
+            )),
             seen_txs: RwLock::new(HashSet::new()),
-            txs_in_flight: RwLock::new(HashMap::new()),
-            request_queue: RwLock::new(VecDeque::new()),
+            requests: RwLock::new(Requests::default()),
             recently_announced: RwLock::new(HashMap::new()),
             event_tx,
             relayed: RwLock::new(HashMap::new()),
@@ -181,24 +299,26 @@ impl TxRelay {
 
     /// Remove a peer from tracking
     pub fn remove_peer(&self, peer_id: PeerId) {
-        self.peer_inventory.write().remove(&peer_id);
-
-        // Remove peer from tx_sources
-        let mut tx_sources = self.tx_sources.write();
-        for peers in tx_sources.values_mut() {
-            peers.remove(&peer_id);
+        let now = self.peer_manager.clock().now();
+        let mut inv = self.peer_inventory.write();
+        inv.remove_peer(peer_id);
+        let mut req = self.requests.write();
+        let mut retry = Vec::new();
+        req.flight.retain(|hash, r| {
+            if r.peer_id == peer_id {
+                retry.push(*hash);
+            }
+            r.peer_id != peer_id
+        });
+        if let Some(q) = req.queued.remove(&peer_id) {
+            req.ready.retain(|p| *p != peer_id);
+            retry.extend(q);
         }
-
-        // Cancel in-flight requests from this peer
-        let mut in_flight = self.txs_in_flight.write();
-        let to_remove: Vec<_> = in_flight
-            .iter()
-            .filter(|(_, req)| req.peer_id == peer_id)
-            .map(|(txid, _)| *txid)
-            .collect();
-
-        for txid in to_remove {
-            in_flight.remove(&txid);
+        for hash in retry {
+            req.queued_ids.remove(&hash);
+            if let Some(other) = inv.alternate(&hash, peer_id, now) {
+                req.enqueue(hash, other);
+            }
         }
     }
 
@@ -215,106 +335,66 @@ impl TxRelay {
 
         counted::hit(Site::RelayInv);
 
-        let mut new_txs = Vec::new();
-
         {
-            let in_flight = self.txs_in_flight.read();
-
-            // Track peer inventory
-            let mut peer_inv = self.peer_inventory.write();
-            let inv = peer_inv.entry(peer_id).or_default();
-
-            // Limit inventory size per peer
-            if inv.len() > MAX_TX_PER_PEER {
-                // Remove oldest entries (just clear and start fresh)
-                inv.clear();
-            }
-
-            let mut tx_sources = self.tx_sources.write();
-
+            let mut inv = self.peer_inventory.write();
+            let now = self.peer_manager.clock().now();
+            let mut req = self.requests.write();
             for item in tx_items {
                 let txid = item.hash;
-
-                // Track that this peer has this tx
-                inv.insert(txid);
-                tx_sources.entry(txid).or_default().insert(peer_id);
-
-                // Check if we need to request it
-                if !self.already_have(&txid) && !in_flight.contains_key(&txid) {
-                    new_txs.push((txid, peer_id));
+                inv.note(peer_id, txid, now);
+                if !self.already_have(&txid) {
+                    req.enqueue(txid, peer_id);
                 }
             }
         }
-
-        // Queue new transactions for request
-        if !new_txs.is_empty() {
-            let mut queue = self.request_queue.write();
-            for (txid, peer) in new_txs {
-                queue.push_back((txid, peer));
-            }
-        }
-
-        // Process request queue
-        self.process_request_queue().await;
+        self.process_request_queue();
     }
 
     /// Process the request queue
-    async fn process_request_queue(&self) {
-        let in_flight_count = self.txs_in_flight.read().len();
-        if in_flight_count >= MAX_TX_IN_FLIGHT {
+    fn process_request_queue(&self) {
+        let mut req = self.requests.write();
+        if req.queued.is_empty() {
             return;
         }
-
-        let to_request: Vec<_> = {
-            let mut queue = self.request_queue.write();
-            let mut requests = Vec::new();
-            let in_flight = self.txs_in_flight.read();
-
-            while requests.len() < MAX_TX_IN_FLIGHT - in_flight_count {
-                match queue.pop_front() {
-                    Some((txid, peer_id)) => {
-                        // Skip if we already have it or it's in flight
-                        if self.already_have(&txid) || in_flight.contains_key(&txid) {
-                            continue;
-                        }
-                        requests.push((txid, peer_id));
-                    }
-                    None => break,
-                }
+        let mut by_peer = HashMap::<PeerId, usize>::new();
+        for r in req.flight.values() {
+            *by_peer.entry(r.peer_id).or_default() += 1;
+        }
+        let mut blocked = 0;
+        while req.flight.len() < MAX_TX_IN_FLIGHT && blocked < req.ready.len() {
+            let peer = req.ready.pop_front().unwrap();
+            if by_peer.get(&peer).copied().unwrap_or(0) >= MAX_FLIGHT_PER_PEER {
+                req.ready.push_back(peer);
+                blocked += 1;
+                continue;
             }
-            requests
-        };
-
-        // Request transactions
-        for (txid, peer_id) in to_request {
-            self.request_tx(txid, peer_id).await;
-        }
-    }
-
-    /// Request a transaction from a peer
-    async fn request_tx(&self, txid: Hash256, peer_id: PeerId) {
-        let inv = vec![InvItem::new(InvType::Tx, txid)];
-        let msg = NetworkMessage::GetData(inv);
-
-        if let Err(e) = self.peer_manager.send_to_peer(peer_id, msg).await {
-            warn!(
-                "Failed to request tx {} from peer {}: {}",
-                WalletTxid::of(txid),
-                peer_id,
-                e
+            blocked = 0;
+            let q = req.queued.get_mut(&peer).unwrap();
+            let hash = q.pop_front().unwrap();
+            if q.is_empty() {
+                req.queued.remove(&peer);
+            } else {
+                req.ready.push_back(peer);
+            }
+            req.queued_ids.remove(&hash);
+            if self.already_have(&hash) {
+                continue;
+            }
+            let msg = NetworkMessage::GetData(vec![InvItem::new(InvType::Tx, hash)]);
+            if let Err(e) = self.peer_manager.send_required(peer, msg) {
+                tracing::debug!("Did not request tx from peer {}: {}", peer, e);
+                continue;
+            }
+            counted::hit(Site::RelayRequested);
+            req.flight.insert(
+                hash,
+                TxRequest {
+                    peer_id: peer,
+                    requested_at: self.peer_manager.clock().now(),
+                },
             );
-            return;
+            *by_peer.entry(peer).or_default() += 1;
         }
-
-        counted::hit(Site::RelayRequested);
-
-        self.txs_in_flight.write().insert(
-            txid,
-            TxRequest {
-                peer_id,
-                requested_at: Instant::now(),
-            },
-        );
     }
 
     /// Handle received transaction
@@ -322,14 +402,27 @@ impl TxRelay {
         let txid = tx.txid();
 
         // Remove from in-flight
-        self.txs_in_flight.write().remove(&txid);
+        let released = {
+            let mut req = self.requests.write();
+            let released = req.flight.remove(&txid).is_some();
+            if let Some(peer) = req.queued_ids.remove(&txid) {
+                let q = req.queued.get_mut(&peer).unwrap();
+                q.retain(|hash| *hash != txid);
+                if q.is_empty() {
+                    req.queued.remove(&peer);
+                    req.ready.retain(|p| *p != peer);
+                }
+            }
+            released
+        };
+        if released {
+            self.process_request_queue();
+        }
 
         // The peer has it (Divi Core AddInventoryKnown, main.cpp:720)
         self.peer_inventory
             .write()
-            .entry(peer_id)
-            .or_default()
-            .insert(txid);
+            .note(peer_id, txid, self.peer_manager.clock().now());
 
         // One already in the mempool changes nothing there; one held as an
         // orphan is offered again, as its parent may have come in a block
@@ -390,8 +483,7 @@ impl TxRelay {
     pub fn peer_knows(&self, peer_id: PeerId, txid: &Hash256) -> bool {
         self.peer_inventory
             .read()
-            .get(&peer_id)
-            .is_some_and(|known| known.contains(txid))
+            .knows(peer_id, txid, self.peer_manager.clock().now())
     }
 
     /// Relay a transaction the mempool took, to every peer but the one it came
@@ -477,10 +569,8 @@ impl TxRelay {
                     }
 
                     // Check if peer already has this tx
-                    if let Some(inv) = peer_inventory.get(&peer_id) {
-                        if inv.contains(&txid) {
-                            return false;
-                        }
+                    if peer_inventory.knows(peer_id, &txid, self.peer_manager.clock().now()) {
+                        return false;
                     }
 
                     let Some(stats) = self.peer_manager.peer_stats(peer_id) else {
@@ -505,12 +595,7 @@ impl TxRelay {
         let msg = NetworkMessage::Inv(inv);
 
         for peer_id in peers_to_notify {
-            if self
-                .peer_manager
-                .send_to_peer(peer_id, msg.clone())
-                .await
-                .is_err()
-            {
+            if self.peer_manager.send_gossip(peer_id, msg.clone()).is_err() {
                 counted::hit(Site::RelayInvSendFailed);
             }
         }
@@ -518,37 +603,26 @@ impl TxRelay {
 
     /// Check for timed out requests and retry
     pub async fn check_timeouts(&self) {
-        let now = Instant::now();
-
-        let timed_out: Vec<(Hash256, PeerId)> = {
-            self.txs_in_flight
-                .read()
-                .iter()
-                .filter(|(_, req)| now.duration_since(req.requested_at) > TX_REQUEST_TIMEOUT)
-                .map(|(txid, req)| (*txid, req.peer_id))
-                .collect()
-        };
-
-        for (txid, peer_id) in timed_out {
-            warn!(
-                "Tx {} request timed out from peer {}",
-                WalletTxid::of(txid),
-                peer_id
-            );
-            self.txs_in_flight.write().remove(&txid);
-
-            // Try to get from another peer
-            let alternate_peer = {
-                let tx_sources = self.tx_sources.read();
-                tx_sources
-                    .get(&txid)
-                    .and_then(|peers| peers.iter().find(|&&p| p != peer_id).copied())
-            };
-
-            if let Some(other_peer) = alternate_peer {
-                self.request_tx(txid, other_peer).await;
+        {
+            let mut inv = self.peer_inventory.write();
+            let mut requests = self.requests.write();
+            let now = self.peer_manager.clock().now();
+            inv.expire(now);
+            let mut retry = Vec::new();
+            requests.flight.retain(|hash, r| {
+                if now.saturating_duration_since(r.requested_at) < TX_REQUEST_TIMEOUT {
+                    return true;
+                }
+                if let Some(other) = inv.alternate(hash, r.peer_id, now) {
+                    retry.push((*hash, other));
+                }
+                false
+            });
+            for (hash, peer) in retry {
+                requests.enqueue(hash, peer);
             }
         }
+        self.process_request_queue();
 
         // Clean up old entries from recently_announced
         {
@@ -569,11 +643,13 @@ impl TxRelay {
 
     /// Get statistics
     pub fn stats(&self) -> TxRelayStats {
+        let tracked_peers = self.peer_inventory.read().peers.len();
+        let requests = self.requests.read();
         TxRelayStats {
             seen_count: self.seen_txs.read().len(),
-            in_flight_count: self.txs_in_flight.read().len(),
-            queue_size: self.request_queue.read().len(),
-            tracked_peers: self.peer_inventory.read().len(),
+            in_flight_count: requests.flight.len(),
+            queue_size: requests.queued_ids.len(),
+            tracked_peers,
         }
     }
 }
@@ -630,29 +706,92 @@ mod tests {
         relay
             .peer_inventory
             .write()
-            .entry(peer_id)
-            .or_default()
-            .insert(txid);
-
-        // Add to tx_sources
-        relay
-            .tx_sources
-            .write()
-            .entry(txid)
-            .or_default()
-            .insert(peer_id);
-
-        assert!(relay.peer_inventory.read().contains_key(&peer_id));
+            .note(peer_id, txid, Instant::now());
+        assert!(relay.peer_knows(peer_id, &txid));
 
         relay.remove_peer(peer_id);
 
-        assert!(!relay.peer_inventory.read().contains_key(&peer_id));
-        assert!(!relay
-            .tx_sources
-            .read()
-            .get(&txid)
-            .map(|s| s.contains(&peer_id))
-            .unwrap_or(false));
+        assert!(!relay.peer_knows(peer_id, &txid));
+    }
+
+    #[test]
+    fn d4_inventory_expires_and_evicts_without_losing_recent_hints() {
+        let ttl = Duration::from_secs(10);
+        let t = Instant::now();
+        let mut inv = PeerInventory::new(2, 2, ttl);
+        let [a, b, c] = [1, 2, 3].map(|n| Hash256([n; 32]));
+        inv.note(1, a, t);
+        inv.note(1, b, t);
+        inv.note(1, c, t);
+        assert!(!inv.knows(1, &a, t));
+        assert!(inv.knows(1, &b, t));
+        inv.note(2, c, t + Duration::from_secs(1));
+        inv.note(3, c, t + Duration::from_secs(2));
+        assert!(!inv.knows(1, &c, t));
+        assert_eq!(inv.alternate(&c, 3, t + ttl), Some(2));
+        assert_eq!(inv.alternate(&c, 3, t + ttl + Duration::from_secs(1)), None);
+        inv.note(2, a, t + ttl + Duration::from_secs(1));
+        assert_eq!(inv.peers[&2].items.len(), 1);
+        inv.expire(t + ttl * 3);
+        assert!(inv.peers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn d4_duplicate_inv_and_disconnect_transfer_one_request() {
+        let relay = create_test_relay();
+        let mut first = test_peer(&relay, 1);
+        let mut second = test_peer(&relay, 2);
+        let a = Hash256([7; 32]);
+        let item = InvItem::new(InvType::Tx, a);
+        relay.handle_inv(1, vec![item.clone(), item.clone()]).await;
+        relay.handle_inv(2, vec![item]).await;
+        assert!(matches!(first.try_recv(), Ok(NetworkMessage::GetData(_))));
+        assert!(first.try_recv().is_err() && second.try_recv().is_err());
+        relay.remove_peer(1);
+        relay.check_timeouts().await;
+        assert!(
+            matches!(second.try_recv(),Ok(NetworkMessage::GetData(items)) if items.len()==1 && items[0].hash==a)
+        );
+        assert_eq!(relay.stats().in_flight_count, 1);
+    }
+
+    #[tokio::test]
+    async fn d4_timeout_rotates_and_leaves_room_for_another_peer() {
+        let clock = crate::peer_clock::PeerClock::skippable(Duration::from_secs(1));
+        let relay = TxRelay::new(PeerManager::with_clock(Default::default(), clock.clone()));
+        let mut first = test_peer(&relay, 1);
+        let mut second = test_peer(&relay, 2);
+        let mut third = test_peer(&relay, 3);
+        for n in 0..MAX_FLIGHT_PER_PEER {
+            let hash = Hash256([n as u8; 32]);
+            relay
+                .handle_inv(1, vec![InvItem::new(InvType::Tx, hash)])
+                .await;
+            assert!(matches!(first.try_recv(), Ok(NetworkMessage::GetData(_))));
+        }
+        let next = InvItem::new(InvType::Tx, Hash256([241; 32]));
+        relay.handle_inv(1, vec![next.clone()]).await;
+        assert!(first.try_recv().is_err());
+        let independent = InvItem::new(InvType::Tx, Hash256([242; 32]));
+        relay.handle_inv(2, vec![independent]).await;
+        assert!(matches!(second.try_recv(), Ok(NetworkMessage::GetData(_))));
+        let retry = InvItem::new(InvType::Tx, Hash256([0; 32]));
+        relay.handle_inv(2, vec![retry.clone()]).await;
+        relay.handle_inv(3, vec![retry.clone()]).await;
+        clock.skip(TX_REQUEST_TIMEOUT);
+        relay.check_timeouts().await;
+        assert!(
+            matches!(first.try_recv(), Ok(NetworkMessage::GetData(items)) if items == vec![next])
+        );
+        assert!(
+            matches!(second.try_recv(), Ok(NetworkMessage::GetData(items)) if items == vec![retry.clone()])
+        );
+        clock.skip(TX_REQUEST_TIMEOUT);
+        relay.check_timeouts().await;
+        assert!(
+            matches!(third.try_recv(), Ok(NetworkMessage::GetData(items)) if items == vec![retry])
+        );
+        assert_eq!(relay.stats().queue_size, 0);
     }
 
     /// A peer and the receiver of the messages sent to it

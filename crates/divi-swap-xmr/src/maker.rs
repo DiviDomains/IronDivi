@@ -446,6 +446,8 @@ pub struct XmrMaker {
     /// Hold `cancel_after_secs`/`punish_after_secs` to the taker's bounds (always, outside
     /// the test that needs a maker the taker must still refuse).
     bounded_deadlines: bool,
+    /// Why new swaps are refused ([`XmrMaker::with_admission_hold`]); `None`: admitted.
+    held: Option<String>,
 }
 
 /// Removes a quote id from `XmrMaker::quotes_in_setup` when `setup` returns.
@@ -495,7 +497,32 @@ impl XmrMaker {
             funding_gate: tokio::sync::RwLock::new(()),
             swept: AtomicBool::new(false),
             bounded_deadlines: true,
+            held: None,
         })
+    }
+
+    /// Refuse new swaps (an unauthenticated network or an advisory hold): `quote`, `setup`,
+    /// `j_round` and the `sigs` that would broadcast `Tx_lock` fail, and an `Accepted` swap
+    /// (nothing broadcast) is aborted with its coins released. A swap whose `Tx_lock` is out
+    /// (`Locked` and later) keeps running: its sweep, redeem, cancel, refund and reclaim paths
+    /// are the operator's way back to the DIVI.
+    pub fn with_admission_hold(mut self, reason: impl Into<String>) -> Self {
+        self.held = Some(reason.into());
+        self
+    }
+
+    /// Why new swaps are refused, if they are.
+    pub fn admission_hold(&self) -> Option<&str> {
+        self.held.as_deref()
+    }
+
+    fn check_not_held(&self) -> Result<()> {
+        match &self.held {
+            Some(why) => Err(SwapError::InvalidParams(format!(
+                "new xmr swaps are held: {why}"
+            ))),
+            None => Ok(()),
+        }
     }
 
     /// Replace the wall clock (quote expiry, the signatures wait).
@@ -526,6 +553,7 @@ impl XmrMaker {
     /// Issue a quote for `btc_sats` 1e-8-XMR units. The per-swap keys come in the setup
     /// reply, so the quote's `maker_*_pubkey` fields are zero here.
     pub async fn quote(&self, offer_id: &str, btc_sats: u64) -> Result<Quote> {
+        self.check_not_held()?;
         let offer = self
             .offers
             .iter()
@@ -628,6 +656,7 @@ impl XmrMaker {
     /// 2P-ECDSA session for `J` and answer its first round. Nothing is persisted but the
     /// used quote and session id until `J` exists.
     pub async fn setup(&self, req: SetupRequest) -> Result<JRoundReply> {
+        self.check_not_held()?;
         let _claim = {
             let mut set = self.quotes_in_setup.lock();
             if !set.insert(req.quote_id.clone()) {
@@ -734,6 +763,7 @@ impl XmrMaker {
     /// the setup (`Tx_lock` and `Tx_cancel`, `Tx_lock` not broadcast) and our signing
     /// messages on `Tx_cancel`; `signed` once our side has `σ_J`.
     pub async fn j_round(&self, swap_id: &str, req: JRoundRequest) -> Result<JRoundReply> {
+        self.check_not_held()?;
         let entry = self
             .keying
             .lock()
@@ -982,7 +1012,7 @@ impl XmrMaker {
                 .map(|e| (e.cancel_txid.clone(), e.encsig.to_string()))
                 .collect();
             match r.state {
-                XmrMakerState::Accepted => {}
+                XmrMakerState::Accepted => self.check_not_held()?,
                 _ if r.taker_cancel_sig.as_deref() == Some(cancel_sig.as_str())
                     && r.refund_encsigs == encsigs =>
                 {
@@ -1286,6 +1316,13 @@ impl XmrMaker {
     async fn advance(&self, r: &mut XmrMakerRecord) -> Result<Flow> {
         use XmrMakerState::*;
         match r.state {
+            Accepted if self.held.is_some() => {
+                let why = self.held.clone().unwrap_or_default();
+                self.keying.lock().remove(&r.id);
+                self.divi.release_funding(&r.tx_lock).await?;
+                r.last_error = Some(format!("aborted: new xmr swaps are held: {why}"));
+                self.enter(r, Aborted)
+            }
             Accepted => {
                 // The reservation on `Tx_lock`'s coins expires with the signatures wait
                 // (`sigs_wait_secs`, the profile's setup timeout): a swap that never reached

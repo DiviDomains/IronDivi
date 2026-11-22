@@ -109,7 +109,7 @@ Hybrid v2 (2577 B):                Hybrid v2 (2577 B):                      Lega
 
 1. **`SporkAuthPolicy::ClassicalOnly` (Default Pre-`DIP-PQ-2` Compatibility Mode):**
    - A 65-byte `v1` Spork is accepted if and only if `sig_secp256k1[65]` recovers to the configured compressed `strSporkKey`.
-   - A 2,577-byte `v2` Spork is accepted if and only if its 65-byte prefix `sig_secp256k1[0..65]` recovers to `strSporkKey` **and** its 2,512-byte suffix `sig_lms[65..2577]` passes strict `LMS-SHA256-M32-H10` canonical header/bounds validation (`PqSchemeId::LmsSha256M32H10.validate_signature_encoding`). This guarantees that even a node without a configured 60-byte `pq_spork_pubkey` never accepts or relays malformed garbage in the 2,512-byte suffix.
+   - A 2,577-byte `v2` Spork is accepted if and only if its 65-byte prefix `sig_secp256k1[0..65]` recovers to `strSporkKey` **and** its 2,512-byte suffix `sig_lms[65..2577]` passes strict `LMS-SHA256-M32-H10` canonical header/bounds validation (`PqSchemeId::LmsSha256M32H10.validate_signature_encoding`). This guarantees that even a node without a configured 60-byte `pq_spork_pubkey` never accepts or relays malformed garbage in the 2,512-byte suffix. The `LMS` signature itself is not verified, so the outcome is `Ok(SporkAuthKind::HybridV2LmsUnverified { lms_leaf_q })`, never `HybridV2`, and its leaf index is not tracked (§5.2).
 2. **`SporkAuthPolicy::HybridOptional { pq_spork_pubkey: [u8; 60], network_magic: [u8; 4] }` (Phase `P2.1` Rollout):**
    - A 65-byte `v1` Spork is accepted if `sig_secp256k1[65]` is valid for `strSporkKey` (`Ok(SporkAuthKind::ClassicalV1)`).
    - A 2,577-byte `v2` Spork is accepted if and only if **both** `sig_secp256k1[0..65]` is valid for `strSporkKey` **and** `sig_lms[65..2577]` is cryptographically valid for `pq_spork_pubkey` under `network_magic` (`Ok(SporkAuthKind::HybridV2 { lms_leaf_q })`). If either component fails, the Spork is rejected and the sending peer receives `BAD_SPORK_SCORE` (`100`).
@@ -129,11 +129,36 @@ Hybrid v2 (2577 B):                Hybrid v2 (2577 B):                      Lega
 1. The offline Spork signing tool (`LmsPrivateKey`) MUST advance `next_leaf_q` monotonically (`0, 1, 2, ..., 1023`) and fsync the updated counter before outputting any signed `CSporkMessage` v2 payload.
 2. When `next_leaf_q >= 1024`, `LmsPrivateKey::sign_prehash` returns `Err(PqError::LmsKeyExhausted(1024))` and refuses to sign.
 
+**Status: operational `LMS` signing is unavailable.** No component in IronDivi meets rule 1. `LmsPrivateKey` keeps `next_leaf_q` in memory only, and every constructor (`from_seed`, `from_pq_leaf`) starts at leaf `0`. Until a signer that meets every requirement below has been reviewed and approved separately:
+
+- `LmsPrivateKey::sign_prehash` and `sign_spork` are compiled only in `divi-crypto`'s own unit tests or with the test-only `lms-volatile-test-signer` feature. `LmsPrivateKey` is no longer `Clone`.
+- `sign_hybrid_spork_lms` and `SporkMessage::attach_lms_signature` in `divi-network` return `SporkVerifyError::LmsSigningUnavailable` without signing or consuming a leaf. They work only when `divi-network`'s `lms-volatile-test-signer` feature is enabled, which only its tests do.
+- `tools/release-check.sh` fails if a shipped binary's dependency graph enables either feature.
+- Key generation, public-key derivation, encoding checks, verification (`verify_lms_prehash`, `verify_lms_with_domain`, the C99 reference) and all of §4 and §5.2 are unchanged.
+
+#### 5.1.1 Requirements for a future signer
+
+1. **Exclusive.** Exactly one signer process may hold a given tree's state at a time, enforced by an exclusive lock on the state, not by convention. The private key must not be copyable in memory.
+2. **Reserve before release.** Leaf `q` is reserved by durably writing `next_leaf_q = q + 1` (file and directory fsync, or an equivalent atomic durable store) before the signature is computed or released. If signing then fails or the process crashes, the leaf is burnt, never retried.
+3. **Fail closed.** If the state is missing, unreadable, corrupt or for a different public key, the signer refuses to sign. It never falls back to leaf `0` or to a re-derived counter.
+4. **Exhaustion.** `q >= 1024` refuses (`LmsKeyExhausted`); the tree must be replaced before then by rotating `pq_spork_pubkey` (a policy change on both clients).
+
+#### 5.1.2 Restore and rollback limitations
+
+These hold even for a signer that meets §5.1.1:
+
+- **Re-derivation knows nothing about used leaves.** The key is derived from the BIP39 seed (`m/44'/coin'/account'/4'/index'`). Restoring the mnemonic, a wallet backup or a second copy of the seed recreates the same public key at leaf `0`.
+- **A restored counter can be stale.** A backup, disk image, VM snapshot or filesystem rollback of the state file returns an older `next_leaf_q`. Durability does not protect against restoring an old copy, so a restored counter must not be trusted on its own.
+- **Recovery after restore** must therefore either retire the tree (rotate `pq_spork_pubkey` on both clients) or move the counter forward past every leaf that might have been used. The highest leaf seen on the network (§5.2) is only a lower bound, because signatures that were made but never broadcast are invisible to it.
+- **Detection is not prevention.** §5.2 tracking only logs a warning after a conflicting leaf is seen, only on nodes with a configured key, and only for sporks they receive.
+- **Residual secret handling.** `from_seed` takes the 32-byte seed by value, and copies made by the caller are outside this crate's zeroization. `from_pq_leaf` now keeps its intermediate seed copy in `Zeroizing`. No claim of erasure from swap, core dumps or storage media is made.
+
 ### 5.2 Validator Leaf-Index Tracking (`last_lms_leaf_q`)
 
 1. Every node's `SporkManager` tracks:
    - `last_lms_leaf_q: Option<u32>`: the highest verified `LMS` leaf index $q$ observed across all accepted `HybridV2` Sporks, and
    - `spork_lms_leaf_q: HashMap<i32, u32>`: the last verified `LMS` leaf index $q$ per `spork_id`, plus `(q -> spork_hash)` mapping to detect conflicting reuse of the same one-time leaf $q$ on two distinct Spork messages.
+   Only sporks whose `LMS` signature verified against `pq_spork_pubkey` (`SporkAuthKind::HybridV2`) are tracked. Sporks accepted under `ClassicalOnly` (`HybridV2LmsUnverified`) are not, and a stored spork's leaf is tracked at start-up only if it verifies under the active policy.
 2. If a valid `HybridV2` Spork arrives with a leaf index $q$ that was already used to sign a **different** `spork.hash()`, or with $q \le \text{spork\_lms\_leaf\_q}[spork\_id]$ for a newer `time_signed`, `SporkManager` logs a high-priority security warning (`tracing::warn!`) flagging potential signer state rollback or key-state desynchronization.
 
 ---
@@ -142,7 +167,7 @@ Hybrid v2 (2577 B):                Hybrid v2 (2577 B):                      Lega
 
 1. **Unit & Adversarial Suite (`crates/divi-network/src/spork.rs`):**
    - Legacy `65 B` `v1` acceptance under `ClassicalOnly`, `HybridOptional`, and `HybridRequiredAfter` (when `time_signed < cutoff_time_signed`).
-   - Hybrid `2,577 B` `v2` signing (`sign_hybrid_spork_lms` / `attach_lms_signature`), P2P wire `serialize()` / `deserialize()` round-trip, and verification under `ClassicalOnly`, `HybridOptional`, and `HybridRequiredAfter`.
+   - Hybrid `2,577 B` `v2` signing (`sign_hybrid_spork_lms` / `attach_lms_signature`; through the test-only volatile signer, and `LmsSigningUnavailable` without it, §5.1), P2P wire `serialize()` / `deserialize()` round-trip, and verification under `ClassicalOnly`, `HybridOptional`, and `HybridRequiredAfter`.
    - Post-cutoff rejection (`MissingPostQuantumSignatureAfterCutoff`) of `65 B` `v1` Sporks when `time_signed >= cutoff_time_signed` (both exact boundary `time_signed == cutoff_time_signed` and `time_signed > cutoff_time_signed`).
    - Adversarial bit-flip & substitution tests:
      - Bit-flipped classical `secp256k1` portion (`sig[10] ^= 0x01`) rejected as `InvalidClassicalSignature`.

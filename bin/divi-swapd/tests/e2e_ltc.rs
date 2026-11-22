@@ -227,7 +227,7 @@ async fn happy(dir: Direction) {
         &taker,
         &client,
         &sessions,
-        &offer.id,
+        &offer,
         LTC_SATS,
         &opts,
         &mut || w.mine(),
@@ -271,7 +271,7 @@ async fn refund(dir: Direction) {
     let taker_before = bal(l.taker_chain, l.taker_on_taker_leg);
     let maker_before = bal(l.maker_chain, l.maker_on_maker_leg);
 
-    let local = flow::begin(&taker, &client, &sessions, &offer.id, LTC_SATS)
+    let local = flow::begin(&taker, &client, &sessions, &offer, LTC_SATS)
         .await
         .unwrap();
     flow::lock(&taker, &client, &sessions, &local)
@@ -430,7 +430,7 @@ async fn new_client_take_of_ltc_offer_is_accepted() {
     let taker = taker(&w, &tdb);
     let client = MakerClient::new(&d.base);
     let sessions = Sessions::beside(&tdb);
-    let local = flow::begin(&taker, &client, &sessions, &offer.id, LTC_SATS)
+    let local = flow::begin(&taker, &client, &sessions, &offer, LTC_SATS)
         .await
         .unwrap();
     let id = sessions.get(&local).unwrap().maker_swap_id;
@@ -454,7 +454,7 @@ async fn btc_taker_on_ltc_offer_is_told_to_pass_counter_chain() {
     let client = MakerClient::new(&d.base);
     let sessions = Sessions::beside(&tdb);
     let offer = World::offer(Direction::TakerPaysBtc);
-    let err = flow::begin(&btc_taker, &client, &sessions, &offer.id, LTC_SATS)
+    let err = flow::begin(&btc_taker, &client, &sessions, &offer, LTC_SATS)
         .await
         .unwrap_err()
         .to_string();

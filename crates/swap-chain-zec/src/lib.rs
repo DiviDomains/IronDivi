@@ -36,7 +36,7 @@ use secp256k1::{All, Secp256k1, SecretKey};
 use divi_swap::backend::TipHeader;
 use divi_swap::{
     Amount, Chain, ChainBackend, Funding, HtlcParams, InputReservations, LockedOutput, Outpoint,
-    SignedTx, SpendInfo, SwapError, Txid,
+    ScanMark, SignedTx, SpendInfo, SpendScan, SwapError, Txid,
 };
 
 use address::TransparentAddress;
@@ -123,8 +123,10 @@ pub fn lightwalletd_endpoints(network: &str) -> Result<Vec<String>> {
     ))
 }
 
-/// Blocks scanned per `find_spend` call (mirrors the BTC lane's `MAX_SCAN_BLOCKS`): we have
-/// no "find the spend of this outpoint" index on this API, only block scanning.
+/// Blocks scanned per `scan_spend` pass (mirrors the BTC lane's `MAX_SCAN_BLOCKS`): we have
+/// no "find the spend of this outpoint" index on this API, only block scanning. A pass that
+/// stops short of the tip says so (`SpendScan::NotYet { complete: false }`), and the engine
+/// resumes from its mark (H2).
 const MAX_SCAN_BLOCKS: u64 = 200;
 
 /// Zcash's target block spacing in seconds since Blossom (ZIP 208), on mainnet and
@@ -832,16 +834,52 @@ fn spend_in_block(
     block: &CompactBlock,
     want_txid: &[u8; 32],
     want_vout: u32,
-) -> Option<([u8; 32], u32)> {
+) -> Result<Option<([u8; 32], u32)>> {
+    let mut ids = std::collections::HashSet::new();
+    let mut indices = std::collections::HashSet::new();
     for t in &block.vtx {
+        if !ids.insert(&t.txid) || !indices.insert(t.index) {
+            return Err(SwapError::Transient(
+                "duplicate compact transaction ID or index".into(),
+            ));
+        }
+    }
+    for t in &block.vtx {
+        let txid = <[u8; 32]>::try_from(t.txid.as_slice())
+            .map_err(|_| SwapError::Transient("malformed CompactTx.txid".into()))?;
         for (i, vin) in t.vin.iter().enumerate() {
+            if vin.prevout_txid.len() != 32 {
+                return Err(SwapError::Transient(
+                    "malformed CompactTxIn.prevout_txid".into(),
+                ));
+            }
             if vin.prevout_txid == want_txid && vin.prevout_index == want_vout {
-                let txid = ZecBackend::txid32(&t.txid, "CompactTx.txid").ok()?;
-                return Some((txid, i as u32));
+                return Ok(Some((txid, i as u32)));
             }
         }
     }
-    None
+    Ok(None)
+}
+
+/// The transparent-pool range is trusted to include every transparent spend, even though
+/// a filtered compact block may legitimately have empty vtx/vin and has no total to check.
+/// These links establish one reported branch, not independent header or inclusion proofs.
+fn validate_scan_block(
+    block: &CompactBlock,
+    height: u64,
+    parent: Option<&CompactBlock>,
+) -> Result<()> {
+    if block.height != height
+        || block.hash.len() != 32
+        || !(block.prev_hash.len() == 32 || height == 0 && block.prev_hash.is_empty())
+        || block.prev_hash == block.hash
+        || parent.is_some_and(|p| p.hash != block.prev_hash)
+    {
+        return Err(SwapError::Transient(format!(
+            "inconsistent compact block at height {height}"
+        )));
+    }
+    Ok(())
 }
 
 #[allow(clippy::double_must_use)]
@@ -1148,9 +1186,34 @@ impl ChainBackend for ZecBackend {
     }
 
     async fn find_spend(&self, outpoint: &Outpoint, from_height: u64) -> Result<Option<SpendInfo>> {
-        let tip = self.tip_height().await?;
+        Ok(self
+            .scan_spend(outpoint, from_height, None)
+            .await?
+            .into_spend())
+    }
+
+    /// At most [`MAX_SCAN_BLOCKS`] compact blocks from `from_height`. A short range
+    /// covers only its returned prefix. A gap or broken parent link invalidates the
+    /// range; it supplies no mark. Cursor hashes stay in lightwalletd wire order.
+    async fn scan_spend(
+        &self,
+        outpoint: &Outpoint,
+        from_height: u64,
+        resume: Option<&ScanMark>,
+    ) -> Result<SpendScan> {
+        let latest = self.client.latest_block().await.map_err(SwapError::from)?;
+        let tip = latest.height;
+        if latest.hash.len() != 32 {
+            return Err(SwapError::Transient("malformed GetLatestBlock hash".into()));
+        }
+        if resume.is_some_and(|m| m.height > tip) {
+            return Ok(SpendScan::Reorged);
+        }
         if from_height > tip {
-            return Ok(None);
+            return Ok(SpendScan::NotYet {
+                through: None,
+                complete: true,
+            });
         }
         let last = tip.min(from_height.saturating_add(MAX_SCAN_BLOCKS - 1));
         let blocks = self
@@ -1158,24 +1221,69 @@ impl ChainBackend for ZecBackend {
             .block_range(from_height, last)
             .await
             .map_err(SwapError::from)?;
+        if blocks.is_empty() {
+            return Err(SwapError::Transient("empty GetBlockRange".into()));
+        }
+        for (i, (block, height)) in blocks.iter().zip(from_height..=last).enumerate() {
+            validate_scan_block(block, height, i.checked_sub(1).map(|j| &blocks[j]))?;
+        }
+        if blocks
+            .last()
+            .is_some_and(|b| b.height == tip && b.hash != latest.hash)
+        {
+            return Err(SwapError::Transient(
+                "tip changed during GetBlockRange".into(),
+            ));
+        }
+        if let Some(m) = resume {
+            match blocks.first() {
+                Some(b) if b.height == m.height => {
+                    if hex::encode(&b.hash) != m.hash {
+                        return Ok(SpendScan::Reorged);
+                    }
+                }
+                // The marked block was not returned: nothing is known past it yet.
+                _ => {
+                    return Ok(SpendScan::NotYet {
+                        through: None,
+                        complete: false,
+                    })
+                }
+            }
+        }
+        let mut through: Option<ScanMark> = None;
         for block in &blocks {
+            let mark = ScanMark {
+                height: block.height,
+                hash: hex::encode(&block.hash),
+            };
             let Some((spender_txid, input_index)) =
-                spend_in_block(block, &outpoint.txid.0, outpoint.vout)
+                spend_in_block(block, &outpoint.txid.0, outpoint.vout)?
             else {
+                through = Some(mark);
                 continue;
             };
-            let Some(full) = self
+            let full = self
                 .client
                 .get_transaction(&spender_txid)
                 .await
-                .map_err(SwapError::from)?
-            else {
-                continue; // compact block saw it, full tx vanished (reorg); caller retries.
+                .map_err(SwapError::from)?;
+            // The compact block names a spender the server cannot give in full (a reorg
+            // under the read) or whose input is missing: this block is not read, so the
+            // mark stops before it and the next pass reads it again.
+            let Some(full) = full else {
+                return Ok(SpendScan::NotYet {
+                    through,
+                    complete: false,
+                });
             };
             let parsed = tx::ParsedTx::parse(&full.data)?;
             self.requested(&parsed, &spender_txid)?;
             let Some(input) = parsed.vin.get(input_index as usize) else {
-                continue;
+                return Ok(SpendScan::NotYet {
+                    through,
+                    complete: false,
+                });
             };
             // The txid commits to the prevouts: the compact block's claim is now checkable.
             if input.prevout.txid != outpoint.txid.0 || input.prevout.n != outpoint.vout {
@@ -1192,7 +1300,7 @@ impl ChainBackend for ZecBackend {
             } else {
                 Some(full.height)
             };
-            return Ok(Some(SpendInfo {
+            return Ok(SpendScan::Spent(SpendInfo {
                 txid: Txid(spender_txid),
                 input_index,
                 height,
@@ -1200,7 +1308,8 @@ impl ChainBackend for ZecBackend {
                 witness: vec![],
             }));
         }
-        Ok(None)
+        let complete = through.as_ref().is_some_and(|m| m.height == tip);
+        Ok(SpendScan::NotYet { through, complete })
     }
 }
 
@@ -1370,6 +1479,7 @@ mod tests {
         let block = |height, hash: &[u8], time| CompactBlock {
             height,
             hash: hash.to_vec(),
+            prev_hash: vec![0; 32],
             time,
             vtx: Vec::new(),
         };
@@ -1393,6 +1503,27 @@ mod tests {
             let err = display_block_hash(bad).unwrap_err();
             assert!(matches!(err, SwapError::Transient(_)), "{err:?}");
         }
+    }
+
+    #[test]
+    fn scan_range_requires_links_as_well_as_consecutive_heights() {
+        let first = CompactBlock {
+            height: 12,
+            hash: vec![1; 32],
+            prev_hash: vec![0; 32],
+            ..Default::default()
+        };
+        let mut second = CompactBlock {
+            height: 13,
+            hash: vec![2; 32],
+            prev_hash: first.hash.clone(),
+            ..Default::default()
+        };
+        validate_scan_block(&second, 13, Some(&first)).unwrap();
+        second.prev_hash = vec![3; 32];
+        assert!(validate_scan_block(&second, 13, Some(&first)).is_err());
+        second.prev_hash.clear();
+        assert!(validate_scan_block(&second, 13, None).is_err());
     }
 
     #[test]
@@ -1485,6 +1616,7 @@ mod tests {
         let block = CompactBlock {
             height: 500,
             hash: vec![0x55; 32],
+            prev_hash: vec![0x54; 32],
             time: 1_900_000_100,
             vtx: vec![CompactTx {
                 index: 1,
@@ -1495,7 +1627,16 @@ mod tests {
                 }],
             }],
         };
-        let found = spend_in_block(&block, &fund_outpoint.txid, fund_outpoint.n);
+        let mut extended = block.clone();
+        let mut other = block.vtx[0].clone();
+        other.index += 3;
+        extended.vtx.push(other);
+        assert!(spend_in_block(&extended, &fund_outpoint.txid, fund_outpoint.n).is_err());
+        extended.vtx[1].txid[0] ^= 1;
+        assert!(spend_in_block(&extended, &fund_outpoint.txid, fund_outpoint.n).is_ok());
+        extended.vtx[1].index = extended.vtx[0].index;
+        assert!(spend_in_block(&extended, &fund_outpoint.txid, fund_outpoint.n).is_err());
+        let found = spend_in_block(&block, &fund_outpoint.txid, fund_outpoint.n).unwrap();
         assert_eq!(found, Some((spender_txid, 0)));
 
         // The full tx (as `GetTransaction` would return it) is what supplies the scriptSig.
@@ -1516,7 +1657,7 @@ mod tests {
             txid: [8; 32],
             n: 0,
         };
-        assert_eq!(spend_in_block(&block, &other.txid, other.n), None);
+        assert_eq!(spend_in_block(&block, &other.txid, other.n).unwrap(), None);
     }
 
     /// Read-only smoke: prints `SMOKE ZEC <net> <height_before> <tip_hash> <height_after>`

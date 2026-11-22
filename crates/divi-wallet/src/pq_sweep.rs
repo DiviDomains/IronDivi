@@ -33,6 +33,13 @@
 //!    fallback to `P2PQPKH` single-key 256-bit outputs or explicit rejection.
 //! 4. **Deterministic Weight & Fee Accounting:** Respects `max_inputs_per_tx` and `max_tx_weight`
 //!    (`<= MAX_PQ_BLOCK_WEIGHT`) and computes exact byte/weight-proportional fees (`fee_per_kb_sat`).
+//! 5. **Fail-Closed Activation Gate:** Until `DIP-PQ-3` (`PostQuantumWitnessAndVaults`) is enforced
+//!    by consensus, `P2PQPKH` and `PQ_STAKING_VAULT` outputs carry no consensus spending rules, so
+//!    [`plan_voluntary_pq_sweep`] never returns an unsigned transaction that creates or spends them
+//!    while [`PqSweepPlanConfig::pq_output_activation`] is [`PqOutputActivation::Inactive`] (the
+//!    default). This covers PQ primary destinations, sub-threshold `P2PQPKH` fallback outputs in
+//!    otherwise classical plans, and re-sweeps of PQ-native inputs. Callers that only need fee and
+//!    posture numbers use [`estimate_voluntary_pq_sweep`], which never returns transactions or scripts.
 
 use divi_primitives::amount::Amount;
 use divi_primitives::constants::COIN;
@@ -322,6 +329,40 @@ pub enum SubThresholdVaultPolicy {
     FallbackToPqSingleKey { fallback_addr_key_hash32: [u8; 32] },
 }
 
+/// Whether consensus enforces `DIP-PQ-3` spending rules for `P2PQPKH` / `PQ_STAKING_VAULT` outputs.
+///
+/// Divi Core defines `Fork::PostQuantumWitnessAndVaults` but does not consult it yet, and IronDivi
+/// has no such fork, so callers must keep the default [`PqOutputActivation::Inactive`] until both
+/// clients enforce the fork at the chain tip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum PqOutputActivation {
+    /// `DIP-PQ-3` is not enforced: PQ outputs must not appear in signable sweep material.
+    #[default]
+    Inactive,
+    /// `DIP-PQ-3` is enforced by consensus at the chain tip.
+    Active,
+}
+
+impl PqOutputActivation {
+    /// Returns `true` if `DIP-PQ-3` PQ outputs are enforced by consensus.
+    pub const fn is_active(self) -> bool {
+        matches!(self, Self::Active)
+    }
+
+    /// Stable lowercase label (`"inactive"` / `"active"`).
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Inactive => "inactive",
+            Self::Active => "active",
+        }
+    }
+}
+
+/// Returns `true` if `script` is a `DIP-PQ-3` `P2PQPKH` or `PQ_STAKING_VAULT` output.
+pub fn is_pq_output_script(script: &Script) -> bool {
+    is_p2pqpkh_script(script).is_some() || is_pq_staking_vault_script(script).is_some()
+}
+
 /// Configuration for [`plan_voluntary_pq_sweep`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PqSweepPlanConfig {
@@ -347,7 +388,10 @@ pub struct PqSweepPlanConfig {
     /// 74-byte 256-bit `PQ_STAKING_VAULT`).
     pub include_classical_vaults: bool,
     /// Whether to re-sweep UTXOs that are already `PostQuantumNative` (`false` by default for idempotency).
+    /// Ignored by [`plan_voluntary_pq_sweep`] while `pq_output_activation` is `Inactive`.
     pub resweep_pq_native: bool,
+    /// Consensus status of `DIP-PQ-3` outputs (fail-closed default: `Inactive`).
+    pub pq_output_activation: PqOutputActivation,
 }
 
 impl PqSweepPlanConfig {
@@ -371,6 +415,7 @@ impl PqSweepPlanConfig {
             include_unexposed_classical: true,
             include_classical_vaults: true,
             resweep_pq_native: false,
+            pq_output_activation: PqOutputActivation::Inactive,
         }
     }
 
@@ -389,7 +434,14 @@ impl PqSweepPlanConfig {
             include_unexposed_classical: true,
             include_classical_vaults: false,
             resweep_pq_native: false,
+            pq_output_activation: PqOutputActivation::Inactive,
         }
+    }
+
+    /// Return a copy of this configuration with `pq_output_activation` set.
+    pub fn with_pq_output_activation(mut self, activation: PqOutputActivation) -> Self {
+        self.pq_output_activation = activation;
+        self
     }
 }
 
@@ -469,6 +521,118 @@ pub enum PqSweepError {
         input_value_sat: i64,
         required_fee_sat: i64,
     },
+
+    #[error("post-quantum P2PQPKH / PQ_STAKING_VAULT outputs are not enforced by consensus before DIP-PQ-3 activation; no signable sweep transaction is produced")]
+    PqOutputsNotActive,
+}
+
+/// Script family of a planned sweep output, reported by [`estimate_voluntary_pq_sweep`]
+/// without the output script itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PqSweepOutputKind {
+    /// Classical 2-key `STAKING_VAULT` (`50 B`).
+    ClassicalStakingVault,
+    /// `DIP-PQ-3` `PQ_STAKING_VAULT` (`74 B`).
+    PqStakingVault,
+    /// `DIP-PQ-3` `P2PQPKH` (`34 B`).
+    PqSingleKey,
+}
+
+impl PqSweepOutputKind {
+    fn of_script(script: &Script) -> Self {
+        if is_pq_staking_vault_script(script).is_some() {
+            Self::PqStakingVault
+        } else if is_p2pqpkh_script(script).is_some() {
+            Self::PqSingleKey
+        } else {
+            Self::ClassicalStakingVault
+        }
+    }
+
+    /// Returns `true` for `DIP-PQ-3` output kinds.
+    pub const fn is_post_quantum(self) -> bool {
+        matches!(self, Self::PqStakingVault | Self::PqSingleKey)
+    }
+
+    /// Stable snake_case label.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::ClassicalStakingVault => "staking_vault",
+            Self::PqStakingVault => "pq_staking_vault",
+            Self::PqSingleKey => "p2pqpkh",
+        }
+    }
+}
+
+/// Read-only estimate of one sweep batch. Holds no transaction, txid or output script.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PqSweepBatchEstimate {
+    /// Zero-based batch index.
+    pub batch_index: usize,
+    /// Wallet UTXOs that the batch would consume.
+    pub inputs: Vec<TrackableWalletUtxo>,
+    /// Sum of input values in satoshis.
+    pub input_total_sat: i64,
+    /// Sum of output values in satoshis.
+    pub output_total_sat: i64,
+    /// Estimated fee in satoshis.
+    pub fee_sat: i64,
+    /// Estimated base transaction bytes.
+    pub estimated_base_bytes: usize,
+    /// Estimated segregated witness bytes.
+    pub estimated_witness_bytes: usize,
+    /// Estimated `DIP-PQ-3` transaction weight.
+    pub estimated_weight: usize,
+    /// Number of vault outputs.
+    pub vault_output_count: usize,
+    /// Number of `P2PQPKH` outputs.
+    pub p2pqpkh_output_count: usize,
+    /// `(value_sat, kind)` per output, in output order.
+    pub outputs: Vec<(i64, PqSweepOutputKind)>,
+    /// Whether the batch creates or spends `DIP-PQ-3` outputs.
+    pub requires_pq_outputs: bool,
+}
+
+/// Read-only estimate of a voluntary sweep produced by [`estimate_voluntary_pq_sweep`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PqSweepEstimate {
+    /// Estimated batches in execution order.
+    pub batches: Vec<PqSweepBatchEstimate>,
+    /// UTXOs that would be left untouched.
+    pub skipped_utxos: Vec<TrackableWalletUtxo>,
+    /// Total number of inputs that would be swept.
+    pub swept_input_count: usize,
+    /// Number of swept inputs with historically exposed public keys.
+    pub exposed_input_count: usize,
+    /// Sum of input satoshis.
+    pub total_input_value_sat: i64,
+    /// Sum of output satoshis.
+    pub insulated_output_value_sat: i64,
+    /// Sum of fees in satoshis.
+    pub total_fee_sat: i64,
+    /// Aggregate staking posture before the sweep.
+    pub pre_sweep_posture: &'static str,
+    /// Aggregate staking posture after the sweep.
+    pub post_sweep_posture: &'static str,
+    /// Whether any batch creates or spends `DIP-PQ-3` outputs.
+    pub requires_pq_outputs: bool,
+}
+
+fn batch_requires_pq_outputs(batch: &PqSweepBatchTx) -> bool {
+    batch
+        .unsigned_tx
+        .vout
+        .iter()
+        .any(|o| is_pq_output_script(&o.script_pubkey))
+        || batch
+            .inputs
+            .iter()
+            .any(|u| is_pq_output_script(&u.script_pubkey))
+}
+
+/// Returns `true` if any batch of `plan` creates or spends `DIP-PQ-3` outputs.
+pub fn plan_requires_pq_outputs(plan: &PqSweepPlan) -> bool {
+    plan.batches.iter().any(batch_requires_pq_outputs)
 }
 
 fn estimate_input_bytes(utxo: &TrackableWalletUtxo) -> (usize, usize) {
@@ -495,7 +659,11 @@ fn compute_fee_from_weight_and_rate(
     i64::try_from(fee.max(1)).unwrap_or(i64::MAX)
 }
 
-fn is_utxo_eligible_for_sweep(utxo: &TrackableWalletUtxo, config: &PqSweepPlanConfig) -> bool {
+fn is_utxo_eligible_for_sweep(
+    utxo: &TrackableWalletUtxo,
+    config: &PqSweepPlanConfig,
+    pq_active: bool,
+) -> bool {
     if !utxo.is_mature || utxo.value.as_sat() <= 0 {
         return false;
     }
@@ -506,15 +674,88 @@ fn is_utxo_eligible_for_sweep(utxo: &TrackableWalletUtxo, config: &PqSweepPlanCo
         | QuantumExposureReason::ReusedAddressP2PKH => true,
         QuantumExposureReason::UnexposedClassicalP2PKH => config.include_unexposed_classical,
         QuantumExposureReason::ClassicalVaultInsulated => config.include_classical_vaults,
-        QuantumExposureReason::PostQuantumNative => config.resweep_pq_native,
+        QuantumExposureReason::PostQuantumNative => pq_active && config.resweep_pq_native,
     }
 }
 
 /// Plan a deterministic, voluntary sweep of exposed classical UTXOs into post-quantum or vault-insulated outputs.
+///
+/// While `config.pq_output_activation` is [`PqOutputActivation::Inactive`], this returns
+/// [`PqSweepError::PqOutputsNotActive`] instead of any plan that would create a `DIP-PQ-3` output
+/// (PQ primary destination or sub-threshold `P2PQPKH` fallback), and never selects PQ-native inputs.
+/// Classical-only plans (e.g. `ClassicalStakingVault` with every batch above the vault minimum)
+/// are returned unchanged.
 pub fn plan_voluntary_pq_sweep(
     utxos: &[TrackableWalletUtxo],
     config: &PqSweepPlanConfig,
 ) -> Result<PqSweepPlan, PqSweepError> {
+    let pq_active = config.pq_output_activation.is_active();
+    validate_config(config)?;
+    if !pq_active && config.primary_destination.is_post_quantum_256() {
+        return Err(PqSweepError::PqOutputsNotActive);
+    }
+    let plan = plan_sweep_unchecked(utxos, config, pq_active)?;
+    if !pq_active && plan_requires_pq_outputs(&plan) {
+        return Err(PqSweepError::PqOutputsNotActive);
+    }
+    Ok(plan)
+}
+
+/// Estimate fees, batching and post-sweep posture of a voluntary sweep as if `DIP-PQ-3` were active,
+/// without returning any transaction, txid or output script.
+pub fn estimate_voluntary_pq_sweep(
+    utxos: &[TrackableWalletUtxo],
+    config: &PqSweepPlanConfig,
+) -> Result<PqSweepEstimate, PqSweepError> {
+    validate_config(config)?;
+    let plan = plan_sweep_unchecked(utxos, config, true)?;
+    let requires_pq_outputs = plan_requires_pq_outputs(&plan);
+    let batches = plan
+        .batches
+        .into_iter()
+        .map(|b| {
+            let requires_pq_outputs = batch_requires_pq_outputs(&b);
+            PqSweepBatchEstimate {
+                batch_index: b.batch_index,
+                outputs: b
+                    .unsigned_tx
+                    .vout
+                    .iter()
+                    .map(|o| {
+                        (
+                            o.value.as_sat(),
+                            PqSweepOutputKind::of_script(&o.script_pubkey),
+                        )
+                    })
+                    .collect(),
+                inputs: b.inputs,
+                input_total_sat: b.input_total_sat,
+                output_total_sat: b.output_total_sat,
+                fee_sat: b.fee_sat,
+                estimated_base_bytes: b.estimated_base_bytes,
+                estimated_witness_bytes: b.estimated_witness_bytes,
+                estimated_weight: b.estimated_weight,
+                vault_output_count: b.vault_output_count,
+                p2pqpkh_output_count: b.p2pqpkh_output_count,
+                requires_pq_outputs,
+            }
+        })
+        .collect();
+    Ok(PqSweepEstimate {
+        batches,
+        skipped_utxos: plan.skipped_utxos,
+        swept_input_count: plan.swept_input_count,
+        exposed_input_count: plan.exposed_input_count,
+        total_input_value_sat: plan.total_input_value_sat,
+        insulated_output_value_sat: plan.insulated_output_value_sat,
+        total_fee_sat: plan.total_fee_sat,
+        pre_sweep_posture: plan.pre_sweep_posture,
+        post_sweep_posture: plan.post_sweep_posture,
+        requires_pq_outputs,
+    })
+}
+
+fn validate_config(config: &PqSweepPlanConfig) -> Result<(), PqSweepError> {
     if config.fee_per_kb_sat == 0 {
         return Err(PqSweepError::InvalidConfiguration(
             "fee_per_kb_sat must be > 0",
@@ -543,14 +784,21 @@ pub fn plan_voluntary_pq_sweep(
         }
     }
     config.primary_destination.validate_non_degenerate()?;
+    Ok(())
+}
 
+fn plan_sweep_unchecked(
+    utxos: &[TrackableWalletUtxo],
+    config: &PqSweepPlanConfig,
+    pq_active: bool,
+) -> Result<PqSweepPlan, PqSweepError> {
     let pre_sweep_posture = summarize_staking_posture(utxos.iter().map(|u| &u.script_pubkey));
 
     let mut eligible: Vec<TrackableWalletUtxo> = Vec::new();
     let mut skipped_utxos: Vec<TrackableWalletUtxo> = Vec::new();
 
     for utxo in utxos {
-        if is_utxo_eligible_for_sweep(utxo, config) {
+        if is_utxo_eligible_for_sweep(utxo, config, pq_active) {
             eligible.push(utxo.clone());
         } else {
             skipped_utxos.push(utxo.clone());
@@ -873,6 +1121,43 @@ mod tests {
         create_p2pqpkh_script(&[tag; 32])
     }
 
+    fn active_pq_vault(
+        owner: [u8; 32],
+        vault: [u8; 32],
+        policy: SubThresholdVaultPolicy,
+    ) -> PqSweepPlanConfig {
+        PqSweepPlanConfig::new_pq_vault(owner, vault, policy)
+            .with_pq_output_activation(PqOutputActivation::Active)
+    }
+
+    fn active_pq_single_key(addr: [u8; 32]) -> PqSweepPlanConfig {
+        PqSweepPlanConfig::new_pq_single_key(addr)
+            .with_pq_output_activation(PqOutputActivation::Active)
+    }
+
+    fn classical_vault_cfg(policy: SubThresholdVaultPolicy) -> PqSweepPlanConfig {
+        let mut cfg = PqSweepPlanConfig::new_pq_vault([0x11; 32], [0x22; 32], policy);
+        cfg.primary_destination = PqSweepDestination::ClassicalStakingVault {
+            owner_pubkey_hash20: [0x11; 20],
+            vault_pubkey_hash20: [0x22; 20],
+        };
+        cfg
+    }
+
+    fn exposed_p2pk(tag: u8, divi: i64) -> TrackableWalletUtxo {
+        TrackableWalletUtxo::new(
+            make_txid(tag),
+            0,
+            Amount::from_divi(divi),
+            make_p2pk_script(tag),
+            "DExposedP2pk",
+            0,
+            false,
+            false,
+            true,
+        )
+    }
+
     #[test]
     fn test_01_exposure_classification_across_all_utxo_categories() {
         let p2pk = TrackableWalletUtxo::new(
@@ -1017,7 +1302,7 @@ mod tests {
 
     #[test]
     fn test_03_priority_ordering_sweeps_most_exposed_utxos_first() {
-        let mut cfg = PqSweepPlanConfig::new_pq_vault(
+        let mut cfg = active_pq_vault(
             [0xa1; 32],
             [0xb2; 32],
             SubThresholdVaultPolicy::RejectBelowMinimum,
@@ -1096,7 +1381,7 @@ mod tests {
 
     #[test]
     fn test_04_pq_vault_sweep_preserves_exact_fee_and_post_sweep_posture() {
-        let cfg = PqSweepPlanConfig::new_pq_vault(
+        let cfg = active_pq_vault(
             [0x11; 32],
             [0x22; 32],
             SubThresholdVaultPolicy::RejectBelowMinimum,
@@ -1144,7 +1429,7 @@ mod tests {
 
     #[test]
     fn test_05_sub_threshold_vault_sweep_rejected_under_reject_policy() {
-        let cfg = PqSweepPlanConfig::new_pq_vault(
+        let cfg = active_pq_vault(
             [0x11; 32],
             [0x22; 32],
             SubThresholdVaultPolicy::RejectBelowMinimum,
@@ -1176,7 +1461,7 @@ mod tests {
     #[test]
     fn test_06_sub_threshold_vault_sweep_routes_to_p2pqpkh_under_fallback_policy() {
         let fallback_hash = [0x99; 32];
-        let cfg = PqSweepPlanConfig::new_pq_vault(
+        let cfg = active_pq_vault(
             [0x11; 32],
             [0x22; 32],
             SubThresholdVaultPolicy::FallbackToPqSingleKey {
@@ -1209,7 +1494,7 @@ mod tests {
 
     #[test]
     fn test_07_large_balance_splits_into_multiple_vault_outputs_above_10k_divi() {
-        let mut cfg = PqSweepPlanConfig::new_pq_vault(
+        let mut cfg = active_pq_vault(
             [0x11; 32],
             [0x22; 32],
             SubThresholdVaultPolicy::RejectBelowMinimum,
@@ -1247,7 +1532,7 @@ mod tests {
 
     #[test]
     fn test_08_idempotency_skips_already_migrated_pq_native_utxos() {
-        let cfg = PqSweepPlanConfig::new_pq_vault(
+        let cfg = active_pq_vault(
             [0x11; 32],
             [0x22; 32],
             SubThresholdVaultPolicy::RejectBelowMinimum,
@@ -1300,7 +1585,7 @@ mod tests {
 
     #[test]
     fn test_09_immature_coinbase_or_coinstake_utxos_skipped() {
-        let cfg = PqSweepPlanConfig::new_pq_single_key([0x77; 32]);
+        let cfg = active_pq_single_key([0x77; 32]);
 
         let immature = TrackableWalletUtxo::new(
             make_txid(60),
@@ -1334,7 +1619,7 @@ mod tests {
     #[test]
     fn test_10_degenerate_vault_keys_rejected() {
         let same_hash32 = [0xaa; 32];
-        let bad_pq_cfg = PqSweepPlanConfig::new_pq_vault(
+        let bad_pq_cfg = active_pq_vault(
             same_hash32,
             same_hash32,
             SubThresholdVaultPolicy::RejectBelowMinimum,
@@ -1400,7 +1685,7 @@ mod tests {
 
     #[test]
     fn test_12_batching_respects_max_inputs_per_tx_and_max_tx_weight() {
-        let mut cfg = PqSweepPlanConfig::new_pq_single_key([0x88; 32]);
+        let mut cfg = active_pq_single_key([0x88; 32]);
         cfg.max_inputs_per_tx = 3;
 
         let utxos: Vec<TrackableWalletUtxo> = (0..10u8)
@@ -1430,7 +1715,7 @@ mod tests {
 
     #[test]
     fn test_13_dust_input_insufficient_for_fee_returns_error() {
-        let cfg = PqSweepPlanConfig::new_pq_single_key([0x99; 32]);
+        let cfg = active_pq_single_key([0x99; 32]);
         let dust_utxo = TrackableWalletUtxo::new(
             make_txid(110),
             0,
@@ -1452,7 +1737,7 @@ mod tests {
 
     #[test]
     fn test_14_exclude_unexposed_classical_leaves_fresh_p2pkh_untouched() {
-        let mut cfg = PqSweepPlanConfig::new_pq_single_key([0xaa; 32]);
+        let mut cfg = active_pq_single_key([0xaa; 32]);
         cfg.include_unexposed_classical = false;
 
         let exposed = TrackableWalletUtxo::new(
@@ -1488,21 +1773,21 @@ mod tests {
 
     #[test]
     fn test_15_invalid_config_parameters_rejected() {
-        let mut cfg = PqSweepPlanConfig::new_pq_single_key([0xbb; 32]);
+        let mut cfg = active_pq_single_key([0xbb; 32]);
         cfg.fee_per_kb_sat = 0;
         assert!(matches!(
             plan_voluntary_pq_sweep(&[], &cfg),
             Err(PqSweepError::InvalidConfiguration(_))
         ));
 
-        let mut cfg2 = PqSweepPlanConfig::new_pq_single_key([0xbb; 32]);
+        let mut cfg2 = active_pq_single_key([0xbb; 32]);
         cfg2.max_inputs_per_tx = 0;
         assert!(matches!(
             plan_voluntary_pq_sweep(&[], &cfg2),
             Err(PqSweepError::InvalidConfiguration(_))
         ));
 
-        let mut cfg3 = PqSweepPlanConfig::new_pq_single_key([0xbb; 32]);
+        let mut cfg3 = active_pq_single_key([0xbb; 32]);
         cfg3.min_vault_funding_sat = MIN_VAULT_SWEEP_OUTPUT_SAT - 1;
         assert!(matches!(
             plan_voluntary_pq_sweep(&[], &cfg3),
@@ -1529,6 +1814,132 @@ mod tests {
         assert_eq!(
             trackable.classify_exposure(),
             QuantumExposureReason::DirectPubKeyExposedPosStaker
+        );
+    }
+
+    #[test]
+    fn test_17_inactive_pq_primary_withholds_plan_but_estimate_matches_active_plan() {
+        let utxos = vec![exposed_p2pk(200, 15_000), exposed_p2pk(201, 4_000)];
+        let configs = [
+            PqSweepPlanConfig::new_pq_vault(
+                [0x11; 32],
+                [0x22; 32],
+                SubThresholdVaultPolicy::RejectBelowMinimum,
+            ),
+            PqSweepPlanConfig::new_pq_single_key([0x33; 32]),
+        ];
+        for cfg in configs {
+            assert_eq!(cfg.pq_output_activation, PqOutputActivation::Inactive);
+            assert_eq!(
+                plan_voluntary_pq_sweep(&utxos, &cfg),
+                Err(PqSweepError::PqOutputsNotActive)
+            );
+
+            let estimate = estimate_voluntary_pq_sweep(&utxos, &cfg).unwrap();
+            let active = cfg
+                .clone()
+                .with_pq_output_activation(PqOutputActivation::Active);
+            let plan = plan_voluntary_pq_sweep(&utxos, &active).unwrap();
+            assert!(estimate.requires_pq_outputs);
+            assert!(plan_requires_pq_outputs(&plan));
+            assert_eq!(estimate.swept_input_count, plan.swept_input_count);
+            assert_eq!(estimate.total_fee_sat, plan.total_fee_sat);
+            assert_eq!(
+                estimate.insulated_output_value_sat,
+                plan.insulated_output_value_sat
+            );
+            assert_eq!(estimate.post_sweep_posture, plan.post_sweep_posture);
+            assert_eq!(estimate.batches.len(), plan.batches.len());
+            for (e, b) in estimate.batches.iter().zip(&plan.batches) {
+                assert!(e.requires_pq_outputs);
+                assert_eq!(e.outputs.len(), b.unsigned_tx.vout.len());
+                assert!(e.outputs.iter().all(|(_, kind)| kind.is_post_quantum()));
+            }
+        }
+    }
+
+    #[test]
+    fn test_18_inactive_mixed_classical_vault_plan_with_p2pqpkh_fallback_is_withheld() {
+        let mut cfg = classical_vault_cfg(SubThresholdVaultPolicy::FallbackToPqSingleKey {
+            fallback_addr_key_hash32: [0x44; 32],
+        });
+        cfg.max_inputs_per_tx = 1;
+        // Batch 0 funds a classical vault; batch 1 falls below 10,000 DIVI and would fall back to P2PQPKH
+        let utxos = vec![exposed_p2pk(210, 15_000), exposed_p2pk(211, 2_000)];
+
+        assert_eq!(
+            plan_voluntary_pq_sweep(&utxos, &cfg),
+            Err(PqSweepError::PqOutputsNotActive)
+        );
+
+        let estimate = estimate_voluntary_pq_sweep(&utxos, &cfg).unwrap();
+        assert!(estimate.requires_pq_outputs);
+        assert_eq!(estimate.batches.len(), 2);
+        assert!(!estimate.batches[0].requires_pq_outputs);
+        assert_eq!(
+            estimate.batches[0].outputs[0].1,
+            PqSweepOutputKind::ClassicalStakingVault
+        );
+        assert!(estimate.batches[1].requires_pq_outputs);
+        assert_eq!(
+            estimate.batches[1].outputs[0].1,
+            PqSweepOutputKind::PqSingleKey
+        );
+
+        // The same mixed plan is produced once DIP-PQ-3 is active
+        let active = cfg.with_pq_output_activation(PqOutputActivation::Active);
+        let plan = plan_voluntary_pq_sweep(&utxos, &active).unwrap();
+        assert_eq!(plan.batches[1].p2pqpkh_output_count, 1);
+    }
+
+    #[test]
+    fn test_19_inactive_classical_vault_plan_above_threshold_stays_signable() {
+        let cfg = classical_vault_cfg(SubThresholdVaultPolicy::FallbackToPqSingleKey {
+            fallback_addr_key_hash32: [0x44; 32],
+        });
+        let utxos = vec![exposed_p2pk(220, 12_000), exposed_p2pk(221, 3_000)];
+
+        let plan = plan_voluntary_pq_sweep(&utxos, &cfg).unwrap();
+        assert!(!plan_requires_pq_outputs(&plan));
+        assert_eq!(plan.swept_input_count, 2);
+        for batch in &plan.batches {
+            assert_eq!(batch.p2pqpkh_output_count, 0);
+            assert!(batch
+                .unsigned_tx
+                .vout
+                .iter()
+                .all(|o| is_staking_vault_script(&o.script_pubkey)));
+        }
+        let estimate = estimate_voluntary_pq_sweep(&utxos, &cfg).unwrap();
+        assert!(!estimate.requires_pq_outputs);
+        assert_eq!(estimate.total_fee_sat, plan.total_fee_sat);
+    }
+
+    #[test]
+    fn test_20_inactive_resweep_never_selects_pq_native_inputs() {
+        let mut cfg = classical_vault_cfg(SubThresholdVaultPolicy::RejectBelowMinimum);
+        cfg.resweep_pq_native = true;
+        let pq_native = TrackableWalletUtxo::new(
+            make_txid(230),
+            0,
+            Amount::from_divi(20_000),
+            make_p2pqpkh_script(0x23),
+            "divi1p2pqpkh",
+            0,
+            false,
+            false,
+            true,
+        );
+        let utxos = vec![pq_native.clone(), exposed_p2pk(231, 12_000)];
+
+        let plan = plan_voluntary_pq_sweep(&utxos, &cfg).unwrap();
+        assert!(!plan_requires_pq_outputs(&plan));
+        assert_eq!(plan.swept_input_count, 1);
+        assert_eq!(plan.skipped_utxos, vec![pq_native.clone()]);
+
+        assert_eq!(
+            plan_voluntary_pq_sweep(&[pq_native], &cfg),
+            Err(PqSweepError::NoEligibleUtxosToSweep)
         );
     }
 }

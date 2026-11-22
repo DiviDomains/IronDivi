@@ -102,6 +102,15 @@ Every transaction and block MUST satisfy both limits (`validate_pq_block_weight`
 
 ---
 
+### 2.6 Review Notes on Count and Length Commitments (Open, Documentation Only)
+
+These notes record a review of the code above. They change no rule, encoding or code, and any change needs separate cross-client (C++ `divid` and Rust `irondivid`) agreement before `DIP-PQ-3` activation:
+
+1. **Lengths inside one input are committed.** `L_i` hashes `serialize_canonical`, which includes `CompactSize(item_count)` and every `CompactSize(|item|)`. `deserialize_canonical` checks the overall byte cap and the item count before allocating, then the per-item cap.
+2. **The number of input witnesses is not committed separately.** `witness_merkle_root` duplicates the last element of odd layers, the same construction as the transaction Merkle tree, so the root alone does not fix how many leaves there were. `PqTxWitness::inputs.len() == tx.vin.len()` appears only as a doc comment; `compute_witness_merkle_root` and `compute_wtxid` accept any slice. Activation must enforce `inputs.len() == vin.len()` before computing the root, or commit the count explicitly, identically in both clients.
+3. **Empty vs absent.** A vector of empty witnesses and no witness vector both yield `wtxid == txid`. This matches §2.4 #1, but both clients must serialize and relay the two cases the same way.
+4. **Signature lengths.** Each scheme has one fixed signature length (`validate_signature_encoding`). Every allowed signature item fits `MAX_PQ_WITNESS_ITEM_SIZE`, and `LMS` is restricted to the spork domain.
+
 ## 3. Versioned 256-Bit PQ Output & Vault Script Templates (`P3.2`)
 
 ### 3.1 `P2PQPKH` (`34` Bytes, Witness Version `1`)

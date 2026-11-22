@@ -78,6 +78,68 @@ const fn fixed(o: Opt) -> Opt {
     }
 }
 
+/// Options a signed-in web session may read but never change. Each one runs
+/// a command as the daemon user, changes who may call RPC, REST or Electrum
+/// (or where they listen), reads or writes a file at a path, sends wallet or
+/// block data to another address, or redirects the node's traffic. They stay
+/// editable in the config file and on the command line, where the operator
+/// is.
+pub const OPERATOR_ONLY: &[&str] = &[
+    // Commands run as the daemon user
+    "walletnotify",
+    "blocknotify",
+    "alertnotify",
+    // Who may call the daemon, and from where
+    "rpcbind",
+    "rpcallowip",
+    "rpcuser",
+    "rpcpassword",
+    "rpcauth",
+    "rpcwhitelist",
+    "rpcwhitelistdefault",
+    "rpcalloworigin",
+    "rpcallowhost",
+    "rest",
+    "webuibind",
+    "webuiallowremote",
+    "webuiallowhost",
+    "electrum",
+    "electrumtls",
+    "electrumws",
+    "electrumwss",
+    "electrumcert",
+    "electrumkey",
+    // Files the daemon reads or writes at a given path
+    "pid",
+    "loadblock",
+    "mnconf",
+    // Wallet and block data sent to another address
+    "zmqpubhashblock",
+    "zmqpubhashtx",
+    "zmqpubrawblock",
+    "zmqpubrawtx",
+    // The node's own traffic and its Tor credentials
+    "proxy",
+    "onion",
+    "torcontrol",
+    "torpassword",
+    "wallet",
+    "salvagewallet",
+    "resync",
+    "reindex",
+    "sysperms",
+    "sporkkey",
+    "whitebind",
+    "whitelist",
+    "bind",
+    "connect",
+    "fullnode",
+    "externalip",
+    "rpcport",
+    "webuiport",
+    "port",
+];
+
 const PORT: Kind = Kind::Int(1, 65535);
 const COUNT: Kind = Kind::Int(0, u32::MAX as i64);
 const BOOL: Kind = Kind::Bool;
@@ -273,6 +335,13 @@ pub const LIVE: &[(&str, &str)] = &[
     ("addnode", "addnode"),
 ];
 
+impl Opt {
+    /// Whether a web session may change it
+    pub fn web_writable(&self) -> bool {
+        self.writable && !OPERATOR_ONLY.contains(&self.key)
+    }
+}
+
 pub fn find(key: &str) -> Option<&'static Opt> {
     OPTIONS.iter().find(|o| o.key == key)
 }
@@ -339,7 +408,7 @@ pub fn to_json() -> Value {
                 "range": extra,
                 "multi": o.multi,
                 "secret": o.secret,
-                "writable": o.writable,
+                "writable": o.web_writable(),
                 "default": o.default,
                 "help": o.help,
                 "live": LIVE.iter().any(|(k, _)| *k == o.key),
@@ -360,6 +429,66 @@ mod tests {
             assert!(seen.insert(o.key), "{} twice", o.key);
             assert!(CATEGORIES.contains(&o.category), "{}", o.key);
         }
+    }
+
+    #[test]
+    fn operator_options_are_read_only_to_a_web_session() {
+        for key in OPERATOR_ONLY {
+            let o = find(key).unwrap_or_else(|| panic!("{key} is not an option"));
+            assert!(!o.web_writable(), "{key}");
+        }
+        // The hooks and credentials, whatever the list says
+        for key in [
+            "blocknotify",
+            "walletnotify",
+            "alertnotify",
+            "rpcpassword",
+            "rpcallowip",
+            "rpcbind",
+            "sysperms",
+            "wallet",
+            "whitelist",
+            "resync",
+            "rpcport",
+        ] {
+            assert!(!find(key).unwrap().web_writable(), "{key}");
+        }
+        for o in OPTIONS.iter().filter(|o| !OPERATOR_ONLY.contains(&o.key)) {
+            assert_eq!(o.web_writable(), o.writable, "{}", o.key);
+        }
+    }
+
+    #[test]
+    fn ordinary_settings_stay_writable() {
+        for key in [
+            "staking",
+            "stakesplitthreshold",
+            "addnode",
+            "loglevel",
+            "debug",
+            "maxconnections",
+            "dbcache",
+            "txindex",
+            "createwalletbackups",
+            "monthlybackups",
+            "mode",
+        ] {
+            assert!(find(key).unwrap().web_writable(), "{key}");
+        }
+    }
+
+    #[test]
+    fn the_schema_sent_to_the_page_marks_operator_options_read_only() {
+        let schema = to_json();
+        let options = schema["options"].as_array().unwrap();
+        let writable = |key: &str| {
+            options.iter().find(|o| o["key"] == key).unwrap()["writable"]
+                .as_bool()
+                .unwrap()
+        };
+        assert!(!writable("blocknotify"));
+        assert!(!writable("rpcpassword"));
+        assert!(writable("staking"));
     }
 
     #[test]

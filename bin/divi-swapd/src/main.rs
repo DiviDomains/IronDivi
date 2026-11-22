@@ -16,7 +16,7 @@
 
 //! divi-swapd — atomic swap maker daemon.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -255,6 +255,7 @@ async fn live_xmr_engine(
     xs: &XmrSection,
     store: Store,
     offers: Vec<divi_swap::api::Offer>,
+    hold: Option<&str>,
 ) -> Result<Arc<divi_swap_xmr::XmrMaker>> {
     use divi_swap_xmr::live::{self, LiveDivi, LiveMonero, LiveMoneroConfig};
     let network = live::parse_network(&xs.network)?;
@@ -328,8 +329,12 @@ async fn live_xmr_engine(
         divi_address = %address, network = %xs.network, monerod = %xs.monerod_url,
         "xmr engine ready (live)"
     );
-    let engine =
+    let mut engine =
         divi_swap_xmr::XmrMaker::new(profile, Arc::new(divi), Arc::new(xmr), store, offers)?;
+    if let Some(why) = hold {
+        tracing::warn!(reason = %why, "new xmr swaps are held; the engine runs for swaps already under way");
+        engine = engine.with_admission_hold(why);
+    }
     Ok(Arc::new(engine))
 }
 
@@ -415,9 +420,14 @@ const MIN_MAKER_USDC_UNITS: u64 = 10_000_000; // 10 USDC, 6 decimals
 
 /// The live `UsdcBackend` a `[usdc]` section describes, signing with `key`, with the second
 /// node of `fallback_rpc_url` when set. No network request is made here.
+///
+/// New fundings are gated: closed outright under `label_hold` (a mainnet label), otherwise
+/// allowed only while every endpoint reports the chain id of `network` at that moment. Claims
+/// and refunds are never gated, so a swap already funded stays recoverable.
 fn usdc_backend(
     cfg: &divi_swapd::UsdcSection,
     key: swap_chain_evm::PrivateKeySigner,
+    label_hold: Option<&str>,
 ) -> Result<swap_chain_evm::UsdcBackend> {
     let htlc = cfg
         .htlc
@@ -429,6 +439,10 @@ fn usdc_backend(
         .map_err(|e| anyhow::anyhow!("usdc token address: {e}"))?;
     let mut backend = swap_chain_evm::UsdcBackend::new(&cfg.rpc_url()?, key, htlc, token)?
         .with_min_lock_gas_wei(MIN_MAKER_ETH_WEI);
+    backend = match label_hold {
+        Some(why) => backend.with_funding_closed(why),
+        None => backend.with_funding_chain_id(cfg.network()?.chain_id()),
+    };
     // Opt-in (`[usdc].fallback_rpc_url`): the reads a claim or refund rests on are asked of
     // both nodes. Unset, the backend is built as before.
     if let Some(second) = cfg.fallback_rpc_url()? {
@@ -440,10 +454,16 @@ fn usdc_backend(
 /// Builds the live `UsdcBackend` and checks its balance against every enabled usdc offer
 /// in `offers`, returning the ids of any that are enabled but underfunded — the caller
 /// drops those from what it actually serves.
+///
+/// The third value is the admission hold on new usdc swaps, `None` only when the label is a
+/// testnet (`label_hold` unset) *and* the endpoint(s) report that network's chain id. A held
+/// backend can recover counter funds only when its configured chain authenticates.
+/// An unavailable or mismatched chain leaves the local DIVI backend available.
 async fn live_usdc(
     cfg: &divi_swapd::UsdcSection,
     offers: &[divi_swap::api::Offer],
-) -> Result<(Arc<dyn ChainBackend>, Vec<String>)> {
+    label_hold: Option<&str>,
+) -> Result<(Option<Arc<dyn ChainBackend>>, Vec<String>, Option<String>)> {
     let hex_key = divi_swap::secrets::SecretRef::parse(&cfg.key)
         .and_then(|r| r.resolve())
         .map_err(|e| anyhow::anyhow!("usdc key: {e}"))?;
@@ -454,7 +474,22 @@ async fn live_usdc(
     drop(hex_key);
     let token_str = cfg.token()?;
     let address = key.address();
-    let backend = usdc_backend(cfg, key)?;
+    let backend = usdc_backend(cfg, key, label_hold)?;
+    let expected = cfg.network()?.chain_id();
+    let endpoint_error = match backend.authenticated_chain_id().await {
+        Ok(id) if id == expected => None,
+        Ok(id) => Some(format!(
+            "USDC endpoint reports chain {id}, expected {expected}"
+        )),
+        Err(e) => Some(format!("cannot authenticate USDC endpoint: {e}")),
+    };
+    if let Some(reason) = endpoint_error {
+        tracing::warn!(%reason, "USDC backend unavailable; local DIVI recovery only");
+        return Ok((None, Vec::new(), Some(reason)));
+    }
+    if let Some(reason) = label_hold {
+        return Ok((Some(Arc::new(backend)), Vec::new(), Some(reason.into())));
+    }
     let (eth_wei, usdc_units) = backend
         .gas_and_token_balance()
         .await
@@ -480,7 +515,7 @@ async fn live_usdc(
             underfunded.push(o.id.clone());
         }
     }
-    Ok((Arc::new(backend), underfunded))
+    Ok((Some(Arc::new(backend)), underfunded, None))
 }
 
 async fn live_zec(
@@ -510,10 +545,20 @@ async fn live_zec(
     Ok(Arc::new(backend))
 }
 
+/// What `live_backends` built: the backends, the DIVI scan to run, the offers to serve, and
+/// the counter chains whose new swaps are held (with why).
+type LiveBackends = (
+    Backends,
+    Option<ScanJob>,
+    Vec<divi_swap::api::Offer>,
+    BTreeMap<Chain, String>,
+);
+
 async fn live_backends(
     cfg: &DaemonConfig,
     in_flight: &BTreeSet<Chain>,
-) -> Result<(Backends, Option<ScanJob>, Vec<divi_swap::api::Offer>)> {
+    label_holds: &BTreeMap<Chain, String>,
+) -> Result<LiveBackends> {
     let (Some(divi_cfg), Some(btc_cfg)) = (&cfg.divi, &cfg.btc) else {
         bail!("live backend needs both [divi] and [btc] sections");
     };
@@ -525,15 +570,44 @@ async fn live_backends(
         InputReservations::open(&cfg.db_path).context("opening input reservations")?;
     let mut others: Vec<Arc<dyn ChainBackend>> = Vec::new();
     let mut underfunded_offers: Vec<String> = Vec::new();
+    let mut holds = label_holds.clone();
+    if in_flight.contains(&Chain::Usdc) && cfg.usdc.is_none() {
+        let reason = "USDC configuration missing; local DIVI recovery only";
+        tracing::warn!("{reason}");
+        holds.insert(Chain::Usdc, reason.to_owned());
+    }
     for c in cfg.counter_backends_to_start(in_flight)? {
+        // A label-held chain with no swap under way has nothing to recover: no key is read
+        // and no backend starts. With swaps in flight it starts, closed to new fundings.
+        if c == Chain::Usdc && holds.contains_key(&Chain::Usdc) && !in_flight.contains(&c) {
+            tracing::warn!(reason = %holds[&Chain::Usdc], "new usdc swaps are held; [usdc] not started (no usdc swap in flight)");
+            continue;
+        }
         others.push(match c {
             Chain::Ltc => {
                 live_ltc(cfg.ltc.as_ref().expect("checked by config"), &reservations).await?
             }
             Chain::Usdc => {
-                let (backend, underfunded) =
-                    live_usdc(cfg.usdc.as_ref().expect("checked by config"), &cfg.offers).await?;
+                let startup = live_usdc(
+                    cfg.usdc.as_ref().expect("checked by config"),
+                    &cfg.offers,
+                    label_holds.get(&Chain::Usdc).map(String::as_str),
+                )
+                .await;
+                let (backend, underfunded, hold) = match startup {
+                    Ok(result) => result,
+                    Err(e) if in_flight.contains(&c) => {
+                        tracing::warn!(error = %e, "USDC startup failed; local DIVI recovery only");
+                        holds.insert(c, "USDC backend unavailable".into());
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                };
+                if let Some(why) = hold {
+                    holds.insert(Chain::Usdc, why);
+                }
                 underfunded_offers.extend(underfunded);
+                let Some(backend) = backend else { continue };
                 backend
             }
             Chain::Zec => {
@@ -547,7 +621,7 @@ async fn live_backends(
         (Chain::Usdc, cfg.usdc.is_some()),
         (Chain::Zec, cfg.zec.is_some()),
     ] {
-        if present && !others.iter().any(|b| b.chain() == c) {
+        if present && !others.iter().any(|b| b.chain() == c) && !holds.contains_key(&c) {
             tracing::info!(%c, "no enabled {c} offer and no {c} swap in flight; not starting the [{c}] backend");
         }
     }
@@ -558,11 +632,11 @@ async fn live_backends(
     let known: Vec<Chain> = std::iter::once(Chain::Btc)
         .chain(others.iter().map(|b| b.chain()))
         .collect();
-    if let Some(o) = cfg
-        .offers
-        .iter()
-        .find(|o| !o.counter_chain.is_adaptor() && !known.contains(&o.counter_chain))
-    {
+    if let Some(o) = cfg.offers.iter().find(|o| {
+        !o.counter_chain.is_adaptor()
+            && !known.contains(&o.counter_chain)
+            && !holds.contains_key(&o.counter_chain)
+    }) {
         bail!(
             "offer {}: no live {} backend in this build yet (add a [{}] section, or use --backend mock)",
             o.id,
@@ -581,10 +655,10 @@ async fn live_backends(
     let offers = cfg
         .offers
         .iter()
-        .filter(|o| !underfunded_offers.contains(&o.id))
+        .filter(|o| !underfunded_offers.contains(&o.id) && !holds.contains_key(&o.counter_chain))
         .cloned()
         .collect();
-    Ok((backends, job, offers))
+    Ok((backends, job, offers, holds))
 }
 
 /// The live DIVI backend of `[divi]` for `key`, reserving the inputs of its locks in
@@ -937,9 +1011,14 @@ async fn main() -> Result<()> {
         .filter(|s| !s.state.is_terminal())
         .map(|s| s.quote.counter_chain)
         .collect();
-    let (backends, scan_job, offers) = match kind {
-        BackendKind::Mock => (mock_backends(), None, mock_offers(&cfg)),
-        BackendKind::Live => live_backends(&cfg, &in_flight).await?,
+    // By network label only; `live_backends` adds the usdc endpoint's chain-id check.
+    let label_holds = match kind {
+        BackendKind::Mock => BTreeMap::new(),
+        BackendKind::Live => cfg.advisory_holds(),
+    };
+    let (backends, scan_job, offers, holds) = match kind {
+        BackendKind::Mock => (mock_backends(), None, mock_offers(&cfg), BTreeMap::new()),
+        BackendKind::Live => live_backends(&cfg, &in_flight, &label_holds).await?,
     };
     let Backends { divi, btc, others } = backends;
     let scan = if scan_job.is_some() {
@@ -958,9 +1037,19 @@ async fn main() -> Result<()> {
             .transpose()?,
         BackendKind::Live => {
             let open = divi_swap_xmr::XmrMaker::open_swaps(&store)?;
-            if cfg.xmr_engine_needed(open)? {
+            let xmr_hold = label_holds.get(&Chain::Xmr).map(String::as_str);
+            if let (Some(why), 0) = (xmr_hold, open) {
+                tracing::warn!(reason = %why, "new xmr swaps are held; [xmr] engine not started (no xmr swap in flight)");
+                None
+            } else if cfg.xmr_engine_needed(open)? {
                 let xs = cfg.xmr.as_ref().expect("checked by xmr_engine_needed");
-                Some(live_xmr_engine(&cfg, xs, store.clone(), xmr_offers).await?)
+                // Held: no offers, but the engine starts for the swaps under way.
+                let offers = if xmr_hold.is_some() {
+                    Vec::new()
+                } else {
+                    xmr_offers
+                };
+                Some(live_xmr_engine(&cfg, xs, store.clone(), offers, xmr_hold).await?)
             } else {
                 if cfg.xmr.is_some() {
                     tracing::info!("no enabled xmr offer and no xmr swap in flight; not starting the [xmr] engine");
@@ -990,6 +1079,11 @@ async fn main() -> Result<()> {
                 move || s.is_done()
             }));
     maker = with_claim_fees(maker, &args)?;
+    for (chain, why) in holds {
+        if chain != Chain::Xmr {
+            maker = maker.with_admission_hold(chain, why);
+        }
+    }
     if let Some(x) = &xmr {
         maker = maker.with_engine(x.clone())?;
     }
@@ -1131,7 +1225,11 @@ mod tests {
             eprintln!("skipping: forge/anvil not found on PATH");
             return;
         }
-        let anvil = alloy::node_bindings::Anvil::new().spawn();
+        // The `sepolia` label is authenticated against the endpoint's chain id, so anvil
+        // must claim to be Sepolia.
+        let anvil = alloy::node_bindings::Anvil::new()
+            .chain_id(11_155_111)
+            .spawn();
         let endpoint = anvil.endpoint();
 
         let deployer = swap_chain_evm::PrivateKeySigner::from(&anvil.keys()[0]);
@@ -1190,7 +1288,9 @@ mod tests {
             offer("usdc-divi-sepolia", Direction::TakerPaysDivi),
         ];
 
-        let (_backend, underfunded) = live_usdc(&cfg, &offers).await.expect("live_usdc");
+        let (_backend, underfunded, hold) =
+            live_usdc(&cfg, &offers, None).await.expect("live_usdc");
+        assert_eq!(hold, None);
         unsafe {
             std::env::remove_var("CREDENTIALS_DIRECTORY");
         }
@@ -1253,7 +1353,7 @@ mod tests {
     async fn usdc_fallback_rpc_url_makes_the_backend_ask_the_second_node() {
         let (primary, second) = (evm_node(2_000).await, evm_node(1_000).await);
         let cfg = usdc_section(&primary.uri(), Some(&second.uri()));
-        let backend = usdc_backend(&cfg, swap_chain_evm::PrivateKeySigner::random()).unwrap();
+        let backend = usdc_backend(&cfg, swap_chain_evm::PrivateKeySigner::random(), None).unwrap();
         assert_eq!(backend.median_time_past().await.unwrap(), 1_000);
         assert_eq!(requests(&primary).await, 1);
         assert_eq!(requests(&second).await, 1);
@@ -1267,7 +1367,8 @@ mod tests {
             let (primary, second) = (evm_node(2_000).await, evm_node(1_000).await);
             let mut cfg = usdc_section(&primary.uri(), None);
             cfg.fallback_rpc_url = fallback.map(Into::into);
-            let backend = usdc_backend(&cfg, swap_chain_evm::PrivateKeySigner::random()).unwrap();
+            let backend =
+                usdc_backend(&cfg, swap_chain_evm::PrivateKeySigner::random(), None).unwrap();
             assert_eq!(backend.median_time_past().await.unwrap(), 2_000);
             assert_eq!(requests(&primary).await, 1);
             assert_eq!(
@@ -1561,6 +1662,7 @@ mod tests {
             last_error: None,
             maker_lock_dropped: false,
             maker_lock_sent: false,
+            usdc_admission: None,
             claim_fees: Default::default(),
         }
     }
@@ -1769,6 +1871,8 @@ mod tests {
             maker_leg_amount: None,
             maker_leg_claim: None,
             taker_leg_refund: None,
+            taker_leg_sent: false,
+            usdc_admission: None,
             claim_declined: None,
             claim_base_feerate: None,
             claim_feerate: None,

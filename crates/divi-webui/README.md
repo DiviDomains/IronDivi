@@ -27,13 +27,31 @@ All can also go in `divi.conf`.
   POST, strict CSP with no inline script/style, `X-Frame-Options: DENY`,
   `no-store` on the API, 1 MB body cap.
 - **Wallet rules** (`src/gate.rs`):
-  - keys never leave: `dumpprivkey`, `dumpwallet`, `dumphdinfo` are refused;
+  - keys never leave: `dumpprivkey`, `dumpwallet`, `dumphdinfo` and their
+    equivalents (`bip38encrypt`, `bip38paperwallet`, `setupmasternode`) are
+    refused;
+  - a web session is not the node operator: `/api/rpc` and the Console allow
+    only an explicit list of read calls and wallet calls. Anything else
+    (`stop`, `backupwallet` to a path, `loadwallet`, mining, `invalidateblock`,
+    `setban`, `spork`, `setlogconfig`, and any method not yet listed) is refused;
+    use `irondivi-cli`, which is unaffected. The Wallet page's own backup
+    button still writes to `<datadir>/backups/`;
   - an **unencrypted** wallet may only read and `encryptwallet` — nothing that
     spends, stakes or changes settings until it is encrypted;
   - unlocking is for **staking only** (`walletpassphrase p 0 true`), or for
     spending for at most 600 s.
 - **Settings** save only once the wallet is encrypted; secret values
   (`rpcpassword`, …) show as "set" and are never sent to the browser.
+  Options that run commands (`blocknotify`, `walletnotify`, `alertnotify`),
+  set RPC, REST, Electrum or web-interface credentials and listeners
+  (`rpcuser`, `rpcpassword`, `rpcauth`, `rpcbind`, `rpcallowip`, `webuibind`, …),
+  name a file path (`pid`, `loadblock`, `mnconf`, `electrumcert`, `electrumkey`),
+  send data to another address (`zmqpub*`) or redirect the node's traffic
+  (`proxy`, `onion`, `torcontrol`) show as "read-only here" and answer 403.
+  Wallet-file selection and salvage, resync/reindex, system file permissions,
+  listener ports, peer binds and peer whitelists are operator settings too.
+  Edit them in the config file or on the command line (`OPERATOR_ONLY` in
+  `src/schema.rs`).
 
 ## Pages
 

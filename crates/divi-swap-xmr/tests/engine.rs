@@ -1572,3 +1572,144 @@ async fn a_reorged_tx_lock_is_resent_by_the_locked_pass() {
     w.divi.mine(1);
     assert!(w.maker_divi.confirmations(&lock).await.unwrap().unwrap() >= 1);
 }
+
+/// Rebuild the engines over the same database with the admission hold on the maker, the
+/// taker, or both: a restart under a hold.
+fn restart_held(w: &mut W, maker: bool, taker: bool) {
+    let (m, t) = W::engines(
+        &w.maker_divi,
+        &w.taker_divi,
+        &w.maker_xmr,
+        &w.taker_xmr,
+        &w.store,
+        &w.clock,
+    );
+    w.maker = if maker {
+        m.with_admission_hold("advisory")
+    } else {
+        m
+    };
+    w.taker = if taker {
+        t.with_admission_hold("advisory")
+    } else {
+        t
+    };
+}
+
+/// A held maker refuses new rounds and aborts a swap that never broadcast `Tx_lock`
+/// (coins released), but a swap whose `Tx_lock` is out still runs to its end.
+#[tokio::test]
+async fn a_held_maker_aborts_unfunded_swaps_and_finishes_a_locked_one() {
+    let mut w = W::new();
+    let (mid, _, _) = w.key(&mut |_| {}).await.unwrap();
+    let q = w.maker.quote("divi-xmr-stagenet", XMR_UNITS).await.unwrap();
+    let (_, req) = w.taker.prepare(&q).await.unwrap();
+    assert_eq!(w.maker_divi.reserved_count(), 1);
+    restart_held(&mut w, true, false);
+    assert!(w.maker.quote("divi-xmr-stagenet", XMR_UNITS).await.is_err());
+    assert!(w.maker.setup(req).await.is_err());
+    w.maker.tick().await.unwrap();
+    assert_eq!(w.maker_state(&mid), XmrMakerState::Aborted);
+    assert_eq!(w.maker_divi.reserved_count(), 0);
+
+    let mut w = W::new();
+    let (mid, tid) = w.open().await;
+    restart_held(&mut w, true, false);
+    for _ in 0..30 {
+        w.round(&mid, &tid, true, true).await;
+        if w.maker_state(&mid) == XmrMakerState::Done
+            && w.taker_rec(&tid).state == XmrTakerState::Done
+        {
+            break;
+        }
+    }
+    assert_eq!(w.maker_state(&mid), XmrMakerState::Done);
+    assert_eq!(w.taker_rec(&tid).outcome.as_deref(), Some("redeemed"));
+}
+
+/// Ambiguous send under a hold: `Tx_lock` is persisted as `Locked` and the node does not
+/// show it (the broadcast may or may not have happened). The held maker neither aborts nor
+/// releases it: it sends the same signed bytes again.
+#[tokio::test]
+async fn a_held_maker_keeps_and_rebroadcasts_an_unseen_tx_lock() {
+    let w = W::new();
+    let (mid, _tid) = w.open().await;
+    let r = w.maker.record(&mid).unwrap().unwrap();
+    let divi = Arc::new(Forgetful {
+        inner: w.maker_divi.clone(),
+        unseen: r.tx_lock.txid(),
+        watched: r.tx_lock.vin[0].prevout,
+        scans: AtomicU64::new(0),
+    });
+    let c = w.clock.clone();
+    let maker = XmrMaker::new(
+        cfg(),
+        divi,
+        Arc::new(w.maker_xmr.clone()),
+        w.store.clone(),
+        vec![offer()],
+    )
+    .unwrap()
+    .with_clock(Arc::new(move || c.load(Ordering::SeqCst)))
+    .with_admission_hold("advisory");
+    for _ in 0..3 {
+        assert_eq!(maker.step(&mid).await.unwrap(), XmrMakerState::Locked);
+    }
+    let after = maker.record(&mid).unwrap().unwrap();
+    assert_eq!(after.tx_lock, r.tx_lock, "never re-signed");
+    assert_eq!(w.maker_divi.reserved_count(), 1, "coins stay reserved");
+}
+
+/// A held taker refuses a new swap and, with a confirmed `Tx_lock` and no XMR out yet,
+/// never locks XMR; the swap is cancelled in due course.
+#[tokio::test]
+async fn a_held_taker_refuses_new_swaps_and_never_locks_xmr() {
+    let mut w = W::new();
+    let q = w.maker.quote("divi-xmr-stagenet", XMR_UNITS).await.unwrap();
+    let (mid, tid) = w.open().await;
+    restart_held(&mut w, false, true);
+    assert!(w.taker.prepare(&q).await.is_err());
+    for _ in 0..8 {
+        w.round(&mid, &tid, true, true).await;
+    }
+    assert_eq!(w.taker_rec(&tid).state, XmrTakerState::Accepted);
+    assert_eq!(w.taker_xmr.balance(), TAKER_XMR, "no XMR went out");
+    w.divi.advance_time(cfg().cancel_after_secs);
+    for _ in 0..15 {
+        w.round(&mid, &tid, true, true).await;
+    }
+    assert_eq!(w.maker_state(&mid), XmrMakerState::Done);
+    let t = w.taker_rec(&tid);
+    assert_eq!(
+        (t.state, t.outcome.as_deref()),
+        (XmrTakerState::Done, Some("cancelled")),
+        "{:?}",
+        t.last_error
+    );
+    assert_eq!(w.taker_xmr.balance(), TAKER_XMR);
+}
+
+/// Restart under a hold with the XMR already locked: both engines still redeem and sweep.
+#[tokio::test]
+async fn a_held_restart_with_xmr_out_still_completes() {
+    let mut w = W::new();
+    let (mid, tid) = w.open().await;
+    for _ in 0..30 {
+        w.round(&mid, &tid, true, true).await;
+        if w.taker_rec(&tid).state == XmrTakerState::XmrLocked {
+            break;
+        }
+    }
+    assert_eq!(w.taker_rec(&tid).state, XmrTakerState::XmrLocked);
+    restart_held(&mut w, true, true);
+    for _ in 0..30 {
+        w.round(&mid, &tid, true, true).await;
+        if w.maker_state(&mid) == XmrMakerState::Done
+            && w.taker_rec(&tid).state == XmrTakerState::Done
+        {
+            break;
+        }
+    }
+    assert_eq!(w.maker_state(&mid), XmrMakerState::Done);
+    assert_eq!(w.taker_rec(&tid).outcome.as_deref(), Some("redeemed"));
+}

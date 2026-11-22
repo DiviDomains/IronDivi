@@ -262,6 +262,55 @@ impl SpendInfo {
     }
 }
 
+/// A block a spend scan read, by height and by the hash the backend reported for it. The
+/// hash is opaque: it is only ever compared with what the same backend reports at the same
+/// height, to tell whether the chain the scan read is still the best chain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScanMark {
+    /// Height of the block.
+    pub height: u64,
+    /// Its hash, lowercase hex, in the byte order the backend reports it.
+    pub hash: String,
+}
+
+/// What one pass of [`ChainBackend::scan_spend`](crate::ChainBackend::scan_spend) learned.
+///
+/// Unlike `find_spend`'s `None`, an answer without a spend says how far it reaches: a
+/// backend that reads at most a bounded window per call cannot prove from one call that no
+/// spend exists through the tip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpendScan {
+    /// A transaction spending the outpoint.
+    Spent(SpendInfo),
+    /// No spend in any block from the start of the pass through `through`.
+    ///
+    /// `through` is the last block read, `None` if the backend did not scan blocks (it
+    /// answered from an index, or read nothing): then there is nothing to resume from.
+    /// `complete` is `true` only if the answer covers the chain up to the tip the backend
+    /// read (an index answer, or a block scan that reached that tip); `false` is "not seen
+    /// yet", never "unspent".
+    NotYet {
+        /// The last block read, with its hash.
+        through: Option<ScanMark>,
+        /// Whether the pass reached the tip.
+        complete: bool,
+    },
+    /// The block at the `resume` mark is no longer on the backend's best chain (or the tip
+    /// is now below it): the chain reorganised under the scan. Nothing after the mark was
+    /// read; scan again from the lock without a mark.
+    Reorged,
+}
+
+impl SpendScan {
+    /// The spend, if this pass found one (`find_spend`'s answer).
+    pub fn into_spend(self) -> Option<SpendInfo> {
+        match self {
+            SpendScan::Spent(s) => Some(s),
+            SpendScan::NotYet { .. } | SpendScan::Reorged => None,
+        }
+    }
+}
+
 /// Data pushes of a script, ignoring non-push opcodes. Stops at a malformed push.
 pub fn script_pushes(script: &[u8]) -> Vec<Vec<u8>> {
     let mut out = Vec::new();

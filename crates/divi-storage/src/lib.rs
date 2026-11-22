@@ -75,6 +75,8 @@ pub mod txindex;
 pub mod undo;
 pub mod utxo;
 pub mod utxo_cache;
+#[cfg(test)]
+mod utxo_race_tests;
 
 pub use address_index::{AddressHistoryEntry, AddressIndex, AddressUtxo, TxIndexEntry};
 pub use block_index::{BlockIndex, BlockStatus};
@@ -123,4 +125,4 @@ pub use stake_modifier::{
 };
 pub use txindex::{bare_txid, TxIndex, TxLocation};
 pub use utxo::Utxo;
-pub use utxo_cache::{CacheStats, UtxoCache, DEFAULT_UTXO_CACHE_SIZE};
+pub use utxo_cache::{CacheStats, FillTicket, UtxoCache, DEFAULT_UTXO_CACHE_SIZE};

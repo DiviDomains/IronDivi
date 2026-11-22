@@ -20,6 +20,13 @@ zeroize = { workspace = true }
 [build-dependencies]
 cc = "1"
 
+[features]
+# Leaf-consuming LMS signing with an in-memory counter only. It does not persist,
+# lock or reserve leaves, so re-deriving or restoring a key reuses one-time leaves.
+# For tests and vector generation only; no shipped binary may enable it
+# (tools/release-check.sh), see docs/plans/dip-pq-2-hybrid-sporks.md §5.1.
+lms-volatile-test-signer = []
+
 [dev-dependencies]
 proptest = { workspace = true }
 criterion = { workspace = true }

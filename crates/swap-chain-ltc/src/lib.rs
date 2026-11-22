@@ -47,7 +47,7 @@ use crosscheck::{
 };
 use divi_swap::{
     Amount, Chain, ChainBackend, ClaimSizes, FeeBump, Funding, HtlcParams, InputReservations,
-    LockedOutput, Outpoint, SignedTx, SpendInfo, SwapError, Txid,
+    LockedOutput, Outpoint, ScanMark, SignedTx, SpendInfo, SpendScan, SwapError, Txid,
 };
 use serde_json::Value;
 
@@ -105,7 +105,8 @@ impl Default for FeePolicy {
     }
 }
 
-/// Blocks scanned per `find_spend` call when falling back to block scanning.
+/// Blocks scanned per `scan_spend` pass when falling back to block scanning. A pass that
+/// stops short of the tip says so, and the engine resumes from its mark (H2).
 const MAX_SCAN_BLOCKS: u64 = 200;
 
 /// Litecoin's target block spacing in seconds, the same on mainnet and testnet: Litecoin
@@ -467,26 +468,42 @@ impl LtcBackend {
         }
     }
 
-    /// The primary's `find_spend`: outspend then the spender, or a block scan where the
-    /// endpoint has no outspend.
+    /// The primary's `scan_spend`: outspend then the spender (an index answer, through the
+    /// tip), or a bounded block scan where the endpoint has no outspend.
     async fn find_spend_primary(
         &self,
         outpoint: &Outpoint,
         from_height: u64,
-    ) -> Result<Option<SpendInfo>> {
+        resume: Option<&ScanMark>,
+    ) -> Result<SpendScan> {
+        // The index answers for the whole chain: nothing to resume from.
+        const INDEXED: SpendScan = SpendScan::NotYet {
+            through: None,
+            complete: true,
+        };
+        const UNKNOWN: SpendScan = SpendScan::NotYet { through: None, complete: false };
         let prev = outpoint.txid.to_rpc_hex();
         let path = format!("/tx/{prev}/outspend/{}", outpoint.vout);
         let outspend = match self.esplora.get_opt(&path).await {
             Ok(Some(b)) => parse_json(&b)?,
-            Ok(None) => return Ok(None),
+            Ok(None) => return Ok(UNKNOWN),
             // Endpoint without outspend support: fall back to scanning blocks.
             Err(ClientError::Http(f)) if f.status == 400 || f.status == 501 => {
-                return self.scan_blocks(outpoint, from_height).await;
+                return self.scan_blocks(outpoint, from_height, resume).await;
             }
             Err(e) => return Err(e.into()),
         };
-        if outspend["spent"].as_bool() != Some(true) {
-            return Ok(None);
+        match outspend["spent"].as_bool() {
+            Some(false)
+                if ["txid", "vin", "status"]
+                    .iter()
+                    .any(|key| !outspend[*key].is_null()) =>
+            {
+                return Ok(UNKNOWN)
+            }
+            Some(false) => return Ok(INDEXED),
+            Some(true) => {},
+            None => return Ok(UNKNOWN),
         }
         let spender = outspend["txid"]
             .as_str()
@@ -495,10 +512,16 @@ impl LtcBackend {
         // indexed the spending tx itself; treat that race as "not found yet" (the caller
         // polls find_spend again), not a permanent error.
         let Some(t) = self.get_json_opt(&format!("/tx/{spender}")).await? else {
-            return Ok(None);
+            return Ok(SpendScan::NotYet {
+                through: None,
+                complete: false,
+            });
         };
         let height = outspend["status"]["block_height"].as_u64();
-        spend_from_tx(&t, &prev, outpoint.vout, height)
+        Ok(match spend_from_tx(&t, &prev, outpoint.vout, height)? {
+            Some(s) => SpendScan::Spent(s),
+            None => UNKNOWN,
+        })
     }
 
     /// `coins` without those reserved by a broadcast transaction that has not confirmed.
@@ -775,38 +798,62 @@ impl LtcBackend {
         }
     }
 
-    /// Scan blocks `from_height..=tip` for a transaction spending `outpoint`.
+    /// Scan at most [`MAX_SCAN_BLOCKS`] blocks from `from_height` for a transaction spending
+    /// `outpoint`. With `resume`, the block at its height must still have its hash
+    /// ([`SpendScan::Reorged`] otherwise). The mark is the last block read in full.
     async fn scan_blocks(
         &self,
         outpoint: &Outpoint,
         from_height: u64,
-    ) -> Result<Option<SpendInfo>> {
+        resume: Option<&ScanMark>,
+    ) -> Result<SpendScan> {
         let tip = self.tip_height().await?;
+        if resume.is_some_and(|m| m.height > tip) {
+            return Ok(SpendScan::Reorged);
+        }
+        if from_height > tip {
+            return Ok(SpendScan::NotYet {
+                through: None,
+                complete: true,
+            });
+        }
         let want_txid = outpoint.txid.to_rpc_hex();
         let last = tip.min(from_height.saturating_add(MAX_SCAN_BLOCKS - 1));
+        let mut through: Option<ScanMark> = None;
         for height in from_height..=last {
-            let hash = self
-                .esplora
-                .get(&format!("/block-height/{height}"))
-                .await?
-                .trim()
-                .to_string();
-            let mut start = 0u32;
-            loop {
-                let txs = self.get_json(&format!("/block/{hash}/txs/{start}")).await?;
-                let txs = txs.as_array().cloned().unwrap_or_default();
-                if txs.is_empty() {
-                    break;
-                }
-                for t in &txs {
+            let raw = self.esplora.get(&format!("/block-height/{height}")).await?;
+            let hash = divi_swap::backend::normalize_block_hash(&raw)?;
+            if resume.is_some_and(|m| m.height == height && m.hash != hash) {
+                return Ok(SpendScan::Reorged);
+            }
+            let meta = self.get_json(&format!("/block/{hash}")).await?;
+            let mark = ScanMark { height, hash };
+            let count = divi_swap::esplora_scan::transaction_count(&meta, &mark, through.as_ref())?;
+            let mut seen = std::collections::HashSet::new();
+            for start in (0..count).step_by(25) {
+                let page = self
+                    .get_json(&format!("/block/{}/txs/{start}", mark.hash))
+                    .await?;
+                for t in
+                    divi_swap::esplora_scan::checked_page(&page, &mark, start, count, &mut seen)?
+                {
                     if let Some(info) = spend_from_tx(t, &want_txid, outpoint.vout, Some(height))? {
-                        return Ok(Some(info));
+                        return Ok(SpendScan::Spent(info));
                     }
                 }
-                start += txs.len() as u32;
+            }
+            through = Some(mark);
+        }
+        if let Some(mark) = &through {
+            let raw = self.esplora.get(&format!("/block-height/{last}")).await?;
+            if divi_swap::backend::normalize_block_hash(&raw)? != mark.hash {
+                return Err(SwapError::Transient(
+                    "last scanned block changed during read".into(),
+                ));
             }
         }
-        Ok(None)
+        let complete = last == tip;
+        Ok(SpendScan::NotYet { through, complete })
     }
 }
 
@@ -1237,10 +1284,53 @@ impl ChainBackend for LtcBackend {
     }
 
     async fn find_spend(&self, outpoint: &Outpoint, from_height: u64) -> Result<Option<SpendInfo>> {
-        let mine = self.find_spend_primary(outpoint, from_height).await?;
-        match &self.claim_check {
-            Some(cc) => self.agree_spend_with_source(cc, outpoint, mine).await,
-            None => Ok(mine),
+        Ok(self
+            .scan_spend(outpoint, from_height, None)
+            .await?
+            .into_spend())
+    }
+
+    /// The primary's pass, cross-checked ([`Self::agree_spend_with_source`]) as
+    /// `find_spend` always was, except a block-scan pass that stopped short of the tip (a
+    /// mark, not `complete`): the source (an index) would name a spend past the window as a
+    /// disagreement and hold every pass, so the cursor could never reach that spend. Such a
+    /// pass is "not seen yet", never "unspent"; the pass that reaches the tip is checked.
+    async fn scan_spend(
+        &self,
+        outpoint: &Outpoint,
+        from_height: u64,
+        resume: Option<&ScanMark>,
+    ) -> Result<SpendScan> {
+        let mine = self
+            .find_spend_primary(outpoint, from_height, resume)
+            .await?;
+        let Some(cc) = &self.claim_check else {
+            return Ok(mine);
+        };
+        match mine {
+            SpendScan::Reorged => Ok(SpendScan::Reorged),
+            SpendScan::NotYet {
+                through: Some(m),
+                complete: false,
+            } => Ok(SpendScan::NotYet {
+                through: Some(m),
+                complete: false,
+            }),
+            SpendScan::NotYet { through, complete } => Ok(
+                match self.agree_spend_with_source(cc, outpoint, None).await? {
+                    Some(s) => SpendScan::Spent(s),
+                    None => SpendScan::NotYet { through, complete },
+                },
+            ),
+            SpendScan::Spent(s) => Ok(
+                match self.agree_spend_with_source(cc, outpoint, Some(s)).await? {
+                    Some(s) => SpendScan::Spent(s),
+                    None => SpendScan::NotYet {
+                        through: None,
+                        complete: false,
+                    },
+                },
+            ),
         }
     }
 }

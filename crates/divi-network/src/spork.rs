@@ -27,7 +27,7 @@ use divi_crypto::pq::{
     PqDomainTag, PqError, PqSchemeId,
 };
 use divi_primitives::hash::Hash256;
-use divi_storage::{ChainDatabase, SharedSporks};
+use divi_storage::{ChainDatabase, SharedSporks, StorageError};
 use parking_lot::{Mutex, RwLock};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
@@ -86,11 +86,17 @@ pub enum SporkAuthKind {
     /// Authenticated by a 65-byte classical `secp256k1` compact signature (`CSporkMessage` v1).
     ClassicalV1,
     /// Authenticated by both a 65-byte classical `secp256k1` compact signature and a 2,512-byte
-    /// `LMS-SHA256-M32-H10` post-quantum signature using one-time leaf index `lms_leaf_q` (`CSporkMessage` v2).
+    /// `LMS-SHA256-M32-H10` post-quantum signature, verified against the policy's
+    /// `pq_spork_pubkey`, using one-time leaf index `lms_leaf_q` (`CSporkMessage` v2).
     HybridV2 { lms_leaf_q: u32 },
+    /// A `CSporkMessage` v2 accepted under [`SporkAuthPolicy::ClassicalOnly`]: the classical
+    /// signature verified, but the `LMS` signature was only checked for canonical framing because
+    /// no post-quantum key is configured. `lms_leaf_q` is unauthenticated and the message is not
+    /// post-quantum authenticated.
+    HybridV2LmsUnverified { lms_leaf_q: u32 },
 }
 
-/// Alias for [`SporkAuthKind`] representing the verified signature status of a Spork message.
+/// Alias for [`SporkAuthKind`] representing the signature status of a Spork message.
 pub type SporkSigStatus = SporkAuthKind;
 
 /// Errors returned when signing or verifying a Spork message under `DIP-PQ-2`.
@@ -112,6 +118,11 @@ pub enum SporkVerifyError {
 
     #[error("invalid post-quantum LMS spork signature: {0}")]
     InvalidPostQuantumSignature(#[from] PqError),
+
+    #[error(
+        "LMS spork signing is unavailable: this build has no durable, exclusive LMS leaf reservation (DIP-PQ-2 §5.1)"
+    )]
+    LmsSigningUnavailable,
 }
 
 /// Compute the 32-byte `DIP-PQ-2` §3.1 `payload_hash_256` for an integer-valued Spork:
@@ -184,7 +195,46 @@ pub fn spork_pq_signing_prehash(
 
 /// Sign a hybrid `CSporkMessage` v2 (`65 B` `secp256k1` + `2,512 B` `LMS-SHA256-M32-H10` = `2,577 B`)
 /// using the classical Spork secret key and stateful `LMS-SHA256-M32-H10` private key (`DIP-PQ-2` §2–§3).
+///
+/// Returns [`SporkVerifyError::LmsSigningUnavailable`] before signing anything unless the
+/// test-only `lms-volatile-test-signer` feature is enabled: no durable, exclusive leaf
+/// reservation exists, so a restarted or restored signer would reuse one-time leaves (§5.1).
 pub fn sign_hybrid_spork_lms(
+    secret_key: &divi_crypto::SecretKey,
+    lms_sk: &mut LmsPrivateKey,
+    network_magic: [u8; 4],
+    spork_id: i32,
+    value: impl Into<String>,
+    time_signed: i64,
+) -> Result<SporkMessage, SporkVerifyError> {
+    #[cfg(feature = "lms-volatile-test-signer")]
+    {
+        sign_hybrid_spork_lms_volatile(
+            secret_key,
+            lms_sk,
+            network_magic,
+            spork_id,
+            value,
+            time_signed,
+        )
+    }
+    #[cfg(not(feature = "lms-volatile-test-signer"))]
+    {
+        let _ = (
+            secret_key,
+            lms_sk,
+            network_magic,
+            spork_id,
+            value,
+            time_signed,
+        );
+        Err(SporkVerifyError::LmsSigningUnavailable)
+    }
+}
+
+/// [`sign_hybrid_spork_lms`] with the in-memory leaf counter of a test-only signer.
+#[cfg(any(test, feature = "lms-volatile-test-signer"))]
+fn sign_hybrid_spork_lms_volatile(
     secret_key: &divi_crypto::SecretKey,
     lms_sk: &mut LmsPrivateKey,
     network_magic: [u8; 4],
@@ -202,7 +252,7 @@ pub fn sign_hybrid_spork_lms(
         time_signed,
         signature: classical_sig,
     };
-    spork.attach_lms_signature(lms_sk, network_magic)?;
+    spork.attach_lms_signature_volatile(lms_sk, network_magic)?;
     Ok(spork)
 }
 
@@ -241,18 +291,231 @@ const ASK_AGAIN_AFTER: Duration = Duration::from_secs(120);
 /// Points Divi Core adds for a spork with a bad signature (spork.cpp)
 pub const BAD_SPORK_SCORE: u32 = 100;
 
-/// The spork key of a Divi network, by its magic (None for other chains)
-pub fn spork_key(magic: &crate::constants::Magic) -> Option<Vec<u8>> {
-    use crate::constants::{MAINNET_MAGIC, REGTEST_MAGIC, TESTNET_MAGIC};
-    let key = if magic == &MAINNET_MAGIC {
-        MAINNET_SPORK_KEY
-    } else if magic == &TESTNET_MAGIC || magic == &REGTEST_MAGIC {
-        TESTNET_SPORK_KEY
-    } else {
-        return None;
-    };
-    hex::decode(key).ok()
+/// The PrivateDivi Core revision whose `strSporkKey` is pinned here
+/// (`divi/src/chainparams.cpp:444`; regtest inherits it, `:458`). It predates the
+/// PrivateDivi mainnet relaunch, so it pins testnet and regtest only.
+pub const PRIVATEDIVI_REFERENCE_REVISION: &str = "408ad01e929543c7d11586b06fe8d26de8460539";
+
+/// PrivateDivi Core testnet/regtest `strSporkKey` at
+/// [`PRIVATEDIVI_REFERENCE_REVISION`]: the same key as Divi testnet
+const PRIVATEDIVI_TESTNET_SPORK_KEY: &str =
+    "034ffa41e5cffdd009f3b34a3e1482ec82b514bb218b7648948b5858cc5c035adb";
+
+/// Who signs the sporks of a network
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SporkAuthority {
+    /// Divi Core's `strSporkKey`. Stored sporks load without a second check, as
+    /// Divi Core's `LoadSporksFromDB` loads them.
+    Divi(Vec<u8>),
+    /// PrivateDivi Core's `strSporkKey`, pinned at
+    /// [`PRIVATEDIVI_REFERENCE_REVISION`]. Rows stored by earlier IronDivi
+    /// releases were never checked, so each stored spork must verify again
+    /// before it loads.
+    PrivateDivi(Vec<u8>),
+    /// No key is known. Sporks are not accepted, stored, relayed or loaded, and
+    /// the peers that relay them are not scored.
+    Unmapped,
 }
+
+impl SporkAuthority {
+    /// The compressed `secp256k1` key that signs sporks, if any
+    pub fn key(&self) -> Option<&[u8]> {
+        match self {
+            SporkAuthority::Divi(key) | SporkAuthority::PrivateDivi(key) => Some(key),
+            SporkAuthority::Unmapped => None,
+        }
+    }
+
+    fn from_key(key: Option<Vec<u8>>) -> Self {
+        key.map_or(SporkAuthority::Unmapped, SporkAuthority::Divi)
+    }
+}
+
+/// The spork authority of a network, by its magic. The PrivateDivi mainnet is
+/// `Unmapped`: its key after the relaunch has not been confirmed.
+pub fn spork_authority(magic: &crate::constants::Magic) -> SporkAuthority {
+    use crate::constants::{
+        MAINNET_MAGIC, PRIVATEDIVI_REGTEST_MAGIC, PRIVATEDIVI_TESTNET_MAGIC, REGTEST_MAGIC,
+        TESTNET_MAGIC,
+    };
+    let decode = |key: &str| hex::decode(key).ok();
+    let authority = if magic == &MAINNET_MAGIC {
+        decode(MAINNET_SPORK_KEY).map(SporkAuthority::Divi)
+    } else if magic == &TESTNET_MAGIC || magic == &REGTEST_MAGIC {
+        decode(TESTNET_SPORK_KEY).map(SporkAuthority::Divi)
+    } else if magic == &PRIVATEDIVI_TESTNET_MAGIC || magic == &PRIVATEDIVI_REGTEST_MAGIC {
+        decode(PRIVATEDIVI_TESTNET_SPORK_KEY).map(SporkAuthority::PrivateDivi)
+    } else {
+        None
+    };
+    authority.unwrap_or(SporkAuthority::Unmapped)
+}
+
+/// The spork key of a network, by its magic (None where no authority is mapped)
+pub fn spork_key(magic: &crate::constants::Magic) -> Option<Vec<u8>> {
+    spork_authority(magic).key().map(<[u8]>::to_vec)
+}
+
+/// The environment variable an operator sets to the fingerprint of a
+/// [`SporkStoreHold`] to start the node anyway (see `docs/spork-authority.md`)
+pub const SPORK_HOLD_ACK_ENV: &str = "IRONDIVI_SPORK_HOLD_ACK";
+
+/// Why a stored spork was not loaded
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QuarantineReason {
+    /// The network has no mapped spork authority
+    NoAuthority,
+    /// The spork does not verify against the network's authority
+    InvalidSignature(SporkVerifyError),
+    /// The row does not decode to a spork, or does not re-encode to the same
+    /// bytes, so what it held cannot be checked
+    Undecodable(String),
+    /// The row `spork_<id>` holds a spork of another id
+    IdMismatch { decoded_id: i32 },
+}
+
+impl std::fmt::Display for QuarantineReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            QuarantineReason::NoAuthority => write!(f, "no spork authority is mapped"),
+            QuarantineReason::InvalidSignature(err) => write!(f, "{err}"),
+            QuarantineReason::Undecodable(err) => write!(f, "row does not decode: {err}"),
+            QuarantineReason::IdMismatch { decoded_id } => {
+                write!(f, "row holds a spork of id {decoded_id}")
+            }
+        }
+    }
+}
+
+/// The fields of a stored row that decodes
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredSpork {
+    pub spork_id: i32,
+    pub value: String,
+    pub time_signed: i64,
+    pub signature_len: usize,
+}
+
+/// A stored spork that was not loaded. Its database row is left as it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuarantinedSpork {
+    /// The id of the row, `spork_<id>`
+    pub spork_id: i32,
+    /// What the row decodes to (None: it does not decode)
+    pub decoded: Option<StoredSpork>,
+    pub reason: QuarantineReason,
+    /// The row as stored, byte for byte
+    pub raw: Vec<u8>,
+}
+
+/// A stored spork row that could not be read at start: its content is unknown
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnreadableSpork {
+    pub spork_id: i32,
+    pub error: String,
+}
+
+/// Raised at startup when stored sporks cannot be authenticated on a network
+/// with no spork authority. Starting with defaults would change the active
+/// values, and loading the rows would accept values nobody can verify. The
+/// node stops instead, until an operator acknowledges [`Self::fingerprint`] or
+/// rolls back (see `docs/spork-authority.md`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SporkStoreHold {
+    pub quarantined: Vec<QuarantinedSpork>,
+    /// SHA-256 of the held rows (id, then raw bytes, in id order), hex
+    pub fingerprint: String,
+}
+
+impl SporkStoreHold {
+    fn new(quarantined: Vec<QuarantinedSpork>) -> Self {
+        let mut hasher = Sha256::new();
+        for spork in &quarantined {
+            hasher.update(spork.spork_id.to_le_bytes());
+            hasher.update((spork.raw.len() as u64).to_le_bytes());
+            hasher.update(&spork.raw);
+        }
+        let fingerprint = hex::encode(hasher.finalize());
+        SporkStoreHold {
+            quarantined,
+            fingerprint,
+        }
+    }
+}
+
+impl std::fmt::Display for SporkStoreHold {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(
+            f,
+            "spork store hold: {} stored spork(s) cannot be authenticated because this network has no mapped spork authority",
+            self.quarantined.len()
+        )?;
+        for spork in &self.quarantined {
+            match &spork.decoded {
+                Some(d) => writeln!(
+                    f,
+                    "  spork_{} id={} value={:?} time_signed={} signature={} bytes ({})",
+                    spork.spork_id,
+                    d.spork_id,
+                    d.value,
+                    d.time_signed,
+                    d.signature_len,
+                    spork.reason
+                )?,
+                None => writeln!(
+                    f,
+                    "  spork_{} {} bytes ({})",
+                    spork.spork_id,
+                    spork.raw.len(),
+                    spork.reason
+                )?,
+            }
+        }
+        writeln!(f, "  fingerprint: {}", self.fingerprint)?;
+        write!(
+            f,
+            "  The rows were not loaded and are unchanged. To start with default spork values, set {}={}; to keep the previous behaviour, roll back the binary. See docs/spork-authority.md.",
+            SPORK_HOLD_ACK_ENV, self.fingerprint
+        )
+    }
+}
+
+impl std::error::Error for SporkStoreHold {}
+
+/// Why [`SporkManager::try_with_chain`] refused to start
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SporkStartError {
+    /// Stored rows could not be read on a network whose stored sporks must be
+    /// checked. Their content is unknown, so no acknowledgement releases this.
+    Unreadable(Vec<UnreadableSpork>),
+    /// Stored rows are held; [`SPORK_HOLD_ACK_ENV`] can release them
+    Held(SporkStoreHold),
+}
+
+impl std::fmt::Display for SporkStartError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SporkStartError::Held(hold) => std::fmt::Display::fmt(hold, f),
+            SporkStartError::Unreadable(rows) => {
+                writeln!(
+                    f,
+                    "spork store unreadable: {} stored spork row(s) could not be read, so they cannot be checked",
+                    rows.len()
+                )?;
+                for row in rows {
+                    writeln!(f, "  spork_{}: {}", row.spork_id, row.error)?;
+                }
+                write!(
+                    f,
+                    "  Their content is unknown; {} does not release this. Repair or restore the chain database, or roll back the binary. See docs/spork-authority.md.",
+                    SPORK_HOLD_ACK_ENV
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for SporkStartError {}
 
 /// The ids Divi Core loads at start: those from `SPORK_START` to `SPORK_END`
 /// (spork.h) that have a name (spork.cpp:196-197, `GetSporkNameByID`). It stores
@@ -277,6 +540,24 @@ const SPORK_IDS: [i32; 11] = {
 /// Where a spork id is kept in the chain database's metadata
 fn db_key(spork_id: i32) -> Vec<u8> {
     format!("spork_{spork_id}").into_bytes()
+}
+
+/// PrivateDivi Core `CSporkMessage::CheckSignature` at
+/// [`PRIVATEDIVI_REFERENCE_REVISION`]: a 65-byte compact signature only, as
+/// PrivateDivi has no `HybridSporkV2` fork. The manager's [`SporkAuthPolicy`]
+/// does not apply.
+fn verify_privatedivi(spork: &SporkMessage, key: &[u8]) -> Result<SporkAuthKind, SporkVerifyError> {
+    if spork.signature.len() != CLASSICAL_SPORK_SIG_LEN {
+        return Err(SporkVerifyError::InvalidSignatureLength(
+            spork.signature.len(),
+        ));
+    }
+    spork.verify_with_policy(key, &SporkAuthPolicy::ClassicalOnly)
+}
+
+/// Where a quarantined row of a spork id is copied before it is replaced
+fn quarantine_db_key(spork_id: i32) -> Vec<u8> {
+    format!("spork_quarantine_{spork_id}").into_bytes()
 }
 
 /// Divi Core `IsMultiValueSpork`: sporks 13 to 16 keep a list of values
@@ -330,7 +611,28 @@ impl SporkMessage {
     /// Attach a 2,512-byte `LMS-SHA256-M32-H10` signature to a `SporkMessage` that already carries
     /// a 65-byte classical `secp256k1` signature, upgrading `self.signature` in-place to the
     /// 2,577-byte `DIP-PQ-2` hybrid `v2` layout (`sig_secp256k1[65] || sig_lms_m32_h10[2512]`).
+    ///
+    /// Without the test-only `lms-volatile-test-signer` feature this returns
+    /// [`SporkVerifyError::LmsSigningUnavailable`] and leaves `self` and `lms_sk` unchanged
+    /// (see [`sign_hybrid_spork_lms`]).
     pub fn attach_lms_signature(
+        &mut self,
+        lms_sk: &mut LmsPrivateKey,
+        network_magic: [u8; 4],
+    ) -> Result<[u8; PQ_LMS_SPORK_SIG_LEN], SporkVerifyError> {
+        #[cfg(feature = "lms-volatile-test-signer")]
+        {
+            self.attach_lms_signature_volatile(lms_sk, network_magic)
+        }
+        #[cfg(not(feature = "lms-volatile-test-signer"))]
+        {
+            let _ = (lms_sk, network_magic);
+            Err(SporkVerifyError::LmsSigningUnavailable)
+        }
+    }
+
+    #[cfg(any(test, feature = "lms-volatile-test-signer"))]
+    fn attach_lms_signature_volatile(
         &mut self,
         lms_sk: &mut LmsPrivateKey,
         network_magic: [u8; 4],
@@ -375,12 +677,18 @@ impl SporkMessage {
             .map_err(|_| SporkVerifyError::InvalidSignatureLength(sig_len))?;
 
         let message = format!("{}{}{}", self.spork_id, self.value, self.time_signed);
-        let classical_ok = (31..=34).contains(&sig_secp256k1[0])
-            && divi_masternode::cpp_wire::verify_message(
-                classical_key,
-                sig_secp256k1,
-                message.as_bytes(),
-            );
+        // C++ CSporkMessage::CheckSignature -> CObfuScationSigner::VerifyMessage
+        // (spork.cpp:522-533, obfuscation.cpp:59-74) accepts any 65-byte header
+        // (RecoverCompact masks the byte) and compares CKeyIDs. The compression
+        // flag is enforced inside `verify_message` via Hash160, so a spork
+        // re-headed from 31+r to 39+r stays valid for both clients and an honest
+        // relaying peer is no longer scored (S11). Do NOT re-add a header-range
+        // pre-guard here: it would reject re-headed sporks that C++ accepts.
+        let classical_ok = divi_masternode::cpp_wire::verify_message(
+            classical_key,
+            sig_secp256k1,
+            message.as_bytes(),
+        );
         if !classical_ok {
             return Err(SporkVerifyError::InvalidClassicalSignature);
         }
@@ -410,7 +718,7 @@ impl SporkMessage {
                 PqSchemeId::LmsSha256M32H10.validate_signature_encoding(lms_sig)?;
                 let lms_leaf_q =
                     u32::from_be_bytes([lms_sig[0], lms_sig[1], lms_sig[2], lms_sig[3]]);
-                Ok(SporkAuthKind::HybridV2 { lms_leaf_q })
+                Ok(SporkAuthKind::HybridV2LmsUnverified { lms_leaf_q })
             }
             SporkAuthPolicy::HybridOptional {
                 pq_spork_pubkey,
@@ -450,13 +758,20 @@ pub struct SporkManager {
     /// Peer manager for sending messages
     peer_manager: Arc<PeerManager>,
 
-    /// Key that signs sporks on this network (None: not checked)
-    spork_key: Option<Vec<u8>>,
+    /// Who signs sporks on this network
+    authority: SporkAuthority,
+
+    /// Stored sporks that were not loaded at start; their rows are kept
+    quarantined: Vec<QuarantinedSpork>,
+
+    /// Stored rows that could not be read at start (networks whose stored
+    /// sporks must be checked only)
+    unreadable: Vec<UnreadableSpork>,
 
     /// Active `DIP-PQ-2` signature authentication and cutoff policy
     auth_policy: RwLock<SporkAuthPolicy>,
 
-    /// Highest verified `LMS` leaf index $q$ across all accepted `HybridV2` Sporks (`DIP-PQ-2` §5.2)
+    /// Highest `LMS` leaf index $q$ across accepted Sporks whose `LMS` signature verified (`DIP-PQ-2` §5.2)
     last_lms_leaf_q: RwLock<Option<u32>>,
 
     /// Last verified `LMS` leaf index $q$ per `spork_id` (`DIP-PQ-2` §5.2)
@@ -499,36 +814,69 @@ pub struct SporkManager {
 impl SporkManager {
     /// Create a new spork manager that keeps sporks in memory only
     pub fn new(peer_manager: Arc<PeerManager>) -> Arc<Self> {
-        let key = spork_key(&peer_manager.magic());
-        Self::with_key(peer_manager, key, None)
+        let authority = spork_authority(&peer_manager.magic());
+        Self::with_authority(peer_manager, authority, None, Default::default())
     }
 
     /// Create a spork manager that keeps sporks in `db` and loads the ones a
     /// previous run stored (Divi Core `LoadSporksFromDB`)
     pub fn with_db(peer_manager: Arc<PeerManager>, db: Arc<ChainDatabase>) -> Arc<Self> {
-        let key = spork_key(&peer_manager.magic());
-        Self::with_key(peer_manager, key, Some(db))
+        let authority = spork_authority(&peer_manager.magic());
+        Self::with_authority(peer_manager, authority, Some(db), Default::default())
     }
 
     /// [`SporkManager::with_db`], keeping the entries of sporks 13 to 16 in
-    /// `consensus` (the chain's), loaded ones included
+    /// `consensus` (the chain's), loaded ones included. Unreadable rows and a
+    /// [`SporkStoreHold`] are logged, not enforced;
+    /// [`SporkManager::try_with_chain`] enforces them.
     pub fn with_chain(
         peer_manager: Arc<PeerManager>,
         db: Arc<ChainDatabase>,
         consensus: SharedSporks,
     ) -> Arc<Self> {
-        let key = spork_key(&peer_manager.magic());
-        Self::build(
-            peer_manager,
-            key,
-            SporkAuthPolicy::ClassicalOnly,
-            Some(db),
-            consensus,
-        )
+        let authority = spork_authority(&peer_manager.magic());
+        Self::with_authority(peer_manager, authority, Some(db), consensus)
     }
 
-    /// Create a spork manager that checks sporks against `spork_key` (None:
-    /// not checked), optionally kept in `db`
+    /// [`SporkManager::with_chain`], refusing to start while stored rows
+    /// could not be read (no acknowledgement releases that) or while stored
+    /// sporks are held ([`SporkManager::store_hold`]) unless `hold_ack` is the
+    /// hold's fingerprint. Nothing held is loaded either way, and no row is
+    /// changed.
+    pub fn try_with_chain(
+        peer_manager: Arc<PeerManager>,
+        db: Arc<ChainDatabase>,
+        consensus: SharedSporks,
+        hold_ack: Option<&str>,
+    ) -> Result<Arc<Self>, SporkStartError> {
+        let manager = Self::with_chain(peer_manager, db, consensus);
+        manager.check_start(hold_ack)?;
+        Ok(manager)
+    }
+
+    /// The startup check of [`SporkManager::try_with_chain`]
+    fn check_start(&self, hold_ack: Option<&str>) -> Result<(), SporkStartError> {
+        if !self.unreadable.is_empty() {
+            return Err(SporkStartError::Unreadable(self.unreadable.clone()));
+        }
+        match self.store_hold() {
+            Some(hold) if hold_ack != Some(hold.fingerprint.as_str()) => {
+                Err(SporkStartError::Held(hold))
+            }
+            Some(hold) => {
+                tracing::warn!(
+                    "Spork store hold {} acknowledged by the operator: starting with default spork values; the held rows stay in the database",
+                    hold.fingerprint
+                );
+                Ok(())
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// Create a spork manager that checks sporks against `spork_key` as Divi
+    /// Core does (None: no authority, so sporks are refused), optionally kept
+    /// in `db`
     pub fn with_key(
         peer_manager: Arc<PeerManager>,
         spork_key: Option<Vec<u8>>,
@@ -536,10 +884,26 @@ impl SporkManager {
     ) -> Arc<Self> {
         Self::build(
             peer_manager,
-            spork_key,
+            SporkAuthority::from_key(spork_key),
             SporkAuthPolicy::ClassicalOnly,
             db,
             Default::default(),
+        )
+    }
+
+    /// Create a spork manager for an explicit [`SporkAuthority`]
+    pub fn with_authority(
+        peer_manager: Arc<PeerManager>,
+        authority: SporkAuthority,
+        db: Option<Arc<ChainDatabase>>,
+        consensus: SharedSporks,
+    ) -> Arc<Self> {
+        Self::build(
+            peer_manager,
+            authority,
+            SporkAuthPolicy::ClassicalOnly,
+            db,
+            consensus,
         )
     }
 
@@ -550,7 +914,13 @@ impl SporkManager {
         auth_policy: SporkAuthPolicy,
         db: Option<Arc<ChainDatabase>>,
     ) -> Arc<Self> {
-        Self::build(peer_manager, spork_key, auth_policy, db, Default::default())
+        Self::build(
+            peer_manager,
+            SporkAuthority::from_key(spork_key),
+            auth_policy,
+            db,
+            Default::default(),
+        )
     }
 
     /// [`SporkManager::with_key`] keeping sporks 13 to 16 in `consensus`
@@ -562,7 +932,7 @@ impl SporkManager {
     ) -> Arc<Self> {
         Self::build(
             peer_manager,
-            spork_key,
+            SporkAuthority::from_key(spork_key),
             SporkAuthPolicy::ClassicalOnly,
             db,
             consensus,
@@ -571,14 +941,16 @@ impl SporkManager {
 
     fn build(
         peer_manager: Arc<PeerManager>,
-        spork_key: Option<Vec<u8>>,
+        authority: SporkAuthority,
         auth_policy: SporkAuthPolicy,
         db: Option<Arc<ChainDatabase>>,
         consensus: SharedSporks,
     ) -> Arc<Self> {
         let (progress_tx, _) = broadcast::channel(16);
-        let manager = SporkManager {
-            spork_key,
+        let mut manager = SporkManager {
+            authority,
+            quarantined: Vec::new(),
+            unreadable: Vec::new(),
             auth_policy: RwLock::new(auth_policy),
             last_lms_leaf_q: RwLock::new(None),
             spork_lms_leaf_q: RwLock::new(HashMap::new()),
@@ -593,8 +965,44 @@ impl SporkManager {
             asked: Mutex::new(HashMap::new()),
             progress_tx,
         };
-        manager.load_stored();
+        let rows: Vec<_> = match &manager.db {
+            Some(db) => SPORK_IDS
+                .iter()
+                .map(|&id| (id, db.get_metadata(&db_key(id))))
+                .collect(),
+            None => Vec::new(),
+        };
+        manager.load_rows(rows);
+        if !manager.unreadable.is_empty() {
+            tracing::error!(
+                "{}",
+                SporkStartError::Unreadable(manager.unreadable.clone())
+            );
+        }
+        if let Some(hold) = manager.store_hold() {
+            tracing::error!("{}", hold);
+        }
         Arc::new(manager)
+    }
+
+    /// Who signs sporks on this network
+    pub fn authority(&self) -> &SporkAuthority {
+        &self.authority
+    }
+
+    /// The stored sporks that were not loaded at start
+    pub fn quarantined(&self) -> &[QuarantinedSpork] {
+        &self.quarantined
+    }
+
+    /// The startup hold: stored sporks on a network with no spork authority.
+    /// On a network with an authority, stored sporks that fail to verify are
+    /// quarantined without a hold, as verified ones replace them from peers.
+    pub fn store_hold(&self) -> Option<SporkStoreHold> {
+        if self.authority != SporkAuthority::Unmapped || self.quarantined.is_empty() {
+            return None;
+        }
+        Some(SporkStoreHold::new(self.quarantined.clone()))
     }
 
     /// Update the active `DIP-PQ-2` [`SporkAuthPolicy`].
@@ -615,6 +1023,22 @@ impl SporkManager {
     /// Return the last verified `LMS` leaf index $q$ for a specific `spork_id`.
     pub fn spork_lms_leaf_index(&self, spork_id: i32) -> Option<u32> {
         self.spork_lms_leaf_q.read().get(&spork_id).copied()
+    }
+
+    /// The `LMS` leaf of a stored spork, if its `LMS` signature verifies under the active
+    /// policy. Stored Divi rows load without a second check, so framing alone is not enough to
+    /// track a leaf.
+    fn verified_lms_leaf(&self, spork: &SporkMessage) -> Option<u32> {
+        let SporkAuthority::Divi(key) = &self.authority else {
+            return None;
+        };
+        if !spork.is_hybrid_v2() {
+            return None;
+        }
+        match spork.verify_with_policy(key, &self.auth_policy.read()) {
+            Ok(SporkAuthKind::HybridV2 { lms_leaf_q }) => Some(lms_leaf_q),
+            _ => None,
+        }
     }
 
     fn record_lms_leaf(&self, spork_id: i32, hash: Hash256, lms_leaf_q: u32) {
@@ -646,31 +1070,178 @@ impl SporkManager {
         *last_q = Some(last_q.map_or(lms_leaf_q, |prev| prev.max(lms_leaf_q)));
     }
 
-    /// Divi Core `LoadSporksFromDB`: one stored spork per known id
-    fn load_stored(&self) {
-        let Some(db) = &self.db else {
-            return;
-        };
-        for id in SPORK_IDS {
-            let stored = match db.get_metadata(&db_key(id)) {
-                Ok(Some(bytes)) => SporkMessage::deserialize(&bytes),
+    /// Divi Core `LoadSporksFromDB`: one stored spork per known id, from the
+    /// result of reading `spork_<id>`. On a Divi network a row loads as Divi
+    /// Core loads it, and a row that cannot be read or decoded is skipped.
+    /// Elsewhere [`SporkManager::stored_refusal`] decides: a refused row is
+    /// quarantined instead of loaded and left as it is, and a row that cannot
+    /// be read is recorded as unreadable, never as absent.
+    fn load_rows(&mut self, rows: Vec<(i32, Result<Option<Vec<u8>>, StorageError>)>) {
+        let checked = !matches!(self.authority, SporkAuthority::Divi(_));
+        for (id, read) in rows {
+            let bytes = match read {
+                Ok(Some(bytes)) => bytes,
                 Ok(None) => continue,
+                Err(e) if checked => {
+                    tracing::error!("Could not read spork {} from the database: {}", id, e);
+                    self.unreadable.push(UnreadableSpork {
+                        spork_id: id,
+                        error: e.to_string(),
+                    });
+                    continue;
+                }
                 Err(e) => {
                     tracing::warn!("Could not read spork {} from the database: {}", id, e);
                     continue;
                 }
             };
-            match stored {
-                Ok(spork) => {
-                    tracing::debug!("Loaded spork {} with value {}", id, spork.value);
-                    let hash = spork.hash();
-                    if let Some(lms_leaf_q) = spork.lms_leaf_index() {
-                        self.record_lms_leaf(spork.spork_id, hash, lms_leaf_q);
-                    }
-                    self.sporks.write().insert(hash, spork.clone());
-                    self.add_active(spork);
+            let decoded = SporkMessage::deserialize(&bytes);
+            if !checked {
+                match decoded {
+                    Ok(spork) => self.load_one(spork),
+                    Err(e) => tracing::warn!("Stored spork {} does not decode: {}", id, e),
                 }
-                Err(e) => tracing::warn!("Stored spork {} does not decode: {}", id, e),
+                continue;
+            }
+            let spork = match decoded {
+                Ok(spork) => spork,
+                Err(e) => {
+                    self.quarantine(
+                        id,
+                        None,
+                        QuarantineReason::Undecodable(e.to_string()),
+                        bytes,
+                    );
+                    continue;
+                }
+            };
+            match self.stored_refusal(id, &bytes, &spork) {
+                None => self.load_one(spork),
+                Some(reason) => self.quarantine(id, Some(spork), reason, bytes),
+            }
+        }
+    }
+
+    fn quarantine(
+        &mut self,
+        id: i32,
+        spork: Option<SporkMessage>,
+        reason: QuarantineReason,
+        raw: Vec<u8>,
+    ) {
+        let decoded = spork.map(|spork| StoredSpork {
+            spork_id: spork.spork_id,
+            signature_len: spork.signature.len(),
+            value: spork.value,
+            time_signed: spork.time_signed,
+        });
+        tracing::error!(
+            "Stored spork {} ({:?}) not loaded: {}; its database row is kept",
+            id,
+            decoded,
+            reason
+        );
+        self.quarantined.push(QuarantinedSpork {
+            spork_id: id,
+            decoded,
+            reason,
+            raw,
+        });
+    }
+
+    fn load_one(&self, spork: SporkMessage) {
+        tracing::debug!("Loaded spork {} with value {}", spork.spork_id, spork.value);
+        let hash = spork.hash();
+        if let Some(lms_leaf_q) = self.verified_lms_leaf(&spork) {
+            self.record_lms_leaf(spork.spork_id, hash, lms_leaf_q);
+        }
+        self.sporks.write().insert(hash, spork.clone());
+        self.add_active(spork);
+    }
+
+    /// Why a stored spork in row `spork_<id>` may not load, if it may not.
+    /// Divi rows load as Divi Core loads them; PrivateDivi rows must be
+    /// canonical, of their row's id, and verify again; with no authority
+    /// nothing loads.
+    fn stored_refusal(
+        &self,
+        id: i32,
+        raw: &[u8],
+        spork: &SporkMessage,
+    ) -> Option<QuarantineReason> {
+        let key = match &self.authority {
+            SporkAuthority::Divi(_) => return None,
+            SporkAuthority::PrivateDivi(key) => Some(key),
+            SporkAuthority::Unmapped => None,
+        };
+        if spork.serialize() != raw {
+            return Some(QuarantineReason::Undecodable(
+                "trailing or non-canonical bytes".into(),
+            ));
+        }
+        if spork.spork_id != id {
+            return Some(QuarantineReason::IdMismatch {
+                decoded_id: spork.spork_id,
+            });
+        }
+        let Some(key) = key else {
+            return Some(QuarantineReason::NoAuthority);
+        };
+        verify_privatedivi(spork, key)
+            .err()
+            .map(QuarantineReason::InvalidSignature)
+    }
+
+    /// Copy a quarantined row of `spork_id` to its quarantine key before a
+    /// verified spork replaces it, so no operator data is lost. False when the
+    /// copy could not be made, in which case the row must not be replaced.
+    fn preserve_quarantined(&self, db: &ChainDatabase, spork_id: i32) -> bool {
+        if self.unreadable.iter().any(|u| u.spork_id == spork_id) {
+            tracing::error!(
+                "Spork {} row could not be read at start; the row is not replaced",
+                spork_id
+            );
+            return false;
+        }
+        let Some(held) = self.quarantined.iter().find(|q| q.spork_id == spork_id) else {
+            return true;
+        };
+        let key = quarantine_db_key(spork_id);
+        match db.get_metadata(&key) {
+            Ok(Some(kept)) if kept == held.raw => true,
+            Ok(Some(_)) => {
+                tracing::error!(
+                    "{} already holds other bytes than the quarantined spork {} row; neither is replaced",
+                    String::from_utf8_lossy(&key),
+                    spork_id
+                );
+                false
+            }
+            Ok(None) => match db.put_metadata(&key, &held.raw) {
+                Ok(()) => {
+                    tracing::warn!(
+                        "Quarantined spork {} row copied to {} before a verified spork replaces it",
+                        spork_id,
+                        String::from_utf8_lossy(&key)
+                    );
+                    true
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "Could not keep quarantined spork {} row: {}; the row is not replaced",
+                        spork_id,
+                        e
+                    );
+                    false
+                }
+            },
+            Err(e) => {
+                tracing::error!(
+                    "Could not read quarantine key of spork {}: {}; the row is not replaced",
+                    spork_id,
+                    e
+                );
+                false
             }
         }
     }
@@ -762,10 +1333,15 @@ impl SporkManager {
         }
 
         tracing::debug!("Requesting sporks from peer {}", peer_id);
-        let _ = self
+        if let Err(e) = self
             .peer_manager
             .send_to_peer(peer_id, NetworkMessage::GetSporks)
-            .await;
+            .await
+        {
+            tracing::debug!("Could not request sporks from peer {}: {}", peer_id, e);
+            self.remove_peer(peer_id);
+            return;
+        }
         if count == 0 {
             self.peer_manager.sporks_arrived(peer_id);
         }
@@ -798,30 +1374,42 @@ impl SporkManager {
             self.emit_progress();
             return;
         }
-        if let Some(key) = &self.spork_key {
-            let policy = self.auth_policy.read().clone();
-            match spork.verify_with_policy(key, &policy) {
-                Ok(SporkAuthKind::ClassicalV1) => {}
-                Ok(SporkAuthKind::HybridV2 { lms_leaf_q }) => {
-                    self.record_lms_leaf(spork.spork_id, hash, lms_leaf_q);
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        "Spork {} from peer {}: invalid signature ({})",
-                        hash,
-                        peer_id,
-                        err
-                    );
-                    self.peer_manager.report_misbehavior_score(
-                        peer_id,
-                        BAD_SPORK_SCORE,
-                        "Invalid spork signature",
-                    );
-                    return;
-                }
+        // No authority: the spork cannot be checked, so it is not taken. An
+        // honest peer relays sporks its own key accepted, so it is not scored;
+        // it is counted so that its spork sync still completes.
+        let Some(key) = self.authority.key() else {
+            tracing::debug!(
+                "Spork {} from peer {} ignored: no spork authority on this network",
+                hash,
+                peer_id
+            );
+            self.count_received(peer_id);
+            self.emit_progress();
+            return;
+        };
+        let verified = match &self.authority {
+            SporkAuthority::PrivateDivi(_) => verify_privatedivi(&spork, key),
+            _ => spork.verify_with_policy(key, &self.auth_policy.read().clone()),
+        };
+        match verified {
+            Ok(SporkAuthKind::ClassicalV1 | SporkAuthKind::HybridV2LmsUnverified { .. }) => {}
+            Ok(SporkAuthKind::HybridV2 { lms_leaf_q }) => {
+                self.record_lms_leaf(spork.spork_id, hash, lms_leaf_q);
             }
-        } else if let Some(lms_leaf_q) = spork.lms_leaf_index() {
-            self.record_lms_leaf(spork.spork_id, hash, lms_leaf_q);
+            Err(err) => {
+                tracing::warn!(
+                    "Spork {} from peer {}: invalid signature ({})",
+                    hash,
+                    peer_id,
+                    err
+                );
+                self.peer_manager.report_misbehavior_score(
+                    peer_id,
+                    BAD_SPORK_SCORE,
+                    "Invalid spork signature",
+                );
+                return;
+            }
         }
 
         self.count_received(peer_id);
@@ -831,8 +1419,10 @@ impl SporkManager {
         let added = self.add_active(spork.clone());
         if added {
             if let Some(db) = &self.db {
-                if let Err(e) = db.put_metadata(&db_key(spork.spork_id), &spork.serialize()) {
-                    tracing::warn!("Could not store spork {}: {}", spork.spork_id, e);
+                if self.preserve_quarantined(db, spork.spork_id) {
+                    if let Err(e) = db.put_metadata(&db_key(spork.spork_id), &spork.serialize()) {
+                        tracing::warn!("Could not store spork {}: {}", spork.spork_id, e);
+                    }
                 }
             }
         }
@@ -888,16 +1478,24 @@ impl SporkManager {
         tracing::debug!("Sending {} sporks to peer {}", sporks.len(), peer_id);
 
         for spork in sporks {
-            let _ = self
+            if let Err(e) = self
                 .peer_manager
                 .send_to_peer(peer_id, NetworkMessage::Spork(spork))
-                .await;
+                .await
+            {
+                tracing::debug!("Could not send sporks to peer {}: {}", peer_id, e);
+                break;
+            }
         }
     }
 
     /// Handle an `inv` that announces sporks: ask for the ones this node does
     /// not hold, once (Divi Core main.cpp:559-612, `AlreadyHave` then `AskFor`)
     pub async fn handle_inv(&self, peer_id: PeerId, items: &[InvItem]) {
+        // With no authority every spork would be refused, so none is asked for
+        if self.authority.key().is_none() {
+            return;
+        }
         let wanted: Vec<InvItem> = {
             let held = self.sporks.read();
             let mut asked = self.asked.lock();
@@ -912,10 +1510,22 @@ impl SporkManager {
                 .collect()
         };
         if !wanted.is_empty() {
-            let _ = self
+            let hashes: Vec<_> = wanted.iter().map(|i| i.hash).collect();
+            if let Err(e) = self
                 .peer_manager
                 .send_to_peer(peer_id, NetworkMessage::GetData(wanted))
-                .await;
+                .await
+            {
+                let mut asked = self.asked.lock();
+                for hash in hashes {
+                    asked.remove(&hash);
+                }
+                tracing::debug!(
+                    "Could not request announced sporks from peer {}: {}",
+                    peer_id,
+                    e
+                );
+            }
         }
     }
 
@@ -1016,6 +1626,22 @@ mod tests {
             time_signed: time,
             signature,
         }
+    }
+
+    #[test]
+    fn spork_preserves_value_bytes_from_cpp_message() {
+        let kp = divi_crypto::KeyPair::new_random();
+        let spork = SporkMessage {
+            spork_id: 10001,
+            value: "001".into(),
+            time_signed: 1700000000,
+            signature: divi_masternode::cpp_wire::sign_message(
+                kp.secret_key(),
+                b"100010011700000000",
+            )
+            .unwrap(),
+        };
+        assert!(spork.signature_is_valid(&kp.public_key().to_bytes()));
     }
 
     #[test]
@@ -1319,6 +1945,592 @@ mod tests {
         assert!(spork_key(&PRIVATEDIVI_MAINNET_MAGIC).is_none());
     }
 
+    /// Divi keeps its keys; PrivateDivi testnet and regtest take the key pinned
+    /// from PrivateDivi Core 408ad01e (chainparams.cpp:444, regtest inherits it
+    /// at :458); the relaunched PrivateDivi mainnet and other magics stay unmapped
+    #[test]
+    fn spork_authority_by_network() {
+        use crate::constants::*;
+        let pinned = hex::decode(PRIVATEDIVI_TESTNET_SPORK_KEY).unwrap();
+        assert_eq!(
+            spork_authority(&MAINNET_MAGIC),
+            SporkAuthority::Divi(hex::decode(MAINNET_SPORK_KEY).unwrap())
+        );
+        for magic in [TESTNET_MAGIC, REGTEST_MAGIC] {
+            assert_eq!(
+                spork_authority(&magic),
+                SporkAuthority::Divi(hex::decode(TESTNET_SPORK_KEY).unwrap())
+            );
+        }
+        for magic in [PRIVATEDIVI_TESTNET_MAGIC, PRIVATEDIVI_REGTEST_MAGIC] {
+            assert_eq!(
+                spork_authority(&magic),
+                SporkAuthority::PrivateDivi(pinned.clone())
+            );
+            assert_eq!(spork_key(&magic).as_deref(), Some(&pinned[..]));
+        }
+        assert_eq!(
+            spork_authority(&PRIVATEDIVI_MAINNET_MAGIC),
+            SporkAuthority::Unmapped
+        );
+        assert_eq!(spork_authority(&[0, 0, 0, 0]), SporkAuthority::Unmapped);
+        assert_eq!(pinned.len(), 33);
+        assert_eq!(
+            PRIVATEDIVI_REFERENCE_REVISION,
+            "408ad01e929543c7d11586b06fe8d26de8460539"
+        );
+    }
+
+    /// A row as an earlier release stored it: any bytes for a signature
+    fn store_row(db: &ChainDatabase, spork: &SporkMessage) {
+        db.put_metadata(&db_key(spork.spork_id), &spork.serialize())
+            .unwrap();
+    }
+
+    fn row(db: &ChainDatabase, key: &[u8]) -> Option<Vec<u8>> {
+        db.get_metadata(key).unwrap()
+    }
+
+    fn unsigned(id: i32, value: &str, time: i64) -> SporkMessage {
+        SporkMessage {
+            spork_id: id,
+            value: value.into(),
+            time_signed: time,
+            signature: vec![0x1f; 65],
+        }
+    }
+
+    fn peers_on(magic: crate::constants::Magic) -> Arc<PeerManager> {
+        PeerManager::new(crate::PeerManagerConfig {
+            magic,
+            dns_seeds: vec![],
+            static_peers: vec![],
+            listen_addr: None,
+            ..Default::default()
+        })
+    }
+
+    fn score(peers: &PeerManager, id: PeerId) -> i32 {
+        peers.scoring().get_stats(id).unwrap().misbehavior_score
+    }
+
+    /// With no authority a spork, even a well-signed one, is not stored,
+    /// activated, handed to the chain, relayed or asked for; the peer that sent
+    /// it is not scored and its spork sync still completes
+    #[tokio::test]
+    async fn unmapped_authority_refuses_sporks_without_scoring() {
+        use crate::messages::spork_ids::*;
+        let kp = divi_crypto::KeyPair::new_random();
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(ChainDatabase::open(dir.path()).unwrap());
+        let consensus = SharedSporks::default();
+        let peers = quiet_peers();
+        let sporks = SporkManager::with_authority(
+            Arc::clone(&peers),
+            SporkAuthority::Unmapped,
+            Some(Arc::clone(&db)),
+            consensus.clone(),
+        );
+        let mut sender = test_peer(&peers, 1);
+        let mut other = test_peer(&peers, 2);
+        peers
+            .scoring()
+            .register_peer(1, "127.0.0.1".parse().unwrap());
+
+        sporks.handle_sporkcount(1, 2).await;
+        received(&mut sender);
+        let value = SPORK_15_BLOCK_VALUE;
+        let entry = signed(&kp, value, "5000;100", 1000);
+        sporks.handle_spork(1, entry.clone()).await;
+        let mut forged = signed(&kp, SPORK_8_MASTERNODE_PAYMENT_ENFORCEMENT, "1", 1000);
+        forged.signature[10] ^= 1;
+        sporks.handle_spork(1, forged).await;
+
+        assert_eq!(score(&peers, 1), 0);
+        assert!(sporks.is_peer_synced(1));
+        assert_eq!(sporks.spork_count(), 0);
+        assert!(sporks.spork_by_hash(&entry.hash()).is_none());
+        assert!(consensus.read().entries(value).is_empty());
+        assert!(row(&db, &db_key(value)).is_none());
+        assert!(received(&mut other).is_empty(), "nothing relayed");
+
+        received(&mut sender);
+        sporks
+            .handle_inv(1, &[InvItem::new(InvType::Spork, entry.hash())])
+            .await;
+        assert!(received(&mut sender).is_empty(), "nothing asked for");
+    }
+
+    /// A PrivateDivi authority checks what arrives as Divi Core does: a bad
+    /// signature scores 100 and is not kept; a good one is kept and relayed
+    #[tokio::test]
+    async fn privatedivi_authority_checks_sporks_on_receipt() {
+        use crate::messages::spork_ids::*;
+        let kp = divi_crypto::KeyPair::new_random();
+        let peers = quiet_peers();
+        let sporks = SporkManager::with_authority(
+            Arc::clone(&peers),
+            SporkAuthority::PrivateDivi(kp.public_key().to_bytes()),
+            None,
+            Default::default(),
+        );
+        let _sender = test_peer(&peers, 1);
+        let mut other = test_peer(&peers, 2);
+        peers
+            .scoring()
+            .register_peer(1, "127.0.0.1".parse().unwrap());
+        let id = SPORK_8_MASTERNODE_PAYMENT_ENFORCEMENT;
+
+        sporks.handle_spork(1, unsigned(id, "1", 1000)).await;
+        assert!(sporks.get_spork(id).is_none());
+        assert_eq!(score(&peers, 1), BAD_SPORK_SCORE as i32);
+        assert!(received(&mut other).is_empty());
+
+        sporks.handle_spork(1, signed(&kp, id, "2", 2000)).await;
+        assert_eq!(sporks.get_spork(id).unwrap().value, "2");
+        assert!(!received(&mut other).is_empty());
+    }
+
+    /// Rows stored before an authority was mapped are re-checked at start: one
+    /// that verifies loads; one that does not is quarantined, not handed to the
+    /// chain, and its row kept. When a verified spork replaces it, the old row
+    /// is first copied to its quarantine key. No hold on a mapped network.
+    #[tokio::test]
+    async fn privatedivi_stored_sporks_are_checked_again_after_a_restart() {
+        use crate::messages::spork_ids::*;
+        let kp = divi_crypto::KeyPair::new_random();
+        let authority = SporkAuthority::PrivateDivi(kp.public_key().to_bytes());
+        let dir = tempfile::tempdir().unwrap();
+        let enforcement = SPORK_8_MASTERNODE_PAYMENT_ENFORCEMENT;
+        let value = SPORK_15_BLOCK_VALUE;
+        let forged = unsigned(value, "1;1", 1000);
+        {
+            let db = ChainDatabase::open(dir.path()).unwrap();
+            store_row(&db, &signed(&kp, enforcement, "7", 1000));
+            store_row(&db, &forged);
+        }
+
+        let consensus = SharedSporks::default();
+        {
+            let db = Arc::new(ChainDatabase::open(dir.path()).unwrap());
+            let sporks = SporkManager::with_authority(
+                quiet_peers(),
+                authority.clone(),
+                Some(Arc::clone(&db)),
+                consensus.clone(),
+            );
+            assert_eq!(sporks.get_spork(enforcement).unwrap().value, "7");
+            assert!(sporks.get_spork(value).is_none());
+            assert!(consensus.read().entries(value).is_empty());
+            assert_eq!(sporks.quarantined().len(), 1);
+            let held = &sporks.quarantined()[0];
+            let decoded = held.decoded.as_ref().unwrap();
+            assert_eq!(
+                (held.spork_id, decoded.value.as_str(), decoded.time_signed),
+                (value, "1;1", 1000)
+            );
+            assert_eq!(
+                held.reason,
+                QuarantineReason::InvalidSignature(SporkVerifyError::InvalidClassicalSignature)
+            );
+            assert_eq!(held.raw, forged.serialize());
+            assert!(sporks.store_hold().is_none());
+            assert_eq!(row(&db, &db_key(value)), Some(forged.serialize()));
+
+            sporks
+                .handle_spork(1, signed(&kp, value, "5000;100", 2000))
+                .await;
+            assert_eq!(
+                consensus.read().entries(value),
+                &[SporkEntry::new("5000;100", 2000)]
+            );
+            assert_eq!(
+                row(&db, &quarantine_db_key(value)),
+                Some(forged.serialize())
+            );
+        }
+
+        let restarted = SharedSporks::default();
+        let db = Arc::new(ChainDatabase::open(dir.path()).unwrap());
+        let sporks = SporkManager::with_authority(
+            quiet_peers(),
+            authority,
+            Some(db.clone()),
+            restarted.clone(),
+        );
+        assert!(sporks.quarantined().is_empty());
+        assert_eq!(
+            restarted.read().entries(value),
+            &[SporkEntry::new("5000;100", 2000)]
+        );
+        assert_eq!(
+            row(&db, &quarantine_db_key(value)),
+            Some(forged.serialize())
+        );
+    }
+
+    /// With no authority, stored rows are not loaded after a restart and are
+    /// not changed. They raise a hold: `try_with_chain` refuses to start until
+    /// the operator acknowledges the fingerprint of exactly these rows.
+    #[tokio::test]
+    async fn unmapped_stored_sporks_are_held_not_loaded_or_deleted() {
+        use crate::constants::PRIVATEDIVI_MAINNET_MAGIC;
+        use crate::messages::spork_ids::*;
+        let kp = divi_crypto::KeyPair::new_random();
+        let dir = tempfile::tempdir().unwrap();
+        let enforcement = SPORK_8_MASTERNODE_PAYMENT_ENFORCEMENT;
+        let value = SPORK_15_BLOCK_VALUE;
+        let rows = [
+            signed(&kp, enforcement, "1600000000", 1000),
+            unsigned(value, "5000;100", 1000),
+        ];
+        {
+            let db = ChainDatabase::open(dir.path()).unwrap();
+            for spork in &rows {
+                store_row(&db, spork);
+            }
+        }
+        let open = || Arc::new(ChainDatabase::open(dir.path()).unwrap());
+
+        let consensus = SharedSporks::default();
+        let held = SporkManager::try_with_chain(
+            peers_on(PRIVATEDIVI_MAINNET_MAGIC),
+            open(),
+            consensus.clone(),
+            None,
+        )
+        .err()
+        .and_then(held_by)
+        .expect("held");
+        assert_eq!(held.quarantined.len(), 2);
+        assert!(held
+            .quarantined
+            .iter()
+            .all(|q| q.reason == QuarantineReason::NoAuthority));
+        assert!(consensus.read().entries(value).is_empty());
+        let report = held.to_string();
+        assert!(report.contains(&held.fingerprint));
+        assert!(report.contains(SPORK_HOLD_ACK_ENV));
+        assert!(report.contains("5000;100"));
+
+        // the same rows give the same fingerprint; a wrong one does not release it
+        let again = SporkManager::try_with_chain(
+            peers_on(PRIVATEDIVI_MAINNET_MAGIC),
+            open(),
+            Default::default(),
+            Some("00"),
+        )
+        .err()
+        .and_then(held_by)
+        .expect("still held");
+        assert_eq!(again.fingerprint, held.fingerprint);
+
+        let sporks = SporkManager::try_with_chain(
+            peers_on(PRIVATEDIVI_MAINNET_MAGIC),
+            open(),
+            consensus.clone(),
+            Some(held.fingerprint.as_str()),
+        )
+        .expect("acknowledged");
+        assert_eq!(sporks.spork_count(), 0);
+        assert!(sporks.get_spork(enforcement).is_none());
+        assert!(consensus.read().entries(value).is_empty());
+        drop(sporks);
+
+        let db = open();
+        for spork in &rows {
+            assert_eq!(row(&db, &db_key(spork.spork_id)), Some(spork.serialize()));
+            assert!(row(&db, &quarantine_db_key(spork.spork_id)).is_none());
+        }
+
+        // an empty store raises no hold
+        let empty = tempfile::tempdir().unwrap();
+        let db = Arc::new(ChainDatabase::open(empty.path()).unwrap());
+        assert!(SporkManager::try_with_chain(
+            peers_on(PRIVATEDIVI_MAINNET_MAGIC),
+            db,
+            Default::default(),
+            None
+        )
+        .is_ok());
+    }
+
+    fn held_by(err: SporkStartError) -> Option<SporkStoreHold> {
+        match err {
+            SporkStartError::Held(hold) => Some(hold),
+            SporkStartError::Unreadable(_) => None,
+        }
+    }
+
+    /// Rows that do not decode, carry trailing bytes or hold a spork of
+    /// another id are quarantined, never taken as absent: with no authority
+    /// they hold the start; with a PrivateDivi authority they do not load,
+    /// even when the spork they hold is well signed. Divi skips or loads them
+    /// as before.
+    #[tokio::test]
+    async fn malformed_and_misplaced_rows_are_quarantined_not_absent() {
+        use crate::constants::{PRIVATEDIVI_MAINNET_MAGIC, REGTEST_MAGIC};
+        use crate::messages::spork_ids::*;
+        let kp = divi_crypto::KeyPair::new_random();
+        let dir = tempfile::tempdir().unwrap();
+        let garbage = vec![0x01, 0x02, 0x03];
+        let mut trailing = signed(&kp, SPORK_13_BLOCK_PAYMENTS, "1;1", 1000).serialize();
+        trailing.push(0);
+        let misplaced = signed(&kp, SPORK_14_TX_FEE, "10000;100000", 1000);
+        {
+            let db = ChainDatabase::open(dir.path()).unwrap();
+            db.put_metadata(&db_key(SPORK_8_MASTERNODE_PAYMENT_ENFORCEMENT), &garbage)
+                .unwrap();
+            db.put_metadata(&db_key(SPORK_13_BLOCK_PAYMENTS), &trailing)
+                .unwrap();
+            db.put_metadata(&db_key(SPORK_15_BLOCK_VALUE), &misplaced.serialize())
+                .unwrap();
+        }
+        let open = || Arc::new(ChainDatabase::open(dir.path()).unwrap());
+        let reasons = |held: &[QuarantinedSpork]| {
+            held.iter()
+                .map(|q| (q.spork_id, q.reason.clone()))
+                .collect::<Vec<_>>()
+        };
+        let expected = |last: QuarantineReason| {
+            vec![
+                (
+                    SPORK_8_MASTERNODE_PAYMENT_ENFORCEMENT,
+                    QuarantineReason::Undecodable(
+                        SporkMessage::deserialize(&garbage).unwrap_err().to_string(),
+                    ),
+                ),
+                (
+                    SPORK_13_BLOCK_PAYMENTS,
+                    QuarantineReason::Undecodable("trailing or non-canonical bytes".into()),
+                ),
+                (SPORK_15_BLOCK_VALUE, last),
+            ]
+        };
+        let mismatch = QuarantineReason::IdMismatch {
+            decoded_id: SPORK_14_TX_FEE,
+        };
+
+        // no authority: held, with these rows in the fingerprint
+        let hold = SporkManager::try_with_chain(
+            peers_on(PRIVATEDIVI_MAINNET_MAGIC),
+            open(),
+            Default::default(),
+            None,
+        )
+        .err()
+        .and_then(held_by)
+        .expect("held");
+        assert_eq!(reasons(&hold.quarantined[..]), expected(mismatch.clone()));
+        assert!(hold.quarantined[0].decoded.is_none());
+        assert_eq!(hold.quarantined[0].raw, garbage);
+        assert!(hold.to_string().contains("does not decode"));
+
+        // a PrivateDivi authority that signed the rows: still none loads
+        let consensus = SharedSporks::default();
+        let sporks = SporkManager::with_authority(
+            quiet_peers(),
+            SporkAuthority::PrivateDivi(kp.public_key().to_bytes()),
+            Some(open()),
+            consensus.clone(),
+        );
+        assert_eq!(reasons(sporks.quarantined()), expected(mismatch));
+        assert_eq!(sporks.spork_count(), 0);
+        assert!(consensus.read().entries(SPORK_14_TX_FEE).is_empty());
+        assert!(consensus.read().entries(SPORK_15_BLOCK_VALUE).is_empty());
+        drop(sporks);
+
+        // Divi: the garbage row is skipped, the others load as decoded, unchanged
+        let sporks =
+            SporkManager::try_with_chain(peers_on(REGTEST_MAGIC), open(), Default::default(), None)
+                .expect("no hold");
+        assert!(sporks.quarantined().is_empty());
+        assert_eq!(
+            sporks.get_spork(SPORK_14_TX_FEE).unwrap().value,
+            "10000;100000"
+        );
+        drop(sporks);
+
+        let db = open();
+        assert_eq!(
+            row(&db, &db_key(SPORK_8_MASTERNODE_PAYMENT_ENFORCEMENT)),
+            Some(garbage)
+        );
+        assert_eq!(row(&db, &db_key(SPORK_13_BLOCK_PAYMENTS)), Some(trailing));
+        assert_eq!(
+            row(&db, &db_key(SPORK_15_BLOCK_VALUE)),
+            Some(misplaced.serialize())
+        );
+    }
+
+    /// A row that cannot be read is not an empty row: on PrivateDivi and
+    /// unmapped networks the start stops, no acknowledgement releases it, and
+    /// a verified spork does not overwrite the unread row. Divi only warns.
+    #[tokio::test]
+    async fn unreadable_rows_stop_the_start_and_cannot_be_acknowledged() {
+        use crate::messages::spork_ids::*;
+        let kp = divi_crypto::KeyPair::new_random();
+        let id = SPORK_15_BLOCK_VALUE;
+        let injected = || StorageError::Deserialization("injected read failure".into());
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(ChainDatabase::open(dir.path()).unwrap());
+
+        for authority in [
+            SporkAuthority::Unmapped,
+            SporkAuthority::PrivateDivi(kp.public_key().to_bytes()),
+        ] {
+            let mut sporks = SporkManager::with_authority(
+                quiet_peers(),
+                authority.clone(),
+                Some(Arc::clone(&db)),
+                Default::default(),
+            );
+            let raw = unsigned(SPORK_14_TX_FEE, "1;1", 1000).serialize();
+            Arc::get_mut(&mut sporks).unwrap().load_rows(vec![
+                (id, Err(injected())),
+                (SPORK_14_TX_FEE, Ok(Some(raw))),
+            ]);
+            let fingerprint = sporks.store_hold().map(|hold| hold.fingerprint);
+            for ack in [None, Some("00"), fingerprint.as_deref()] {
+                match sporks.check_start(ack) {
+                    Err(SporkStartError::Unreadable(rows)) => {
+                        assert_eq!(
+                            rows,
+                            vec![UnreadableSpork {
+                                spork_id: id,
+                                error: injected().to_string(),
+                            }]
+                        );
+                    }
+                    other => panic!("{authority:?} ack {ack:?}: {other:?}"),
+                }
+            }
+            let report = sporks.check_start(None).unwrap_err().to_string();
+            assert!(report.contains("spork_10014"));
+            assert!(report.contains("injected read failure"));
+            assert!(report.contains(SPORK_HOLD_ACK_ENV));
+
+            sporks
+                .handle_spork(1, signed(&kp, id, "5000;100", 2000))
+                .await;
+            assert!(row(&db, &db_key(id)).is_none(), "{authority:?}");
+            assert!(row(&db, &quarantine_db_key(id)).is_none());
+        }
+
+        let mut sporks = SporkManager::with_authority(
+            quiet_peers(),
+            SporkAuthority::Divi(kp.public_key().to_bytes()),
+            None,
+            Default::default(),
+        );
+        Arc::get_mut(&mut sporks)
+            .unwrap()
+            .load_rows(vec![(id, Err(injected()))]);
+        assert!(sporks.check_start(None).is_ok());
+    }
+
+    /// A quarantine copy already in the database must hold the same bytes as
+    /// the quarantined row before that row is replaced. Otherwise neither is
+    /// replaced; the verified spork is still active until the next start.
+    #[tokio::test]
+    async fn quarantine_copy_must_match_before_a_row_is_replaced() {
+        use crate::messages::spork_ids::*;
+        let kp = divi_crypto::KeyPair::new_random();
+        let id = SPORK_15_BLOCK_VALUE;
+        let forged = unsigned(id, "1;1", 1000).serialize();
+        let verified = signed(&kp, id, "5000;100", 2000);
+
+        for (kept, replaced) in [(b"other".to_vec(), false), (forged.clone(), true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = Arc::new(ChainDatabase::open(dir.path()).unwrap());
+            db.put_metadata(&db_key(id), &forged).unwrap();
+            db.put_metadata(&quarantine_db_key(id), &kept).unwrap();
+            let consensus = SharedSporks::default();
+            let sporks = SporkManager::with_authority(
+                quiet_peers(),
+                SporkAuthority::PrivateDivi(kp.public_key().to_bytes()),
+                Some(Arc::clone(&db)),
+                consensus.clone(),
+            );
+            assert_eq!(sporks.quarantined().len(), 1);
+            sporks.handle_spork(1, verified.clone()).await;
+            assert_eq!(
+                consensus.read().entries(id),
+                &[SporkEntry::new("5000;100", 2000)]
+            );
+            let stored = if replaced {
+                verified.serialize()
+            } else {
+                forged.clone()
+            };
+            assert_eq!(row(&db, &db_key(id)), Some(stored));
+            assert_eq!(row(&db, &quarantine_db_key(id)), Some(kept));
+        }
+    }
+
+    /// PrivateDivi takes 65-byte classical signatures only, on receipt and at
+    /// load, whatever `DIP-PQ-2` policy the manager is set to
+    #[tokio::test]
+    async fn privatedivi_takes_classical_signatures_only() {
+        use crate::messages::spork_ids::*;
+        let kp = divi_crypto::KeyPair::new_random();
+        let id = SPORK_8_MASTERNODE_PAYMENT_ENFORCEMENT;
+        let mut hybrid = signed(&kp, id, "1", 1000);
+        hybrid.signature.resize(HYBRID_SPORK_SIG_LEN, 0);
+        let length = SporkVerifyError::InvalidSignatureLength(HYBRID_SPORK_SIG_LEN);
+        let authority = SporkAuthority::PrivateDivi(kp.public_key().to_bytes());
+
+        let peers = quiet_peers();
+        let sporks = SporkManager::with_authority(
+            Arc::clone(&peers),
+            authority.clone(),
+            None,
+            Default::default(),
+        );
+        sporks.set_auth_policy(SporkAuthPolicy::HybridOptional {
+            pq_spork_pubkey: [0; PQ_LMS_SPORK_PUBKEY_LEN],
+            network_magic: [0; 4],
+        });
+        let _sender = test_peer(&peers, 1);
+        peers
+            .scoring()
+            .register_peer(1, "127.0.0.1".parse().unwrap());
+        sporks.handle_spork(1, hybrid.clone()).await;
+        assert!(sporks.get_spork(id).is_none());
+        assert_eq!(score(&peers, 1), BAD_SPORK_SCORE as i32);
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(ChainDatabase::open(dir.path()).unwrap());
+        store_row(&db, &hybrid);
+        let sporks =
+            SporkManager::with_authority(quiet_peers(), authority, Some(db), Default::default());
+        assert!(sporks.get_spork(id).is_none());
+        assert_eq!(
+            sporks.quarantined()[0].reason,
+            QuarantineReason::InvalidSignature(length)
+        );
+    }
+
+    /// Divi networks still load stored rows as Divi Core does, unchecked
+    /// (spork.cpp LoadSporksFromDB), and raise no hold
+    #[tokio::test]
+    async fn divi_stored_sporks_still_load_unchecked() {
+        use crate::constants::REGTEST_MAGIC;
+        use crate::messages::spork_ids::*;
+        let dir = tempfile::tempdir().unwrap();
+        let id = SPORK_8_MASTERNODE_PAYMENT_ENFORCEMENT;
+        {
+            let db = ChainDatabase::open(dir.path()).unwrap();
+            store_row(&db, &unsigned(id, "1", 1000));
+        }
+        let db = Arc::new(ChainDatabase::open(dir.path()).unwrap());
+        let sporks =
+            SporkManager::try_with_chain(peers_on(REGTEST_MAGIC), db, Default::default(), None)
+                .expect("no hold");
+        assert_eq!(sporks.get_spork(id).unwrap().value, "1");
+        assert!(sporks.quarantined().is_empty());
+    }
+
     // =========================================================================
     // DIP-PQ-2 (`P2.1` & `P2.2`) Hybrid secp256k1 + LMS-SHA256-M32-H10 Tests
     // =========================================================================
@@ -1392,13 +2604,65 @@ mod tests {
     }
 
     #[test]
+    fn s11_spork_reheaded_signature_matches_cpp_recover_compact() {
+        // Full-caller check: SporkMessage::verify_with_policy must mirror C++
+        // CSporkMessage::CheckSignature, which tolerates any compact header byte
+        // (RecoverCompact masks it) and compares CKeyIDs. Previously Rust gated on
+        // header 31..=34, so a spork relayed by a C++ node with header 39+r was
+        // rejected and the honest relaying peer scored 100 (S11).
+        let kp = divi_crypto::KeyPair::new_random();
+        let classical_pub = kp.public_key().to_bytes();
+
+        let spork = signed(&kp, 10007, "1537971708", 1_700_000_000);
+        assert_eq!(spork.signature.len(), CLASSICAL_SPORK_SIG_LEN);
+        // honest signer emits a compressed header in 31..=34.
+        assert!((31..=34).contains(&spork.signature[0]));
+        assert_eq!(
+            spork.verify_with_policy(&classical_pub, &SporkAuthPolicy::ClassicalOnly),
+            Ok(SporkAuthKind::ClassicalV1)
+        );
+
+        // Re-head 31+r -> 39+r: keeps recid ((h-27)&3) and the compressed bit
+        // ((h-27)&4); C++ accepts, so Rust must too.
+        let mut reheaded = spork.clone();
+        reheaded.signature[0] += 8;
+        assert_eq!(
+            reheaded.verify_with_policy(&classical_pub, &SporkAuthPolicy::ClassicalOnly),
+            Ok(SporkAuthKind::ClassicalV1),
+            "re-headed 39+r spork must stay valid (S11)"
+        );
+        assert!(reheaded.signature_is_valid(&classical_pub));
+
+        // Clear the compressed bit (31+r -> 27+r): C++ recovers an uncompressed
+        // key whose GetID no longer matches the compressed spork key, so both
+        // clients reject.
+        let mut uncompressed_hdr = spork.clone();
+        uncompressed_hdr.signature[0] -= 4;
+        assert_eq!(
+            uncompressed_hdr.verify_with_policy(&classical_pub, &SporkAuthPolicy::ClassicalOnly),
+            Err(SporkVerifyError::InvalidClassicalSignature),
+            "uncompressed-flag header must not match a compressed spork key"
+        );
+
+        // A different key still fails.
+        let other = divi_crypto::KeyPair::new_random();
+        assert_eq!(
+            spork.verify_with_policy(
+                &other.public_key().to_bytes(),
+                &SporkAuthPolicy::ClassicalOnly
+            ),
+            Err(SporkVerifyError::InvalidClassicalSignature)
+        );
+    }
+
+    #[test]
     fn dip_pq_2_hybrid_v2_sign_roundtrip_and_verify_all_policies() {
         use crate::constants::MAINNET_MAGIC;
         let kp = divi_crypto::KeyPair::new_random();
         let classical_pub = kp.public_key().to_bytes();
         let (mut lms_sk, lms_pk) = test_lms_keypair();
 
-        let spork_v2 = sign_hybrid_spork_lms(
+        let spork_v2 = sign_hybrid_spork_lms_volatile(
             kp.secret_key(),
             &mut lms_sk,
             MAINNET_MAGIC,
@@ -1426,7 +2690,7 @@ mod tests {
         assert!(decoded.signature_is_valid(&classical_pub));
         assert_eq!(
             decoded.verify_with_policy(&classical_pub, &SporkAuthPolicy::ClassicalOnly),
-            Ok(SporkAuthKind::HybridV2 { lms_leaf_q: 0 })
+            Ok(SporkAuthKind::HybridV2LmsUnverified { lms_leaf_q: 0 })
         );
         assert_eq!(
             decoded.verify_with_policy(
@@ -1451,6 +2715,56 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "lms-volatile-test-signer"))]
+    #[test]
+    fn dip_pq_2_lms_signing_refused_but_verification_kept() {
+        use crate::constants::MAINNET_MAGIC;
+        let kp = divi_crypto::KeyPair::new_random();
+        let classical_pub = kp.public_key().to_bytes();
+        let (mut lms_sk, lms_pk) = test_lms_keypair();
+
+        assert!(matches!(
+            sign_hybrid_spork_lms(
+                kp.secret_key(),
+                &mut lms_sk,
+                MAINNET_MAGIC,
+                10007,
+                "1537971708",
+                1_800_000_000,
+            ),
+            Err(SporkVerifyError::LmsSigningUnavailable)
+        ));
+        let mut spork = signed(&kp, 10015, "5000;100", 1_800_000_000);
+        let classical_sig = spork.signature.clone();
+        assert!(matches!(
+            spork.attach_lms_signature(&mut lms_sk, MAINNET_MAGIC),
+            Err(SporkVerifyError::LmsSigningUnavailable)
+        ));
+        assert_eq!(spork.signature, classical_sig);
+        assert_eq!(lms_sk.next_leaf_index(), 0, "no leaf consumed");
+
+        // Hybrid sporks from elsewhere still verify.
+        let v2 = sign_hybrid_spork_lms_volatile(
+            kp.secret_key(),
+            &mut lms_sk,
+            MAINNET_MAGIC,
+            10007,
+            "1537971708",
+            1_800_000_000,
+        )
+        .unwrap();
+        assert_eq!(
+            v2.verify_with_policy(
+                &classical_pub,
+                &SporkAuthPolicy::HybridOptional {
+                    pq_spork_pubkey: lms_pk,
+                    network_magic: MAINNET_MAGIC,
+                },
+            ),
+            Ok(SporkAuthKind::HybridV2 { lms_leaf_q: 0 })
+        );
+    }
+
     #[test]
     fn dip_pq_2_attach_lms_signature_upgrades_v1_in_place() {
         use crate::constants::MAINNET_MAGIC;
@@ -1461,7 +2775,7 @@ mod tests {
         let mut spork = signed(&kp, 10015, "5000;100", 1_800_000_000);
         let hash_before = spork.hash();
         let lms_sig = spork
-            .attach_lms_signature(&mut lms_sk, MAINNET_MAGIC)
+            .attach_lms_signature_volatile(&mut lms_sk, MAINNET_MAGIC)
             .unwrap();
         assert_eq!(lms_sig.len(), PQ_LMS_SPORK_SIG_LEN);
         assert_eq!(spork.signature.len(), HYBRID_SPORK_SIG_LEN);
@@ -1523,7 +2837,7 @@ mod tests {
         );
 
         // At and after cutoff: 2,577-byte hybrid v2 is ACCEPTED
-        let at_cutoff_v2 = sign_hybrid_spork_lms(
+        let at_cutoff_v2 = sign_hybrid_spork_lms_volatile(
             kp.secret_key(),
             &mut lms_sk,
             MAINNET_MAGIC,
@@ -1545,7 +2859,7 @@ mod tests {
         let classical_pub = kp.public_key().to_bytes();
         let (mut lms_sk, lms_pk) = test_lms_keypair();
 
-        let mut spork = sign_hybrid_spork_lms(
+        let mut spork = sign_hybrid_spork_lms_volatile(
             kp.secret_key(),
             &mut lms_sk,
             MAINNET_MAGIC,
@@ -1574,7 +2888,7 @@ mod tests {
         let classical_pub = kp.public_key().to_bytes();
         let (mut lms_sk, lms_pk) = test_lms_keypair();
 
-        let mut spork = sign_hybrid_spork_lms(
+        let mut spork = sign_hybrid_spork_lms_volatile(
             kp.secret_key(),
             &mut lms_sk,
             MAINNET_MAGIC,
@@ -1605,7 +2919,7 @@ mod tests {
         let classical_pub = kp.public_key().to_bytes();
         let (mut lms_sk, lms_pk) = test_lms_keypair();
 
-        let base = sign_hybrid_spork_lms(
+        let base = sign_hybrid_spork_lms_volatile(
             kp.secret_key(),
             &mut lms_sk,
             MAINNET_MAGIC,
@@ -1644,7 +2958,7 @@ mod tests {
         let (mut lms_sk, lms_pk) = test_lms_keypair();
 
         // Signed on TESTNET_MAGIC, verified on MAINNET_MAGIC
-        let spork = sign_hybrid_spork_lms(
+        let spork = sign_hybrid_spork_lms_volatile(
             kp.secret_key(),
             &mut lms_sk,
             TESTNET_MAGIC,
@@ -1673,7 +2987,7 @@ mod tests {
         let classical_pub = kp.public_key().to_bytes();
         let (mut lms_sk, lms_pk) = test_lms_keypair();
 
-        let spork = sign_hybrid_spork_lms(
+        let spork = sign_hybrid_spork_lms_volatile(
             kp.secret_key(),
             &mut lms_sk,
             MAINNET_MAGIC,
@@ -1716,7 +3030,7 @@ mod tests {
         let classical_pub = kp.public_key().to_bytes();
         let (mut lms_sk, lms_pk) = test_lms_keypair();
 
-        let spork = sign_hybrid_spork_lms(
+        let spork = sign_hybrid_spork_lms_volatile(
             kp.secret_key(),
             &mut lms_sk,
             MAINNET_MAGIC,
@@ -1772,7 +3086,7 @@ mod tests {
         let (mut lms_sk, lms_pk) = test_lms_keypair();
 
         // Sign hybrid v2 with kp1 + lms_sk
-        let orig = sign_hybrid_spork_lms(
+        let orig = sign_hybrid_spork_lms_volatile(
             kp1.secret_key(),
             &mut lms_sk,
             MAINNET_MAGIC,
@@ -1845,7 +3159,7 @@ mod tests {
         assert!(received(&mut other).is_empty());
 
         // 3. Post-cutoff hybrid v2 spork (leaf q=0) is ACCEPTED, stored, and relayed
-        let post_v2 = sign_hybrid_spork_lms(
+        let post_v2 = sign_hybrid_spork_lms_volatile(
             kp.secret_key(),
             &mut lms_sk,
             MAINNET_MAGIC,
@@ -1861,7 +3175,7 @@ mod tests {
         assert!(!received(&mut other).is_empty());
 
         // 4. Second post-cutoff hybrid v2 spork (leaf q=1) advances tracked leaf index to 1
-        let post_v2_next = sign_hybrid_spork_lms(
+        let post_v2_next = sign_hybrid_spork_lms_volatile(
             kp.secret_key(),
             &mut lms_sk,
             MAINNET_MAGIC,
@@ -1890,6 +3204,73 @@ mod tests {
         assert_eq!(restored.last_lms_leaf_index(), Some(1));
     }
 
+    /// F2: under `ClassicalOnly` the `LMS` tail is only framing-checked. A forged tail is still
+    /// accepted, as Divi Core accepts it, but it is reported as unverified and its leaf is never
+    /// tracked, live or after a restart.
+    #[tokio::test]
+    async fn dip_pq_2_classical_only_hybrid_spork_lms_is_unverified_and_untracked() {
+        use crate::constants::MAINNET_MAGIC;
+        use crate::messages::spork_ids::*;
+        let kp = divi_crypto::KeyPair::new_random();
+        let classical_pub = kp.public_key().to_bytes();
+        let (mut lms_sk, lms_pk) = test_lms_keypair();
+        let hybrid_policy = SporkAuthPolicy::HybridOptional {
+            pq_spork_pubkey: lms_pk,
+            network_magic: MAINNET_MAGIC,
+        };
+        let id = SPORK_8_MASTERNODE_PAYMENT_ENFORCEMENT;
+
+        let mut forged = sign_hybrid_spork_lms_volatile(
+            kp.secret_key(),
+            &mut lms_sk,
+            MAINNET_MAGIC,
+            id,
+            "100",
+            1_800_000_000,
+        )
+        .unwrap();
+        // First LM-OTS chain value: any bytes keep the framing canonical
+        forged.signature[CLASSICAL_SPORK_SIG_LEN + 40] ^= 0x01;
+
+        assert!(forged.signature_is_valid(&classical_pub));
+        assert_eq!(
+            forged.verify_with_policy(&classical_pub, &SporkAuthPolicy::ClassicalOnly),
+            Ok(SporkAuthKind::HybridV2LmsUnverified { lms_leaf_q: 0 })
+        );
+        assert_eq!(
+            forged.verify_with_policy(&classical_pub, &hybrid_policy),
+            Err(SporkVerifyError::InvalidPostQuantumSignature(
+                PqError::VerificationFailed
+            ))
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(ChainDatabase::open(dir.path()).unwrap());
+        let manager = SporkManager::with_key_and_policy(
+            quiet_peers(),
+            Some(classical_pub.clone()),
+            SporkAuthPolicy::ClassicalOnly,
+            Some(db),
+        );
+        manager.handle_spork(1, forged).await;
+        assert_eq!(manager.get_spork(id).unwrap().value, "100");
+        assert_eq!(manager.last_lms_leaf_index(), None);
+        assert_eq!(manager.spork_lms_leaf_index(id), None);
+        drop(manager);
+
+        for policy in [SporkAuthPolicy::ClassicalOnly, hybrid_policy] {
+            let restored = SporkManager::with_key_and_policy(
+                quiet_peers(),
+                Some(classical_pub.clone()),
+                policy,
+                Some(Arc::new(ChainDatabase::open(dir.path()).unwrap())),
+            );
+            assert_eq!(restored.get_spork(id).unwrap().value, "100");
+            assert_eq!(restored.last_lms_leaf_index(), None);
+            assert_eq!(restored.spork_lms_leaf_index(id), None);
+        }
+    }
+
     #[test]
     fn dip_pq_2_multi_value_hybrid_spork_roundtrip_and_tamper_rejection() {
         use crate::constants::MAINNET_MAGIC;
@@ -1898,7 +3279,7 @@ mod tests {
         let classical_pub = kp.public_key().to_bytes();
         let (mut lms_sk, lms_pk) = test_lms_keypair();
 
-        let spork = sign_hybrid_spork_lms(
+        let spork = sign_hybrid_spork_lms_volatile(
             kp.secret_key(),
             &mut lms_sk,
             MAINNET_MAGIC,
@@ -1944,7 +3325,7 @@ mod tests {
         let classical_pub = kp.public_key().to_bytes();
         let (mut lms_sk, lms_pk) = test_lms_keypair();
 
-        let spork = sign_hybrid_spork_lms(
+        let spork = sign_hybrid_spork_lms_volatile(
             kp.secret_key(),
             &mut lms_sk,
             MAINNET_MAGIC,
@@ -1975,7 +3356,7 @@ mod tests {
         let classical_pub = kp.public_key().to_bytes();
         let (mut lms_sk, lms_pk) = test_lms_keypair();
 
-        let spork = sign_hybrid_spork_lms(
+        let spork = sign_hybrid_spork_lms_volatile(
             kp.secret_key(),
             &mut lms_sk,
             MAINNET_MAGIC,
@@ -2024,7 +3405,7 @@ mod tests {
         assert!(manager.get_spork(10007).is_none());
 
         // Post-cutoff v2 spork accepted
-        let v2 = sign_hybrid_spork_lms(
+        let v2 = sign_hybrid_spork_lms_volatile(
             kp.secret_key(),
             &mut lms_sk,
             MAINNET_MAGIC,

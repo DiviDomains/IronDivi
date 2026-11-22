@@ -91,7 +91,8 @@ Screenshots are in the session notes folder `webui-proof/` (names below).
   each transaction's net effect on the wallet (change netted out), newest
   first, mempool on top, up to the last 100 transactions.
 - `gate.rs` still applies; `dumpprivkey`, `dumpwallet` and `dumphdinfo` return
-  403 through `/api/rpc` ("keys never leave it").
+  403 through `/api/rpc` ("keys never leave it"), as do the other key-export
+  equivalents; calls outside its allowlist return 403 ("for the node operator").
 - **Limits:**
   - needs `txindex=1` and `addressindex=1`. Without them the wallet page says
     which to set and to restart, and nothing else breaks;

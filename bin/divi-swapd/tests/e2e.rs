@@ -72,7 +72,7 @@ async fn e2e_mock_happy_path() {
         &taker,
         &client,
         &sessions,
-        OFFER_ID,
+        &offer(OFFER_ID),
         BTC_SATS,
         &fast(),
         &mut || w.mine_both(),
@@ -111,7 +111,7 @@ async fn e2e_mock_refund() {
     let divi_before = w.divi.balance(&w.maker_divi_pub());
 
     // Taker locks, the maker locks, and the taker then goes silent (case C).
-    let local = flow::begin(&taker, &client, &sessions, OFFER_ID, BTC_SATS)
+    let local = flow::begin(&taker, &client, &sessions, &offer(OFFER_ID), BTC_SATS)
         .await
         .unwrap();
     flow::lock(&taker, &client, &sessions, &local)
@@ -180,7 +180,7 @@ async fn e2e_mock_rev_happy_path() {
         &taker,
         &client,
         &sessions,
-        REV_OFFER_ID,
+        &offer(REV_OFFER_ID),
         BTC_SATS,
         &fast(),
         &mut || w.mine_both(),
@@ -220,7 +220,7 @@ async fn e2e_mock_rev_refund() {
     let btc_before = w.btc.balance(&w.maker_btc_pub());
 
     // Taker locks DIVI, the maker locks BTC, and the taker then goes silent (case C).
-    let local = flow::begin(&taker, &client, &sessions, REV_OFFER_ID, BTC_SATS)
+    let local = flow::begin(&taker, &client, &sessions, &offer(REV_OFFER_ID), BTC_SATS)
         .await
         .unwrap();
     flow::lock(&taker, &client, &sessions, &local)

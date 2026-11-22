@@ -13,15 +13,42 @@
 //!
 //! Provides an LRU cache for UTXO lookups to dramatically reduce database I/O
 //! during block synchronization. Uses the moka crate for efficient concurrent access.
+//!
+//! # Ownership and coherence (C3)
+//!
+//! RocksDB owns the durable UTXO set. The cache holds two kinds of entry:
+//!
+//! * **Clean** entries, equal to what RocksDB holds. They are put there by a
+//!   *write-through* ([`UtxoCache::write_through`]: the database write and the
+//!   cache update happen as one serialized step) or by a *validated fill*
+//!   ([`UtxoCache::fill_ticket`] + [`UtxoCache::fill`]) after a cache miss.
+//!   `ChainDatabase` only ever creates clean entries.
+//! * **Dirty** entries ([`UtxoCache::insert`] / [`UtxoCache::remove`], the
+//!   standalone write-back use), newer than RocksDB until [`UtxoCache::flush`]
+//!   writes them. They live in their own map, outside the LRU, so eviction can
+//!   never drop or reorder unflushed data.
+//!
+//! Every mutation (write-through, write-back, flush, clear) holds `gate`, so
+//! the order in which the database is written is the order in which the cache
+//! changes, and a flush can never interleave with a write-through and put an
+//! older value back over a newer one. Each mutation also moves `seq` to an odd
+//! value before it touches the database and back to even when it is done. A
+//! fill records `seq` before its database read and is accepted only if, under
+//! `fill_lock` (which a mutation holds while it changes cache contents), `seq`
+//! is still that same even value: no mutation began, was in flight, or ended
+//! between the read and the fill, so the value read is the current one. A
+//! stale read can therefore never be cached, whatever the interleaving with
+//! writers, flushes or eviction.
 
 use crate::error::StorageError;
 use crate::utxo::{utxo_key, Utxo};
 use divi_primitives::transaction::OutPoint;
-use moka::notification::RemovalCause;
 use moka::sync::Cache;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use rocksdb::{WriteBatch, DB};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(test)]
 use std::sync::Arc;
 use tracing::{debug, error, trace, warn};
 
@@ -40,64 +67,106 @@ pub enum CacheEntry {
     Deleted,
 }
 
-/// High-performance in-memory UTXO cache with LRU eviction and write-back
+impl CacheEntry {
+    fn from_option(utxo: Option<Utxo>) -> Self {
+        match utxo {
+            Some(u) => CacheEntry::Present(u),
+            None => CacheEntry::Deleted,
+        }
+    }
+
+    fn into_option(self) -> Option<Utxo> {
+        match self {
+            CacheEntry::Present(u) => Some(u),
+            CacheEntry::Deleted => None,
+        }
+    }
+}
+
+/// The mutation sequence number observed before a cache-miss database read.
+/// Pass it to [`UtxoCache::fill`] with the value read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use]
+pub struct FillTicket(u64);
+
+#[cfg(test)]
+pub(crate) type SchedHook = Arc<dyn Fn() + Send + Sync>;
+
+/// High-performance in-memory UTXO cache with LRU eviction
 ///
-/// The cache sits between the application and RocksDB, providing:
-/// - Fast lookups for hot UTXOs
-/// - Tombstone tracking for deleted UTXOs
-/// - Dirty tracking for write-back to database
-/// - LRU eviction when capacity is reached
-/// - Safe handling of evicted dirty entries
+/// See the module documentation for the ownership and coherence rules.
 pub struct UtxoCache {
-    /// The underlying moka LRU cache
+    /// The underlying moka LRU cache (clean entries and copies of dirty ones)
     cache: Cache<OutPoint, CacheEntry>,
-    /// Set of dirty (modified but not flushed) outpoints
-    dirty: Arc<RwLock<HashSet<OutPoint>>>,
-    /// Entries that were evicted while dirty - must be flushed to DB
-    evicted_dirty: Arc<RwLock<HashMap<OutPoint, CacheEntry>>>,
+    /// Write-back entries not yet written to the database. Never evicted.
+    /// Changed only while `gate` is held.
+    dirty: RwLock<HashMap<OutPoint, CacheEntry>>,
+    /// Serializes every mutation of the cache and every database write made
+    /// through it
+    gate: Mutex<()>,
+    /// Held by a mutation while it changes cache contents and by a fill while
+    /// it validates its ticket and inserts
+    fill_lock: Mutex<()>,
+    /// Even: no mutation in flight. Odd: a mutation is in flight. Bumped twice
+    /// by every mutation.
+    seq: AtomicU64,
     /// Maximum number of entries
     max_entries: u64,
+    /// Test-only scheduling points (see `sched_point`)
+    #[cfg(test)]
+    hooks: Mutex<HashMap<&'static str, SchedHook>>,
+}
+
+/// One mutation in flight: `seq` is odd while it lives. Dropping it makes
+/// `seq` even again; if the mutation did not settle (it unwound), the touched
+/// outpoints are dropped from memory so the database is read again.
+struct Mutation<'a> {
+    owner: &'a UtxoCache,
+    keys: Vec<OutPoint>,
+    settled: bool,
+}
+
+impl Drop for Mutation<'_> {
+    fn drop(&mut self) {
+        if !self.settled {
+            let _fill = self.owner.fill_lock.lock();
+            let mut dirty = self.owner.dirty.write();
+            for key in &self.keys {
+                self.owner.cache.invalidate(key);
+                dirty.remove(key);
+            }
+        }
+        self.owner.seq.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 impl UtxoCache {
     /// Create a new UTXO cache with the specified maximum entries
     pub fn new(max_entries: u64) -> Self {
-        let dirty = Arc::new(RwLock::new(HashSet::new()));
-        let evicted_dirty = Arc::new(RwLock::new(HashMap::new()));
-        let dirty_clone = dirty.clone();
-        let evicted_dirty_clone = evicted_dirty.clone();
-
-        // Build the cache with an eviction listener
-        // When dirty entries are evicted due to cache pressure (Size),
-        // we save them to evicted_dirty so they can be flushed to DB later.
-        let cache = Cache::builder()
-            .max_capacity(max_entries)
-            .eviction_listener(move |key: Arc<OutPoint>, value, cause| {
-                // For Size evictions (cache pressure), save dirty entries for later flush
-                if cause == RemovalCause::Size {
-                    let was_dirty = dirty_clone.write().remove(&*key);
-                    if was_dirty {
-                        debug!(
-                            "UTXO cache saving evicted dirty entry {}:{} for later flush",
-                            key.txid, key.vout
-                        );
-                        evicted_dirty_clone.write().insert(*key, value);
-                    }
-                } else if cause != RemovalCause::Replaced {
-                    // For non-Replaced evictions, just remove from dirty set
-                    dirty_clone.write().remove(&*key);
-                }
-                // For Replaced, don't touch dirty set - the key still has a new value
-            })
-            .build();
+        let cache = Cache::builder().max_capacity(max_entries).build();
 
         debug!("UTXO cache initialized with max_entries={}", max_entries);
 
         Self {
             cache,
-            dirty,
-            evicted_dirty,
+            dirty: RwLock::new(HashMap::new()),
+            gate: Mutex::new(()),
+            fill_lock: Mutex::new(()),
+            seq: AtomicU64::new(0),
             max_entries,
+            #[cfg(test)]
+            hooks: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Start a mutation. The caller must hold `gate`, and must declare the
+    /// gate guard before the returned value so the mutation ends first.
+    fn begin(&self, keys: Vec<OutPoint>) -> Mutation<'_> {
+        self.seq.fetch_add(1, Ordering::SeqCst);
+        Mutation {
+            owner: self,
+            keys,
+            settled: false,
         }
     }
 
@@ -108,19 +177,12 @@ impl UtxoCache {
     /// - `Some(None)` if the UTXO is known to be deleted (tombstone)
     /// - `None` if the UTXO is not in cache (cache miss)
     pub fn get(&self, outpoint: &OutPoint) -> Option<Option<Utxo>> {
-        // First check the main cache
         if let Some(entry) = self.cache.get(outpoint) {
-            return Some(match entry {
-                CacheEntry::Present(utxo) => Some(utxo),
-                CacheEntry::Deleted => None,
-            });
+            return Some(entry.into_option());
         }
-        // Then check evicted entries that haven't been flushed yet
-        if let Some(entry) = self.evicted_dirty.read().get(outpoint) {
-            return Some(match entry {
-                CacheEntry::Present(utxo) => Some(utxo.clone()),
-                CacheEntry::Deleted => None,
-            });
+        // A dirty entry the LRU evicted is still here until flushed
+        if let Some(entry) = self.dirty.read().get(outpoint) {
+            return Some(entry.clone().into_option());
         }
         None
     }
@@ -132,29 +194,83 @@ impl UtxoCache {
     /// - `Some(false)` if the UTXO is known to be deleted
     /// - `None` if not in cache (cache miss)
     pub fn contains(&self, outpoint: &OutPoint) -> Option<bool> {
-        // First check the main cache
-        if let Some(entry) = self.cache.get(outpoint) {
-            return Some(matches!(entry, CacheEntry::Present(_)));
-        }
-        // Then check evicted entries that haven't been flushed yet
-        if let Some(entry) = self.evicted_dirty.read().get(outpoint) {
-            return Some(matches!(entry, CacheEntry::Present(_)));
-        }
-        None
+        self.get(outpoint).map(|u| u.is_some())
     }
 
-    /// Insert a UTXO into the cache
+    /// Write `changes` (`Some` = present with that value, `None` = deleted) to
+    /// the database with `db_write` and update the cache to match, as one step
+    /// ordered against every other mutation of this cache.
+    ///
+    /// `db_write` must perform the whole durable write (one RocksDB write or
+    /// `WriteBatch`); it runs with the mutation gate held, so it must not call
+    /// back into this cache's writers. If it fails the database is unchanged
+    /// and so is the cache. If it panics the touched outpoints are dropped
+    /// from the cache. A write-through overlapping pending write-back entries is rejected before
+    /// invoking the closure. Flush those entries before mixing write modes.
+    pub fn write_through<R>(
+        &self,
+        changes: Vec<(OutPoint, Option<Utxo>)>,
+        db_write: impl FnOnce() -> Result<R, StorageError>,
+    ) -> Result<R, StorageError> {
+        let _gate = self.gate.lock();
+        // Do not discard pending work if an arbitrary writer unwinds with an
+        // unknown commit outcome. Refuse mixed ownership before invoking it.
+        if changes.iter().any(|(key, _)| self.dirty.read().contains_key(key)) {
+            return Err(StorageError::ChainState(
+                "flush pending UTXO write-back entries before write-through".into(),
+            ));
+        }
+        let mut mutation = self.begin(changes.iter().map(|(k, _)| *k).collect());
+        let result = db_write();
+        if result.is_ok() {
+            self.sched_point("utxo write-through applied");
+            let _fill = self.fill_lock.lock();
+            let mut dirty = self.dirty.write();
+            for (outpoint, utxo) in changes {
+                dirty.remove(&outpoint);
+                self.cache.insert(outpoint, CacheEntry::from_option(utxo));
+            }
+        }
+        mutation.settled = true;
+        result
+    }
+
+    /// Record the mutation sequence before a cache-miss database read
+    pub fn fill_ticket(&self) -> FillTicket {
+        FillTicket(self.seq.load(Ordering::SeqCst))
+    }
+
+    /// Cache `utxo`, read from the database after `ticket` was taken, unless
+    /// any mutation was in flight when the ticket was taken or has begun since
+    /// (the value may then be stale). Negative results are not cached.
+    /// Returns whether the value was cached.
+    pub fn fill(&self, ticket: FillTicket, outpoint: OutPoint, utxo: Option<Utxo>) -> bool {
+        let Some(utxo) = utxo else {
+            return false;
+        };
+        if ticket.0 & 1 == 1 {
+            return false;
+        }
+        let _fill = self.fill_lock.lock();
+        if self.seq.load(Ordering::SeqCst) != ticket.0 {
+            return false;
+        }
+        if self.dirty.read().contains_key(&outpoint) {
+            return false;
+        }
+        self.cache.insert(outpoint, CacheEntry::Present(utxo));
+        true
+    }
+
+    /// Insert a UTXO into the cache (write-back)
     ///
     /// Marks the entry as dirty for later flush to database.
     pub fn insert(&self, outpoint: OutPoint, utxo: Utxo) {
         trace!("Cache insert: {}:{}", outpoint.txid, outpoint.vout);
-        // Remove from evicted_dirty if present (we have a newer value now)
-        self.evicted_dirty.write().remove(&outpoint);
-        self.cache.insert(outpoint, CacheEntry::Present(utxo));
-        self.dirty.write().insert(outpoint);
+        self.write_back(outpoint, CacheEntry::Present(utxo));
     }
 
-    /// Mark a UTXO as deleted in the cache
+    /// Mark a UTXO as deleted in the cache (write-back)
     ///
     /// Inserts a tombstone entry and marks it as dirty for later flush.
     pub fn remove(&self, outpoint: OutPoint) {
@@ -163,17 +279,26 @@ impl UtxoCache {
             outpoint.txid,
             outpoint.vout
         );
-        // Remove from evicted_dirty if present (we have a newer state now)
-        self.evicted_dirty.write().remove(&outpoint);
-        self.cache.insert(outpoint, CacheEntry::Deleted);
-        self.dirty.write().insert(outpoint);
+        self.write_back(outpoint, CacheEntry::Deleted);
+    }
+
+    fn write_back(&self, outpoint: OutPoint, entry: CacheEntry) {
+        let _gate = self.gate.lock();
+        let mut mutation = self.begin(Vec::new());
+        {
+            let _fill = self.fill_lock.lock();
+            self.dirty.write().insert(outpoint, entry.clone());
+            self.cache.insert(outpoint, entry);
+        }
+        mutation.settled = true;
     }
 
     /// Flush all dirty entries to the database
     ///
-    /// Writes all modified entries to RocksDB in a single atomic batch.
-    /// This includes both entries still in cache and entries that were
-    /// evicted due to cache pressure.
+    /// Writes every dirty entry to RocksDB in a single atomic batch. The gate
+    /// is held from the snapshot of the dirty entries until they are cleared,
+    /// so no write can land in between: what is written is the newest value of
+    /// each outpoint, and only what was written is cleared.
     /// Returns the number of entries flushed.
     ///
     /// On failure, entries remain dirty for retry on next flush.
@@ -182,16 +307,22 @@ impl UtxoCache {
             .cf_handle(CF_UTXO)
             .ok_or_else(|| StorageError::ChainState("UTXO column family not found".to_string()))?;
 
+        let _gate = self.gate.lock();
+        let entries: Vec<(OutPoint, CacheEntry)> = self
+            .dirty
+            .read()
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
+        if entries.is_empty() {
+            return Ok(0);
+        }
+        let mut mutation = self.begin(Vec::new());
+        // The cache contents do not change; nothing to undo on any exit
+        mutation.settled = true;
+
         let mut batch = WriteBatch::default();
-        let mut flushed_count = 0;
-
-        // First, flush entries that were evicted while dirty
-        let evicted_entries: Vec<(OutPoint, CacheEntry)> = {
-            let evicted = self.evicted_dirty.read();
-            evicted.iter().map(|(k, v)| (*k, v.clone())).collect()
-        };
-
-        for (outpoint, entry) in &evicted_entries {
+        for (outpoint, entry) in &entries {
             match entry {
                 CacheEntry::Present(utxo) => {
                     batch.put_cf(&cf, utxo_key(outpoint), utxo.to_bytes());
@@ -200,55 +331,27 @@ impl UtxoCache {
                     batch.delete_cf(&cf, utxo_key(outpoint));
                 }
             }
-            flushed_count += 1;
         }
 
-        // Then, flush entries still in cache
-        let to_flush: Vec<OutPoint> = {
-            let dirty = self.dirty.read();
-            dirty.iter().cloned().collect()
-        };
+        self.sched_point("utxo flush");
+        // A test can stop here, as if the write failed after the batch was
+        // built; every entry stays dirty for the retry. Nothing outside test
+        // builds (see `fault`).
+        stop_point!("utxo flush");
 
-        for outpoint in &to_flush {
-            if let Some(entry) = self.cache.get(outpoint) {
-                match &entry {
-                    CacheEntry::Present(utxo) => {
-                        batch.put_cf(&cf, utxo_key(outpoint), utxo.to_bytes());
-                    }
-                    CacheEntry::Deleted => {
-                        batch.delete_cf(&cf, utxo_key(outpoint));
-                    }
-                }
-                flushed_count += 1;
-            }
-        }
-
-        if flushed_count == 0 {
-            return Ok(0);
-        }
-
-        // Attempt atomic write
         match db.write(batch) {
             Ok(()) => {
-                // Success: clear evicted_dirty and remove flushed from dirty set
-                self.evicted_dirty.write().clear();
-                let mut dirty = self.dirty.write();
-                for outpoint in &to_flush {
-                    dirty.remove(outpoint);
-                }
-                debug!(
-                    "UTXO cache flushed {} entries to database ({} evicted, {} in-cache)",
-                    flushed_count,
-                    evicted_entries.len(),
-                    to_flush.len()
-                );
-                Ok(flushed_count)
+                // The gate was held throughout: the dirty map is exactly the
+                // snapshot just written
+                self.dirty.write().clear();
+                debug!("UTXO cache flushed {} entries to database", entries.len());
+                Ok(entries.len())
             }
             Err(e) => {
-                // On failure, entries remain dirty for retry
                 error!(
                     "UTXO cache flush failed: {}. {} entries remain dirty.",
-                    e, flushed_count
+                    e,
+                    entries.len()
                 );
                 Err(StorageError::Database(e))
             }
@@ -256,14 +359,18 @@ impl UtxoCache {
     }
 
     /// Get the number of dirty (unflushed) entries
-    /// Includes both entries in cache and entries evicted but not yet flushed
     pub fn dirty_count(&self) -> usize {
-        self.dirty.read().len() + self.evicted_dirty.read().len()
+        self.dirty.read().len()
     }
 
-    /// Get the number of evicted entries waiting to be flushed
+    /// Get the number of dirty entries the LRU has evicted, still waiting to
+    /// be flushed
     pub fn evicted_count(&self) -> usize {
-        self.evicted_dirty.read().len()
+        self.dirty
+            .read()
+            .keys()
+            .filter(|k| !self.cache.contains_key(*k))
+            .count()
     }
 
     /// Get the current number of entries in the cache
@@ -280,7 +387,7 @@ impl UtxoCache {
     pub fn stats(&self) -> CacheStats {
         CacheStats {
             entry_count: self.cache.entry_count(),
-            dirty_count: self.dirty.read().len(),
+            dirty_count: self.dirty_count(),
             max_entries: self.max_entries,
         }
     }
@@ -290,6 +397,7 @@ impl UtxoCache {
     /// WARNING: This will discard any dirty entries. Call flush() first
     /// if you want to persist changes.
     pub fn clear(&self) {
+        let _gate = self.gate.lock();
         let dirty_count = self.dirty_count();
         if dirty_count > 0 {
             warn!(
@@ -297,24 +405,46 @@ impl UtxoCache {
                 dirty_count
             );
         }
-        self.cache.invalidate_all();
-        self.dirty.write().clear();
+        let mut mutation = self.begin(Vec::new());
+        {
+            let _fill = self.fill_lock.lock();
+            self.cache.invalidate_all();
+            self.dirty.write().clear();
+        }
+        mutation.settled = true;
     }
 
-    /// Populate cache entry from database (for cache misses)
-    ///
-    /// Call this after a cache miss to populate the cache from DB.
-    /// Does NOT mark the entry as dirty since it matches the DB state.
-    pub fn populate_from_db(&self, outpoint: OutPoint, utxo: Option<Utxo>) {
-        match utxo {
-            Some(u) => {
-                self.cache.insert(outpoint, CacheEntry::Present(u));
-            }
-            None => {
-                // Don't cache negative results by default to avoid
-                // filling cache with tombstones during validation
+    /// A point where a test can run code (for example, block until another
+    /// thread has acted) to force one interleaving; nothing outside tests
+    #[inline]
+    pub(crate) fn sched_point(&self, point: &'static str) {
+        #[cfg(test)]
+        {
+            let hook = self.hooks.lock().get(point).cloned();
+            if let Some(hook) = hook {
+                hook();
             }
         }
+        let _ = point;
+    }
+
+    /// Run `hook` whenever `point` is reached (None removes it)
+    #[cfg(test)]
+    pub(crate) fn set_sched_hook(&self, point: &'static str, hook: Option<SchedHook>) {
+        let mut hooks = self.hooks.lock();
+        match hook {
+            Some(h) => {
+                hooks.insert(point, h);
+            }
+            None => {
+                hooks.remove(point);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn run_pending_tasks(&self) {
+        self.cache.run_pending_tasks();
     }
 }
 
@@ -340,301 +470,4 @@ impl std::fmt::Display for CacheStats {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use divi_primitives::amount::Amount;
-    use divi_primitives::hash::Hash256;
-    use divi_primitives::script::Script;
-
-    fn test_outpoint(n: u8) -> OutPoint {
-        OutPoint::new(Hash256::from_bytes([n; 32]), n as u32)
-    }
-
-    fn test_utxo(value: i64) -> Utxo {
-        Utxo::new(
-            Amount::from_sat(value),
-            Script::new_p2pkh(&[0u8; 20]),
-            100,
-            false,
-            false,
-        )
-    }
-
-    #[test]
-    fn test_cache_insert_and_get() {
-        let cache = UtxoCache::new(1000);
-        let outpoint = test_outpoint(1);
-        let utxo = test_utxo(50000);
-
-        // Insert
-        cache.insert(outpoint, utxo.clone());
-
-        // Get should return the UTXO
-        let result = cache.get(&outpoint);
-        assert!(result.is_some());
-        let inner = result.unwrap();
-        assert!(inner.is_some());
-        assert_eq!(inner.unwrap().value, utxo.value);
-
-        // Should be dirty
-        assert_eq!(cache.dirty_count(), 1);
-    }
-
-    #[test]
-    fn test_cache_remove_tombstone() {
-        let cache = UtxoCache::new(1000);
-        let outpoint = test_outpoint(2);
-        let utxo = test_utxo(100000);
-
-        // Insert then remove
-        cache.insert(outpoint, utxo);
-        cache.remove(outpoint);
-
-        // Get should return tombstone (Some(None))
-        let result = cache.get(&outpoint);
-        assert!(result.is_some());
-        assert!(result.unwrap().is_none());
-
-        // Contains should return Some(false)
-        assert_eq!(cache.contains(&outpoint), Some(false));
-    }
-
-    #[test]
-    fn test_cache_miss() {
-        let cache = UtxoCache::new(1000);
-        let outpoint = test_outpoint(3);
-
-        // Get non-existent entry should return None (cache miss)
-        let result = cache.get(&outpoint);
-        assert!(result.is_none());
-
-        // Contains should also return None
-        assert!(cache.contains(&outpoint).is_none());
-    }
-
-    #[test]
-    fn test_cache_contains() {
-        let cache = UtxoCache::new(1000);
-        let outpoint1 = test_outpoint(4);
-        let outpoint2 = test_outpoint(5);
-
-        cache.insert(outpoint1, test_utxo(1000));
-        cache.remove(outpoint2);
-
-        // Present entry
-        assert_eq!(cache.contains(&outpoint1), Some(true));
-
-        // Deleted entry
-        assert_eq!(cache.contains(&outpoint2), Some(false));
-
-        // Non-existent entry
-        assert!(cache.contains(&test_outpoint(99)).is_none());
-    }
-
-    #[test]
-    fn test_cache_stats() {
-        let cache = UtxoCache::new(1000);
-
-        // Empty cache
-        let stats = cache.stats();
-        assert_eq!(stats.entry_count, 0);
-        assert_eq!(stats.dirty_count, 0);
-        assert_eq!(stats.max_entries, 1000);
-
-        // Add some entries
-        cache.insert(test_outpoint(1), test_utxo(100));
-        cache.insert(test_outpoint(2), test_utxo(200));
-        cache.remove(test_outpoint(3));
-
-        // Sync the cache to ensure counts are accurate
-        cache.cache.run_pending_tasks();
-
-        let stats = cache.stats();
-        assert_eq!(stats.entry_count, 3);
-        assert_eq!(stats.dirty_count, 3);
-    }
-
-    #[test]
-    fn test_cache_clear() {
-        let cache = UtxoCache::new(1000);
-
-        cache.insert(test_outpoint(1), test_utxo(100));
-        cache.insert(test_outpoint(2), test_utxo(200));
-
-        // Sync cache to ensure counts are accurate
-        cache.cache.run_pending_tasks();
-
-        assert_eq!(cache.entry_count(), 2);
-        assert_eq!(cache.dirty_count(), 2);
-
-        cache.clear();
-
-        // Sync after clear
-        cache.cache.run_pending_tasks();
-
-        assert_eq!(cache.entry_count(), 0);
-        assert_eq!(cache.dirty_count(), 0);
-    }
-
-    #[test]
-    fn test_populate_from_db() {
-        let cache = UtxoCache::new(1000);
-        let outpoint = test_outpoint(10);
-        let utxo = test_utxo(999999);
-
-        // Populate from DB (simulating cache miss handling)
-        cache.populate_from_db(outpoint, Some(utxo.clone()));
-
-        // Sync cache to ensure counts are accurate
-        cache.cache.run_pending_tasks();
-
-        // Should be in cache but NOT dirty
-        assert_eq!(cache.entry_count(), 1);
-        assert_eq!(cache.dirty_count(), 0);
-
-        let result = cache.get(&outpoint);
-        assert!(result.is_some());
-        assert_eq!(result.unwrap().unwrap().value, utxo.value);
-    }
-
-    #[test]
-    fn test_cache_lru_eviction() {
-        // Small cache for testing eviction
-        let cache = UtxoCache::new(5);
-
-        // Insert 10 entries - should evict older ones
-        for i in 0..10u8 {
-            cache.insert(test_outpoint(i), test_utxo(i as i64 * 100));
-        }
-
-        // Cache should have at most max_entries
-        assert!(cache.entry_count() <= 5);
-    }
-
-    #[test]
-    fn test_max_entries() {
-        let cache = UtxoCache::new(12345);
-        assert_eq!(cache.max_entries(), 12345);
-    }
-
-    #[test]
-    fn test_evicted_count_initially_zero() {
-        let cache = UtxoCache::new(1000);
-        assert_eq!(cache.evicted_count(), 0);
-    }
-
-    #[test]
-    fn test_populate_from_db_none_does_not_cache() {
-        // Populating with None (negative result) should NOT store a tombstone
-        // so the entry remains a cache miss (returns None from get)
-        let cache = UtxoCache::new(1000);
-        let outpoint = test_outpoint(20);
-
-        cache.populate_from_db(outpoint, None);
-
-        // Run pending tasks to flush internal state
-        cache.cache.run_pending_tasks();
-
-        // Should remain a cache miss - no tombstone stored
-        assert!(
-            cache.get(&outpoint).is_none(),
-            "Negative populate_from_db should leave entry as cache miss"
-        );
-        assert_eq!(
-            cache.dirty_count(),
-            0,
-            "populate_from_db(None) must not dirty the cache"
-        );
-    }
-
-    #[test]
-    fn test_insert_overrides_populate_from_db() {
-        let cache = UtxoCache::new(1000);
-        let outpoint = test_outpoint(30);
-        let utxo = test_utxo(12345);
-
-        // First populate from DB
-        cache.populate_from_db(outpoint, Some(test_utxo(99999)));
-        cache.cache.run_pending_tasks();
-
-        // Should not be dirty
-        assert_eq!(cache.dirty_count(), 0);
-
-        // Insert a newer value - this should mark dirty
-        cache.insert(outpoint, utxo.clone());
-
-        let result = cache.get(&outpoint);
-        assert!(result.is_some());
-        assert_eq!(result.unwrap().unwrap().value.as_sat(), 12345);
-        assert_eq!(cache.dirty_count(), 1);
-    }
-
-    #[test]
-    fn test_remove_after_populate_from_db_marks_dirty() {
-        let cache = UtxoCache::new(1000);
-        let outpoint = test_outpoint(40);
-        let utxo = test_utxo(5000);
-
-        // Populate from DB (not dirty)
-        cache.populate_from_db(outpoint, Some(utxo));
-        cache.cache.run_pending_tasks();
-        assert_eq!(cache.dirty_count(), 0);
-
-        // Remove it - should mark dirty (tombstone)
-        cache.remove(outpoint);
-        assert_eq!(cache.dirty_count(), 1);
-
-        // Should now be a tombstone
-        let result = cache.get(&outpoint);
-        assert!(result.is_some());
-        assert!(result.unwrap().is_none()); // tombstone
-    }
-
-    #[test]
-    fn test_cache_multiple_inserts_same_outpoint() {
-        let cache = UtxoCache::new(1000);
-        let outpoint = test_outpoint(50);
-
-        cache.insert(outpoint, test_utxo(100));
-        cache.insert(outpoint, test_utxo(200));
-        cache.insert(outpoint, test_utxo(300));
-
-        cache.cache.run_pending_tasks();
-
-        let result = cache.get(&outpoint);
-        assert!(result.is_some());
-        // Should reflect the latest value
-        assert_eq!(result.unwrap().unwrap().value.as_sat(), 300);
-
-        // Dirty count should be 1 (same outpoint, deduplicated in HashSet)
-        assert_eq!(cache.dirty_count(), 1);
-    }
-
-    #[test]
-    fn test_dirty_count_after_clear_includes_evicted() {
-        let cache = UtxoCache::new(1000);
-
-        cache.insert(test_outpoint(1), test_utxo(100));
-        cache.insert(test_outpoint(2), test_utxo(200));
-        cache.cache.run_pending_tasks();
-        assert_eq!(cache.dirty_count(), 2);
-
-        // clear() discards dirty entries
-        cache.clear();
-        cache.cache.run_pending_tasks();
-        assert_eq!(cache.dirty_count(), 0);
-        assert_eq!(cache.entry_count(), 0);
-    }
-
-    #[test]
-    fn test_stats_display() {
-        let cache = UtxoCache::new(500);
-        cache.insert(test_outpoint(1), test_utxo(100));
-        cache.cache.run_pending_tasks();
-
-        let stats = cache.stats();
-        let display = format!("{}", stats);
-        assert!(display.contains("500"), "Display should show max_entries");
-        assert!(display.contains("dirty"), "Display should mention dirty");
-    }
-}
+mod tests;

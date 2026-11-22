@@ -33,7 +33,7 @@
 //! earlier.
 //!
 //! Reads (EV): a two-source read (BTC `[btc].quorum_reads`, the USDC quorum, DIVI
-//! `fallback_rpc_url`) is `Held` the same way. Beyond the spend read above ([`find_spend`]),
+//! `fallback_rpc_url`) is `Held` the same way. Beyond the spend read above ([`scan_spend`]),
 //! the other reads in front of a refund (the taker's `taker_leg_refundable` and the lock's
 //! confirmations and tip in `taker_leg_lost`, the maker's lock confirmations and
 //! `maker_leg_timed_out`, both refunds' confirmation) are made on the primary alone from the
@@ -44,7 +44,7 @@
 use crate::backend::ChainBackend;
 use crate::error::{Result, SwapError};
 use crate::htlc::HtlcParams;
-use crate::types::{Amount, Outpoint, SignedTx, SpendInfo, Txid};
+use crate::types::{Amount, Outpoint, ScanMark, SignedTx, SpendScan, Txid};
 
 /// What `last_error` says of a public-preimage claim held past its old deadline.
 pub(crate) const NO_REFUND_PATH: &str = "held claim, no refund path: needs a human";
@@ -266,30 +266,31 @@ pub(crate) async fn build_refund(
     Ok(tx)
 }
 
-/// [`ChainBackend::find_spend`] for a read a refund of the HTLC with `locktime` waits on:
+/// [`ChainBackend::scan_spend`] for a read a refund of the HTLC with `locktime` waits on:
 /// held reads are read on the primary alone from the refund deadline ([`refund_deadline`]
 /// with the chain's claim `margin`); `last_error` then names it.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn find_spend(
+pub(crate) async fn scan_spend(
     backend: &dyn ChainBackend,
     at: &Outpoint,
     from_height: u64,
+    resume: Option<&ScanMark>,
     locktime: u32,
     margin: u32,
     swap: &str,
     last_error: &mut Option<String>,
-) -> Result<Option<SpendInfo>> {
-    let why = match backend.find_spend(at, from_height).await {
+) -> Result<SpendScan> {
+    let why = match backend.scan_spend(at, from_height, resume).await {
         Err(SwapError::Held(why)) => why,
         other => return other,
     };
     let deadline = refund_deadline(locktime, margin);
     let view = past_deadline(backend, why.clone(), deadline, swap, "spend read", locktime).await?;
-    let spend = view.find_spend(at, from_height).await?;
+    let scan = view.scan_spend(at, from_height, resume).await?;
     *last_error = Some(format!(
         "spend read on the primary source alone at its hold deadline (held: {why})"
     ));
-    Ok(spend)
+    Ok(scan)
 }
 
 #[cfg(test)]

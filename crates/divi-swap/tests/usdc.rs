@@ -59,7 +59,9 @@ struct World {
 }
 
 async fn setup() -> World {
-    let anvil = Anvil::new().spawn();
+    let anvil = Anvil::new()
+        .chain_id(swap_chain_evm::UsdcNetwork::Sepolia.chain_id())
+        .spawn();
     let endpoint = anvil.endpoint();
 
     let deployer = PrivateKeySigner::from(&anvil.keys()[0]);
@@ -90,8 +92,12 @@ async fn setup() -> World {
             .expect("mint receipt");
     }
 
-    let maker_usdc = UsdcBackend::new(&endpoint, maker_key, htlc, token).expect("maker backend");
-    let taker_usdc = UsdcBackend::new(&endpoint, taker_key, htlc, token).expect("taker backend");
+    let maker_usdc = UsdcBackend::new(&endpoint, maker_key, htlc, token)
+        .expect("maker backend")
+        .with_funding_chain_id(anvil.chain_id());
+    let taker_usdc = UsdcBackend::new(&endpoint, taker_key, htlc, token)
+        .expect("taker backend")
+        .with_funding_chain_id(anvil.chain_id());
 
     let divi = MockChain::new(Chain::Divi, T0, 60);
     World {

@@ -282,7 +282,7 @@ pub struct PeerManager {
     /// Listeners bound before the node starts (bind_listeners): address,
     /// whether its peers are whitelisted, socket. None until bound.
     prebound: parking_lot::Mutex<Option<Vec<(SocketAddr, bool, TcpListener)>>>,
-    /// Inbound connections accepted whose handshake has not finished yet
+    /// Accepted inbound sockets not yet represented in `peers`
     inbound_handshaking: AtomicUsize,
     /// Addresses of other nodes learnt from peers (Divi Core's addrman)
     address_book: Arc<crate::addrbook::AddressBook>,
@@ -295,6 +295,14 @@ pub struct PeerManager {
     /// The clock the manager, its connections, bans and address book read
     /// (the system clock unless a test gives one it moves on)
     clock: crate::peer_clock::PeerClock,
+}
+
+struct InboundReservation(Arc<PeerManager>);
+
+impl Drop for InboundReservation {
+    fn drop(&mut self) {
+        self.0.inbound_handshaking.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl PeerManager {
@@ -400,10 +408,8 @@ impl PeerManager {
     /// first ping goes now, before what the node sends it next (Divi Core pings
     /// before SendMessages, net.cpp:871-893)
     pub fn sporks_arrived(&self, peer_id: PeerId) {
-        if let Some(handle) = self.peers_r().get(&peer_id) {
-            if handle.stats.sporks_arrived() {
-                let _ = handle.try_send(NetworkMessage::Ping(0));
-            }
+        if self.peer_stats(peer_id).is_some_and(|s| s.sporks_arrived()) {
+            let _ = self.send_required(peer_id, NetworkMessage::Ping(0));
         }
     }
 
@@ -411,12 +417,21 @@ impl PeerManager {
     /// sync is started with it, as Divi Core's SendMessages asks for blocks before it
     /// sends the inventory it kept (main.cpp:1304-1330)
     pub fn release_held(&self, peer_id: PeerId) {
-        if let Some(handle) = self.peers_r().get(&peer_id) {
+        let handle = self.peers_r().get(&peer_id).cloned();
+        if let Some(handle) = handle {
             if handle.stats.sporks_wait.load(Ordering::Acquire) {
                 return;
             }
             for msg in handle.stats.take_held() {
-                let _ = handle.try_send(msg);
+                // Already charged on admission, even while held.
+                if handle.tx.try_send(msg).is_err() {
+                    warn!(
+                        "Disconnecting peer {}: cannot release held messages",
+                        peer_id
+                    );
+                    self.disconnect(peer_id);
+                    break;
+                }
             }
         }
     }
@@ -707,6 +722,13 @@ impl PeerManager {
         self.peers_r().len()
     }
 
+    /// A socket alone is not a staking peer.
+    pub fn has_handshaken_peer(&self) -> bool {
+        self.peers_r()
+            .values()
+            .any(|p| p.stats.verack_received.load(Ordering::Acquire))
+    }
+
     /// Get list of connected peer addresses
     pub fn peer_addresses(&self) -> Vec<SocketAddr> {
         self.peers_r().values().map(|p| p.addr).collect()
@@ -806,8 +828,27 @@ impl PeerManager {
     /// Whether another inbound connection may be taken: fewer inbound peers,
     /// counting those still in their handshake, than `max_inbound`
     pub fn has_inbound_room(&self) -> bool {
-        self.inbound_count() + self.inbound_handshaking.load(Ordering::SeqCst)
-            < self.config.max_inbound
+        let peers = self.peers_r();
+        self.inbound_handshaking.load(Ordering::SeqCst)
+            < self
+                .config
+                .max_inbound
+                .saturating_sub(peers.values().filter(|p| p.inbound).count())
+    }
+
+    fn reserve_inbound(self: &Arc<Self>) -> Option<InboundReservation> {
+        // Serialize reservations with registration. Dropping an unregistered
+        // reservation can only increase the available room.
+        let peers = self.peers_w();
+        let room = self
+            .config
+            .max_inbound
+            .saturating_sub(peers.values().filter(|p| p.inbound).count());
+        if self.inbound_handshaking.load(Ordering::SeqCst) >= room {
+            return None;
+        }
+        self.inbound_handshaking.fetch_add(1, Ordering::SeqCst);
+        Some(InboundReservation(Arc::clone(self)))
     }
 
     /// Get count of outbound connections
@@ -1222,20 +1263,17 @@ impl PeerManager {
                             // Divi Core counts every inbound connection, handshake
                             // done or not, against -maxconnections less the outbound
                             // slots; outbound peers do not use them (net.cpp:744-759)
-                            if !self.has_inbound_room() {
+                            let Some(slot) = self.reserve_inbound() else {
                                 // divid's text, in its "net" debug category (net.cpp:757-759)
                                 debug!("connection from {} dropped (full)", peer_addr);
                                 continue;
-                            }
+                            };
 
-                            self.inbound_handshaking.fetch_add(1, Ordering::SeqCst);
                             let self_clone = Arc::clone(&self);
                             self.spawn_task(format!("inbound connection from {peer_addr}"), async move {
-                                let pm = Arc::clone(&self_clone);
-                                if let Err(e) = self_clone.handle_inbound(stream, white).await {
+                                if let Err(e) = self_clone.handle_inbound(stream, white, slot).await {
                                     debug!("Inbound connection error from {}: {}", peer_addr, e);
                                 }
-                                pm.inbound_handshaking.fetch_sub(1, Ordering::SeqCst);
                             });
                         }
                         Err(e) => {
@@ -1535,6 +1573,7 @@ impl PeerManager {
         self: Arc<Self>,
         stream: tokio::net::TcpStream,
         white_listener: bool,
+        slot: InboundReservation,
     ) -> Result<PeerId, NetworkError> {
         // Get peer address and check if banned; a whitelisted peer comes in
         // although its address is banned (net.cpp:760)
@@ -1577,8 +1616,11 @@ impl PeerManager {
             self.scoring.set_whitelisted(peer_id);
         }
 
-        // Store the handle
-        self.peers_w().insert(peer_id, handle);
+        {
+            let mut peers = self.peers_w();
+            peers.insert(peer_id, handle);
+            drop(slot);
+        }
 
         // Run the connection handler
         let self_clone = Arc::clone(&self);
@@ -1619,24 +1661,40 @@ impl PeerManager {
         peer_id: PeerId,
         msg: NetworkMessage,
     ) -> Result<(), NetworkError> {
-        let handle = self.peers_r().get(&peer_id).cloned();
+        self.send_required(peer_id, msg)
+    }
 
-        if let Some(handle) = handle {
-            handle
-                .send(msg)
-                .await
-                .map_err(|_| NetworkError::Disconnected)?;
-            Ok(())
-        } else {
-            Err(NetworkError::PeerNotFound(peer_id))
+    /// A required response is either queued now or this session is retired;
+    /// continuing after a partial response would leave both ends out of step.
+    pub fn send_required(&self, peer_id: PeerId, msg: NetworkMessage) -> Result<(), NetworkError> {
+        match self.try_send_to_peer(peer_id, msg) {
+            TrySend::Sent => Ok(()),
+            TrySend::Full => {
+                warn!("Disconnecting peer {}: protocol send queue full", peer_id);
+                self.disconnect(peer_id);
+                Err(NetworkError::RateLimitExceeded)
+            }
+            TrySend::Gone => Err(NetworkError::PeerNotFound(peer_id)),
         }
+    }
+
+    /// Unsolicited gossip must leave room for directed requests and answers.
+    pub fn send_gossip(&self, peer_id: PeerId, msg: NetworkMessage) -> Result<(), NetworkError> {
+        let peers = self.peers_r();
+        let handle = peers
+            .get(&peer_id)
+            .ok_or(NetworkError::PeerNotFound(peer_id))?;
+        handle.try_enqueue(msg, true).map_err(|e| match *e {
+            tokio::sync::mpsc::error::TrySendError::Full(_) => NetworkError::RateLimitExceeded,
+            tokio::sync::mpsc::error::TrySendError::Closed(_) => NetworkError::Disconnected,
+        })
     }
 
     /// Broadcast a message to all connected peers
     pub fn broadcast(&self, msg: NetworkMessage) {
         let peers = self.peers_r();
         for (peer_id, handle) in peers.iter() {
-            if let Err(e) = handle.try_send(msg.clone()) {
+            if let Err(e) = handle.try_enqueue(msg.clone(), true) {
                 debug!("Failed to broadcast to peer {}: {}", peer_id, e);
             }
         }
@@ -1664,7 +1722,7 @@ impl PeerManager {
         // No per-block line: an announce line would mark own blocks (A11)
         let peers = self.peers_r();
         for (peer_id, handle) in peers.iter() {
-            if let Err(e) = handle.try_send(msg.clone()) {
+            if let Err(e) = handle.try_enqueue(msg.clone(), true) {
                 debug!("Failed to send block inv to peer {}: {}", peer_id, e);
             }
         }
@@ -1688,7 +1746,7 @@ impl PeerManager {
             {
                 continue;
             }
-            if let Err(e) = handle.try_send(msg.clone()) {
+            if let Err(e) = handle.try_enqueue(msg.clone(), true) {
                 debug!("Failed to send block inv to peer {}: {}", peer_id, e);
             }
         }
@@ -1704,7 +1762,7 @@ impl PeerManager {
         let peers = self.peers_r();
         for (peer_id, handle) in peers.iter() {
             if *peer_id != exclude {
-                if let Err(e) = handle.try_send(msg.clone()) {
+                if let Err(e) = handle.try_enqueue(msg.clone(), true) {
                     debug!("Failed to send block inv to peer {}: {}", peer_id, e);
                 }
             }
@@ -1729,16 +1787,27 @@ impl PeerManager {
 
     /// Queue a message for `peer_id` without waiting
     pub fn try_send_to_peer(&self, peer_id: PeerId, msg: NetworkMessage) -> TrySend {
-        let Some(handle) = self.peers_r().get(&peer_id).cloned() else {
-            return TrySend::Gone;
-        };
-        match handle.try_send(msg) {
+        match self.try_queue(peer_id, msg) {
             Ok(()) => TrySend::Sent,
             Err(e) if matches!(*e, tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                 TrySend::Full
             }
             Err(_) => TrySend::Gone,
         }
+    }
+
+    /// Like try_send_to_peer, but return ownership so a deferred response can resume.
+    pub fn try_queue(
+        &self,
+        peer_id: PeerId,
+        msg: NetworkMessage,
+    ) -> Result<(), Box<tokio::sync::mpsc::error::TrySendError<NetworkMessage>>> {
+        let Some(handle) = self.peers_r().get(&peer_id).cloned() else {
+            return Err(Box::new(tokio::sync::mpsc::error::TrySendError::Closed(
+                msg,
+            )));
+        };
+        handle.try_send(msg)
     }
 
     /// The node missed messages it cannot count: every peer may be read again
@@ -1753,7 +1822,7 @@ impl PeerManager {
         let peers = self.peers_r();
         for (peer_id, handle) in peers.iter() {
             if *peer_id != exclude {
-                if let Err(e) = handle.try_send(msg.clone()) {
+                if let Err(e) = handle.try_enqueue(msg.clone(), true) {
                     debug!("Failed to broadcast to peer {}: {}", peer_id, e);
                 }
             }
@@ -2161,6 +2230,66 @@ mod tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn gossip_leaves_room_and_a_full_peer_does_not_delay_another() {
+        use futures::FutureExt;
+        let pm = PeerManager::new(Default::default());
+        let mut a = test_handle("127.0.0.1:1", false);
+        let mut b = test_handle("127.0.0.1:2", false);
+        let (tx, mut slow) = tokio::sync::mpsc::channel(2);
+        a.tx = tx;
+        let (tx, mut other) = tokio::sync::mpsc::channel(2);
+        b.tx = tx;
+        let (a_id, b_id) = (a.id, b.id);
+        pm.insert_test_peer(a);
+        pm.insert_test_peer(b);
+        pm.send_gossip(a_id, NetworkMessage::Inv(vec![])).unwrap();
+        assert!(matches!(
+            pm.send_gossip(a_id, NetworkMessage::Inv(vec![])),
+            Err(NetworkError::RateLimitExceeded)
+        ));
+        pm.send_to_peer(a_id, NetworkMessage::Pong(1))
+            .await
+            .unwrap();
+        let before = tokio::time::Instant::now();
+        assert!(matches!(
+            pm.send_to_peer(a_id, NetworkMessage::Pong(2))
+                .now_or_never(),
+            Some(Err(NetworkError::RateLimitExceeded))
+        ));
+        pm.send_to_peer(b_id, NetworkMessage::Pong(3))
+            .await
+            .unwrap();
+        assert_eq!(before.elapsed(), std::time::Duration::ZERO);
+        assert!(matches!(other.try_recv(), Ok(NetworkMessage::Pong(3))));
+        assert!(matches!(slow.try_recv(), Ok(NetworkMessage::Inv(_))));
+        assert!(matches!(slow.try_recv(), Ok(NetworkMessage::Pong(1))));
+        assert!(slow.is_closed());
+    }
+
+    #[test]
+    fn deferred_response_returns_its_frame_without_charging_it_twice() {
+        let pm = PeerManager::new(Default::default());
+        let mut peer = test_handle("127.0.0.1:1", false);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        peer.tx = tx;
+        let (id, stats) = (peer.id, Arc::clone(&peer.stats));
+        pm.insert_test_peer(peer);
+        let watermark = crate::buffers::max_send_buffer();
+        stats.send_queued_bytes.store(watermark, Ordering::Relaxed);
+        let msg = NetworkMessage::Pong(1);
+        let size = msg.wire_size();
+        let err = pm.try_queue(id, msg).unwrap_err();
+        let tokio::sync::mpsc::error::TrySendError::Full(msg) = *err else {
+            panic!("expected a deferred frame")
+        };
+        assert_eq!(pm.send_queued(id), Some(watermark));
+        stats.send_written(watermark);
+        pm.try_queue(id, msg).unwrap();
+        assert!(matches!(rx.try_recv(), Ok(NetworkMessage::Pong(1))));
+        assert_eq!(pm.send_queued(id), Some(size));
+    }
+
     /// A dial that finishes while a second is being claimed (connect_peer stores
     /// the peer, then drops the address from the dialled set) must not let the
     /// second through: Divi Core's OpenNetworkConnection finds the node with the
@@ -2289,6 +2418,48 @@ mod tests {
             net_group("2001:470:1:2::1".parse().unwrap()),
             net_group("2001:470:ffff::1".parse().unwrap())
         );
+    }
+
+    #[test]
+    fn d4_group_claims_follow_pending_and_established_sessions() {
+        for (first, same, other) in [
+            ("8.8.1.1:51472", "8.8.2.1:51472", "8.9.1.1:51472"),
+            (
+                "[2600:1234:1::1]:51472",
+                "[2600:1234:2::1]:51472",
+                "[2600:1235::1]:51472",
+            ),
+        ] {
+            let pm = PeerManager::new(Default::default());
+            let addr = sa(first);
+            let addr_group = |s: &str| {
+                let bytes = match sa(s).ip() {
+                    IpAddr::V4(v4) => v4.to_ipv6_mapped().octets(),
+                    IpAddr::V6(v6) => v6.octets(),
+                };
+                crate::addrbook::group(&bytes)
+            };
+            assert_eq!(addr_group(first), addr_group(same));
+            assert_ne!(addr_group(first), addr_group(other));
+            assert!(pm.claim_dial(addr, DialRule::Automatic));
+            assert_eq!(pm.peer_count(), 0);
+            assert!(!pm.claim_dial(sa(same), DialRule::Automatic));
+            let handle = test_handle(first, false);
+            let id = handle.id;
+            pm.insert_test_peer(handle);
+            pm.connecting_addrs.write().remove(&addr);
+            assert!(!pm.claim_dial(sa(same), DialRule::Automatic));
+            assert!(pm.claim_dial(sa(other), DialRule::Automatic));
+            pm.remove_test_peer(id);
+            assert!(pm.claim_dial(sa(same), DialRule::Automatic));
+        }
+        let configured = PeerManager::new(PeerManagerConfig {
+            connect_only: true,
+            ..Default::default()
+        });
+        configured.address_book.add_seeds(&[sa("8.8.1.1:51472")]);
+        configured.dial_learnt();
+        assert!(configured.connecting_addrs.read().is_empty());
     }
 
     #[test]
@@ -2548,6 +2719,55 @@ mod tests {
         assert_eq!(pm.peer_count(), 0);
         assert_eq!(pm.inbound_count(), 0);
         assert_eq!(pm.outbound_count(), 0);
+    }
+
+    #[test]
+    fn d4_listeners_share_the_last_inbound_slot() {
+        let pm = PeerManager::new(PeerManagerConfig {
+            max_inbound: 1,
+            ..Default::default()
+        });
+        let start = std::sync::Barrier::new(4);
+        let slots = std::thread::scope(|scope| {
+            let threads: Vec<_> = (0..4)
+                .map(|_| {
+                    scope.spawn(|| {
+                        start.wait();
+                        pm.reserve_inbound()
+                    })
+                })
+                .collect();
+            threads
+                .into_iter()
+                .filter_map(|t| t.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(slots.len(), 1);
+        assert!(!pm.has_inbound_room());
+        drop(slots);
+        assert!(pm.has_inbound_room());
+    }
+
+    #[test]
+    fn d4_reservation_release_and_staking_readiness() {
+        let pm = PeerManager::new(PeerManagerConfig {
+            max_inbound: 1,
+            ..Default::default()
+        });
+        let slot = pm.reserve_inbound().unwrap();
+        assert!(pm.reserve_inbound().is_none());
+        drop(slot);
+        assert!(pm.has_inbound_room());
+        let p = test_handle("127.0.0.1:4000", true);
+        let id = p.id;
+        let stats = p.stats.clone();
+        pm.insert_test_peer(p);
+        assert!(!pm.has_handshaken_peer());
+        stats.verack_received.store(true, Ordering::Release);
+        assert!(pm.has_handshaken_peer());
+        pm.remove_test_peer(id);
+        assert!(!pm.has_handshaken_peer());
+        assert!(pm.reserve_inbound().is_some());
     }
 
     #[test]

@@ -138,7 +138,7 @@ async fn daemon_swaps_ltc_and_zec_both_ways() {
             &taker,
             &client,
             &sessions,
-            &o.id,
+            o,
             o.min_btc_sats,
             &opts,
             &mut || net.mine(),

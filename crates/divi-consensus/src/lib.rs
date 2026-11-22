@@ -92,10 +92,11 @@ pub use pos_calculator::{
 };
 pub use pos_generator::ProofOfStakeGenerator;
 pub use pq_block_sig::{
-    classify_block_sig_format, compute_pos_block_payload_hash, compute_pos_block_signing_prehash,
-    is_classical_coinstake_script, parse_pq_coinstake_script, serialize_pos_block_payload_preimage,
-    verify_block_sig_envelope_binding, BlockSigFormat, CoinstakeStakerBinding, PosBlockAuthPolicy,
-    PqBlockSigEnvelope, PqBlockSigError, VerifiedBlockSigBinding, CLASSICAL_COMPACT_BLOCK_SIG_LEN,
+    check_block_sig_envelope_binding, classify_block_sig_format, compute_pos_block_payload_hash,
+    compute_pos_block_signing_prehash, is_classical_coinstake_script, parse_pq_coinstake_script,
+    serialize_pos_block_payload_preimage, verify_pq_block_signature, BlockSigFormat,
+    CoinstakeStakerBinding, PosBlockAuthPolicy, PqBlockSigEnvelope, PqBlockSigError,
+    UnverifiedBlockSigBinding, VerifiedPqBlockSignature, CLASSICAL_COMPACT_BLOCK_SIG_LEN,
     FN_DSA_512_BLOCK_SIG_ENVELOPE_LEN, ML_DSA_44_BLOCK_SIG_ENVELOPE_LEN, POS_BLOCK_PAYLOAD_DOMAIN,
     POS_BLOCK_PAYLOAD_PREIMAGE_LEN, PQ_BLOCK_SIG_HEADER_LEN, PQ_BLOCK_SIG_MAGIC,
     PQ_BLOCK_SIG_VERSION_V1,

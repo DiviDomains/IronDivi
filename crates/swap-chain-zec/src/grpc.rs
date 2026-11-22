@@ -181,6 +181,8 @@ pub struct CompactBlock {
     /// The block's hash, little-endian (wire) byte order like `BlockID.hash`.
     #[prost(bytes = "vec", tag = "3")]
     pub hash: Vec<u8>,
+    #[prost(bytes = "vec", tag = "4")]
+    pub prev_hash: Vec<u8>,
     #[prost(uint32, tag = "5")]
     pub time: u32,
     #[prost(message, repeated, tag = "7")]
@@ -385,6 +387,7 @@ impl LightwalletdClient {
         endpoint: String,
         path: &'static str,
         req: Req,
+        limit: u64,
     ) -> Result<Vec<Resp>, ClientError>
     where
         Req: prost::Message + Clone + 'static,
@@ -407,6 +410,9 @@ impl LightwalletdClient {
         let mut out = Vec::new();
         loop {
             match stream.message().await {
+                Ok(Some(_)) if out.len() as u64 >= limit => {
+                    return Err(ClientError::Transient("overlong GetBlockRange".into()));
+                }
                 Ok(Some(m)) => out.push(m),
                 Ok(None) => break,
                 Err(status) => return Err(ClientError::from(status)),
@@ -444,7 +450,12 @@ impl LightwalletdClient {
     ) -> Result<Vec<CompactBlock>, ClientError> {
         let req = block_range_request(start, end);
         retry_fallback(&self.endpoints, &self.retry, |ep| {
-            Self::server_streaming(ep, PATH_GET_BLOCK_RANGE, req.clone())
+            Self::server_streaming(
+                ep,
+                PATH_GET_BLOCK_RANGE,
+                req.clone(),
+                start.abs_diff(end).saturating_add(1),
+            )
         })
         .await
     }

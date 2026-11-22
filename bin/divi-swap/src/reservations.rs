@@ -127,6 +127,8 @@ mod tests {
             maker_leg_amount: None,
             maker_leg_claim: None,
             taker_leg_refund: None,
+            taker_leg_sent: false,
+            usdc_admission: None,
             claim_declined: None,
             claim_base_feerate: None,
             claim_feerate: None,

@@ -22,7 +22,9 @@ use async_trait::async_trait;
 use crate::backend::{ChainBackend, ClaimSizes, FeeBump, TipHeader};
 use crate::error::{Result, SwapError};
 use crate::htlc::HtlcParams;
-use crate::types::{Amount, Chain, Funding, LockedOutput, Outpoint, SignedTx, SpendInfo, Txid};
+use crate::types::{
+    Amount, Chain, Funding, LockedOutput, Outpoint, ScanMark, SignedTx, SpendInfo, SpendScan, Txid,
+};
 
 /// Where a transaction is, as one source sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -213,6 +215,15 @@ impl<B: ChainBackend> ChainBackend for TwoSource<B> {
 
     async fn find_spend(&self, outpoint: &Outpoint, from_height: u64) -> Result<Option<SpendInfo>> {
         self.inner.find_spend(outpoint, from_height).await
+    }
+
+    async fn scan_spend(
+        &self,
+        outpoint: &Outpoint,
+        from_height: u64,
+        resume: Option<&ScanMark>,
+    ) -> Result<SpendScan> {
+        self.inner.scan_spend(outpoint, from_height, resume).await
     }
 
     fn lock_finished(&self, at: &Outpoint) {

@@ -18,6 +18,17 @@ export SWAP_BTC_NETWORK="$btc_network"
 usage() { echo "usage: $0 <happy|case-c|case-d> [--backend live|mock] [--offer divi-btc-testnet|btc-divi-testnet] [--maker-url URL]" >&2; exit 2; }
 die() { echo "e2e: $*" >&2; exit 1; }
 
+# `accept`/`run` commit funds only under the user's own direction and price limit. This
+# harness drives the operator's own maker, so its listed terms are the intent; set
+# TAKER_LIMIT_PRICE to hold the quote to a different worst price (DIVI sats per coin).
+intent_flags() { # intent_flags <maker base> <offer id>: prints --direction D --limit-price P
+  curl -sf -m 10 "$1/offers" | python3 -c '
+import json, os, sys
+o = next(o for o in json.load(sys.stdin) if o["id"] == sys.argv[1])
+print("--direction", o["direction"].replace("_", "-"),
+      "--limit-price", os.environ.get("TAKER_LIMIT_PRICE") or o["divi_sats_per_btc"])' "$2"
+}
+
 scenario="${1:-}"; [[ -n "$scenario" ]] || usage
 shift || true
 backend=live
@@ -199,15 +210,18 @@ if [[ -n "$reverse" && "$backend" == live ]]; then
   echo "e2e: preflight ok (offer $offer advertised, maker BTC backend up, taker DIVI balance $have_divi)"
 fi
 
+ifl_s="$(intent_flags "$base" "$offer")" || die "offer $offer is not listed at $base"
+read -r -a ifl <<<"$ifl_s"
+
 if [[ "$backend" == mock ]]; then
   "${taker[@]}" quote --maker "$base" --offer "$offer" --btc-sats "$btc_sats"
-  local_id="$("${taker[@]}" accept --maker "$base" --offer "$offer" --btc-sats "$btc_sats" | tail -1)"
+  local_id="$("${taker[@]}" accept --maker "$base" --offer "$offer" --btc-sats "$btc_sats" "${ifl[@]}" | tail -1)"
   echo "e2e: mock plumbing ok (accepted $local_id); no swap is possible across mock processes"
   exit 0
 fi
 
 out="$state/taker-run.log"
-"${taker[@]}" run --maker "$base" --offer "$offer" --btc-sats "$btc_sats" \
+"${taker[@]}" run --maker "$base" --offer "$offer" --btc-sats "$btc_sats" "${ifl[@]}" \
   --timeout-secs "$timeout_secs" ${taker_flags[@]+"${taker_flags[@]}"} 2>&1 | tee "$out"
 local_id="$(tail -1 "$out" | awk '{print $1}')"
 [[ -n "$local_id" ]] || die "taker run printed no swap id"

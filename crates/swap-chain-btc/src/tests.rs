@@ -427,6 +427,107 @@ async fn find_spend_treats_a_lagging_spender_lookup_as_not_found_yet() {
     assert!(b.find_spend(&fund, 700).await.unwrap().is_none());
 }
 
+// A hash encodes its height in this deterministic chain. Each block has one transaction.
+async fn scan_chain(server: &MockServer, changed_at: Option<u64>) {
+    use wiremock::matchers::path_regex;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/block-height/[0-9]+$"))
+        .respond_with(|r: &wiremock::Request| {
+            let h: u64 = r.url.path().rsplit('/').next().unwrap().parse().unwrap();
+            ResponseTemplate::new(200).set_body_string(format!("{h:064x}"))
+        })
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/block/[0-9a-f]{64}$"))
+        .respond_with(move |r: &wiremock::Request| {
+            let id = r.url.path().rsplit('/').next().unwrap();
+            let h = u64::from_str_radix(id, 16).unwrap();
+            let parent = if changed_at == Some(h) {
+                "ee".repeat(32)
+            } else {
+                format!("{:064x}", h.saturating_sub(1))
+            };
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"id":id,"height":h,"previousblockhash":parent,"tx_count":1}))
+        })
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn unreadable_outspend_index_is_unknown() {
+    for (status, body) in [(200, json!({})), (404, json!({})), (200, json!({"spent":false,"txid":"ab".repeat(32)})), (200,json!({"spent":false,"vin":0})), (200,json!({"spent":false,"status":{"confirmed":true}}))] {
+        let server = MockServer::start().await;
+        let fund = outpoint();
+        Mock::given(method("GET"))
+            .and(path(format!("/tx/{}/outspend/{}", fund.txid, fund.vout)))
+            .respond_with(ResponseTemplate::new(status).set_body_json(body))
+            .mount(&server)
+            .await;
+        let scan = backend(vec![server.uri()], MAKER_KEY)
+            .scan_spend(&fund, 10, None)
+            .await.unwrap();
+        assert_eq!(scan, SpendScan::NotYet { through: None, complete: false });
+    }
+}
+
+#[tokio::test]
+async fn scan_spend_requires_one_branch_and_readable_pages_after_resume() {
+    let page = json!([{"txid":"aa".repeat(32),"vin":[{"is_coinbase":true}]}]);
+    for (new_parent, last_page, valid) in [
+        (None, Some(page.clone()), true),
+        (Some(11), Some(page.clone()), false),
+        (None, Some(json!({})), false),
+        (None, Some(json!([])), false),
+        (None, None, false),
+    ] {
+        let server = MockServer::start().await;
+        let fund = outpoint();
+        Mock::given(method("GET"))
+            .and(path(format!("/tx/{}/outspend/{}", fund.txid, fund.vout)))
+            .respond_with(ResponseTemplate::new(501))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/blocks/tip/height"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("11"))
+            .mount(&server)
+            .await;
+        scan_chain(&server, new_parent).await;
+        for (h, body) in [(10, Some(page.clone())), (11, last_page)] {
+            if let Some(body) = body {
+                Mock::given(method("GET"))
+                    .and(path(format!("/block/{h:064x}/txs/0")))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                    .mount(&server)
+                    .await;
+            }
+        }
+        let resume = ScanMark {
+            height: 10,
+            hash: format!("{:064x}", 10),
+        };
+        let result = backend(vec![server.uri()], MAKER_KEY)
+            .scan_spend(&fund, 10, Some(&resume))
+            .await;
+        if valid {
+            assert_eq!(
+                result.unwrap(),
+                SpendScan::NotYet {
+                    through: Some(ScanMark {
+                        height: 11,
+                        hash: format!("{:064x}", 11)
+                    }),
+                    complete: true
+                }
+            );
+        } else {
+            assert!(result.is_err(), "unexpected scan progress: {result:?}");
+        }
+    }
+}
+
 #[tokio::test]
 async fn find_spend_scans_blocks_without_outspend() {
     let server = MockServer::start().await;
@@ -443,30 +544,16 @@ async fn find_spend_scans_blocks_without_outspend() {
         .respond_with(ResponseTemplate::new(200).set_body_string("11"))
         .mount(&server)
         .await;
+    scan_chain(&server, None).await;
     Mock::given(method("GET"))
-        .and(path("/block-height/10"))
-        .respond_with(ResponseTemplate::new(200).set_body_string("blockhash10"))
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/block-height/11"))
-        .respond_with(ResponseTemplate::new(200).set_body_string("blockhash11"))
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/block/blockhash10/txs/0"))
+        .and(path(format!("/block/{:064x}/txs/0", 10)))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!([
             {"txid": "cd".repeat(32), "vin": [{"txid": "00".repeat(32), "vout": 0, "scriptsig": "", "witness": []}]}
         ])))
         .mount(&server)
         .await;
     Mock::given(method("GET"))
-        .and(path("/block/blockhash10/txs/1"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/block/blockhash11/txs/0"))
+        .and(path(format!("/block/{:064x}/txs/0", 11)))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!([
             {"txid": "ef".repeat(32), "vin": [{"txid": fund.txid.to_rpc_hex(), "vout": 1, "scriptsig": "",
               "witness": [hex::encode([0x30u8; 71]), hex::encode(pre), "01", hex::encode(h.redeem_script())]}]}
@@ -481,6 +568,104 @@ async fn find_spend_scans_blocks_without_outspend() {
         .expect("found by scan");
     assert_eq!(spend.height, Some(11));
     assert_eq!(spend.extract_preimage(&hash), Some(pre));
+}
+
+/// H2: the block-scan fallback reads at most `MAX_SCAN_BLOCKS` per pass and says it stopped
+/// short of the tip (never "unspent"); a resumed pass whose marked block changed, or whose
+/// tip fell below it, reports the reorg.
+#[tokio::test]
+async fn scan_spend_fallback_reports_its_reach_and_a_changed_mark() {
+    use wiremock::matchers::path_regex;
+    let server = MockServer::start().await;
+    let fund = outpoint();
+    Mock::given(method("GET"))
+        .and(path(format!("/tx/{}/outspend/1", fund.txid)))
+        .respond_with(ResponseTemplate::new(501))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/blocks/tip/height"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("1000"))
+        .mount(&server)
+        .await;
+    scan_chain(&server, None).await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/block/[0-9a-f]+/txs/0$"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!([{"txid":"aa".repeat(32),"vin":[{"is_coinbase":true}]}])),
+        )
+        .mount(&server)
+        .await;
+    let b = backend(vec![server.uri()], MAKER_KEY);
+    let mark = ScanMark {
+        height: 10 + MAX_SCAN_BLOCKS - 1,
+        hash: format!("{:064x}", 10 + MAX_SCAN_BLOCKS - 1),
+    };
+    assert_eq!(
+        b.scan_spend(&fund, 10, None).await.unwrap(),
+        SpendScan::NotYet {
+            through: Some(mark.clone()),
+            complete: false
+        }
+    );
+    assert_eq!(b.find_spend(&fund, 10).await.unwrap(), None);
+    let moved = ScanMark {
+        hash: "bb".repeat(32),
+        ..mark.clone()
+    };
+    assert_eq!(
+        b.scan_spend(&fund, mark.height, Some(&moved))
+            .await
+            .unwrap(),
+        SpendScan::Reorged
+    );
+    let above_tip = ScanMark {
+        height: 1001,
+        ..mark
+    };
+    assert_eq!(
+        b.scan_spend(&fund, 1001, Some(&above_tip)).await.unwrap(),
+        SpendScan::Reorged
+    );
+}
+
+/// H2: a quorum pass reaches only as far as both endpoints read, and an index answer
+/// covers what the other endpoint scanned.
+#[test]
+fn quorum_scan_keeps_the_lower_mark() {
+    let m = |height: u64, b: &str| ScanMark {
+        height,
+        hash: b.repeat(32),
+    };
+    let not_yet = |through: Option<ScanMark>, complete| SpendScan::NotYet { through, complete };
+    let join = |a, b| crate::quorum::agree_scan(a, b).unwrap();
+    assert_eq!(
+        join(
+            not_yet(Some(m(20, "aa")), false),
+            not_yet(Some(m(15, "bb")), false)
+        ),
+        not_yet(Some(m(15, "bb")), false)
+    );
+    assert_eq!(
+        join(
+            not_yet(Some(m(20, "aa")), true),
+            not_yet(Some(m(20, "bb")), true)
+        ),
+        not_yet(None, false)
+    );
+    assert_eq!(
+        join(not_yet(None, true), not_yet(Some(m(20, "aa")), false)),
+        not_yet(Some(m(20, "aa")), false)
+    );
+    assert_eq!(
+        join(not_yet(None, false), not_yet(Some(m(20, "aa")), true)),
+        not_yet(None, false)
+    );
+    assert_eq!(
+        join(SpendScan::Reorged, not_yet(None, true)),
+        SpendScan::Reorged
+    );
 }
 
 #[tokio::test]

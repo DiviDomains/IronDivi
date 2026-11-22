@@ -1989,7 +1989,7 @@ async function swapsView() {
 function consoleView() {
   const out = h("pre", { class: "out" });
   show(h("section", {}, h("h2", {}, "Console"),
-    h("p", { class: "muted" }, "Any daemon call, as with divi-cli. Key exports are refused; spending unlocks last " +
+    h("p", { class: "muted" }, "Wallet and read-only node calls, as with divi-cli. Key exports and node-operator calls (stop, backupwallet, mining, peers, and the like) are refused here; use irondivi-cli for those. Spending unlocks last " +
       state.max_full_unlock + " seconds at most."),
     form("Call", [
       field("Method", "method", "text", { placeholder: "getblockcount", autofocus: true }),

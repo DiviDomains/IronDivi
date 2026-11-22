@@ -680,8 +680,13 @@ mod native {
             now: u32,
             start: ExpiryStart,
         ) -> Result<usize> {
-            self.release_expired_from(backend, &swap_locks(store, backend.chain())?, now, start)
-                .await
+            self.release_expired_from(
+                backend,
+                &expirable_locks(store, backend.chain())?,
+                now,
+                start,
+            )
+            .await
         }
 
         /// The tip height at which the expiry sweep first found `lock` absent past its
@@ -839,6 +844,7 @@ mod native {
         tx: SignedTx,
         locktime: Option<u32>,
         finished: bool,
+        pending_usdc_send: bool,
     }
 
     /// Every lock a swap in `store` funded on `chain`: the maker leg of each maker swap and the
@@ -850,6 +856,9 @@ mod native {
                 out.push(SwapLock {
                     tx: f.tx.clone(),
                     locktime: s.maker_leg_htlc.map(|h| h.locktime),
+                    pending_usdc_send: s.quote.counter_chain == Chain::Usdc
+                        && s.state == crate::SwapState::MakerLocked
+                        && !s.maker_lock_sent,
                     finished: matches!(s.state, crate::SwapState::Done | crate::SwapState::Lost),
                 });
             }
@@ -859,6 +868,9 @@ mod native {
                 out.push(SwapLock {
                     tx: f.tx.clone(),
                     locktime: s.taker_leg_htlc.map(|h| h.locktime),
+                    pending_usdc_send: s.quote.counter_chain == Chain::Usdc
+                        && s.state == crate::TakerState::Locked
+                        && !s.taker_leg_sent,
                     finished: s.state.is_terminal(),
                 });
             }
@@ -866,11 +878,20 @@ mod native {
         Ok(out)
     }
 
-    /// The `(txid, HTLC locktime)` of every lock a swap in `store` funded on `chain`: the maker
-    /// leg of each maker swap and the taker leg of each taker swap, whatever their state.
+    /// Every stored funding transaction on this chain with a known HTLC deadline.
     pub fn swap_locks(store: &Store, chain: Chain) -> Result<Vec<(Txid, u32)>> {
         Ok(locks_on(store, chain)?
             .into_iter()
+            .filter_map(|l| Some((l.tx.txid, l.locktime?)))
+            .collect())
+    }
+
+    // A signed USDC swap with an unknown send outcome keeps its inputs even if
+    // neither endpoint can currently see the lock.
+    fn expirable_locks(store: &Store, chain: Chain) -> Result<Vec<(Txid, u32)>> {
+        Ok(locks_on(store, chain)?
+            .into_iter()
+            .filter(|l| !l.pending_usdc_send)
             .filter_map(|l| Some((l.tx.txid, l.locktime?)))
             .collect())
     }
@@ -927,7 +948,7 @@ mod native {
                 return Ok(0);
             }
             let released = self
-                .release_expired_from(backend, &swap_locks(store, chain)?, now, start)
+                .release_expired_from(backend, &expirable_locks(store, chain)?, now, start)
                 .await?;
             if released == 0 {
                 return Ok(0);

@@ -27,7 +27,7 @@
 //!
 //! Hashes are stored in internal (little-endian) byte order, like `uint256`.
 
-use divi_crypto::{double_sha256, sign_hash_recoverable, RecoverableSig, SecretKey};
+use divi_crypto::{double_sha256, hash160, sign_hash_recoverable, RecoverableSig, SecretKey};
 use std::fmt;
 
 /// C++ `strMessageMagic` for masternode message signatures.
@@ -201,12 +201,8 @@ impl CppTxIn {
                 .collect();
             s.push_str(&format!(", coinbase {}", hex));
         } else {
-            let hex: String = self
-                .script_sig
-                .iter()
-                .map(|b| format!("{:02x}", b))
-                .collect();
-            s.push_str(&format!(", scriptSig={}", &hex[..hex.len().min(24)]));
+            let asm = divi_script::asm::to_asm(&self.script_sig);
+            s.push_str(&format!(", scriptSig={}", &asm[..asm.len().min(24)]));
         }
         if self.sequence != u32::MAX {
             s.push_str(&format!(", nSequence={}", self.sequence));
@@ -429,29 +425,80 @@ impl CppBroadcast {
         self.port = port;
     }
 
-    /// C++ `CService::ToString`: `a.b.c.d:port` for IPv4, `[x:x:...]:port` for IPv6 (groups are
-    /// not zero-compressed in the C++ formatter).
+    /// Format the service for the C++ broadcast signature.
     pub fn service_string(&self) -> String {
-        const V4_PREFIX: [u8; 12] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff];
-        if self.ip[..12] == V4_PREFIX {
-            format!(
-                "{}.{}.{}.{}:{}",
-                self.ip[12], self.ip[13], self.ip[14], self.ip[15], self.port
-            )
-        } else {
-            let groups: Vec<String> = self
-                .ip
-                .chunks(2)
-                .map(|c| format!("{:x}", u16::from_be_bytes([c[0], c[1]])))
-                .collect();
-            format!("[{}]:{}", groups.join(":"), self.port)
+        String::from_utf8_lossy(&self.service_bytes()).into_owned()
+    }
+
+    /// Preserve native C++ address bytes for signature preimages.
+    fn service_bytes(&self) -> Vec<u8> {
+        const ONION_PREFIX: [u8; 6] = [0xfd, 0x87, 0xd8, 0x7e, 0xeb, 0x43];
+        if self.ip.starts_with(&ONION_PREFIX) {
+            const ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
+            let mut bits = 0u16;
+            let mut count = 0;
+            let mut host = String::with_capacity(16);
+            for byte in &self.ip[6..] {
+                bits = (bits << 8) | u16::from(*byte);
+                count += 8;
+                while count >= 5 {
+                    count -= 5;
+                    host.push(ALPHABET[((bits >> count) & 31) as usize] as char);
+                }
+            }
+            return format!("{host}.onion:{}", self.port).into_bytes();
         }
+        let addr = std::net::Ipv6Addr::from(self.ip);
+        if let Some(v4) = addr.to_ipv4_mapped() {
+            return format!("{v4}:{}", self.port).into_bytes();
+        }
+        let socket = socket2::SockAddr::from(std::net::SocketAddrV6::new(addr, 0, 0, 0));
+        let mut host = [0u8; 1025];
+        #[cfg(unix)]
+        use libc::{getnameinfo, NI_NUMERICHOST};
+        #[cfg(windows)]
+        use windows_sys::Win32::Networking::WinSock::{getnameinfo, NI_NUMERICHOST};
+
+        // SAFETY: socket owns the sockaddr for this call. The host buffer is writable
+        // for the supplied length. A null service pointer with length zero is valid.
+        let status = unsafe {
+            getnameinfo(
+                socket.as_ptr().cast(),
+                socket.len() as _,
+                host.as_mut_ptr().cast(),
+                host.len() as _,
+                std::ptr::null_mut(),
+                0,
+                NI_NUMERICHOST as _,
+            )
+        };
+        if status == 0 {
+            let end = host
+                .iter()
+                .position(|&byte| byte == 0)
+                .unwrap_or(host.len());
+            return Self::native_service_bytes(&host[..end], self.port);
+        }
+        let groups = addr.segments().map(|segment| format!("{segment:x}"));
+        format!("[{}]:{}", groups.join(":"), self.port).into_bytes()
     }
 
     /// C++ `CMasternodeBroadcast::getMessageToSign`:
     /// `addr.ToString() + sigTime + pubKeyCollateral bytes + pubKeyMasternode bytes + protocolVersion`
     pub fn message_to_sign(&self) -> Vec<u8> {
-        let mut m = self.service_string().into_bytes();
+        self.message_with_service(self.service_bytes())
+    }
+
+    fn native_service_bytes(host: &[u8], port: u16) -> Vec<u8> {
+        let mut service = Vec::with_capacity(host.len() + 9);
+        service.push(b'[');
+        service.extend_from_slice(host);
+        service.extend_from_slice(b"]:");
+        service.extend_from_slice(port.to_string().as_bytes());
+        service
+    }
+
+    fn message_with_service(&self, mut m: Vec<u8>) -> Vec<u8> {
         m.extend_from_slice(self.sig_time.to_string().as_bytes());
         m.extend_from_slice(&self.pubkey_collateral);
         m.extend_from_slice(&self.pubkey_masternode);
@@ -562,14 +609,53 @@ impl CppWinner {
     }
 }
 
-/// Check that `signature` over `message` recovers to `pubkey`
-pub fn verify_message(pubkey: &[u8], signature: &[u8], message: &[u8]) -> bool {
-    let Ok(sig) = RecoverableSig::from_compact_with_recovery(signature) else {
-        return false;
+/// Recover the signing key's `CKeyID` (`Hash160`) from a 65-byte compact
+/// recoverable `signature` over `hash`, matching C++ Divi
+/// `CPubKey::RecoverCompact` + `CPubKey::GetID` (pubkey.cpp:181-199,
+/// pubkey.h:146-148).
+///
+/// C++ derives both the recovery id and the compression flag from *any* header
+/// byte with `recid = (vchSig[0] - 27) & 3` and `fComp = ((vchSig[0] - 27) & 4)
+/// != 0`, serializes the recovered key in that form and hashes it. A header byte
+/// never rejects on its own (only a wrong length or an unrecoverable `r`/`s`
+/// does), so a signature re-headed from `31 + r` to `39 + r` recovers the same
+/// key in the same (compressed) form — the S11 divergence.
+///
+/// This is the message-path analogue of A1's block-path helper. It is
+/// deliberately NOT shared code: the block path compares an output's pubkey hash
+/// (in `divi-storage` `chain.rs`), whereas messages compare the signer's
+/// `CKeyID` against a caller-supplied key.
+fn recover_compact_key_id(signature: &[u8], hash: &[u8; 32]) -> Option<[u8; 20]> {
+    if signature.len() != 65 {
+        return None;
+    }
+    let header = signature[0] as i32;
+    let recid = (header - 27) & 3;
+    let compressed = ((header - 27) & 4) != 0;
+    // `from_compact_with_recovery` maps header 31..=34 to recovery id 0..=3; feed
+    // it a normalised header so recovery uses the C++-masked recid for *any* byte.
+    let mut normalised = [0u8; 65];
+    normalised[0] = (31 + recid) as u8;
+    normalised[1..].copy_from_slice(&signature[1..65]);
+    let sig = RecoverableSig::from_compact_with_recovery(&normalised).ok()?;
+    let recovered = sig.recover_from_hash(hash).ok()?;
+    let serialized = if compressed {
+        recovered.serialize_compressed().to_vec()
+    } else {
+        recovered.serialize_uncompressed().to_vec()
     };
-    match sig.recover_from_hash(&message_hash(message)) {
-        Ok(recovered) => recovered.to_bytes() == pubkey,
-        Err(_) => false,
+    Some(hash160(&serialized).0)
+}
+
+/// Check that `signature` verifies `message` against `pubkey`, matching C++ Divi
+/// `CObfuScationSigner::VerifyMessage` (obfuscation.cpp:59-74): recover the key
+/// with [`recover_compact_key_id`] and compare `CKeyID`s (`Hash160`), not raw
+/// serialized bytes. The compression flag therefore participates in the compare,
+/// so an uncompressed-header signature only matches an uncompressed `pubkey`.
+pub fn verify_message(pubkey: &[u8], signature: &[u8], message: &[u8]) -> bool {
+    match recover_compact_key_id(signature, &message_hash(message)) {
+        Some(recovered_id) => recovered_id == hash160(pubkey).0,
+        None => false,
     }
 }
 
@@ -597,6 +683,51 @@ mod tests {
         };
         b.set_service("10.1.2.3".parse().unwrap(), 51474);
         b
+    }
+
+    #[test]
+    fn ping_input_displays_script_as_cpp_assembly() {
+        let vin = CppTxIn {
+            prevout_hash: [1; 32],
+            prevout_n: 2,
+            script_sig: vec![0x51],
+            sequence: u32::MAX,
+        };
+        assert_eq!(
+            vin.to_cpp_string(),
+            format!("CTxIn(COutPoint({}, 2), scriptSig=1)", "01".repeat(32))
+        );
+    }
+
+    #[test]
+    fn null_input_displays_script_as_coinbase_hex() {
+        let vin = CppTxIn {
+            prevout_hash: [0; 32],
+            prevout_n: u32::MAX,
+            script_sig: vec![0x51],
+            sequence: u32::MAX,
+        };
+        assert_eq!(
+            vin.to_cpp_string(),
+            format!(
+                "CTxIn(COutPoint({}, 4294967295), coinbase 51)",
+                "00".repeat(32)
+            )
+        );
+    }
+
+    #[test]
+    fn native_zone_bytes_are_preserved_in_broadcast_preimage() {
+        let b = sample();
+        let service = CppBroadcast::native_service_bytes(b"fe80::1%zone\xff", 51474);
+        assert_eq!(service, b"[fe80::1%zone\xff]:51474");
+        let mut expected = service.clone();
+        expected.extend_from_slice(b.sig_time.to_string().as_bytes());
+        expected.extend_from_slice(&b.pubkey_collateral);
+        expected.extend_from_slice(&b.pubkey_masternode);
+        expected.extend_from_slice(b.protocol_version.to_string().as_bytes());
+        assert_eq!(b.message_with_service(service), expected);
+        assert!(std::str::from_utf8(&expected).is_err());
     }
 
     #[test]
@@ -637,8 +768,18 @@ mod tests {
         assert_eq!(b.message_to_sign(), m);
 
         let mut v6 = sample();
-        v6.set_service("2001:db8::1".parse().unwrap(), 5);
-        assert_eq!(v6.service_string(), "[2001:db8:0:0:0:0:0:1]:5");
+        for (addr, expected) in [
+            ("2001:db8::1", "[2001:db8::1]:5"),
+            ("2001:0:0:1:0:0:2:3", "[2001::1:0:0:2:3]:5"),
+            ("::ffff:192.0.2.7", "192.0.2.7:5"),
+            (
+                "fd87:d87e:eb43:0001:0203:0405:0607:0809",
+                "aaaqeayeaudaocaj.onion:5",
+            ),
+        ] {
+            v6.set_service(addr.parse().unwrap(), 5);
+            assert_eq!(v6.service_string(), expected);
+        }
     }
 
     /// A payment vote as `mnw` carries it: vin, height, payee script,
@@ -674,6 +815,13 @@ mod tests {
         assert!(w.signature_is_valid(&key.public_key().to_bytes()));
         let other = SecretKey::new_random();
         assert!(!w.signature_is_valid(&other.public_key().to_bytes()));
+        w.vin = CppTxIn::new([0; 32], 2);
+        w.payee = vec![0x51];
+        assert_eq!(
+            w.message_to_sign(),
+            b"0000000000000000000000000000000000000000000000000000000000000000-212341"
+        );
+
         let mut extra = bytes.clone();
         extra.push(0);
         assert_eq!(CppWinner::decode(&extra), Err(WireError::TrailingData));
@@ -718,5 +866,89 @@ mod tests {
         // any change to the signed fields invalidates it
         b.sig_time += 1;
         assert!(!b.signature_is_valid());
+    }
+
+    // ---- A2 (S11): spork/masternode message-path parity fixtures ----
+    //
+    // Ground truth generated and checked by the pinned C++ Divi control in
+    // `A2-scratch/cpp-controls/` (RecoverCompact + GetID over the magic-framed
+    // `CHashWriter` hash; MISMATCHES=0). The bytes below are the control's exact
+    // output; `expected` is C++'s accept(1)/reject(0). Synthetic keys only
+    // (secret keys 0x11.. and 0x22..); no real spork or masternode keys.
+    fn h(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    const C1: &str = "034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa";
+    const U1: &str = "044f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa385b6b1b8ead809ca67454d9683fcf2ba03456d6fe2c4abe2b07f0fbdbb2f1c1";
+    const C2: &str = "02466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f27";
+    const SPORK_MSG: &[u8] = b"100011700000000";
+    const MN_MSG: &[u8] = b"mn-vote:height=1000;payee=synthetic";
+
+    #[test]
+    fn message_hash_matches_cpp_chashwriter_magic_framing() {
+        // Proves the DarkNet magic + CompactSize framing equals the C++ control's
+        // CHashWriter(SER_GETHASH,0) << strMessageMagic << strMessage.
+        // The control prints uint256::GetHex(), in reverse digest byte order.
+        let cpp_hex = |msg| {
+            let mut digest = message_hash(msg);
+            digest.reverse();
+            hex::encode(digest)
+        };
+        assert_eq!(
+            cpp_hex(SPORK_MSG),
+            "3a5af4cc681e654516261fdc64cba4fd594d6c018051ef1852fd19f4f0315e5a"
+        );
+        assert_eq!(
+            cpp_hex(MN_MSG),
+            "bdab2f0fbe09ce41a38ad9183d26724bc2d0d7c14bf87aa17d9aaf942ad65f89"
+        );
+    }
+
+    #[test]
+    fn verify_message_matches_cpp_recover_compact_getid() {
+        struct Case {
+            name: &'static str,
+            msg: &'static [u8],
+            key: &'static str,
+            sig: &'static str,
+            expected: bool,
+        }
+        let cases = [
+            Case { name: "spork_orig_compressed", msg: SPORK_MSG, key: C1,
+                sig: "1f4cfccf5d1eef870996793ec21f33f5dceef67d8dee097013dfe8870e1492347c449509e8756ba68eb7ed94d650c03be6d911bb4bdc3e15fb4800e99254eba8a5", expected: true },
+            // S11: a spork re-headed from 31+r to 39+r stays valid for both clients.
+            Case { name: "spork_reheaded_plus8", msg: SPORK_MSG, key: C1,
+                sig: "274cfccf5d1eef870996793ec21f33f5dceef67d8dee097013dfe8870e1492347c449509e8756ba68eb7ed94d650c03be6d911bb4bdc3e15fb4800e99254eba8a5", expected: true },
+            // uncompressed-flag header must NOT match a compressed key (GetID differs).
+            Case { name: "spork_uncompressed_hdr_vs_c1", msg: SPORK_MSG, key: C1,
+                sig: "1b4cfccf5d1eef870996793ec21f33f5dceef67d8dee097013dfe8870e1492347c449509e8756ba68eb7ed94d650c03be6d911bb4bdc3e15fb4800e99254eba8a5", expected: false },
+            // the same signature DOES match the uncompressed key form.
+            Case { name: "spork_uncompressed_hdr_vs_u1", msg: SPORK_MSG, key: U1,
+                sig: "1b4cfccf5d1eef870996793ec21f33f5dceef67d8dee097013dfe8870e1492347c449509e8756ba68eb7ed94d650c03be6d911bb4bdc3e15fb4800e99254eba8a5", expected: true },
+            Case { name: "spork_wrong_key", msg: SPORK_MSG, key: C2,
+                sig: "1f4cfccf5d1eef870996793ec21f33f5dceef67d8dee097013dfe8870e1492347c449509e8756ba68eb7ed94d650c03be6d911bb4bdc3e15fb4800e99254eba8a5", expected: false },
+            Case { name: "spork_truncated", msg: SPORK_MSG, key: C1,
+                sig: "1f4cfccf5d1eef870996793ec21f33f5dceef67d8dee097013dfe8870e1492347c449509e8756ba68eb7ed94d650c03be6d911bb4bdc3e15fb4800e99254eba8", expected: false },
+            Case { name: "mn_orig_compressed", msg: MN_MSG, key: C1,
+                sig: "1f2f99f8c15f9b21719e42f92c056474791273ffb4fb2343a9dd30d49f9e90d568667cc86d525f9c49d7d8934749fb9e8345ebdd7effca9268667b177afce407aa", expected: true },
+            Case { name: "mn_reheaded_plus8", msg: MN_MSG, key: C1,
+                sig: "272f99f8c15f9b21719e42f92c056474791273ffb4fb2343a9dd30d49f9e90d568667cc86d525f9c49d7d8934749fb9e8345ebdd7effca9268667b177afce407aa", expected: true },
+            Case { name: "mn_uncompressed_hdr_vs_c1", msg: MN_MSG, key: C1,
+                sig: "1b2f99f8c15f9b21719e42f92c056474791273ffb4fb2343a9dd30d49f9e90d568667cc86d525f9c49d7d8934749fb9e8345ebdd7effca9268667b177afce407aa", expected: false },
+            Case { name: "mn_wrong_message", msg: b"tampered", key: C1,
+                sig: "1f2f99f8c15f9b21719e42f92c056474791273ffb4fb2343a9dd30d49f9e90d568667cc86d525f9c49d7d8934749fb9e8345ebdd7effca9268667b177afce407aa", expected: false },
+        ];
+        for c in &cases {
+            let got = verify_message(&h(c.key), &h(c.sig), c.msg);
+            assert_eq!(
+                got, c.expected,
+                "case {} diverged from C++ ground truth",
+                c.name
+            );
+        }
     }
 }

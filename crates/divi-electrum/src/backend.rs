@@ -12,6 +12,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
+use crate::limits::MAX_HISTORY_ENTRIES;
 use divi_crypto::hash::{double_sha256, sha256};
 use divi_primitives::block::BlockHeader;
 use divi_primitives::hash::Hash256;
@@ -173,7 +174,18 @@ pub struct Backend {
     chain: Arc<Chain>,
     mempool: Arc<dyn MempoolProvider>,
     rpc: Arc<RpcServer>,
+    /// Blocking calls running at once, over every session; waiting for one
+    /// is first come, first served
+    work: Arc<tokio::sync::Semaphore>,
+    pub(crate) notifications: Arc<tokio::sync::Semaphore>,
+    /// Scripthash subscriptions over every session
+    subscriptions: Arc<crate::limits::SubscriptionPool>,
 }
+
+/// Most calls into the chain and mempool running at once, all sessions
+/// together: the blocking pool is shared with the rest of the node, and a
+/// flood of requests should wait here, not take its threads
+pub const MAX_CONCURRENT_CALLS: usize = 8;
 
 impl Backend {
     pub fn new(chain: Arc<Chain>, mempool: Arc<dyn MempoolProvider>, rpc: Arc<RpcServer>) -> Self {
@@ -181,7 +193,21 @@ impl Backend {
             chain,
             mempool,
             rpc,
+            work: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CALLS - 1)),
+            notifications: Arc::new(tokio::sync::Semaphore::new(1)),
+            subscriptions: Arc::new(crate::limits::SubscriptionPool::new(
+                crate::limits::MAX_TOTAL_SUBSCRIPTIONS,
+            )),
         }
+    }
+
+    pub fn subscriptions(&self) -> &Arc<crate::limits::SubscriptionPool> {
+        &self.subscriptions
+    }
+
+    /// The permits for calls that run at once
+    pub fn work(&self) -> &Arc<tokio::sync::Semaphore> {
+        &self.work
     }
 
     pub fn genesis_hash(&self) -> Hash256 {
@@ -205,11 +231,18 @@ impl Backend {
 
     /// The tip as `blockchain.headers.subscribe` reports it
     pub fn tip(&self) -> Result<Value> {
+        self.header_snapshot().map(|(header, _)| header)
+    }
+
+    pub(crate) fn header_snapshot(&self) -> Result<(Value, Hash256)> {
         let tip = self
             .chain
             .tip()
             .ok_or_else(|| ElectrumError::daemon("no chain tip"))?;
-        Ok(json!({ "hex": hex::encode(header_bytes(&tip)), "height": tip.height }))
+        Ok((
+            json!({ "hex": hex::encode(header_bytes(&tip)), "height": tip.height }),
+            tip.hash,
+        ))
     }
 
     pub fn tip_hash(&self) -> Option<Hash256> {
@@ -253,18 +286,23 @@ impl Backend {
         let Some((address_type, hash)) = index.lookup_script_hash(sh).map_err(storage)? else {
             return Ok(Vec::new());
         };
-        Ok(index
-            .read_unspent(address_type, &hash)
-            .map_err(storage)?
-            .into_iter()
-            .filter(|(_, value)| script_hash(value.script.as_bytes()) == *sh)
-            .map(|(key, value)| Unspent {
-                txid: key.txid,
-                vout: key.index,
-                height: value.height as i64,
-                value: value.satoshis,
+        let mut out = Vec::new();
+        let complete = index
+            .visit_unspent(address_type, &hash, MAX_HISTORY_ENTRIES, |key, value| {
+                if script_hash(value.script.as_bytes()) == *sh {
+                    out.push(Unspent {
+                        txid: key.txid,
+                        vout: key.index,
+                        height: value.height as i64,
+                        value: value.satoshis,
+                    });
+                }
             })
-            .collect())
+            .map_err(storage)?;
+        if !complete {
+            return Err(ElectrumError::bad_request("too many unspent outputs"));
+        }
+        Ok(out)
     }
 
     fn search_index(&self) -> Result<&Arc<divi_storage::SearchIndex>> {
@@ -281,11 +319,13 @@ impl Backend {
             return Ok(Vec::new());
         };
         let mut seen: BTreeMap<(u32, u32), Hash256> = BTreeMap::new();
-        for (key, _) in index
-            .read_deltas(address_type, &hash, 0, 0)
-            .map_err(storage)?
-        {
-            seen.insert((key.height, key.tx_index), key.txid);
+        let complete = index
+            .visit_deltas(address_type, &hash, 0, 0, MAX_HISTORY_ENTRIES, |key, _| {
+                seen.insert((key.height, key.tx_index), key.txid);
+            })
+            .map_err(storage)?;
+        if !complete {
+            return Err(ElectrumError::bad_request("history too large"));
         }
         Ok(seen
             .into_iter()
@@ -297,7 +337,12 @@ impl Backend {
             .collect())
     }
 
-    fn mempool_view(&self, sh: &[u8; 32], confirmed: &[Unspent]) -> MempoolView {
+    fn mempool_view(
+        &self,
+        sh: &[u8; 32],
+        confirmed: &[Unspent],
+        history_limit: usize,
+    ) -> Result<MempoolView> {
         let infos = self.mempool.get_tx_infos();
         let mut txs: Vec<(Hash256, i64, bool, Transaction)> = Vec::new();
         for info in infos {
@@ -314,6 +359,9 @@ impl Backend {
         for (txid, _, depends, tx) in &txs {
             for (k, out) in tx.vout.iter().enumerate() {
                 if script_hash(out.script_pubkey.as_bytes()) == *sh {
+                    if outputs.len() == MAX_HISTORY_ENTRIES {
+                        return Err(ElectrumError::bad_request("too many unspent outputs"));
+                    }
                     let outpoint = OutPoint::new(*txid, k as u32);
                     let value = out.value.as_sat();
                     values.insert(outpoint, value);
@@ -333,6 +381,9 @@ impl Backend {
                 }
             }
             if relevant {
+                if history.len() == history_limit {
+                    return Err(ElectrumError::bad_request("history too large"));
+                }
                 history.push(HistoryEntry {
                     txid: *txid,
                     height: if *depends { -1 } else { 0 },
@@ -345,23 +396,28 @@ impl Backend {
                 .cmp(&a.height)
                 .then_with(|| a.txid.to_hex().cmp(&b.txid.to_hex()))
         });
-        MempoolView {
+        Ok(MempoolView {
             history,
             outputs,
             spent,
-        }
+        })
     }
 
     pub fn history(&self, sh: &[u8; 32]) -> Result<Vec<HistoryEntry>> {
         let mut history = self.confirmed_history(sh)?;
         let confirmed = self.confirmed_unspent(sh)?;
-        history.extend(self.mempool_view(sh, &confirmed).history);
+        history.extend(
+            self.mempool_view(sh, &confirmed, MAX_HISTORY_ENTRIES - history.len())?
+                .history,
+        );
         Ok(history)
     }
 
     pub fn mempool_history(&self, sh: &[u8; 32]) -> Result<Vec<HistoryEntry>> {
         let confirmed = self.confirmed_unspent(sh)?;
-        Ok(self.mempool_view(sh, &confirmed).history)
+        Ok(self
+            .mempool_view(sh, &confirmed, MAX_HISTORY_ENTRIES)?
+            .history)
     }
 
     pub fn status(&self, sh: &[u8; 32]) -> Result<Option<String>> {
@@ -371,7 +427,7 @@ impl Backend {
     /// (confirmed, unconfirmed) balance in satoshis
     pub fn balance(&self, sh: &[u8; 32]) -> Result<(i64, i64)> {
         let confirmed = self.confirmed_unspent(sh)?;
-        let view = self.mempool_view(sh, &confirmed);
+        let view = self.mempool_view(sh, &confirmed, MAX_HISTORY_ENTRIES)?;
         let confirmed_sum: i64 = confirmed.iter().map(|u| u.value).sum();
         let incoming: i64 = view.outputs.iter().map(|(_, value, _)| value).sum();
         let mut values: HashMap<OutPoint, i64> = confirmed
@@ -387,13 +443,16 @@ impl Backend {
 
     pub fn listunspent(&self, sh: &[u8; 32]) -> Result<Vec<Unspent>> {
         let confirmed = self.confirmed_unspent(sh)?;
-        let view = self.mempool_view(sh, &confirmed);
+        let view = self.mempool_view(sh, &confirmed, MAX_HISTORY_ENTRIES)?;
         let mut out: Vec<Unspent> = confirmed
             .into_iter()
             .filter(|u| !view.spent.contains(&OutPoint::new(u.txid, u.vout)))
             .collect();
         for (outpoint, value, height) in view.outputs {
             if !view.spent.contains(&outpoint) {
+                if out.len() == MAX_HISTORY_ENTRIES {
+                    return Err(ElectrumError::bad_request("too many unspent outputs"));
+                }
                 out.push(Unspent {
                     txid: outpoint.txid,
                     vout: outpoint.vout,

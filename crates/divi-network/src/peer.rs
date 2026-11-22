@@ -204,7 +204,7 @@ pub enum PeerEvent {
     },
 }
 
-/// Messages kept for a dialled peer whose sporks are out (LivePeerStats::hold)
+/// Messages kept for a dialled peer whose sporks are out
 pub const MAX_HELD: usize = 1000;
 
 /// Live per-peer statistics shared between the connection task and RPC readers
@@ -228,8 +228,8 @@ pub struct LivePeerStats {
     pub time_offset: AtomicI64,
     /// Peer's advertised protocol version
     pub version: AtomicU64,
-    /// A peer we dialled has sent its verack (Divi Core fCurrentlyConnected,
-    /// main.cpp:498-507)
+    /// The peer has sent its verack. For an outbound connection this also
+    /// drives address-book finalization (Divi Core fCurrentlyConnected).
     pub verack_received: std::sync::atomic::AtomicBool,
     /// Peer's advertised services
     pub services: AtomicU64,
@@ -261,6 +261,9 @@ pub struct LivePeerStats {
 
     /// Bytes queued for the peer and not yet written (Divi Core nSendSize)
     pub send_queued_bytes: AtomicU64,
+    /// Serialize slot admission, never socket I/O. Optional producers cannot
+    /// both observe the same spare slot or reserve the final protocol slot.
+    send_admission: parking_lot::Mutex<()>,
     /// The peer's bloom filter and transaction relay flag (not published by
     /// the connection: the filter messages change them)
     pub bloom: crate::bloom::PeerBloom,
@@ -292,14 +295,21 @@ impl LivePeerStats {
             )
     }
 
-    /// Keep a message held back from a peer whose sporks are out, at most
-    /// MAX_HELD (the oldest goes first)
-    pub fn hold(&self, msg: crate::messages::NetworkMessage) {
+    /// Keep the existing byte charge until the held message is written.
+    pub(crate) fn hold_if_waiting(
+        &self,
+        msg: NetworkMessage,
+    ) -> Result<Option<NetworkMessage>, crate::error::NetworkError> {
         let mut held = self.held.lock();
+        if !self.holds_back(&msg) {
+            return Ok(Some(msg));
+        }
         if held.len() >= MAX_HELD {
-            held.remove(0);
+            self.send_written(msg.wire_size());
+            return Err(crate::error::NetworkError::RateLimitExceeded);
         }
         held.push(msg);
+        Ok(None)
     }
 
     /// The peer's sporks are in: nothing is held back from now on. True when it was
@@ -435,23 +445,12 @@ pub struct PeerHandle {
 }
 
 impl PeerHandle {
-    /// Send a message to this peer
-    // SendError hands the unsent message back to the caller; boxing it would
-    // change every call site for no runtime benefit.
-    #[allow(clippy::result_large_err)]
+    /// Admit a message without waiting for the recipient.
     pub async fn send(
         &self,
         msg: NetworkMessage,
-    ) -> Result<(), mpsc::error::SendError<NetworkMessage>> {
-        let size = msg.wire_size();
-        self.stats
-            .send_queued_bytes
-            .fetch_add(size, Ordering::Relaxed);
-        let sent = self.tx.send(msg).await;
-        if sent.is_err() {
-            self.stats.send_written(size);
-        }
-        sent
+    ) -> Result<(), Box<mpsc::error::TrySendError<NetworkMessage>>> {
+        self.try_send(msg)
     }
 
     /// Try to send a message without blocking
@@ -459,14 +458,45 @@ impl PeerHandle {
         &self,
         msg: NetworkMessage,
     ) -> Result<(), Box<mpsc::error::TrySendError<NetworkMessage>>> {
+        self.try_enqueue(msg, false)
+    }
+
+    pub(crate) fn try_enqueue(
+        &self,
+        msg: NetworkMessage,
+        gossip: bool,
+    ) -> Result<(), Box<mpsc::error::TrySendError<NetworkMessage>>> {
+        use mpsc::error::TrySendError;
         let size = msg.wire_size();
-        self.stats
-            .send_queued_bytes
-            .fetch_add(size, Ordering::Relaxed);
-        self.tx.try_send(msg).map_err(|e| {
-            self.stats.send_written(size);
-            Box::new(e)
-        })
+        let _admission = self.stats.send_admission.lock();
+        if gossip && self.tx.capacity() <= 1 && !self.tx.is_closed() {
+            return Err(Box::new(TrySendError::Full(msg)));
+        }
+        let permit = match self.tx.try_reserve() {
+            Ok(permit) => permit,
+            Err(TrySendError::Full(())) => return Err(Box::new(TrySendError::Full(msg))),
+            Err(TrySendError::Closed(())) => return Err(Box::new(TrySendError::Closed(msg))),
+        };
+        let max = crate::buffers::max_send_buffer();
+        // Reserve byte headroom and the last channel slot for protocol traffic.
+        // As in getdata, a required frame can cross the watermark once; a
+        // single legal block can itself be larger than -maxsendbuffer.
+        // Admission is serialized; only the writer can reduce the charge here.
+        let queued = &self.stats.send_queued_bytes;
+        let used = queued.load(Ordering::Relaxed);
+        let fits = used.checked_add(size).is_some_and(|next| {
+            if gossip {
+                next <= max - max.div_ceil(8)
+            } else {
+                used == 0 || used < max
+            }
+        });
+        if !fits {
+            return Err(Box::new(TrySendError::Full(msg)));
+        }
+        queued.fetch_add(size, Ordering::Relaxed);
+        permit.send(msg);
+        Ok(())
     }
 }
 
@@ -564,7 +594,7 @@ mod tests {
         ] {
             assert!(!stats.holds_back(&sent), "{}", sent.command());
         }
-        stats.hold(M::Inv(vec![]));
+        assert!(stats.hold_if_waiting(M::Inv(vec![])).unwrap().is_none());
         assert!(stats.sporks_arrived());
         assert!(!stats.sporks_arrived());
         assert!(matches!(stats.take_held()[..], [M::Inv(_)]));

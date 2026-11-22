@@ -33,6 +33,12 @@ pub enum UsdcNetwork {
 }
 
 impl UsdcNetwork {
+    pub(crate) fn from_chain_id(id: u64) -> Option<Self> {
+        [Self::Sepolia, Self::BaseSepolia, Self::Ethereum, Self::Base]
+            .into_iter()
+            .find(|network| network.chain_id() == id)
+    }
+
     /// Circle USDC on this network (test USDC on the testnets, native USDC on mainnets).
     pub fn usdc_token(self) -> &'static str {
         match self {
@@ -54,9 +60,10 @@ impl UsdcNetwork {
         }
     }
 
-    /// This network's chain id (<https://chainlist.org>). Informational only — alloy reads
-    /// the chain id from the RPC itself when signing, so nothing here enforces it; it is a
-    /// convenience for anyone wiring up monitoring or sanity checks.
+    /// This network's chain id (<https://chainlist.org>). alloy signs with the chain
+    /// id the RPC endpoint reports, so the label proves nothing; `divi-swap` and `divi-swapd`
+    /// compare this against the endpoint (`UsdcBackend::with_funding_chain_id`) and refuse new
+    /// fundings and swap admissions on a mismatch.
     pub fn chain_id(self) -> u64 {
         match self {
             UsdcNetwork::Sepolia => 11_155_111,

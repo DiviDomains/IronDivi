@@ -725,6 +725,14 @@ mod engine {
             let at = self.serve(htlc, at, real);
             self.zec.htlc_output(htlc, &at).await
         }
+        async fn scan_spend(
+            &self,
+            outpoint: &Outpoint,
+            from_height: u64,
+            resume: Option<&divi_swap::ScanMark>,
+        ) -> Result<divi_swap::SpendScan> {
+            self.mock.scan_spend(outpoint, from_height, resume).await
+        }
         async fn find_spend(
             &self,
             outpoint: &Outpoint,

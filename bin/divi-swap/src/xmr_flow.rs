@@ -13,6 +13,7 @@
 use std::time::Instant;
 
 use anyhow::{bail, Result};
+use divi_swap::{rt, Chain, QuoteIntent};
 use divi_swap_xmr::taker::JNext;
 use divi_swap_xmr::{XmrTaker, XmrTakerState};
 
@@ -27,23 +28,31 @@ const MAX_J_EXCHANGES: usize = 64;
 /// prepare → `POST /xmr/swaps` → the 2P-ECDSA exchanges of `J` (`POST /xmr/swaps/:id/j`;
 /// our side verifies the maker's setup before signing `Tx_cancel`) → send our signatures (the
 /// maker then broadcasts `Tx_lock`). Returns the local id.
+///
+/// The quote must match `intent` ([`QuoteIntent::check_quote`]: offer, amount, XMR, the
+/// taker-pays-XMR direction and the DIVI bound) before a key is made or the maker is told
+/// anything; the swap timelocks are held to the taker's own floor by [`XmrTaker::prepare`].
 pub async fn begin(
     taker: &XmrTaker,
     client: &MakerClient,
     sessions: &Sessions,
-    offer_id: &str,
-    btc_sats: u64,
+    intent: &QuoteIntent,
 ) -> Result<String> {
-    client.wait_ready().await?;
-    taker.warm_primes().await?;
-    let quote = client.quote_retrying(offer_id, btc_sats).await?;
-    if quote.counter_chain != divi_swap::Chain::Xmr {
+    intent.validate()?;
+    let offer_id = intent.offer_id.as_str();
+    if intent.counter_chain != Chain::Xmr {
         bail!(
-            "offer {offer_id} swaps DIVI against {}; this is the xmr flow",
-            quote.counter_chain
+            "offer {offer_id} is held to {}; this is the xmr flow",
+            intent.counter_chain
         );
     }
+    client.wait_ready().await?;
+    taker.warm_primes().await?;
+    let quote = client.quote_retrying(offer_id, intent.btc_sats).await?;
+    intent.check_quote(&quote, rt::unix_now())?;
     let (local, req) = taker.prepare(&quote).await?;
+    // `prepare` may have taken a while (key generation): the quote must still be live.
+    intent.check_deadline(&quote, rt::unix_now())?;
     let reply = client.xmr_setup(&req).await?;
     sessions.put(
         &local,
@@ -100,19 +109,18 @@ pub async fn step(
     Ok(state)
 }
 
-/// [`begin`], then [`step`] until `Done`. `pump` runs once per poll (tests mine blocks with
+/// [`begin`] (held to `intent`), then [`step`] until `Done`. `pump` runs once per poll (tests mine blocks with
 /// it). Returns the local id and how the swap ended (`redeemed`, `refunded`, `punished`,
 /// `cancelled`).
 pub async fn run(
     taker: &XmrTaker,
     client: &MakerClient,
     sessions: &Sessions,
-    offer_id: &str,
-    btc_sats: u64,
+    intent: &QuoteIntent,
     opts: &RunOpts,
     pump: &mut dyn FnMut(),
 ) -> Result<(String, String)> {
-    let local = begin(taker, client, sessions, offer_id, btc_sats).await?;
+    let local = begin(taker, client, sessions, intent).await?;
     let started = Instant::now();
     loop {
         pump();

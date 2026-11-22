@@ -258,6 +258,9 @@ pub struct XmrTaker {
     primes_fn: PrimesFn,
     /// Primes made by [`XmrTaker::warm_primes`], taken by the next [`XmrTaker::prepare`].
     warm: parking_lot::Mutex<Vec<Primes>>,
+    /// Why no new swap may start and no new XMR may be locked
+    /// ([`XmrTaker::with_admission_hold`]); `None`: admitted.
+    held: Option<String>,
 }
 
 impl XmrTaker {
@@ -279,7 +282,30 @@ impl XmrTaker {
             keying: parking_lot::Mutex::new(HashMap::new()),
             primes_fn: Arc::new(jsig::generate_primes),
             warm: parking_lot::Mutex::new(Vec::new()),
+            held: None,
         })
+    }
+
+    /// Refuse to start a swap ([`XmrTaker::prepare`]) and to lock any new XMR (`Accepted` and
+    /// an `XmrLocking` whose lock is not on the Monero chain). Everything that gets money
+    /// back keeps working: a lock already on the chain is recognised, and the `Tx_cancel`,
+    /// `Tx_redeem`, `Tx_punish` and sweep-back paths run as before, so the operator can still
+    /// recover a swap that is under way.
+    pub fn with_admission_hold(mut self, reason: impl Into<String>) -> Self {
+        self.held = Some(reason.into());
+        self
+    }
+
+    /// Why new swaps are refused, if they are.
+    pub fn admission_hold(&self) -> Option<&str> {
+        self.held.as_deref()
+    }
+
+    fn check_not_held(&self) -> Result<()> {
+        match &self.held {
+            Some(why) => Err(SwapError::Other(format!("new xmr swaps are held: {why}"))),
+            None => Ok(()),
+        }
     }
 
     /// Refuse, in [`XmrTaker::prepare`] (before any key is generated or anything persisted)
@@ -310,6 +336,7 @@ impl XmrTaker {
     /// Step 1: generate and persist `b` and `s_t`, start our side of the `J` keying (20–90 s
     /// generating Paillier primes); returns the local id and the request to `POST /xmr/swaps`.
     pub async fn prepare(&self, quote: &Quote) -> Result<(String, SetupRequest)> {
+        self.check_not_held()?;
         if quote.counter_chain != Chain::Xmr {
             return Err(SwapError::InvalidParams("not an xmr quote".into()));
         }
@@ -687,6 +714,8 @@ impl XmrTaker {
                 {
                     Some(o) => o.txid,
                     None => {
+                        // No lock on the chain: this would be new XMR out.
+                        self.check_not_held()?;
                         self.xmr
                             .lock(&spend_pub, &view, r.setup()?.xmr_amount)
                             .await?
@@ -794,6 +823,8 @@ impl XmrTaker {
         if confs < self.cfg.divi_confirmations {
             return Ok(Flow::Idle);
         }
+        // After `cancel_if_due`: a held swap can still be cancelled, never funded.
+        self.check_not_held()?;
         // Locking XMR needs time left to see it confirm and redeem before t_cancel.
         let mtp = self.divi.median_time_past().await?;
         if mtp + 2 * self.cfg.redeem_margin_secs >= s.t_cancel {

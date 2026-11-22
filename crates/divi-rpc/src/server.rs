@@ -138,8 +138,84 @@ async fn serve(
     if let Some(e) = failure.filter(|_| listeners.is_empty()) {
         return Err(e.into());
     }
-    serve_listener(listeners, app, config.threads, stopped).await;
+    let access = Arc::new(access);
+    let policy = ConnectionPolicy {
+        admit: Some(Arc::new(move |peer| access.peer_allowed(peer))),
+        ..ConnectionPolicy::default()
+    };
+    serve_listener_with(listeners, app, config.threads, policy, stopped).await;
     Ok(())
+}
+
+/// How long a connection may wait for the next request, or for the rest of a
+/// request's headers; a kept connection that stays idle longer is closed.
+/// Divi Core sets no limit (its thread waits in the stream, rpcserver.cpp:1000-1013)
+/// so a client that sends nothing holds one of the -rpcthreads for good.
+/// 30 s is hyper's own default for the header wait.
+const HEADER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// How long a request body or a reply may make no progress
+const STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// How long a connection waits for a free slot before it is closed unread
+const SLOT_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+/// How long a peer that -rpcallowip does not admit may take to be refused
+const REFUSED_HEADER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Most refusals (HTTP 403) written at once; further such peers are dropped
+const MAX_REFUSALS: usize = 64;
+/// Fewest connections (running or waiting for a slot) taken in all
+const MIN_QUEUED_CONNECTIONS: usize = 256;
+
+/// The limits one RPC connection is served under
+#[derive(Clone)]
+pub(crate) struct ConnectionPolicy {
+    /// Whether a peer may be served at all: a peer that may not is answered
+    /// with HTTP 403 at once, without taking a slot (as Divi Core's
+    /// ClientAllowed runs before its thread does, rpcserver.cpp:906-912).
+    /// None admits every peer; the router's checks still apply.
+    pub admit: Option<Arc<dyn Fn(std::net::IpAddr) -> bool + Send + Sync>>,
+    pub header_timeout: std::time::Duration,
+    pub stall_timeout: std::time::Duration,
+    pub slot_wait: std::time::Duration,
+}
+
+impl Default for ConnectionPolicy {
+    fn default() -> Self {
+        ConnectionPolicy {
+            admit: None,
+            header_timeout: HEADER_TIMEOUT,
+            stall_timeout: STALL_TIMEOUT,
+            slot_wait: SLOT_WAIT,
+        }
+    }
+}
+
+/// What the table of connections allows for `threads` slots: a peer other
+/// than the local host holds at most half the slots (two at least), so that
+/// one cannot starve the rest; connections waiting for a slot count
+pub(crate) fn rpc_peer_limits(threads: usize) -> crate::conn_policy::PeerLimits {
+    crate::conn_policy::PeerLimits {
+        total: threads.saturating_mul(4).max(MIN_QUEUED_CONNECTIONS),
+        per_peer: (threads / 2).max(2),
+        reserved: 0,
+        reserved_peer_max: 0,
+    }
+}
+
+/// Serve `app` on `listeners` with the default [`ConnectionPolicy`]; see
+/// [`serve_listener_with`]
+pub(crate) async fn serve_listener(
+    listeners: Vec<tokio::net::TcpListener>,
+    app: Router,
+    threads: i64,
+    stopped: impl std::future::Future<Output = ()> + Send + 'static,
+) {
+    serve_listener_with(
+        listeners,
+        app,
+        threads,
+        ConnectionPolicy::default(),
+        stopped,
+    )
+    .await
 }
 
 /// Serve `app` on `listeners`, each connection with hyper's HTTP/1 as Divi
@@ -147,24 +223,38 @@ async fn serve(
 /// `threads` slots, until `stopped`.
 ///
 /// Divi Core serves each RPC connection to its end on one of its -rpcthreads
-/// threads, idle keep-alive waits included (rpcserver.cpp:755-757, :1000-1010):
-/// a connection past them waits, accepted but unread, until one closes. Each
-/// connection here takes a slot before it is served and gives it back when it
-/// closes; the accept loop waits for the slot, as Divi Core's threads do.
+/// threads, idle keep-alive waits included (rpcserver.cpp:755-757, :1000-1010),
+/// with no time limit on any wait: a connection past them waits, accepted but
+/// unread, until one closes. Each connection here takes a slot before it is
+/// served and gives it back when it closes, with these bounds added:
+///
+/// - a peer the policy does not admit is refused at once, without a slot;
+/// - a peer other than the local host holds a limited share of the
+///   connections ([`rpc_peer_limits`]), so that it cannot take every slot;
+/// - a connection waits for a slot for `slot_wait` at most, and the accept
+///   loop never waits for one;
+/// - the headers of a request, an idle keep-alive wait included, take
+///   `header_timeout` at most, a body or a reply that makes no progress
+///   `stall_timeout`.
+///
+/// A call under way is never cut short: the bounds apply to waiting for the
+/// client, not to the node working.
 ///
 /// Once `stopped` resolves no connection is taken (one waiting for a slot is
 /// closed unread), each connection under way ends after the call it is
 /// answering (hyper's graceful shutdown), and this returns once they have
 /// closed, as axum's graceful shutdown did.
-pub(crate) async fn serve_listener(
+pub(crate) async fn serve_listener_with(
     listeners: Vec<tokio::net::TcpListener>,
     app: Router,
     threads: i64,
+    policy: ConnectionPolicy,
     stopped: impl std::future::Future<Output = ()> + Send + 'static,
 ) {
-    let slots = Arc::new(tokio::sync::Semaphore::new(
-        threads.clamp(0, tokio::sync::Semaphore::MAX_PERMITS as i64) as usize,
-    ));
+    let threads = threads.clamp(0, tokio::sync::Semaphore::MAX_PERMITS as i64) as usize;
+    let slots = Arc::new(tokio::sync::Semaphore::new(threads));
+    let peers = crate::conn_policy::PeerTable::new(rpc_peer_limits(threads));
+    let refusals = Arc::new(tokio::sync::Semaphore::new(MAX_REFUSALS));
     // `stop` is closed once `stopped` resolves; each connection holds an
     // `open` receiver until it has closed
     let (stop, stop_rx) = tokio::sync::watch::channel(());
@@ -206,16 +296,57 @@ pub(crate) async fn serve_listener(
                 continue;
             }
         };
-        // The semaphore is never closed
-        let slot = tokio::select! {
-            slot = slots.clone().acquire_owned() => slot.ok(),
-            _ = stop.closed() => break,
-        };
         let app = app.clone();
         let stop = stop.clone();
         let open = open_rx.clone();
+        let policy = policy.clone();
+        if let Some(admit) = &policy.admit {
+            if !admit(peer.ip()) {
+                // Refused with HTTP 403 by the router, without a slot, and
+                // only a few at a time
+                let Ok(refusal) = refusals.clone().try_acquire_owned() else {
+                    debug!("RPC: dropping {peer}: too many refusals under way");
+                    continue;
+                };
+                let timeouts = ConnectionPolicy {
+                    header_timeout: REFUSED_HEADER_TIMEOUT,
+                    ..policy.clone()
+                };
+                tokio::spawn(async move {
+                    serve_connection(stream, peer, app, stop, open, timeouts).await;
+                    drop(refusal);
+                });
+                continue;
+            }
+        }
+        let guard = match peers.admit(peer.ip()) {
+            Ok(guard) => guard,
+            Err(refusal) => {
+                debug!("RPC: dropping {peer}: {refusal}");
+                continue;
+            }
+        };
+        let slots = slots.clone();
         tokio::spawn(async move {
-            serve_connection(stream, peer, app, stop, open).await;
+            let _guard = guard;
+            // The semaphore is never closed
+            let slot = match slots.clone().try_acquire_owned() {
+                Ok(slot) => slot,
+                Err(_) => {
+                    let waited = tokio::select! {
+                        waited = tokio::time::timeout(policy.slot_wait, slots.acquire_owned()) => waited,
+                        _ = stop.closed() => return,
+                    };
+                    match waited {
+                        Ok(Ok(slot)) => slot,
+                        _ => {
+                            debug!("RPC: closing {peer}: no free slot");
+                            return;
+                        }
+                    }
+                }
+            };
+            serve_connection(stream, peer, app, stop, open, policy).await;
             drop(slot);
         });
     }
@@ -229,23 +360,26 @@ pub(crate) async fn serve_listener(
 /// socket go, and [`Socket`] then writes the raw bytes, if any, and closes.
 /// Once `stop` is closed the connection ends after the call under way.
 async fn serve_connection(
-    stream: tokio::net::TcpStream,
+    mut stream: tokio::net::TcpStream,
     peer: SocketAddr,
     app: Router,
     stop: Arc<tokio::sync::watch::Sender<()>>,
-    open: tokio::sync::watch::Receiver<()>,
+    _open: tokio::sync::watch::Receiver<()>,
+    policy: ConnectionPolicy,
 ) {
     let raw: Arc<parking_lot::Mutex<Option<Vec<u8>>>> = Arc::default();
     let socket = Socket {
-        stream: Some(stream),
-        raw: raw.clone(),
-        open,
+        stream: &mut stream,
+        stall_timeout: policy.stall_timeout,
+        write_stall: None,
     };
+    let body_stall = policy.stall_timeout;
+    let pending_reply = raw.clone();
     let service = hyper::service::service_fn(move |req: HttpRequest<hyper::body::Incoming>| {
         let mut app = app.clone();
         let raw = raw.clone();
         async move {
-            let mut req = req.map(axum::body::Body::new);
+            let mut req = req.map(|body| axum::body::Body::new(StallBody::new(body, body_stall)));
             req.extensions_mut()
                 .insert(axum::extract::ConnectInfo(peer));
             // A Router is always ready (axum's poll_ready never waits)
@@ -263,53 +397,132 @@ async fn serve_connection(
             }
         }
     });
-    let conn = hyper::server::conn::http1::Builder::new()
-        .serve_connection(hyper_util::rt::TokioIo::new(socket), service);
-    tokio::pin!(conn);
-    let mut stopping = std::pin::pin!(stop.closed());
-    let mut stop_asked = false;
-    loop {
-        tokio::select! {
-            _ = conn.as_mut() => break,
-            // once: the shutdown is asked for, then the connection runs out
-            _ = &mut stopping, if !stop_asked => {
-                stop_asked = true;
-                conn.as_mut().graceful_shutdown();
+    {
+        let conn = hyper::server::conn::http1::Builder::new()
+            .timer(hyper_util::rt::TokioTimer::new())
+            .header_read_timeout(policy.header_timeout)
+            .serve_connection(hyper_util::rt::TokioIo::new(socket), service);
+        tokio::pin!(conn);
+        let mut stopping = std::pin::pin!(stop.closed());
+        let mut stop_asked = false;
+        loop {
+            tokio::select! {
+                _ = conn.as_mut() => break,
+                // once: the shutdown is asked for, then the connection runs out
+                _ = &mut stopping, if !stop_asked => {
+                    stop_asked = true;
+                    conn.as_mut().graceful_shutdown();
+                }
             }
         }
     }
-}
-
-/// A connection's socket as hyper uses it. Once hyper lets it go, a reply
-/// left for it ([`crate::http::RawReply`]) is written, and the socket closed.
-struct Socket {
-    stream: Option<tokio::net::TcpStream>,
-    raw: Arc<parking_lot::Mutex<Option<Vec<u8>>>>,
-    /// Held until the socket is closed, a reply left for it written
-    open: tokio::sync::watch::Receiver<()>,
-}
-
-impl Socket {
-    fn stream(&mut self) -> std::pin::Pin<&mut tokio::net::TcpStream> {
-        std::pin::Pin::new(self.stream.as_mut().expect("taken only on drop"))
-    }
-}
-
-impl Drop for Socket {
-    fn drop(&mut self) {
-        if let (Some(mut stream), Some(raw)) = (self.stream.take(), self.raw.lock().take()) {
-            let open = self.open.clone();
-            tokio::spawn(async move {
-                use tokio::io::AsyncWriteExt;
-                let _ = stream.write_all(&raw).await;
-                let _ = stream.shutdown().await;
-                drop(open);
-            });
+    let reply = pending_reply.lock().take();
+    if let Some(reply) = reply {
+        use tokio::io::AsyncWriteExt;
+        let write = async {
+            stream.write_all(&reply).await?;
+            stream.shutdown().await
+        };
+        match tokio::time::timeout(policy.stall_timeout, write).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => debug!("RPC: raw reply to {peer} failed: {e}"),
+            Err(_) => debug!("RPC: raw reply to {peer} timed out"),
         }
     }
 }
 
-impl tokio::io::AsyncRead for Socket {
+struct Socket<'a> {
+    stream: &'a mut tokio::net::TcpStream,
+    /// How long a write may make no progress before the connection fails
+    stall_timeout: std::time::Duration,
+    /// Runs while a write is pending
+    write_stall: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl Socket<'_> {
+    fn stream(&mut self) -> std::pin::Pin<&mut tokio::net::TcpStream> {
+        std::pin::Pin::new(&mut *self.stream)
+    }
+
+    /// The outcome of a write that was not ready: it waits, unless the client
+    /// has not taken any bytes for `stall_timeout`
+    fn write_pending<T>(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<T>> {
+        use std::future::Future;
+        let limit = self.stall_timeout;
+        let sleep = self
+            .write_stall
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep(limit)));
+        if sleep.as_mut().poll(cx).is_ready() {
+            self.write_stall = None;
+            std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "the client stopped reading",
+            )))
+        } else {
+            std::task::Poll::Pending
+        }
+    }
+}
+
+/// A request body that fails when the client sends nothing for `limit`, so
+/// that a slow body cannot hold its slot for good. The time it takes the
+/// router to answer, once the body is read, is not counted.
+struct StallBody {
+    inner: std::pin::Pin<Box<hyper::body::Incoming>>,
+    sleep: std::pin::Pin<Box<tokio::time::Sleep>>,
+    limit: std::time::Duration,
+}
+
+impl StallBody {
+    fn new(inner: hyper::body::Incoming, limit: std::time::Duration) -> Self {
+        StallBody {
+            inner: Box::pin(inner),
+            sleep: Box::pin(tokio::time::sleep(limit)),
+            limit,
+        }
+    }
+}
+
+impl hyper::body::Body for StallBody {
+    type Data = hyper::body::Bytes;
+    type Error = Box<dyn std::error::Error + Send + Sync>;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        use std::future::Future;
+        let this = &mut *self;
+        match this.inner.as_mut().poll_frame(cx) {
+            std::task::Poll::Ready(frame) => {
+                this.sleep
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + this.limit);
+                std::task::Poll::Ready(frame.map(|frame| frame.map_err(Into::into)))
+            }
+            std::task::Poll::Pending => {
+                if this.sleep.as_mut().poll(cx).is_ready() {
+                    std::task::Poll::Ready(Some(Err("the request body stopped coming".into())))
+                } else {
+                    std::task::Poll::Pending
+                }
+            }
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+impl tokio::io::AsyncRead for Socket<'_> {
     fn poll_read(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -319,27 +532,45 @@ impl tokio::io::AsyncRead for Socket {
     }
 }
 
-impl tokio::io::AsyncWrite for Socket {
+impl tokio::io::AsyncWrite for Socket<'_> {
     fn poll_write(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
-        self.stream().poll_write(cx, buf)
+        match self.stream().poll_write(cx, buf) {
+            std::task::Poll::Ready(result) => {
+                self.write_stall = None;
+                std::task::Poll::Ready(result)
+            }
+            std::task::Poll::Pending => self.write_pending(cx),
+        }
     }
 
     fn poll_flush(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        self.stream().poll_flush(cx)
+        match self.stream().poll_flush(cx) {
+            std::task::Poll::Ready(result) => {
+                self.write_stall = None;
+                std::task::Poll::Ready(result)
+            }
+            std::task::Poll::Pending => self.write_pending(cx),
+        }
     }
 
     fn poll_shutdown(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        self.stream().poll_shutdown(cx)
+        match self.stream().poll_shutdown(cx) {
+            std::task::Poll::Ready(result) => {
+                self.write_stall = None;
+                std::task::Poll::Ready(result)
+            }
+            std::task::Poll::Pending => self.write_pending(cx),
+        }
     }
 }
 
@@ -1741,7 +1972,7 @@ impl RpcServer {
                 "keypoolrefill" => "keypoolrefill ( newsize )\n\nFills the keypool.\n\nArguments:\n1. newsize  (numeric, optional, default=100) The new keypool size",
                 "getkeypoolsize" => "getkeypoolsize\n\nReturns the number of keys in the keypool.\n\nResult:\n  n    (numeric) The number of pre-generated but unused keys in the keypool",
                 "getpqposture" => "getpqposture\n\nReturns a deterministic post-quantum key-exposure report over the active wallet's unspent outputs.",
-                "planpqsweep" => "planpqsweep \"destination\" ( fee_per_kb_sat include_unexposed_p2pkh )\n\nPlan a deterministic, voluntary post-quantum or vault sweep over the active wallet's UTXOs without broadcasting or mutating wallet state.\n\nArguments:\n1. \"destination\"             (string or object, required) Bech32m P2PQPKH/PQ_STAKING_VAULT address, owner:vault pair, or destination spec object\n2. fee_per_kb_sat            (numeric, optional, default=10000) Fee rate in satoshis per 1,000 virtual bytes\n3. include_unexposed_p2pkh   (boolean, optional, default=true) Whether to include unexposed classical P2PKH outputs",
+                "planpqsweep" => "planpqsweep \"destination\" ( fee_per_kb_sat include_unexposed_p2pkh )\n\nPlan a deterministic, voluntary post-quantum or vault sweep over the active wallet's UTXOs without broadcasting or mutating wallet state.\n\nBefore DIP-PQ-3 activation, P2PQPKH and PQ_STAKING_VAULT outputs are not enforced by consensus: any plan that would create or spend them is returned as a read-only estimate (\"signable\": false) with no txid, raw_tx_hex or output scripts. Classical STAKING_VAULT plans stay signable.\n\nArguments:\n1. \"destination\"             (string or object, required) Bech32m P2PQPKH/PQ_STAKING_VAULT address, owner:vault pair, or destination spec object\n2. fee_per_kb_sat            (numeric, optional, default=10000) Fee rate in satoshis per 1,000 virtual bytes\n3. include_unexposed_p2pkh   (boolean, optional, default=true) Whether to include unexposed classical P2PKH outputs",
                 "decodescript" => "decodescript \"hexstring\"\n\nDecode a hex-encoded script.\n\nArguments:\n1. \"hexstring\"  (string) the hex encoded script\n\nResult:\n{\n  \"asm\":\"asm\",      (string) Script public key\n  \"hex\":\"hex\",      (string) hex encoded public key\n  \"type\":\"type\",    (string) The output type\n  \"reqSigs\": n,      (numeric) The required signatures\n  \"addresses\": [     (json array of string)\n     \"address\"       (string) divi address\n     ,...\n  ],\n  \"p2sh\":\"address\"   (string) address of P2SH script wrapping this redeem script\n}",
                 // Address index
                 "getaddressdeltas" => "getaddressdeltas <address>|<addresses> (only_vaults)\n\nReturns all changes for an address (requires addressindex to be enabled).\n\nArguments:\naddress: (string) The base58check encoded address\n\"addresses\": (optional JSON object) An object with fields:\n               (1) '\"addresses\"' (required) array of base58check encoded addresses\n               (2) '\"start\"' (optional field) integer block height to start at\n               (3) '\"end\"' (optional field) integer block height to stop at\n               (4) '\"chainInfo\"' (optional field) bool flag to include chain info\n\"only_vaults\" (boolean, optional) Only return utxos spendable by the specified addresses\n\nResult:\n[\n  {\n    \"satoshis\"  (number) The difference of satoshis\n    \"txid\"  (string) The related txid\n    \"index\"  (number) The related input or output index\n    \"height\"  (number) The block height\n    \"address\"  (string) The base58check encoded address\n  }\n]\n\nExamples:\n> divi-cli getaddressdeltas '{\"addresses\": [\"12c6DSiU4Rq3P4ZxziKxzrL5LmMBrzjrJX\"]}'\n> curl --user myusername --data-binary '{\"jsonrpc\": \"1.0\", \"id\":\"curltest\", \"method\": \"getaddressdeltas\", \"params\": [{\"addresses\": [\"12c6DSiU4Rq3P4ZxziKxzrL5LmMBrzjrJX\"]}] }' -H 'content-type: text/plain;' http://127.0.0.1:51473/",
@@ -3156,6 +3387,83 @@ mod tests {
             .await
             .expect("the server returns once its connections have closed")
             .unwrap();
+    }
+
+    /// A connection that sends nothing gives its slot back when the header
+    /// wait ends, and the connection queued behind it is served
+    #[tokio::test]
+    async fn a_silent_connection_gives_its_slot_to_the_next_one() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let app = Router::new().route("/", post(|| async { "done" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let policy = ConnectionPolicy {
+            header_timeout: std::time::Duration::from_millis(300),
+            ..ConnectionPolicy::default()
+        };
+        tokio::spawn(serve_listener_with(
+            vec![listener],
+            app,
+            1,
+            policy,
+            std::future::pending(),
+        ));
+        let silent = tokio::net::TcpStream::connect(addr).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let mut next = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let request = format!(
+            "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        next.write_all(request.as_bytes()).await.unwrap();
+        let mut reply = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            next.read_to_end(&mut reply),
+        )
+        .await
+        .expect("served once the silent connection timed out")
+        .unwrap();
+        let reply = String::from_utf8_lossy(&reply);
+        assert!(reply.starts_with("HTTP/1.1 200 OK"), "{reply}");
+        drop(silent);
+    }
+
+    /// A request body that stops coming ends its request instead of holding
+    /// the slot
+    #[tokio::test]
+    async fn a_stalled_request_body_ends_the_request() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let app = Router::new().route(
+            "/",
+            post(|body: String| async move { body.len().to_string() }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let policy = ConnectionPolicy {
+            stall_timeout: std::time::Duration::from_millis(300),
+            ..ConnectionPolicy::default()
+        };
+        tokio::spawn(serve_listener_with(
+            vec![listener],
+            app,
+            1,
+            policy,
+            std::future::pending(),
+        ));
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let head = format!("POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Length: 100\r\n\r\nabc");
+        client.write_all(head.as_bytes()).await.unwrap();
+        let mut reply = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client.read_to_end(&mut reply),
+        )
+        .await
+        .expect("the connection ends once the body stalls")
+        .unwrap();
+        let reply = String::from_utf8_lossy(&reply);
+        assert!(!reply.contains("200 OK"), "{reply}");
     }
 
     /// A JSON null where Divi Core reads an account name, an address or a

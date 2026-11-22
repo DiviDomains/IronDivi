@@ -21,7 +21,7 @@
 //! endpoints give. Funding reads (EO): only the wallet coins both endpoints list.
 
 use divi_swap::backend::TipHeader;
-use divi_swap::{LockedOutput, SpendInfo, SwapError};
+use divi_swap::{LockedOutput, SpendInfo, SpendScan, SwapError};
 
 use crate::tx::Coin;
 
@@ -132,6 +132,50 @@ pub(crate) fn agree_spend(a: Option<SpendInfo>, b: Option<SpendInfo>) -> Result<
                 describe_spend(&b)
             ),
         )),
+    }
+}
+
+/// Join two endpoints' answers to one spend-scan pass (H2). A spend on either side is joined
+/// as [`agree_spend`] joins it. Without one, the pass reaches only as far as both read: the
+/// lower mark (none when both marked one height with different blocks), where an index
+/// answer (no mark, `complete`) covers whatever the other side read. A reorg seen by either
+/// side voids the mark for both.
+pub(crate) fn agree_scan(a: SpendScan, b: SpendScan) -> Result<SpendScan> {
+    match (a, b) {
+        (SpendScan::Reorged, _) | (_, SpendScan::Reorged) => Ok(SpendScan::Reorged),
+        (
+            SpendScan::NotYet {
+                through: ta,
+                complete: ca,
+            },
+            SpendScan::NotYet {
+                through: tb,
+                complete: cb,
+            },
+        ) => {
+            let same_end = match (&ta, &tb) {
+                (Some(a), Some(b)) => a == b,
+                _ => true,
+            };
+            let through = match (ta, tb) {
+                (Some(x), Some(y)) if x.height == y.height => (x.hash == y.hash).then_some(x),
+                (Some(x), Some(y)) => Some(if x.height < y.height { x } else { y }),
+                (Some(x), None) if cb => Some(x),
+                (None, Some(y)) if ca => Some(y),
+                _ => None,
+            };
+            Ok(SpendScan::NotYet {
+                through,
+                complete: ca && cb && same_end,
+            })
+        }
+        (a, b) => Ok(match agree_spend(a.into_spend(), b.into_spend())? {
+            Some(s) => SpendScan::Spent(s),
+            None => SpendScan::NotYet {
+                through: None,
+                complete: false,
+            },
+        }),
     }
 }
 

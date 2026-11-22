@@ -35,6 +35,14 @@ pub const REV_OFFER_ID: &str = "o1-rev";
 pub const BTC_SATS: u64 = 100_000;
 pub const T0: u32 = 1_700_000_000;
 
+/// The offer `id` as listed by the test daemon: what a taker selected.
+pub fn offer(id: &str) -> Offer {
+    World::offers()
+        .into_iter()
+        .find(|o| o.id == id)
+        .expect("a test offer")
+}
+
 /// The operator credential the test daemons are configured with (`GET /swaps`).
 pub const OPERATOR_TOKEN: &str = "test-operator-token";
 

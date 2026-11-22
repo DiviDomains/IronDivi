@@ -100,7 +100,7 @@ $$\text{staker\_key\_hash\_256} = \text{pq\_address\_key\_hash\_256}(\text{schem
 
 In a Divi Proof-of-Stake block, `block.vtx[1]` (`block.transactions[1]`) is the coinstake transaction (`tx.IsCoinStake()`), and `coinstake.vout[1]` is the primary staking output (`coinstake.vout[0]` is the empty marker output `scriptPubKey = ""`, `nValue = 0`).
 
-`PqBlockSigEnvelope::verify_structural_and_staker_binding(&coinstake.vout[1].scriptPubKey)` enforces:
+`PqBlockSigEnvelope::check_structural_and_staker_binding(&coinstake.vout[1].scriptPubKey)` enforces the rules below. It checks encodings and the key binding only; it does not verify the signature (see §4.3).
 
 1. **`DIP-PQ-3` `PQ_STAKING_VAULT` (`74` bytes, `OP_IF 0x20 <owner_hash_256> OP_ELSE OP_REQUIRE_COINSTAKE 0x20 <vault_hash_256> OP_ENDIF OP_OVER OP_SHA256 OP_EQUALVERIFY OP_CHECKSIG`):**
    - **Rule 1 (Cold-Owner Key Strictly Forbidden):** If `staker_key_hash_256 == owner_hash_256`, the block MUST be rejected with `PqBlockSigError::ColdOwnerKeyForbiddenForBlockSigning { owner_hash_256, vault_hash_256 }`.
@@ -139,6 +139,12 @@ $$\text{pk\_hash256} = \text{pq\_key\_hash\_256}(\text{scheme\_id},\ \text{pubke
 $$\text{prehash\_msg} = \text{SHA512}\Bigl(\texttt{0x13} \parallel \texttt{"Divi-PQ-BlockSig-v1"} \parallel \text{network\_magic}[4] \parallel \text{u8}(\text{scheme\_id}) \parallel \text{pk\_hash256}[32] \parallel \text{block\_signing\_payload\_hash\_256}[32]\Bigr)$$
 
 The resulting 64-byte `prehash_msg` is signed and verified by the `scheme_id` algorithm (`FN-DSA-512` or `ML-DSA-44`).
+
+### 4.3 Implementation Status: No Signature Verifier
+
+IronDivi contains no `FN-DSA-512` or `ML-DSA-44` verifier. `check_block_sig_envelope_binding` decodes `vchBlockSig`, applies the `PosBlockAuthPolicy`, binds the staker key to the coinstake output and derives `prehash_msg`, and returns an `UnverifiedBlockSigBinding` (`ClassicalFormatOnly` or `PostQuantumV1BindingOnly`). Any canonically encoded signature passes it, so that outcome is never evidence that a block was signed. The classical outcome records the wire format only; classical `secp256k1` block signatures are checked in `divi-storage`.
+
+`verify_pq_block_signature` is the only constructor of `VerifiedPqBlockSignature`. It reports forbidden schemes and non-canonical encodings and otherwise always fails with `PqBlockSigError::PostQuantumSignatureVerifierUnavailable`. Replacing that failure with a real verifier needs reviewed primitives, known-answer vectors, agreement with C++ Divi Core and a separate activation decision. Until then no code path, including the `pq_epoch_gauntlet` model, may treat a post-quantum block signature as verified.
 
 ---
 

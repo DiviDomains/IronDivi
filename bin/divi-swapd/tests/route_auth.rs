@@ -395,7 +395,7 @@ async fn taker_cli_stores_and_sends_the_swap_token() {
     let sessions = Sessions::beside(&dir.path().join("t.db"));
     let client = MakerClient::new(&s.base);
 
-    let local = flow::begin(&taker, &client, &sessions, OFFER_ID, BTC_SATS)
+    let local = flow::begin(&taker, &client, &sessions, &offer(OFFER_ID), BTC_SATS)
         .await
         .unwrap();
     let sess = sessions.get(&local).unwrap();

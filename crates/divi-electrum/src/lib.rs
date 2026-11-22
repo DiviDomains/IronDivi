@@ -13,6 +13,7 @@
 //! design is in docs/electrum-server.md.
 
 pub mod backend;
+pub mod limits;
 pub mod session;
 pub mod tls;
 
@@ -26,7 +27,7 @@ use divi_rpc::RpcServer;
 use divi_storage::Chain;
 use futures::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
-use tokio::sync::{broadcast, Semaphore};
+use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
@@ -34,8 +35,17 @@ use tokio_tungstenite::tungstenite::Message;
 
 pub use backend::Backend;
 
-/// Most connections served at once, over every listener together
-const MAX_CONNECTIONS: usize = 1000;
+/// Connection allocation over every listener together: ElectrumX's 1000
+/// sessions, the last 100 of them kept for peers holding few, and at most 32
+/// from one peer (loopback exempt)
+fn peer_limits() -> divi_rpc::conn_policy::PeerLimits {
+    divi_rpc::conn_policy::PeerLimits {
+        total: 1000,
+        per_peer: 32,
+        reserved: 100,
+        reserved_peer_max: 4,
+    }
+}
 
 /// The TLS listener: where it binds and its PEM certificate chain and key
 #[derive(Debug, Clone)]
@@ -150,7 +160,7 @@ impl Prepared {
                 }
             }
             let backend = Arc::new(Backend::new(chain, mempool, rpc));
-            let limit = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+            let limit = divi_rpc::conn_policy::PeerTable::new(peer_limits());
             let mut tasks = Vec::new();
             let mut listen = |name: &str,
                               listener: Option<std::net::TcpListener>,
@@ -250,7 +260,7 @@ async fn accept_loop(
     framing: Framing,
     backend: Arc<Backend>,
     banner: Arc<String>,
-    limit: Arc<Semaphore>,
+    limit: Arc<divi_rpc::conn_policy::PeerTable>,
     mut shutdown: broadcast::Receiver<()>,
 ) {
     loop {
@@ -266,9 +276,12 @@ async fn accept_loop(
                 continue;
             }
         };
-        let Ok(permit) = limit.clone().try_acquire_owned() else {
-            tracing::debug!("electrum: refusing {peer}: too many connections");
-            continue;
+        let permit = match limit.admit(peer.ip()) {
+            Ok(permit) => permit,
+            Err(refusal) => {
+                tracing::debug!("electrum: refusing {peer}: {refusal}");
+                continue;
+            }
         };
         let _ = stream.set_nodelay(true);
         let backend = backend.clone();

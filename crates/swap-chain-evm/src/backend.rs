@@ -148,6 +148,19 @@ fn is_revert(msg: &str) -> bool {
     msg.to_ascii_lowercase().contains("revert")
 }
 
+/// Whether [`UsdcBackend::build_funding`] may start a new lock. Claims, refunds and reads of
+/// an already funded swap never consult it: refusing them would strand the operator's funds.
+#[derive(Clone, Debug, Default)]
+enum FundingGate {
+    /// No restriction (library users, tests, anvil).
+    #[default]
+    Open,
+    /// Fund only while every configured endpoint reports this chain id.
+    Chain(u64),
+    /// Never fund; the reason is shown to the operator.
+    Closed(String),
+}
+
 /// [`ChainBackend`] for USDC on an EVM chain (Sepolia, Base Sepolia, or anvil in tests),
 /// over one deployed `Erc20Htlc` and one ERC-20 token.
 #[derive(Clone)]
@@ -160,6 +173,8 @@ pub struct UsdcBackend {
     /// A second node `htlc_output`, `find_spend`, `confirmations` and `median_time_past`
     /// also ask ([`UsdcBackend::with_quorum_rpc`]); `None` reads the one node only.
     quorum: Option<DynProvider>,
+    /// Gate on new fundings only ([`UsdcBackend::with_funding_chain_id`]).
+    funding_gate: FundingGate,
 }
 
 impl std::fmt::Debug for UsdcBackend {
@@ -193,7 +208,67 @@ impl UsdcBackend {
             compressed_pubkey,
             min_lock_gas_wei: U256::ZERO,
             quorum: None,
+            funding_gate: FundingGate::Open,
         })
+    }
+
+    /// Refuse every new funding (`build_funding`: the `approve` and the `lock`) unless each
+    /// configured endpoint reports chain id `chain_id` at that moment. Claims, refunds and
+    /// reads are unaffected, so an existing funded swap stays recoverable. Off by default.
+    pub fn with_funding_chain_id(mut self, chain_id: u64) -> Self {
+        self.funding_gate = FundingGate::Chain(chain_id);
+        self
+    }
+
+    /// Refuse every new funding with `reason`; claims, refunds and reads are unaffected.
+    pub fn with_funding_closed(mut self, reason: impl Into<String>) -> Self {
+        self.funding_gate = FundingGate::Closed(reason.into());
+        self
+    }
+
+    /// The chain id the endpoint(s) report now: the primary node's, and the quorum node's if
+    /// one is configured. Different answers are an error. This is what the endpoint asserts
+    /// (it is what alloy signs with), not a proof of the network behind it.
+    pub async fn authenticated_chain_id(&self) -> Result<u64> {
+        let primary = self
+            .client
+            .provider()
+            .get_chain_id()
+            .await
+            .map_err(|e| SwapError::Transient(format!("get_chain_id: {e}")))?;
+        if let Some(q) = &self.quorum {
+            let second = q
+                .get_chain_id()
+                .await
+                .map_err(|e| SwapError::Transient(format!("quorum get_chain_id: {e}")))?;
+            if second != primary {
+                return Err(SwapError::Other(format!(
+                    "the RPC endpoints disagree on the chain id ({primary} vs {second})"
+                )));
+            }
+        }
+        Ok(primary)
+    }
+
+    /// `Ok` when a new funding may start; checked before anything is signed or sent.
+    async fn ensure_funding_allowed(&self) -> Result<()> {
+        match &self.funding_gate {
+            FundingGate::Open => Ok(()),
+            FundingGate::Closed(why) => Err(SwapError::Other(format!(
+                "new USDC fundings are held: {why}"
+            ))),
+            FundingGate::Chain(want) => {
+                let got = self.authenticated_chain_id().await?;
+                if got == *want {
+                    Ok(())
+                } else {
+                    Err(SwapError::Other(format!(
+                        "new USDC fundings are held: the RPC endpoint reports chain id {got}, \
+                         the configured network is chain id {want}"
+                    )))
+                }
+            }
+        }
     }
 
     /// The EVM address this backend signs from.
@@ -434,7 +509,7 @@ impl UsdcBackend {
             .await
             .map_err(|e| SwapError::Transient(format!("get_transaction_receipt: {e}")))?
         else {
-            return Ok(None);
+            return Err(SwapError::Transient("funding receipt unavailable".into()));
         };
         let mut id = None;
         for log in receipt.inner.logs() {
@@ -447,7 +522,7 @@ impl UsdcBackend {
             }
         }
         let Some(id) = id else {
-            return Ok(None);
+            return Err(SwapError::Transient("funding lock ID unavailable".into()));
         };
 
         let from_block = BlockNumberOrTag::Number(from_height);
@@ -461,11 +536,14 @@ impl UsdcBackend {
             .await
             .map_err(|e| SwapError::Transient(format!("get_logs Claimed: {e}")))?
         {
-            let Some(txid) = log.transaction_hash else {
-                continue;
-            };
+            let txid = log
+                .transaction_hash
+                .ok_or_else(|| SwapError::Transient("spend log lacks transaction hash".into()))?;
             let height = log.block_number;
-            if let Ok(decoded) = log.log_decode::<IErc20Htlc::Claimed>() {
+            {
+                let decoded = log
+                    .log_decode::<IErc20Htlc::Claimed>()
+                    .map_err(|e| SwapError::Transient(format!("invalid Claimed log: {e}")))?;
                 if decoded.inner.data.id == id {
                     return Ok(Some(SpendInfo {
                         txid: Txid(txid.0),
@@ -488,11 +566,14 @@ impl UsdcBackend {
             .await
             .map_err(|e| SwapError::Transient(format!("get_logs Refunded: {e}")))?
         {
-            let Some(txid) = log.transaction_hash else {
-                continue;
-            };
+            let txid = log
+                .transaction_hash
+                .ok_or_else(|| SwapError::Transient("spend log lacks transaction hash".into()))?;
             let height = log.block_number;
-            if let Ok(decoded) = log.log_decode::<IErc20Htlc::Refunded>() {
+            {
+                let decoded = log
+                    .log_decode::<IErc20Htlc::Refunded>()
+                    .map_err(|e| SwapError::Transient(format!("invalid Refunded log: {e}")))?;
                 if decoded.inner.data.id == id {
                     return Ok(Some(SpendInfo {
                         txid: Txid(txid.0),
@@ -511,6 +592,24 @@ impl UsdcBackend {
 #[allow(clippy::double_must_use)]
 #[async_trait]
 impl ChainBackend for UsdcBackend {
+    async fn usdc_admission(&self) -> Result<divi_swap::backend::UsdcAdmission> {
+        self.ensure_funding_allowed().await?;
+        let FundingGate::Chain(id) = self.funding_gate else {
+            return Err(SwapError::InvalidParams(
+                "no permitted USDC chain id".into(),
+            ));
+        };
+        let network = crate::UsdcNetwork::from_chain_id(id)
+            .ok_or_else(|| SwapError::InvalidParams(format!("unknown USDC chain id {id}")))?;
+        divi_swap::config::check_advisory_hold(&[(Chain::Usdc, network.as_str(), None)])
+            .map_err(SwapError::InvalidParams)?;
+        Ok(divi_swap::backend::UsdcAdmission::EvmContracts {
+            chain_id: id,
+            token: self.token.into_array(),
+            htlc: self.client.htlc_address().into_array(),
+        })
+    }
+
     fn chain(&self) -> Chain {
         Chain::Usdc
     }
@@ -586,6 +685,8 @@ impl ChainBackend for UsdcBackend {
                 "backend key is not the HTLC refund (sender) key".into(),
             ));
         }
+        // Before the eager `approve`, which is sent outside the write-ahead path.
+        self.ensure_funding_allowed().await?;
         let allowance = self
             .client
             .token_allowance(
@@ -840,6 +941,24 @@ impl ChainBackend for UsdcBackend {
         quorum::agree_htlc_output(a, b)
     }
 
+    async fn scan_spend(
+        &self,
+        outpoint: &Outpoint,
+        from_height: u64,
+        resume: Option<&divi_swap::ScanMark>,
+    ) -> Result<divi_swap::SpendScan> {
+        if resume.is_some() {
+            return Ok(divi_swap::SpendScan::Reorged);
+        }
+        Ok(match self.find_spend(outpoint, from_height).await? {
+            Some(s) => divi_swap::SpendScan::Spent(s),
+            None => divi_swap::SpendScan::NotYet {
+                through: None,
+                complete: true,
+            },
+        })
+    }
+
     async fn find_spend(&self, outpoint: &Outpoint, from_height: u64) -> Result<Option<SpendInfo>> {
         let a = self
             .find_spend_on(self.client.provider(), outpoint, from_height)
@@ -1079,6 +1198,43 @@ mod tests {
         )
         .unwrap()
         .with_min_lock_gas_wei(min_lock_gas_wei)
+    }
+
+    /// New fundings need the endpoint's own chain id (the one alloy signs with) to match the
+    /// gate; a label is not consulted. The mock node reports 0x7a69 = 31337.
+    #[tokio::test]
+    async fn funding_gate_authenticates_the_endpoint_chain_id() {
+        let server = balance_node(0, 0).await;
+        let b = balance_backend(&server, 0);
+        assert_eq!(b.authenticated_chain_id().await.unwrap(), 31_337);
+        b.ensure_funding_allowed().await.expect("ungated is open");
+        assert!(b.usdc_admission().await.is_err());
+        let ok = balance_backend(&server, 0).with_funding_chain_id(31_337);
+        ok.ensure_funding_allowed().await.expect("matching id");
+        assert!(ok
+            .usdc_admission()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("unknown USDC chain id"));
+        let bad = balance_backend(&server, 0).with_funding_chain_id(11_155_111);
+        let e = bad.ensure_funding_allowed().await.unwrap_err().to_string();
+        assert!(e.contains("held") && e.contains("31337"), "{e}");
+        let closed = balance_backend(&server, 0).with_funding_closed("advisory");
+        let e = closed
+            .ensure_funding_allowed()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("held") && e.contains("advisory"), "{e}");
+    }
+
+    /// A dead endpoint cannot authenticate: the gate fails closed, never open.
+    #[tokio::test]
+    async fn funding_gate_fails_closed_when_the_chain_id_cannot_be_read() {
+        let server = wiremock::MockServer::start().await;
+        let b = balance_backend(&server, 0).with_funding_chain_id(31_337);
+        assert!(b.ensure_funding_allowed().await.is_err());
     }
 
     /// `Maker::accept` checks `spendable` on the maker-leg chain, so on USDC it has to be the

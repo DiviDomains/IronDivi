@@ -169,8 +169,17 @@ impl DirtyFlags {
             || self.vaults
     }
 
-    fn clear(&mut self) {
-        *self = DirtyFlags::default();
+    /// Mark dirty again what `taken` had, after a save of it failed
+    fn merge(&mut self, taken: &DirtyFlags) {
+        self.metadata |= taken.metadata;
+        self.keys |= taken.keys;
+        self.utxos |= taken.utxos;
+        self.spent |= taken.spent;
+        self.transactions |= taken.transactions;
+        self.addresses |= taken.addresses;
+        self.accounts |= taken.accounts;
+        self.scripts |= taken.scripts;
+        self.vaults |= taken.vaults;
     }
 }
 
@@ -383,6 +392,14 @@ pub struct WalletDb {
     /// the same index, and the indices are stored in the order they advanced.
     /// Taken after `locked`.
     key_lock: Mutex<()>,
+    /// Held while wallet state is read into a batch and written (`save`,
+    /// `save_incremental`, `persist_keys`), and by `encrypt_wallet` and
+    /// `change_passphrase` from the moment they read the keys until the wallet
+    /// is encrypted in memory and on disk: a batch built while the wallet was
+    /// plain is never written after it was encrypted, and two batches built
+    /// from different moments never land out of order. Taken after `locked`
+    /// and `key_lock`, before any other lock of the wallet.
+    persist_lock: Mutex<()>,
     /// Sends in progress (`begin_spend`), so that a lock lets them finish
     spends: Mutex<SpendState>,
     /// Told each wallet transaction added or seen again (-walletnotify)
@@ -524,6 +541,7 @@ impl WalletDb {
             detached_txs: RwLock::new(HashMap::new()),
             scan_lock: Mutex::new(()),
             key_lock: Mutex::new(()),
+            persist_lock: Mutex::new(()),
             spends: Mutex::new(SpendState::default()),
             tx_listener: RwLock::new(None),
             reorg_accepted: RwLock::new(HashSet::new()),
@@ -569,6 +587,7 @@ impl WalletDb {
             detached_txs: RwLock::new(HashMap::new()),
             scan_lock: Mutex::new(()),
             key_lock: Mutex::new(()),
+            persist_lock: Mutex::new(()),
             spends: Mutex::new(SpendState::default()),
             tx_listener: RwLock::new(None),
             reorg_accepted: RwLock::new(HashSet::new()),
@@ -618,6 +637,7 @@ impl WalletDb {
             detached_txs: RwLock::new(HashMap::new()),
             scan_lock: Mutex::new(()),
             key_lock: Mutex::new(()),
+            persist_lock: Mutex::new(()),
             spends: Mutex::new(SpendState::default()),
             tx_listener: RwLock::new(None),
             reorg_accepted: RwLock::new(HashSet::new()),
@@ -992,6 +1012,7 @@ impl WalletDb {
             detached_txs: RwLock::new(HashMap::new()),
             scan_lock: Mutex::new(()),
             key_lock: Mutex::new(()),
+            persist_lock: Mutex::new(()),
             spends: Mutex::new(SpendState::default()),
             tx_listener: RwLock::new(None),
             reorg_accepted: RwLock::new(HashSet::new()),
@@ -1271,6 +1292,7 @@ impl WalletDb {
     /// goes through here before it is handed out: the per-block `save_incremental`
     /// is too late, a lock or restart before the next block would lose the key.
     fn persist_keys(&self, hashes: &[Hash160]) -> Result<(), WalletError> {
+        let _persist = self.persist_lock.lock();
         let db = match self.db() {
             Some(db) => db,
             None => return self.closed_database(),
@@ -1303,6 +1325,7 @@ impl WalletDb {
             receiving.to_le_bytes(),
         );
         batch.put_cf(db.cf_metadata(), b"change_index", change.to_le_bytes());
+        pause_point!(self, "wallet keys batch built");
         db.write_batch_sync(batch)
     }
 
@@ -1409,11 +1432,24 @@ impl WalletDb {
 
     /// Save wallet data to database
     pub fn save(&self) -> Result<(), WalletError> {
+        let _persist = self.persist_lock.lock();
         let db = match self.db() {
             Some(db) => db,
             None => return self.closed_database(),
         };
-        let db = &*db;
+        // Taken before any state is read: a change made from here on marks its
+        // category dirty again, so the next save writes it
+        let taken = std::mem::take(&mut *self.dirty.write());
+        let saved = self.write_everything(&db);
+        if saved.is_err() {
+            // Whatever was dirty is still unwritten (or unknown): keep it dirty
+            self.dirty.write().merge(&taken);
+        }
+        saved
+    }
+
+    /// [`Self::save`]'s write, with `persist_lock` held
+    fn write_everything(&self, db: &WalletDatabase) -> Result<(), WalletError> {
         use crate::persistence::{outpoint_key, serialize_tx, serialize_utxo};
 
         // One synced batch: a crash or kill during the save leaves the previous
@@ -1517,13 +1553,11 @@ impl WalletDb {
             batch.put_cf(db.cf_scripts(), hash.as_bytes(), script.as_bytes());
         }
 
+        pause_point!(self, "wallet save batch built");
         // Synced, so it is on disk when this returns; no memtable flush needed
         db.write_batch_sync(batch)?;
         self.clear_pending_deletes(&pending);
         stop_point!("wallet deletes written");
-
-        // Clear dirty flags since everything was just written
-        self.dirty.write().clear();
 
         debug!("Wallet saved to disk");
         Ok(())
@@ -1565,12 +1599,18 @@ impl WalletDb {
 
     /// Save only the last scan height to database (lightweight, no flush)
     pub fn save_scan_height(&self) -> Result<(), WalletError> {
-        if let Some(db) = &self.db() {
-            let mut batch = db.create_batch();
-            self.put_scan_state(&mut batch, db);
-            db.write_batch(batch)?;
+        let _persist = self.persist_lock.lock();
+        match &self.db() {
+            Some(db) => self.write_scan_state(db),
+            None => Ok(()),
         }
-        Ok(())
+    }
+
+    /// [`Self::save_scan_height`]'s write, with `persist_lock` held
+    fn write_scan_state(&self, db: &WalletDatabase) -> Result<(), WalletError> {
+        let mut batch = db.create_batch();
+        self.put_scan_state(&mut batch, db);
+        db.write_batch(batch)
     }
 
     /// The scan height and the hashes of the blocks scanned up to it, so a
@@ -1599,19 +1639,32 @@ impl WalletDb {
     /// Incrementally save only dirty wallet data using an atomic WriteBatch.
     /// Much cheaper than full save() when only a few categories changed.
     pub fn save_incremental(&self) -> Result<(), WalletError> {
-        use crate::persistence::{outpoint_key, serialize_tx, serialize_utxo};
-
+        let _persist = self.persist_lock.lock();
         let db = match self.db() {
             Some(db) => db,
             None => return self.closed_database(),
         };
-        let db = &*db;
+        // Taken, not copied: only the categories taken here are written below,
+        // and a change made from here on marks its category dirty again, so a
+        // later save writes it rather than finding its flag cleared
+        let flags = std::mem::take(&mut *self.dirty.write());
+        let saved = self.write_dirty(&db, &flags);
+        if saved.is_err() {
+            // Nothing written: what was dirty stays dirty for the next save
+            self.dirty.write().merge(&flags);
+        }
+        saved
+    }
 
-        let flags = self.dirty.read().clone();
+    /// [`Self::save_incremental`]'s write of the `flags` taken, with
+    /// `persist_lock` held
+    fn write_dirty(&self, db: &WalletDatabase, flags: &DirtyFlags) -> Result<(), WalletError> {
+        use crate::persistence::{outpoint_key, serialize_tx, serialize_utxo};
+
         let pending = self.pending_deletes_snapshot();
         if !flags.any_dirty() && pending.is_empty() {
             // Nothing changed — just persist scan height
-            return self.save_scan_height();
+            return self.write_scan_state(db);
         }
 
         let mut batch = db.create_batch();
@@ -1703,11 +1756,10 @@ impl WalletDb {
             );
         }
 
+        pause_point!(self, "wallet incremental batch built");
+        stop_point!("wallet incremental batch built");
         // Atomic write
         db.write_batch(batch)?;
-
-        // Clear dirty flags
-        self.dirty.write().clear();
         self.clear_pending_deletes(&pending);
 
         counted::hit(Site::WalletSave);
@@ -3429,7 +3481,10 @@ impl WalletDb {
         // written with the rest of the encrypted wallet
         self.keystore.hold_pool_lines();
         let encrypted = self.encrypt_and_store(passphrase);
-        self.keystore.release_pool_lines(encrypted.is_ok());
+        self.keystore.release_pool_lines(matches!(
+            encrypted,
+            Ok(()) | Err(WalletError::EncryptionCleanup(_))
+        ));
         encrypted
     }
 
@@ -3437,6 +3492,13 @@ impl WalletDb {
     fn encrypt_and_store(&self, passphrase: &str) -> Result<(), WalletError> {
         use rand::RngCore;
 
+        // From the snapshot of the keys below until the wallet is encrypted in
+        // memory with its secrets gone, no key is made or imported (key_lock)
+        // and no other batch is built or written (persist_lock): a key cannot
+        // join after the snapshot and lose its secret to strip_secrets, and a
+        // batch holding the plain phrase or keys cannot land after this one
+        let keys = self.key_lock.lock();
+        let persist = self.persist_lock.lock();
         let mut encrypted = self.encrypted.write();
         if *encrypted {
             return Err(WalletError::AlreadyEncrypted);
@@ -3542,7 +3604,9 @@ impl WalletDb {
         batch.put_cf(db.cf_metadata(), KEY_ENCRYPTION_SALT, &salt);
         batch.put_cf(db.cf_metadata(), KEY_ENCRYPTED_MASTER_KEY, &sealed_master);
         batch.put_cf(db.cf_metadata(), b"encrypted", [1u8]);
-        if let Err(e) = db.write_batch(batch) {
+        // Synced: once this returns the wallet is encrypted on disk, and memory
+        // follows below whatever happens after
+        if let Err(e) = db.write_batch_sync(batch) {
             // The pool keys of the top-up were not written: Divi Core's
             // derivation throws before a key it cannot write joins the pool
             // (wallet.cpp:1011-1015, :2357-2360)
@@ -3550,20 +3614,38 @@ impl WalletDb {
             self.keystore.restore_pool_state(pool);
             return Err(e);
         }
-        // Divi Core rewrites the whole wallet file after encrypting, so no bit of
-        // the plain keys stays on disk (wallet.cpp:1023-1026): every family is
-        // flushed, so the write-ahead log holding the plain phrase is retired,
-        // and the secret families are compacted, so old SST files go too
-        db.flush_all_cfs()?;
-        db.compact_secret_cfs();
-
+        // Before the flush below can fail: a wallet left marked plain in memory
+        // would write its plain phrase, keys and encrypted flag 0 over the
+        // encrypted wallet on the next save
         *encrypted = true;
         drop(encrypted);
         // Every secret is in the batch above; lock() has nothing left to store
         self.keystore.strip_secrets();
+        // Divi Core rewrites the whole wallet file after encrypting, so no bit of
+        // the plain keys stays on disk (wallet.cpp:1023-1026): every family is
+        // flushed, so the write-ahead log holding the plain phrase is retired,
+        // and the secret families are compacted, so old SST files go too
+        let flushed = Self::retire_plaintext_log(db);
+        db.compact_secret_cfs();
+        drop(persist);
+        drop(keys);
         self.lock();
+        if let Err(e) = flushed {
+            error!(
+                "Wallet encrypted and locked, but its plaintext copies may remain on disk: {}",
+                e
+            );
+            return Err(WalletError::EncryptionCleanup(Box::new(e)));
+        }
         info!("Wallet encrypted; it is now locked");
         Ok(())
+    }
+
+    /// Flush every column family, so the write-ahead log holding the plain
+    /// phrase and keys is retired
+    fn retire_plaintext_log(db: &WalletDatabase) -> Result<(), WalletError> {
+        stop_point!("wallet encryption written");
+        db.flush_all_cfs()
     }
 
     /// Change the wallet passphrase. Does not require the wallet to be unlocked.
@@ -3574,6 +3656,9 @@ impl WalletDb {
         if old_pass.is_empty() || new_pass.is_empty() {
             return Err(WalletError::InvalidPassphrase);
         }
+        // Before the master key slot, as in save: a save sealing keys with the
+        // master key of the older format cannot land after the move below
+        let _persist = self.persist_lock.lock();
         let db = self.db().ok_or_else(|| {
             WalletError::Storage("Cannot change passphrase without database".to_string())
         })?;
@@ -3627,6 +3712,9 @@ impl WalletDb {
         compressed: bool,
         label: Option<String>,
     ) -> Address {
+        // As every key made: an encryption cannot snapshot the keys between
+        // the import and its write, then strip the imported secret
+        let _keys = self.key_lock.lock();
         let address = self
             .keystore
             .import_key_with_compression(secret, compressed, label);
@@ -6413,6 +6501,9 @@ mod tests {
             .iter()
             .any(|(h, _)| *h == addr.hash));
     }
+
+    /// Saves, key writes and encryption racing one another
+    mod save_boundaries;
 
     /// Confirmed-state accounting: blocks scanned twice, reorgs, restarts
     mod chain_accounting {

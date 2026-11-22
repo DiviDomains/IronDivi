@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use divi_swap::mock::MockChain;
-use divi_swap::{Amount, Chain, Maker, Profile, Store, SwapConfig};
+use divi_swap::{Amount, Chain, Maker, Profile, QuoteIntent, Store, SwapConfig};
 use divi_swap_cli::{xmr_flow, MakerClient, RunOpts, Sessions};
 use divi_swap_xmr::api::{JRoundRequest, SigsRequest, XmrLockNotice};
 use divi_swap_xmr::mock::{
@@ -180,6 +180,11 @@ fn quoted_divi() -> u64 {
     mock_xmr_offers()[0].divi_for(XMR_UNITS).0
 }
 
+/// What the taker selected: the stagenet XMR offer, for `XMR_UNITS`.
+fn intent() -> QuoteIntent {
+    QuoteIntent::for_offer(&mock_xmr_offers()[0], XMR_UNITS).unwrap()
+}
+
 #[tokio::test]
 async fn e2e_mock_xmr_happy() {
     let w = World::new();
@@ -201,15 +206,9 @@ async fn e2e_mock_xmr_happy() {
         timeout: Duration::from_secs(180), // hp2 runs many lanes at once
         poll: TICK,
     };
-    let (local, outcome) = xmr_flow::run(
-        &taker,
-        &client,
-        &sessions,
-        "divi-xmr-stagenet",
-        XMR_UNITS,
-        &opts,
-        &mut || w.mine(),
-    )
+    let (local, outcome) = xmr_flow::run(&taker, &client, &sessions, &intent(), &opts, &mut || {
+        w.mine()
+    })
     .await
     .unwrap();
     assert_eq!(outcome, "redeemed");
@@ -251,7 +250,7 @@ async fn e2e_mock_xmr_refund() {
     let client = MakerClient::new(&d.base);
     let sessions = Sessions::beside(&tdb);
 
-    let local = xmr_flow::begin(&taker, &client, &sessions, "divi-xmr-stagenet", XMR_UNITS)
+    let local = xmr_flow::begin(&taker, &client, &sessions, &intent())
         .await
         .unwrap();
     let deadline = Instant::now() + LOADED_HOST_WAIT;
@@ -377,7 +376,7 @@ async fn xmr_swap_routes_need_the_swap_token() {
     let taker = w.taker(&tdb);
     let client = MakerClient::new(&d.base);
     let sessions = Sessions::beside(&tdb);
-    let local = xmr_flow::begin(&taker, &client, &sessions, "divi-xmr-stagenet", XMR_UNITS)
+    let local = xmr_flow::begin(&taker, &client, &sessions, &intent())
         .await
         .unwrap();
     let session = sessions.get(&local).unwrap();
@@ -511,7 +510,7 @@ async fn xmr_swap_routes_share_a_per_swap_bucket() {
     let taker = w.taker(&tdb);
     let client = MakerClient::new(&d.base);
     let sessions = Sessions::beside(&tdb);
-    let local = xmr_flow::begin(&taker, &client, &sessions, "divi-xmr-stagenet", XMR_UNITS)
+    let local = xmr_flow::begin(&taker, &client, &sessions, &intent())
         .await
         .unwrap();
     let session = sessions.get(&local).unwrap();
@@ -553,7 +552,7 @@ async fn xmr_token_guesses_are_throttled() {
     let taker = w.taker(&tdb);
     let client = MakerClient::new(&d.base);
     let sessions = Sessions::beside(&tdb);
-    let local = xmr_flow::begin(&taker, &client, &sessions, "divi-xmr-stagenet", XMR_UNITS)
+    let local = xmr_flow::begin(&taker, &client, &sessions, &intent())
         .await
         .unwrap();
     let session = sessions.get(&local).unwrap();
@@ -690,7 +689,7 @@ async fn begun(w: &World, tmp: &std::path::Path, base: &str) -> (String, String)
     let taker = w.taker(&tdb);
     let client = MakerClient::new(base);
     let sessions = Sessions::beside(&tdb);
-    let local = xmr_flow::begin(&taker, &client, &sessions, "divi-xmr-stagenet", XMR_UNITS)
+    let local = xmr_flow::begin(&taker, &client, &sessions, &intent())
         .await
         .unwrap();
     let session = sessions.get(&local).unwrap();
@@ -987,4 +986,44 @@ async fn a_prober_cannot_drain_a_swaps_bucket_on_the_post_routes() {
         limit,
         "the taker's requests fill the bucket exactly"
     );
+}
+
+/// The XMR taker is held to its intent: a quote off it (here, less DIVI than the user's
+/// limit) is refused before any key is made or `POST /xmr/swaps` is sent, and an intent for
+/// another chain never asks for a quote.
+#[tokio::test]
+async fn xmr_begin_refuses_a_quote_off_the_intent_before_setup() {
+    let w = World::new();
+    let tmp = tempfile::tempdir().unwrap();
+    let d = serve(&w, &tmp.path().join("m.db")).await;
+    let tdb = tmp.path().join("t.db");
+    let taker = w.taker(&tdb);
+    let client = MakerClient::new(&d.base);
+    let sessions = Sessions::beside(&tdb);
+
+    let price = mock_xmr_offers()[0].divi_sats_per_btc;
+    let greedy = intent().stricter_price(price * 2).unwrap();
+    let err = xmr_flow::begin(&taker, &client, &sessions, &greedy)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("below the"), "{err}");
+
+    let wrong_chain = QuoteIntent {
+        counter_chain: Chain::Ltc,
+        ..intent()
+    };
+    let err = xmr_flow::begin(&taker, &client, &sessions, &wrong_chain)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("this is the xmr flow"), "{err}");
+
+    assert!(d.xmr.list().unwrap().is_empty(), "nothing reached setup");
+
+    // On its intent the same taker goes on to set the swap up.
+    xmr_flow::begin(&taker, &client, &sessions, &intent())
+        .await
+        .unwrap();
+    assert_eq!(d.xmr.list().unwrap().len(), 1);
 }

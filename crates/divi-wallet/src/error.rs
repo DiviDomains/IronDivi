@@ -65,6 +65,9 @@ pub enum WalletError {
     #[error("wallet already encrypted")]
     AlreadyEncrypted,
 
+    #[error("wallet encrypted and locked, but plaintext cleanup failed: {0}")]
+    EncryptionCleanup(#[source] Box<WalletError>),
+
     /// Wallet not encrypted
     #[error("wallet not encrypted")]
     NotEncrypted,

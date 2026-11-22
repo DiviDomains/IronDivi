@@ -901,6 +901,24 @@ impl ChainBackend for DiviBackend {
         second_source::agree_htlc_output(a, b)
     }
 
+    async fn scan_spend(
+        &self,
+        outpoint: &Outpoint,
+        from_height: u64,
+        resume: Option<&divi_swap::ScanMark>,
+    ) -> Result<divi_swap::SpendScan> {
+        if resume.is_some() {
+            return Ok(divi_swap::SpendScan::Reorged);
+        }
+        Ok(match self.find_spend(outpoint, from_height).await? {
+            Some(s) => divi_swap::SpendScan::Spent(s),
+            None => divi_swap::SpendScan::NotYet {
+                through: None,
+                complete: true,
+            },
+        })
+    }
+
     async fn find_spend(&self, outpoint: &Outpoint, from_height: u64) -> Result<Option<SpendInfo>> {
         let Some(fb) = &self.fallback else {
             return find_spend_on(&self.rpc, outpoint, from_height).await;
@@ -917,14 +935,25 @@ impl ChainBackend for DiviBackend {
 async fn block_txids_on(rpc: &RpcClient, height: u64) -> Result<Vec<String>> {
     let hash = rpc.call_ok("getblockhash", json!([height])).await?;
     let block = rpc.call_ok("getblock", json!([hash, true])).await?;
-    Ok(block["tx"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|t| t.as_str().map(String::from))
-                .collect()
+    txids(&block["tx"], false)
+}
+
+fn txids(value: &Value, allow_empty: bool) -> Result<Vec<String>> {
+    let invalid = || SwapError::Transient("incomplete transaction list".into());
+    let list = value.as_array().ok_or_else(invalid)?;
+    if list.is_empty() && !allow_empty {
+        return Err(invalid());
+    }
+    let mut seen = std::collections::HashSet::new();
+    list.iter()
+        .map(|v| {
+            let id = v.as_str().ok_or_else(invalid)?;
+            if id.parse::<Txid>().is_err() || !seen.insert(id.to_ascii_lowercase()) {
+                return Err(invalid());
+            }
+            Ok(id.to_ascii_lowercase())
         })
-        .unwrap_or_default())
+        .collect()
 }
 
 fn prevout(input: &TxIn) -> Outpoint {
@@ -1080,30 +1109,55 @@ async fn find_spend_on(
 ) -> Result<Option<SpendInfo>> {
     let want_txid = outpoint.txid.to_rpc_hex();
     let tip = tip_height_on(rpc).await?;
+    let invalid = || SwapError::Transient("inconsistent spend scan evidence".into());
+    if from_height > tip {
+        return Err(invalid());
+    }
+    let mut parent = None;
     for h in from_height..=tip {
-        for txid in block_txids_on(rpc, h).await? {
+        let hash = rpc.call_ok("getblockhash", json!([h])).await?;
+        let block = rpc.call_ok("getblock", json!([hash, true])).await?;
+        if hash.as_str().and_then(|v| v.parse::<Txid>().ok()).is_none()
+            || block["hash"] != hash
+            || block["height"].as_u64() != Some(h)
+            || (h > 0 && block["previousblockhash"].as_str().and_then(|v| v.parse::<Txid>().ok()).is_none())
+            || parent
+                .as_ref()
+                .is_some_and(|p| p != &block["previousblockhash"])
+        {
+            return Err(invalid());
+        }
+        parent = Some(hash);
+        for txid in txids(&block["tx"], false)? {
             let tx = get_tx_on(rpc, &txid).await?;
+            if tx["txid"].as_str() != Some(txid.as_str()) {
+                return Err(invalid());
+            }
             if let Some(s) = spend_in(&tx, &want_txid, outpoint.vout, Some(h))? {
+                if Some(rpc.call_ok("getblockhash", json!([h])).await?) != parent {
+                    return Err(invalid());
+                }
                 return Ok(Some(s));
             }
         }
     }
+    let mut found = None;
     let pool = rpc.call_ok("getrawmempool", json!([])).await?;
-    for txid in pool
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-    {
-        let tx = match get_tx_opt_on(rpc, &txid.parse()?).await? {
-            Some(tx) => tx,
-            None => continue, // left the mempool meanwhile; a block scan will see it
-        };
+    for txid in txids(&pool, true)? {
+        let tx = get_tx_on(rpc, &txid).await?;
+        if tx["txid"].as_str() != Some(txid.as_str()) {
+            return Err(invalid());
+        }
         if let Some(s) = spend_in(&tx, &want_txid, outpoint.vout, None)? {
-            return Ok(Some(s));
+            found = Some(s);
         }
     }
-    Ok(None)
+    if tip_height_on(rpc).await? != tip
+        || Some(rpc.call_ok("getblockhash", json!([tip])).await?) != parent
+    {
+        return Err(invalid());
+    }
+    Ok(found)
 }
 
 /// One endpoint's `sendrawtransaction`, with the "already known" / premature / recheck
@@ -1143,9 +1197,28 @@ async fn send_raw_on(rpc: &RpcClient, raw_hex: &str, txid: &Txid) -> Result<()> 
 
 /// If `tx` (verbose JSON) has an input spending `txid:vout`, describe it.
 fn spend_in(tx: &Value, txid: &str, vout: u32, height: Option<u64>) -> Result<Option<SpendInfo>> {
-    for (i, input) in tx["vin"].as_array().into_iter().flatten().enumerate() {
+    let invalid = || SwapError::Transient("incomplete transaction inputs".into());
+    for (i, input) in tx["vin"]
+        .as_array()
+        .filter(|v| !v.is_empty())
+        .ok_or_else(invalid)?
+        .iter()
+        .enumerate()
+    {
+        if input["coinbase"].as_str().is_none()
+            && (input["txid"]
+                .as_str()
+                .and_then(|v| v.parse::<Txid>().ok())
+                .is_none()
+                || input["vout"]
+                    .as_u64()
+                    .and_then(|n| u32::try_from(n).ok())
+                    .is_none())
+        {
+            return Err(invalid());
+        }
         if input["txid"].as_str() == Some(txid) && input["vout"].as_u64() == Some(vout as u64) {
-            let script_sig = hex::decode(input["scriptSig"]["hex"].as_str().unwrap_or(""))
+            let script_sig = hex::decode(input["scriptSig"]["hex"].as_str().ok_or_else(invalid)?)
                 .map_err(|e| SwapError::Other(format!("scriptSig hex: {e}")))?;
             return Ok(Some(SpendInfo {
                 txid: tx["txid"]

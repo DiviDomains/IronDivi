@@ -68,6 +68,7 @@ fn maker() -> MakerRecord {
         last_error: None,
         maker_lock_dropped: false,
         maker_lock_sent: false,
+        usdc_admission: None,
         claim_fees: Default::default(),
     }
 }
@@ -87,6 +88,8 @@ fn taker() -> TakerRecord {
         maker_leg_amount: None,
         maker_leg_claim: None,
         taker_leg_refund: None,
+        taker_leg_sent: false,
+        usdc_admission: None,
         claim_declined: None,
         claim_base_feerate: None,
         claim_feerate: None,

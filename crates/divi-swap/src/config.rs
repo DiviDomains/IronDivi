@@ -720,6 +720,33 @@ pub fn check_profile_networks(
     Ok(())
 }
 
+/// Hold on *new* real-value Monero and EVM (USDC) swaps while their signing stacks still link
+/// `crypto-bigint 0.5.5` (RUSTSEC-2026-0387, secret-dependent timing; fixed only in
+/// `>= 0.7.6`) and no release of `alloy-signer`/`k256`, `ciphersuite`/`dalek-ff-group` or
+/// `monero-ed25519` accepts that version. `divi-swap-xmr` also pins `cggmp21 0.6.3`
+/// (RUSTSEC-2025-0127, no fixed release). Stagenet/testnet and every other coin are
+/// unaffected; there is no opt-out.
+///
+/// This judges the configured network *label* only, and a label is not proof of the network:
+/// the USDC backend signs with the chain id its RPC endpoint reports. Callers therefore use it
+/// as the first of two admission checks (the second authenticates the endpoint's chain id; see
+/// `docs/dependency-advisories.md`) and apply it to **new** swaps only: refusing to load a
+/// config, or to run `claim`/`refund`, would strand funded swaps. Lift this when
+/// `cargo deny check advisories` is clean for the `divi-swapd` and `divi-swap` roots.
+pub fn check_advisory_hold(coins: &[ConfiguredNetwork<'_>]) -> std::result::Result<(), String> {
+    for &(chain, network, _) in coins {
+        if matches!(chain, Chain::Xmr | Chain::Usdc) && is_mainnet_network(chain, network) {
+            return Err(format!(
+                "[{chain}].network = \"{network}\" is held: its signing dependencies carry \
+                 unfixed advisories (RUSTSEC-2026-0387, RUSTSEC-2025-0127); new real-value \
+                 {chain} swaps are refused while swaps already funded keep their claim and \
+                 refund paths (docs/dependency-advisories.md)"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// The terms a maker puts in a quote that bind the taker's money: how long each leg is
 /// locked and how deep each lock must be before the other side acts. All durations in
 /// seconds.
@@ -1492,6 +1519,29 @@ quote_expiry_secs = 60
         let e =
             check_profile_networks(Profile::Testnet, &[(Chain::Usdc, "base", None)]).unwrap_err();
         assert!(e.contains("[usdc].network = \"base\""), "{e}");
+    }
+
+    #[test]
+    fn advisory_hold_refuses_only_real_value_xmr_and_usdc() {
+        for coin in [
+            (Chain::Xmr, "mainnet", Some(true)),
+            (Chain::Usdc, "ethereum", None),
+            (Chain::Usdc, "base", None),
+        ] {
+            let e = check_advisory_hold(&[coin]).unwrap_err();
+            assert!(
+                e.contains("RUSTSEC-2026-0387") && e.contains(&format!("[{}]", coin.0)),
+                "{e}"
+            );
+        }
+        assert!(check_advisory_hold(&ALL_TEST).is_ok());
+        let others = [
+            (Chain::Btc, "mainnet", Some(true)),
+            (Chain::Ltc, "mainnet", Some(true)),
+            (Chain::Zec, "mainnet", Some(true)),
+            (Chain::Divi, "mainnet", Some(true)),
+        ];
+        assert!(check_advisory_hold(&others).is_ok());
     }
 
     #[test]

@@ -26,5 +26,5 @@ pub mod wallet;
 pub mod xmr_flow;
 
 pub use client::MakerClient;
-pub use flow::{run_swap, run_swap_gated, ClaimGate, ClaimPolicy, RunOpts};
+pub use flow::{run_swap, run_swap_gated, run_swap_intent, ClaimGate, ClaimPolicy, RunOpts};
 pub use session::Sessions;

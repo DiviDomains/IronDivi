@@ -4329,13 +4329,18 @@ impl WalletRpc {
 
         // Divi Core's reply names no cause (rpcwallet.cpp:2729-2730); the
         // cause goes to the log
-        wallet.encrypt_wallet(passphrase).map_err(|e| {
-            tracing::error!("Failed to encrypt the wallet: {}", e);
-            RpcError::new(
-                codes::WALLET_ENCRYPTION_FAILED,
-                "Error: Failed to encrypt the wallet.",
-            )
-        })?;
+        let cleanup_failed = match wallet.encrypt_wallet(passphrase) {
+            Ok(()) => false,
+            Err(divi_wallet::error::WalletError::EncryptionCleanup(_)) => true,
+            Err(e) => {
+                tracing::error!("Failed to encrypt the wallet: {}", e);
+                return Err(RpcError::new(
+                    codes::WALLET_ENCRYPTION_FAILED,
+                    "Error: Failed to encrypt the wallet.",
+                )
+                .into());
+            }
+        };
 
         // As Divi Core 3.0.0 the node keeps running with the wallet reloaded,
         // encrypted and locked (rpcwallet.cpp:2732-2733). The reloaded wallet
@@ -4345,6 +4350,13 @@ impl WalletRpc {
         wallet.read_names_back();
         for outpoint in wallet.locked_coins() {
             wallet.set_coin_locked(outpoint, false);
+        }
+        if cleanup_failed {
+            return Err(RpcError::new(
+                codes::WALLET_ENCRYPTION_FAILED,
+                "Wallet encrypted and locked. Plaintext key material may remain on disk; do not retry encryptwallet. Check the node log.",
+            )
+            .into());
         }
         Ok(serde_json::json!("Wallet reloaded!"))
     }
@@ -5515,9 +5527,14 @@ impl WalletRpc {
     }
 
     /// planpqsweep - Plan a deterministic voluntary post-quantum / vault sweep without broadcasting or mutating wallet state.
+    ///
+    /// Signable material (`txid`, `raw_tx_hex`, output scripts) is returned only for plans that
+    /// neither create nor spend `DIP-PQ-3` outputs, or once `DIP-PQ-3` is enforced. Otherwise the
+    /// reply is a read-only estimate with `"signable": false`.
     pub fn plan_pq_sweep(&self, params: &Params) -> Result<serde_json::Value, Error> {
         use divi_wallet::pq_sweep::{
-            plan_voluntary_pq_sweep, PqSweepError, PqSweepPlanConfig, DEFAULT_SWEEP_FEE_PER_KB_SAT,
+            estimate_voluntary_pq_sweep, plan_requires_pq_outputs, plan_voluntary_pq_sweep,
+            PqSweepError, PqSweepPlanConfig, DEFAULT_SWEEP_FEE_PER_KB_SAT,
         };
 
         if params.is_empty() || params.len() > 3 {
@@ -5588,21 +5605,19 @@ impl WalletRpc {
         config.fee_per_kb_sat = fee_per_kb_sat;
         config.include_unexposed_classical = include_unexposed_classical;
         config.include_classical_vaults = include_classical_vaults;
+        config.pq_output_activation = self.pq_output_activation();
+        let activation = config.pq_output_activation;
 
         let trackable = self.collect_trackable_utxos(&wallet);
-        let plan = plan_voluntary_pq_sweep(&trackable, &config).map_err(|e| match e {
-            PqSweepError::InvalidConfiguration(msg) => {
-                RpcError::new(codes::INVALID_PARAMETER, msg.to_string())
+        let plan = match plan_voluntary_pq_sweep(&trackable, &config) {
+            Ok(plan) if activation.is_active() || !plan_requires_pq_outputs(&plan) => plan,
+            Ok(_) | Err(PqSweepError::PqOutputsNotActive) => {
+                let estimate =
+                    estimate_voluntary_pq_sweep(&trackable, &config).map_err(pq_sweep_rpc_error)?;
+                return Ok(pq_sweep_estimate_json(&estimate, activation));
             }
-            PqSweepError::DegenerateVaultKeys => {
-                RpcError::new(codes::INVALID_PARAMETER, e.to_string())
-            }
-            PqSweepError::NoEligibleUtxosToSweep
-            | PqSweepError::BelowMinimumVaultThreshold { .. }
-            | PqSweepError::InsufficientValueForFee { .. } => {
-                RpcError::new(codes::WALLET_INSUFFICIENT_FUNDS, e.to_string())
-            }
-        })?;
+            Err(e) => return Err(pq_sweep_rpc_error(e)),
+        };
 
         let batches: Vec<serde_json::Value> = plan
             .batches
@@ -5622,17 +5637,7 @@ impl WalletRpc {
                     "estimated_weight": b.estimated_weight,
                     "vault_output_count": b.vault_output_count,
                     "p2pqpkh_output_count": b.p2pqpkh_output_count,
-                    "inputs": b.inputs.iter().map(|u| {
-                        let reason = u.classify_exposure();
-                        serde_json::json!({
-                            "txid": u.txid.to_string(),
-                            "vout": u.vout,
-                            "address": u.address,
-                            "value_sat": u.value.as_sat(),
-                            "category": pq_exposure_category_label(reason),
-                            "shor_exposed_immediately": reason.is_shor_exposed_immediately(),
-                        })
-                    }).collect::<Vec<_>>(),
+                    "inputs": b.inputs.iter().map(pq_sweep_input_json).collect::<Vec<_>>(),
                     "outputs": b.unsigned_tx.vout.iter().enumerate().map(|(vout, o)| {
                         serde_json::json!({
                             "vout": vout,
@@ -5647,19 +5652,12 @@ impl WalletRpc {
         let skipped_utxos: Vec<serde_json::Value> = plan
             .skipped_utxos
             .iter()
-            .map(|u| {
-                serde_json::json!({
-                    "txid": u.txid.to_string(),
-                    "vout": u.vout,
-                    "address": u.address,
-                    "value_sat": u.value.as_sat(),
-                    "is_mature": u.is_mature,
-                    "category": pq_exposure_category_label(u.classify_exposure()),
-                })
-            })
+            .map(pq_sweep_skipped_json)
             .collect();
 
         Ok(serde_json::json!({
+            "signable": true,
+            "pq_output_activation": activation.label(),
             "swept_input_count": plan.swept_input_count,
             "exposed_input_count": plan.exposed_input_count,
             "skipped_utxo_count": plan.skipped_utxos.len(),
@@ -5671,6 +5669,15 @@ impl WalletRpc {
             "batches": batches,
             "skipped_utxos": skipped_utxos,
         }))
+    }
+
+    /// `DIP-PQ-3` status used by `planpqsweep`. IronDivi consensus has no
+    /// `PostQuantumWitnessAndVaults` fork (Divi Core declares one in `ForkActivation.cpp` but no
+    /// consensus code consults it), so PQ outputs are never enforced and sweep material that
+    /// creates or spends them is withheld. Wire this to the tip's fork state when both clients
+    /// enforce the fork.
+    fn pq_output_activation(&self) -> divi_wallet::pq_sweep::PqOutputActivation {
+        divi_wallet::pq_sweep::PqOutputActivation::Inactive
     }
 
     fn parse_pq_sweep_destination(
@@ -5996,6 +6003,97 @@ fn pq_exposure_category_label(
         QuantumExposureReason::ClassicalVaultInsulated => "classical_vault_insulated",
         QuantumExposureReason::PostQuantumNative => "post_quantum_native",
     }
+}
+
+fn pq_sweep_rpc_error(e: divi_wallet::pq_sweep::PqSweepError) -> Error {
+    use divi_wallet::pq_sweep::PqSweepError;
+    let err = match e {
+        PqSweepError::InvalidConfiguration(msg) => {
+            RpcError::new(codes::INVALID_PARAMETER, msg.to_string())
+        }
+        PqSweepError::DegenerateVaultKeys | PqSweepError::PqOutputsNotActive => {
+            RpcError::new(codes::INVALID_PARAMETER, e.to_string())
+        }
+        PqSweepError::NoEligibleUtxosToSweep
+        | PqSweepError::BelowMinimumVaultThreshold { .. }
+        | PqSweepError::InsufficientValueForFee { .. } => {
+            RpcError::new(codes::WALLET_INSUFFICIENT_FUNDS, e.to_string())
+        }
+    };
+    err.into()
+}
+
+fn pq_sweep_input_json(u: &divi_wallet::pq_sweep::TrackableWalletUtxo) -> serde_json::Value {
+    let reason = u.classify_exposure();
+    serde_json::json!({
+        "txid": u.txid.to_string(),
+        "vout": u.vout,
+        "address": u.address,
+        "value_sat": u.value.as_sat(),
+        "category": pq_exposure_category_label(reason),
+        "shor_exposed_immediately": reason.is_shor_exposed_immediately(),
+    })
+}
+
+fn pq_sweep_skipped_json(u: &divi_wallet::pq_sweep::TrackableWalletUtxo) -> serde_json::Value {
+    serde_json::json!({
+        "txid": u.txid.to_string(),
+        "vout": u.vout,
+        "address": u.address,
+        "value_sat": u.value.as_sat(),
+        "is_mature": u.is_mature,
+        "category": pq_exposure_category_label(u.classify_exposure()),
+    })
+}
+
+/// Read-only `planpqsweep` reply: no `txid`, `raw_tx_hex` or output script is included.
+fn pq_sweep_estimate_json(
+    estimate: &divi_wallet::pq_sweep::PqSweepEstimate,
+    activation: divi_wallet::pq_sweep::PqOutputActivation,
+) -> serde_json::Value {
+    let batches: Vec<serde_json::Value> = estimate
+        .batches
+        .iter()
+        .map(|b| {
+            serde_json::json!({
+                "batch_index": b.batch_index,
+                "input_count": b.inputs.len(),
+                "input_total_sat": b.input_total_sat,
+                "output_total_sat": b.output_total_sat,
+                "fee_sat": b.fee_sat,
+                "estimated_base_bytes": b.estimated_base_bytes,
+                "estimated_witness_bytes": b.estimated_witness_bytes,
+                "estimated_weight": b.estimated_weight,
+                "vault_output_count": b.vault_output_count,
+                "p2pqpkh_output_count": b.p2pqpkh_output_count,
+                "requires_pq_outputs": b.requires_pq_outputs,
+                "inputs": b.inputs.iter().map(pq_sweep_input_json).collect::<Vec<_>>(),
+                "outputs": b.outputs.iter().enumerate().map(|(vout, (value_sat, kind))| {
+                    serde_json::json!({
+                        "vout": vout,
+                        "value_sat": value_sat,
+                        "kind": kind.label(),
+                    })
+                }).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+
+    serde_json::json!({
+        "signable": false,
+        "pq_output_activation": activation.label(),
+        "withheld_reason": "P2PQPKH and PQ_STAKING_VAULT outputs are not enforced by consensus before DIP-PQ-3 activation; this is a read-only estimate with no transaction to sign or broadcast",
+        "swept_input_count": estimate.swept_input_count,
+        "exposed_input_count": estimate.exposed_input_count,
+        "skipped_utxo_count": estimate.skipped_utxos.len(),
+        "total_input_value_sat": estimate.total_input_value_sat,
+        "insulated_output_value_sat": estimate.insulated_output_value_sat,
+        "total_fee_sat": estimate.total_fee_sat,
+        "pre_sweep_posture": estimate.pre_sweep_posture,
+        "post_sweep_posture": estimate.post_sweep_posture,
+        "batches": batches,
+        "skipped_utxos": estimate.skipped_utxos.iter().map(pq_sweep_skipped_json).collect::<Vec<_>>(),
+    })
 }
 
 impl Default for WalletRpc {
@@ -8311,6 +8409,30 @@ mod pq_posture_and_sweep {
         }
     }
 
+    fn has_key(v: &serde_json::Value, key: &str) -> bool {
+        match v {
+            serde_json::Value::Object(m) => {
+                m.contains_key(key) || m.values().any(|x| has_key(x, key))
+            }
+            serde_json::Value::Array(a) => a.iter().any(|x| has_key(x, key)),
+            _ => false,
+        }
+    }
+
+    /// A pre-activation PQ reply is a read-only estimate carrying nothing to sign or broadcast.
+    fn assert_pq_estimate_only(reply: &serde_json::Value, pq_script: &Script) {
+        assert_eq!(reply["signable"], json!(false));
+        assert_eq!(reply["pq_output_activation"], json!("inactive"));
+        assert!(reply["withheld_reason"].is_string());
+        assert!(!has_key(reply, "raw_tx_hex"));
+        assert!(!has_key(reply, "script_pubkey"));
+        for batch in reply["batches"].as_array().unwrap() {
+            assert!(batch.get("txid").is_none());
+            assert_eq!(batch["requires_pq_outputs"], json!(true));
+        }
+        assert!(!reply.to_string().contains(&pq_script.to_hex()));
+    }
+
     fn mixed_wallet_rpc() -> (WalletRpc, Arc<WalletDb>) {
         let db = Arc::new(WalletDb::with_hd_wallet(
             Network::Testnet,
@@ -8507,6 +8629,7 @@ mod pq_posture_and_sweep {
         );
         assert_eq!(plan_single["batches"][0]["p2pqpkh_output_count"], json!(1));
         assert_eq!(plan_single["batches"][0]["vault_output_count"], json!(0));
+        assert_pq_estimate_only(&plan_single, &create_p2pqpkh_script(&[0x44; 32]));
 
         // 2. owner:vault pair of Bech32m P2PQPKH addresses
         let owner_pq = encode_pq_bech32m_address(
@@ -8531,6 +8654,10 @@ mod pq_posture_and_sweep {
         assert_eq!(plan_pair["skipped_utxo_count"], json!(1));
         assert_eq!(plan_pair["batches"][0]["vault_output_count"], json!(1));
         assert_eq!(plan_pair["post_sweep_posture"], json!("vault_only"));
+        assert_pq_estimate_only(
+            &plan_pair,
+            &create_pq_staking_vault_script(&[0x55; 32], &[0x66; 32]),
+        );
 
         // 3. Explicit JSON object {"type":"pq_vault","owner_hash32":"...","vault_hash32":"..."}
         let spec_obj = json!({
@@ -8544,6 +8671,36 @@ mod pq_posture_and_sweep {
         assert_eq!(plan_obj, plan_pair);
 
         // Zero mutation of wallet state
+        assert_eq!(db.get_utxos().len(), before_utxos);
+    }
+
+    #[test]
+    fn planpqsweep_classical_vault_plan_stays_signable_before_pq_activation() {
+        let (rpc, db) = mixed_wallet_rpc();
+        let before_utxos = db.get_utxos().len();
+        let plan = rpc
+            .plan_pq_sweep(&p(&[json!({
+                "type": "classical_vault",
+                "owner_hash20": hex::encode([0x71u8; 20]),
+                "vault_hash20": hex::encode([0x72u8; 20]),
+            })]))
+            .unwrap();
+
+        assert_eq!(plan["signable"], json!(true));
+        assert_eq!(plan["pq_output_activation"], json!("inactive"));
+        // 2 exposed + 1 unexposed P2PKH (17,000 DIVI); classical and PQ vault UTXOs are skipped
+        assert_eq!(plan["swept_input_count"], json!(3));
+        let vault_hex = StakingVaultScript::new([0x71; 20], [0x72; 20])
+            .to_script()
+            .to_hex();
+        for batch in plan["batches"].as_array().unwrap() {
+            assert!(batch["raw_tx_hex"].is_string());
+            assert!(batch["txid"].is_string());
+            assert_eq!(batch["p2pqpkh_output_count"], json!(0));
+            for out in batch["outputs"].as_array().unwrap() {
+                assert_eq!(out["script_pubkey"], json!(vault_hex));
+            }
+        }
         assert_eq!(db.get_utxos().len(), before_utxos);
     }
 

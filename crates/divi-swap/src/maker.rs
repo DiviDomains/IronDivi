@@ -32,6 +32,7 @@ use crate::config::{ClaimDeadline, FeeEscalation, SwapConfig};
 use crate::error::{Result, SwapError};
 use crate::hold;
 use crate::htlc::{HtlcParams, ScriptVersion};
+use crate::spend_cursor::{self, Watch};
 use crate::state::SwapState;
 use crate::store::{MakerRecord, QuoteRecord, Store};
 use crate::types::{Amount, Chain, Funding, Outpoint, SignedTx, SpendInfo};
@@ -104,6 +105,8 @@ pub struct Maker {
     fee_escalations: BTreeMap<Chain, Option<FeeEscalation>>,
     /// Whether the DIVI wallet is ready for new coin selection (e.g. startup scan finished).
     divi_ready: Arc<dyn Fn() -> bool + Send + Sync>,
+    /// Counter chains whose new swaps are refused ([`Maker::with_admission_hold`]), with why.
+    held: BTreeMap<Chain, String>,
 }
 
 impl Maker {
@@ -185,7 +188,35 @@ impl Maker {
             engines: Vec::new(),
             fee_escalations: BTreeMap::new(),
             divi_ready: Arc::new(|| true),
+            held: BTreeMap::new(),
         })
+    }
+
+    /// Hold new swaps on counter chain `chain` (an unauthenticated or advisory-held network):
+    /// `quote` and `accept` refuse them, and a swap on it that has not yet put the maker's own
+    /// funds at risk (`Accepted` .. `TakerLockConfirmed`) is aborted. A `MakerLocked` swap whose
+    /// lock is not marked sent is unknown, not unsent: it is never aborted or released on an
+    /// absent observation and never first-broadcast under the hold; a lock the chain shows
+    /// is marked sent and runs on. Swaps with a lock out (`MakerLocked` sent,
+    /// `MakerLockConfirmed`, `TakerClaimed`, `MakerClaimed`, `MakerRefundable`,
+    /// `MakerRefunded`) keep running, so claims, refunds and rebroadcasts still happen.
+    pub fn with_admission_hold(mut self, chain: Chain, reason: impl Into<String>) -> Self {
+        self.held.insert(chain, reason.into());
+        self
+    }
+
+    /// Why new swaps on `chain` are refused, if they are.
+    pub fn admission_hold(&self, chain: Chain) -> Option<&str> {
+        self.held.get(&chain).map(String::as_str)
+    }
+
+    fn check_not_held(&self, chain: Chain) -> Result<()> {
+        match self.held.get(&chain) {
+            Some(why) => Err(SwapError::InvalidParams(format!(
+                "new {chain} swaps are held: {why}"
+            ))),
+            None => Ok(()),
+        }
     }
 
     /// Gate DIVI maker-leg coin selection (`TakerLockConfirmed -> MakerLocked` when the maker
@@ -301,6 +332,7 @@ impl Maker {
             .iter()
             .find(|o| o.id == offer_id)
             .ok_or_else(|| SwapError::InvalidParams(format!("unknown offer {offer_id:?}")))?;
+        self.check_not_held(offer.counter_chain)?;
         if btc_sats < offer.min_btc_sats || btc_sats > offer.max_btc_sats {
             return Err(SwapError::InvalidParams(format!(
                 "{btc_sats} sats outside offer range {}..={}",
@@ -365,6 +397,8 @@ impl Maker {
         // Before anything else touches the quote: an old client on a non-BTC offer must
         // not get a taker-leg HTLC it would fund on the wrong chain.
         req.check_counter_chain(&qr.quote)?;
+        // A quote issued before a restart under a hold must not become a swap.
+        self.check_not_held(qr.quote.counter_chain)?;
         let now = (self.clock)();
         if now > qr.quote.expires_at {
             return Err(SwapError::InvalidParams("quote expired".into()));
@@ -456,6 +490,17 @@ impl Maker {
             last_error: None,
             maker_lock_dropped: false,
             maker_lock_sent: false,
+            usdc_admission: if qr.quote.counter_chain == Chain::Usdc {
+                Some(
+                    crate::rt::timeout(self.gate_bound, self.chain(Chain::Usdc)?.usdc_admission())
+                        .await
+                        .map_err(|_| {
+                            SwapError::Transient("accept: timed out checking USDC identity".into())
+                        })??,
+                )
+            } else {
+                None
+            },
             claim_fees: Default::default(),
         };
         qr.used = true;
@@ -616,6 +661,7 @@ impl Maker {
             if let (Some(op), Ok(tk)) = (r.taker_leg_outpoint, self.tk(r)) {
                 tk.lock_finished(&op);
             }
+            spend_cursor::forget(&self.store, &r.id, &Watch::MAKER);
         }
         if *self.halt_after.lock() == Some(next) {
             return Ok(Flow::Halted);
@@ -628,7 +674,58 @@ impl Maker {
         self.enter(r, SwapState::Aborted)
     }
 
+    async fn verify_usdc_admission(&self, r: &MakerRecord) -> Result<()> {
+        if r.quote.counter_chain == Chain::Usdc {
+            let expected = r.usdc_admission.ok_or_else(|| {
+                SwapError::InvalidParams("unfunded USDC swap requires a fresh quote".into())
+            })?;
+            if self.chain(Chain::Usdc)?.usdc_admission().await? != expected {
+                return Err(SwapError::InvalidParams(
+                    "USDC identity differs from accepted quote".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Under an admission hold on this swap's counter chain: drop a swap that has certainly not
+    /// put the maker's funds out, hold an unmarked signed lock as unknown, leave every other
+    /// one to the normal paths.
+    async fn advance_held(&self, r: &mut MakerRecord) -> Result<Option<Flow>> {
+        let Some(why) = self.held.get(&r.quote.counter_chain).cloned() else {
+            return Ok(None);
+        };
+        let chain = r.quote.counter_chain;
+        match r.state {
+            SwapState::Accepted | SwapState::TakerLockSeen | SwapState::TakerLockConfirmed => self
+                .abort(r, &format!("{chain} swaps are held: {why}"))
+                .map(Some),
+            // The persisted signed lock may have been broadcast before a crash cut the
+            // `maker_lock_sent` marker, and an endpoint can lag in showing it: an absent
+            // observation proves nothing. Seen: it is out, and the normal paths (refund
+            // included) take over. Unseen: neither abort nor release it, and do not make the
+            // first send under a hold either; the signed state is kept and re-read each pass.
+            SwapState::MakerLocked if !r.maker_lock_sent => {
+                let funding = r
+                    .maker_leg_funding
+                    .clone()
+                    .ok_or_else(|| SwapError::Other("MakerLocked without a funding tx".into()))?;
+                match self.mk(r)?.confirmations(&funding.tx.txid).await? {
+                    Some(_) => {
+                        self.mark_lock_sent(r)?;
+                        Ok(None)
+                    }
+                    None => Ok(Some(Flow::Idle)),
+                }
+            }
+            _ => Ok(None),
+        }
+    }
+
     async fn advance(&self, r: &mut MakerRecord, divi_ready: bool) -> Result<Flow> {
+        if let Some(flow) = self.advance_held(r).await? {
+            return Ok(flow);
+        }
         match r.state {
             SwapState::Accepted => self.on_accepted(r).await,
             SwapState::TakerLockSeen => self.on_taker_lock_seen(r).await,
@@ -815,6 +912,7 @@ impl Maker {
         };
         htlc.validate()?;
         let scan_from = mb.tip_height().await?;
+        self.verify_usdc_admission(r).await?;
         let funding = mb.build_funding(&htlc, r.quote.maker_leg_amount()).await?;
         r.maker_leg_htlc = Some(htlc);
         r.maker_leg_funding = Some(funding);
@@ -829,6 +927,14 @@ impl Maker {
             .clone()
             .ok_or_else(|| SwapError::Other("MakerLocked without a funding tx".into()))?;
         // Idempotent: a tx the chain already has is Ok.
+        if r.quote.counter_chain == Chain::Usdc && !r.maker_lock_sent {
+            if let Err(reason) = self.verify_usdc_admission(r).await {
+                if self.mk(r)?.confirmations(&funding.tx.txid).await?.is_none() {
+                    return Err(reason);
+                }
+                self.mark_lock_sent(r)?;
+            }
+        }
         let rejected = match self.mk(r)?.broadcast(&funding.tx).await {
             Ok(_) => {
                 self.mark_lock_sent(r)?;
@@ -852,7 +958,7 @@ impl Maker {
             self.mark_lock_sent(r)?;
         }
         let confs = confs_opt.unwrap_or(0);
-        let spent_already = confs >= 1 && self.revealed_preimage(r).await?.is_some();
+        let spent_already = confs >= 1 && self.revealed_preimage(r).await?.preimage().is_some();
         if confs >= self.maker_leg_confs(r) || spent_already {
             return self.enter(r, SwapState::MakerLockConfirmed);
         }
@@ -924,7 +1030,7 @@ impl Maker {
     }
 
     async fn on_maker_lock_confirmed(&self, r: &mut MakerRecord) -> Result<Flow> {
-        if let Some(p) = self.revealed_preimage(r).await? {
+        if let Some(p) = self.revealed_preimage(r).await?.preimage() {
             r.preimage = Some(p);
             return self.enter(r, SwapState::TakerClaimed);
         }
@@ -975,9 +1081,16 @@ impl Maker {
 
     async fn on_maker_refundable(&self, r: &mut MakerRecord) -> Result<Flow> {
         // A late claim still wins until our refund is on chain.
-        if let Some(p) = self.revealed_preimage(r).await? {
+        let revealed = self.revealed_preimage(r).await?;
+        if let Some(p) = revealed.preimage() {
             r.preimage = Some(p);
             return self.enter(r, SwapState::TakerClaimed);
+        }
+        // S10b: a bounded spend scan that has not yet read through the tip may still be hiding
+        // the taker's claim (and its preimage). Never send the maker-leg refund on such a
+        // partial window; wait, resuming from the saved cursor, until the scan is complete.
+        if revealed.is_pending() {
+            return Ok(Flow::Idle);
         }
         // Entered early (a late lock, `watch_maker_lock`) or not: never send a refund the
         // node must refuse as non-final.
@@ -1199,20 +1312,33 @@ impl Maker {
 
     /// A confirmed spend of the taker-leg lock that carries no preimage (the taker's
     /// refund), and whether it is as deep as the quote's confirmations on that chain.
+    ///
+    /// Only an actual spend declares the taker leg refunded (and, if buried, lost): a bounded
+    /// spend scan short of the tip ([`spend_cursor::Found::Pending`]) is `None` here, exactly
+    /// as "no spend yet", so the maker keeps retrying its own claim rather than recording a
+    /// loss on an unfinished window (review finding S10b).
     async fn taker_leg_refund(&self, r: &MakerRecord) -> Result<Option<(SpendInfo, bool)>> {
         let Some(op) = r.taker_leg_outpoint else {
             return Ok(None);
         };
         let tb = self.tk(r)?;
-        // No spend predates the lock's own block.
+        // Sample height first. A block mined before confirmations are read can
+        // move the scan floor earlier, but cannot hide an intervening spend.
+        let tip = tb.tip_height().await?;
         let Some(confs) = tb.confirmations(&op.txid).await?.filter(|&c| c >= 1) else {
             return Ok(None);
         };
-        let tip = tb.tip_height().await?;
-        let Some(spend) = tb
-            .find_spend(&op, (tip + 1).saturating_sub(confs as u64))
-            .await?
-        else {
+        let Some(spend) = spend_cursor::find_spend(
+            &self.store,
+            &r.id,
+            Watch::MakerTakerLegRefund,
+            &**tb,
+            &op,
+            (tip + 1).saturating_sub(confs as u64),
+            None,
+        )
+        .await?
+        .spend() else {
             return Ok(None);
         };
         let Some(height) = spend.height else {
@@ -1260,31 +1386,73 @@ impl Maker {
 
     /// The preimage, if a transaction other than our own refund spent the maker-leg lock. Our
     /// refund waits on this read, so a read held by the second source is read on the primary
-    /// alone one claim margin after the locktime ([`hold::find_spend`]).
-    async fn revealed_preimage(&self, r: &mut MakerRecord) -> Result<Option<[u8; 32]>> {
+    /// alone one claim margin after the locktime ([`hold::scan_spend`]). The read resumes from
+    /// where the last one stopped ([`spend_cursor`]).
+    ///
+    /// [`Revealed::Pending`] (a bounded spend scan short of the tip) is kept distinct from
+    /// [`Revealed::NotRevealed`]: a maker-leg refund must never go out while the taker's claim
+    /// could still be hiding past the scanned window (review finding S10b).
+    async fn revealed_preimage(&self, r: &mut MakerRecord) -> Result<Revealed> {
         let (htlc, funding) = self.maker_leg(r)?;
         let mk = self.mk(r)?.clone();
         let margin = ClaimDeadline::builtin(mk.chain()).margin_secs();
-        let Some(spend) = hold::find_spend(
+        let found = spend_cursor::find_spend(
+            &self.store,
+            &r.id,
+            Watch::MakerLegClaim,
             mk.as_ref(),
             &funding.outpoint,
             r.maker_leg_scan_from,
-            htlc.locktime,
-            margin,
-            &r.id,
-            &mut r.last_error,
+            Some(spend_cursor::Held {
+                locktime: htlc.locktime,
+                margin,
+                last_error: &mut r.last_error,
+            }),
         )
-        .await?
-        else {
-            return Ok(None);
+        .await?;
+        if found.is_pending() {
+            return Ok(Revealed::Pending);
+        }
+        let Some(spend) = found.spend() else {
+            return Ok(Revealed::NotRevealed);
         };
         if r.maker_leg_refund
             .as_ref()
             .is_some_and(|t| t.txid == spend.txid)
         {
-            return Ok(None);
+            return Ok(Revealed::NotRevealed);
         }
-        Ok(spend.extract_preimage(&r.hash))
+        Ok(match spend.extract_preimage(&r.hash) {
+            Some(p) => Revealed::Preimage(p),
+            None => Revealed::NotRevealed,
+        })
+    }
+}
+
+/// What [`Maker::revealed_preimage`] learned from the maker-leg spend scan. Like
+/// [`spend_cursor::Found`], a bounded read that has not reached the tip is `Pending` and is
+/// never mistaken for "no claim": the maker-leg refund waits on it (review finding S10b).
+enum Revealed {
+    /// A spend other than our own refund carried the preimage.
+    Preimage([u8; 32]),
+    /// Read through the tip: no claim of ours was seen; the refund may proceed.
+    NotRevealed,
+    /// Only a bounded window was read; whether the taker claimed past it is unknown.
+    Pending,
+}
+
+impl Revealed {
+    /// The preimage, if one was revealed. `Pending` and `NotRevealed` are both `None`.
+    fn preimage(&self) -> Option<[u8; 32]> {
+        match self {
+            Revealed::Preimage(p) => Some(*p),
+            Revealed::NotRevealed | Revealed::Pending => None,
+        }
+    }
+
+    /// True while only a bounded window has been read: no maker-leg refund may go out yet.
+    fn is_pending(&self) -> bool {
+        matches!(self, Revealed::Pending)
     }
 }
 

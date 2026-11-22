@@ -67,9 +67,17 @@ impl Respond for Node {
             "getblockhash" => ok(json!(block_hash(p[0].as_u64().unwrap()))),
             "getblock" => {
                 let h = u64::from_str_radix(p[0].as_str().unwrap(), 16).unwrap() - 1;
+                let coinbase = format!("01{h:062x}");
+                c.txs.insert(
+                    coinbase.clone(),
+                    json!({"txid":coinbase,"vin":[{"coinbase":"01"}],"vout":[]}),
+                );
+                let mut txs = vec![coinbase];
+                txs.extend(c.blocks.get(&h).into_iter().flatten().cloned());
                 let mut b = json!({
+                    "hash":block_hash(h),"height":h,
                     "time": BASE_TIME + h * 60 + c.skew,
-                    "tx": c.blocks.get(&h).cloned().unwrap_or_default(),
+                    "tx": txs,
                 });
                 if h > 0 {
                     b["previousblockhash"] = json!(block_hash(h - 1));

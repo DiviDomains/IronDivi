@@ -427,6 +427,13 @@ impl GetBlocksMessage {
         let mut r = Reader::new(data);
         let version = r.i32()?;
         let count = r.size()?;
+        // A normal locator is logarithmic in height; bound both decoding and
+        // the subsequent chain-index probes for getblocks and getheaders.
+        if count > 101 {
+            return Err(NetworkError::Deserialization(
+                "block locator exceeds 101 hashes".into(),
+            ));
+        }
         let mut locator_hashes = Vec::with_capacity(r.capacity(count, 32));
         for _ in 0..count {
             locator_hashes.push(r.hash()?);
@@ -627,6 +634,17 @@ mod tests {
     fn reject_limits_are_cores() {
         assert_eq!(MAX_REJECT_COMMAND_LENGTH, 12);
         assert_eq!(MAX_REJECT_MESSAGE_LENGTH, 111);
+    }
+
+    #[test]
+    fn d4_locator_boundary_applies_to_both_commands() {
+        for n in [0, 101, 102] {
+            let locator = GetBlocksMessage::new(vec![Hash256::zero(); n], Hash256::zero());
+            let payload = locator.serialize();
+            for cmd in ["getblocks", "getheaders"] {
+                assert_eq!(NetworkMessage::deserialize(cmd, &payload).is_ok(), n <= 101);
+            }
+        }
     }
 
     #[test]

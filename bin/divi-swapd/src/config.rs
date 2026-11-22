@@ -813,6 +813,8 @@ impl DaemonConfig {
             let wanted = self.serves(c) || swaps;
             match (wanted, self.has_section(c)) {
                 (true, true) => start.push(c),
+                // A disabled USDC offer can still have a funded local DIVI refund.
+                (true, false) if c == Chain::Usdc && !self.serves(c) => {}
                 (true, false) if swaps => bail!(
                     "swaps in flight on {c} need the [{c}] section (restore it, or the maker \
                      cannot claim or refund them)"
@@ -825,6 +827,32 @@ impl DaemonConfig {
             }
         }
         Ok(start)
+    }
+
+    /// Chains whose *new* swaps the advisory hold refuses, judged by the configured network
+    /// label alone ([`divi_swap::config::check_advisory_hold`]), with the reason. Loading never
+    /// fails on it: a held config still serves read-only reports and keeps claiming and
+    /// refunding the swaps already funded. The daemon turns each entry into an admission hold
+    /// and, for usdc, also authenticates the endpoint's chain id before admitting anything.
+    pub fn advisory_holds(&self) -> BTreeMap<Chain, String> {
+        let mut holds = BTreeMap::new();
+        if let Some(x) = &self.xmr {
+            if let Err(e) = divi_swap::config::check_advisory_hold(&[(
+                Chain::Xmr,
+                x.network.as_str(),
+                Some(x.allow_mainnet),
+            )]) {
+                holds.insert(Chain::Xmr, e);
+            }
+        }
+        if let Some(u) = &self.usdc {
+            if let Err(e) =
+                divi_swap::config::check_advisory_hold(&[(Chain::Usdc, u.network.as_str(), None)])
+            {
+                holds.insert(Chain::Usdc, e);
+            }
+        }
+        holds
     }
 
     /// Whether to start the live adaptor-swap engine: an enabled xmr offer or `open_swaps`
@@ -1979,17 +2007,32 @@ divi_fund_txids = ["ab"]
     }
 
     #[test]
-    fn usdc_mainnet_with_allow_and_matching_profile_is_ok() {
+    fn usdc_mainnet_with_allow_and_matching_profile_loads_but_new_swaps_are_held() {
         for net in ["ethereum", "base"] {
             let text = format!(
                 "profile = \"mainnet\"\n{}\n[usdc]\nnetwork = \"{net}\"\n\
                  allow_mainnet = true\n{USDC_KEY}",
                 good_mainnet_btc()
             );
-            let u = DaemonConfig::parse(&text).unwrap().usdc.unwrap();
+            // Loading must not fail: the config still serves read-only reports and recovery.
+            let cfg = DaemonConfig::parse(&text).unwrap();
+            let u = cfg.usdc.as_ref().unwrap();
             assert_eq!(u.network, net);
             assert!(u.allow_mainnet && u.network().unwrap().is_mainnet());
+            let holds = cfg.advisory_holds();
+            assert_eq!(holds.keys().copied().collect::<Vec<_>>(), [Chain::Usdc]);
+            assert!(
+                holds[&Chain::Usdc].contains("[usdc].network")
+                    && holds[&Chain::Usdc].contains("RUSTSEC-2026-0387"),
+                "{net}: {holds:?}"
+            );
         }
+    }
+
+    #[test]
+    fn usdc_testnet_label_is_not_held_by_label() {
+        let cfg = DaemonConfig::parse(&format!("{GOOD}\n[usdc]\n{USDC_KEY}")).unwrap();
+        assert!(cfg.advisory_holds().is_empty());
     }
 
     #[test]
@@ -2408,7 +2451,8 @@ divi_fund_txids = ["ab"]
         );
         let e = DaemonConfig::parse(&text).unwrap_err().to_string();
         assert!(e.contains("[xmr].allow_mainnet is not set"), "{e}");
-        // All agree: accepted.
+        // All agree: accepted; new real-value xmr swaps are held (`advisory_holds`) while the
+        // signing dependencies carry unfixed advisories, but the config still loads.
         let section = XMR_SECTION.replace(
             "[xmr]\n",
             "[xmr]\nnetwork = \"mainnet\"\nallow_mainnet = true\n",
@@ -2417,7 +2461,14 @@ divi_fund_txids = ["ab"]
             "profile = \"mainnet\"\n{}{XMR}{section}",
             good_mainnet_btc()
         );
-        DaemonConfig::parse(&text).unwrap();
+        let cfg = DaemonConfig::parse(&text).unwrap();
+        let holds = cfg.advisory_holds();
+        assert!(
+            holds[&Chain::Xmr].contains("[xmr].network")
+                && holds[&Chain::Xmr].contains("RUSTSEC-2025-0127"),
+            "{holds:?}"
+        );
+        assert_eq!(holds.len(), 1, "{holds:?}");
     }
 
     #[test]

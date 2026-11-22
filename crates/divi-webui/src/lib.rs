@@ -1384,8 +1384,14 @@ async fn api_save_settings(
     let mut changes = Vec::new();
     for c in &body.changes {
         let o = schema::find(&c.key).ok_or_else(|| bad(format!("{}: no such option", c.key)))?;
-        if !o.writable {
-            return Err(bad(format!("{} is not set from the web interface", o.key)));
+        if !o.web_writable() {
+            return Err(ApiError(
+                StatusCode::FORBIDDEN,
+                format!(
+                    "{} is not set from the web interface; edit the config file or use the command line",
+                    o.key
+                ),
+            ));
         }
         if changes.iter().any(|x: &conffile::Change| x.key == o.key) {
             return Err(bad(format!("{} given twice", o.key)));
@@ -2537,6 +2543,77 @@ mod tests {
         assert_eq!(default_port(true, false, true), 52482);
     }
 
+    #[tokio::test]
+    async fn signed_in_session_cannot_apply_partial_operator_settings_or_export_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config("127.0.0.1:0", &[]);
+        config.data_dir = dir.path().to_owned();
+        config.conf_path = dir.path().join("divi.conf");
+        let original = "staking=1\n";
+        std::fs::write(&config.conf_path, original).unwrap();
+        let wallet = divi_wallet::WalletDb::create_persistent(
+            &dir.path().join("wallet"),
+            divi_wallet::Network::Regtest,
+            divi_wallet::HdWallet::new(divi_primitives::ChainMode::Divi).unwrap(),
+        )
+        .unwrap();
+        wallet.encrypt_wallet("fixture passphrase").unwrap();
+        let s = Arc::new(Shared {
+            hosts: allowed_hosts(&config),
+            wallets: wallets::WalletStore::new(dir.path(), &config.network, &config.chain_mode),
+            node_passkeys: node_passkey::NodePasskeyStore::new(dir.path()),
+            auth: AuthStore::open(dir.path()).unwrap(),
+            challenges: webauthn::ChallengeStore::default(),
+            sessions: Sessions::default(),
+            limiter: LoginLimiter::default(),
+            hashing: Semaphore::new(2),
+            rpc: Arc::new(RpcServer::new_regtest_with_wallet(
+                dir.path(),
+                Arc::new(wallet),
+            )),
+            launch: launch::LaunchToken::default(),
+            electrum: None,
+            config,
+        });
+        let session = s.sessions.create();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            format!("{COOKIE_NAME}={}", session.cookie).parse().unwrap(),
+        );
+        headers.insert("x-csrf-token", session.csrf.parse().unwrap());
+        let changes = ["staking", "resync"].map(|key| ChangeBody {
+            key: key.into(),
+            values: Some(vec!["0".into()]),
+        });
+        let err = api_save_settings(
+            State(s.clone()),
+            headers.clone(),
+            Json(SettingsBody {
+                changes: changes.into(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert_eq!(
+            std::fs::read_to_string(&s.config.conf_path).unwrap(),
+            original
+        );
+        let err = api_rpc(
+            State(s),
+            ConnectInfo("127.0.0.1:12345".parse().unwrap()),
+            headers,
+            Json(RpcBody {
+                method: "bip38encrypt".into(),
+                params: vec![],
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
     #[test]
     fn display_host_maps_loopback_and_unspecified_to_localhost() {
         assert_eq!(
@@ -2969,6 +3046,11 @@ mod tests {
             .await
             .unwrap();
         let plan_json: Value = serde_json::from_slice(&plan_bytes).unwrap();
+        assert_eq!(plan_json["signable"], json!(false));
+        let batch = &plan_json["batches"][0];
+        assert!(batch.get("raw_tx_hex").is_none());
+        assert!(batch.get("txid").is_none());
+        assert!(batch["outputs"][0].get("script_pubkey").is_none());
         assert_eq!(plan_json["swept_input_count"], json!(1));
         assert_eq!(plan_json["exposed_input_count"], json!(1));
         assert_eq!(plan_json["batches"][0]["vault_output_count"], json!(1));

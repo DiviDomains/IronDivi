@@ -1661,6 +1661,15 @@ impl ChainBackend for Spy {
     async fn htlc_output(&self, htlc: &HtlcParams, at: &Outpoint) -> Result<Option<LockedOutput>> {
         self.inner.htlc_output(htlc, at).await
     }
+    async fn scan_spend(
+        &self,
+        outpoint: &Outpoint,
+        from_height: u64,
+        resume: Option<&divi_swap::ScanMark>,
+    ) -> Result<divi_swap::SpendScan> {
+        self.inner.scan_spend(outpoint, from_height, resume).await
+    }
+
     async fn find_spend(&self, outpoint: &Outpoint, from_height: u64) -> Result<Option<SpendInfo>> {
         self.inner.find_spend(outpoint, from_height).await
     }

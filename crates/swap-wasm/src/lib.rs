@@ -16,6 +16,7 @@
 pub mod durable;
 pub mod engine;
 pub mod maker;
+pub mod selection;
 pub mod store;
 pub mod view;
 
@@ -28,5 +29,6 @@ mod tests;
 pub use durable::{Durable, Persister, Sink};
 pub use engine::{Addresses, CoinIn, Config, Engine};
 pub use maker::MakerClient;
+pub use selection::{SelectionSpec, Selections};
 pub use store::{store_prefix, EncryptedStore, Entry};
 pub use view::SwapSummary;
