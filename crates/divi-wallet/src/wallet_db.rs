@@ -14,7 +14,7 @@
 //! Persistent storage for wallet data including keys, addresses, and UTXOs.
 
 use crate::address::{Address, Network};
-use crate::at_rest::{self, KdfParams, MasterKey};
+use crate::at_rest::{self, KdfParams, MasterKey, UnconfirmedMove};
 use crate::error::WalletError;
 use crate::hd::HdWallet;
 use crate::keystore::KeyStore;
@@ -351,8 +351,16 @@ pub struct WalletDb {
     encrypted: RwLock<bool>,
     /// Whether the wallet is locked
     locked: RwLock<bool>,
+    /// A lock that could not take the keys out of memory yet (the record
+    /// format was unconfirmed or the write failed) and deferred that cleanup.
+    /// While set the wallet still reads as locked, so sends and key exports are
+    /// refused; the next write that settles the format finishes the cleanup
+    /// (`finish_deferred_lock_if_pending`). Not dropping the keys keeps a key
+    /// that was never durable from being lost.
+    lock_cleanup_pending: RwLock<bool>,
     /// Last scanned block height
     last_scan_height: RwLock<u32>,
+    hd_replay_generation: RwLock<u64>,
     /// Account to addresses mapping
     accounts: RwLock<HashMap<String, Vec<String>>>,
     /// Address to account mapping
@@ -372,7 +380,11 @@ pub struct WalletDb {
     unlock: RwLock<UnlockState>,
     /// Decrypted master key (in memory only when unlocked). Unlock and
     /// change_passphrase hold the write lock while they rewrite records, so no
-    /// key is written in a format that is being replaced.
+    /// key is written in a format that is being replaced. While a move's
+    /// format is unconfirmed (`MasterKey::unconfirmed`) it is kept, even
+    /// through a lock whose key write failed, and no key is written until
+    /// `settle_record_format` reads the format on disk. Taken after
+    /// `persist_lock`, before the database slot.
     decrypted_master_key: RwLock<Option<MasterKey>>,
     /// Tracks which data categories have been modified since last save
     dirty: RwLock<DirtyFlags>,
@@ -397,8 +409,12 @@ pub struct WalletDb {
     /// `change_passphrase` from the moment they read the keys until the wallet
     /// is encrypted in memory and on disk: a batch built while the wallet was
     /// plain is never written after it was encrypted, and two batches built
-    /// from different moments never land out of order. Taken after `locked`
-    /// and `key_lock`, before any other lock of the wallet.
+    /// from different moments never land out of order. `change_passphrase`,
+    /// and an unlock that moves an older wallet to the current format, hold
+    /// it while they rewrite the sealed master key and records, so no batch
+    /// sealing keys in the format being replaced lands after them. Taken after
+    /// `locked` and `key_lock`, before any other lock of the wallet (so before
+    /// `decrypted_master_key`).
     persist_lock: Mutex<()>,
     /// Sends in progress (`begin_spend`), so that a lock lets them finish
     spends: Mutex<SpendState>,
@@ -526,7 +542,9 @@ impl WalletDb {
             closed_path: Mutex::new(None),
             encrypted: RwLock::new(false),
             locked: RwLock::new(false),
+            lock_cleanup_pending: RwLock::new(false),
             last_scan_height: RwLock::new(0),
+            hd_replay_generation: RwLock::new(0),
             accounts: RwLock::new(HashMap::new()),
             address_accounts: RwLock::new(HashMap::new()),
             last_by_label: RwLock::new(HashMap::new()),
@@ -572,7 +590,9 @@ impl WalletDb {
             closed_path: Mutex::new(None),
             encrypted: RwLock::new(false),
             locked: RwLock::new(false),
+            lock_cleanup_pending: RwLock::new(false),
             last_scan_height: RwLock::new(0),
+            hd_replay_generation: RwLock::new(0),
             accounts: RwLock::new(HashMap::new()),
             address_accounts: RwLock::new(HashMap::new()),
             last_by_label: RwLock::new(HashMap::new()),
@@ -622,7 +642,9 @@ impl WalletDb {
             closed_path: Mutex::new(None),
             encrypted: RwLock::new(false),
             locked: RwLock::new(false),
+            lock_cleanup_pending: RwLock::new(false),
             last_scan_height: RwLock::new(0),
+            hd_replay_generation: RwLock::new(0),
             accounts: RwLock::new(HashMap::new()),
             address_accounts: RwLock::new(HashMap::new()),
             last_by_label: RwLock::new(HashMap::new()),
@@ -997,7 +1019,9 @@ impl WalletDb {
             closed_path: Mutex::new(None),
             encrypted: RwLock::new(false),
             locked: RwLock::new(false),
+            lock_cleanup_pending: RwLock::new(false),
             last_scan_height: RwLock::new(0),
+            hd_replay_generation: RwLock::new(0),
             accounts: RwLock::new(HashMap::new()),
             address_accounts: RwLock::new(HashMap::new()),
             last_by_label: RwLock::new(HashMap::new()),
@@ -1156,9 +1180,18 @@ impl WalletDb {
 
         // Load used addresses
         let addresses = db.load_used_addresses()?;
+        let mut observed_hd = false;
+        let mut advanced = false;
         {
             let mut addr_set = self.used_addresses.write();
             for addr in addresses {
+                if let Ok(address) = Address::from_base58(&addr) {
+                    observed_hd |= self.keystore.pool_position(&address.hash).is_some();
+                    if self.keystore.observe_pool_key(&address.hash) {
+                        advanced = true;
+                        self.dirty.write().metadata = true;
+                    }
+                }
                 addr_set.insert(addr);
             }
         }
@@ -1176,6 +1209,17 @@ impl WalletDb {
 
         // Load last scan height
         *self.last_scan_height.write() = db.load_last_scan_height()?;
+        // Older databases could checkpoint a locked discovery before recording
+        // its rewind. Replay once when their scanned HD history is ambiguous.
+        let prior = db.hd_replay_pending()?;
+        let legacy = observed_hd && *self.encrypted.read() && self.last_scan_height() > 0;
+        let pending = advanced || prior.unwrap_or(legacy);
+        if pending && prior != Some(true) {
+            let mut batch = db.create_batch();
+            batch.put_cf(db.cf_metadata(), b"hd_replay_pending", [1]);
+            db.write_batch_sync(batch)?;
+        }
+        *self.hd_replay_generation.write() = u64::from(pending);
         self.scanned_hashes
             .write()
             .extend(db.load_scanned_hashes()?);
@@ -1254,18 +1298,25 @@ impl WalletDb {
     /// Add one key entry to a write batch. In an encrypted wallet the private key is
     /// written only as an encrypted blob (and never at all while locked, when there is
     /// no master key); the plain entry carries just the public data.
+    ///
+    /// Fails, adding nothing, while the format of the records is unconfirmed
+    /// ([`Self::settle_record_format`] goes first)
     fn put_key(
         &self,
         batch: &mut rocksdb::WriteBatch,
         db: &WalletDatabase,
         hash: &Hash160,
         entry: &crate::keystore::KeyEntry,
-    ) {
+    ) -> Result<(), WalletError> {
         use crate::persistence::{serialize_key_entry, ENCRYPTED_SECRET_SUFFIX};
 
         if !*self.encrypted.read() {
             batch.put_cf(db.cf_keys(), hash.as_bytes(), serialize_key_entry(entry));
-            return;
+            return Ok(());
+        }
+        let master = self.decrypted_master_key.read();
+        if master.as_ref().is_some_and(|m| m.unconfirmed.is_some()) {
+            return Err(WalletError::RecordFormatUnconfirmed);
         }
         let mut stripped = entry.clone();
         let secret = stripped.secret.take();
@@ -1275,7 +1326,7 @@ impl WalletDb {
             serialize_key_entry(&stripped),
         );
         if let Some(secret) = secret {
-            match self.decrypted_master_key.read().as_ref() {
+            match master.as_ref() {
                 Some(master) => {
                     let mut suffixed = hash.as_bytes().to_vec();
                     suffixed.push(ENCRYPTED_SECRET_SUFFIX);
@@ -1285,6 +1336,53 @@ impl WalletDb {
                 None => tracing::warn!("Refusing to write a private key unencrypted"),
             }
         }
+        Ok(())
+    }
+
+    /// Settle an unconfirmed move to the current format (`MasterKey::unconfirmed`)
+    /// by reading which sealed master key `db` holds, before a batch that
+    /// writes keys is built. With `persist_lock` held, and no lock of the
+    /// wallet after it: takes `decrypted_master_key`, never the database slot
+    /// (`db` is the caller's, opened again by `db()` if it had failed).
+    /// `RecordFormatUnconfirmed` while it still cannot be read.
+    fn settle_record_format(&self, db: &WalletDatabase) -> Result<(), WalletError> {
+        let mut slot = self.decrypted_master_key.write();
+        let Some(master) = slot.as_mut() else {
+            return Ok(());
+        };
+        let Some(moving) = master.unconfirmed.as_ref() else {
+            return Ok(());
+        };
+        // A handle whose write failed may not show a write its log holds
+        let on_disk = if db.has_failed() {
+            None
+        } else {
+            read_back_sealed_master(db).ok().flatten()
+        };
+        let aead = match on_disk {
+            Some(sealed) if sealed == moving.aead_sealed => true,
+            Some(sealed) if sealed == moving.legacy_sealed => false,
+            _ => {
+                warn!("Wallet record format still unconfirmed; keys are not written");
+                return Err(WalletError::RecordFormatUnconfirmed);
+            }
+        };
+        master.aead = aead;
+        master.unconfirmed = None;
+        drop(slot);
+        if aead {
+            info!("Wallet encryption upgrade confirmed on disk");
+            if let Err(e) = retire_replaced_records(db) {
+                warn!(
+                    "Copies of the wallet's records in the older format may remain in the \
+                     wallet files: {}",
+                    e
+                );
+            }
+        } else {
+            info!("Wallet encryption upgrade not on disk; still readable as before");
+        }
+        Ok(())
     }
 
     /// Write the given keys (with the encrypted secret, on an encrypted wallet) and
@@ -1293,11 +1391,30 @@ impl WalletDb {
     /// is too late, a lock or restart before the next block would lose the key.
     fn persist_keys(&self, hashes: &[Hash160]) -> Result<(), WalletError> {
         let _persist = self.persist_lock.lock();
+        self.persist_keys_locked(hashes, None)
+    }
+
+    fn persist_keys_locked(
+        &self,
+        hashes: &[Hash160],
+        replay_height: Option<u32>,
+    ) -> Result<(), WalletError> {
         let db = match self.db() {
             Some(db) => db,
             None => return self.closed_database(),
         };
         let db = &*db;
+        self.settle_record_format(db)?;
+        self.write_keys(db, hashes, replay_height)
+    }
+
+    /// Called with the persistence lock held and the record format confirmed.
+    fn write_keys(
+        &self,
+        db: &WalletDatabase,
+        hashes: &[Hash160],
+        replay_height: Option<u32>,
+    ) -> Result<(), WalletError> {
         let entries: Vec<_> = hashes
             .iter()
             .filter_map(|h| self.keystore.get_key(h).map(|e| (*h, e)))
@@ -1310,8 +1427,11 @@ impl WalletDb {
             return Err(WalletError::WalletLocked);
         }
         let mut batch = db.create_batch();
+        if let Some(height) = replay_height {
+            batch.put_cf(db.cf_metadata(), b"last_scan_height", height.to_le_bytes());
+        }
         for (hash, entry) in &entries {
-            self.put_key(&mut batch, db, hash, entry);
+            self.put_key(&mut batch, db, hash, entry)?;
         }
         let (receiving, change) = self.keystore.get_indices();
         batch.put_cf(
@@ -1326,6 +1446,7 @@ impl WalletDb {
         );
         batch.put_cf(db.cf_metadata(), b"change_index", change.to_le_bytes());
         pause_point!(self, "wallet keys batch built");
+        stop_point!("wallet key batch unwritten");
         db.write_batch_sync(batch)
     }
 
@@ -1432,30 +1553,46 @@ impl WalletDb {
 
     /// Save wallet data to database
     pub fn save(&self) -> Result<(), WalletError> {
-        let _persist = self.persist_lock.lock();
-        let db = match self.db() {
-            Some(db) => db,
-            None => return self.closed_database(),
+        let saved = {
+            let _persist = self.persist_lock.lock();
+            let db = match self.db() {
+                Some(db) => db,
+                None => return self.closed_database(),
+            };
+            // Taken before any state is read: a change made from here on marks its
+            // category dirty again, so the next save writes it
+            let taken = std::mem::take(&mut *self.dirty.write());
+            let saved = self.write_everything(&db, false);
+            if saved.is_err() {
+                // Whatever was dirty is still unwritten (or unknown): keep it dirty
+                self.dirty.write().merge(&taken);
+            }
+            saved
         };
-        // Taken before any state is read: a change made from here on marks its
-        // category dirty again, so the next save writes it
-        let taken = std::mem::take(&mut *self.dirty.write());
-        let saved = self.write_everything(&db);
-        if saved.is_err() {
-            // Whatever was dirty is still unwritten (or unknown): keep it dirty
-            self.dirty.write().merge(&taken);
+        // With persist_lock released: if a lock is waiting to take the keys out
+        // of memory and this write settled the format, finish it now.
+        if saved.is_ok() {
+            self.finish_deferred_lock_if_pending();
         }
         saved
     }
 
     /// [`Self::save`]'s write, with `persist_lock` held
-    fn write_everything(&self, db: &WalletDatabase) -> Result<(), WalletError> {
+    fn write_everything(
+        &self,
+        db: &WalletDatabase,
+        completed_replay: bool,
+    ) -> Result<(), WalletError> {
         use crate::persistence::{outpoint_key, serialize_tx, serialize_utxo};
 
         // One synced batch: a crash or kill during the save leaves the previous
         // save or this one on disk, never a mix of the two (e.g. a coin gone
         // from the UTXO table without the transaction that spent it)
         let mut batch = db.create_batch();
+
+        if completed_replay {
+            batch.put_cf(db.cf_metadata(), b"hd_replay_pending", [0]);
+        }
 
         // Save mnemonic (an encrypted wallet keeps only the encrypted copy)
         if !*self.encrypted.read() {
@@ -1490,8 +1627,9 @@ impl WalletDb {
         );
 
         // Save keys
+        self.settle_record_format(db)?;
         for (hash, entry) in self.keystore.get_all_keys_with_hashes() {
-            self.put_key(&mut batch, db, &hash, &entry);
+            self.put_key(&mut batch, db, &hash, &entry)?;
         }
 
         // Delete rows dropped from memory (reorg, rescan) so they do not come
@@ -1639,19 +1777,27 @@ impl WalletDb {
     /// Incrementally save only dirty wallet data using an atomic WriteBatch.
     /// Much cheaper than full save() when only a few categories changed.
     pub fn save_incremental(&self) -> Result<(), WalletError> {
-        let _persist = self.persist_lock.lock();
-        let db = match self.db() {
-            Some(db) => db,
-            None => return self.closed_database(),
+        let saved = {
+            let _persist = self.persist_lock.lock();
+            let db = match self.db() {
+                Some(db) => db,
+                None => return self.closed_database(),
+            };
+            // Taken, not copied: only the categories taken here are written below,
+            // and a change made from here on marks its category dirty again, so a
+            // later save writes it rather than finding its flag cleared
+            let flags = std::mem::take(&mut *self.dirty.write());
+            let saved = self.write_dirty(&db, &flags);
+            if saved.is_err() {
+                // Nothing written: what was dirty stays dirty for the next save
+                self.dirty.write().merge(&flags);
+            }
+            saved
         };
-        // Taken, not copied: only the categories taken here are written below,
-        // and a change made from here on marks its category dirty again, so a
-        // later save writes it rather than finding its flag cleared
-        let flags = std::mem::take(&mut *self.dirty.write());
-        let saved = self.write_dirty(&db, &flags);
-        if saved.is_err() {
-            // Nothing written: what was dirty stays dirty for the next save
-            self.dirty.write().merge(&flags);
+        // With persist_lock released: finish a deferred lock if this write
+        // settled the record format (see `save`).
+        if saved.is_ok() {
+            self.finish_deferred_lock_if_pending();
         }
         saved
     }
@@ -1702,8 +1848,9 @@ impl WalletDb {
         }
 
         if flags.keys {
+            self.settle_record_format(db)?;
             for (hash, entry) in self.keystore.get_all_keys_with_hashes() {
-                self.put_key(&mut batch, db, &hash, &entry);
+                self.put_key(&mut batch, db, &hash, &entry)?;
             }
         }
 
@@ -1780,10 +1927,21 @@ impl WalletDb {
     /// starts from the block the two chains share, and the transactions of the
     /// block scanned again are notified again.
     pub fn resume_scan<H: Fn(u32) -> Option<Hash256>>(&self, tip_height: u32, hash_at: H) {
+        self.try_resume_scan(tip_height, |h| {
+            Ok::<_, std::convert::Infallible>(hash_at(h))
+        })
+        .unwrap()
+    }
+
+    pub fn try_resume_scan<E>(
+        &self,
+        tip_height: u32,
+        hash_at: impl Fn(u32) -> Result<Option<Hash256>, E>,
+    ) -> Result<(), E> {
         let _scan = self.scan_lock.lock();
         let last = self.last_scan_height();
         let top = last.min(tip_height);
-        match self.find_fork(top, &hash_at) {
+        match self.find_fork(top, &hash_at)? {
             Some(fork) => {
                 info!(
                     "Wallet scanned blocks above {} that left the active chain; rolling back",
@@ -1794,6 +1952,7 @@ impl WalletDb {
             }
             None => self.set_last_scan_height(last.saturating_sub(1)),
         }
+        Ok(())
     }
 
     /// Set last scanned block height
@@ -1967,7 +2126,7 @@ impl WalletDb {
     pub fn return_change_address(&self, address: &Address) -> Result<bool, WalletError> {
         let _locked = self.locked.read();
         let _keys = self.key_lock.lock();
-        if !self.keystore.return_change_key(address) {
+        if self.is_address_used(&address.to_string()) || !self.keystore.return_change_key(address) {
             return Ok(false);
         }
         self.dirty.write().metadata = true; // the change index changed
@@ -2591,6 +2750,19 @@ impl WalletDb {
     where
         F: Fn(&OutPoint) -> bool,
     {
+        match self.try_reconcile_utxos(chain_height, |op| {
+            Ok::<_, std::convert::Infallible>(chain_has_utxo(op))
+        }) {
+            Ok(count) => count,
+            Err(never) => match never {},
+        }
+    }
+
+    pub fn try_reconcile_utxos<E>(
+        &self,
+        chain_height: u32,
+        chain_has_utxo: impl Fn(&OutPoint) -> Result<bool, E>,
+    ) -> Result<u32, E> {
         let _scan = self.scan_lock.lock();
         let last_scan = self.last_scan_height();
         let checked_to = chain_height.min(last_scan);
@@ -2601,22 +2773,6 @@ impl WalletDb {
             .filter(|(_, u)| u.height.is_some_and(|h| h <= checked_to))
             .map(|(op, _)| *op)
             .collect();
-        let mut removed = 0u32;
-        for outpoint in &outpoints {
-            if !chain_has_utxo(outpoint) {
-                if let Some(utxo) = self.utxos.write().remove(outpoint) {
-                    info!(
-                        "Reconciliation: removed phantom UTXO {} ({}, addr={})",
-                        OwnOutpoint(outpoint.txid, outpoint.vout),
-                        WalletAmount(utxo.value.as_sat()),
-                        WalletAddress(&utxo.address)
-                    );
-                    self.pending_deletes.write().utxos.insert(*outpoint);
-                    removed += 1;
-                }
-            }
-        }
-
         // Clear stale spent-set entries when the chain UTXO set proves an
         // output is unspent (e.g. an earlier false phantom eviction or an
         // orphaned spend whose height record was lost). When the chain is
@@ -2632,10 +2788,32 @@ impl WalletDb {
                 .map(|(op, _)| *op)
                 .collect()
         };
-        let unspent_on_chain: Vec<OutPoint> = spent_candidates
-            .into_iter()
-            .filter(|op| chain_has_utxo(op))
-            .collect();
+        let mut unspent_on_chain = Vec::new();
+        for op in spent_candidates {
+            if chain_has_utxo(&op)? {
+                unspent_on_chain.push(op);
+            }
+        }
+
+        let mut absent = Vec::new();
+        for op in &outpoints {
+            if !chain_has_utxo(op)? {
+                absent.push(*op);
+            }
+        }
+        let mut removed = 0u32;
+        for outpoint in &absent {
+            if let Some(utxo) = self.utxos.write().remove(outpoint) {
+                info!(
+                    "Reconciliation: removed phantom UTXO {} ({}, addr={})",
+                    OwnOutpoint(outpoint.txid, outpoint.vout),
+                    WalletAmount(utxo.value.as_sat()),
+                    WalletAddress(&utxo.address)
+                );
+                self.pending_deletes.write().utxos.insert(*outpoint);
+                removed += 1;
+            }
+        }
 
         let mut cleared_spent = 0u32;
         let mut restored_utxos = 0u32;
@@ -2696,7 +2874,7 @@ impl WalletDb {
                 checked_to
             );
         }
-        total_changes
+        Ok(total_changes)
     }
 
     /// Select UTXOs for a transaction using coin selection algorithm
@@ -2982,8 +3160,69 @@ impl WalletDb {
 
     /// Mark an address as used
     pub fn mark_address_used(&self, address: &str) {
+        if let Err(error) = self.observe_address(address, None) {
+            warn!("Could not extend the HD lookahead: {error}");
+            return;
+        }
         self.used_addresses.write().insert(address.to_string());
         self.dirty.write().addresses = true;
+    }
+
+    fn observe_address(
+        &self,
+        address: &str,
+        replay_floor: Option<u32>,
+    ) -> Result<bool, WalletError> {
+        let Ok(addr) = Address::from_base58(address) else {
+            return Ok(false);
+        };
+        let locked = self.locked.read();
+        let _keys = self.key_lock.lock();
+        let indices = self.keystore.get_indices();
+        let Some((change, child)) = self.keystore.pool_position(&addr.hash) else {
+            return Ok(false);
+        };
+        let next = if change { indices.1 } else { indices.0 };
+        if child < next {
+            return Ok(false);
+        }
+        // A concurrent checkpoint must see either the old cursor or the durable
+        // keys and rewind together. Keep this lock through any rollback.
+        let _persist = self.persist_lock.lock();
+        let replay_height = replay_floor.map(|floor| self.last_scan_height().min(floor));
+        // Record deferred discovery before any checkpoint can publish the cursor.
+        // A crash between these writes leaves a conservative extra replay.
+        if *locked || replay_floor.is_none() {
+            let mut generation = self.hd_replay_generation.write();
+            // A prior replay checkpoint may have reached disk despite a sync
+            // error. Reassert the marker before publishing each new discovery.
+            if let Some(db) = self.db() {
+                let mut batch = db.create_batch();
+                batch.put_cf(db.cf_metadata(), b"hd_replay_pending", [1]);
+                db.write_batch_sync(batch)?;
+            } else {
+                self.closed_database()?;
+            }
+            *generation += 1;
+        }
+        let pool = self.keystore.pool_state();
+        if !self.keystore.observe_pool_key(&addr.hash) {
+            return Ok(false);
+        }
+        if !*locked {
+            if let Err(error) = self.store_new_pool_keys(None, replay_height) {
+                self.keystore.set_indices(indices.0, indices.1);
+                self.keystore.restore_pool_state(pool);
+                return Err(error);
+            }
+        }
+        self.dirty.write().metadata = true;
+        if !*locked {
+            if let Some(height) = replay_height {
+                self.set_last_scan_height(height);
+            }
+        }
+        Ok(!*locked)
     }
 
     /// Check if address has been used
@@ -3025,34 +3264,97 @@ impl WalletDb {
         // An encrypted wallet also drops every private key and the HD seed; they
         // are restored from their encrypted copies on unlock. An unencrypted
         // wallet has no other copy, so it only gets the flag.
-        if *self.encrypted.read() {
-            // Store every in-memory secret encrypted while the master key is still
-            // here: unlock can only bring back what is on disk. If that write fails,
-            // keep the keys in memory rather than lose them.
-            let held: Vec<Hash160> = self
-                .keystore
-                .get_all_keys_with_hashes()
-                .into_iter()
-                .filter(|(_, e)| e.secret.is_some())
-                .map(|(h, _)| h)
-                .collect();
-            match self.persist_keys(&held) {
-                Ok(()) => self.keystore.strip_secrets(),
-                Err(e) => {
-                    error!(
-                        "Could not store private keys before locking ({}); keeping {} keys in memory",
-                        e,
-                        held.len()
-                    );
-                    self.keystore.clear_hd_wallet();
-                }
-            }
-        }
-        // Clear decrypted master key from memory
-        *self.decrypted_master_key.write() = None;
+        let deferred = if *self.encrypted.read() {
+            !self.store_and_strip_secrets()
+        } else {
+            false
+        };
+        // When the cleanup could not finish (the record format was unconfirmed
+        // or the write failed), the keys and the master key stay in memory and
+        // the lock is marked incomplete; the wallet still reads as locked, so
+        // sends and key exports are refused meanwhile. The next write that
+        // settles the format finishes it (`finish_deferred_lock_if_pending`).
+        *self.lock_cleanup_pending.write() = deferred;
         *self.unlock.write() = UnlockState::default();
         drop(locked);
-        info!("Wallet locked");
+        if deferred {
+            warn!(
+                "Wallet locked, but its keys could not be stored yet; they stay in memory \
+                 (spends and exports stay refused) until a write can settle their format"
+            );
+        } else {
+            info!("Wallet locked");
+        }
+    }
+
+    /// Store every in-memory secret encrypted, then drop the secrets and the
+    /// master key from memory. Returns true when the wallet is fully locked
+    /// (keys durable and dropped); false when the write could not confirm the
+    /// record format or failed, in which case the keys and the master key are
+    /// kept so nothing undurable is lost and the format can be settled later.
+    /// The caller holds `self.locked` so no key is created between storing and
+    /// stripping. Only meaningful for an encrypted wallet.
+    fn store_and_strip_secrets(&self) -> bool {
+        // Store every in-memory secret encrypted while the master key is still
+        // here: unlock can only bring back what is on disk.
+        let held: Vec<Hash160> = self
+            .keystore
+            .get_all_keys_with_hashes()
+            .into_iter()
+            .filter(|(_, e)| e.secret.is_some())
+            .map(|(h, _)| h)
+            .collect();
+        match self.persist_keys(&held) {
+            Ok(()) => {
+                // The keys are on disk in the confirmed format; drop the secrets
+                // and the master key. unlock restores them from disk.
+                self.keystore.strip_secrets();
+                *self.decrypted_master_key.write() = None;
+                true
+            }
+            Err(e) => {
+                error!(
+                    "Could not store private keys before locking ({}); keeping {} keys in memory",
+                    e,
+                    held.len()
+                );
+                // Keep the per-key secrets and the master key: without the
+                // master key the kept secrets could never be sealed in the
+                // format the disk has, and dropping them would lose keys that
+                // were never written. Only the HD seed goes.
+                self.keystore.clear_hd_wallet();
+                false
+            }
+        }
+    }
+
+    /// Whether a lock is waiting to take the keys out of memory (the record
+    /// format was unconfirmed or the write failed). The wallet is locked for
+    /// spends and exports throughout; this only reports that the keys have not
+    /// yet been stored and dropped.
+    pub fn is_lock_cleanup_pending(&self) -> bool {
+        *self.lock_cleanup_pending.read()
+    }
+
+    /// Finish a lock whose cleanup was deferred, once a write may have settled
+    /// the record format. Called after a successful save with `persist_lock`
+    /// already released. If the keys can now be stored, they are, and the
+    /// secrets and master key are dropped; otherwise the wallet stays locked
+    /// with the keys kept for a later attempt.
+    fn finish_deferred_lock_if_pending(&self) {
+        if !*self.lock_cleanup_pending.read() {
+            return;
+        }
+        // Held throughout, as in lock_now, so no key is created between storing
+        // and stripping, and a concurrent unlock cannot race the cleanup.
+        let locked = self.locked.write();
+        if !*locked || !*self.lock_cleanup_pending.read() {
+            return;
+        }
+        if *self.encrypted.read() && self.store_and_strip_secrets() {
+            *self.lock_cleanup_pending.write() = false;
+            info!("Deferred wallet lock completed; private keys stored and dropped from memory");
+        }
     }
 
     /// Unlock the wallet with passphrase for specified timeout
@@ -3100,12 +3402,22 @@ impl WalletDb {
         let was_staking_only = self.is_unlocked_for_staking_only();
 
         // Load encryption metadata from database
-        let db = self.db().ok_or_else(|| {
+        let handle = self.db().ok_or_else(|| {
             WalletError::Storage("Cannot unlock wallet without database".to_string())
         })?;
 
-        let db = &*db;
+        let db = &*handle;
 
+        // Moving an older wallet to the current format rewrites every sealed
+        // record, so no save or key write may build a batch in the old format
+        // and land it after the move: persist_lock is taken first, before the
+        // master key slot, as change_passphrase and save take them. A wallet
+        // already in the current format never goes back, so its unlocks leave
+        // saves running.
+        let persist = match db.load_kdf_params() {
+            Ok(Some(_)) => None,
+            _ => Some(self.persist_lock.lock()),
+        };
         // Held until the master key is installed: a key written meanwhile by
         // another thread would use the format this unlock may be replacing
         let mut master_slot = self.decrypted_master_key.write();
@@ -3173,22 +3485,76 @@ impl WalletDb {
             records.secrets.push((hash, secret));
         }
 
-        // Wallets from older builds move to Argon2id and authenticated records
-        if !master.aead {
-            match migrate_legacy(db, passphrase, &master.key, &records) {
-                Ok(()) => {
-                    master.aead = true;
-                    info!("Wallet encryption upgraded to Argon2id and XChaCha20-Poly1305");
-                }
+        // Wallets from older builds move to Argon2id and authenticated records.
+        // The master key stays the same: only how it is sealed, and the record
+        // format, change
+        if !master.aead && persist.is_none() {
+            // Only a wallet put back in the older format while this unlock
+            // started could get here; the next unlock moves it
+            warn!("Wallet encryption not upgraded this time, still readable as before");
+        } else if !master.aead {
+            let legacy_sealed = db.load_encryption_metadata()?.map(|(_, sealed)| sealed);
+            let migration = legacy_migration_batch(db, passphrase, &master.key, &records);
+            match migration {
                 Err(e) => warn!(
                     "Wallet encryption not upgraded, still readable as before: {}",
                     e
                 ),
+                Ok((batch, sealed)) => {
+                    match self.write_sealed_master(handle, batch, legacy_sealed.as_deref(), &sealed)
+                    {
+                        MasterWrite::Written(db) => {
+                            // From here every record on disk is in the current
+                            // format, and any key sealed from now on must be too
+                            master.aead = true;
+                            info!("Wallet encryption upgraded to Argon2id and XChaCha20-Poly1305");
+                            if let Err(e) = Self::retire_migrated_records(&db) {
+                                warn!(
+                                    "Wallet encryption upgraded, but copies of its records in the \
+                                 older format may remain in the wallet files: {}",
+                                    e
+                                );
+                            }
+                        }
+                        MasterWrite::NotWritten(e) => warn!(
+                            "Wallet encryption not upgraded, still readable as before: {}",
+                            e
+                        ),
+                        MasterWrite::Unknown(e) => {
+                            // Neither format can be assumed for the keys sealed
+                            // next. A locked wallet stays locked, with no master
+                            // key. One already unlocked keeps its keys in memory
+                            // (dropping only the master key would leave them
+                            // there, unlocked, with nothing to store them): it
+                            // keeps the master key marked unconfirmed, so no key
+                            // is written until a write reads the format on disk
+                            error!(
+                                "Wallet encryption upgrade could not be confirmed on disk; \
+                             unlock not completed: {}",
+                                e
+                            );
+                            if master_slot.is_some() {
+                                master.unconfirmed = Some(UnconfirmedMove {
+                                    legacy_sealed: legacy_sealed.unwrap_or_default(),
+                                    aead_sealed: sealed,
+                                });
+                                *master_slot = Some(master);
+                            }
+                            return Err(e);
+                        }
+                    }
+                }
             }
         }
         // Keep the decrypted master key in memory so new keys can be stored encrypted
         *master_slot = Some(master);
         drop(master_slot);
+        drop(persist);
+        // The migration above may have opened the database again
+        let handle = self.db().ok_or_else(|| {
+            WalletError::Storage("Cannot unlock wallet without database".to_string())
+        })?;
+        let db = &*handle;
         let OpenedRecords {
             mnemonic,
             mnemonic_passphrase,
@@ -3246,6 +3612,9 @@ impl WalletDb {
         };
 
         *self.locked.write() = false;
+        // A fresh unlock restores the keys and master key from disk, so any
+        // lock whose cleanup was still deferred is void.
+        *self.lock_cleanup_pending.write() = false;
         info!(
             "Wallet unlocked{} for {} seconds",
             if staking_only {
@@ -3527,6 +3896,7 @@ impl WalletDb {
         let master = MasterKey {
             key: master_key,
             aead: true,
+            unconfirmed: None,
         };
 
         // Fill the keypool while the seed is still in the clear: the pool keys go
@@ -3624,9 +3994,9 @@ impl WalletDb {
         // Divi Core rewrites the whole wallet file after encrypting, so no bit of
         // the plain keys stays on disk (wallet.cpp:1023-1026): every family is
         // flushed, so the write-ahead log holding the plain phrase is retired,
-        // and the secret families are compacted, so old SST files go too
+        // and the secret families are compacted, so old SST files go too (a
+        // failed flush or log sync is reported; the compaction reports nothing)
         let flushed = Self::retire_plaintext_log(db);
-        db.compact_secret_cfs();
         drop(persist);
         drop(keys);
         self.lock();
@@ -3642,13 +4012,37 @@ impl WalletDb {
     }
 
     /// Flush every column family, so the write-ahead log holding the plain
-    /// phrase and keys is retired
+    /// phrase and keys is retired, and compact the secret families
+    /// ([`retire_replaced_records`])
     fn retire_plaintext_log(db: &WalletDatabase) -> Result<(), WalletError> {
         stop_point!("wallet encryption written");
-        db.flush_all_cfs()
+        retire_replaced_records(db)
     }
 
     /// Change the wallet passphrase. Does not require the wallet to be unlocked.
+    ///
+    /// The master key stays the same; it is sealed again under the new
+    /// passphrase (and an older wallet's records move to the current format)
+    /// in one synced write. What a result means:
+    ///
+    /// - `Ok`: the new passphrase opens the wallet, the old one does not, every
+    ///   column family was flushed and the log synced without error, and a
+    ///   compaction of the families holding the replaced sealed master key
+    ///   (and older-format records) was run. RocksDB reports no result for a
+    ///   compaction, so this does not prove those copies left the live files.
+    /// - [`WalletError::PassphraseChangeCleanup`]: the new passphrase is in
+    ///   effect on disk, but the replaced copies may remain in the files.
+    /// - [`WalletError::PassphraseChangeUnconfirmed`]: the write reported an
+    ///   error and the database could not tell whether it landed; the wallet
+    ///   opens with the old or the new passphrase, never neither. An unlocked
+    ///   older wallet stays unlocked but writes no key (saves, imports and new
+    ///   keys fail with [`WalletError::RecordFormatUnconfirmed`]) until a
+    ///   write reads which format is on disk, or the next unlock does.
+    /// - Any other error: nothing was changed; the old passphrase still opens it.
+    ///
+    /// None of this erases disk blocks, nor touches any copy of the wallet
+    /// (backups, snapshots): such a copy still opens with the old passphrase,
+    /// and yields the same master key, so it also opens records written later.
     pub fn change_passphrase(&self, old_pass: &str, new_pass: &str) -> Result<(), WalletError> {
         if !*self.encrypted.read() {
             return Err(WalletError::WalletNotEncrypted);
@@ -3656,99 +4050,219 @@ impl WalletDb {
         if old_pass.is_empty() || new_pass.is_empty() {
             return Err(WalletError::InvalidPassphrase);
         }
-        // Before the master key slot, as in save: a save sealing keys with the
-        // master key of the older format cannot land after the move below
+        // Before the master key slot, as in save and unlock: a save sealing
+        // keys with the master key of the older format cannot land after the
+        // move below
         let _persist = self.persist_lock.lock();
-        let db = self.db().ok_or_else(|| {
+        let handle = self.db().ok_or_else(|| {
             WalletError::Storage("Cannot change passphrase without database".to_string())
         })?;
 
-        let db = &*db;
+        let db = &*handle;
 
         let mut master_slot = self.decrypted_master_key.write();
         let master = open_master(db, old_pass)?;
+        // The format just read is the one on disk: it settles an earlier
+        // unconfirmed move of an unlocked wallet (a failed handle may not
+        // show a write its log holds, so not from one)
+        if !db.has_failed() {
+            if let Some(unlocked) = master_slot.as_mut() {
+                unlocked.aead = master.aead;
+                unlocked.unconfirmed = None;
+            }
+        }
+        let legacy_sealed = db.load_encryption_metadata()?.map(|(_, sealed)| sealed);
         // wallet.cpp:836; the count is the Argon2id passes of the new passphrase key
         info!(
             "Wallet passphrase changed to an nDeriveIterations of {}",
             KdfParams::DEFAULT.t
         );
-        if master.aead {
+        let (batch, sealed) = if master.aead {
             let mut batch = db.create_batch();
-            put_sealed_master(&mut batch, db, &master.key, new_pass)?;
-            db.write_batch_sync(batch)?;
+            let sealed = put_sealed_master(&mut batch, db, &master.key, new_pass)?;
+            (batch, sealed)
         } else {
             // An older wallet: every record moves to the new format with the new
             // passphrase, so the old one can open nothing afterwards
             let records = decrypt_records(db, &master)?;
-            migrate_legacy(db, new_pass, &master.key, &records)?;
+            legacy_migration_batch(db, new_pass, &master.key, &records)?
+        };
+        let db = match self.write_sealed_master(handle, batch, legacy_sealed.as_deref(), &sealed) {
+            MasterWrite::Written(db) => db,
+            MasterWrite::NotWritten(e) => return Err(e),
+            MasterWrite::Unknown(e) => {
+                if !master.aead {
+                    // The records may be in either format. An unlocked wallet
+                    // keeps its keys and master key, marked unconfirmed: no
+                    // key is written until a write reads which format is on
+                    // disk (settle_record_format), or an unlock does
+                    if let Some(unlocked) = master_slot.as_mut() {
+                        unlocked.unconfirmed = Some(UnconfirmedMove {
+                            legacy_sealed: legacy_sealed.unwrap_or_default(),
+                            aead_sealed: sealed,
+                        });
+                    }
+                }
+                error!(
+                    "Wallet passphrase change could not be confirmed on disk; after a \
+                     restart the old or the new passphrase opens the wallet: {}",
+                    e
+                );
+                return Err(WalletError::PassphraseChangeUnconfirmed(Box::new(e)));
+            }
+        };
+        // The new passphrase is the one on disk from here: an unlocked older
+        // wallet seals every later key in the format it now has
+        if !master.aead {
             if let Some(unlocked) = master_slot.as_mut() {
                 unlocked.aead = true;
+                unlocked.unconfirmed = None;
             }
         }
         drop(master_slot);
-        // The new salt and sealed master key went in as one synced write: a stop
-        // here leaves the wallet opening with the new passphrase
-        stop_point!("passphrase salt written");
+        if let Err(e) = Self::retire_replaced_master(&db) {
+            error!(
+                "Wallet passphrase changed, but copies sealed under the old passphrase \
+                 may remain in the wallet files: {}",
+                e
+            );
+            return Err(WalletError::PassphraseChangeCleanup(Box::new(e)));
+        }
 
         info!("Wallet passphrase changed successfully");
         Ok(())
     }
 
+    /// Write `batch`, which seals the master key as `sealed`, and tell whether
+    /// it is on disk. A synced write can fail after its log record reached the
+    /// disk, and the database opened again (`db`) replays it, so after an
+    /// error the sealed master key is read back
+    fn write_sealed_master(
+        &self,
+        handle: Arc<WalletDatabase>,
+        batch: rocksdb::WriteBatch,
+        previous: Option<&[u8]>,
+        sealed: &[u8],
+    ) -> MasterWrite {
+        let error = match Self::write_master_batch(&handle, batch) {
+            Ok(()) => return MasterWrite::Written(handle),
+            Err(e) => e,
+        };
+        // db() waits for the last handle to go before it opens the database again
+        drop(handle);
+        let Some(db) = self.db().filter(|db| !db.has_failed()) else {
+            return MasterWrite::Unknown(error);
+        };
+        match read_back_sealed_master(&db) {
+            Ok(Some(on_disk)) if on_disk == sealed => {
+                warn!(
+                    "The wallet write reported an error but is on disk: {}",
+                    error
+                );
+                MasterWrite::Written(db)
+            }
+            Ok(Some(on_disk)) if previous == Some(on_disk.as_slice()) => {
+                MasterWrite::NotWritten(error)
+            }
+            _ => MasterWrite::Unknown(error),
+        }
+    }
+
+    fn write_master_batch(
+        db: &WalletDatabase,
+        batch: rocksdb::WriteBatch,
+    ) -> Result<(), WalletError> {
+        // As a write that fails before, or after, it reaches the disk
+        stop_point!("sealed master unwritten");
+        db.write_batch_sync(batch)?;
+        stop_point!("sealed master written");
+        Ok(())
+    }
+
+    /// After a passphrase change is on disk, take the master key sealed under
+    /// the old passphrase out of the live files
+    fn retire_replaced_master(db: &WalletDatabase) -> Result<(), WalletError> {
+        // The new salt and sealed master key went in as one synced write: a
+        // stop here leaves the wallet opening with the new passphrase
+        stop_point!("passphrase salt written");
+        retire_replaced_records(db)
+    }
+
+    /// After an unlock moved the wallet to the current format, take the
+    /// records in the older format out of the live files
+    fn retire_migrated_records(db: &WalletDatabase) -> Result<(), WalletError> {
+        stop_point!("legacy records written");
+        retire_replaced_records(db)
+    }
+
     /// Import a private key into the wallet
     ///
-    /// Returns the address for the imported key.
+    /// Returns the address for the imported key. Atomic: if the key cannot be
+    /// made durable because the record format is unconfirmed, nothing is added
+    /// and `RecordFormatUnconfirmed` is returned (see
+    /// [`Self::import_key_with_compression`]).
     pub fn import_key(
         &self,
         secret: divi_crypto::keys::SecretKey,
         label: Option<String>,
-    ) -> Address {
+    ) -> Result<Address, WalletError> {
         self.import_key_with_compression(secret, true, label)
     }
 
     /// Import a private key in its compressed or uncompressed form (the WIF's flag)
+    ///
+    /// Confirm the record format before replacing even a watch-only entry.
+    /// After an indeterminate write, retain the secret for retry and report the error.
     pub fn import_key_with_compression(
         &self,
         secret: divi_crypto::keys::SecretKey,
         compressed: bool,
         label: Option<String>,
-    ) -> Address {
-        // As every key made: an encryption cannot snapshot the keys between
-        // the import and its write, then strip the imported secret
+    ) -> Result<Address, WalletError> {
+        let locked = self.locked.read();
+        if *locked && *self.encrypted.read() {
+            return Err(WalletError::WalletLocked);
+        }
         let _keys = self.key_lock.lock();
+        let _persist = self.persist_lock.lock();
+        let db = self.db();
+        if let Some(db) = &db {
+            self.settle_record_format(db)?;
+        } else {
+            self.closed_database()?;
+        }
         let address = self
             .keystore
             .import_key_with_compression(secret, compressed, label);
         self.dirty.write().keys = true;
-        if let Err(e) = self.persist_keys(&[address.hash]) {
-            // Still held in memory; save() and lock() retry the write
-            error!(
-                "Failed to store imported key {}: {}",
-                WalletAddress(&address.to_string()),
-                e
-            );
+        if let Some(db) = db {
+            self.write_keys(&db, &[address.hash], None)?;
         }
         info!(
             "Imported key for address {}",
             WalletAddress(&address.to_string())
         );
-        address
+        Ok(address)
+    }
+
+    fn export_hd_secret<T>(&self, read: impl FnOnce(&KeyStore) -> Option<T>) -> Option<T> {
+        self.is_locked();
+        let locked = self.locked.read();
+        let unlock = self.unlock.read();
+        if *locked || unlock.staking_only {
+            return None;
+        }
+        read(&self.keystore)
     }
 
     /// Get mnemonic (if available and fully unlocked)
     pub fn mnemonic(&self) -> Option<String> {
-        // is_fully_unlocked() applies an expired timeout first
-        if !self.is_fully_unlocked() {
-            return None;
-        }
-        self.keystore.mnemonic()
+        self.export_hd_secret(KeyStore::mnemonic)
     }
 
     /// The seed of a wallet made from a seed (no words); None while locked
     pub fn hd_seed(&self) -> Option<Zeroizing<Vec<u8>>> {
-        if *self.locked.read() {
-            return None;
-        }
-        self.keystore.hd_seed()
+        self.export_hd_secret(KeyStore::hd_seed)
     }
 
     /// Path of the account the wallet's HD keys derive from, m/44'/coin'/0'
@@ -3758,15 +4272,19 @@ impl WalletDb {
 
     /// BIP39 passphrase of the HD seed (if one was given and unlocked)
     pub fn mnemonic_passphrase(&self) -> Option<String> {
-        if *self.locked.read() {
-            return None;
-        }
-        self.keystore.mnemonic_passphrase()
+        self.export_hd_secret(KeyStore::mnemonic_passphrase)
     }
 
     /// Get key entry by address
     pub fn get_key_by_address(&self, address: &Address) -> Option<crate::keystore::KeyEntry> {
-        self.keystore.get_key_by_address(address)
+        self.is_locked();
+        let locked = self.locked.read();
+        let unlock = self.unlock.read();
+        let mut entry = self.keystore.get_key_by_address(address)?;
+        if *locked || unlock.staking_only {
+            entry.secret = None;
+        }
+        Some(entry)
     }
 
     /// Get HD chain ID (SHA256 hash of master pubkey)
@@ -3796,20 +4314,25 @@ impl WalletDb {
         let _locked = self.locked.read();
         let _keys = self.key_lock.lock();
         self.keystore.hold_pool_lines();
-        let added = self.store_new_pool_keys(new_size);
+        let _persist = self.persist_lock.lock();
+        let added = self.store_new_pool_keys(new_size, None);
         self.keystore.release_pool_lines(added.is_ok());
         added
     }
 
     /// Top the keypool up to `new_size` and write the new keys
-    fn store_new_pool_keys(&self, new_size: Option<u32>) -> Result<u32, WalletError> {
+    fn store_new_pool_keys(
+        &self,
+        new_size: Option<u32>,
+        replay_height: Option<u32>,
+    ) -> Result<u32, WalletError> {
         let pool = self.keystore.pool_state();
         let added = self.keystore.top_up_keypool(new_size)?;
-        if !added.is_empty() {
+        if !added.is_empty() || replay_height.is_some() {
             self.dirty.write().keys = true;
             // Keys that cannot be written do not join the pool, as Divi Core's
             // derivation throws before they do (wallet.cpp:2339-2347)
-            if let Err(e) = self.persist_keys(&added) {
+            if let Err(e) = self.persist_keys_locked(&added, replay_height) {
                 self.keystore.remove_keys(&added);
                 self.keystore.restore_pool_state(pool);
                 return Err(e);
@@ -3826,9 +4349,41 @@ impl WalletDb {
         block_time: u32,
         transactions: &[divi_primitives::transaction::Transaction],
     ) {
+        self.scan_block_with_replay(block_hash, height, block_time, transactions, 0);
+    }
+
+    fn scan_block_with_replay(
+        &self,
+        block_hash: Hash256,
+        height: u32,
+        block_time: u32,
+        transactions: &[divi_primitives::transaction::Transaction],
+        replay_floor: u32,
+    ) -> bool {
+        loop {
+            let mut expanded = false;
+            for output in transactions.iter().flat_map(|tx| &tx.vout) {
+                if self.is_mine_script(&output.script_pubkey) {
+                    match self.observe_address(
+                        &self.output_address(&output.script_pubkey),
+                        Some(replay_floor),
+                    ) {
+                        Ok(changed) => expanded |= changed,
+                        Err(error) => {
+                            warn!("HD key refill failed at height {height}: {error}");
+                            return false;
+                        }
+                    }
+                }
+            }
+            if !expanded {
+                break;
+            }
+        }
         for tx in transactions {
             self.scan_transaction(tx, Some(block_hash), Some(height), Some(block_time));
         }
+        true
     }
 
     /// Scan a transaction for wallet relevance
@@ -4502,12 +5057,26 @@ impl WalletDb {
         H: Fn(u32) -> Option<Hash256>,
         F: FnMut(u32) -> Option<(Hash256, divi_primitives::block::Block)>,
     {
+        self.try_sync_to_tip(
+            tip_height,
+            |h| Ok::<_, std::convert::Infallible>(hash_at(h)),
+            |h| Ok(get_block(h)),
+        )
+        .unwrap()
+    }
+
+    pub fn try_sync_to_tip<E>(
+        &self,
+        tip_height: u32,
+        hash_at: impl Fn(u32) -> Result<Option<Hash256>, E>,
+        mut get_block: impl FnMut(u32) -> Result<Option<(Hash256, divi_primitives::block::Block)>, E>,
+    ) -> Result<Vec<u32>, E> {
         let _scan = self.scan_lock.lock();
 
         let last = self.last_scan_height();
         let top = last.min(tip_height);
         let fork = self
-            .find_fork(top, &hash_at)
+            .find_fork(top, &hash_at)?
             .or_else(|| (top < last).then_some(top));
         if let Some(fork) = fork {
             counted::hit(Site::WalletRollback);
@@ -4516,16 +5085,61 @@ impl WalletDb {
         }
 
         let mut missing = Vec::new();
-        let from = self.last_scan_height().saturating_add(1);
-        for height in from..=tip_height {
-            match get_block(height) {
-                Some((hash, block)) => self.scan_active_block(hash, height, &block),
+        let generation = *self.hd_replay_generation.read();
+        let deferred = generation != 0 && !*self.locked.read();
+        let from = if deferred {
+            if let Err(error) = self.top_up_keypool() {
+                warn!("Cannot complete deferred HD refill: {error}");
+                return Ok(vec![1]);
+            }
+            1
+        } else {
+            self.last_scan_height().saturating_add(1)
+        };
+        let mut replay = false;
+        let mut heights = from..=tip_height;
+        while let Some(height) = heights.next() {
+            let before = self.keystore.get_indices();
+            match get_block(height)? {
+                Some((hash, block)) => {
+                    if !self.scan_active_block(hash, height, &block, 0) {
+                        missing.push(height);
+                        break;
+                    }
+                    replay |= height > 1 && before != self.keystore.get_indices();
+                }
                 None => missing.push(height),
             }
-            self.set_last_scan_height(height);
+            if replay {
+                if height == tip_height {
+                    heights = 1..=tip_height;
+                    missing.clear();
+                    replay = false;
+                }
+            } else {
+                self.set_last_scan_height(height);
+            }
+        }
+        if deferred && missing.is_empty() {
+            let _persist = self.persist_lock.lock();
+            let mut current = self.hd_replay_generation.write();
+            if *current == generation {
+                let result = if let Some(db) = self.db() {
+                    self.write_everything(&db, true)
+                } else {
+                    self.closed_database()
+                };
+                match result {
+                    Ok(()) => *current = 0,
+                    Err(error) => {
+                        warn!("Cannot checkpoint deferred HD replay: {error}");
+                        missing.push(tip_height);
+                    }
+                }
+            }
         }
         self.tell_of_dropped_after_reorg();
-        missing
+        Ok(missing)
     }
 
     /// A transaction of a disconnected block that the new branch neither mined
@@ -4546,26 +5160,45 @@ impl WalletDb {
     /// Highest height below `last` whose scanned block is still active, if
     /// the block scanned at `last` is not. Heights without a remembered hash
     /// are taken as still active.
-    fn find_fork<H: Fn(u32) -> Option<Hash256>>(&self, last: u32, hash_at: &H) -> Option<u32> {
+    fn find_fork<E>(
+        &self,
+        last: u32,
+        hash_at: &impl Fn(u32) -> Result<Option<Hash256>, E>,
+    ) -> Result<Option<u32>, E> {
         let hashes = self.scanned_hashes.read();
         let mut height = last;
         while height > 0 {
             match hashes.get(&height) {
-                Some(scanned) if hash_at(height) != Some(*scanned) => height -= 1,
+                Some(scanned) if hash_at(height)? != Some(*scanned) => height -= 1,
                 _ => break,
             }
         }
-        (height < last).then_some(height)
+        Ok((height < last).then_some(height))
     }
 
     /// Scan a block of the active chain and remember its hash
-    fn scan_active_block(&self, hash: Hash256, height: u32, block: &divi_primitives::block::Block) {
-        self.scan_block(hash, height, block.header.time, &block.transactions);
+    fn scan_active_block(
+        &self,
+        hash: Hash256,
+        height: u32,
+        block: &divi_primitives::block::Block,
+        replay_floor: u32,
+    ) -> bool {
+        if !self.scan_block_with_replay(
+            hash,
+            height,
+            block.header.time,
+            &block.transactions,
+            replay_floor,
+        ) {
+            return false;
+        }
         let mut hashes = self.scanned_hashes.write();
         hashes.insert(height, hash);
         while hashes.len() > SCANNED_HASHES_KEPT {
             hashes.pop_first();
         }
+        true
     }
 
     /// Rescan heights `start..=stop` of the active chain (`rescanblockchain`).
@@ -4586,6 +5219,7 @@ impl WalletDb {
         F: FnMut(u32) -> Option<(Hash256, divi_primitives::block::Block)>,
     {
         let _scan = self.scan_lock.lock();
+        let last = self.last_scan_height();
         let full = start == 0 && stop >= tip_height;
         if full {
             self.clear_transactions_and_utxos();
@@ -4617,10 +5251,23 @@ impl WalletDb {
 
         let mut scanned = 0u32;
         let mut unreadable = None;
-        for height in start..=stop {
+        let mut heights = start..=stop;
+        while let Some(height) = heights.next() {
+            let before = self.keystore.get_indices();
             match get_block(height) {
                 Some((hash, block)) => {
-                    self.scan_active_block(hash, height, &block);
+                    if !self.scan_active_block(hash, height, &block, start.saturating_sub(1)) {
+                        self.set_last_scan_height(
+                            self.last_scan_height().min(start.saturating_sub(1)),
+                        );
+                        unreadable = Some(height);
+                        break;
+                    }
+                    if height > start && before != self.keystore.get_indices() {
+                        heights = start..=stop;
+                        scanned = 0;
+                        continue;
+                    }
                     scanned += 1;
                 }
                 None => {
@@ -4659,14 +5306,14 @@ impl WalletDb {
             }
         }
 
-        let last = self.last_scan_height();
         match unreadable {
             // Blocks from here on were rolled back but not scanned again
-            Some(h) => self.set_last_scan_height(last.min(h.saturating_sub(1))),
+            Some(h) => self
+                .set_last_scan_height(self.last_scan_height().min(last).min(h.saturating_sub(1))),
             None if full || (start <= last.saturating_add(1) && stop > last) => {
                 self.set_last_scan_height(stop)
             }
-            None => {}
+            None => self.set_last_scan_height(last),
         }
         (scanned, unreadable)
     }
@@ -5222,12 +5869,14 @@ fn open_master(db: &WalletDatabase, passphrase: &str) -> Result<MasterKey, Walle
         Some(params) => Ok(MasterKey {
             key: at_rest::open_master_key(&sealed, passphrase, &salt, &params)?,
             aead: true,
+            unconfirmed: None,
         }),
         None => {
             let key = at_rest::legacy::derive_key_from_passphrase(passphrase, &salt);
             Ok(MasterKey {
                 key: at_rest::legacy::open_master_key(&sealed, &key)?,
                 aead: false,
+                unconfirmed: None,
             })
         }
     }
@@ -5308,13 +5957,13 @@ fn open_secret(
 }
 
 /// Add the master key, sealed under `passphrase` with a fresh salt at the
-/// default cost, to `batch`
+/// default cost, to `batch`; returns the sealed master key
 fn put_sealed_master(
     batch: &mut rocksdb::WriteBatch,
     db: &WalletDatabase,
     master_key: &[u8],
     passphrase: &str,
-) -> Result<(), WalletError> {
+) -> Result<Vec<u8>, WalletError> {
     use rand::RngCore;
     let mut salt = vec![0u8; 16];
     rand::rngs::OsRng.fill_bytes(&mut salt);
@@ -5322,26 +5971,40 @@ fn put_sealed_master(
     let sealed = at_rest::seal_master_key(master_key, passphrase, &salt, &params)?;
     batch.put_cf(db.cf_metadata(), KEY_KDF_PARAMS, params.encode());
     batch.put_cf(db.cf_metadata(), KEY_ENCRYPTION_SALT, &salt);
-    batch.put_cf(db.cf_metadata(), KEY_ENCRYPTED_MASTER_KEY, sealed);
-    Ok(())
+    batch.put_cf(db.cf_metadata(), KEY_ENCRYPTED_MASTER_KEY, &sealed);
+    Ok(sealed)
 }
 
-/// Rewrite an older wallet's encrypted records in the current format, keeping
-/// its master key: Argon2id for the passphrase key, XChaCha20-Poly1305 for every
-/// record. One synced batch, so a crash leaves either format whole.
-fn migrate_legacy(
+/// How a write replacing the sealed master key ended
+enum MasterWrite {
+    /// On disk, in the database returned (opened again after an error)
+    Written(Arc<WalletDatabase>),
+    /// Not on disk: the wallet is as it was
+    NotWritten(WalletError),
+    /// The write reported an error and the database cannot tell whether it is
+    /// on disk: either the old or the new one is, whole
+    Unknown(WalletError),
+}
+
+/// The batch rewriting an older wallet's encrypted records in the current
+/// format, keeping its master key: Argon2id for the passphrase key,
+/// XChaCha20-Poly1305 for every record. Written as one synced batch, so a
+/// crash leaves either format whole. Returns the batch and the sealed master
+/// key in it.
+fn legacy_migration_batch(
     db: &WalletDatabase,
     passphrase: &str,
     master_key: &[u8],
     records: &OpenedRecords,
-) -> Result<(), WalletError> {
+) -> Result<(rocksdb::WriteBatch, Vec<u8>), WalletError> {
     use crate::persistence::{KEY_ENCRYPTED_HD_SEED, KEY_ENCRYPTED_MNEMONIC_PASSPHRASE};
     let master = MasterKey {
         key: Zeroizing::new(master_key.to_vec()),
         aead: true,
+        unconfirmed: None,
     };
     let mut batch = db.create_batch();
-    put_sealed_master(&mut batch, db, master_key, passphrase)?;
+    let sealed = put_sealed_master(&mut batch, db, master_key, passphrase)?;
     let metadata = [
         (KEY_ENCRYPTED_MNEMONIC, &records.mnemonic),
         (
@@ -5364,11 +6027,24 @@ fn migrate_legacy(
         let blob = master.seal_record(&record_key, secret.as_bytes());
         batch.put_cf(db.cf_keys(), &record_key, blob);
     }
-    db.write_batch_sync(batch)?;
-    db.flush()?;
-    // The old records were readable with the old passphrase alone
-    db.compact_secret_cfs();
-    Ok(())
+    Ok((batch, sealed))
+}
+
+/// Flush every column family, so the write-ahead log holding the replaced
+/// values is retired, ask for the metadata and key families to be compacted,
+/// so the SST files holding them go, and sync the log. A failed flush or sync
+/// is returned; the compaction reports no result, so `Ok` does not prove the
+/// old files are gone. This is the database's logical storage only: it
+/// erases no disk block, and no copy of the wallet made before
+fn retire_replaced_records(db: &WalletDatabase) -> Result<(), WalletError> {
+    db.compact_secret_cfs()
+}
+
+/// The sealed master key on disk, read to tell whether a write that reported
+/// an error landed
+fn read_back_sealed_master(db: &WalletDatabase) -> Result<Option<Vec<u8>>, WalletError> {
+    stop_point!("sealed master read back");
+    Ok(db.load_encryption_metadata()?.map(|(_, sealed)| sealed))
 }
 
 /// Order transactions oldest first, moving each child after the parents it
@@ -5408,6 +6084,78 @@ mod tests {
     fn create_test_wallet() -> WalletDb {
         let wallet = HdWallet::from_mnemonic(TEST_MNEMONIC, None, ChainMode::Divi).unwrap();
         WalletDb::with_hd_wallet(Network::Mainnet, wallet)
+    }
+
+    #[test]
+    fn restored_hd_out_of_order_payments() {
+        let owned = tempfile::tempdir().unwrap();
+        let recovered = tempfile::tempdir().unwrap();
+        let make = |path: &std::path::Path| {
+            let hd = HdWallet::from_mnemonic(TEST_MNEMONIC, None, ChainMode::Divi).unwrap();
+            let wallet = WalletDb::create_persistent(path, Network::Testnet, hd).unwrap();
+            wallet.keystore.set_keypool_target(2);
+            wallet.top_up_keypool().unwrap();
+            wallet
+        };
+        let original = make(owned.path());
+        let restored = make(recovered.path());
+
+        let addresses: Vec<_> = (0..4)
+            .map(|_| original.new_receiving_address().unwrap())
+            .collect();
+        let txs: Vec<_> = addresses
+            .iter()
+            .rev()
+            .enumerate()
+            .map(|(i, a)| paying_tx(a, i as u8))
+            .collect();
+        restored.scan_block(Hash256::from_bytes([1; 32]), 1, 1, &txs);
+        assert!(addresses
+            .iter()
+            .all(|a| restored.is_address_used(&a.to_string())));
+    }
+
+    #[test]
+    fn restored_hd_scan_extends_both_branches_and_reopens_at_unused_keys() {
+        let owned = tempfile::tempdir().unwrap();
+        let recovered = tempfile::tempdir().unwrap();
+        let make = |path: &std::path::Path| {
+            let hd = HdWallet::from_mnemonic(TEST_MNEMONIC, None, ChainMode::Divi).unwrap();
+            let wallet = WalletDb::create_persistent(path, Network::Testnet, hd).unwrap();
+            wallet.keystore.set_keypool_target(2);
+            wallet.top_up_keypool().unwrap();
+            wallet
+        };
+        let original = make(owned.path());
+        let restored = make(recovered.path());
+        for height in 1..=5 {
+            for address in [
+                original.new_receiving_address().unwrap(),
+                original.new_change_address().unwrap(),
+            ] {
+                let tx = paying_tx(&address, height as u8);
+                restored.scan_block(
+                    Hash256::from_bytes([height as u8; 32]),
+                    height,
+                    height,
+                    &[tx],
+                );
+                assert!(restored.is_address_used(&address.to_string()));
+            }
+        }
+        restored.save().unwrap();
+        // Older scanners persisted used addresses without advancing either cursor.
+        restored.db().unwrap().store_indices(0, 0).unwrap();
+        drop(restored);
+        let restored = WalletDb::open(recovered.path(), Network::Testnet).unwrap();
+        assert_eq!(
+            restored.new_receiving_address().unwrap(),
+            original.new_receiving_address().unwrap()
+        );
+        assert_eq!(
+            restored.new_change_address().unwrap(),
+            original.new_change_address().unwrap()
+        );
     }
 
     /// A transaction paying `to`, its input made up from `tag`
@@ -6505,6 +7253,9 @@ mod tests {
     /// Saves, key writes and encryption racing one another
     mod save_boundaries;
 
+    /// Passphrase changes and older-format moves: results, restarts, races
+    mod passphrase_change;
+
     /// Confirmed-state accounting: blocks scanned twice, reorgs, restarts
     mod chain_accounting {
         mod crash;
@@ -6987,6 +7738,162 @@ mod tests {
             }
         }
 
+        fn recovery_wallet(path: &std::path::Path) -> WalletDb {
+            let hd = HdWallet::from_mnemonic(TEST_MNEMONIC, None, ChainMode::Divi).unwrap();
+            let wallet = WalletDb::create_persistent(path, Network::Testnet, hd).unwrap();
+            wallet.keystore.set_keypool_target(2);
+            wallet.top_up_keypool().unwrap();
+            wallet
+        }
+
+        #[test]
+        fn recovery_replays_both_branches_and_spends_in_chain_order() {
+            let sender = tempfile::tempdir().unwrap();
+            let original = recovery_wallet(sender.path());
+            let mut blocks = Vec::new();
+            for index in 0..4 {
+                let receive = original.new_receiving_address().unwrap();
+                let change = original.new_change_address().unwrap();
+                blocks.push(vec![tx(
+                    &[(Hash256::from_bytes([index; 32]), 0)],
+                    vec![(COIN, mine(&receive)), (COIN, mine(&change))],
+                )]);
+            }
+            blocks.reverse();
+            let spent = blocks[0][0].txid();
+            blocks.push(vec![tx(&[(spent, 0)], vec![(COIN - 1000, stranger())])]);
+            let slices: Vec<_> = blocks.iter().map(Vec::as_slice).collect();
+            let chain = TestChain::new(0, &slices);
+            for method in ["catchup", "successive tips", "rescan", "locked restart"] {
+                let dir = tempfile::tempdir().unwrap();
+                let wallet = recovery_wallet(dir.path());
+                match method {
+                    "locked restart" => {
+                        wallet.encrypt_wallet("pw").unwrap();
+                        assert!(chain.sync(&wallet).is_empty());
+                        let known = outpoints(&wallet);
+                        assert!(!known.is_empty());
+                        assert!(chain.sync(&wallet).is_empty());
+                        assert_eq!(known, outpoints(&wallet));
+                        wallet.save().unwrap();
+                        // This copy models a checkpoint from before replay metadata existed.
+                        {
+                            let db = wallet.db().unwrap();
+                            let mut batch = db.create_batch();
+                            batch.delete_cf(db.cf_metadata(), b"hd_replay_pending");
+                            db.write_batch_sync(batch).unwrap();
+                        }
+                        drop(wallet);
+                        let wallet = WalletDb::open(dir.path(), Network::Testnet).unwrap();
+                        crate::fault::arm("wallet key batch unwritten", 0);
+                        let _ = wallet.unlock("pw", 0);
+                        assert_eq!(
+                            wallet.db().unwrap().hd_replay_pending().unwrap(),
+                            Some(true)
+                        );
+                        wallet.top_up_keypool().unwrap();
+                        // Crash after refill, before the next active-chain notification.
+                        drop(wallet);
+                        let wallet = WalletDb::open(dir.path(), Network::Testnet).unwrap();
+                        wallet.unlock("pw", 0).unwrap();
+                        for _ in 0..2 {
+                            assert!(chain.sync(&wallet).is_empty());
+                            assert_eq!(wallet.get_balance().as_sat(), 7 * COIN);
+                            assert!(!outpoints(&wallet).contains(&OutPoint::new(spent, 0)));
+                        }
+                        assert_eq!(
+                            wallet.db().unwrap().hd_replay_pending().unwrap(),
+                            Some(false)
+                        );
+                        continue;
+                    }
+                    "catchup" => assert!(chain.sync(&wallet).is_empty()),
+                    "successive tips" => {
+                        for tip in 1..=5 {
+                            assert!(wallet
+                                .sync_to_tip(tip, |h| chain.hash_at(h), |h| chain.block_at(h))
+                                .is_empty());
+                        }
+                    }
+                    _ => assert_eq!(wallet.rescan(1, 5, 5, |h| chain.block_at(h)), (5, None)),
+                }
+                for _ in 0..2 {
+                    assert_eq!(wallet.get_balance().as_sat(), 7 * COIN);
+                    assert!(!outpoints(&wallet).contains(&OutPoint::new(spent, 0)));
+                    assert_eq!(wallet.rescan(1, 5, 5, |h| chain.block_at(h)), (5, None));
+                }
+            }
+        }
+
+        #[test]
+        fn locked_discovery_replays_on_unlock() {
+            let sender = tempfile::tempdir().unwrap();
+            let original = recovery_wallet(sender.path());
+            let addresses: Vec<_> = (0..4)
+                .map(|_| original.new_receiving_address().unwrap())
+                .collect();
+            let payments: Vec<_> = addresses
+                .iter()
+                .rev()
+                .enumerate()
+                .map(|(i, a)| paying_tx(a, i as u8))
+                .collect();
+            let chain = TestChain::new(0, &[&payments]);
+            let dir = tempfile::tempdir().unwrap();
+            let wallet = recovery_wallet(dir.path());
+            wallet.encrypt_wallet("pw").unwrap();
+            // A replay checkpoint reached disk but its sync reported an error.
+            *wallet.hd_replay_generation.write() = 1;
+            {
+                let db = wallet.db().unwrap();
+                let mut batch = db.create_batch();
+                batch.put_cf(db.cf_metadata(), b"hd_replay_pending", [0]);
+                db.write_batch_sync(batch).unwrap();
+            }
+            assert!(chain.sync(&wallet).is_empty());
+            wallet.save().unwrap();
+            drop(wallet);
+            let wallet = WalletDb::open(dir.path(), Network::Testnet).unwrap();
+            wallet.unlock("pw", 0).unwrap();
+            assert!(chain.sync(&wallet).is_empty());
+            let after_sync = outpoints(&wallet).len();
+            assert_eq!(wallet.rescan(1, 1, 1, |h| chain.block_at(h)), (1, None));
+            assert_eq!(
+                outpoints(&wallet).len(),
+                4,
+                "manual replay recovers all payments"
+            );
+            assert_eq!(after_sync, 4, "automatic sync after unlock");
+        }
+
+        #[test]
+        fn recovery_refill_failure_preserves_checkpoint_across_restart() {
+            let sender = tempfile::tempdir().unwrap();
+            let original = recovery_wallet(sender.path());
+            let addresses: Vec<_> = (0..4)
+                .map(|_| original.new_receiving_address().unwrap())
+                .collect();
+            let payments: Vec<_> = addresses
+                .iter()
+                .rev()
+                .enumerate()
+                .map(|(i, a)| paying_tx(a, i as u8))
+                .collect();
+            let chain = TestChain::new(0, &[&payments]);
+            let dir = tempfile::tempdir().unwrap();
+            let wallet = recovery_wallet(dir.path());
+            crate::fault::arm("wallet key batch unwritten", 0);
+            assert_eq!(chain.sync(&wallet), vec![1]);
+            assert_eq!(wallet.last_scan_height(), 0);
+            wallet.save().unwrap();
+            drop(wallet);
+            let wallet = WalletDb::open(dir.path(), Network::Testnet).unwrap();
+            assert_eq!(wallet.last_scan_height(), 0);
+            assert!(chain.sync(&wallet).is_empty());
+            assert_eq!(wallet.last_scan_height(), 1);
+            assert_eq!(outpoints(&wallet).len(), 4);
+        }
+
         #[test]
         fn sync_scans_every_block_of_a_reorg() {
             let wallet = create_test_wallet();
@@ -7098,6 +8005,27 @@ mod tests {
                 |h| (h != 2).then(|| chain.block_at(h)).flatten(),
             );
             assert_eq!(missing, vec![2]);
+            assert_eq!(wallet.last_scan_height(), 3);
+        }
+
+        #[test]
+        fn unreadable_scan_stops_and_retries_the_same_height() {
+            let wallet = create_test_wallet();
+            let (fund, _) = fixture(&wallet);
+            let chain = TestChain::new(0, &[std::slice::from_ref(&fund), &[], &[]]);
+            let result = wallet.try_sync_to_tip(
+                3,
+                |h| Ok(chain.hash_at(h)),
+                |h| {
+                    if h == 2 {
+                        return Err("storage unavailable");
+                    }
+                    Ok(chain.block_at(h))
+                },
+            );
+            assert_eq!(result, Err("storage unavailable"));
+            assert_eq!(wallet.last_scan_height(), 1);
+            chain.sync(&wallet);
             assert_eq!(wallet.last_scan_height(), 3);
         }
 
@@ -7802,6 +8730,29 @@ mod tests {
         (Arc::new(wallet), addr)
     }
 
+    #[test]
+    fn cleanup_error_identifies_the_working_passphrase_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let (wallet, address) = timed_encrypted_wallet(dir.path());
+        crate::fault::arm("passphrase salt written", 0);
+        let change = wallet.change_passphrase("pw", "replacement");
+        crate::fault::disarm();
+        let message = change.unwrap_err().to_string();
+        drop(wallet);
+        let wallet = WalletDb::open(&dir.path().join("wallet"), Network::Testnet).unwrap();
+        assert!(matches!(
+            wallet.unlock("pw", 0),
+            Err(WalletError::WrongPassphrase)
+        ));
+        wallet.unlock("replacement", 0).unwrap();
+        assert!(wallet
+            .get_key_by_address(&address)
+            .unwrap()
+            .secret
+            .is_some());
+        assert!(message.contains("wallet passphrase changed"), "{message}");
+    }
+
     /// NODE-6: a timed unlock drops the secrets when it runs out, even if no
     /// RPC call comes along to check the lock.
     #[test]
@@ -7813,7 +8764,12 @@ mod tests {
         WalletDb::start_auto_lock(&wallet);
         std::thread::sleep(std::time::Duration::from_millis(2_200));
         // Read the keystore directly: is_locked() would lock it itself
-        assert!(wallet.get_key_by_address(&addr).unwrap().secret.is_none());
+        assert!(wallet
+            .keystore
+            .get_key_by_address(&addr)
+            .unwrap()
+            .secret
+            .is_none());
         assert!(*wallet.locked.read());
     }
 
@@ -8036,6 +8992,7 @@ mod tests {
                     .to_vec(),
             ),
             aead: false,
+            unconfirmed: None,
         };
         let db = wallet.db().unwrap();
         for (hash, blob) in db.load_encrypted_secrets().unwrap() {
@@ -8245,6 +9202,7 @@ mod tests {
         let legacy = MasterKey {
             key: master.key.clone(),
             aead: false,
+            unconfirmed: None,
         };
         let salt = [0x5au8; 16];
         let key = at_rest::legacy::derive_key_from_passphrase(passphrase, &salt);

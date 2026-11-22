@@ -4473,7 +4473,7 @@ mod tests {
             WalletDb::create_persistent(&wallet_path, divi_wallet::Network::Regtest, hd).unwrap(),
         );
         let imported = divi_crypto::keys::SecretKey::new_random();
-        let imported_addr = wallet.import_key(imported, None);
+        let imported_addr = wallet.import_key(imported, None).unwrap();
         wallet.encrypt_wallet("test-passphrase").unwrap();
         assert!(wallet.is_locked());
 

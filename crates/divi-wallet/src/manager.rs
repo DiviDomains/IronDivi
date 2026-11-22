@@ -318,6 +318,9 @@ impl WalletManager {
 
         // Create persistent wallet
         let wallet = WalletDb::create_persistent(&wallet_path, self.network, hd_wallet)?;
+        if mnemonic.is_some() {
+            wallet.top_up_keypool()?;
+        }
         let wallet = Arc::new(wallet);
 
         // Add to loaded wallets

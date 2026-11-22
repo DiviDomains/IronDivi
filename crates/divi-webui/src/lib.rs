@@ -1193,6 +1193,13 @@ async fn api_wallet_change_passphrase(
         }
         Err((code, msg)) => {
             s.limiter.failed(peer.ip());
+            // -16 covers a change that is on disk but not cleaned up, and one
+            // that may or may not be: the slots may wrap a passphrase that no
+            // longer opens the wallet, and re-enrolling is cheap
+            if code == i64::from(divi_rpc::error::codes::WALLET_ENCRYPTION_FAILED) {
+                let _ = s.node_passkeys.clear_all();
+                warn!("Wallet passphrase change may have taken effect; cleared passkey slots");
+            }
             Err(bad(format!("{msg} ({code})")))
         }
     }

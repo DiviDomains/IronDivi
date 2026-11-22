@@ -68,6 +68,23 @@ pub enum WalletError {
     #[error("wallet encrypted and locked, but plaintext cleanup failed: {0}")]
     EncryptionCleanup(#[source] Box<WalletError>),
 
+    /// The new passphrase is in effect on disk; taking the master key sealed
+    /// under the old one out of the wallet files failed
+    #[error("wallet passphrase changed, but cleanup of the old sealed key failed: {0}")]
+    PassphraseChangeCleanup(#[source] Box<WalletError>),
+
+    /// The passphrase change's write reported an error and whether it reached
+    /// the disk cannot be told: the wallet opens with the old or the new one
+    #[error("wallet passphrase change not confirmed on disk: {0}")]
+    PassphraseChangeUnconfirmed(#[source] Box<WalletError>),
+
+    /// A move of the wallet to the current record format reported an error
+    /// and could not be read back, so the format its keys must be sealed in
+    /// is not known: no key is written (and nothing that writes keys reports
+    /// success) until the database can be read again
+    #[error("wallet record format not confirmed on disk; keys are not written until the wallet database can be read")]
+    RecordFormatUnconfirmed,
+
     /// Wallet not encrypted
     #[error("wallet not encrypted")]
     NotEncrypted,

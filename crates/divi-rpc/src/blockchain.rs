@@ -65,7 +65,7 @@ pub fn load_block_or_fetch(
     if let Some(block) = chain.get_block(&index.hash)? {
         return Ok(Some(block));
     }
-    if index.height <= chain.prune_height() {
+    if (1..=chain.prune_height()).contains(&index.height) {
         return Ok(fetcher.and_then(|f| f.fetch_block(index.hash, index.merkle_root)));
     }
     Ok(None)

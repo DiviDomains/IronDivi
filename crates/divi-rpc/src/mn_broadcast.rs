@@ -108,7 +108,12 @@ fn wallet_secret(wallet: &WalletDb, pubkey: &[u8]) -> Option<SecretKey> {
         return None;
     }
     let id = hash160(pubkey);
-    wallet.keystore().get_key(&id).and_then(|e| e.secret)
+    wallet
+        .get_key_by_address(&divi_wallet::Address::from_pubkey_hash(
+            id,
+            wallet.network(),
+        ))
+        .and_then(|e| e.secret)
 }
 
 /// C++ `MasternodeTier` int for a collateral amount (regtest collaterals are 1000x cheaper)
@@ -357,7 +362,6 @@ pub fn setup_masternode(
             .map_err(|e| RpcError::new(codes::WALLET_ERROR, e.to_string()))?,
     };
     let entry = wallet
-        .keystore()
         .get_key_by_address(&addr)
         .ok_or_else(|| RpcError::new(codes::WALLET_ERROR, "Private key for new address unknown"))?;
     let mn_secret = entry.secret.clone().ok_or_else(|| {

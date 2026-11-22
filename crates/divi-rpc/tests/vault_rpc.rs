@@ -574,7 +574,7 @@ fn addvault_refuses_spent_funding_output() {
         .unwrap()
         .secret
         .unwrap();
-    fresh.import_key(manager_key, None);
+    fresh.import_key(manager_key, None).unwrap();
     let rpc = s.net.rpc(&fresh);
     let e = rpc
         .add_vault(&p(vec![json!(s.encoding), json!(s.fund_txid.to_string())]))
@@ -627,7 +627,7 @@ fn make_self_vault(s: &Setup) -> WalletRpc {
         .unwrap()
         .secret
         .unwrap();
-    s.owner.import_key(manager_key, None);
+    s.owner.import_key(manager_key, None).unwrap();
     let rpc = s.net.rpc(&s.owner);
     rpc.add_vault(&p(vec![json!(s.encoding), json!(s.fund_txid.to_string())]))
         .unwrap();
@@ -1029,7 +1029,7 @@ fn addvault_needs_the_vault_option() {
         .unwrap()
         .secret
         .unwrap();
-    fresh.import_key(manager_key, None);
+    fresh.import_key(manager_key, None).unwrap();
     let rpc = s.net.rpc(&fresh);
     let e = rpc
         .add_vault(&p(vec![json!(s.encoding), json!(s.fund_txid.to_string())]))

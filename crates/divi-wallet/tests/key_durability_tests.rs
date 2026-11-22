@@ -139,7 +139,7 @@ fn imported_key_survives_lock_and_restart() {
     wallet.unlock("pw", 60).unwrap();
     let imported = SecretKey::new_random();
     let expected = imported.as_bytes().to_vec();
-    let addr = wallet.import_key(imported, None);
+    let addr = wallet.import_key(imported, None).unwrap();
     wallet.lock();
     drop(wallet);
 

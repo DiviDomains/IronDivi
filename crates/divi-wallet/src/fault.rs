@@ -8,36 +8,46 @@
 //! Compiled into test builds only.
 
 use crate::error::WalletError;
-use std::cell::Cell;
+use std::cell::RefCell;
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::Mutex;
 use std::time::Duration;
 
 thread_local! {
-    /// The armed point and how many more times it is passed before it stops
-    static ARMED: Cell<Option<(&'static str, u32)>> = const { Cell::new(None) };
+    /// The armed points, each with how many more times it is passed before
+    /// it stops
+    static ARMED: RefCell<Vec<(&'static str, u32)>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Stop at `point` after it has been passed `skip` times
+/// Stop at `point` after it has been passed `skip` times, and at no other
+/// point armed before
 pub(crate) fn arm(point: &'static str, skip: u32) {
-    ARMED.with(|a| a.set(Some((point, skip))));
+    ARMED.with(|a| *a.borrow_mut() = vec![(point, skip)]);
+}
+
+/// Stop at `point` after it has been passed `skip` times too, keeping the
+/// points armed before: a write and the read that checks it can both fail
+pub(crate) fn arm_also(point: &'static str, skip: u32) {
+    ARMED.with(|a| a.borrow_mut().push((point, skip)));
 }
 
 pub(crate) fn disarm() {
-    ARMED.with(|a| a.set(None));
+    ARMED.with(|a| a.borrow_mut().clear());
 }
 
 pub(crate) fn check(point: &'static str) -> Result<(), WalletError> {
-    ARMED.with(|a| match a.get() {
-        Some((armed, 0)) if armed == point => {
-            a.set(None);
+    ARMED.with(|a| {
+        let mut armed = a.borrow_mut();
+        let Some(i) = armed.iter().position(|(p, _)| *p == point) else {
+            return Ok(());
+        };
+        if armed[i].1 == 0 {
+            armed.remove(i);
             Err(WalletError::Storage(format!("stopped at {point}")))
-        }
-        Some((armed, n)) if armed == point => {
-            a.set(Some((armed, n - 1)));
+        } else {
+            armed[i].1 -= 1;
             Ok(())
         }
-        _ => Ok(()),
     })
 }
 

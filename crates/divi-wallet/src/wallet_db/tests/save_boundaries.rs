@@ -154,7 +154,7 @@ fn encryption_waits_for_an_imported_key() {
         let wallet = Arc::clone(&wallet);
         std::thread::spawn(move || {
             let key = divi_crypto::keys::SecretKey::from_bytes(&secret).unwrap();
-            wallet.import_key(key, None)
+            wallet.import_key(key, None).unwrap()
         })
     };
     pause.reached();

@@ -432,18 +432,20 @@ impl WalletDatabase {
         Ok(())
     }
 
-    /// Force the metadata and key column families through compaction so that
-    /// overwritten/deleted plaintext does not linger in old SST files.
+    /// Ask for the metadata and key column families to be compacted so that
+    /// overwritten/deleted values are not kept in old SST files.
     ///
     /// Every column family is flushed first: the write-ahead log is shared, and
-    /// a log file holding the old plaintext writes is kept until all column
-    /// families with data in it have been flushed.
-    pub fn compact_secret_cfs(&self) {
+    /// a log file holding the old writes is kept until all column families
+    /// with data in it have been flushed. A failed flush or log sync is
+    /// returned (the old log may remain). The compaction itself reports no
+    /// result, so `Ok` does not tell that it removed anything, and nothing
+    /// here erases disk blocks.
+    pub fn compact_secret_cfs(&self) -> Result<(), WalletError> {
         for name in ALL_CFS {
             if let Some(cf) = self.db.cf_handle(name) {
-                if let Err(e) = self.db.flush_cf(cf) {
-                    tracing::warn!("Wallet flush of {} failed: {}", name, e);
-                }
+                stop_point!("wallet cleanup flush");
+                self.db.flush_cf(cf).map_err(|e| self.storage_error(e))?;
             }
         }
         for name in [CF_METADATA, CF_KEYS] {
@@ -451,9 +453,8 @@ impl WalletDatabase {
                 self.db.compact_range_cf(cf, None::<&[u8]>, None::<&[u8]>);
             }
         }
-        if let Err(e) = self.db.flush_wal(true) {
-            tracing::warn!("Wallet log sync failed: {}", e);
-        }
+        stop_point!("wallet cleanup log sync");
+        self.db.flush_wal(true).map_err(|e| self.storage_error(e))
     }
 
     /// Store network type
@@ -690,6 +691,19 @@ impl WalletDatabase {
         Ok(raw.map(|v| decode_scanned_hashes(&v)).unwrap_or_default())
     }
 
+    pub(crate) fn hd_replay_pending(&self) -> Result<Option<bool>, WalletError> {
+        let value = self
+            .db
+            .get_cf(self.cf_metadata(), b"hd_replay_pending")
+            .map_err(|error| self.storage_error(error))?;
+        match value.as_deref() {
+            Some([0]) => Ok(Some(false)),
+            Some([1]) => Ok(Some(true)),
+            None => Ok(None),
+            _ => Err(WalletError::Storage("invalid HD replay flag".into())),
+        }
+    }
+
     /// Load last scan height
     pub fn load_last_scan_height(&self) -> Result<u32, WalletError> {
         let cf = self.db.cf_handle(CF_METADATA).unwrap();
@@ -772,9 +786,12 @@ impl WalletDatabase {
             if key.len() == 36 {
                 let outpoint = outpoint_from_key(&key);
                 match deserialize_utxo(&value) {
-                    Ok(utxo) => utxos.push((outpoint, utxo)),
+                    Ok(utxo) if utxo.outpoint() == outpoint => utxos.push((outpoint, utxo)),
+                    Ok(_) => self.unreadable(Kind::Transaction, "coin", "outpoint mismatch"),
                     Err(e) => self.unreadable(Kind::Transaction, "coin", e),
                 }
+            } else {
+                self.unreadable(Kind::Transaction, "coin", "invalid outpoint length");
             }
         }
 
@@ -1128,11 +1145,13 @@ impl WalletDatabase {
         for item in iter {
             let (key, value) = item.map_err(|e| self.storage_error(e))?;
             if key.len() != 36 {
+                self.unreadable(Kind::Transaction, "spent coin", "invalid outpoint length");
                 continue;
             }
             let outpoint = outpoint_from_key(&key);
             // Value = serialized WalletUtxo + 4 bytes spent_height
             if value.len() < 4 {
+                self.unreadable(Kind::Transaction, "spent coin", "missing height");
                 continue;
             }
             let spent_height_bytes = &value[value.len() - 4..];
@@ -1144,7 +1163,10 @@ impl WalletDatabase {
             ]);
             let utxo_data = &value[..value.len() - 4];
             match deserialize_utxo(utxo_data) {
-                Ok(utxo) => results.push((outpoint, utxo, spent_height)),
+                Ok(utxo) if utxo.outpoint() == outpoint => {
+                    results.push((outpoint, utxo, spent_height))
+                }
+                Ok(_) => self.unreadable(Kind::Transaction, "spent coin", "outpoint mismatch"),
                 Err(e) => self.unreadable(Kind::Transaction, "spent coin", e),
             }
         }
@@ -1679,6 +1701,9 @@ fn deserialize_utxo(data: &[u8]) -> Result<WalletUtxo, WalletError> {
     let script_len =
         u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
     pos += 4;
+    if data.len() - pos < 4 || script_len > data.len() - pos - 4 {
+        return Err(WalletError::Storage("Invalid UTXO script length".into()));
+    }
     let script_pubkey = Script::from_bytes(data[pos..pos + script_len].to_vec());
     pos += script_len;
 
@@ -1686,6 +1711,9 @@ fn deserialize_utxo(data: &[u8]) -> Result<WalletUtxo, WalletError> {
     let addr_len =
         u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
     pos += 4;
+    if addr_len > data.len() - pos {
+        return Err(WalletError::Storage("Invalid UTXO address length".into()));
+    }
     let address = String::from_utf8(data[pos..pos + addr_len].to_vec())
         .map_err(|e| WalletError::Storage(e.to_string()))?;
 
@@ -1833,6 +1861,11 @@ fn deserialize_tx(data: &[u8]) -> Result<WalletTx, WalletError> {
     let cat_len =
         u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
     pos += 4;
+    if data.len() - pos < 4 || cat_len > data.len() - pos - 4 {
+        return Err(WalletError::Storage(
+            "Invalid transaction category length".into(),
+        ));
+    }
     let category = String::from_utf8(data[pos..pos + cat_len].to_vec())
         .map_err(|e| WalletError::Storage(e.to_string()))?;
     pos += cat_len;
@@ -2030,6 +2063,9 @@ mod tests {
         };
 
         let serialized = serialize_utxo(&utxo);
+        for end in 0..serialized.len() {
+            assert!(deserialize_utxo(&serialized[..end]).is_err());
+        }
         let deserialized = deserialize_utxo(&serialized).unwrap();
 
         assert_eq!(utxo.txid, deserialized.txid);

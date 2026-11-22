@@ -115,7 +115,7 @@ impl Node {
         self.chain.accept_block(block).unwrap();
         // As irondivid's block callback does, so the wallet knows the blocks
         // it scanned and leaves them when they are disconnected
-        divi_rpc::wallet::sync_wallet_with_chain(&self.wallet, &self.chain);
+        divi_rpc::wallet::sync_wallet_with_chain(&self.wallet, &self.chain).unwrap();
         self.server.set_height(height);
         txs[0].clone()
     }
@@ -423,7 +423,7 @@ fn invalidateblock_returns_transactions_to_the_mempool() {
     // mempool takes the transactions back and hands them to the wallet
     f.n.server
         .set_reorg_hook(Arc::new(move |txs: Vec<Transaction>| {
-            divi_rpc::wallet::sync_wallet_with_chain(&wallet, &chain);
+            divi_rpc::wallet::sync_wallet_with_chain(&wallet, &chain).unwrap();
             for tx in &txs {
                 wallet.add_mempool_tx(tx);
             }

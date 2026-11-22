@@ -884,36 +884,54 @@ pub struct WalletRpc {
 }
 
 /// Position the wallet's scan for a start (see [`WalletDb::resume_scan`])
-pub fn resume_wallet_scan(wallet: &WalletDb, chain: &Chain) {
-    wallet.resume_scan(chain.height(), |height| {
-        chain
-            .get_block_index_by_height(height)
-            .ok()
-            .flatten()
-            .map(|index| index.hash)
-    });
+fn scan_hash(
+    chain: &Chain,
+    height: u32,
+) -> Result<Option<divi_primitives::hash::Hash256>, divi_storage::StorageError> {
+    chain
+        .get_block_index_by_height(height)?
+        .map(|index| Some(index.hash))
+        .ok_or_else(|| {
+            divi_storage::StorageError::NotFound(format!("block index at height {height}"))
+        })
 }
 
-/// Scan the active chain into the wallet, in order, from its last scanned
-/// height up to the tip (rolling back first if the chain switched under it).
-/// Returns the heights whose block could not be read (pruned); they are
-/// skipped.
-pub fn sync_wallet_with_chain(wallet: &WalletDb, chain: &Chain) -> Vec<u32> {
-    wallet.sync_to_tip(
-        chain.height(),
+pub fn resume_wallet_scan(
+    wallet: &WalletDb,
+    chain: &Chain,
+) -> Result<(), divi_storage::StorageError> {
+    wallet.try_resume_scan(chain.height(), |height| scan_hash(chain, height))
+}
+
+/// Continue past pruned history and stop at the first storage failure.
+pub fn sync_wallet_with_chain(
+    wallet: &WalletDb,
+    chain: &Chain,
+) -> Result<Vec<u32>, divi_storage::StorageError> {
+    let tip = chain.height();
+    let missing = wallet.try_sync_to_tip(
+        tip,
+        |height| scan_hash(chain, height),
         |height| {
-            chain
-                .get_block_index_by_height(height)
-                .ok()
-                .flatten()
-                .map(|index| index.hash)
+            let index = chain.get_block_index_by_height(height)?.ok_or_else(|| {
+                divi_storage::StorageError::NotFound(format!("block index at height {height}"))
+            })?;
+            match chain.get_block(&index.hash)? {
+                Some(block) => Ok(Some((index.hash, block))),
+                None if (1..=chain.prune_height()).contains(&height) => Ok(None),
+                None => Err(divi_storage::StorageError::BlockNotFound(format!(
+                    "height {height}"
+                ))),
+            }
         },
-        |height| {
-            let index = chain.get_block_index_by_height(height).ok().flatten()?;
-            let block = chain.get_block(&index.hash).ok().flatten()?;
-            Some((index.hash, block))
-        },
-    )
+    )?;
+    if wallet.last_scan_height() < tip {
+        return Err(divi_storage::StorageError::ChainState(format!(
+            "wallet keypool refill failed while scanning height {}",
+            missing.last().copied().unwrap_or(tip)
+        )));
+    }
+    Ok(missing)
 }
 
 impl WalletRpc {
@@ -923,7 +941,9 @@ impl WalletRpc {
         let (Some(chain), Ok(wallet)) = (self.chain.as_ref(), self.get_wallet()) else {
             return;
         };
-        sync_wallet_with_chain(&wallet, chain);
+        if let Err(error) = sync_wallet_with_chain(&wallet, chain) {
+            warn!("Wallet sync stopped: {error}");
+        }
         if let Err(e) = wallet.save_incremental() {
             warn!("Failed to save wallet after chain sync: {}", e);
         }
@@ -1735,6 +1755,14 @@ impl WalletRpc {
         }
 
         wallet.lock();
+        if wallet.is_lock_cleanup_pending() {
+            return Err(RpcError::new(
+                codes::WALLET_ERROR,
+                "Wallet locked for spending and export, but private keys remain in memory \
+                 because they could not be saved. Keep the wallet running and retry the save.",
+            )
+            .into());
+        }
         Ok(serde_json::Value::Null)
     }
 
@@ -1761,10 +1789,7 @@ impl WalletRpc {
                 format!("Private key for address {addr_str} is not known"),
             )
         };
-        let key_entry = wallet
-            .keystore()
-            .get_key_by_address(&addr)
-            .ok_or_else(not_known)?;
+        let key_entry = wallet.get_key_by_address(&addr).ok_or_else(not_known)?;
 
         let network = match addr.network {
             divi_wallet::address::Network::Mainnet => Network::Mainnet,
@@ -1824,7 +1849,14 @@ impl WalletRpc {
             .address(wallet.network());
         let held = wallet.is_mine(&address) && !wallet.is_watch_only(&address);
         if !held {
-            wallet.import_key_with_compression(secret, wif_key.compressed, label.clone());
+            wallet
+                .import_key_with_compression(secret, wif_key.compressed, label.clone())
+                .map_err(|e| {
+                    RpcError::new(
+                        codes::WALLET_ERROR,
+                        format!("Failed to import private key: {}", e),
+                    )
+                })?;
             info!(
                 "Imported private key for address: {}",
                 divi_primitives::redact::WalletAddress(&address.to_string())
@@ -1860,44 +1892,49 @@ impl WalletRpc {
         start_height: u32,
         stop_height: u32,
     ) -> Result<u32, Error> {
-        // Do not wipe the wallet if the first block cannot be had at all
         let fetcher = self.block_fetcher.read().clone();
-        if let Some(first) = chain.get_block_index_by_height(start_height)? {
-            if crate::blockchain::load_block_or_fetch(chain, fetcher.as_ref(), &first)?.is_none() {
-                return Err(RpcError::new(
+        let read = |height| -> Result<_, Error> {
+            let index = chain.get_block_index_by_height(height)?.ok_or_else(|| {
+                RpcError::new(
                     codes::MISC_ERROR,
-                    format!(
-                        "Block {} is pruned and no full-history peer returned it; rescan from a later height (prune height {})",
-                        start_height,
-                        chain.prune_height()
-                    ),
+                    format!("Missing block index at height {height}"),
                 )
-                .into());
-            }
-        }
-
+            })?;
+            let block = crate::blockchain::load_block_or_fetch(chain, fetcher.as_ref(), &index)?
+                .ok_or_else(|| {
+                    let reason = if (1..=chain.prune_height()).contains(&height) {
+                        "pruned and unavailable from peers"
+                    } else {
+                        "missing from local storage"
+                    };
+                    RpcError::new(codes::MISC_ERROR, format!("Block {height} is {reason}"))
+                })?;
+            Ok((index.hash, block))
+        };
+        let mut first = Some(read(start_height)?);
+        let mut failure = None;
         let current_height = chain.height();
 
         // A full rescan rebuilds the wallet; a partial one replaces only what
         // the range recorded. Block notifications wait on the wallet's scan
         // lock meanwhile, so none is scanned out of order.
-        let (scanned, unreadable) =
-            wallet.rescan(start_height, stop_height, current_height, |height| {
-                let index = chain.get_block_index_by_height(height).ok().flatten()?;
-                let block = crate::blockchain::load_block_or_fetch(chain, fetcher.as_ref(), &index)
-                    .ok()
-                    .flatten()?;
-                Some((index.hash, block))
-            });
-        if let Some(height) = unreadable {
-            info!(
-                "Block at height {} not available, stopping rescan (total scanned: {})",
-                height, scanned
+        let (scanned, _) =
+            wallet.rescan(
+                start_height,
+                stop_height,
+                current_height,
+                |height| match first.take().map_or_else(|| read(height), Ok) {
+                    Ok(block) => Some(block),
+                    Err(error) => {
+                        failure = Some(error);
+                        None
+                    }
+                },
             );
-        } else if stop_height >= current_height {
-            wallet.reconcile_utxos(current_height, |outpoint| {
-                chain.get_utxo(outpoint).ok().flatten().is_some()
-            });
+        if failure.is_none() && stop_height >= current_height {
+            wallet.try_reconcile_utxos(current_height, |outpoint| {
+                chain.get_utxo(outpoint).map(|row| row.is_some())
+            })?;
         }
 
         info!("Rescan complete: scanned {} blocks", scanned);
@@ -1908,7 +1945,7 @@ impl WalletRpc {
                 format!("Failed to save wallet after rescan: {}", e),
             )
         })?;
-        Ok(scanned)
+        failure.map_or(Ok(scanned), Err)
     }
 
     /// Rescan the whole chain after an import, as Divi Core's
@@ -2647,12 +2684,9 @@ impl WalletRpc {
                 RpcError::new(codes::WALLET_ERROR, "Unable to sign for unknown address")
             })?;
         let wallet = self.get_wallet()?;
-        let entry = wallet
-            .keystore()
-            .get_key_by_address(&address)
-            .ok_or_else(|| {
-                RpcError::new(codes::WALLET_ERROR, "Unable to sign for unknown address")
-            })?;
+        let entry = wallet.get_key_by_address(&address).ok_or_else(|| {
+            RpcError::new(codes::WALLET_ERROR, "Unable to sign for unknown address")
+        })?;
         let unable = || RpcError::new(codes::WALLET_ERROR, "Unable to sign for input");
         // A key of the HD chain is derived from the seed when it signs; with the
         // wallet locked divid's GetKey throws (wallet.cpp:543-544), which the RPC
@@ -3813,7 +3847,7 @@ impl WalletRpc {
         ensure_fully_unlocked(&wallet)?;
 
         // Get the private key for this address
-        let key_entry = wallet.keystore().get_key_by_address(&addr).ok_or_else(|| {
+        let key_entry = wallet.get_key_by_address(&addr).ok_or_else(|| {
             RpcError::new(
                 codes::INVALID_ADDRESS_OR_KEY,
                 "Private key for address not found in wallet",
@@ -3905,7 +3939,14 @@ impl WalletRpc {
         if wallet.is_mine(&address) && !wallet.is_watch_only(&address) {
             return Err(failed("Key already held by wallet").into());
         }
-        wallet.import_key_with_compression(secret, compressed, Some(String::new()));
+        wallet
+            .import_key_with_compression(secret, compressed, Some(String::new()))
+            .map_err(|e| {
+                RpcError::new(
+                    codes::WALLET_ERROR,
+                    format!("Failed to import private key: {}", e),
+                )
+            })?;
         info!(
             "Imported BIP38 key for address: {}",
             divi_primitives::redact::WalletAddress(&address.to_string())
@@ -4285,6 +4326,18 @@ impl WalletRpc {
                         "Error: The wallet passphrase entered was incorrect.",
                     )
                 }
+                divi_wallet::WalletError::PassphraseChangeCleanup(_) => RpcError::new(
+                    codes::WALLET_ENCRYPTION_FAILED,
+                    "Wallet passphrase changed; use the new passphrase. The master key sealed \
+                     under the old passphrase may remain in the wallet files; check the node log.",
+                ),
+                divi_wallet::WalletError::PassphraseChangeUnconfirmed(_) => RpcError::new(
+                    codes::WALLET_ENCRYPTION_FAILED,
+                    "Error: the wallet passphrase change could not be confirmed on disk. After a \
+                     restart the wallet opens with either the old or the new passphrase. Until \
+                     the wallet files can be read again, saves, imports and new keys of an \
+                     unlocked wallet fail; check the node log.",
+                ),
                 other => RpcError::new(codes::WALLET_ENCRYPTION_FAILED, other.to_string()),
             })?;
 
@@ -4953,10 +5006,7 @@ impl WalletRpc {
 
         // Get private key for this address; watch-only keys have none
         let no_key = || RpcError::new(codes::WALLET_ERROR, "Private key not available");
-        let key_entry = wallet
-            .keystore()
-            .get_key_by_address(&address)
-            .ok_or_else(no_key)?;
+        let key_entry = wallet.get_key_by_address(&address).ok_or_else(no_key)?;
         let secret = key_entry.secret.as_ref().ok_or_else(no_key)?;
 
         // Hash with the DarkNet magic prefix to match C++ Divi's CHashWriter protocol
@@ -6821,7 +6871,7 @@ mod tests {
         // Test imported non-HD key - should not have hdkeypath
         use divi_crypto::keys::SecretKey;
         let imported_key = SecretKey::new_random();
-        let imported_addr = wallet.import_key(imported_key, None);
+        let imported_addr = wallet.import_key(imported_key, None).unwrap();
 
         let params = Params::Array(vec![serde_json::json!(imported_addr.to_string())]);
         let result = rpc.get_address_info(&params).unwrap();
@@ -7025,6 +7075,12 @@ mod send_unlock_regression {
 
         let to = address(8, Network::Testnet);
         let own = rpc.get_new_address(&Params::None).unwrap();
+        let own_address = Address::from_base58(own.as_str().unwrap()).unwrap();
+        assert!(db
+            .get_key_by_address(&own_address)
+            .unwrap()
+            .secret
+            .is_none());
         let need_unlock = codes::WALLET_UNLOCK_NEEDED;
         assert_eq!(
             err(rpc.send_to_address(&p(vec![json!(to), json!(1.0)]))).0,

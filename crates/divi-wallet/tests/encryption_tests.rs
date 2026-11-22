@@ -50,7 +50,7 @@ fn encrypt_removes_plaintext_and_locks() {
     let addr = wallet.new_receiving_address().unwrap();
     let imported = SecretKey::new_random();
     let imported_bytes = imported.as_bytes().to_vec();
-    let imported_addr = wallet.import_key(imported, None);
+    let imported_addr = wallet.import_key(imported, None).unwrap();
     let derived_secret = wallet
         .get_key_by_address(&addr)
         .unwrap()
@@ -133,7 +133,7 @@ fn unlock_restores_secrets_and_wrong_passphrase_fails() {
     let addr = wallet.new_receiving_address().unwrap();
     let imported = SecretKey::new_random();
     let imported_bytes = imported.as_bytes().to_vec();
-    let imported_addr = wallet.import_key(imported, None);
+    let imported_addr = wallet.import_key(imported, None).unwrap();
     wallet.save().unwrap();
     let expected = wallet
         .get_key_by_address(&addr)
@@ -366,7 +366,7 @@ fn a_damaged_imported_key_is_a_wrong_passphrase_or_logged_as_corruption() {
             let hashes: Vec<Vec<u8>> = [[0x31u8; 32], [0x62u8; 32]]
                 .iter()
                 .map(|b| {
-                    let address = wallet.import_key(SecretKey::from_bytes(b).unwrap(), None);
+                    let address = wallet.import_key(SecretKey::from_bytes(b).unwrap(), None).unwrap();
                     address.hash.as_bytes().to_vec()
                 })
                 .collect();

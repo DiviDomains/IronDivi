@@ -113,6 +113,18 @@ pub(crate) struct MasterKey {
     pub key: Zeroizing<Vec<u8>>,
     /// True once the wallet stores `kdf_params` and its records are AEAD
     pub aead: bool,
+    /// Set while a move of the wallet to the current format reported an
+    /// error and could not be read back: `aead` cannot be trusted, and no
+    /// record may be sealed with this key until the format on disk is read
+    pub unconfirmed: Option<UnconfirmedMove>,
+}
+
+/// A move to the current format whose write may or may not be on disk: the
+/// master key as sealed before it (older format) and by it (current format).
+/// Whichever of the two the database holds tells the format of its records.
+pub(crate) struct UnconfirmedMove {
+    pub legacy_sealed: Vec<u8>,
+    pub aead_sealed: Vec<u8>,
 }
 
 impl Zeroize for MasterKey {
@@ -380,6 +392,7 @@ mod tests {
         let master = MasterKey {
             key: Zeroizing::new(vec![3u8; 32]),
             aead: true,
+            unconfirmed: None,
         };
         let blob = master.seal_record(b"record-a", b"secret bytes");
         assert_eq!(
@@ -406,6 +419,7 @@ mod tests {
         let master = MasterKey {
             key: master,
             aead: false,
+            unconfirmed: None,
         };
         let blob = master.seal_record(b"ignored", b"abc");
         assert_eq!(&master.open_record(b"other", &blob).unwrap()[..], b"abc");
@@ -419,6 +433,7 @@ mod tests {
         let mut mk = MasterKey {
             key: Zeroizing::new(vec![0xAA; 32]),
             aead: true,
+            unconfirmed: None,
         };
         assert_eq!(&mk.key[..], &[0xAA; 32]);
         mk.zeroize();

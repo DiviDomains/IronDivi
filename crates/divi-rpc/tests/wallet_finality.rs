@@ -87,7 +87,7 @@ impl Node {
         }
         let txs = block.transactions.clone();
         self.chain.accept_block(block).unwrap();
-        divi_rpc::wallet::sync_wallet_with_chain(&self.wallet, &self.chain);
+        divi_rpc::wallet::sync_wallet_with_chain(&self.wallet, &self.chain).unwrap();
         self.server.set_height(height);
         txs[0].clone()
     }

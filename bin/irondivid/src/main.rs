@@ -3181,7 +3181,7 @@ async fn run_daemon(
                 // starts at the genesis block. Its line names both ends
                 // (wallet.cpp:292-294)
                 let scanned = wallet_arc.last_scan_height();
-                divi_rpc::wallet::resume_wallet_scan(wallet_arc, node.chain());
+                divi_rpc::wallet::resume_wallet_scan(wallet_arc, node.chain())?;
                 let from = if scanned == 0 {
                     0
                 } else {
@@ -3203,7 +3203,7 @@ async fn run_daemon(
                 );
             }
             if last_scan != chain_height {
-                sync_wallet_to_tip(wallet_arc, node.chain());
+                sync_wallet_to_tip(wallet_arc, node.chain())?;
                 if let Err(e) = wallet_arc.save() {
                     error!("Failed to save wallet after catch-up scan: {}", e);
                 }
@@ -3217,13 +3217,12 @@ async fn run_daemon(
             // Removes phantom UTXOs left from orphaned staked blocks whose
             // spent_utxo_data was lost before it was persisted to disk.
             let chain_for_reconcile = node.chain().clone();
-            let removed = wallet_arc.reconcile_utxos(chain_for_reconcile.height(), |outpoint| {
-                chain_for_reconcile
-                    .get_utxo(outpoint)
-                    .ok()
-                    .flatten()
-                    .is_some()
-            });
+            let removed =
+                wallet_arc.try_reconcile_utxos(chain_for_reconcile.height(), |outpoint| {
+                    chain_for_reconcile
+                        .get_utxo(outpoint)
+                        .map(|coin| coin.is_some())
+                })?;
             if removed > 0 {
                 if let Err(e) = wallet_arc.save_incremental() {
                     error!("Failed to save wallet after UTXO reconciliation: {}", e);
@@ -4321,7 +4320,9 @@ fn mempool_reorg_hook(
     let mempool = node.mempool().clone();
     Arc::new(move |disconnected| {
         if let Some(wallet) = &wallet {
-            sync_wallet_to_tip(wallet, &chain);
+            if let Err(error) = sync_wallet_to_tip(wallet, &chain) {
+                error!("Wallet reorg scan stopped: {error}");
+            }
             if let Err(e) = wallet.save_incremental() {
                 error!("Failed to save the wallet after the chain moved: {}", e);
             }
@@ -4357,7 +4358,9 @@ fn wallet_block_callback(
         // This runs before the mempool cleanup below so the wallet's mempool
         // entries for this block are replaced by confirmed records in one step;
         // otherwise a send would briefly show its inputs as unspent again.
-        sync_wallet_to_tip(&wallet, &chain);
+        if let Err(error) = sync_wallet_to_tip(&wallet, &chain) {
+            error!("Wallet block scan stopped: {error}");
+        }
 
         // 2. Calculate fees from mempool entries and clean mempool
         let total_fees = mempool_block_connected(
@@ -4413,8 +4416,13 @@ fn mempool_block_connected(
 /// Scan the active chain into the wallet, in order, from its last scanned
 /// height up to the tip. Blocks that cannot be read (pruned) are skipped and
 /// reported.
-fn sync_wallet_to_tip(wallet: &WalletDb, chain: &divi_storage::Chain) {
-    let missing = divi_rpc::wallet::sync_wallet_with_chain(wallet, chain);
+fn sync_wallet_to_tip(wallet: &WalletDb, chain: &divi_storage::Chain) -> Result<()> {
+    let missing = divi_rpc::wallet::sync_wallet_with_chain(wallet, chain).with_context(|| {
+        format!(
+            "wallet scan stopped after height {}",
+            wallet.last_scan_height()
+        )
+    })?;
     if let (Some(first), Some(last)) = (missing.first(), missing.last()) {
         error!(
             "Wallet scan could not read {} block(s) in {}..={} (pruned: prune height {}). \
@@ -4425,6 +4433,7 @@ fn sync_wallet_to_tip(wallet: &WalletDb, chain: &divi_storage::Chain) {
             chain.prune_height()
         );
     }
+    Ok(())
 }
 
 fn storage_params(config: &NodeConfig) -> divi_storage::ChainParams {

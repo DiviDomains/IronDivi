@@ -439,6 +439,36 @@ impl KeyStore {
         (*self.receiving_index.read(), *self.change_index.read())
     }
 
+    pub(crate) fn pool_position(&self, hash: &Hash160) -> Option<(bool, u32)> {
+        self.keys
+            .read()
+            .get(hash)
+            .and_then(|entry| hd_chain_index(entry.hd_path.as_deref()?))
+    }
+
+    /// Retire this observed HD key and all older pool entries on its branch.
+    pub(crate) fn observe_pool_key(&self, hash: &Hash160) -> bool {
+        let path = self.pool_position(hash);
+        let Some((change, index)) = path else {
+            return false;
+        };
+        let counter = if change {
+            &self.change_index
+        } else {
+            &self.receiving_index
+        };
+        let mut next = counter.write();
+        if index < *next {
+            return false;
+        }
+        *next = index.saturating_add(1);
+        drop(next);
+        self.pool_numbers
+            .write()
+            .retain(|&(branch, child), _| branch != change || child > index);
+        true
+    }
+
     /// Set HD wallet indices (for restoration from persistence)
     pub fn set_indices(&self, receiving: u32, change: u32) {
         *self.receiving_index.write() = receiving;
