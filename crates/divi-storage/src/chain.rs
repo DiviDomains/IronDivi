@@ -4021,8 +4021,9 @@ impl Chain {
     /// Implements CheckBlockSignature() from C++ Divi:
     /// - PoW blocks: block signature must be empty
     /// - PoS blocks with P2PKH coinstake output: Recover public key from compact
-    ///   signature over the block hash, verify recovered pubkey's hash160 matches
-    ///   the output's pubkey hash
+    ///   signature over the block hash, verify the hash160 of the recovered
+    ///   pubkey, serialized as the signature's header byte selects
+    ///   ([`Self::compact_signer_key_hash`]), matches the output's pubkey hash
     /// - PoS blocks with P2PK coinstake output: Standard ECDSA verify with the
     ///   pubkey extracted from the script
     /// - PoS blocks with vault (TX_VAULT) output: Recover public key from compact
@@ -4099,8 +4100,9 @@ impl Chain {
                         )
                     })?;
 
-                let recovered_hash = divi_crypto::hash160(&recovered_pubkey.to_bytes());
-                if *recovered_hash.as_bytes() != expected_hash {
+                let recovered_hash =
+                    Self::compact_signer_key_hash(&recovered_pubkey, block.block_sig[0]);
+                if recovered_hash != expected_hash {
                     return Err(StorageError::invalid_block_scored(
                         0,
                         "block signature: recovered pubkey does not match coinstake P2PKH output"
@@ -4174,8 +4176,9 @@ impl Chain {
                         )
                     })?;
 
-                let recovered_hash = divi_crypto::hash160(&recovered_pubkey.to_bytes());
-                if *recovered_hash.as_bytes() != vault_hash {
+                let recovered_hash =
+                    Self::compact_signer_key_hash(&recovered_pubkey, block.block_sig[0]);
+                if recovered_hash != vault_hash {
                     return Err(StorageError::invalid_block_scored(
                         0,
                         "block signature: recovered pubkey does not match vault manager key".into(),
@@ -4197,6 +4200,21 @@ impl Chain {
         debug!("Block signature verified for block {}", block_hash);
 
         Ok(())
+    }
+
+    /// The key hash (`CPubKey::GetID`) of a key recovered from a 65-byte
+    /// compact block signature whose first byte is `header`, serialized as
+    /// Divi Core `CPubKey::RecoverCompact` (pubkey.cpp:181-199) serializes it:
+    /// uncompressed for headers 27..=30, compressed for 31..=34. Any other
+    /// header byte keeps the compressed form this check has always hashed; its
+    /// parity with Divi Core is not established here.
+    fn compact_signer_key_hash(recovered: &divi_crypto::PublicKey, header: u8) -> [u8; 20] {
+        let hash = if (27..=30).contains(&header) {
+            divi_crypto::hash160(&recovered.serialize_uncompressed())
+        } else {
+            divi_crypto::hash160(&recovered.serialize_compressed())
+        };
+        *hash.as_bytes()
     }
 
     /// Get stake modifier for PoS validation
@@ -6256,6 +6274,50 @@ mod tests {
 
     /// Divi Core's VerifyDB depth: 0 or below is every block, more than the
     /// height is the height (verifyDb.cpp:73-76)
+    // Divi mainnet height 2,000,000. The unchanged 480-byte wire block has
+    // SHA-256 7599012b6e053834da12bcb2c13e39efb7f7d1c2b24b3c40c013a3f362552763.
+    // Divi Core 1b553a3b BlockSigning.cpp accepts this signature.
+    #[test]
+    fn historical_mainnet_2000000_block_signature() {
+        let bytes = include_bytes!("../tests/fixtures/mainnet-2000000.bin");
+        let block: Block = divi_primitives::serialize::deserialize(bytes).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let chain = Chain::new(
+            Arc::new(ChainDatabase::open(dir.path()).unwrap()),
+            ChainParams::for_network(NetworkType::Mainnet, ChainMode::Divi),
+        )
+        .unwrap();
+        assert_eq!(
+            chain.compute_block_hash(&block).to_string(),
+            "cf7a7dc8c7c0358479b21be964c8ef1da647e5a2c279d2da140c5cfd50da8ca6"
+        );
+        assert!(block.is_proof_of_stake());
+        chain.verify_block_signature(&block).unwrap();
+    }
+
+    #[test]
+    fn compact_block_signer_supported_encodings() {
+        let digest = "c57b2cfc01450ee0d0f0b71705aa1c5ffd5e015588bd1a5b7f132bf420fcf95f";
+        let key_compressed = "4a940017491cdb766e7fca056239eb85ce718169";
+        let key_uncompressed = "77aba9529940729244a86240b1edf1fa1890f23c";
+        let sig_31 = "2024f9388c06792ed90433a2f477e400e204bf05e03326948ecd67dedec817f0\
+                      af5bdccbdbd7459f823466855bb8b82027799df6a425c01cdd98ab6f174a11cc00";
+        let sig_27 = "1c24f9388c06792ed90433a2f477e400e204bf05e03326948ecd67dedec817f0\
+                      af5bdccbdbd7459f823466855bb8b82027799df6a425c01cdd98ab6f174a11cc00";
+        let digest: [u8; 32] = hex::decode(digest).unwrap().try_into().unwrap();
+        for (sig, expected) in [(sig_31, key_compressed), (sig_27, key_uncompressed)] {
+            let bytes = hex::decode(sig).unwrap();
+            let signer = divi_crypto::RecoverableSig::from_compact_with_recovery(&bytes)
+                .unwrap()
+                .recover_from_hash(&digest)
+                .unwrap();
+            assert_eq!(
+                hex::encode(Chain::compact_signer_key_hash(&signer, bytes[0])),
+                expected
+            );
+        }
+    }
+
     #[test]
     fn verify_depth_is_divid_s() {
         assert_eq!(check_depth(0, 30), 30);

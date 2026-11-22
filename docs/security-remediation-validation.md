@@ -17,3 +17,7 @@ Swap schema 4 requires compatible maker and taker programs. Ambiguous unfunded U
 Electrum reserves one of eight backend slots for FIFO notification work, leaving seven concurrent request jobs. Each session retains at most one waiter. Slow admitted database work or client writes can delay later notifications. The 20,000-subscription test completes in 79 uncontended ticks; this is not a production latency guarantee.
 
 No deployment or real-fund transaction is part of this change. This validation covers the integrated changes, not closure of every item in the broader security/performance review.
+
+## Standard compact block-signature key encoding
+
+The P2PKH and vault checks now hash the recovered key using the encoding selected by standard compact headers: 27–30 uncompressed, 31–34 compressed. This follows the pinned C++ Divi checker at `1b553a3b`. Storage and crypto suites passed 629 tests with one ignored test. Independent checks reran both focused regressions and the C++ historical checker. Mainnet block 2,000,000 has the same block hash and accepted signature in both clients. Historical coverage is one block; chain-wide replay, nonstandard headers, script classification, P2PK signature-policy parity and signing for uncompressed stake keys remain outside this correction.
