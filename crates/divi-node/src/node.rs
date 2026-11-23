@@ -1697,24 +1697,22 @@ impl Node {
                                 );
                             }
                             NetworkMessage::Block(block) => {
-                                if history.deliver(
-                                    peer_id,
-                                    compute_block_hash(&block.header),
-                                    &block,
-                                ) {
+                                // The header is not changed below: one hash serves
+                                let hash = compute_block_hash(&block.header);
+                                if history.deliver(peer_id, hash, &block) {
                                     continue;
                                 }
                                 tracing::debug!(
                                     "Block message received from peer {}: {} with {} txs",
                                     peer_id,
-                                    compute_block_hash(&block.header),
+                                    hash,
                                     block.transactions.len()
                                 );
-                                // First try to connect via sync manager
-                                block_sync.handle_block(peer_id, block.clone()).await;
+                                // First try to connect via sync manager, which
+                                // takes the block: nothing below reads it
+                                block_sync.handle_block(peer_id, block).await;
 
                                 // Also emit event
-                                let hash = compute_block_hash(&block.header);
                                 if chain.has_block(&hash).unwrap_or(false) {
                                     let _ = event_tx.send(NodeEvent::BlockAccepted(hash));
                                 }

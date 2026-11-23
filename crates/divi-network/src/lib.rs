@@ -56,6 +56,7 @@
 //! ```
 
 pub mod alert;
+pub mod blocking;
 pub mod bloom;
 pub mod constants;
 pub mod error;

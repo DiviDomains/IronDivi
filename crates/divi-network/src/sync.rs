@@ -22,7 +22,7 @@ use divi_crypto::compute_block_hash;
 use divi_primitives::block::{Block, BlockHeader};
 use divi_primitives::hash::Hash256;
 use divi_primitives::transaction::Transaction;
-use divi_storage::{Chain, StorageError};
+use divi_storage::{AcceptBlockResult, Chain, StorageError};
 
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -39,6 +39,23 @@ const MIB: usize = 1024 * 1024;
 const INVENTORY_GLOBAL: usize = 8192;
 const INVENTORY_PEER: usize = 2048;
 const HASH_BYTES: usize = 32;
+
+/// Inputs in a block from which its validation (and the connected callback
+/// after it) runs off the async workers even when it extends the tip. Each
+/// input is a signature check. The hand-off to the blocking pool and back
+/// costs about 0.1-0.15 ms on hp1, against about 0.6 ms to connect a
+/// one-input regtest block, so light blocks on the tip stay inline (K1
+/// measurements, where moving them made the replay 27% slower).
+const OFF_WORKER_INPUTS: usize = 8;
+
+fn many_inputs(block: &Block) -> bool {
+    block
+        .transactions
+        .iter()
+        .map(|tx| tx.vin.len())
+        .sum::<usize>()
+        >= OFF_WORKER_INPUTS
+}
 
 fn retained_bytes(block: &Block) -> usize {
     use divi_primitives::{TxIn, TxOut};
@@ -344,7 +361,7 @@ fn order_retry_peers(
 #[derive(Clone)]
 struct OrphanBlock {
     /// The orphan block
-    block: Block,
+    block: Arc<Block>,
     /// When we received it
     received_at: Instant,
 }
@@ -399,8 +416,10 @@ pub struct BlockSync {
     pending_headers: RwLock<VecDeque<BlockHeader>>,
     /// Blocks currently being downloaded
     blocks_in_flight: RwLock<HashMap<Hash256, BlockRequest>>,
-    /// Blocks that have been downloaded but not yet connected
-    downloaded_blocks: RwLock<Store<Block>>,
+    /// Blocks that have been downloaded but not yet connected. Shared, so a
+    /// retry pass or a validation off the async workers holds a block
+    /// without copying it; charged by `retained_bytes` of the block itself.
+    downloaded_blocks: RwLock<Store<Arc<Block>>>,
     /// Orphan blocks (blocks whose parent we don't have yet)
     orphan_blocks: RwLock<Store<OrphanBlock>>,
     /// Blocks queued for download (not yet requested due to in-flight limits)
@@ -559,6 +578,66 @@ impl BlockSync {
         if let Some(callback) = self.orphaned_tx_callback.read().as_ref() {
             callback(orphaned_txs);
         }
+    }
+
+    /// [`BlockSync::fire_reorg_callbacks`] off the async workers
+    /// (`crate::blocking`), awaited in place, after a block this sync
+    /// manager connected
+    async fn fire_reorg_callbacks_off_worker(
+        &self,
+        fork_height: u32,
+        orphaned_txs: Vec<Transaction>,
+    ) {
+        let reorg = self.reorg_callback.read().clone();
+        let orphaned = self.orphaned_tx_callback.read().clone();
+        if reorg.is_none() && orphaned.is_none() {
+            return;
+        }
+        crate::blocking::run(move || {
+            if let Some(callback) = reorg {
+                callback(fork_height);
+            }
+            if let Some(callback) = orphaned {
+                callback(orphaned_txs);
+            }
+        })
+        .await;
+    }
+
+    /// `Chain::accept_block` for a held block, awaited in place, so blocks are
+    /// still validated one at a time and in the order of the calls. A block
+    /// whose validation can be long (see [`OFF_WORKER_INPUTS`]) runs off the
+    /// async workers (`crate::blocking`); a light block on the tip runs inline,
+    /// after a yield that lets the worker's other tasks (timers, sockets) run
+    /// between blocks. Returns whether it ran off the workers.
+    async fn accept_held(
+        &self,
+        block: &Arc<Block>,
+    ) -> (Result<AcceptBlockResult, StorageError>, bool) {
+        tokio::task::yield_now().await;
+        let extends_tip = self.chain.tip().map(|t| t.hash) == Some(block.header.prev_block);
+        if extends_tip && !many_inputs(block) {
+            return (self.chain.accept_block_ref(block), false);
+        }
+        let chain = Arc::clone(&self.chain);
+        let block = Arc::clone(block);
+        let result = crate::blocking::run(move || chain.accept_block_ref(&block)).await;
+        (result, true)
+    }
+
+    /// The block connected callback, if set, awaited in place: off the async
+    /// workers after a validation that ran there (or a reorganization),
+    /// inline after a light block
+    async fn notify_block_connected(&self, block: &Arc<Block>, height: u32, off_worker: bool) {
+        let Some(callback) = self.block_connected_callback.read().clone() else {
+            return;
+        };
+        if !off_worker {
+            callback(block, height);
+            return;
+        }
+        let block = Arc::clone(block);
+        crate::blocking::run(move || callback(&block, height)).await;
     }
 
     /// Subscribe to sync progress updates
@@ -1336,7 +1415,7 @@ impl BlockSync {
                 if priority && downloaded.make_room(peer_id, bytes) {
                     self.refresh_inventory.store(true, Ordering::Relaxed);
                 }
-                if !downloaded.insert(hash, peer_id, bytes, block) {
+                if !downloaded.insert(hash, peer_id, bytes, Arc::new(block)) {
                     debug!(
                         "Block cache at capacity; deferred {} from peer {}",
                         hash, peer_id
@@ -1452,11 +1531,17 @@ impl BlockSync {
             };
 
             // Try to connect it
-            match self.chain.accept_block(block.clone()) {
+            let (accepted, off_worker) = self.accept_held(&block).await;
+            match accepted {
                 Ok(result) => {
                     let hash = result.hash;
+                    let off_worker = off_worker || result.reorg_fork_height.is_some();
                     if let Some(fork_height) = result.reorg_fork_height {
-                        self.fire_reorg_callbacks(fork_height, result.orphaned_transactions);
+                        self.fire_reorg_callbacks_off_worker(
+                            fork_height,
+                            result.orphaned_transactions,
+                        )
+                        .await;
                     }
                     let height = self.chain.height();
                     // Remove from pending headers
@@ -1464,9 +1549,8 @@ impl BlockSync {
                     log_block_connected(&hash, height);
 
                     // Call block connected callback if set
-                    if let Some(callback) = self.block_connected_callback.read().as_ref() {
-                        callback(&block, height);
-                    }
+                    self.notify_block_connected(&block, height, off_worker)
+                        .await;
                 }
                 Err(e) => {
                     log_block_connect_failed(&hash, &e);
@@ -1573,19 +1657,24 @@ impl BlockSync {
             let hash = compute_block_hash(&block.header);
 
             // Try to connect it
-            match self.chain.accept_block(block.clone()) {
+            let (accepted, off_worker) = self.accept_held(&block).await;
+            match accepted {
                 Ok(result) => {
+                    let off_worker = off_worker || result.reorg_fork_height.is_some();
                     if let Some(fork_height) = result.reorg_fork_height {
-                        self.fire_reorg_callbacks(fork_height, result.orphaned_transactions);
+                        self.fire_reorg_callbacks_off_worker(
+                            fork_height,
+                            result.orphaned_transactions,
+                        )
+                        .await;
                     }
                     let height = self.chain.height();
                     log_block_connected(&hash, height);
                     self.stats.write().blocks_connected += 1;
 
                     // Call block connected callback if set
-                    if let Some(callback) = self.block_connected_callback.read().as_ref() {
-                        callback(&block, height);
-                    }
+                    self.notify_block_connected(&block, height, off_worker)
+                        .await;
                 }
                 Err(e) => {
                     log_block_connect_failed(&hash, &e);
@@ -1622,10 +1711,16 @@ impl BlockSync {
                     continue;
                 };
                 // Try to accept the block - this will store it and potentially trigger a reorg
-                match self.chain.accept_block(block.clone()) {
+                let (accepted, off_worker) = self.accept_held(&block).await;
+                match accepted {
                     Ok(result) => {
+                        let off_worker = off_worker || result.reorg_fork_height.is_some();
                         if let Some(fork_height) = result.reorg_fork_height {
-                            self.fire_reorg_callbacks(fork_height, result.orphaned_transactions);
+                            self.fire_reorg_callbacks_off_worker(
+                                fork_height,
+                                result.orphaned_transactions,
+                            )
+                            .await;
                         }
                         // Remove from downloaded if it was accepted
                         self.downloaded_blocks.write().remove(&hash);
@@ -1637,9 +1732,8 @@ impl BlockSync {
                             log_block_connected(&hash, new_height);
 
                             // Call block connected callback if set
-                            if let Some(callback) = self.block_connected_callback.read().as_ref() {
-                                callback(&block, new_height);
-                            }
+                            self.notify_block_connected(&block, new_height, off_worker)
+                                .await;
                         }
                     }
                     Err(e) => {
@@ -2482,10 +2576,16 @@ impl BlockSync {
                 };
                 let block = orphan.block;
                 // Try to accept this block - this will store and connect it
-                match self.chain.accept_block(block.clone()) {
+                let (accepted, off_worker) = self.accept_held(&block).await;
+                match accepted {
                     Ok(result) => {
+                        let off_worker = off_worker || result.reorg_fork_height.is_some();
                         if let Some(fork_height) = result.reorg_fork_height {
-                            self.fire_reorg_callbacks(fork_height, result.orphaned_transactions);
+                            self.fire_reorg_callbacks_off_worker(
+                                fork_height,
+                                result.orphaned_transactions,
+                            )
+                            .await;
                         }
                         let height = self.chain.height();
                         log_block_connected(&hash, height);
@@ -2497,9 +2597,8 @@ impl BlockSync {
                         self.stats.write().blocks_connected += 1;
 
                         // Notify callback if registered
-                        if let Some(callback) = self.block_connected_callback.read().as_ref() {
-                            callback(&block, height);
-                        }
+                        self.notify_block_connected(&block, height, off_worker)
+                            .await;
 
                         connected_any = true;
                     }
@@ -4745,5 +4844,130 @@ mod tests {
         let (sync, mut rxs, _dir) = sync_with_peers(1);
         sync.begin_syncing_with_peer(1, full_node(true)).await;
         assert_eq!(getblocks_recipients(&mut rxs), vec![1]);
+    }
+
+    /// A block held for later is shared, not copied, by the retry passes, is
+    /// charged its own retained size as before, and still connects
+    #[tokio::test]
+    async fn a_held_block_is_shared_and_charged_as_before() {
+        let blocks = build_regtest_chain(3, 0x31, 0);
+        let dir = tempdir().unwrap();
+        let db = Arc::new(ChainDatabase::open(dir.path()).unwrap());
+        let chain = Arc::new(Chain::new(db, regtest_params()).unwrap());
+        let sync = BlockSync::new(chain.clone(), PeerManager::new(Default::default()));
+        let _rxs = add_test_peers(&sync, 1);
+
+        // Block 3 before 1 and 2: held, as its parent is unknown
+        let third = blocks[2].clone();
+        let hash = compute_block_hash(&third.header);
+        let bytes = retained_bytes(&third);
+        sync.handle_block(1, third).await;
+        assert_eq!(chain.height(), 0);
+        let (owner, held) = sync.downloaded_blocks.read().copy_one(&hash).unwrap();
+        let (_, again) = sync.downloaded_blocks.read().copy_one(&hash).unwrap();
+        assert_eq!(owner, 1);
+        assert!(Arc::ptr_eq(&held, &again), "a retry pass copies the block");
+        let entry = sync.downloaded_blocks.write().remove(&hash).unwrap();
+        assert_eq!(entry.bytes, bytes);
+        assert!(Arc::ptr_eq(&entry.value, &held));
+        assert!(sync
+            .downloaded_blocks
+            .write()
+            .insert(hash, entry.owner, entry.bytes, entry.value));
+        drop((held, again));
+
+        sync.handle_block(1, blocks[0].clone()).await;
+        sync.handle_block(1, blocks[1].clone()).await;
+        assert_eq!(chain.height(), 3);
+        assert_eq!(chain.tip().unwrap().hash, hash);
+        assert!(sync.downloaded_blocks.read().is_empty());
+    }
+
+    /// Which blocks are validated off the async worker, awaited in place and
+    /// in block order: a light block on the tip inline, as before; a block on
+    /// a side chain, a reorganization (and its callbacks), and a block with
+    /// many inputs off the worker
+    #[tokio::test]
+    async fn heavy_and_side_chain_blocks_validate_off_the_worker_in_order() {
+        let a = build_regtest_chain(3, 0xD1, 0);
+        let b = build_regtest_chain(5, 0xD2, 1);
+        // Block 40 of this chain joins 10 coins: 10 inputs
+        let heavy = {
+            let dir = tempdir().unwrap();
+            let db = Arc::new(ChainDatabase::open(dir.path()).unwrap());
+            let scratch = Chain::new(db, regtest_params()).unwrap();
+            extend_regtest_chain(&scratch, 41, 0xD3, 0, true)
+        };
+        assert!(many_inputs(&heavy[39]));
+        assert!(heavy
+            .iter()
+            .enumerate()
+            .all(|(i, b)| i == 39 || !many_inputs(b)));
+
+        let worker = std::thread::current().id();
+        let replay = |blocks: Vec<Block>| async move {
+            let dir = tempdir().unwrap();
+            let db = Arc::new(ChainDatabase::open(dir.path()).unwrap());
+            let chain = Arc::new(Chain::new(db, regtest_params()).unwrap());
+            let sync = BlockSync::new(chain.clone(), PeerManager::new(Default::default()));
+            let _rxs = add_test_peers(&sync, 1);
+            let log: Arc<parking_lot::Mutex<Vec<String>>> = Default::default();
+            let note = {
+                let log = Arc::clone(&log);
+                move |line: String| {
+                    let at = if std::thread::current().id() == worker {
+                        "inline"
+                    } else {
+                        "off"
+                    };
+                    log.lock().push(format!("{line} {at}"));
+                }
+            };
+            let n = note.clone();
+            sync.set_block_connected_callback(Arc::new(move |block, height| {
+                n(format!(
+                    "connected {height} {}",
+                    compute_block_hash(&block.header)
+                ))
+            }));
+            let n = note.clone();
+            sync.set_reorg_callback(Arc::new(move |fork| n(format!("reorg {fork}"))));
+            let n = note;
+            sync.set_orphaned_tx_callback(Arc::new(move |txs| {
+                n(format!("orphaned {}", txs.len()))
+            }));
+            for block in blocks {
+                sync.handle_block(1, block).await;
+            }
+            let tip = chain.tip().unwrap().hash;
+            let lines = log.lock().clone();
+            (tip, lines)
+        };
+        let hash = |blocks: &[Block], i: usize| compute_block_hash(&blocks[i].header);
+
+        let (tip, log) = replay(a.iter().chain(&b).cloned().collect()).await;
+        assert_eq!(tip, hash(&b, 4));
+        assert_eq!(
+            log,
+            vec![
+                format!("connected 1 {} inline", hash(&a, 0)),
+                format!("connected 2 {} inline", hash(&a, 1)),
+                format!("connected 3 {} inline", hash(&a, 2)),
+                "reorg 0 off".to_string(),
+                "orphaned 0 off".to_string(),
+                format!("connected 4 {} off", hash(&b, 3)),
+                format!("connected 5 {} inline", hash(&b, 4)),
+            ]
+        );
+
+        let (tip, log) = replay(heavy.clone()).await;
+        assert_eq!(tip, hash(&heavy, 40));
+        let expected: Vec<String> = (0..41)
+            .map(|i| {
+                let at = if i == 39 { "off" } else { "inline" };
+                format!("connected {} {} {at}", i + 1, hash(&heavy, i))
+            })
+            .collect();
+        assert_eq!(log, expected);
     }
 }

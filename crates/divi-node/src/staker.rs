@@ -303,6 +303,18 @@ impl Default for StakingConfig {
     }
 }
 
+/// How a staking round run off the async workers ended. Moved once per
+/// round, so the size of the result does not matter
+#[allow(clippy::large_enum_variant)]
+enum Round {
+    /// Staking was stopped before the round began
+    Stop,
+    /// The staked block was not connected: try again at once
+    Again,
+    /// The round's result
+    Done(StakeResult),
+}
+
 /// Result of a staking attempt
 pub enum StakeResult {
     /// Successfully staked a block (includes the block for self-acceptance)
@@ -728,7 +740,7 @@ impl Staker {
     }
 
     /// Main staking loop
-    async fn staking_loop(&self) {
+    async fn staking_loop(self: Arc<Self>) {
         let interval = tokio::time::Duration::from_millis(self.config.read().loop_interval_ms);
 
         info!(
@@ -755,27 +767,42 @@ impl Staker {
                 continue;
             }
 
-            // Try to stake; skip the round while setgenerate is producing
-            let result = match self.producing.try_lock() {
-                // stop_and_wait may have come in since the loop's check
-                Some(_) if !self.running.load(Ordering::SeqCst) => break,
-                Some(_producing) => {
-                    let result = self.try_stake();
-                    if let StakeResult::Success {
-                        block,
-                        block_hash,
-                        height,
-                        ..
-                    } = &result
-                    {
-                        // Self-accept into our chain BEFORE broadcasting
-                        if self.accept_own_block(block, *block_hash, *height).is_err() {
-                            continue;
+            // Try to stake; skip the round while setgenerate is producing. The
+            // round (kernel search, signing, connecting the block) runs off the
+            // async workers and is awaited in place; it takes `producing` there,
+            // so stop_and_wait still waits for it to end.
+            let staker = Arc::clone(&self);
+            let round = divi_network::blocking::run(move || {
+                match staker.producing.try_lock() {
+                    // stop_and_wait may have come in since the loop's check
+                    Some(_) if !staker.running.load(Ordering::SeqCst) => Round::Stop,
+                    Some(_producing) => {
+                        let result = staker.try_stake();
+                        if let StakeResult::Success {
+                            block,
+                            block_hash,
+                            height,
+                            ..
+                        } = &result
+                        {
+                            // Self-accept into our chain BEFORE broadcasting
+                            if staker
+                                .accept_own_block(block, *block_hash, *height)
+                                .is_err()
+                            {
+                                return Round::Again;
+                            }
                         }
+                        Round::Done(result)
                     }
-                    result
+                    None => Round::Done(StakeResult::NoProofFound),
                 }
-                None => StakeResult::NoProofFound,
+            })
+            .await;
+            let result = match round {
+                Round::Stop => break,
+                Round::Again => continue,
+                Round::Done(result) => result,
             };
             match result {
                 StakeResult::Success {
@@ -836,7 +863,7 @@ impl Staker {
         block_hash: Hash256,
         height: u32,
     ) -> Result<(), String> {
-        match self.chain.accept_block(block.clone()) {
+        match self.chain.accept_block_ref(block) {
             Ok(result) => {
                 if let Some(fork_height) = result.reorg_fork_height {
                     counted::hit(Site::StakerSelfAcceptReorg);

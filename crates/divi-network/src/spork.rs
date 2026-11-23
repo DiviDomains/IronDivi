@@ -1076,6 +1076,7 @@ impl SporkManager {
     /// Elsewhere [`SporkManager::stored_refusal`] decides: a refused row is
     /// quarantined instead of loaded and left as it is, and a row that cannot
     /// be read is recorded as unreadable, never as absent.
+    #[allow(clippy::type_complexity)]
     fn load_rows(&mut self, rows: Vec<(i32, Result<Option<Vec<u8>>, StorageError>)>) {
         let checked = !matches!(self.authority, SporkAuthority::Divi(_));
         for (id, read) in rows {

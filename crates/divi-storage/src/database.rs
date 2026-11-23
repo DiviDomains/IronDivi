@@ -309,10 +309,14 @@ impl ChainDatabase {
 
     /// Store a block
     pub fn store_block(&self, hash: &Hash256, block: &Block) -> Result<(), StorageError> {
+        self.store_block_bytes(hash, serialize(block))
+    }
+
+    /// Store a block the caller has already serialized: `bytes` must be
+    /// `serialize(block)` of the block whose hash is `hash`
+    pub fn store_block_bytes(&self, hash: &Hash256, bytes: Vec<u8>) -> Result<(), StorageError> {
         let cf = self.db.cf_handle(CF_BLOCKS).unwrap();
-        let key = hash.as_bytes();
-        let value = serialize(block);
-        self.db.put_cf(cf, key, value)?;
+        self.db.put_cf(cf, hash.as_bytes(), bytes)?;
         Ok(())
     }
 

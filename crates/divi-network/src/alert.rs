@@ -62,6 +62,7 @@ impl Alert {
     /// alerts (IronDivi stores none): the signature by `key`, the alert in
     /// effect at `adjusted_time`, and the reserved maximum id used only for
     /// the fixed "key compromised" alert
+    #[allow(clippy::needless_bool)]
     pub fn is_acceptable(&self, key: &[u8], adjusted_time: i64) -> bool {
         let hash = double_sha256(&self.msg);
         if !divi_script::checker::verify_ecdsa_lax(key, &self.sig, &hash) {

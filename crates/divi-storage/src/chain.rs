@@ -2339,17 +2339,23 @@ impl Chain {
 
     /// Accept a new block into the chain
     pub fn accept_block(&self, block: Block) -> Result<AcceptBlockResult, StorageError> {
+        self.accept_block_ref(&block)
+    }
+
+    /// [`Chain::accept_block`] for a block the caller keeps: the same checks,
+    /// storage and connection, without taking (or cloning) the block
+    pub fn accept_block_ref(&self, block: &Block) -> Result<AcceptBlockResult, StorageError> {
         abort_on_write_failure(self.notifying_tip(|| self.accept_block_unnotified(block)))
     }
 
-    fn accept_block_unnotified(&self, block: Block) -> Result<AcceptBlockResult, StorageError> {
+    fn accept_block_unnotified(&self, block: &Block) -> Result<AcceptBlockResult, StorageError> {
         // Acquire exclusive lock for chain state modifications
         trace!("accept_block: Waiting for chain lock...");
         let _chain_guard = self.chain_lock_guard();
         trace!("accept_block: Chain lock acquired");
 
         // 1. Compute block hash
-        let hash = self.compute_block_hash(&block);
+        let hash = self.compute_block_hash(block);
         let height_estimate = block.header.prev_block.to_string();
 
         debug!(
@@ -2398,8 +2404,8 @@ impl Chain {
 
         // 3. Basic header validation
         debug!("  ├─ Header validation");
-        self.check_block_header(&block)?;
-        check_block_transactions(&block, self.max_money())?;
+        let txids = self.check_block_header(block)?;
+        check_block_transactions(block, self.max_money())?;
         debug!("  ├─ Header validation: ✅ PASS");
 
         // 4. Check if this is the genesis block (prev_block is all zeros)
@@ -2444,8 +2450,8 @@ impl Chain {
                 .unwrap_or(true)
         });
         if let Some(ref parent) = parent_index {
-            self.check_block_work(&block, &hash, parent)?;
-            match self.check_block_proof_of_stake(&block, parent) {
+            self.check_block_work(block, &hash, parent)?;
+            match self.check_block_proof_of_stake(block, parent) {
                 // A block of a side chain may stake a coin that only its own branch
                 // made, which is in neither the unspent outputs nor the chain we hold,
                 // so its proof can be checked only when the branch is connected. Divi
@@ -2464,15 +2470,15 @@ impl Chain {
             // :493). The coins, scripts and amounts are checked when the block
             // is connected: on arrival for a block on the tip, during a reorg
             // for a block of a side chain, as in Divi Core's ConnectTip.
-            self.check_block_context(&block, parent)?;
+            self.check_block_context(block, parent)?;
             self.check_checkpoint(&hash, parent.height + 1)?;
-            Self::check_block_version(&block)?;
-            if let Err(e) = Self::check_block_final_and_height(&block, parent.height + 1) {
+            Self::check_block_version(block)?;
+            if let Err(e) = Self::check_block_final_and_height(block, parent.height + 1) {
                 // Divi Core has added the header to its block index by now
                 // (AcceptBlockHeader) and marks it failed (:493-499): the block
                 // sent again is refused as known to be invalid, a block on it
                 // as bad-prevblk.
-                self.store_failed_header(&block, &hash, parent)?;
+                self.store_failed_header(block, &hash, parent)?;
                 return Err(e);
             }
         }
@@ -2556,12 +2562,14 @@ impl Chain {
 
         // 8. Store block and index. Divi Core first checks that 50 MB stay
         // free beyond what the block adds (BlockFileHelpers.cpp:132-142).
-        let size = divi_primitives::serialize::serialize(&block).len() as u64;
+        // The bytes measured are the bytes stored: one serialization
+        let block_bytes = divi_primitives::serialize::serialize(block);
+        let size = block_bytes.len() as u64;
         if !crate::disk_space::check_disk_space(self.db.path(), size) {
             return Err(crate::disk_space::disk_space_low());
         }
         debug!("  ├─ Storing block data and index");
-        self.db.store_block(&hash, &block)?;
+        self.db.store_block_bytes(&hash, block_bytes)?;
         // Index entry only: the height -> hash mapping is written solely when the
         // block is connected to the active chain (atomic_connect_block). Writing it
         // here let a later-arriving stale sibling overwrite the main-chain entry,
@@ -2589,7 +2597,8 @@ impl Chain {
                 if block.header.prev_block == current_tip.hash {
                     // Simple extension - connect the block atomically
                     debug!("  ├─ Simple extension from tip {}", current_tip.hash);
-                    let (utxo_batch, undo_bytes) = match self.connect_block(&block, &mut index) {
+                    let connected = self.connect_block_with_txids(block, &mut index, txids);
+                    let (utxo_batch, undo_bytes) = match connected {
                         Ok(connected) => connected,
                         Err(e) => {
                             // Divi Core ChainTipManager::connectTip -> InvalidBlockFound: a block
@@ -2605,7 +2614,7 @@ impl Chain {
                     let accepted_height = index.height;
 
                     // Atomic write: UTXOs + undo data + tip update in single WriteBatch
-                    self.commit_connected_block(&block, &utxo_batch, &undo_bytes, &index)?;
+                    self.commit_connected_block(block, &utxo_batch, &undo_bytes, &index)?;
                     *self.tip.write() = Some(index.clone());
 
                     // Keep best_known_block in sync with the new tip
@@ -2646,7 +2655,7 @@ impl Chain {
                     );
                     let accepted_height = index.height;
                     let (fork_height, orphans) =
-                        self.reorganize_chain(&block, &mut index, current_tip)?;
+                        self.reorganize_chain(block, &mut index, current_tip)?;
                     reorg_fork_height = Some(fork_height);
                     orphaned_transactions = orphans;
 
@@ -2678,11 +2687,12 @@ impl Chain {
             } else {
                 // No tip yet (genesis block)
                 debug!("  ├─ Genesis or first block after genesis");
-                let (utxo_batch, undo_bytes) = self.connect_block(&block, &mut index)?;
+                let (utxo_batch, undo_bytes) =
+                    self.connect_block_with_txids(block, &mut index, txids)?;
                 let accepted_height = index.height;
 
                 // Atomic write: UTXOs + undo data + tip update in single WriteBatch
-                self.commit_connected_block(&block, &utxo_batch, &undo_bytes, &index)?;
+                self.commit_connected_block(block, &utxo_batch, &undo_bytes, &index)?;
                 *self.tip.write() = Some(index.clone());
 
                 // Keep best_known_block in sync with the new tip
@@ -3892,8 +3902,9 @@ impl Chain {
         self.db.store_block_index_entry(&index)
     }
 
-    /// Check basic block header validity
-    fn check_block_header(&self, block: &Block) -> Result<(), StorageError> {
+    /// Check basic block header validity. Returns the block's txids, in
+    /// block order, which the merkle checks computed
+    fn check_block_header(&self, block: &Block) -> Result<Vec<Hash256>, StorageError> {
         // Check version
         if block.header.version < 1 {
             return Err(StorageError::invalid_block_scored(
@@ -3909,8 +3920,10 @@ impl Chain {
             ));
         }
 
-        // Check merkle root
-        let computed_merkle_root = compute_merkle_root(&block.transactions);
+        // Check merkle root. The root and the mutation flag come from one pass
+        // over one set of txids (compute_merkle_root's tree, built once)
+        let txids: Vec<Hash256> = block.transactions.iter().map(|tx| tx.txid()).collect();
+        let (computed_merkle_root, mutated) = merkle_root_and_mutation(&txids);
         if block.header.merkle_root != computed_merkle_root {
             return Err(StorageError::InvalidBlock(format!(
                 "bad-txnmrklroot: merkle root mismatch: header has {}, computed {}",
@@ -3920,14 +3933,13 @@ impl Chain {
 
         // A transaction list repeated at the end of a level gives the same merkle
         // root; Core refuses it as a duplicate (BlockCheckingHelpers.cpp:39-44)
-        let txids: Vec<Hash256> = block.transactions.iter().map(|tx| tx.txid()).collect();
-        if merkle_tree_mutated(&txids) {
+        if mutated {
             return Err(StorageError::InvalidBlock(
                 "bad-txns-duplicate: duplicate transaction".into(),
             ));
         }
 
-        Ok(())
+        Ok(txids)
     }
 
     /// Divi Core ContextualCheckBlockHeader's version rule
@@ -4816,6 +4828,19 @@ impl Chain {
         block: &Block,
         index: &mut BlockIndex,
     ) -> Result<(BatchedUtxoWriter, Vec<u8>), StorageError> {
+        let txids = block.transactions.iter().map(|tx| tx.txid()).collect();
+        self.connect_block_with_txids(block, index, txids)
+    }
+
+    /// [`Chain::connect_block`] given the block's txids, in block order, as
+    /// `check_block_header` returns them
+    fn connect_block_with_txids(
+        &self,
+        block: &Block,
+        index: &mut BlockIndex,
+        txids: Vec<Hash256>,
+    ) -> Result<(BatchedUtxoWriter, Vec<u8>), StorageError> {
+        debug_assert_eq!(txids.len(), block.transactions.len());
         let height = index.height;
 
         debug!(
@@ -4855,9 +4880,8 @@ impl Chain {
         // Divi Core BIP30 (BlockConnectionService.cpp:56-62): a transaction may not
         // reuse the id of one that still has unspent outputs
         if height > 0 {
-            for tx in &block.transactions {
-                let txid = tx.txid();
-                if self.db.has_spendable_output_of(&txid)? {
+            for txid in &txids {
+                if self.db.has_spendable_output_of(txid)? {
                     return Err(StorageError::InvalidBlock(format!(
                         "bad-txns-BIP30: tried to overwrite transaction ({})",
                         txid
@@ -4883,21 +4907,19 @@ impl Chain {
         let mut utxo_batch = BatchedUtxoWriter::with_capacity(tx_count * 3, tx_count * 2);
 
         // Track UTXOs created within this block for intra-block spending
-        // (when tx2 spends output created by tx1 in the same block)
+        // (when tx2 spends output created by tx1 in the same block): each
+        // outpoint maps to the position of its first entry in utxo_batch.adds
         use std::collections::HashSet;
-        let mut created_in_block: HashSet<OutPoint> = HashSet::new();
+        let mut created_in_block: HashMap<OutPoint, usize> = HashMap::new();
         let mut spent_in_block: HashSet<OutPoint> = HashSet::new();
+        // Per input of the transaction being connected: the coin it spends as
+        // the sigop count found it, from this block's outputs or the UTXO set.
+        // Neither changes before the input is spent below, so the coin is
+        // read once.
+        let mut prev_coins: Vec<Option<Utxo>> = Vec::new();
 
         // Build undo data: capture previous UTXO state for every input spent
         let mut block_undo = BlockUndo::with_capacity(tx_count * 2);
-
-        // Precompute all txids once to avoid redundant hash computations.
-        // These are reused in the main transaction loop and for the tx_index update.
-        let txids: Vec<Hash256> = block
-            .transactions
-            .iter()
-            .map(|tx| self.compute_txid(tx))
-            .collect();
 
         // Script flags for this block: Core's mandatory flags, plus CLTV and
         // LIMIT_TRANSFER once their forks are active by the block's median
@@ -4943,21 +4965,26 @@ impl Chain {
             let mut value_in = Amount::ZERO;
 
             sig_ops += legacy_sig_op_count(tx);
+            prev_coins.clear();
             if !is_coinbase {
                 // Pay-to-script-hash inputs add their redeem script's sigops, for the
                 // whole transaction before any of its scripts is run
                 for input in &tx.vin {
-                    let prev_script =
-                        match utxo_batch.adds.iter().find(|(op, _)| op == &input.prevout) {
-                            Some((_, u)) => Some(u.script_pubkey.clone()),
-                            None => self.db.get_utxo(&input.prevout)?.map(|u| u.script_pubkey),
-                        };
-                    if let Some(spk) = prev_script.filter(|spk| spk.is_p2sh()) {
+                    let prev = match created_in_block.get(&input.prevout) {
+                        Some(&at) => Some(utxo_batch.adds[at].1.clone()),
+                        None => self.db.get_utxo(&input.prevout)?,
+                    };
+                    if let Some(spk) = prev
+                        .as_ref()
+                        .map(|u| &u.script_pubkey)
+                        .filter(|spk| spk.is_p2sh())
+                    {
                         sig_ops += divi_script::p2sh_sig_op_count(
                             spk.as_bytes(),
                             input.script_sig.as_bytes(),
                         );
                     }
+                    prev_coins.push(prev);
                 }
             }
             if sig_ops > MAX_BLOCK_SIGOPS {
@@ -4984,21 +5011,17 @@ impl Chain {
                     }
 
                     // Check if UTXO was created earlier in this same block
-                    let exists_in_block = created_in_block.contains(&input.prevout);
+                    let exists_in_block = created_in_block.contains_key(&input.prevout);
 
-                    // Capture previous UTXO state for undo data before removal.
-                    // For non-block UTXOs we perform a single get_utxo call and treat
-                    // None as "not found", avoiding a redundant has_utxo round-trip.
+                    // Capture previous UTXO state for undo data before removal: the
+                    // coin the sigop count read for this input, from this block's
+                    // outputs or the UTXO set, with None as "not found".
                     let prev_utxo = if exists_in_block {
-                        // Intra-block spend: find in batch adds
-                        utxo_batch
-                            .adds
-                            .iter()
-                            .find(|(op, _)| op == &input.prevout)
-                            .map(|(_, u)| u.clone())
+                        // Intra-block spend: the batch add
+                        prev_coins[input_index].take()
                     } else {
-                        // Regular spend: single DB read covers both existence check and data.
-                        let utxo = self.db.get_utxo(&input.prevout)?;
+                        // Regular spend: the read covers both existence check and data.
+                        let utxo = prev_coins[input_index].take();
                         if utxo.is_none() {
                             error!(
                                 "UTXO NOT FOUND: {}:{} in tx {} at height {} (block {})",
@@ -5133,8 +5156,11 @@ impl Chain {
                     is_coinstake,
                 )
                 .with_version(tx.version);
-                // Track UTXOs created in this block
-                created_in_block.insert(outpoint);
+                // Track UTXOs created in this block (the first add of an
+                // outpoint is the one found)
+                created_in_block
+                    .entry(outpoint)
+                    .or_insert(utxo_batch.adds.len());
                 // Queue UTXO addition in batch
                 utxo_batch.add(outpoint, utxo);
                 utxos_created += 1;
@@ -6103,9 +6129,14 @@ pub fn bip34_height_script(height: u32) -> Vec<u8> {
     }
 }
 
-/// Divi Core CBlock::BuildMerkleTree's `fMutated` (primitives/block.cpp:59-79): two
-/// identical hashes at the end of a level
-fn merkle_tree_mutated(txids: &[Hash256]) -> bool {
+/// The merkle root of `txids` and Divi Core CBlock::BuildMerkleTree's `fMutated`
+/// (primitives/block.cpp:59-79): two identical hashes at the end of a level
+fn merkle_root_and_mutation(txids: &[Hash256]) -> (Hash256, bool) {
+    // The tree divi_crypto::compute_merkle_root builds (the last hash of an
+    // odd level paired with itself), and the zero hash for no transactions
+    if txids.is_empty() {
+        return (Hash256::zero(), false);
+    }
     let mut level = txids.to_vec();
     let mut mutated = false;
     while level.len() > 1 {
@@ -6116,14 +6147,14 @@ fn merkle_tree_mutated(txids: &[Hash256]) -> bool {
             if i2 == i + 1 && i2 + 1 == n && level[i] == level[i2] {
                 mutated = true;
             }
-            let mut pair = Vec::with_capacity(64);
-            pair.extend_from_slice(level[i].as_bytes());
-            pair.extend_from_slice(level[i2].as_bytes());
+            let mut pair = [0u8; 64];
+            pair[..32].copy_from_slice(level[i].as_bytes());
+            pair[32..].copy_from_slice(level[i2].as_bytes());
             next.push(hash256(&pair));
         }
         level = next;
     }
-    mutated
+    (level[0], mutated)
 }
 
 /// Divi Core `GetLegacySigOpCount` (TransactionOpCounting.cpp:6-16)
@@ -9687,5 +9718,55 @@ mod tests {
             "main kernel block time must hit target"
         );
         assert!(!run(1_786_214_609).1, "stale sibling time must miss target");
+    }
+
+    /// The single pass gives compute_merkle_root's root and the mutation flag
+    /// the separate pass of the base gave, for every list length up to 40 and
+    /// lists with equal hashes anywhere
+    #[test]
+    fn merkle_root_and_mutation_match_the_separate_passes() {
+        // The flag as computed before, on its own pass
+        fn mutated_reference(txids: &[Hash256]) -> bool {
+            let mut level = txids.to_vec();
+            let mut mutated = false;
+            while level.len() > 1 {
+                let n = level.len();
+                let mut next = Vec::with_capacity(n.div_ceil(2));
+                for i in (0..n).step_by(2) {
+                    let i2 = (i + 1).min(n - 1);
+                    if i2 == i + 1 && i2 + 1 == n && level[i] == level[i2] {
+                        mutated = true;
+                    }
+                    let mut pair = Vec::with_capacity(64);
+                    pair.extend_from_slice(level[i].as_bytes());
+                    pair.extend_from_slice(level[i2].as_bytes());
+                    next.push(hash256(&pair));
+                }
+                level = next;
+            }
+            mutated
+        }
+        let tx = |i: u32| Transaction {
+            version: 1,
+            vin: vec![],
+            vout: vec![],
+            lock_time: i,
+        };
+        let mut seen_mutated = 0;
+        for n in 0..=40u32 {
+            for dup in [None, Some(0), Some(n / 2), Some(n.saturating_sub(1))] {
+                let mut txs: Vec<Transaction> = (0..n).map(tx).collect();
+                if let (Some(d), true) = (dup, n >= 2) {
+                    // Repeat a transaction at the end
+                    txs.push(txs[d as usize].clone());
+                }
+                let txids: Vec<Hash256> = txs.iter().map(|t| t.txid()).collect();
+                let (root, mutated) = merkle_root_and_mutation(&txids);
+                assert_eq!(root, compute_merkle_root(&txs), "n={n} dup={dup:?}");
+                assert_eq!(mutated, mutated_reference(&txids), "n={n} dup={dup:?}");
+                seen_mutated += usize::from(mutated);
+            }
+        }
+        assert!(seen_mutated > 0);
     }
 }
