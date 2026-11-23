@@ -147,9 +147,13 @@ pub enum Ownership {
 struct DirtyFlags {
     metadata: bool,
     keys: bool,
-    utxos: bool,
-    spent: bool,
-    transactions: bool,
+    /// Coins whose live or spent row is owed. A save resolves each one to
+    /// its current state (live, spent, or gone, which `pending_deletes`
+    /// carries), so a mutator marks it after changing the maps.
+    outpoints: HashSet<OutPoint>,
+    /// History rows owed a put; an id no longer in memory was deleted or
+    /// pruned, and `pending_deletes` carries what disk needs
+    transactions: HashSet<Hash256>,
     addresses: HashSet<String>,
     accounts: bool,
     scripts: bool,
@@ -160,9 +164,8 @@ impl DirtyFlags {
     fn any_dirty(&self) -> bool {
         self.metadata
             || self.keys
-            || self.utxos
-            || self.spent
-            || self.transactions
+            || !self.outpoints.is_empty()
+            || !self.transactions.is_empty()
             || !self.addresses.is_empty()
             || self.accounts
             || self.scripts
@@ -173,9 +176,8 @@ impl DirtyFlags {
     fn merge(&mut self, taken: &DirtyFlags) {
         self.metadata |= taken.metadata;
         self.keys |= taken.keys;
-        self.utxos |= taken.utxos;
-        self.spent |= taken.spent;
-        self.transactions |= taken.transactions;
+        self.outpoints.extend(taken.outpoints.iter().copied());
+        self.transactions.extend(taken.transactions.iter().copied());
         self.addresses.extend(taken.addresses.iter().cloned());
         self.accounts |= taken.accounts;
         self.scripts |= taken.scripts;
@@ -1185,11 +1187,18 @@ impl WalletDb {
         {
             let spent_set = self.spent.read();
             let mut utxo_map = self.utxos.write();
-            let before = utxo_map.len();
-            utxo_map.retain(|outpoint, _| !spent_set.contains(outpoint));
-            let removed = before - utxo_map.len();
-            if removed > 0 {
-                info!("Removed {} stale UTXOs that were in spent set", removed);
+            let stale: Vec<OutPoint> = utxo_map
+                .keys()
+                .filter(|outpoint| spent_set.contains(outpoint))
+                .copied()
+                .collect();
+            for outpoint in &stale {
+                utxo_map.remove(outpoint);
+            }
+            if !stale.is_empty() {
+                info!("Removed {} stale UTXOs that were in spent set", stale.len());
+                // The next save writes them as spent, deleting the stale row
+                self.dirty.write().outpoints.extend(stale);
             }
         }
 
@@ -1855,29 +1864,33 @@ impl WalletDb {
         // Always update scan height
         self.put_scan_state(&mut batch, db);
 
-        if flags.utxos || flags.spent {
-            // Remove spent outpoints from UTXO CF and add to spent CF
-            for outpoint in self.spent.read().iter() {
+        if !flags.outpoints.is_empty() {
+            // Each coin's live and spent rows from one view of both sets
+            // (spent before utxos, as their writers take them); the guards
+            // end with this block, before the batch is written
+            let spent = self.spent.read();
+            let utxos = self.utxos.read();
+            for outpoint in &flags.outpoints {
                 let key = outpoint_key(outpoint);
-                batch.delete_cf(db.cf_utxos(), &key);
-                batch.put_cf(db.cf_spent(), &key, [1]);
-            }
-
-            // Write current UTXOs (only if utxos dirty), clearing any stale spent row on disk
-            if flags.utxos {
-                for (outpoint, utxo) in self.utxos.read().iter() {
-                    let key = outpoint_key(outpoint);
-                    let value = serialize_utxo(utxo);
+                if let Some(utxo) = utxos.get(outpoint) {
                     batch.delete_cf(db.cf_spent(), &key);
-                    batch.put_cf(db.cf_utxos(), &key, &value);
+                    batch.put_cf(db.cf_utxos(), &key, serialize_utxo(utxo));
+                } else if spent.contains(outpoint) {
+                    batch.delete_cf(db.cf_utxos(), &key);
+                    batch.put_cf(db.cf_spent(), &key, [1]);
                 }
+                // Neither: removed, and `pending_deletes` holds its deletes,
+                // or dropped from memory only and left as it is on disk
             }
         }
 
-        if flags.transactions {
-            for tx in self.transactions_r().values() {
-                let value = serialize_tx(tx);
-                batch.put_cf(db.cf_transactions(), tx.txid.as_bytes(), &value);
+        if !flags.transactions.is_empty() {
+            let history = self.transactions_r();
+            for txid in &flags.transactions {
+                // Gone from memory: deleted or pruned, see `pending_deletes`
+                if let Some(tx) = history.get(txid) {
+                    batch.put_cf(db.cf_transactions(), txid.as_bytes(), serialize_tx(tx));
+                }
             }
         }
 
@@ -2478,7 +2491,7 @@ impl WalletDb {
     pub fn add_utxo(&self, utxo: WalletUtxo) {
         let outpoint = utxo.outpoint();
         counted::hit(Site::WalletUtxoAdded);
-        let cleared_spent = {
+        {
             let mut pending = self.pending_deletes.write();
             let mut spent_data = self.spent_utxo_data.write();
             let mut spent = self.spent.write();
@@ -2495,13 +2508,9 @@ impl WalletDb {
                     let _ = db.remove_spent_utxo_data(&outpoint);
                 }
             }
-            had_spent || had_data
-        };
-        let mut dirty = self.dirty.write();
-        dirty.utxos = true;
-        if cleared_spent {
-            dirty.spent = true;
         }
+        // After the maps: a save that took the mark earlier reads this state
+        self.dirty.write().outpoints.insert(outpoint);
     }
 
     /// Remove a UTXO (mark as spent)
@@ -2532,9 +2541,7 @@ impl WalletDb {
                     }
                 }
             }
-            let mut dirty = self.dirty.write();
-            dirty.utxos = true;
-            dirty.spent = true;
+            self.dirty.write().outpoints.insert(*outpoint);
         }
         utxo
     }
@@ -2836,6 +2843,7 @@ impl WalletDb {
             }
         }
         let mut removed = 0u32;
+        let mut touched = Vec::new();
         for outpoint in &absent {
             let mut pending = self.pending_deletes.write();
             if let Some(utxo) = self.utxos.write().remove(outpoint) {
@@ -2846,6 +2854,7 @@ impl WalletDb {
                     WalletAddress(&utxo.address)
                 );
                 pending.utxos.insert(*outpoint, PendingRow::new(()));
+                touched.push(*outpoint);
                 removed += 1;
             }
         }
@@ -2862,6 +2871,7 @@ impl WalletDb {
                 let was_spent = spent.remove(&outpoint);
                 if was_spent || restored.is_some() {
                     pending.spent.insert(outpoint, PendingRow::new(()));
+                    touched.push(outpoint);
                     cleared_spent += 1;
                     if let Some(utxo) = restored {
                         if let Some(ref db) = self.db() {
@@ -2888,13 +2898,7 @@ impl WalletDb {
 
         let total_changes = removed + cleared_spent;
         if total_changes > 0 {
-            let mut dirty = self.dirty.write();
-            if removed > 0 || restored_utxos > 0 {
-                dirty.utxos = true;
-            }
-            if cleared_spent > 0 {
-                dirty.spent = true;
-            }
+            self.dirty.write().outpoints.extend(touched);
             info!(
                 "UTXO reconciliation complete: removed {} phantom UTXOs, cleared {} stale spent marks ({} UTXOs restored), {} live UTXOs",
                 removed,
@@ -3099,11 +3103,8 @@ impl WalletDb {
                 }
             }
         }
+        // Every row removed is a pending delete: nothing is left to mark
         self.scanned_hashes.write().clear();
-        let mut dirty = self.dirty.write();
-        dirty.transactions = true;
-        dirty.utxos = true;
-        dirty.spent = true;
     }
 
     /// Add a transaction to history
@@ -3116,7 +3117,7 @@ impl WalletDb {
         pending.transactions.remove(&txid);
         self.pruned_history.write().remove(&txid);
         self.transactions_w().insert(tx.txid, tx);
-        self.dirty.write().transactions = true;
+        self.dirty.write().transactions.insert(txid);
         drop(pending);
         if confirmed {
             self.reattach(&txid);
@@ -3186,13 +3187,24 @@ impl WalletDb {
         // its outcome before deciding whether a removed value is still owed.
         let _persist = self.persist_lock.lock();
         let mut pending = self.pending_deletes.write();
-        let preserve = self.db().is_some() && self.dirty.read().transactions;
+        // Rows still owed a put: their value in memory may be the only copy.
+        // Held under `pending_deletes`, so no `add_transaction` marks more.
+        let owed: HashSet<Hash256> = if self.db().is_some() {
+            let dirty = self.dirty.read();
+            pruned
+                .iter()
+                .filter(|id| dirty.transactions.contains(id))
+                .copied()
+                .collect()
+        } else {
+            HashSet::new()
+        };
         let mut memory_only = self.pruned_history.write();
         let mut history = self.transactions_w();
         for id in &pruned {
             if let Some(tx) = history.remove(id) {
                 memory_only.insert(*id, tx.block_height);
-                if preserve {
+                if owed.contains(id) {
                     pending
                         .transactions
                         .insert(*id, PendingRow::new(Some(Box::new(tx))));
@@ -4967,7 +4979,10 @@ impl WalletDb {
         }
     }
 
-    /// Update confirmation counts for all transactions
+    /// Update confirmation counts for all transactions. In memory only: the
+    /// stored count is not read back as a depth, so no row is marked owed; a
+    /// full save writes the counts with every row, an incremental save only
+    /// with the rows it owes.
     pub fn update_confirmations(&self, current_height: u32) {
         let mut txs = self.transactions_w();
         for tx in txs.values_mut() {
@@ -5051,6 +5066,7 @@ impl WalletDb {
             .retain(|height, _| !in_range(*height));
 
         let mut restored = 0usize;
+        let mut touched = Vec::new();
         {
             let mut spent_data = self.spent_utxo_data.write();
             let mut spent_set = self.spent.write();
@@ -5066,6 +5082,7 @@ impl WalletDb {
                 spent_data.remove(&outpoint);
                 spent_set.remove(&outpoint);
                 pending.spent.insert(outpoint, PendingRow::new(()));
+                touched.push(outpoint);
                 if let Some(ref db) = self.db() {
                     if db.remove_spent_utxo_data(&outpoint).is_err() {
                         counted::hit(Site::WalletRollbackRemoveFailed);
@@ -5085,12 +5102,8 @@ impl WalletDb {
 
         counted::hit(Site::WalletRollbackHeights);
 
-        {
-            let mut dirty = self.dirty.write();
-            dirty.utxos = true;
-            dirty.transactions = true;
-            dirty.spent = true;
-        }
+        // Removed rows are pending deletes; a restored coin is owed its row
+        self.dirty.write().outpoints.extend(touched);
         drop(pending);
         if restored > 0 {
             self.claim_mempool_inputs();
@@ -5358,7 +5371,7 @@ impl WalletDb {
             let mut spent = self.spent.write();
             let utxos = self.utxos.read();
             let mut found = 0usize;
-            for op in lifted {
+            for &op in &lifted {
                 if utxos.contains_key(&op) || data.contains_key(&op) {
                     // Seen again: held now, or spent at a known height
                     if !spent.contains(&op) {
@@ -5370,14 +5383,14 @@ impl WalletDb {
                     spent.insert(op);
                 }
             }
+            // Also those put back: a save while they were lifted took any
+            // mark they had and wrote nothing for them
+            self.dirty.write().outpoints.extend(lifted);
             if found > 0 {
                 info!(
                     "Rescan found {} coin(s) marked spent without a spending block",
                     found
                 );
-                let mut dirty = self.dirty.write();
-                dirty.utxos = true;
-                dirty.spent = true;
             }
         }
 
@@ -8348,7 +8361,7 @@ mod tests {
             wallet.spent.write().clear();
             wallet.pending_deletes.write().spent.clear();
             wallet.utxos.write().insert(outpoint, utxo);
-            wallet.dirty.write().utxos = true;
+            wallet.dirty.write().outpoints.insert(outpoint);
             wallet.save_incremental().unwrap();
             drop(wallet);
 
