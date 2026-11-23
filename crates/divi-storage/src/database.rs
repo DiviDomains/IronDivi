@@ -48,6 +48,10 @@ const KEY_BEST_BLOCK: &[u8] = b"best_block";
 const KEY_CHAIN_HEIGHT: &[u8] = b"chain_height";
 const KEY_PRUNE_HEIGHT: &[u8] = b"prune_height";
 const KEY_WINNERS_STRIP_HEIGHT: &[u8] = b"winners_strip_height";
+/// Highest `prune_height` whose deletions `blocks` and `undo` have been compacted past
+const KEY_COMPACTED_PRUNE_HEIGHT: &[u8] = b"compacted_prune_height";
+/// Highest `winners_strip_height` whose rewrites `block_index` has been compacted past
+const KEY_COMPACTED_STRIP_HEIGHT: &[u8] = b"compacted_winners_strip_height";
 const KEY_SNAPSHOT_BASE: &[u8] = b"snapshot_base";
 
 /// `gettxoutsetinfo`'s values, as Divi Core's `CCoinsViewDB::GetStats`
@@ -843,8 +847,96 @@ impl ChainDatabase {
             .unwrap_or(0)
     }
 
+    /// Highest `prune_height` whose deletions have been compacted out of `blocks` and
+    /// `undo` (0 = none, or a datadir pruned before this watermark existed).
+    pub fn compacted_prune_height(&self) -> u32 {
+        self.read_height(KEY_COMPACTED_PRUNE_HEIGHT)
+    }
+
+    /// Highest `winners_strip_height` whose rewrites have been compacted out of
+    /// `block_index` (0 = none, or a datadir stripped before this watermark existed).
+    pub fn compacted_winners_strip_height(&self) -> u32 {
+        self.read_height(KEY_COMPACTED_STRIP_HEIGHT)
+    }
+
+    fn read_height(&self, key: &[u8]) -> u32 {
+        self.get_metadata(key)
+            .ok()
+            .flatten()
+            .and_then(|v| <[u8; 4]>::try_from(v.as_slice()).ok())
+            .map(u32::from_le_bytes)
+            .unwrap_or(0)
+    }
+
+    /// Heights pruned, and heights stripped, since `blocks`/`undo` and `block_index` were
+    /// last compacted: the space the deletions and rewrites still hold on disk.
+    pub fn expiry_compaction_debt(&self) -> (u32, u32) {
+        (
+            self.prune_height()
+                .saturating_sub(self.compacted_prune_height()),
+            self.winners_strip_height()
+                .saturating_sub(self.compacted_winners_strip_height()),
+        )
+    }
+
+    /// Compact `blocks` and `undo` when at least `min_debt` pruned heights are not yet
+    /// compacted, and `block_index` when at least `min_debt` stripped heights are not, then
+    /// advance the matching compacted watermark. `min_debt` 0 compacts all three now.
+    /// Each watermark is written only after its compaction returns, so a crash in between
+    /// costs a second compaction, never lost space. Returns whether `(blocks and undo,
+    /// block_index)` were compacted.
+    pub fn compact_expired(&self, min_debt: u32) -> Result<(bool, bool), StorageError> {
+        let (prune_height, strip_height) = (self.prune_height(), self.winners_strip_height());
+        let (prune_debt, strip_debt) = self.expiry_compaction_debt();
+        let due = |debt: u32| min_debt == 0 || (debt > 0 && debt >= min_debt);
+        let cf_meta = self.db.cf_handle(CF_METADATA).unwrap();
+        let blocks = due(prune_debt);
+        if blocks {
+            let started = std::time::Instant::now();
+            for cf in [CF_BLOCKS, CF_UNDO] {
+                let cf = self.db.cf_handle(cf).unwrap();
+                self.db.compact_range_cf(cf, None::<&[u8]>, None::<&[u8]>);
+            }
+            if prune_debt > 0 {
+                self.db.put_cf(
+                    cf_meta,
+                    KEY_COMPACTED_PRUNE_HEIGHT,
+                    prune_height.to_le_bytes(),
+                )?;
+            }
+            tracing::info!(
+                "Compacted blocks and undo past {} pruned heights (prune height {}) in {:?}",
+                prune_debt,
+                prune_height,
+                started.elapsed()
+            );
+        }
+        let index = due(strip_debt);
+        if index {
+            let started = std::time::Instant::now();
+            let cf_index = self.db.cf_handle(CF_BLOCK_INDEX).unwrap();
+            self.db
+                .compact_range_cf(cf_index, None::<&[u8]>, None::<&[u8]>);
+            if strip_debt > 0 {
+                self.db.put_cf(
+                    cf_meta,
+                    KEY_COMPACTED_STRIP_HEIGHT,
+                    strip_height.to_le_bytes(),
+                )?;
+            }
+            tracing::info!(
+                "Compacted block index past {} stripped heights (strip height {}) in {:?}",
+                strip_debt,
+                strip_height,
+                started.elapsed()
+            );
+        }
+        Ok((blocks, index))
+    }
+
     /// Clear the per-block lottery-winner list from block-index entries for heights
-    /// `(winners_strip_height, cutoff]`, advance the watermark, and compact `block_index`.
+    /// `(winners_strip_height, cutoff]` and advance the watermark. It does not compact:
+    /// [`Self::compact_expired`] reclaims the space once enough heights are owed.
     /// Every other field of the entry is kept, and so is the list at any height where
     /// `keep(height)` is true (the caller passes the heights consensus reads at any depth).
     /// The caller must pick a cutoff old enough that consensus never reads the rest again.
@@ -860,6 +952,9 @@ impl ChainDatabase {
         }
         let cf_index = self.db.cf_handle(CF_BLOCK_INDEX).unwrap();
         let cf_meta = self.db.cf_handle(CF_METADATA).unwrap();
+        // With nothing owed, a chunk that rewrites no entry leaves nothing to compact,
+        // so its heights are compacted already (the old code compacted only on rewrites).
+        let mut owes = self.compacted_winners_strip_height() < start;
         let mut rewritten = 0u32;
         let mut h = start + 1;
         while h <= cutoff {
@@ -886,22 +981,23 @@ impl ChainDatabase {
                 rewritten += 1;
             }
             batch.put_cf(cf_meta, KEY_WINNERS_STRIP_HEIGHT, chunk_end.to_le_bytes());
+            owes |= !touched.is_empty();
+            if !owes {
+                batch.put_cf(cf_meta, KEY_COMPACTED_STRIP_HEIGHT, chunk_end.to_le_bytes());
+            }
             self.db.write(batch)?;
             for entry in touched {
                 self.block_index_cache.insert(entry.hash, entry);
             }
             h = chunk_end + 1;
         }
-        if rewritten > 0 {
-            self.db
-                .compact_range_cf(cf_index, None::<&[u8]>, None::<&[u8]>);
-        }
         Ok(rewritten)
     }
 
-    /// Delete block bodies and undo data for heights `(prune_height, cutoff]`, advance the
-    /// watermark, and compact the touched column families. Block index, UTXO set and all
-    /// other indexes are left alone. Returns the number of blocks pruned.
+    /// Delete block bodies and undo data for heights `(prune_height, cutoff]` and advance
+    /// the watermark. Block index, UTXO set and all other indexes are left alone. It does
+    /// not compact: [`Self::compact_expired`] reclaims the space once enough heights are
+    /// owed. Returns the number of blocks pruned.
     pub fn prune_blocks_to(&self, cutoff: u32) -> Result<u32, StorageError> {
         let start = self.prune_height();
         if cutoff <= start {
@@ -926,10 +1022,6 @@ impl ChainDatabase {
             self.db.write(batch)?;
             h = chunk_end + 1;
         }
-        self.db
-            .compact_range_cf(cf_blocks, None::<&[u8]>, None::<&[u8]>);
-        self.db
-            .compact_range_cf(cf_undo, None::<&[u8]>, None::<&[u8]>);
         Ok(pruned)
     }
 

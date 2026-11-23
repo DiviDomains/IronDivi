@@ -618,7 +618,7 @@ fn dirty_tombstone_rejects_write_through_before_closure_and_survives_flush() {
     let db = chain_db.inner_db();
     let cache = UtxoCache::new(8);
     let op = test_outpoint(99);
-    db_put(&db, &op, &test_utxo(99)).unwrap();
+    db_put(db, &op, &test_utxo(99)).unwrap();
     cache.remove(op);
     let result = cache.write_through(vec![(op, None)], || -> Result<(), StorageError> {
         panic!("must reject before invoking an ambiguous writer")
@@ -626,7 +626,7 @@ fn dirty_tombstone_rejects_write_through_before_closure_and_survives_flush() {
     assert!(result.is_err());
     assert_eq!(cache.dirty_count(), 1);
     assert_eq!(cache.contains(&op), Some(false));
-    assert_eq!(cache.flush(&db).unwrap(), 1);
+    assert_eq!(cache.flush(db).unwrap(), 1);
     let cf = db.cf_handle("utxo").unwrap();
     assert!(db.get_cf(cf, utxo_key(&op)).unwrap().is_none());
 }

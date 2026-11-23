@@ -7,6 +7,13 @@ use std::fmt;
 /// Never prune bodies/undo for this many most-recent blocks (about 2 days at 60 s).
 pub const MIN_BLOCKS_TO_KEEP: u32 = 2880;
 
+/// Compact the pruned column families once this many pruned (or stripped) heights are
+/// owed. A pass prunes about one block a minute at steady state, so this is one full
+/// compaction about every 2 days instead of one a minute, while a bulk catch-up pass
+/// (enabling `expire` on a full datadir) still compacts at once. The space owed is at
+/// most the size of the retained floor.
+pub const EXPIRY_COMPACTION_DEBT: u32 = MIN_BLOCKS_TO_KEEP;
+
 const MONTH_SECS: u64 = 30 * 86_400;
 const YEAR_SECS: u64 = 365 * 86_400;
 

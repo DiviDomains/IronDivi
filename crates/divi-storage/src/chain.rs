@@ -1817,7 +1817,9 @@ impl Chain {
     }
 
     /// Run one pruning pass: drop old block bodies and undo data, and clear old lottery-winner
-    /// lists from the block index. Returns the number of blocks whose data was removed.
+    /// lists from the block index, then compact the column families whose owed heights
+    /// reached [`crate::prune::EXPIRY_COMPACTION_DEBT`] (the owed heights persist across
+    /// restarts). Returns the number of blocks whose data was removed.
     pub fn prune_expired(
         &self,
         expire: crate::prune::Expire,
@@ -1831,6 +1833,8 @@ impl Chain {
                     self.db
                         .strip_lottery_winners_to(strip, |h| self.is_winners_terminal_height(h))?;
                 }
+                self.db
+                    .compact_expired(crate::prune::EXPIRY_COMPACTION_DEBT)?;
                 Ok(pruned)
             }
             None => Ok(0),
@@ -8491,14 +8495,15 @@ mod tests {
 
     // ===== Block-expiry pruning =====
 
-    /// Build `n` blocks on top of genesis by writing storage directly. `accept_block`
-    /// would demand real proof-of-stake past height 100, and pruning does not care.
+    /// Build `n` blocks on top of the tip (genesis on a new chain) by writing storage
+    /// directly. `accept_block` would demand real proof-of-stake past height 100, and
+    /// pruning does not care. Returns the starting tip's hash, then the new blocks'.
     fn build_chain_of(chain: &Chain, n: u32) -> Vec<Hash256> {
-        let (genesis_hash, genesis_time) = get_genesis_info(chain);
-        let mut prev = chain.get_block_index(&genesis_hash).unwrap().unwrap();
-        let mut hashes = vec![genesis_hash];
-        let mut t = genesis_time;
-        for h in 1..=n {
+        let (start_hash, start_time) = get_genesis_info(chain);
+        let mut prev = chain.get_block_index(&start_hash).unwrap().unwrap();
+        let mut hashes = vec![start_hash];
+        let mut t = start_time;
+        for h in prev.height + 1..=prev.height + n {
             t += 60;
             let block = create_child_block_with_time(prev.hash, t);
             let mut index = BlockIndex::from_header(&block.header, h, Some(&prev));
@@ -8656,6 +8661,224 @@ mod tests {
             .get_block(&hashes[cutoff as usize + 1])
             .unwrap()
             .is_some());
+    }
+
+    /// SST files in level 0 of `cf`: a full compaction leaves none.
+    fn l0_files(chain: &Chain, cf: &str) -> u64 {
+        let db = chain.db.inner_db();
+        db.property_int_value_cf(db.cf_handle(cf).unwrap(), "rocksdb.num-files-at-level0")
+            .unwrap()
+            .unwrap()
+    }
+
+    /// Bytes of live SST files in `cf`.
+    fn sst_bytes(db: &ChainDatabase, cf: &str) -> u64 {
+        let db = db.inner_db();
+        db.property_int_value_cf(db.cf_handle(cf).unwrap(), "rocksdb.total-sst-files-size")
+            .unwrap()
+            .unwrap()
+    }
+
+    fn flush_expiry_cfs(chain: &Chain) {
+        let db = chain.db.inner_db();
+        for cf in ["blocks", "undo", "block_index"] {
+            db.flush_cf(db.cf_handle(cf).unwrap()).unwrap();
+        }
+    }
+
+    fn reopen_chain(chain: Chain, dir: &tempfile::TempDir) -> Chain {
+        drop(chain);
+        Chain::new(
+            Arc::new(ChainDatabase::open(dir.path()).unwrap()),
+            ChainParams::for_network(NetworkType::Regtest, ChainMode::Divi),
+        )
+        .unwrap()
+    }
+
+    /// Give each of these entries a one-coinstake lottery-winner list to strip.
+    fn give_winners(chain: &Chain, hashes: &[Hash256]) {
+        use divi_primitives::{LotteryCoinstake, LotteryWinners, Script};
+        for hash in hashes {
+            let mut idx = chain.get_block_index(hash).unwrap().unwrap();
+            idx.lottery_winners = LotteryWinners::with_coinstakes(
+                idx.height,
+                vec![LotteryCoinstake::new(
+                    Hash256::from_bytes([idx.height as u8; 32]),
+                    Script::from(vec![0x51]),
+                )],
+            );
+            chain.db.store_block_index_entry(&idx).unwrap();
+        }
+    }
+
+    /// One-block passes owe their compaction instead of running it, the debt survives a
+    /// restart, the pass that reaches the threshold compacts, and that also persists.
+    #[test]
+    fn test_prune_steady_ticks_defer_compaction_until_debt_threshold() {
+        use crate::prune::{Expire, EXPIRY_COMPACTION_DEBT, MIN_BLOCKS_TO_KEEP};
+        let (chain, dir) = create_test_chain();
+        build_chain_of(&chain, MIN_BLOCKS_TO_KEEP + 120);
+        flush_expiry_cfs(&chain);
+        assert_eq!(l0_files(&chain, "blocks"), 1);
+        assert_eq!(chain.prune_expired(Expire::Minimum, None, 0).unwrap(), 120);
+        for _ in 0..5 {
+            build_chain_of(&chain, 1);
+            assert_eq!(chain.prune_expired(Expire::Minimum, None, 0).unwrap(), 1);
+        }
+        assert_eq!(chain.prune_height(), 125);
+        assert_eq!(chain.db.compacted_prune_height(), 0);
+        assert_eq!(l0_files(&chain, "blocks"), 1, "no pass compacted blocks");
+        assert_eq!(l0_files(&chain, "block_index"), 1, "nor block_index");
+        // No winners to strip: the strip watermark moves and nothing is owed for it.
+        assert!(chain.winners_strip_height() > 0);
+        assert_eq!(chain.db.expiry_compaction_debt(), (125, 0));
+
+        let chain = reopen_chain(chain, &dir);
+        assert_eq!(chain.db.expiry_compaction_debt(), (125, 0), "debt persists");
+        build_chain_of(&chain, EXPIRY_COMPACTION_DEBT - 126);
+        chain.prune_expired(Expire::Minimum, None, 0).unwrap();
+        assert_eq!(
+            chain.db.expiry_compaction_debt().0,
+            EXPIRY_COMPACTION_DEBT - 1
+        );
+        assert!(l0_files(&chain, "blocks") >= 1, "one short: still owed");
+
+        build_chain_of(&chain, 1);
+        assert_eq!(chain.prune_expired(Expire::Minimum, None, 0).unwrap(), 1);
+        assert_eq!(chain.prune_height(), EXPIRY_COMPACTION_DEBT);
+        assert_eq!(chain.db.compacted_prune_height(), EXPIRY_COMPACTION_DEBT);
+        assert_eq!(l0_files(&chain, "blocks"), 0, "threshold pass compacted");
+        assert!(l0_files(&chain, "block_index") >= 1, "nothing owed there");
+
+        let chain = reopen_chain(chain, &dir);
+        assert_eq!(chain.db.compacted_prune_height(), EXPIRY_COMPACTION_DEBT);
+        build_chain_of(&chain, 1);
+        flush_expiry_cfs(&chain);
+        chain.prune_expired(Expire::Minimum, None, 0).unwrap();
+        assert_eq!(chain.db.expiry_compaction_debt(), (1, 0));
+        assert!(l0_files(&chain, "blocks") >= 1, "the next tick owes again");
+    }
+
+    /// Stripped lottery winners owe a `block_index` compaction the same way.
+    #[test]
+    fn test_prune_strip_debt_compacts_block_index_at_threshold() {
+        use crate::prune::{Expire, EXPIRY_COMPACTION_DEBT, MIN_BLOCKS_TO_KEEP};
+        let (chain, _dir) = create_test_chain();
+        let (_, cycle) = chain.get_lottery_params();
+        let n = MIN_BLOCKS_TO_KEEP + 3 * cycle + 1 + 120;
+        let hashes = build_chain_of(&chain, n);
+        give_winners(&chain, &hashes[1..]);
+        flush_expiry_cfs(&chain);
+        chain.prune_expired(Expire::Minimum, None, 0).unwrap();
+        assert_eq!(chain.winners_strip_height(), 120);
+        assert_eq!(chain.db.expiry_compaction_debt().1, 120);
+        assert!(chain
+            .db
+            .get_block_index(&hashes[1])
+            .unwrap()
+            .unwrap()
+            .lottery_winners
+            .coinstakes
+            .is_empty());
+        assert_eq!(l0_files(&chain, "block_index"), 1);
+
+        let more = build_chain_of(&chain, EXPIRY_COMPACTION_DEBT - 121);
+        give_winners(&chain, &more[1..]);
+        chain.prune_expired(Expire::Minimum, None, 0).unwrap();
+        assert_eq!(
+            chain.db.expiry_compaction_debt().1,
+            EXPIRY_COMPACTION_DEBT - 1
+        );
+        assert!(
+            l0_files(&chain, "block_index") >= 1,
+            "one short: still owed"
+        );
+        assert_eq!(l0_files(&chain, "blocks"), 0, "blocks reached it first");
+
+        build_chain_of(&chain, 1);
+        chain.prune_expired(Expire::Minimum, None, 0).unwrap();
+        assert_eq!(
+            chain.db.compacted_winners_strip_height(),
+            chain.winners_strip_height()
+        );
+        assert_eq!(l0_files(&chain, "block_index"), 0);
+    }
+
+    /// Enabling `expire` on a full datadir prunes thousands of blocks in one pass, which
+    /// compacts at once.
+    #[test]
+    fn test_prune_bulk_catch_up_compacts_immediately() {
+        use crate::prune::{Expire, EXPIRY_COMPACTION_DEBT, MIN_BLOCKS_TO_KEEP};
+        let (chain, _dir) = create_test_chain();
+        build_chain_of(&chain, MIN_BLOCKS_TO_KEEP + EXPIRY_COMPACTION_DEBT + 10);
+        flush_expiry_cfs(&chain);
+        let pruned = chain.prune_expired(Expire::Minimum, None, 0).unwrap();
+        assert_eq!(pruned, EXPIRY_COMPACTION_DEBT + 10);
+        assert_eq!(chain.db.compacted_prune_height(), chain.prune_height());
+        assert_eq!(chain.db.expiry_compaction_debt().0, 0);
+        assert_eq!(l0_files(&chain, "blocks"), 0);
+    }
+
+    /// The export compacts whatever its source still owes, well under the threshold, before
+    /// it hashes the files.
+    #[test]
+    fn test_export_snapshot_compacts_owed_debt() {
+        use crate::prune::{Expire, EXPIRY_COMPACTION_DEBT, MIN_BLOCKS_TO_KEEP};
+        let (chain, dir) = create_test_chain();
+        let (_, cycle) = chain.get_lottery_params();
+        let n = MIN_BLOCKS_TO_KEEP + 3 * cycle + 1 + 120;
+        let hashes = build_chain_of(&chain, n);
+        give_winners(&chain, &hashes[1..]);
+        // Large incompressible bodies at the heights about to be pruned, so the space
+        // the export must reclaim dominates the column family.
+        let db = chain.db.inner_db();
+        let cf_blocks = db.cf_handle("blocks").unwrap();
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        for hash in &hashes[1..=150] {
+            let body: Vec<u8> = (0..16 * 1024)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    x as u8
+                })
+                .collect();
+            db.put_cf(cf_blocks, hash.as_bytes(), body).unwrap();
+        }
+        flush_expiry_cfs(&chain);
+        let full = sst_bytes(&chain.db, "blocks");
+        chain.prune_expired(Expire::Minimum, None, 0).unwrap();
+        let (prune_debt, strip_debt) = chain.db.expiry_compaction_debt();
+        assert!(prune_debt > 0 && prune_debt < EXPIRY_COMPACTION_DEBT);
+        assert!(strip_debt > 0 && strip_debt < EXPIRY_COMPACTION_DEBT);
+        assert_eq!(
+            sst_bytes(&chain.db, "blocks"),
+            full,
+            "source keeps the bodies"
+        );
+        drop(chain);
+
+        let out = dir.path().join("snap");
+        let src = dir.path().to_path_buf();
+        let m = crate::snapshot::export_snapshot(
+            &src,
+            &out,
+            ChainParams::for_network(NetworkType::Regtest, ChainMode::Divi),
+        )
+        .unwrap();
+        assert_eq!(m.prune_height, n - MIN_BLOCKS_TO_KEEP);
+        let exported = ChainDatabase::open(out.join(crate::snapshot::DATA_DIR)).unwrap();
+        assert_eq!(exported.compacted_prune_height(), m.prune_height);
+        assert_eq!(
+            exported.compacted_winners_strip_height(),
+            m.winners_strip_height
+        );
+        assert_eq!(exported.expiry_compaction_debt(), (0, 0));
+        let thin = sst_bytes(&exported, "blocks");
+        assert!(thin * 2 < full, "exported blocks {thin} B, source {full} B");
+        // The source itself is untouched.
+        let source = ChainDatabase::open(&src).unwrap();
+        assert_eq!(source.expiry_compaction_debt(), (prune_debt, strip_debt));
     }
 
     #[test]

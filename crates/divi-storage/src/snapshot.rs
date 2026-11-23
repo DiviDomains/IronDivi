@@ -339,6 +339,10 @@ pub fn export_snapshot_with_state(
             .tip()
             .ok_or_else(|| err("source chainstate has no tip"))?;
         chain.prune_expired(Expire::Minimum, None, 0)?;
+        // A thin source may still owe compaction for heights it pruned or stripped below
+        // the threshold, and this pass may add more: compact now so the files hashed below
+        // no longer hold the deleted bodies and old index entries.
+        db.compact_expired(0)?;
         db.flush()?;
         state_hash = compute_state_hash(&db, &chain, tip.height)?;
         tip_height = tip.height;
@@ -444,12 +448,18 @@ fn import_with_staging(
         )));
     }
 
-    dest.file_name().ok_or_else(|| err("destination has no name"))?;
-    let parent = dest.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    dest.file_name()
+        .ok_or_else(|| err("destination has no name"))?;
+    let parent = dest
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
     std::fs::create_dir_all(parent)?;
     // Each attempt owns a private staging directory. Never remove another
     // import's staging tree, including one left behind by an interrupted run.
-    let staging = tempfile::Builder::new().prefix(".snapshot-import-").tempdir_in(parent)?;
+    let staging = tempfile::Builder::new()
+        .prefix(".snapshot-import-")
+        .tempdir_in(parent)?;
     let tmp = staging.path();
     on_staged(tmp);
 
@@ -469,7 +479,7 @@ fn import_with_staging(
                 return Err(err(format!("{} does not match the manifest", f.name)));
             }
         }
-        let db = Arc::new(ChainDatabase::open(&tmp)?);
+        let db = Arc::new(ChainDatabase::open(tmp)?);
         let chain = Chain::new(db.clone(), params.clone())?;
         let tip = chain
             .tip()
@@ -517,7 +527,7 @@ fn import_with_staging(
             if dest.exists() {
                 std::fs::remove_dir(dest)?;
             }
-            std::fs::rename(&tmp, dest)?;
+            std::fs::rename(tmp, dest)?;
             Ok(manifest)
         }
         Err(e) => Err(e),
@@ -623,13 +633,17 @@ mod tests {
             std::fs::write(&marker, b"outer").unwrap();
             import_with_staging(&snap, &dest, params(), None, KNOWN_STATES, |inner| {
                 assert_ne!(outer, inner);
-            }).unwrap();
+            })
+            .unwrap();
             assert_eq!(std::fs::read(marker).unwrap(), b"outer");
             std::fs::write(dest.join("winner-marker"), b"winner").unwrap();
         });
         assert!(import.is_err());
         assert_eq!(std::fs::read(legacy.join("sentinel")).unwrap(), b"legacy");
-        assert_eq!(std::fs::read(dest.join("winner-marker")).unwrap(), b"winner");
+        assert_eq!(
+            std::fs::read(dest.join("winner-marker")).unwrap(),
+            b"winner"
+        );
         let db = ChainDatabase::open(&dest).unwrap();
         assert_eq!(db.snapshot_base().unwrap().1.to_string(), manifest.tip_hash);
     }

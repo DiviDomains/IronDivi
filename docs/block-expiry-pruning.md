@@ -56,8 +56,30 @@ cannot be lost to pruning.
 
 A `prune_height` watermark lives in the metadata column family. A pass deletes
 `blocks` and `undo` entries for heights `watermark+1..=cutoff` (resolved through the
-height mapping) in chunked batches, advances the watermark, and compacts those
-column families so disk space is actually reclaimed. A background task runs a pass once a minute, starting after the wallet catch-up scan at startup.
+height mapping) in chunked batches and advances the watermark. A background task runs a pass once a minute, starting after the wallet catch-up scan at startup.
+
+Deleting a body does not free its disk space until RocksDB compacts the column
+family. A full compaction rewrites every retained body, so a pass does not run one
+for each block it prunes. Two more metadata watermarks record how far the
+compactions have caught up: `compacted_prune_height` for `blocks` and `undo`, and
+`compacted_winners_strip_height` for `block_index`. A pass compacts a column family
+once at least `EXPIRY_COMPACTION_DEBT` heights (= `MIN_BLOCKS_TO_KEEP`, 2880) are
+owed. Then it advances that watermark, and it does so only after the compaction
+returns.
+
+* Steady state (about one block a minute): one compaction about every 2 days
+  instead of one a minute. Until then the space held is at most what the floor's
+  own bodies and undo data take, and RocksDB's background compaction often frees it
+  earlier.
+* Catch-up (`expire` enabled on a full datadir, or a long time offline): the first
+  pass owes thousands of heights and compacts at once.
+* Restarts: the owed heights are stored in the metadata column family, so a restart
+  keeps them. A datadir pruned by an older release has no compacted watermark. Its
+  first pass compacts once and records the watermark. Older releases ignore the
+  keys.
+* `--export-snapshot`: the export compacts `blocks`, `undo` and `block_index`
+  unconditionally after its own pass and before it hashes any file, so a snapshot
+  never ships deleted bodies, whatever its source owed.
 
 ## Behavior with pruned data
 
