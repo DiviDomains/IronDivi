@@ -889,11 +889,17 @@ mod tests {
         assert_eq!(check_statuses(last, |_| Err(failure.clone())), Err(failure));
     }
 
+    /// Counts its listings, the reads a fingerprint makes
     #[derive(Default)]
     struct EmptyMempool(std::sync::atomic::AtomicUsize);
 
     impl divi_rpc::blockchain::MempoolProvider for EmptyMempool {
         fn get_txids(&self) -> Vec<Hash256> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            vec![]
+        }
+
+        fn get_tx_infos(&self) -> Vec<divi_rpc::blockchain::MempoolTxInfo> {
             self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             vec![]
         }
@@ -929,6 +935,61 @@ mod tests {
 
     fn ping(id: usize) -> std::result::Result<String, std::convert::Infallible> {
         Ok(json!({"jsonrpc":"2.0","id":id,"method":"server.ping"}).to_string())
+    }
+
+    #[tokio::test]
+    async fn a_child_whose_parent_confirmed_gets_a_new_status() {
+        use crate::backend::pool_tests::{fixture, sh, tx};
+        use divi_primitives::transaction::OutPoint;
+
+        let f = fixture();
+        let parent = f.add(tx(&[], &[(1, 9)]), 1);
+        let child = f.add(tx(&[OutPoint::new(parent, 0)], &[(2, 8)]), 1);
+        let mut session = Session::new(f.backend.clone(), Arc::default());
+        let script = sh(2);
+        let mut shown = script;
+        shown.reverse();
+        let shown = hex::encode(shown);
+        let status = f.backend.status(&script).unwrap();
+        assert!(session.backend.subscriptions().take());
+        session
+            .scripthashes
+            .insert(shown.clone(), (script, status.clone()));
+        session.fingerprint = Some(f.backend.fingerprint());
+        // nothing but a fingerprint change starts a pass
+        session.reconcile_at = session.now() + Duration::from_secs(3600);
+        let permit = Arc::new(
+            session
+                .backend
+                .notifications
+                .clone()
+                .acquire_owned()
+                .await
+                .unwrap(),
+        );
+        let mut out: Vec<String> = Vec::new();
+        assert!(!session.check_chunk(&mut out, &permit).await.unwrap());
+        assert!(out.is_empty());
+        // the same txids under the same tip, the child no longer at -1
+        f.pool.force_depends(&child, Some(false));
+        assert!(!session.check_chunk(&mut out, &permit).await.unwrap());
+        let expected = crate::backend::status_hash(&[HistoryEntry {
+            txid: child,
+            height: 0,
+            fee: None,
+        }]);
+        assert_ne!(expected, status);
+        let sent: Vec<Value> = out
+            .iter()
+            .map(|m| serde_json::from_str(m).unwrap())
+            .collect();
+        assert_eq!(
+            sent,
+            [notification(
+                "blockchain.scripthash.subscribe",
+                json!([shown, expected])
+            )]
+        );
     }
 
     #[tokio::test]

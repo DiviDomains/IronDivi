@@ -63,14 +63,23 @@ The server refuses to start without `-addressindex=1` and `-txindex=1`.
 
 Unconfirmed transactions appear in `get_history`, `get_balance` and
 `listunspent` the way ElectrumX shows them: at height 0, or -1 when they spend
-an unconfirmed output. There is no address index for the mempool, so each
-request scans it, which costs time proportional to the mempool size. Divi's
-mempool is small, so this is fine for now.
+an unconfirmed output. The server keeps one index of the mempool, shared by
+every session: each pool output by script hash, and each pool input by the
+outpoint it spends. Each request and status check lists the pool (txid, fee,
+and whether it spends an unconfirmed output, in the pool's order) and uses
+the index when the listing is the one indexed; otherwise it builds a new
+index, reading only the transactions the old one did not hold. One pool state
+is read once however many scripts are queried; listing the pool still costs
+time proportional to its size on every call. Confirmed outputs come from the
+address index on every call, so the mempool index never holds chain data.
 
 ### Notifications
 
-Each connection checks the tip and the mempool about once a second. When the
-tip changes it pushes `blockchain.headers.subscribe`. When the status hash of a
+Each connection checks the tip and the mempool about once a second. Its
+fingerprint covers the tip and, for each pool transaction, the txid, the fee,
+and whether it spends an unconfirmed output, so a parent confirming while its
+child stays in the pool (the child going from height -1 to 0) starts a status
+pass. When the tip changes it pushes `blockchain.headers.subscribe`. When the status hash of a
 subscribed scripthash changes it pushes `blockchain.scripthash.subscribe`. The
 status hash is the Electrum one: sha256 over `txid:height:` for each history
 entry, in order.
@@ -217,8 +226,8 @@ Not covered: a reconnecting client starts with a new budget (ElectrumX groups
 cost by subnet; IronDivi does not), there is no connection-rate or TLS
 handshake limit, a client sending a byte every few seconds is held until the
 idle limit, many source addresses still add up to the total, and each
-session still computes its own mempool fingerprint and script queries still
-inspect a pool-wide snapshot. RPC-backed verbose results are materialized
+session's fingerprint and each script query still list the whole pool,
+though they share one index of it. RPC-backed verbose results are materialized
 before the bounded JSON encoder. Put a firewall or rate limit in front of a
 public server.
 

@@ -234,6 +234,9 @@ impl SubscriptionPool {
     }
 
     /// Takes one subscription, if there is one left
+    // fetch_update is deprecated as of Rust 1.100 (renamed try_update);
+    // kept so older toolchains still build
+    #[allow(deprecated)]
     pub fn take(&self) -> bool {
         self.used
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
@@ -247,6 +250,7 @@ impl SubscriptionPool {
         self.used() >= self.max
     }
 
+    #[allow(deprecated)]
     pub fn give(&self, n: usize) {
         let _ = self
             .used
@@ -271,7 +275,7 @@ mod tests {
     #[test]
     fn history_limit_follows_the_response_limit() {
         assert_eq!(MAX_HISTORY_ENTRIES, 81_817);
-        assert!(MAX_HISTORY_ENTRIES * 99 + 100 <= MAX_RESPONSE_BYTES);
+        const { assert!(MAX_HISTORY_ENTRIES * 99 + 100 <= MAX_RESPONSE_BYTES) };
     }
 
     #[test]

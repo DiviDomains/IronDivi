@@ -10,7 +10,7 @@
 //! blocks on RocksDB, so sessions run them on the blocking pool.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use crate::limits::MAX_HISTORY_ENTRIES;
 use divi_crypto::hash::{double_sha256, sha256};
@@ -161,6 +161,7 @@ pub fn merkle_branch(txids: &[Hash256], mut pos: usize) -> Vec<Hash256> {
 }
 
 /// The mempool as one scripthash sees it
+#[derive(Debug, PartialEq)]
 struct MempoolView {
     /// Pool transactions that pay to or spend from the script
     history: Vec<HistoryEntry>,
@@ -168,6 +169,182 @@ struct MempoolView {
     outputs: Vec<(OutPoint, i64, i64)>,
     /// Outpoints of the script that pool transactions spend
     spent: HashSet<OutPoint>,
+}
+
+/// A pool transaction as `get_tx_infos` lists it: txid, fee in satoshis, and
+/// whether it spends an unconfirmed output
+type PoolEntry = (Hash256, i64, bool);
+
+/// What the index keeps of one pool transaction. A txid commits to the whole
+/// transaction, so this never goes stale while the txid is in the pool.
+struct PoolTx {
+    /// The script hash and value of each output
+    outputs: Vec<([u8; 32], i64)>,
+    /// The outpoint each input spends
+    inputs: Vec<OutPoint>,
+}
+
+impl PoolTx {
+    fn new(tx: &Transaction) -> Self {
+        PoolTx {
+            outputs: tx
+                .vout
+                .iter()
+                .map(|out| {
+                    (
+                        script_hash(out.script_pubkey.as_bytes()),
+                        out.value.as_sat(),
+                    )
+                })
+                .collect(),
+            inputs: tx.vin.iter().map(|input| input.prevout).collect(),
+        }
+    }
+}
+
+/// The whole mempool indexed by script and by spent outpoint, built once per
+/// pool state and shared by every request and status check until the pool
+/// changes. It holds no chain data: confirmed outputs are read per call.
+struct MempoolIndex {
+    /// The pool transactions indexed, in `get_tx_infos` order. One that left
+    /// the pool before it could be read is missing, so the next listing
+    /// differs and the index is rebuilt.
+    entries: Vec<PoolEntry>,
+    /// sha256 over `entries` sorted, for the session fingerprint
+    digest: [u8; 32],
+    /// Each indexed transaction, kept so the next index reads only new ones
+    txs: HashMap<Hash256, Arc<PoolTx>>,
+    /// Outputs to each script as (position in `entries`, vout, value), in
+    /// pool order then output order
+    paying: HashMap<[u8; 32], Vec<(usize, u32, i64)>>,
+    /// The positions of the pool transactions spending each outpoint, once
+    /// per input
+    spenders: HashMap<OutPoint, Vec<usize>>,
+}
+
+impl MempoolIndex {
+    /// Indexes `listed`, reading from the pool only the transactions that
+    /// `previous` does not hold
+    fn build(
+        listed: Vec<PoolEntry>,
+        previous: Option<&MempoolIndex>,
+        fetch: impl Fn(&Hash256) -> Option<Transaction>,
+    ) -> Self {
+        let mut entries = Vec::with_capacity(listed.len());
+        let mut txs: HashMap<Hash256, Arc<PoolTx>> = HashMap::with_capacity(listed.len());
+        let mut paying: HashMap<[u8; 32], Vec<(usize, u32, i64)>> = HashMap::new();
+        let mut spenders: HashMap<OutPoint, Vec<usize>> = HashMap::new();
+        for entry in listed {
+            let txid = entry.0;
+            let known = txs
+                .get(&txid)
+                .or_else(|| previous.and_then(|p| p.txs.get(&txid)))
+                .cloned();
+            let tx = match known {
+                Some(tx) => tx,
+                None => match fetch(&txid) {
+                    Some(tx) => Arc::new(PoolTx::new(&tx)),
+                    // gone since the listing: skipped, as a scan skips it
+                    None => continue,
+                },
+            };
+            let pos = entries.len();
+            for (k, (sh, value)) in tx.outputs.iter().enumerate() {
+                paying.entry(*sh).or_default().push((pos, k as u32, *value));
+            }
+            for prevout in &tx.inputs {
+                spenders.entry(*prevout).or_default().push(pos);
+            }
+            txs.insert(txid, tx);
+            entries.push(entry);
+        }
+        let mut sorted = entries.clone();
+        sorted.sort();
+        let mut data = Vec::with_capacity(sorted.len() * 41);
+        for (txid, fee, depends) in &sorted {
+            data.extend_from_slice(txid.as_bytes());
+            data.extend_from_slice(&fee.to_le_bytes());
+            data.push(u8::from(*depends));
+        }
+        MempoolIndex {
+            entries,
+            digest: sha256(&data),
+            txs,
+            paying,
+            spenders,
+        }
+    }
+
+    /// Unconfirmed height: -1 for a transaction spending an unconfirmed
+    /// output, else 0
+    fn height(&self, pos: usize) -> i64 {
+        if self.entries[pos].2 {
+            -1
+        } else {
+            0
+        }
+    }
+
+    /// The pool as script `sh` sees it, given its confirmed unspent outputs.
+    /// Every pool output to the script is found before any spend is looked
+    /// for, so a spend listed before the output it spends still counts.
+    fn view(
+        &self,
+        sh: &[u8; 32],
+        confirmed: &[Unspent],
+        max_outputs: usize,
+        history_limit: usize,
+    ) -> Result<MempoolView> {
+        let paying = self.paying.get(sh).map_or(&[][..], Vec::as_slice);
+        if paying.len() > max_outputs {
+            return Err(ElectrumError::bad_request("too many unspent outputs"));
+        }
+        let outputs: Vec<(OutPoint, i64, i64)> = paying
+            .iter()
+            .map(|&(pos, vout, value)| {
+                (
+                    OutPoint::new(self.entries[pos].0, vout),
+                    value,
+                    self.height(pos),
+                )
+            })
+            .collect();
+        let mut relevant: Vec<usize> = paying.iter().map(|&(pos, _, _)| pos).collect();
+        let mut spent = HashSet::new();
+        let owned = confirmed
+            .iter()
+            .map(|u| OutPoint::new(u.txid, u.vout))
+            .chain(outputs.iter().map(|(outpoint, _, _)| *outpoint));
+        for outpoint in owned {
+            if let Some(spenders) = self.spenders.get(&outpoint) {
+                spent.insert(outpoint);
+                relevant.extend_from_slice(spenders);
+            }
+        }
+        relevant.sort_unstable();
+        relevant.dedup();
+        if relevant.len() > history_limit {
+            return Err(ElectrumError::bad_request("history too large"));
+        }
+        let mut history: Vec<HistoryEntry> = relevant
+            .into_iter()
+            .map(|pos| HistoryEntry {
+                txid: self.entries[pos].0,
+                height: self.height(pos),
+                fee: Some(self.entries[pos].1),
+            })
+            .collect();
+        history.sort_by(|a, b| {
+            b.height
+                .cmp(&a.height)
+                .then_with(|| a.txid.to_hex().cmp(&b.txid.to_hex()))
+        });
+        Ok(MempoolView {
+            history,
+            outputs,
+            spent,
+        })
+    }
 }
 
 pub struct Backend {
@@ -180,6 +357,13 @@ pub struct Backend {
     pub(crate) notifications: Arc<tokio::sync::Semaphore>,
     /// Scripthash subscriptions over every session
     subscriptions: Arc<crate::limits::SubscriptionPool>,
+    /// The index of the last mempool state seen, shared by every call
+    pool_index: RwLock<Option<Arc<MempoolIndex>>>,
+    /// Held while an index is built, so one pool state is read once
+    pool_build: Mutex<()>,
+    /// Answer from the reference mempool scan instead of the index
+    #[cfg(test)]
+    reference: bool,
 }
 
 /// Most calls into the chain and mempool running at once, all sessions
@@ -198,6 +382,10 @@ impl Backend {
             subscriptions: Arc::new(crate::limits::SubscriptionPool::new(
                 crate::limits::MAX_TOTAL_SUBSCRIPTIONS,
             )),
+            pool_index: RwLock::new(None),
+            pool_build: Mutex::new(()),
+            #[cfg(test)]
+            reference: false,
         }
     }
 
@@ -215,18 +403,62 @@ impl Backend {
     }
 
     /// A fingerprint of the tip and the mempool; sessions recompute
-    /// statuses only when it changes
+    /// statuses only when it changes. The mempool part covers each
+    /// transaction's fee and whether it spends an unconfirmed output, so a
+    /// parent confirming under a child still in the pool changes it.
     pub fn fingerprint(&self) -> [u8; 32] {
-        let mut data = Vec::new();
+        let mut data = Vec::with_capacity(64);
         if let Some(tip) = self.chain.tip() {
             data.extend_from_slice(tip.hash.as_bytes());
         }
-        let mut txids = self.mempool.get_txids();
-        txids.sort();
-        for txid in txids {
-            data.extend_from_slice(txid.as_bytes());
-        }
+        data.extend_from_slice(&self.pool_index().digest);
         sha256(&data)
+    }
+
+    /// The index of the mempool as it is now: the shared one when the pool
+    /// lists the same transactions, fees and dependencies in the same order,
+    /// else a new one. No lock is held while the caller uses it.
+    fn pool_index(&self) -> Arc<MempoolIndex> {
+        let listed: Vec<PoolEntry> = self
+            .mempool
+            .get_tx_infos()
+            .into_iter()
+            .map(|info| (info.txid, info.fee_sat, !info.depends.is_empty()))
+            .collect();
+        if let Some(index) = self.cached_pool_index(&listed) {
+            return index;
+        }
+        let _building = self
+            .pool_build
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        // built by another call while this one waited
+        if let Some(index) = self.cached_pool_index(&listed) {
+            return index;
+        }
+        let previous = self
+            .pool_index
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let index = Arc::new(MempoolIndex::build(listed, previous.as_deref(), |txid| {
+            self.mempool.get_transaction(txid)
+        }));
+        *self
+            .pool_index
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Some(index.clone());
+        index
+    }
+
+    /// The shared index, if it indexes exactly `listed`
+    fn cached_pool_index(&self, listed: &[PoolEntry]) -> Option<Arc<MempoolIndex>> {
+        self.pool_index
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .filter(|index| index.entries == listed)
+            .cloned()
     }
 
     /// The tip as `blockchain.headers.subscribe` reports it
@@ -343,64 +575,18 @@ impl Backend {
         confirmed: &[Unspent],
         history_limit: usize,
     ) -> Result<MempoolView> {
-        let infos = self.mempool.get_tx_infos();
-        let mut txs: Vec<(Hash256, i64, bool, Transaction)> = Vec::new();
-        for info in infos {
-            if let Some(tx) = self.mempool.get_transaction(&info.txid) {
-                txs.push((info.txid, info.fee_sat, !info.depends.is_empty(), tx));
-            }
+        #[cfg(test)]
+        if self.reference {
+            return pool_tests::reference_view(
+                self.mempool.as_ref(),
+                sh,
+                confirmed,
+                MAX_HISTORY_ENTRIES,
+                history_limit,
+            );
         }
-        let mut values: HashMap<OutPoint, i64> = confirmed
-            .iter()
-            .map(|u| (OutPoint::new(u.txid, u.vout), u.value))
-            .collect();
-        let mut outputs = Vec::new();
-        let mut paying: HashSet<Hash256> = HashSet::new();
-        for (txid, _, depends, tx) in &txs {
-            for (k, out) in tx.vout.iter().enumerate() {
-                if script_hash(out.script_pubkey.as_bytes()) == *sh {
-                    if outputs.len() == MAX_HISTORY_ENTRIES {
-                        return Err(ElectrumError::bad_request("too many unspent outputs"));
-                    }
-                    let outpoint = OutPoint::new(*txid, k as u32);
-                    let value = out.value.as_sat();
-                    values.insert(outpoint, value);
-                    outputs.push((outpoint, value, if *depends { -1 } else { 0 }));
-                    paying.insert(*txid);
-                }
-            }
-        }
-        let mut spent = HashSet::new();
-        let mut history = Vec::new();
-        for (txid, fee, depends, tx) in &txs {
-            let mut relevant = paying.contains(txid);
-            for input in &tx.vin {
-                if values.contains_key(&input.prevout) {
-                    spent.insert(input.prevout);
-                    relevant = true;
-                }
-            }
-            if relevant {
-                if history.len() == history_limit {
-                    return Err(ElectrumError::bad_request("history too large"));
-                }
-                history.push(HistoryEntry {
-                    txid: *txid,
-                    height: if *depends { -1 } else { 0 },
-                    fee: Some(*fee),
-                });
-            }
-        }
-        history.sort_by(|a, b| {
-            b.height
-                .cmp(&a.height)
-                .then_with(|| a.txid.to_hex().cmp(&b.txid.to_hex()))
-        });
-        Ok(MempoolView {
-            history,
-            outputs,
-            spent,
-        })
+        self.pool_index()
+            .view(sh, confirmed, MAX_HISTORY_ENTRIES, history_limit)
     }
 
     pub fn history(&self, sh: &[u8; 32]) -> Result<Vec<HistoryEntry>> {
@@ -536,6 +722,9 @@ impl Backend {
         }
     }
 }
+
+#[cfg(test)]
+pub(crate) mod pool_tests;
 
 #[cfg(test)]
 mod tests {
