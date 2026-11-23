@@ -1417,15 +1417,17 @@ impl WalletRpc {
         let wallet = self.get_wallet()?;
 
         let height = self.current_height();
-        // Same figures as getbalance, getunconfirmedbalance, getimmaturebalance
-        let balance = wallet.get_balance();
-        let unconfirmed = wallet.get_unconfirmed_balance();
-        let immature = wallet.get_immature_balance(height, wallet.coinbase_maturity());
-
-        // Core: spendable_balance excludes every vault, vaulted_balance is the
-        // coins in vaults we own (a managed vault is in neither)
-        let spendable = wallet.get_spendable_balance(height);
-        let vaulted = wallet.get_vaulted_balance();
+        // Same figures as getbalance, getunconfirmedbalance, getimmaturebalance,
+        // from one pass over the coins. Core: spendable_balance excludes every
+        // vault, vaulted_balance is the coins in vaults we own (a managed vault
+        // is in neither)
+        let divi_wallet::WalletBalances {
+            balance,
+            unconfirmed,
+            immature,
+            spendable,
+            vaulted,
+        } = wallet.balance_summary(height);
 
         let divi_balance = balance.as_sat() as f64 / 100_000_000.0;
         let divi_unconfirmed = unconfirmed.as_sat() as f64 / 100_000_000.0;
@@ -1440,7 +1442,7 @@ impl WalletRpc {
             "immature_balance": divi_immature,
             "spendable_balance": spendable.as_divi_f64(),
             "vaulted_balance": vaulted.as_divi_f64(),
-            "txcount": wallet.history_records().len(),
+            "txcount": wallet.history_count(),
             "keypoolsize": wallet.keypool_size(),
         });
         // Core sends unlocked_until only for an encrypted wallet; clients such
@@ -8805,5 +8807,134 @@ mod pq_posture_and_sweep {
             err_code(rpc.plan_pq_sweep(&p(&[json!(pq_addr), json!(0)]))),
             codes::INVALID_PARAMETER
         );
+    }
+}
+
+#[cfg(test)]
+mod wallet_info_single_pass {
+    use super::*;
+    use divi_primitives::transaction::{TxIn, TxOut};
+    use divi_primitives::ChainMode;
+    use divi_wallet::{HdWallet, WalletUtxo};
+
+    const COIN: i64 = 100_000_000;
+
+    /// getwalletinfo as each of its figures' own calls builds it
+    fn reference(rpc: &WalletRpc, wallet: &WalletDb) -> serde_json::Value {
+        let height = rpc.current_height();
+        let balance = wallet.get_balance();
+        let unconfirmed = wallet.get_unconfirmed_balance();
+        let immature = wallet.get_immature_balance(height, wallet.coinbase_maturity());
+        let spendable = wallet.get_spendable_balance(height);
+        let vaulted = wallet.get_vaulted_balance();
+        let mut info = serde_json::json!({
+            "active_wallet": "wallet.dat",
+            "walletversion": 120200,
+            "balance": balance.as_sat() as f64 / 100_000_000.0,
+            "unconfirmed_balance": unconfirmed.as_sat() as f64 / 100_000_000.0,
+            "immature_balance": immature.as_sat() as f64 / 100_000_000.0,
+            "spendable_balance": spendable.as_divi_f64(),
+            "vaulted_balance": vaulted.as_divi_f64(),
+            "txcount": wallet.history_records().len(),
+            "keypoolsize": wallet.keypool_size(),
+        });
+        if wallet.is_encrypted() {
+            info["unlocked_until"] = serde_json::json!(wallet.unlocked_until());
+        }
+        info["encryption_status"] = serde_json::json!(wallet.encryption_status());
+        info["walletname"] = serde_json::json!("wallet.dat");
+        info["keypoololdest"] = serde_json::json!(wallet.keypool_oldest());
+        info["paytxfee"] = serde_json::json!(0.0001);
+        info["hdmasterkeyid"] = serde_json::json!(wallet.hd_master_key_id());
+        info
+    }
+
+    fn coin(tag: u8, sat: i64, script: Script, height: Option<u32>) -> WalletUtxo {
+        WalletUtxo {
+            height,
+            ..WalletUtxo::new(
+                Hash256::from_bytes([tag; 32]),
+                0,
+                Amount::from_sat(sat),
+                script,
+                String::new(),
+            )
+        }
+    }
+
+    /// The single pass gives the reply member for member, in order, at chain
+    /// heights behind, at and ahead of the scan height
+    #[test]
+    fn getwalletinfo_matches_the_calls_of_each_figure() {
+        let db = Arc::new(WalletDb::with_hd_wallet(
+            Network::Mainnet,
+            HdWallet::new(ChainMode::Divi).unwrap(),
+        ));
+        let rpc = WalletRpc::with_wallet(db.clone());
+        let mine = db.new_receiving_address().unwrap();
+        let owner = db.new_receiving_address().unwrap();
+        let mine_script = Script::new_p2pkh(mine.hash.as_bytes());
+        let mut owner_hash = [0u8; 20];
+        owner_hash.copy_from_slice(owner.hash.as_bytes());
+        let vault = divi_script::StakingVaultScript::new(owner_hash, [0x44; 20]).to_script();
+        db.add_utxo(coin(1, 100 * COIN, mine_script.clone(), Some(10)));
+        db.add_utxo(WalletUtxo {
+            is_coinbase: true,
+            ..coin(2, 1_250 * COIN, mine_script.clone(), Some(30))
+        });
+        db.add_utxo(WalletUtxo {
+            is_coinstake: true,
+            ..coin(3, 300 * COIN, vault.clone(), Some(35))
+        });
+        db.add_utxo(coin(4, 9 * COIN, mine_script.clone(), None));
+        db.add_utxo(coin(5, 50 * COIN, vault, Some(12)));
+        let send = Transaction {
+            version: 1,
+            vin: vec![TxIn::new(
+                OutPoint::new(Hash256::from_bytes([1; 32]), 0),
+                Script::new(),
+                0xffff_ffff,
+            )],
+            vout: vec![
+                TxOut::new(Amount::from_sat(40 * COIN), Script::new_p2pkh(&[0xaa; 20])),
+                TxOut::new(Amount::from_sat(59 * COIN), mine_script.clone()),
+            ],
+            lock_time: 0,
+        };
+        assert!(db.add_mempool_tx(&send));
+        let incoming = Transaction {
+            version: 1,
+            vin: vec![TxIn::new(
+                OutPoint::new(Hash256::from_bytes([0xee; 32]), 0),
+                Script::new(),
+                0xffff_ffff,
+            )],
+            vout: vec![TxOut::new(Amount::from_sat(7 * COIN), mine_script)],
+            lock_time: 0,
+        };
+        assert!(db.add_mempool_tx(&incoming));
+        db.keep_refused_send(&Transaction {
+            lock_time: 7,
+            ..incoming.clone()
+        });
+
+        let mut replies = std::collections::HashSet::new();
+        for scan in [0, 20, 40, 49, 50, 55, 400] {
+            db.set_last_scan_height(scan);
+            for height in [0, 10, 30, 49, 50, 54, 55, 56, 400] {
+                rpc.set_height(height);
+                let got = rpc.get_wallet_info(&Params::None).unwrap();
+                let want = reference(&rpc, &db);
+                assert_eq!(
+                    got.to_string(),
+                    want.to_string(),
+                    "height {height}, scanned {scan}"
+                );
+                replies.insert(got.to_string());
+            }
+        }
+        // the heights give replies that differ
+        assert!(replies.len() > 4, "{}", replies.len());
+        assert_eq!(rpc.get_wallet_info(&Params::None).unwrap()["txcount"], 3);
     }
 }

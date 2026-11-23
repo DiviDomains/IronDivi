@@ -115,5 +115,6 @@ pub use pq_sweep::{
 pub use signer::{sighash, sign_input, TransactionBuilder, TransactionSigner};
 #[cfg(not(target_arch = "wasm32"))]
 pub use wallet_db::{
-    DetachedTx, Ownership, TxListener, WalletDb, WalletTx, WalletUtxo, BACKUP_MARKER,
+    DetachedTx, Ownership, TxListener, WalletBalances, WalletDb, WalletTx, WalletUtxo,
+    BACKUP_MARKER,
 };

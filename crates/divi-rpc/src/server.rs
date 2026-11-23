@@ -81,7 +81,7 @@ pub const MAX_BATCH_CALLS: usize = 100;
 /// Most requests run at once. Handlers block (RocksDB, signing, scans), so
 /// they run on the blocking pool, and a flood of requests waits here instead
 /// of starving the runtime that drives P2P, staking and masternode pings.
-const MAX_CONCURRENT_REQUESTS: usize = 16;
+pub(crate) const MAX_CONCURRENT_REQUESTS: usize = 16;
 
 impl Default for RpcConfig {
     fn default() -> Self {
@@ -201,7 +201,8 @@ pub(crate) fn rpc_peer_limits(threads: usize) -> crate::conn_policy::PeerLimits 
 }
 
 /// Serve `app` on `listeners` with the default [`ConnectionPolicy`]; see
-/// [`serve_listener_with`]
+/// [`serve_listener_with`]. Only the tests serve this way.
+#[cfg(test)]
 pub(crate) async fn serve_listener(
     listeners: Vec<tokio::net::TcpListener>,
     app: Router,
@@ -1189,8 +1190,17 @@ impl RpcServer {
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
 
-        // Wallet data, none without a wallet
-        let wallet_info = self.wallet.get_wallet_info(&Params::None).ok();
+        // Wallet data, none without a wallet: getwalletinfo's balance and
+        // keypool members, without the members getinfo leaves out. The balance
+        // is getbalance's, matured at the scan height whatever the height given;
+        // the one pass over the coins costs less than get_balance's copy of them.
+        let wallet_info = self.wallet.wallet_db().map(|wallet| {
+            (
+                wallet.balance_summary(height).balance.as_sat() as f64 / 100_000_000.0,
+                wallet.keypool_oldest(),
+                wallet.keypool_size(),
+            )
+        });
 
         // Staking status from staking subsystem
         // Divi Core: "Staking Active" when the node tried to stake lately
@@ -1207,9 +1217,9 @@ impl RpcServer {
             "version": "3.0.0.0",
             "protocolversion": divi_network::constants::protocol_version(),
         });
-        if let Some(wallet) = &wallet_info {
+        if let Some((balance, _, _)) = wallet_info {
             info["walletversion"] = serde_json::json!(120200);
-            info["balance"] = serde_json::json!(wallet["balance"].as_f64().unwrap_or(0.0));
+            info["balance"] = serde_json::json!(balance);
         }
         info["blocks"] = serde_json::json!(height);
         // GetTimeOffset (rpcmisc.cpp:147)
@@ -1223,10 +1233,9 @@ impl RpcServer {
         info["staking status"] = serde_json::json!(staking_status_text);
         info["errors"] = serde_json::json!(crate::warnings::status_bar());
         // irondivid's own members, after divid's
-        if let Some(wallet) = &wallet_info {
-            info["keypoololdest"] =
-                serde_json::json!(wallet["keypoololdest"].as_u64().unwrap_or(0));
-            info["keypoolsize"] = serde_json::json!(wallet["keypoolsize"].as_u64().unwrap_or(0));
+        if let Some((_, keypool_oldest, keypool_size)) = wallet_info {
+            info["keypoololdest"] = serde_json::json!(keypool_oldest);
+            info["keypoolsize"] = serde_json::json!(keypool_size);
             info["paytxfee"] = serde_json::json!(0.0);
         }
         Ok(info)
@@ -1377,7 +1386,7 @@ impl RpcServer {
         // Safe wallet summary (B2.9: counts, flags, and magnitude buckets only)
         let wallet_section = match self.wallet.wallet_db() {
             Some(w) => {
-                let tx_count = w.history_records().len() as u64;
+                let tx_count = w.history_count() as u64;
                 let tx_bucket = if tx_count == 0 {
                     "count-0".to_string()
                 } else {
@@ -1387,8 +1396,8 @@ impl RpcServer {
                     "loaded": true,
                     "encrypted": w.is_encrypted(),
                     "encryption_status": w.encryption_status(),
-                    "address_count": w.get_addresses().len(),
-                    "utxo_count": w.get_utxos().len(),
+                    "address_count": w.address_count(),
+                    "utxo_count": w.utxo_count(),
                     "tx_count_bucket": tx_bucket,
                     "mempool_tx_count": w.mempool_tx_count(),
                     "keypool_size": w.keypool_size(),
@@ -3090,8 +3099,10 @@ fn build_router(
     rest: bool,
     max_request_size: usize,
 ) -> Router {
+    // At most MAX_CONCURRENT_REQUESTS requests run at once, JSON-RPC and REST
+    let slots = Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS));
     // /rest/ paths: REST when on, without credentials, as divid
-    let rest_paths = crate::rest::router(server.clone(), rest);
+    let rest_paths = crate::rest::router(server.clone(), rest).layer(Extension(slots.clone()));
     let origins: Vec<HeaderValue> = access
         .allowed_origins()
         .iter()
@@ -3107,7 +3118,7 @@ fn build_router(
             post(handle_wallet_rpc).get(handle_wallet_rpc),
         )
         .with_state(server)
-        .layer(Extension(Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS))))
+        .layer(Extension(slots))
         .layer(DefaultBodyLimit::max(
             max_request_size.min(crate::http::MAX_BODY),
         ));
@@ -4567,5 +4578,159 @@ mod tests {
     fn node13_default_body_limit_holds_a_full_block() {
         // submitblock sends a 2 MB block as 4 MB of hex
         assert!(RpcConfig::default().max_request_size >= 4 * 1024 * 1024 + 1024);
+    }
+
+    /// getinfo's wallet members are getwalletinfo's, and getdiaginfo's wallet
+    /// counts those of the full lists, from the single-pass figures; members
+    /// in Divi Core's order, the wallet's only with a wallet
+    #[test]
+    fn getinfo_and_getdiaginfo_wallet_members_match_the_full_calls() {
+        use divi_primitives::amount::Amount;
+        use divi_primitives::hash::Hash256;
+        use divi_primitives::script::Script;
+        use divi_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut};
+        use divi_wallet::WalletUtxo;
+        use serde_json::json;
+
+        let dir = tempdir().unwrap();
+        let db = Arc::new(ChainDatabase::open(dir.path()).unwrap());
+        let params = ChainParams::for_network(
+            divi_storage::chain::NetworkType::Regtest,
+            divi_primitives::ChainMode::Divi,
+        );
+        let chain = Arc::new(Chain::new(db, params).unwrap());
+        let wallet = Arc::new(WalletDb::with_hd_wallet(
+            divi_wallet::Network::Regtest,
+            divi_wallet::HdWallet::new(divi_primitives::ChainMode::Divi).unwrap(),
+        ));
+        let mine = Script::new_p2pkh(wallet.new_receiving_address().unwrap().hash.as_bytes());
+        for (tag, sat, height, coinbase) in [
+            (1u8, 123_456_789i64, Some(3u32), false),
+            (2, 125_000_000_000, Some(5), true),
+            (3, 7_00000000, None, false),
+        ] {
+            wallet.add_utxo(WalletUtxo {
+                height,
+                is_coinbase: coinbase,
+                ..WalletUtxo::new(
+                    Hash256::from_bytes([tag; 32]),
+                    0,
+                    Amount::from_sat(sat),
+                    mine.clone(),
+                    String::new(),
+                )
+            });
+        }
+        let send = Transaction {
+            version: 1,
+            vin: vec![TxIn::new(
+                OutPoint::new(Hash256::from_bytes([1; 32]), 0),
+                Script::new(),
+                0xffff_ffff,
+            )],
+            vout: vec![TxOut::new(Amount::from_sat(100_000_000), mine.clone())],
+            lock_time: 0,
+        };
+        assert!(wallet.add_mempool_tx(&send));
+        wallet.set_last_scan_height(30);
+        let server = RpcServer::with_wallet(chain, wallet.clone());
+
+        let info = call(&server, "getinfo", Params::None).result.unwrap();
+        let full = server.wallet.get_wallet_info(&Params::None).unwrap();
+        let keys: Vec<&str> = info
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "version",
+                "protocolversion",
+                "walletversion",
+                "balance",
+                "blocks",
+                "timeoffset",
+                "connections",
+                "proxy",
+                "difficulty",
+                "testnet",
+                "moneysupply",
+                "relayfee",
+                "staking status",
+                "errors",
+                "keypoololdest",
+                "keypoolsize",
+                "paytxfee",
+            ]
+        );
+        assert_eq!(
+            info["balance"],
+            json!(full["balance"].as_f64().unwrap_or(0.0))
+        );
+        assert_eq!(
+            info["keypoololdest"],
+            json!(full["keypoololdest"].as_u64().unwrap_or(0))
+        );
+        assert_eq!(
+            info["keypoolsize"],
+            json!(full["keypoolsize"].as_u64().unwrap_or(0))
+        );
+        assert_eq!(info["paytxfee"], json!(0.0));
+        assert_eq!(full["paytxfee"], json!(0.0001));
+        // the chain is at genesis, the wallet scanned to 30 (the first coin
+        // spent in the mempool, the coinbase mature): getbalance's
+        // figure, matured at the scan height
+        assert_eq!(info["balance"], json!(1250.0));
+        assert_eq!(info["balance"].to_string(), full["balance"].to_string());
+
+        let diag = server
+            .get_diag_info(&Params::None, Caller::unknown())
+            .unwrap();
+        let tx_count = wallet.history_records().len() as u64;
+        let expected = json!({
+            "loaded": true,
+            "encrypted": wallet.is_encrypted(),
+            "encryption_status": wallet.encryption_status(),
+            "address_count": wallet.get_addresses().len(),
+            "utxo_count": wallet.get_utxos().len(),
+            "tx_count_bucket": format!("count-1e{}", tx_count.ilog10()),
+            "mempool_tx_count": wallet.mempool_tx_count(),
+            "keypool_size": wallet.keypool_size(),
+        });
+        assert_eq!(diag["wallet"].to_string(), expected.to_string());
+        assert_eq!(diag["wallet"]["utxo_count"], json!(3));
+
+        // Without a wallet: none of the wallet's members
+        let (bare, _bare_dir) = create_test_server();
+        let info = call(&bare, "getinfo", Params::None).result.unwrap();
+        let keys: Vec<&str> = info
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "version",
+                "protocolversion",
+                "blocks",
+                "timeoffset",
+                "connections",
+                "proxy",
+                "difficulty",
+                "testnet",
+                "moneysupply",
+                "relayfee",
+                "staking status",
+                "errors",
+            ]
+        );
+        let diag = bare
+            .get_diag_info(&Params::None, Caller::unknown())
+            .unwrap();
+        assert_eq!(diag["wallet"], json!({ "loaded": false }));
     }
 }

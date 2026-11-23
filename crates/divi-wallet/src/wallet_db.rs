@@ -267,6 +267,67 @@ impl CoinSource {
     }
 }
 
+/// The balances getwalletinfo reports ([`WalletDb::balance_summary`])
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WalletBalances {
+    /// [`WalletDb::get_balance`]
+    pub balance: Amount,
+    /// [`WalletDb::get_unconfirmed_balance`]
+    pub unconfirmed: Amount,
+    /// [`WalletDb::get_immature_balance`]
+    pub immature: Amount,
+    /// [`WalletDb::get_spendable_balance`]
+    pub spendable: Amount,
+    /// [`WalletDb::get_vaulted_balance`]
+    pub vaulted: Amount,
+}
+
+/// The coins of one output script, summed by the filters of the balances
+#[derive(Default)]
+struct ScriptCoins {
+    /// Confirmed and mature at the last scanned height
+    mature_at_scan: Amount,
+    /// Confirmed and mature at the current height
+    mature_now: Amount,
+    /// Confirmed and immature at the current height
+    immature_now: Amount,
+    /// Recorded without a height, or output of a mempool transaction
+    unconfirmed: Amount,
+    /// Output of a trusted mempool transaction
+    trusted_mempool: Amount,
+}
+
+impl ScriptCoins {
+    fn add(
+        &mut self,
+        coin: &WalletUtxo,
+        source: CoinSource,
+        scan_height: u32,
+        current_height: u32,
+        maturity: u32,
+    ) {
+        match source {
+            CoinSource::Block if coin.height.is_some() => {
+                if coin.is_mature(scan_height, maturity) {
+                    self.mature_at_scan += coin.value;
+                }
+                if coin.is_mature(current_height, maturity) {
+                    self.mature_now += coin.value;
+                } else {
+                    self.immature_now += coin.value;
+                }
+            }
+            CoinSource::Block => self.unconfirmed += coin.value,
+            CoinSource::Mempool { trusted } => {
+                self.unconfirmed += coin.value;
+                if trusted {
+                    self.trusted_mempool += coin.value;
+                }
+            }
+        }
+    }
+}
+
 /// A wallet transaction that left the chain or the mempool without
 /// confirming: conflicted by another spend, evicted, or in a block that was
 /// disconnected. Divi Core keeps such transactions in the wallet, at depth -1
@@ -2294,6 +2355,11 @@ impl WalletDb {
         self.keystore.get_addresses()
     }
 
+    /// How many addresses [`Self::get_addresses`] gives: one per key entry
+    pub fn address_count(&self) -> usize {
+        self.keystore.key_count()
+    }
+
     /// Whether the wallet knows an address at all, spendable or watched
     /// (Divi Core's IsMine of its script is not ISMINE_NO)
     pub fn is_mine(&self, address: &Address) -> bool {
@@ -3064,6 +3130,116 @@ impl WalletDb {
             .filter(|(_, source)| matches!(source, CoinSource::Mempool { trusted: true }))
             .fold(Amount::ZERO, |a, (u, _)| a + u.value);
         self.confirmed_mature(&[Ownership::Spendable], current_height) + unconfirmed
+    }
+
+    /// The five balances of getwalletinfo from one look at the coins. Each is
+    /// the figure its own call gives: [`Self::get_balance`],
+    /// [`Self::get_unconfirmed_balance`], [`Self::get_immature_balance`] at
+    /// `current_height` with the network's maturity,
+    /// [`Self::get_spendable_balance`] at `current_height` and
+    /// [`Self::get_vaulted_balance`]. As in those calls, the balance and the
+    /// vaulted balance mature at the last scanned height, the immature and
+    /// spendable balances at `current_height`.
+    ///
+    /// The coins are summed per output script under the overlay and UTXO
+    /// locks, and each script's ownership is found once those locks are
+    /// released, as `owned_coins` finds it: ownership takes the key, script
+    /// and vault locks, and `get_vault_utxos` holds the vaults before the UTXOs.
+    pub fn balance_summary(&self, current_height: u32) -> WalletBalances {
+        let maturity = self.coinbase_maturity();
+        let scan_height = self.last_scan_height();
+        let by_script: Vec<(Script, ScriptCoins)> = {
+            let overlay = self.mempool_txs.read();
+            let spent = Self::mempool_spent_in(&overlay);
+            let utxos = self.utxos.read();
+            let (spent, held) = (&spent, &*utxos);
+            // The coins of effective_utxos, in its order
+            let confirmed = held
+                .values()
+                .filter(|u| !spent.contains(&u.outpoint()))
+                .map(|u| (u, CoinSource::Block));
+            let pending = overlay.values().flat_map(|entry| {
+                entry
+                    .outputs
+                    .iter()
+                    .filter(|u| !spent.contains(&u.outpoint()) && !held.contains_key(&u.outpoint()))
+                    .map(|u| {
+                        (
+                            u,
+                            CoinSource::Mempool {
+                                trusted: entry.trusted,
+                            },
+                        )
+                    })
+            });
+            let mut slots: HashMap<&[u8], usize> = HashMap::new();
+            let mut sums: Vec<(&Script, ScriptCoins)> = Vec::new();
+            for (u, source) in confirmed.chain(pending) {
+                let slot = *slots.entry(u.script_pubkey.as_bytes()).or_insert_with(|| {
+                    sums.push((&u.script_pubkey, ScriptCoins::default()));
+                    sums.len() - 1
+                });
+                sums[slot]
+                    .1
+                    .add(u, source, scan_height, current_height, maturity);
+            }
+            sums.into_iter()
+                .map(|(script, coins)| (script.clone(), coins))
+                .collect()
+        };
+
+        let mut totals = WalletBalances::default();
+        for (script, coins) in &by_script {
+            match self.ownership(script) {
+                Ownership::Spendable => {
+                    totals.balance += coins.mature_at_scan;
+                    totals.unconfirmed += coins.unconfirmed;
+                    totals.immature += coins.immature_now;
+                    totals.spendable += coins.mature_now + coins.trusted_mempool;
+                }
+                Ownership::OwnedVault => {
+                    totals.balance += coins.mature_at_scan;
+                    totals.vaulted += coins.mature_at_scan;
+                }
+                _ => {}
+            }
+        }
+        totals
+    }
+
+    /// How many coins [`Self::get_utxos`] gives, without copying them
+    pub fn utxo_count(&self) -> usize {
+        let overlay = self.mempool_txs.read();
+        let spent = Self::mempool_spent_in(&overlay);
+        let utxos = self.utxos.read();
+        let confirmed = utxos
+            .values()
+            .filter(|u| !spent.contains(&u.outpoint()))
+            .count();
+        let pending = overlay
+            .values()
+            .flat_map(|entry| entry.outputs.iter())
+            .filter(|u| {
+                let outpoint = u.outpoint();
+                !spent.contains(&outpoint) && !utxos.contains_key(&outpoint)
+            })
+            .count();
+        confirmed + pending
+    }
+
+    /// How many records [`Self::history_records`] gives, without copying or
+    /// sorting them: the recorded and mempool transactions, both counted as
+    /// `get_transactions` lists them, and the detached ones in neither. The
+    /// locks are taken in `prune_transactions`' order.
+    pub fn history_count(&self) -> usize {
+        let history = self.transactions_r();
+        let overlay = self.mempool_txs.read();
+        let detached = self.detached_txs.read();
+        let unlisted = detached
+            .keys()
+            .filter(|id| !history.contains_key(id) && !overlay.contains_key(id))
+            .count();
+        history.len() + overlay.len() + unlisted
     }
 
     /// Clear all wallet transactions, UTXOs, and spent tracking
@@ -9461,5 +9637,458 @@ mod tests {
             wallet.mnemonic_passphrase().as_deref(),
             Some(BIP39_PASSPHRASE)
         );
+    }
+
+    /// balance_summary, history_count, utxo_count and address_count give what
+    /// the calls they stand for give, in every state of the coins and history
+    mod single_pass {
+        use super::*;
+        use divi_primitives::transaction::{OutPoint as TxOutPoint, Transaction, TxIn, TxOut};
+
+        const COIN: i64 = 100_000_000;
+
+        fn spend(prevouts: &[(Hash256, u32)], outputs: Vec<(i64, Script)>) -> Transaction {
+            Transaction {
+                version: 1,
+                vin: prevouts
+                    .iter()
+                    .map(|(txid, vout)| TxIn {
+                        prevout: TxOutPoint {
+                            txid: *txid,
+                            vout: *vout,
+                        },
+                        script_sig: Script::default(),
+                        sequence: 0xffffffff,
+                    })
+                    .collect(),
+                vout: outputs
+                    .into_iter()
+                    .map(|(v, script_pubkey)| TxOut {
+                        value: Amount::from_sat(v),
+                        script_pubkey,
+                    })
+                    .collect(),
+                lock_time: 0,
+            }
+        }
+
+        fn p2pkh(addr: &Address) -> Script {
+            Script::new_p2pkh(addr.hash.as_bytes())
+        }
+
+        fn hash20(addr: &Address) -> [u8; 20] {
+            let mut h = [0u8; 20];
+            h.copy_from_slice(addr.hash.as_bytes());
+            h
+        }
+
+        /// A coin recorded from a block, as the scan records one
+        fn coin(tag: u8, vout: u32, sat: i64, script: Script, height: Option<u32>) -> WalletUtxo {
+            WalletUtxo {
+                height,
+                ..WalletUtxo::new(
+                    Hash256::from_bytes([tag; 32]),
+                    vout,
+                    Amount::from_sat(sat),
+                    script,
+                    String::new(),
+                )
+            }
+        }
+
+        /// The figures of the calls each single pass stands for
+        fn assert_single_pass(wallet: &WalletDb, current_height: u32) -> WalletBalances {
+            let summary = wallet.balance_summary(current_height);
+            let maturity = wallet.coinbase_maturity();
+            assert_eq!(
+                summary,
+                WalletBalances {
+                    balance: wallet.get_balance(),
+                    unconfirmed: wallet.get_unconfirmed_balance(),
+                    immature: wallet.get_immature_balance(current_height, maturity),
+                    spendable: wallet.get_spendable_balance(current_height),
+                    vaulted: wallet.get_vaulted_balance(),
+                },
+                "height {current_height}, scanned {}",
+                wallet.last_scan_height()
+            );
+            assert_eq!(wallet.utxo_count(), wallet.get_utxos().len());
+            assert_eq!(wallet.history_count(), wallet.history_records().len());
+            assert_eq!(wallet.address_count(), wallet.get_addresses().len());
+            summary
+        }
+
+        /// Every height around each maturity, at scan heights below, at and
+        /// above the current height: the balance and vaulted balance mature
+        /// at the scan height, the immature and spendable at the current one
+        fn sweep(wallet: &WalletDb) -> Vec<WalletBalances> {
+            let heights = [
+                0, 9, 10, 11, 29, 30, 31, 44, 45, 49, 50, 51, 64, 65, 66, 300,
+            ];
+            let mut seen = Vec::new();
+            for scan in [0, 15, 35, 49, 50, 65, 300] {
+                wallet.set_last_scan_height(scan);
+                for current in heights {
+                    seen.push(assert_single_pass(wallet, current));
+                }
+            }
+            seen
+        }
+
+        #[test]
+        fn balances_match_their_own_calls_in_every_coin_state() {
+            let wallet = create_test_wallet();
+            let maturity = wallet.coinbase_maturity();
+            assert_eq!(maturity, 20);
+            let mine = wallet.new_receiving_address().unwrap();
+            let change = wallet.new_change_address().unwrap();
+            let owner = wallet.new_receiving_address().unwrap();
+            let manager = wallet.new_receiving_address().unwrap();
+            let owned_vault =
+                divi_script::StakingVaultScript::new(hash20(&owner), [0x44; 20]).to_script();
+            let managed_vault =
+                divi_script::StakingVaultScript::new([0x55; 20], hash20(&manager)).to_script();
+            wallet.store_vault(VaultMetadata {
+                owner_address: Address::from_pubkey_hash(
+                    Hash160::from_bytes([0x55; 20]),
+                    wallet.network(),
+                )
+                .to_string(),
+                manager_address: manager.to_string(),
+                vault_script: managed_vault.as_bytes().to_vec(),
+                funding_txid: [0u8; 32],
+            });
+            assert_eq!(wallet.vault_role(&managed_vault), Some(VaultRole::Managed));
+            // A 1-of-1 multisig of a wallet key behind P2SH: spendable
+            let key = wallet.keystore.get_key(&mine.hash).unwrap();
+            let redeem = Script::from_bytes(
+                [
+                    vec![0x51, 0x21],
+                    key.public.serialize_compressed().to_vec(),
+                    vec![0x51, 0xae],
+                ]
+                .concat(),
+            );
+            wallet.add_script(redeem.clone()).unwrap();
+            let mut redeem_hash = [0u8; 20];
+            redeem_hash.copy_from_slice(divi_crypto::hash160(redeem.as_bytes()).as_ref());
+            let p2sh = Script::new_p2sh(&redeem_hash);
+            assert_eq!(wallet.ownership(&p2sh), Ownership::Spendable);
+            let watched =
+                Address::from_pubkey_hash(Hash160::from_bytes([0x66; 20]), wallet.network());
+            wallet.import_watch_only_address(&watched, None).unwrap();
+            assert_eq!(wallet.ownership(&p2pkh(&watched)), Ownership::WatchOnly);
+            let stranger = Script::new_p2pkh(&[0xaa; 20]);
+            let mut seen = sweep(&wallet);
+
+            // Confirmed coins: plain, coinbase and coinstake (immature until
+            // 20 blocks on), one recorded without a height, an unconfirmed
+            // coinbase, both vault kinds, and coins in no balance
+            wallet.add_utxo(coin(1, 0, 100 * COIN, p2pkh(&mine), Some(10)));
+            wallet.add_utxo(coin(1, 1, 7 * COIN, p2pkh(&mine), Some(10)));
+            wallet.add_utxo(WalletUtxo {
+                is_coinbase: true,
+                ..coin(2, 0, 1_250 * COIN, p2pkh(&mine), Some(30))
+            });
+            wallet.add_utxo(WalletUtxo {
+                is_coinstake: true,
+                ..coin(3, 1, 456 * COIN, p2pkh(&change), Some(45))
+            });
+            wallet.add_utxo(coin(4, 0, 11 * COIN, p2pkh(&mine), None));
+            wallet.add_utxo(WalletUtxo {
+                is_coinbase: true,
+                ..coin(5, 0, 13 * COIN, p2pkh(&change), None)
+            });
+            wallet.add_utxo(coin(6, 0, 300 * COIN, owned_vault.clone(), Some(12)));
+            wallet.add_utxo(WalletUtxo {
+                is_coinstake: true,
+                ..coin(6, 1, 301 * COIN, owned_vault.clone(), Some(40))
+            });
+            wallet.add_utxo(coin(7, 0, 500 * COIN, managed_vault.clone(), Some(10)));
+            wallet.add_utxo(WalletUtxo {
+                is_coinstake: true,
+                ..coin(7, 1, 501 * COIN, managed_vault.clone(), Some(40))
+            });
+            wallet.add_utxo(coin(8, 0, 17 * COIN, p2sh.clone(), Some(11)));
+            wallet.add_utxo(coin(9, 0, 19 * COIN, p2pkh(&watched), Some(10)));
+            wallet.add_utxo(coin(10, 0, 23 * COIN, stranger.clone(), Some(10)));
+            seen.extend(sweep(&wallet));
+
+            // Mempool: our send spending a confirmed coin with change back
+            // (trusted), a payment from someone else (untrusted), a send
+            // spending that send's change (chained), and one spending a
+            // vault coin we own
+            let own_send = spend(
+                &[(Hash256::from_bytes([1; 32]), 0)],
+                vec![(30 * COIN, stranger.clone()), (69 * COIN, p2pkh(&change))],
+            );
+            assert!(wallet.add_mempool_tx(&own_send));
+            let incoming = spend(
+                &[(Hash256::from_bytes([0xee; 32]), 3)],
+                vec![(29 * COIN, p2pkh(&mine)), (31 * COIN, p2sh.clone())],
+            );
+            assert!(wallet.add_mempool_tx(&incoming));
+            let chained = spend(
+                &[(own_send.txid(), 1)],
+                vec![(68 * COIN, p2pkh(&mine)), (COIN / 2, stranger.clone())],
+            );
+            assert!(wallet.add_mempool_tx(&chained));
+            let reclaim = spend(
+                &[(Hash256::from_bytes([6; 32]), 0)],
+                vec![(299 * COIN, p2pkh(&change))],
+            );
+            assert!(wallet.add_mempool_tx(&reclaim));
+            assert_eq!(wallet.mempool_tx_count(), 4);
+            seen.extend(sweep(&wallet));
+
+            // A mempool output also confirmed (the block scan adds the coin
+            // before it drops the transaction): counted once, as the coin
+            wallet.add_utxo(WalletUtxo {
+                txid: incoming.txid(),
+                ..coin(0, 0, 29 * COIN, p2pkh(&mine), Some(50))
+            });
+            seen.extend(sweep(&wallet));
+
+            // A spend in the mempool of a coin the wallet learns of later
+            let late = coin(11, 0, 37 * COIN, p2pkh(&mine), Some(20));
+            let spends_late = spend(&[(late.txid, 0)], vec![(36 * COIN, p2pkh(&change))]);
+            assert!(wallet.add_mempool_tx(&spends_late));
+            wallet.add_utxo(late);
+            seen.extend(sweep(&wallet));
+
+            // Each figure is reached, and the two heights give different
+            // figures somewhere
+            let any = |f: fn(&WalletBalances) -> Amount| seen.iter().any(|s| f(s) != Amount::ZERO);
+            assert!(any(|s| s.balance));
+            assert!(any(|s| s.unconfirmed));
+            assert!(any(|s| s.immature));
+            assert!(any(|s| s.spendable));
+            assert!(any(|s| s.vaulted));
+            wallet.set_last_scan_height(15);
+            let behind = wallet.balance_summary(70);
+            wallet.set_last_scan_height(70);
+            let level = wallet.balance_summary(70);
+            assert_eq!(
+                (behind.immature, behind.spendable),
+                (level.immature, level.spendable)
+            );
+            assert_ne!(
+                (behind.balance, behind.vaulted),
+                (level.balance, level.vaulted)
+            );
+            // A vault we only manage is in no balance
+            let managed_only = WalletDb::with_hd_wallet(
+                Network::Mainnet,
+                HdWallet::from_mnemonic(TEST_MNEMONIC, None, ChainMode::Divi).unwrap(),
+            );
+            let m = managed_only.new_receiving_address().unwrap();
+            let script = divi_script::StakingVaultScript::new([0x55; 20], hash20(&m)).to_script();
+            managed_only.store_vault(VaultMetadata {
+                owner_address: String::new(),
+                manager_address: m.to_string(),
+                vault_script: script.as_bytes().to_vec(),
+                funding_txid: [0u8; 32],
+            });
+            managed_only.add_utxo(coin(7, 0, 500 * COIN, script, Some(10)));
+            managed_only.set_last_scan_height(300);
+            assert_eq!(
+                assert_single_pass(&managed_only, 300),
+                WalletBalances::default()
+            );
+            assert_eq!(managed_only.utxo_count(), 1);
+        }
+
+        /// Records in both the history and the overlay are counted twice, as
+        /// get_transactions lists them; a detached one only when it is in
+        /// neither; a pruned one not at all
+        #[test]
+        fn history_count_matches_history_records() {
+            let wallet = create_test_wallet();
+            let mine = wallet.new_receiving_address().unwrap();
+            let check = |w: &WalletDb| {
+                assert_eq!(w.history_count(), w.history_records().len());
+                w.history_count()
+            };
+            assert_eq!(check(&wallet), 0);
+            let confirmed: Vec<Transaction> = (0..5u8)
+                .map(|i| {
+                    spend(
+                        &[(Hash256::from_bytes([0xe0 + i; 32]), 0)],
+                        vec![(COIN, p2pkh(&mine))],
+                    )
+                })
+                .collect();
+            wallet.scan_block(Hash256::from_bytes([1; 32]), 10, 1_000, &confirmed);
+            assert_eq!(check(&wallet), 5);
+
+            let pending: Vec<Transaction> = (0..3u8)
+                .map(|i| {
+                    spend(
+                        &[(Hash256::from_bytes([0xd0 + i; 32]), 0)],
+                        vec![(COIN, p2pkh(&mine))],
+                    )
+                })
+                .collect();
+            for tx in &pending {
+                assert!(wallet.add_mempool_tx(tx));
+            }
+            assert_eq!(check(&wallet), 8);
+
+            // A refused send kept unconfirmed: detached
+            let refused = spend(
+                &[(Hash256::from_bytes([0xc0; 32]), 0)],
+                vec![(COIN, p2pkh(&mine))],
+            );
+            wallet.keep_refused_send(&refused);
+            assert_eq!(wallet.detached_transactions().len(), 1);
+            assert_eq!(check(&wallet), 9);
+
+            // A recorded transaction also in the overlay is listed twice
+            let overlap = &pending[0];
+            wallet.add_transaction(WalletTx {
+                txid: overlap.txid(),
+                block_hash: Some(Hash256::from_bytes([2; 32])),
+                block_height: Some(11),
+                timestamp: 1_100,
+                amount: COIN,
+                fee: None,
+                category: "receive".into(),
+                confirmations: 1,
+            });
+            assert_eq!(check(&wallet), 10);
+
+            // A detached transaction recorded unconfirmed, or in the overlay,
+            // is listed once, as the record
+            wallet.add_transaction(WalletTx {
+                txid: refused.txid(),
+                block_hash: None,
+                block_height: None,
+                timestamp: 1_200,
+                amount: COIN,
+                fee: None,
+                category: "receive".into(),
+                confirmations: 0,
+            });
+            assert_eq!(wallet.detached_transactions().len(), 1);
+            assert_eq!(check(&wallet), 10);
+            wallet.detached_txs.write().insert(
+                pending[1].txid(),
+                DetachedTx {
+                    timestamp: 1_300,
+                    tx: None,
+                },
+            );
+            assert_eq!(check(&wallet), 10);
+            wallet.detached_txs.write().insert(
+                Hash256::from_bytes([0xb0; 32]),
+                DetachedTx {
+                    timestamp: 1_400,
+                    tx: None,
+                },
+            );
+            assert_eq!(check(&wallet), 11);
+
+            // Pruned from memory: in neither list
+            let pruned = confirmed[1].txid();
+            let tx = wallet.transactions_w().remove(&pruned).unwrap();
+            wallet
+                .pruned_history
+                .write()
+                .insert(pruned, tx.block_height);
+            assert_eq!(check(&wallet), 10);
+
+            // Leaving the overlay, confirmed, or detached
+            assert!(wallet.remove_mempool_tx(&pending[2].txid()));
+            check(&wallet);
+            wallet.scan_block(
+                Hash256::from_bytes([3; 32]),
+                12,
+                1_500,
+                std::slice::from_ref(&pending[1]),
+            );
+            check(&wallet);
+            wallet.clear_transactions_and_utxos();
+            check(&wallet);
+        }
+
+        /// Coins spent in the overlay, outputs of the overlay, outputs of the
+        /// overlay spent in it, and outputs also confirmed
+        #[test]
+        fn utxo_count_matches_get_utxos() {
+            let wallet = create_test_wallet();
+            let mine = wallet.new_receiving_address().unwrap();
+            let check = |w: &WalletDb| {
+                assert_eq!(w.utxo_count(), w.get_utxos().len());
+                w.utxo_count()
+            };
+            assert_eq!(check(&wallet), 0);
+            for i in 0..4u8 {
+                wallet.add_utxo(coin(i + 1, 0, COIN, p2pkh(&mine), Some(10)));
+            }
+            assert_eq!(check(&wallet), 4);
+            let send = spend(
+                &[
+                    (Hash256::from_bytes([1; 32]), 0),
+                    (Hash256::from_bytes([2; 32]), 0),
+                ],
+                vec![(COIN, p2pkh(&mine)), (COIN / 2, p2pkh(&mine))],
+            );
+            assert!(wallet.add_mempool_tx(&send));
+            assert_eq!(check(&wallet), 4);
+            let chained = spend(&[(send.txid(), 0)], vec![(COIN / 3, p2pkh(&mine))]);
+            assert!(wallet.add_mempool_tx(&chained));
+            assert_eq!(check(&wallet), 4);
+            wallet.add_utxo(WalletUtxo {
+                txid: send.txid(),
+                ..coin(0, 1, COIN / 2, p2pkh(&mine), Some(11))
+            });
+            assert_eq!(check(&wallet), 4);
+            wallet.spend_utxo(&OutPoint::new(Hash256::from_bytes([3; 32]), 0));
+            assert_eq!(check(&wallet), 3);
+            assert!(wallet.remove_mempool_tx(&send.txid()));
+            check(&wallet);
+        }
+
+        /// HD receiving and change keys, imported keys and watch-only entries
+        /// are addresses; a redeem script is not
+        #[test]
+        fn address_count_matches_get_addresses() {
+            let wallet = create_test_wallet();
+            let check = |w: &WalletDb| {
+                assert_eq!(w.address_count(), w.get_addresses().len());
+                w.address_count()
+            };
+            check(&wallet);
+            let mine = wallet.new_receiving_address().unwrap();
+            wallet.new_change_address().unwrap();
+            let start = check(&wallet);
+            assert!(start >= 2);
+            wallet
+                .import_key(divi_crypto::keys::SecretKey::new_random(), None)
+                .unwrap();
+            assert_eq!(check(&wallet), start + 1);
+            let watched =
+                Address::from_pubkey_hash(Hash160::from_bytes([0x66; 20]), wallet.network());
+            wallet.import_watch_only_address(&watched, None).unwrap();
+            assert_eq!(check(&wallet), start + 2);
+            wallet.import_watch_only_pubkey(
+                divi_crypto::keys::SecretKey::new_random().public_key(),
+                Some("watched".into()),
+            );
+            assert_eq!(check(&wallet), start + 3);
+            let key = wallet.keystore.get_key(&mine.hash).unwrap();
+            let redeem = Script::from_bytes(
+                [
+                    vec![0x51, 0x21],
+                    key.public.serialize_compressed().to_vec(),
+                    vec![0x51, 0xae],
+                ]
+                .concat(),
+            );
+            wallet.add_script(redeem).unwrap();
+            assert_eq!(check(&wallet), start + 3);
+            wallet.top_up_keypool().unwrap();
+            check(&wallet);
+        }
     }
 }

@@ -27,12 +27,13 @@ use axum::{
     extract::State,
     http::{header, HeaderMap, StatusCode, Uri, Version},
     response::{IntoResponse, Response},
-    Router,
+    Extension, Router,
 };
 use divi_primitives::block::Block;
 use divi_primitives::serialize::{deserialize, serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
+use tokio::sync::Semaphore;
 
 /// A reply format (rest.cpp:33-48)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -271,6 +272,8 @@ fn answer(server: &RpcServer, enabled: bool, uri: &str) -> Response {
     if !enabled || !uri.starts_with("/rest/") {
         return not_found();
     }
+    #[cfg(test)]
+    tests::held_at(uri);
     if let Some(req) = uri.strip_prefix("/rest/tx/") {
         return rest_tx(server, req);
     }
@@ -283,12 +286,48 @@ fn answer(server: &RpcServer, enabled: bool, uri: &str) -> Response {
     not_found()
 }
 
+/// Whether `uri` asks for a transaction or a block, the answers that read
+/// the chain; every other path is answered `404 Not Found` from memory
+fn reads_chain(enabled: bool, uri: &str) -> bool {
+    enabled && (uri.starts_with("/rest/tx/") || uri.starts_with("/rest/block/"))
+}
+
+/// Answer `uri` on the runtime's blocking threads, as a JSON-RPC request is
+/// run: the chain reads, block decoding and, without -txindex, the search of
+/// recent blocks for a transaction would otherwise keep a worker thread from
+/// the other connections, P2P, staking and masternode pings. With the RPC
+/// server's request slots (`slots`), at most that many requests, REST and
+/// JSON-RPC together, run at once.
+async fn answer_blocking(
+    server: Arc<RpcServer>,
+    slots: Option<Arc<Semaphore>>,
+    enabled: bool,
+    uri: String,
+) -> Response {
+    let _slot = match slots {
+        Some(slots) => match slots.acquire_owned().await {
+            Ok(slot) => Some(slot),
+            Err(_) => return crate::http::error_page(StatusCode::SERVICE_UNAVAILABLE),
+        },
+        None => None,
+    };
+    match tokio::task::spawn_blocking(move || answer(&server, enabled, &uri)).await {
+        Ok(res) => res,
+        Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+        // Cancelled: the runtime is shutting down
+        Err(_) => crate::http::error_page(StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
 /// The router for every path but the JSON-RPC ones, without credentials:
-/// REST when `enabled` (Divi Core -rest, default off), else `404 Not Found`
+/// REST when `enabled` (Divi Core -rest, default off), else `404 Not Found`.
+/// A layer of `Extension<Arc<Semaphore>>` bounds the requests that read the
+/// chain, as the RPC server's router does with its request slots.
 pub fn router(server: Arc<RpcServer>, enabled: bool) -> Router {
     Router::new()
         .fallback(
             move |State(server): State<Arc<RpcServer>>,
+                  slots: Option<Extension<Arc<Semaphore>>>,
                   version: Version,
                   headers: HeaderMap,
                   uri: Uri| async move {
@@ -296,7 +335,12 @@ pub fn router(server: Arc<RpcServer>, enabled: bool) -> Router {
                     .path_and_query()
                     .map(|p| p.as_str().to_string())
                     .unwrap_or_else(|| uri.path().to_string());
-                let mut res = answer(&server, enabled, &text);
+                let mut res = if reads_chain(enabled, &text) {
+                    let slots = slots.map(|Extension(slots)| slots);
+                    answer_blocking(server, slots, enabled, text).await
+                } else {
+                    not_found()
+                };
                 // A 200 keeps the connection as a JSON-RPC reply does, every
                 // error closes it (rest.cpp:138-152, :264; rpcserver.cpp:1031)
                 let status = res.status();
@@ -316,7 +360,78 @@ mod tests {
     use super::*;
     use divi_primitives::ChainMode;
     use divi_storage::{Chain, ChainDatabase, ChainParams, NetworkType};
+    use std::sync::{Condvar, Mutex};
+    use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A path whose answer, once begun, waits until the test lets it go (ten
+    /// seconds at most, so that a test of an answer on the worker fails
+    /// rather than hangs), then panics if told to
+    struct Hold {
+        path: String,
+        entered: tokio::sync::mpsc::UnboundedSender<()>,
+        open: Mutex<bool>,
+        opened: Condvar,
+        panics: Mutex<bool>,
+    }
+
+    /// The paths held now: each test holds its own
+    static HELD: Mutex<Vec<Arc<Hold>>> = Mutex::new(Vec::new());
+
+    /// Hold `path`; the receiver hears of each answer that begins
+    fn hold(path: &str) -> (HoldGuard, tokio::sync::mpsc::UnboundedReceiver<()>) {
+        let (entered, begun) = tokio::sync::mpsc::unbounded_channel();
+        let hold = Arc::new(Hold {
+            path: path.to_string(),
+            entered,
+            open: Mutex::new(false),
+            opened: Condvar::new(),
+            panics: Mutex::new(false),
+        });
+        HELD.lock().unwrap().push(hold.clone());
+        (HoldGuard(hold), begun)
+    }
+
+    impl Hold {
+        fn release(&self) {
+            *self.open.lock().unwrap() = true;
+            self.opened.notify_all();
+        }
+    }
+
+    /// Lets the held answers go when dropped, a failed test's too
+    struct HoldGuard(Arc<Hold>);
+
+    impl std::ops::Deref for HoldGuard {
+        type Target = Hold;
+        fn deref(&self) -> &Hold {
+            &self.0
+        }
+    }
+
+    impl Drop for HoldGuard {
+        fn drop(&mut self) {
+            HELD.lock().unwrap().retain(|h| !Arc::ptr_eq(h, &self.0));
+            self.0.release();
+        }
+    }
+
+    /// Called by `answer`: wait while `uri` is held
+    pub(super) fn held_at(uri: &str) {
+        let hold = HELD.lock().unwrap().iter().find(|h| h.path == uri).cloned();
+        if let Some(hold) = hold {
+            let _ = hold.entered.send(());
+            let open = hold.open.lock().unwrap();
+            let waited = hold
+                .opened
+                .wait_timeout_while(open, Duration::from_secs(10), |open| !*open)
+                .unwrap();
+            drop(waited);
+            if *hold.panics.lock().unwrap() {
+                panic!("held REST answer told to panic");
+            }
+        }
+    }
 
     fn server() -> (Arc<RpcServer>, tempfile::TempDir, String) {
         let dir = tempfile::tempdir().unwrap();
@@ -354,15 +469,31 @@ mod tests {
         body: &str,
         extra: &str,
     ) -> (u16, String, Vec<u8>) {
+        let addr = serve(router, 4).await;
+        exchange_at(addr, method, path, body, extra).await
+    }
+
+    /// Serve `router` on a loopback port with `threads` connection slots
+    async fn serve(router: &Router, threads: i64) -> std::net::SocketAddr {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let app = router.clone();
         tokio::spawn(crate::server::serve_listener(
             vec![listener],
-            app,
-            4,
+            router.clone(),
+            threads,
             std::future::pending(),
         ));
+        addr
+    }
+
+    /// One request to the server at `addr`, as [`exchange`]
+    async fn exchange_at(
+        addr: std::net::SocketAddr,
+        method: &str,
+        path: &str,
+        body: &str,
+        extra: &str,
+    ) -> (u16, String, Vec<u8>) {
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let request = format!(
             "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\n{extra}\r\n{body}",
@@ -606,5 +737,144 @@ mod tests {
         // the JSON-RPC path still asks for credentials
         let (status, _, _) = exchange(&on, "POST", "/", "{}", "Connection: close\r\n").await;
         assert_eq!(status, 401);
+    }
+
+    /// The answer runs on the blocking threads: while one is under way, the
+    /// one worker thread of the runtime goes on serving other tasks, and the
+    /// reply is the one divid sends
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_rest_answer_does_not_hold_the_worker_thread() {
+        let (server, _dir, _) = server();
+        let on = router(server, true);
+        let txid = "c1".repeat(32);
+        let path = format!("/rest/tx/{txid}.json");
+        let (hold, mut begun) = hold(&path);
+        // A thread lets the answer go once the worker has run the probe, or
+        // after ten seconds: an answer on the worker holds the probe till then
+        let (probed, heard) = std::sync::mpsc::channel::<()>();
+        let releaser = {
+            let hold = hold.0.clone();
+            std::thread::spawn(move || {
+                let in_time = heard.recv_timeout(Duration::from_secs(10)).is_ok();
+                hold.release();
+                in_time
+            })
+        };
+        let request = {
+            let path = path.clone();
+            tokio::spawn(async move { exchange(&on, "GET", &path, "", "").await })
+        };
+        begun.recv().await.unwrap();
+        // the probe: a timer and a task on the worker
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        tokio::spawn(async {}).await.unwrap();
+        probed.send(()).unwrap();
+        assert!(
+            releaser.join().unwrap(),
+            "the worker thread waited for the answer"
+        );
+        let (status, head, body) = request.await.unwrap();
+        assert_eq!(
+            (status, body),
+            (404, format!("{txid} not found\r\n").into_bytes())
+        );
+        assert_eq!(header_of(&head, "content-type"), "text/plain");
+        assert_eq!(header_of(&head, "connection"), "close");
+    }
+
+    /// With request slots, an answer that reads the chain waits for a slot,
+    /// without holding the worker; one answered from memory does not wait
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn request_slots_bound_the_rest_answers() {
+        let (server, _dir, genesis) = server();
+        let slots = Arc::new(Semaphore::new(1));
+        let on = router(server, true).layer(Extension(slots.clone()));
+        let held = format!("/rest/tx/{}.json", "c2".repeat(32));
+        let (hold, mut begun) = hold(&held);
+        let addr = serve(&on, 8).await;
+        let first = tokio::spawn(async move { exchange_at(addr, "GET", &held, "", "").await });
+        begun.recv().await.unwrap();
+        assert_eq!(slots.available_permits(), 0);
+        let block = format!("/rest/block/{genesis}.hex");
+        let second = tokio::spawn(async move { exchange_at(addr, "GET", &block, "", "").await });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !second.is_finished(),
+            "a second answer ran beside the first"
+        );
+        let (status, head, body) = exchange_at(addr, "GET", "/rest/chaininfo.json", "", "").await;
+        assert_eq!((status, body), (404, b"Not Found".to_vec()));
+        assert_eq!(header_of(&head, "connection"), "close");
+        hold.release();
+        assert_eq!(first.await.unwrap().0, 404);
+        let (status, head, body) = second.await.unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(header_of(&head, "connection"), "keep-alive");
+        assert!(body.ends_with(b"\n") && body.len() > 160);
+        assert_eq!(slots.available_permits(), 1);
+    }
+
+    /// On the RPC port REST and JSON-RPC share the server's request slots: with
+    /// every slot taken by REST answers under way, a JSON-RPC call waits
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn rest_and_json_rpc_share_the_request_slots() {
+        let (server, _dir, genesis) = server();
+        let config = crate::server::RpcConfig {
+            username: Some("u".into()),
+            password: Some("p".into()),
+            rest: true,
+            ..Default::default()
+        };
+        let app = crate::server::create_router_with_auth(server, &config);
+        let held = format!("/rest/block/{genesis}.bin");
+        let (hold, mut begun) = hold(&held);
+        let slots = crate::server::MAX_CONCURRENT_REQUESTS;
+        let addr = serve(&app, 4 * slots as i64).await;
+        let answers: Vec<_> = (0..slots)
+            .map(|_| {
+                let held = held.clone();
+                tokio::spawn(async move { exchange_at(addr, "GET", &held, "", "").await })
+            })
+            .collect();
+        for _ in 0..slots {
+            begun.recv().await.unwrap();
+        }
+        let body = r#"{"method":"getblockcount","params":[],"id":1}"#;
+        let rpc = tokio::spawn(async move {
+            exchange_at(
+                addr,
+                "POST",
+                "/",
+                body,
+                "Authorization: Basic dTpw\r\nConnection: close\r\n",
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!rpc.is_finished(), "JSON-RPC ran with every slot taken");
+        hold.release();
+        for answer in answers {
+            assert_eq!(answer.await.unwrap().0, 200);
+        }
+        let (status, _, body) = rpc.await.unwrap();
+        assert_eq!(status, 200);
+        assert!(String::from_utf8_lossy(&body).contains(r#""result":0"#));
+    }
+
+    /// A panic in an answer goes on as one on the worker did: the connection
+    /// closes with no reply, and the server answers the next request
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_panicking_answer_closes_its_connection() {
+        let (server, _dir, genesis) = server();
+        let on = router(server, true);
+        let addr = serve(&on, 4).await;
+        let path = format!("/rest/tx/{}.json", "c3".repeat(32));
+        let (hold, _begun) = hold(&path);
+        *hold.panics.lock().unwrap() = true;
+        hold.release();
+        assert_eq!(exchange_at(addr, "GET", &path, "", "").await.0, 0);
+        let (status, _, _) =
+            exchange_at(addr, "GET", &format!("/rest/block/{genesis}.hex"), "", "").await;
+        assert_eq!(status, 200);
     }
 }
