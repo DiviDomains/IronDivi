@@ -15,8 +15,9 @@
 
 use crate::error::CryptoError;
 use crate::hash::{double_sha256, hash160};
+use crate::signature::with_secp;
 use divi_primitives::hash::Hash160;
-use secp256k1::{Message, Secp256k1};
+use secp256k1::Message;
 use std::fmt;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
@@ -29,8 +30,7 @@ pub struct SecretKey {
 impl SecretKey {
     /// Generate a new random secret key
     pub fn new_random() -> Self {
-        let secp = Secp256k1::new();
-        let (sk, _pk) = secp.generate_keypair(&mut rand::thread_rng());
+        let (sk, _pk) = with_secp(|secp| secp.generate_keypair(&mut rand::thread_rng()));
         SecretKey { inner: sk }
     }
 
@@ -64,8 +64,7 @@ impl SecretKey {
 
     /// Get the public key corresponding to this secret key
     pub fn public_key(&self) -> PublicKey {
-        let secp = Secp256k1::new();
-        let pk = secp256k1::PublicKey::from_secret_key(&secp, &self.inner);
+        let pk = with_secp(|secp| secp256k1::PublicKey::from_secret_key(secp, &self.inner));
         PublicKey { inner: pk }
     }
 
@@ -270,6 +269,60 @@ mod tests {
         assert_eq!(kp.secret_key().as_bytes(), &[9u8; 32]);
         kp.zeroize();
         assert_ne!(kp.secret_key().as_bytes(), &[9u8; 32]);
+    }
+
+    /// The shared context gives the same public keys and signatures as a
+    /// fresh `Secp256k1::new()` per call did, from any thread.
+    #[test]
+    fn shared_context_matches_a_fresh_context_on_every_thread() {
+        let one = SecretKey::from_bytes(&{
+            let mut b = [0u8; 32];
+            b[31] = 1;
+            b
+        })
+        .unwrap();
+        assert_eq!(
+            one.public_key().to_hex(),
+            "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+        );
+        let threads: Vec<_> = (0..8u8)
+            .map(|t| {
+                std::thread::spawn(move || {
+                    for i in 0..64u8 {
+                        let sk =
+                            SecretKey::from_bytes(&[((t.wrapping_mul(31) ^ i) & 0x7f) | 1; 32])
+                                .unwrap();
+                        let fresh = secp256k1::Secp256k1::new();
+                        let expected = secp256k1::PublicKey::from_secret_key(&fresh, sk.inner());
+                        assert_eq!(sk.public_key().inner, expected);
+                        let msg = message_hash(&[t, i]);
+                        let sig = crate::signature::sign_message(&sk, &[t, i]);
+                        assert_eq!(*sig.inner(), fresh.sign_ecdsa(&msg, sk.inner()));
+                        assert!(crate::signature::verify_message(
+                            &sk.public_key(),
+                            &sig,
+                            &[t, i]
+                        ));
+                        let random = SecretKey::new_random();
+                        assert_eq!(
+                            random.public_key().inner,
+                            secp256k1::PublicKey::from_secret_key(&fresh, random.inner())
+                        );
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        // One context for the whole process, not one per call or thread
+        let context = || with_secp(|secp| secp as *const _ as usize);
+        let here = context();
+        let elsewhere: Vec<usize> = (0..4)
+            .map(|_| std::thread::spawn(context).join().unwrap())
+            .collect();
+        assert_eq!(elsewhere, vec![here; 4]);
+        assert_eq!(context(), here);
     }
 
     #[test]

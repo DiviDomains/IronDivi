@@ -21,7 +21,7 @@ use divi_primitives::hash::Hash256;
 use divi_primitives::transaction::{OutPoint, Transaction};
 use parking_lot::RwLock;
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -146,32 +146,46 @@ pub struct BlockCandidate {
     pub parents: Vec<Hash256>,
 }
 
-/// Entry for priority queue ordering by fee rate
-struct PriorityEntry {
-    _txid: Hash256,
+/// A pool transaction's place in the order a full mempool evicts in: lowest
+/// fee rate first, then by txid. `-0.0` is stored as `0.0`, so `total_cmp`
+/// orders every rate that is not NaN exactly as `partial_cmp` does, and the
+/// order is total, as a `BTreeSet` needs, even for a NaN rate (which no
+/// eviction takes: no rate is below NaN and NaN is below none).
+#[derive(Clone, Copy, Debug)]
+struct FeeRateKey {
     fee_rate: f64,
+    txid: Hash256,
 }
 
-impl PartialEq for PriorityEntry {
-    fn eq(&self, other: &Self) -> bool {
-        self.fee_rate == other.fee_rate
+impl FeeRateKey {
+    fn of(entry: &MempoolEntry) -> Self {
+        FeeRateKey {
+            // Adding 0.0 turns -0.0 into 0.0 and leaves every other value as is
+            fee_rate: entry.fee_rate + 0.0,
+            txid: entry.txid,
+        }
     }
 }
 
-impl Eq for PriorityEntry {}
+impl PartialEq for FeeRateKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
 
-impl PartialOrd for PriorityEntry {
+impl Eq for FeeRateKey {}
+
+impl PartialOrd for FeeRateKey {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl Ord for PriorityEntry {
+impl Ord for FeeRateKey {
     fn cmp(&self, other: &Self) -> Ordering {
-        // Higher fee rate = higher priority
         self.fee_rate
-            .partial_cmp(&other.fee_rate)
-            .unwrap_or(Ordering::Equal)
+            .total_cmp(&other.fee_rate)
+            .then(self.txid.cmp(&other.txid))
     }
 }
 
@@ -274,8 +288,10 @@ pub struct Mempool {
     /// All transactions indexed by txid
     txs: RwLock<HashMap<Hash256, MempoolEntry>>,
 
-    /// Transactions ordered by fee rate
-    priority_queue: RwLock<BinaryHeap<PriorityEntry>>,
+    /// Every transaction in `txs`, cheapest first (`make_room_for`'s
+    /// order). Changed only with `txs` write-locked, so the two always hold
+    /// the same transactions; locked after `txs` and `spenders`.
+    by_fee_rate: RwLock<BTreeSet<FeeRateKey>>,
 
     /// Outpoint to spending transaction
     spenders: RwLock<HashMap<(Hash256, u32), Hash256>>,
@@ -337,7 +353,7 @@ impl Mempool {
             config,
             spork_fees: (AtomicI64::new(i64::MIN), AtomicI64::new(i64::MIN)),
             txs: RwLock::new(HashMap::new()),
-            priority_queue: RwLock::new(BinaryHeap::new()),
+            by_fee_rate: RwLock::new(BTreeSet::new()),
             spenders: RwLock::new(HashMap::new()),
             total_size: RwLock::new(0),
             priority_deltas: RwLock::new(HashMap::new()),
@@ -490,14 +506,9 @@ impl Mempool {
             }
 
             *total_size += entry.size;
+            self.by_fee_rate.write().insert(FeeRateKey::of(&entry));
             txs.insert(txid, entry.clone());
         }
-
-        // Add to priority queue
-        self.priority_queue.write().push(PriorityEntry {
-            _txid: txid,
-            fee_rate: entry.fee_rate,
-        });
 
         counted::hit(Site::MempoolAdded);
 
@@ -661,7 +672,12 @@ impl Mempool {
 
     /// Remove a transaction from the mempool
     pub fn remove(&self, txid: &Hash256) -> Option<MempoolEntry> {
-        let entry = self.txs_w().remove(txid)?;
+        let entry = {
+            let mut txs = self.txs_w();
+            let entry = txs.remove(txid)?;
+            self.by_fee_rate.write().remove(&FeeRateKey::of(&entry));
+            entry
+        };
 
         // Remove from spenders
         {
@@ -931,16 +947,14 @@ impl Mempool {
                 }
             }
 
-            let mut cheaper: Vec<&MempoolEntry> = txs
-                .values()
-                .filter(|e| e.fee_rate < entry.fee_rate && !ancestors.contains(&e.txid))
-                .collect();
-            cheaper.sort_by(|a, b| {
-                a.fee_rate
-                    .partial_cmp(&b.fee_rate)
-                    .unwrap_or(Ordering::Equal)
-                    .then(a.txid.cmp(&b.txid))
-            });
+            // Cheapest first, then by txid, and only as far as needed: the
+            // index is kept in that order, so nothing is collected or sorted
+            let by_fee_rate = self.by_fee_rate.read();
+            let cheaper = by_fee_rate
+                .iter()
+                .filter(|k| !k.fee_rate.is_nan())
+                .take_while(|k| k.fee_rate < entry.fee_rate)
+                .filter(|k| !ancestors.contains(&k.txid));
 
             let mut taken = HashSet::new();
             let mut doomed = Vec::new();
@@ -1020,9 +1034,12 @@ impl Mempool {
 
     /// Clear all transactions from mempool
     pub fn clear(&self) {
-        let removed: Vec<MempoolEntry> = self.txs_w().drain().map(|(_, e)| e).collect();
+        let removed: Vec<MempoolEntry> = {
+            let mut txs = self.txs_w();
+            self.by_fee_rate.write().clear();
+            txs.drain().map(|(_, e)| e).collect()
+        };
         self.spenders.write().clear();
-        self.priority_queue.write().clear();
         *self.total_size.write() = 0;
         self.priority_deltas.write().clear();
         tracing::info!("Mempool cleared");
@@ -1937,5 +1954,286 @@ mod tests {
         let entry_low = mempool.get(&tx_low.txid()).unwrap();
         assert!(entry_low.fee_rate >= 1.0);
         assert!(entry_low.fee_rate < 2.0);
+    }
+
+    /// `make_room_for` as it was before the fee-rate index: every cheaper
+    /// entry collected and sorted, per incoming transaction. The index must
+    /// evict exactly these, in this order, or refuse exactly when this does.
+    fn reference_doomed(mempool: &Mempool, entry: &MempoolEntry) -> Option<Vec<Hash256>> {
+        let needed = (mempool.bytes() + entry.size).saturating_sub(mempool.config.max_size);
+        if needed == 0 {
+            return Some(Vec::new());
+        }
+        let txs = mempool.txs.read();
+        let spenders = mempool.spenders.read();
+        let mut ancestors = HashSet::new();
+        let mut stack: Vec<Hash256> = entry.tx.vin.iter().map(|i| i.prevout.txid).collect();
+        while let Some(id) = stack.pop() {
+            if let Some(parent) = txs.get(&id) {
+                if ancestors.insert(id) {
+                    stack.extend(parent.tx.vin.iter().map(|i| i.prevout.txid));
+                }
+            }
+        }
+        let mut cheaper: Vec<&MempoolEntry> = txs
+            .values()
+            .filter(|e| e.fee_rate < entry.fee_rate && !ancestors.contains(&e.txid))
+            .collect();
+        cheaper.sort_by(|a, b| {
+            a.fee_rate
+                .partial_cmp(&b.fee_rate)
+                .unwrap_or(Ordering::Equal)
+                .then(a.txid.cmp(&b.txid))
+        });
+        let mut taken = HashSet::new();
+        let mut doomed = Vec::new();
+        let mut freed = 0;
+        for cheap in cheaper {
+            if freed >= needed {
+                break;
+            }
+            let mut queue = vec![cheap.txid];
+            while let Some(id) = queue.pop() {
+                let Some(e) = txs.get(&id) else { continue };
+                if !taken.insert(id) {
+                    continue;
+                }
+                freed += e.size;
+                doomed.push(id);
+                for vout in 0..e.tx.vout.len() as u32 {
+                    if let Some(child) = spenders.get(&(id, vout)) {
+                        queue.push(*child);
+                    }
+                }
+            }
+        }
+        (freed >= needed).then_some(doomed)
+    }
+
+    /// Deterministic pseudo-random numbers for the pool shapes below
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            self.0 >> 33
+        }
+    }
+
+    /// The fee-rate index holds exactly the pool's transactions
+    fn assert_index_matches(mempool: &Mempool) {
+        let txs = mempool.txs.read();
+        let index = mempool.by_fee_rate.read();
+        assert_eq!(index.len(), txs.len(), "index and pool differ in size");
+        for e in txs.values() {
+            assert!(
+                index.contains(&FeeRateKey::of(e)),
+                "pool tx missing from the index"
+            );
+        }
+    }
+
+    fn fresh_prevout(n: &mut u32) -> [u8; 32] {
+        *n += 1;
+        let mut b = [0xEEu8; 32];
+        b[..4].copy_from_slice(&n.to_le_bytes());
+        b
+    }
+
+    /// A full mempool evicts exactly what sorting every cheaper entry did:
+    /// the same transactions in the same order (ties broken by txid, children
+    /// with their parents, the newcomer's ancestors kept), and refuses the
+    /// same newcomers
+    #[test]
+    fn eviction_by_the_fee_rate_index_matches_a_full_sort() {
+        let size = create_test_tx([1u8; 32], 1).size();
+        let mut config = test_config();
+        config.max_size = 120 * size;
+        let mempool = Mempool::new(config);
+        let removed = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let log = Arc::clone(&removed);
+        mempool.set_removed_listener(Arc::new(move |tx: &Transaction| log.lock().push(tx.txid())));
+
+        let mut rng = Lcg(7);
+        let mut fresh = 0u32;
+        let (mut evictions, mut refusals, mut child_evictions, mut multi) = (0, 0, 0, 0);
+        for round in 0..3_000 {
+            // A third spend an unspent pool output: chains, and newcomers whose
+            // ancestors must stay
+            let parent = if rng.next().is_multiple_of(3) {
+                let txs = mempool.txs.read();
+                let spenders = mempool.spenders.read();
+                let mut open: Vec<Hash256> = txs
+                    .keys()
+                    .filter(|id| !spenders.contains_key(&(**id, 0)))
+                    .copied()
+                    .collect();
+                open.sort();
+                (!open.is_empty()).then(|| open[rng.next() as usize % open.len()])
+            } else {
+                None
+            };
+            let prevout = parent.map_or_else(|| fresh_prevout(&mut fresh), |p| p.0);
+            let tx = create_test_tx(prevout, 1 + (rng.next() % 5) as i64);
+            // Few distinct fees at a time, one size, and fees drifting up so
+            // that most newcomers outbid the pool: most rates tie with others
+            let fee = Amount::from_sat(1_000 * (1 + (rng.next() % 8) as i64 + round / 200));
+            let expected = reference_doomed(&mempool, &MempoolEntry::new(tx.clone(), fee));
+            removed.lock().clear();
+            let result = mempool.add(tx, fee);
+            let got = std::mem::take(&mut *removed.lock());
+            match expected {
+                Some(doomed) => {
+                    assert!(result.is_ok(), "round {round}: refused, reference evicts");
+                    assert_eq!(got, doomed, "round {round}: eviction differs");
+                    if !doomed.is_empty() {
+                        evictions += 1;
+                        child_evictions += usize::from(parent.is_some());
+                        multi += usize::from(doomed.len() > 1);
+                    }
+                }
+                None => {
+                    assert!(
+                        result.is_err(),
+                        "round {round}: accepted, reference refuses"
+                    );
+                    assert!(got.is_empty(), "round {round}: refused but evicted");
+                    refusals += 1;
+                }
+            }
+            assert_index_matches(&mempool);
+            assert!(mempool.bytes() <= 120 * size);
+        }
+        // The fixture's mix (1,080 evictions, 1,512 refusals, 349 evictions
+        // for a child, 242 of a chain): every case well covered
+        let counts = (evictions, refusals, child_evictions, multi);
+        assert!(
+            evictions >= 1_000 && refusals >= 1_000 && child_evictions >= 300 && multi >= 200,
+            "{counts:?}"
+        );
+    }
+
+    /// Equal and signed-zero rates, and a NaN rate, keep the index a strict
+    /// order that agrees with the comparison eviction used
+    #[test]
+    fn fee_rate_keys_order_as_eviction_compares() {
+        let a = Hash256::from_bytes([1u8; 32]);
+        let b = Hash256::from_bytes([2u8; 32]);
+        let key = |fee_rate: f64, txid| FeeRateKey { fee_rate, txid };
+        let entry = |fee_rate: f64, txid| {
+            let mut e = MempoolEntry::new(create_test_tx([3u8; 32], 1), Amount::from_sat(1));
+            e.fee_rate = fee_rate;
+            e.txid = txid;
+            e
+        };
+        assert_eq!(FeeRateKey::of(&entry(-0.0, a)), key(0.0, a));
+        assert!(FeeRateKey::of(&entry(-0.0, a)).fee_rate.is_sign_positive());
+        assert!(FeeRateKey::of(&entry(-0.0, b)) > FeeRateKey::of(&entry(0.0, a)));
+        assert!(key(1.0, b) < key(1.5, a));
+        assert!(key(2.0, a) < key(2.0, b));
+        assert!(key(-1.0, b) < key(0.0, a));
+        assert!(key(f64::INFINITY, a) > key(f64::MAX, b));
+        let mut set = BTreeSet::new();
+        for k in [
+            key(f64::NAN, a),
+            key(1.0, a),
+            key(-f64::NAN, b),
+            key(0.0, b),
+            key(1.0, a),
+        ] {
+            set.insert(k);
+        }
+        assert_eq!(set.len(), 4);
+        assert!(set.remove(&key(f64::NAN, a)) && set.remove(&key(-f64::NAN, b)));
+        assert_eq!(
+            set.iter().map(|k| k.fee_rate).collect::<Vec<_>>(),
+            [0.0, 1.0]
+        );
+    }
+
+    /// A newcomer with a NaN rate is cheaper than nothing, and a pool entry
+    /// with one (of either sign, which sorts first or last) is never
+    /// evicted, exactly as `<` decided before
+    #[test]
+    fn a_nan_fee_rate_neither_evicts_nor_is_evicted() {
+        let size = create_test_tx([1u8; 32], 1).size();
+        let mut config = test_config();
+        config.max_size = 3 * size;
+        let mempool = Mempool::new(config);
+        let cheap = mempool
+            .add(create_test_tx([1u8; 32], 1), Amount::from_sat(1_000))
+            .unwrap();
+        let mut odd = Vec::new();
+        for (prevout, rate) in [([2u8; 32], f64::NAN), ([5u8; 32], -f64::NAN)] {
+            let id = mempool
+                .add(create_test_tx(prevout, 1), Amount::from_sat(2_000))
+                .unwrap();
+            // Give the entry a NaN rate, index and pool alike
+            let mut txs = mempool.txs.write();
+            let mut index = mempool.by_fee_rate.write();
+            let e = txs.get_mut(&id).unwrap();
+            assert!(index.remove(&FeeRateKey::of(e)));
+            e.fee_rate = rate;
+            index.insert(FeeRateKey::of(e));
+            odd.push(id);
+        }
+        let mut nan = MempoolEntry::new(create_test_tx([3u8; 32], 1), Amount::from_sat(9_000));
+        nan.fee_rate = f64::NAN;
+        assert_eq!(reference_doomed(&mempool, &nan), None);
+        assert!(mempool.make_room_for(&nan).is_err());
+        let rich = MempoolEntry::new(create_test_tx([4u8; 32], 1), Amount::from_sat(9_000));
+        assert_eq!(reference_doomed(&mempool, &rich), Some(vec![cheap]));
+        mempool.make_room_for(&rich).unwrap();
+        assert!(!mempool.contains(&cheap));
+        assert!(odd.iter().all(|id| mempool.contains(id)));
+        assert_index_matches(&mempool);
+    }
+
+    /// Every way out of the pool takes the transaction out of the fee-rate
+    /// index too: it no longer grows with every transaction ever accepted
+    #[test]
+    fn the_fee_rate_index_does_not_outgrow_the_pool() {
+        let mempool = Mempool::new(test_config());
+        let mut fresh = 0u32;
+        for i in 0..10_000 {
+            let tx = create_test_tx(fresh_prevout(&mut fresh), 1 + i % 7);
+            let txid = mempool.add(tx, Amount::from_sat(1_000 + i)).unwrap();
+            assert_eq!(mempool.by_fee_rate.read().len(), 1);
+            assert!(mempool.remove(&txid).is_some());
+            assert!(mempool.by_fee_rate.read().is_empty());
+        }
+
+        // A chain under every bulk removal path
+        let add_chain = |fresh: &mut u32| {
+            let root = create_test_tx(fresh_prevout(fresh), 5);
+            let mut ids = vec![mempool.add(root.clone(), Amount::from_sat(2_000)).unwrap()];
+            for _ in 0..4 {
+                let child = create_test_tx(ids.last().unwrap().0, 4);
+                ids.push(mempool.add(child, Amount::from_sat(2_000)).unwrap());
+            }
+            (root, ids)
+        };
+        let (_, ids) = add_chain(&mut fresh);
+        mempool.remove_for_block(&ids[..2]);
+        assert_index_matches(&mempool);
+        assert_eq!(mempool.size(), 3);
+        // Spending the chain root's coin in a block removes the chain
+        let (root, _) = add_chain(&mut fresh);
+        let mut double_spend = root.clone();
+        double_spend.vout[0].value = Amount::from_divi(1);
+        assert_eq!(mempool.remove_conflicts(&[double_spend]), 5);
+        assert_index_matches(&mempool);
+        // Nothing is on chain any more: everything goes
+        add_chain(&mut fresh);
+        assert_eq!(mempool.remove_unspendable(|_| false), 8);
+        assert_index_matches(&mempool);
+        assert!(mempool.by_fee_rate.read().is_empty());
+        add_chain(&mut fresh);
+        mempool.clear();
+        assert_eq!(mempool.size(), 0);
+        assert!(mempool.by_fee_rate.read().is_empty());
     }
 }

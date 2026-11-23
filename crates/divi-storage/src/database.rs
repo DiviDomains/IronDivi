@@ -183,6 +183,19 @@ impl ChainDatabase {
         utxo_block_opts.set_bloom_filter(10.0, false); // Critical for has_utxo lookups
         utxo_block_opts.set_cache_index_and_filter_blocks(true);
         utxo_block_opts.set_pin_l0_filter_and_index_blocks_in_cache(true);
+        // Filter and index in 4 KiB partitions under a small top-level block.
+        // Whole, one table's filter grows with its keys (about 2.5 MB for a
+        // full 64 MB table of outputs); the shared cache is split into shards
+        // (2 MB each at the default 128 MB), and a block larger than its
+        // shard is dropped as soon as it is used, so every lookup in that
+        // table read the whole filter from disk again. Partitions stay
+        // cached. The format is per table and read by every release either
+        // way: older tables keep their whole filter until compaction
+        // rewrites them, and older releases read partitioned tables.
+        utxo_block_opts.set_index_type(rocksdb::BlockBasedIndexType::TwoLevelIndexSearch);
+        utxo_block_opts.set_partition_filters(true);
+        utxo_block_opts.set_metadata_block_size(4096);
+        utxo_block_opts.set_pin_top_level_index_and_filter(true);
         utxo_opts.set_block_based_table_factory(&utxo_block_opts);
         utxo_opts.set_write_buffer_size(DEFAULT_WRITE_BUFFER_SIZE);
 
@@ -1358,6 +1371,7 @@ mod tests {
     use super::*;
     use divi_primitives::amount::Amount;
     use divi_primitives::script::Script;
+    use std::collections::BTreeMap;
     use tempfile::tempdir;
 
     fn create_test_db() -> (ChainDatabase, tempfile::TempDir) {
@@ -2036,5 +2050,307 @@ mod tests {
         let (db, _dir) = create_test_db();
         let batch = db.batch();
         db.write_batch(batch).unwrap();
+    }
+
+    /// The latest OPTIONS file RocksDB wrote for the database at `dir`
+    fn latest_options(dir: &Path) -> String {
+        let mut files: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| {
+                let name = e.unwrap().file_name().into_string().unwrap();
+                let n: u64 = name.strip_prefix("OPTIONS-")?.parse().ok()?;
+                Some((n, name))
+            })
+            .collect();
+        files.sort();
+        std::fs::read_to_string(dir.join(&files.last().unwrap().1)).unwrap()
+    }
+
+    /// One `[...]` section of an OPTIONS file
+    fn options_section<'a>(options: &'a str, header: &str) -> &'a str {
+        let start = options.find(header).unwrap();
+        let rest = &options[start + header.len()..];
+        &rest[..rest.find("\n[").unwrap_or(rest.len())]
+    }
+
+    /// Open the chain database's families with the `utxo` table options of
+    /// releases before the partitioned filter and index (whole filter and
+    /// index blocks, cached and pinned in L0)
+    fn open_with_whole_filters(path: &Path, cache: &Cache) -> DB {
+        let mut opts = Options::default();
+        opts.create_missing_column_families(true);
+        let mut table = BlockBasedOptions::default();
+        table.set_block_cache(cache);
+        table.set_bloom_filter(10.0, false);
+        table.set_cache_index_and_filter_blocks(true);
+        table.set_pin_l0_filter_and_index_blocks_in_cache(true);
+        let cfs = DB::list_cf(&opts, path).unwrap().into_iter().map(|name| {
+            let mut cf = Options::default();
+            if name == CF_UTXO {
+                cf.set_block_based_table_factory(&table);
+            }
+            ColumnFamilyDescriptor::new(name, cf)
+        });
+        DB::open_cf_descriptors(&opts, path, cfs).unwrap()
+    }
+
+    /// `spendable_output_height_of` over a raw handle, as every release reads it
+    fn spendable_height_raw(db: &DB, txid: &Hash256) -> Option<u32> {
+        let cf = db.cf_handle(CF_UTXO).unwrap();
+        let mut prefix = vec![b'u'];
+        prefix.extend_from_slice(txid.as_bytes());
+        let mode = rocksdb::IteratorMode::From(&prefix, rocksdb::Direction::Forward);
+        for item in db.iterator_cf(cf, mode) {
+            let (key, value) = item.unwrap();
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            let utxo = Utxo::from_bytes(&value).unwrap();
+            if !utxo.script_pubkey.is_op_return() {
+                return Some(utxo.height);
+            }
+        }
+        None
+    }
+
+    fn table_test_txid(i: u32) -> Hash256 {
+        // Neighbouring txids share leading bytes, so a seek that left its
+        // prefix would land on the next transaction's outputs
+        let mut b = [0x5au8; 32];
+        b[..4].copy_from_slice(&i.to_be_bytes());
+        Hash256::from_bytes(b)
+    }
+
+    /// Every output of transaction `i` in the fixture: one to three outputs
+    /// at height `i`, some of them (or all) OP_RETURN
+    fn table_test_outputs(i: u32) -> Vec<(OutPoint, Utxo)> {
+        (0..1 + i % 3)
+            .map(|vout| {
+                let script = if i.is_multiple_of(7) || (i.is_multiple_of(5) && vout == 0) {
+                    Script::new_op_return(&[vout as u8])
+                } else {
+                    Script::new_p2pkh(&[(i % 251) as u8; 20])
+                };
+                let utxo = Utxo::new(Amount::from_sat(1_000 + i as i64), script, i, false, false);
+                (OutPoint::new(table_test_txid(i), vout), utxo)
+            })
+            .collect()
+    }
+
+    fn write_outputs(db: &DB, model: &mut BTreeMap<Vec<u8>, Utxo>, txids: std::ops::Range<u32>) {
+        let cf = db.cf_handle(CF_UTXO).unwrap();
+        for i in txids {
+            for (op, utxo) in table_test_outputs(i) {
+                db.put_cf(cf, utxo_key(&op), utxo.to_bytes()).unwrap();
+                model.insert(utxo_key(&op), utxo);
+            }
+        }
+    }
+
+    fn delete_output(db: &DB, model: &mut BTreeMap<Vec<u8>, Utxo>, op: &OutPoint) {
+        db.delete_cf(db.cf_handle(CF_UTXO).unwrap(), utxo_key(op))
+            .unwrap();
+        model.remove(&utxo_key(op));
+    }
+
+    /// What every reader must find: the height of the first spendable output
+    /// of `txid` in key order
+    fn model_height(model: &BTreeMap<Vec<u8>, Utxo>, txid: &Hash256) -> Option<u32> {
+        let mut prefix = vec![b'u'];
+        prefix.extend_from_slice(txid.as_bytes());
+        model
+            .range(prefix.clone()..)
+            .take_while(|(k, _)| k.starts_with(&prefix))
+            .find(|(_, u)| !u.script_pubkey.is_op_return())
+            .map(|(_, u)| u.height)
+    }
+
+    fn check_raw(db: &DB, model: &BTreeMap<Vec<u8>, Utxo>, txids: u32) {
+        let cf = db.cf_handle(CF_UTXO).unwrap();
+        for i in 0..txids {
+            let txid = table_test_txid(i);
+            assert_eq!(
+                spendable_height_raw(db, &txid),
+                model_height(model, &txid),
+                "BIP30 read of tx {i}"
+            );
+            for vout in 0..3 {
+                let key = utxo_key(&OutPoint::new(txid, vout));
+                assert_eq!(
+                    db.get_cf(cf, &key).unwrap(),
+                    model.get(&key).map(|u| u.to_bytes()),
+                    "point read of {i}:{vout}"
+                );
+            }
+        }
+        let walked: Vec<Vec<u8>> = db
+            .iterator_cf(cf, rocksdb::IteratorMode::Start)
+            .map(|item| item.unwrap().0.to_vec())
+            .collect();
+        assert_eq!(walked, model.keys().cloned().collect::<Vec<_>>());
+    }
+
+    fn check_chain_db(db: &ChainDatabase, model: &BTreeMap<Vec<u8>, Utxo>, txids: u32) {
+        let mut hits = 0;
+        for i in 0..txids {
+            let txid = table_test_txid(i);
+            let expected = model_height(model, &txid);
+            hits += usize::from(expected.is_some());
+            assert_eq!(
+                db.spendable_output_height_of(&txid).unwrap(),
+                expected,
+                "tx {i}"
+            );
+            assert_eq!(
+                db.has_spendable_output_of(&txid).unwrap(),
+                expected.is_some()
+            );
+            for vout in 0..3 {
+                let op = OutPoint::new(txid, vout);
+                assert_eq!(
+                    db.get_utxo(&op).unwrap().map(|u| u.to_bytes()),
+                    model.get(&utxo_key(&op)).map(|u| u.to_bytes()),
+                    "point read of {i}:{vout}"
+                );
+            }
+        }
+        assert!(
+            hits > 0 && hits < txids as usize,
+            "fixture covers hits and misses"
+        );
+        let total: i64 = model.values().map(|u| u.value.as_sat()).sum();
+        assert_eq!(db.utxo_value_total().unwrap(), total);
+        let bogosize: u64 = model.values().map(|u| u.to_bytes().len() as u64).sum();
+        assert_eq!(db.get_utxo_stats().unwrap().bogosize, bogosize);
+        check_raw(db.inner_db(), model, txids);
+    }
+
+    /// `utxo` tables with whole filter and index blocks (every older release)
+    /// and with partitioned ones (this release) read the same through either
+    /// set of options: the BIP30 prefix read, point reads and whole-set walks
+    /// agree with the written outputs in the memtable, in flushed tables of
+    /// either kind and after compaction, and the UTXO set hash is unchanged
+    #[test]
+    fn utxo_reads_agree_with_whole_and_partitioned_filters() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("chain");
+        let cache = Cache::new_lru_cache(8 << 20);
+        let mut model = BTreeMap::new();
+        const TXIDS: u32 = 700;
+
+        // Created as this release creates it, then written as an older one
+        drop(ChainDatabase::open(&path).unwrap());
+        {
+            let old = open_with_whole_filters(&path, &cache);
+            write_outputs(&old, &mut model, 0..300);
+            old.flush_cf(old.cf_handle(CF_UTXO).unwrap()).unwrap();
+            write_outputs(&old, &mut model, 300..400);
+            check_raw(&old, &model, TXIDS);
+        }
+
+        let stats_hash = {
+            let db = ChainDatabase::open(&path).unwrap();
+            let options = latest_options(&path);
+            let table = options_section(&options, "[TableOptions/BlockBasedTable \"utxo\"]");
+            assert!(table.contains("partition_filters=true"), "{table}");
+            assert!(table.contains("index_type=kTwoLevelIndexSearch"), "{table}");
+            assert!(table.contains("metadata_block_size=4096"), "{table}");
+            check_chain_db(&db, &model, TXIDS);
+            let raw = db.inner_db();
+            raw.flush_cf(raw.cf_handle(CF_UTXO).unwrap()).unwrap();
+            check_chain_db(&db, &model, TXIDS);
+            write_outputs(raw, &mut model, 400..600);
+            for i in 0..600 {
+                if i % 4 == 1 {
+                    for (op, _) in table_test_outputs(i) {
+                        delete_output(raw, &mut model, &op);
+                    }
+                } else if i % 6 == 2 {
+                    delete_output(raw, &mut model, &OutPoint::new(table_test_txid(i), 0));
+                }
+            }
+            check_chain_db(&db, &model, TXIDS);
+            raw.flush_cf(raw.cf_handle(CF_UTXO).unwrap()).unwrap();
+            check_chain_db(&db, &model, TXIDS);
+            raw.compact_range_cf(
+                raw.cf_handle(CF_UTXO).unwrap(),
+                None::<&[u8]>,
+                None::<&[u8]>,
+            );
+            check_chain_db(&db, &model, TXIDS);
+            db.get_utxo_stats().unwrap().hash_serialized
+        };
+
+        // Back to an older release, over tables written partitioned
+        {
+            let old = open_with_whole_filters(&path, &cache);
+            check_raw(&old, &model, TXIDS);
+            write_outputs(&old, &mut model, 600..650);
+            old.flush_cf(old.cf_handle(CF_UTXO).unwrap()).unwrap();
+            check_raw(&old, &model, TXIDS);
+        }
+
+        let db = ChainDatabase::open_read_only(&path).unwrap();
+        check_chain_db(&db, &model, TXIDS);
+        drop(db);
+        let db = ChainDatabase::open(&path).unwrap();
+        for i in 600..650 {
+            for (op, _) in table_test_outputs(i) {
+                delete_output(db.inner_db(), &mut model, &op);
+            }
+        }
+        check_chain_db(&db, &model, TXIDS);
+        assert_eq!(db.get_utxo_stats().unwrap().hash_serialized, stats_hash);
+    }
+
+    /// A table whose whole filter is larger than one shard of the block
+    /// cache is read from disk on every lookup; partitioned, its filter
+    /// stays cached. With a 4 MiB cache and one table of 1,200,000 outputs
+    /// (a whole filter of 1.5 MB, which that cache drops after every use:
+    /// 2,000 lookups read 2,000 blocks), lookups of absent outputs read next
+    /// to no block once the cache is warm.
+    #[test]
+    fn utxo_lookups_keep_their_filter_cached_in_a_large_table() {
+        use rocksdb::perf::{set_perf_stats, PerfContext, PerfMetric, PerfStatsLevel};
+        let dir = tempdir().unwrap();
+        let db = ChainDatabase::open_with_cache_size(dir.path(), 4 << 20).unwrap();
+        let raw = db.inner_db();
+        let cf = raw.cf_handle(CF_UTXO).unwrap();
+        let utxo = Utxo::new(
+            Amount::from_sat(1),
+            Script::new_p2pkh(&[1u8; 20]),
+            1,
+            false,
+            false,
+        );
+        let id = |i: u32, salt: u8| {
+            let mut b = [salt; 32];
+            b[..4].copy_from_slice(&i.to_le_bytes());
+            b[4..8].copy_from_slice(&i.wrapping_mul(2_654_435_761).to_le_bytes());
+            Hash256::from_bytes(b)
+        };
+        for chunk in (0..1_200_000u32).collect::<Vec<_>>().chunks(20_000) {
+            let mut batch = WriteBatch::default();
+            for &i in chunk {
+                batch.put_cf(cf, utxo_key(&OutPoint::new(id(i, 0), 0)), utxo.to_bytes());
+            }
+            raw.write(batch).unwrap();
+        }
+        raw.flush_cf(cf).unwrap();
+        raw.compact_range_cf(cf, None::<&[u8]>, None::<&[u8]>);
+        for i in 0..20_000 {
+            assert!(db.get_utxo(&OutPoint::new(id(i, 9), 0)).unwrap().is_none());
+        }
+        set_perf_stats(PerfStatsLevel::EnableCount);
+        let mut perf = PerfContext::default();
+        perf.reset();
+        for i in 0..2_000 {
+            assert!(db.get_utxo(&OutPoint::new(id(i, 9), 0)).unwrap().is_none());
+        }
+        let reads = perf.metric(PerfMetric::BlockReadCount);
+        set_perf_stats(PerfStatsLevel::Disable);
+        assert!(db.get_utxo(&OutPoint::new(id(7, 0), 0)).unwrap().is_some());
+        // A whole filter read again per lookup would be at least 2,000 reads
+        assert!(reads < 200, "{reads} block reads for 2,000 absent outputs");
     }
 }

@@ -35,11 +35,50 @@ use swap_chain_divi::RpcClient;
 pub const MONEROD_RPC_DEFAULT: &str = "http://node.monerodevs.org:38089";
 // Fallback if the primary node above is unreachable: override via MONEROD_RPC=http://stagenet.xmr-tw.org:38081.
 
+/// The HTTP client every Monero RPC call here and in [`crate::monero_chain`] goes
+/// through: `reqwest::Client::new()`'s configuration (no timeouts), one per tokio
+/// runtime. A new client per call loaded the TLS roots again and dropped its
+/// connection after one request; this one keeps connections to the daemon and wallet
+/// alive between calls. Shared per runtime rather than per process: a pooled
+/// connection is driven by a task on the runtime that opened it, so once that runtime
+/// is gone a call from another one could wait on the connection for ever. Runtime ids
+/// are never reused; the clients of the last [`KEPT_CLIENTS`] runtimes are kept.
+pub(crate) fn http_client() -> reqwest::Client {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return reqwest::Client::new();
+    };
+    let id = runtime.id();
+    let mut clients = HTTP_CLIENTS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, client)) = clients.iter().find(|(r, _)| *r == id) {
+        return client.clone();
+    }
+    let client = reqwest::Client::new();
+    if clients.len() >= KEPT_CLIENTS {
+        clients.remove(0);
+    }
+    clients.push((id, client.clone()));
+    client
+}
+
+/// How many runtimes' clients [`http_client`] keeps
+const KEPT_CLIENTS: usize = 16;
+
+/// [`http_client`]'s clients, oldest runtime first
+static HTTP_CLIENTS: std::sync::Mutex<Vec<(tokio::runtime::Id, reqwest::Client)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// The runtimes [`http_client`] holds a client for
+#[cfg(test)]
+pub(crate) fn http_client_runtimes() -> Vec<tokio::runtime::Id> {
+    let clients = HTTP_CLIENTS.lock().unwrap_or_else(|e| e.into_inner());
+    clients.iter().map(|(id, _)| *id).collect()
+}
+
 /// `get_info` over `/json_rpc` -- available on restricted public nodes exactly like
 /// trusted/local ones (checked live against `node.monerodevs.org:38089` and
 /// `stagenet.xmr-tw.org:38081`, both `"restricted": true` and both answer it fine).
 pub async fn monerod_get_info(monerod_rpc: &str) -> reqwest::Result<serde_json::Value> {
-    reqwest::Client::new()
+    http_client()
         .post(format!("{monerod_rpc}/json_rpc"))
         .json(&serde_json::json!({"jsonrpc":"2.0","id":"0","method":"get_info"}))
         .send()
@@ -271,7 +310,7 @@ pub const SPENDABLE_AGE: u64 = 10;
 /// on the DIVI side). Scanning for the actual *output* (not just confirming the
 /// funding tx exists) is [`scan_for_lock_output`]'s job.
 pub async fn check_xmr_confirmed_n(monerod_rpc: &str, txid: &str, min_confirmations: u64) -> bool {
-    let resp = reqwest::Client::new()
+    let resp = http_client()
         .post(format!("{monerod_rpc}/get_transactions"))
         .json(&serde_json::json!({"txs_hashes": [txid], "decode_as_json": false}))
         .send()
@@ -333,7 +372,7 @@ impl ProvidesUnvalidatedDecoys for LiveDecoys {
         // DEFAULT_LOCK_WINDOW -- works identically, just smaller and reliable.
         let from_height = self.latest_height.saturating_sub(100_000);
         async move {
-            let body: serde_json::Value = reqwest::Client::new()
+            let body: serde_json::Value = http_client()
                 .post(format!("{monerod_rpc}/json_rpc"))
                 .json(&serde_json::json!({
                     "jsonrpc": "2.0", "id": "0", "method": "get_output_distribution",
@@ -369,7 +408,7 @@ impl ProvidesUnvalidatedDecoys for LiveDecoys {
             .map(|i| serde_json::json!({"amount": 0, "index": i}))
             .collect();
         async move {
-            let body: serde_json::Value = reqwest::Client::new()
+            let body: serde_json::Value = http_client()
                 .post(format!("{monerod_rpc}/get_outs"))
                 .json(&serde_json::json!({"outputs": outputs, "get_txid": false}))
                 .send()
@@ -417,7 +456,7 @@ pub async fn fetch_scannable_block(
     monerod_rpc: &str,
     height: usize,
 ) -> Result<ScannableBlock, String> {
-    let client = reqwest::Client::new();
+    let client = http_client();
     let block_body: serde_json::Value = client
         .post(format!("{monerod_rpc}/json_rpc"))
         .json(&serde_json::json!({"jsonrpc":"2.0","id":"0","method":"get_block","params":{"height":height}}))
@@ -521,7 +560,7 @@ pub async fn scan_for_lock_output(
     txid: &str,
     view_pair: ViewPair,
 ) -> Result<Option<WalletOutput>, String> {
-    let tx_body: serde_json::Value = reqwest::Client::new()
+    let tx_body: serde_json::Value = http_client()
         .post(format!("{monerod_rpc}/get_transactions"))
         .json(&serde_json::json!({"txs_hashes": [txid], "decode_as_json": false}))
         .send()

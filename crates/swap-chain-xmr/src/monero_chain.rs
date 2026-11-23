@@ -155,7 +155,7 @@ async fn digest_auth_post_json(
     body: &serde_json::Value,
 ) -> Result<serde_json::Value, MoneroChainError> {
     let body_bytes = serde_json::to_vec(body).expect("serde_json::Value always serializes");
-    let client = reqwest::Client::new();
+    let client = crate::live_rpc::http_client();
     let url = format!("{rpc_url}{path}");
     let first = client
         .post(&url)
@@ -291,7 +291,7 @@ pub async fn sweep(
         .as_u64()
         .ok_or_else(|| MoneroChainError::RpcError(format!("no height in get_info: {info}")))?
         as usize;
-    let fee_body: serde_json::Value = reqwest::Client::new()
+    let fee_body: serde_json::Value = crate::live_rpc::http_client()
         .post(format!("{monerod_rpc}/json_rpc"))
         .json(&serde_json::json!({"jsonrpc":"2.0","id":"0","method":"get_fee_estimate"}))
         .send()
@@ -342,7 +342,7 @@ pub async fn sweep(
     .map_err(|e| MoneroChainError::SweepBuild(format!("{e:?}")))?;
 
     let tx_hex = hex::encode(monero_wallet::transaction::Transaction::serialize(&tx));
-    let resp: serde_json::Value = reqwest::Client::new()
+    let resp: serde_json::Value = crate::live_rpc::http_client()
         .post(format!("{monerod_rpc}/send_raw_transaction"))
         .json(&serde_json::json!({"tx_as_hex": tx_hex, "do_not_relay": false}))
         .send()
@@ -365,7 +365,7 @@ pub async fn sweep(
 /// in a way worth distinguishing from "unknown" for this crate's callers; wrap with
 /// your own error type if you need to tell "daemon unreachable" apart from "not found").
 pub async fn confirmations(monerod_rpc: &str, txid: &str) -> Option<u32> {
-    let resp = reqwest::Client::new()
+    let resp = crate::live_rpc::http_client()
         .post(format!("{monerod_rpc}/get_transactions"))
         .json(&serde_json::json!({"txs_hashes": [txid], "decode_as_json": false}))
         .send()
@@ -379,6 +379,8 @@ pub async fn confirmations(monerod_rpc: &str, txid: &str) -> Option<u32> {
 mod tests {
     use super::*;
     use monero_wallet::ed25519::Scalar as EdScalar;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::Arc;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -508,6 +510,122 @@ mod tests {
             .mount(&server)
             .await;
         assert_eq!(confirmations(&server.uri(), &"c".repeat(64)).await, None);
+    }
+
+    /// A blocking HTTP/1.1 keep-alive server on its own threads answering
+    /// every request with `body`; counts the connections it accepted
+    fn keep_alive_server(body: &'static str) -> (String, Arc<AtomicUsize>) {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&accepted);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let stream = stream.unwrap();
+                count.fetch_add(1, AtomicOrdering::SeqCst);
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut writer = stream;
+                    loop {
+                        let mut length = 0usize;
+                        loop {
+                            let mut line = String::new();
+                            if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                                return;
+                            }
+                            if line == "\r\n" {
+                                break;
+                            }
+                            let lower = line.to_ascii_lowercase();
+                            if let Some(v) = lower.strip_prefix("content-length:") {
+                                length = v.trim().parse().unwrap();
+                            }
+                        }
+                        let mut request = vec![0u8; length];
+                        reader.read_exact(&mut request).unwrap();
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                             Content-Length: {}\r\n\r\n{body}",
+                            body.len()
+                        );
+                        if writer.write_all(response.as_bytes()).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (url, accepted)
+    }
+
+    /// Monero calls on one runtime share a client: consecutive calls reuse one
+    /// kept-alive connection. A call from a later runtime, after the runtime that
+    /// opened the pooled connection is gone, gets its own client and does not wait on
+    /// the dead connection; concurrent calls on a multi-threaded runtime all succeed
+    #[test]
+    fn monero_calls_reuse_a_kept_alive_connection_per_runtime() {
+        let (url, accepted) = keep_alive_server(r#"{"status":"OK","txs":[{"confirmations":9}]}"#);
+        let call = |url: String| async move {
+            let txid = "e".repeat(64);
+            let reply = confirmations(&url, &txid);
+            tokio::time::timeout(std::time::Duration::from_secs(10), reply)
+                .await
+                .expect("a Monero call hung")
+        };
+        let runtime = || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+        };
+        let first = runtime();
+        for _ in 0..20 {
+            assert_eq!(first.block_on(call(url.clone())), Some(9));
+        }
+        let runtimes = crate::live_rpc::http_client_runtimes();
+        assert!(
+            runtimes.contains(&first.handle().id()),
+            "a client for the runtime"
+        );
+        assert_eq!(
+            accepted.load(AtomicOrdering::SeqCst),
+            1,
+            "one connection for 20 calls"
+        );
+        drop(first);
+        let second = runtime();
+        for _ in 0..5 {
+            assert_eq!(second.block_on(call(url.clone())), Some(9));
+        }
+        let runtimes = crate::live_rpc::http_client_runtimes();
+        assert!(
+            runtimes.contains(&second.handle().id()),
+            "the later runtime has a client of its own"
+        );
+        assert_eq!(
+            accepted.load(AtomicOrdering::SeqCst),
+            2,
+            "one more for the new runtime"
+        );
+        drop(second);
+        let multi = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let results = multi.block_on(async {
+            let calls: Vec<_> = (0..8).map(|_| tokio::spawn(call(url.clone()))).collect();
+            let mut out = Vec::new();
+            for c in calls {
+                out.push(c.await.unwrap());
+            }
+            out
+        });
+        assert_eq!(results, vec![Some(9); 8]);
+        // Outside a runtime there is nothing to share a client with
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        drop(crate::live_rpc::http_client());
     }
 
     #[tokio::test]

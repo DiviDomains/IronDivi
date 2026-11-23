@@ -17,7 +17,7 @@
 use divi_primitives::script::Script;
 use divi_primitives::transaction::Transaction;
 use divi_primitives::Hash256;
-use rocksdb::{ColumnFamilyDescriptor, Options, WriteBatch, DB};
+use rocksdb::{BlockBasedOptions, ColumnFamilyDescriptor, Options, WriteBatch, DB};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -46,10 +46,10 @@ pub fn bare_txid(tx: &Transaction) -> Hash256 {
     stripped.txid()
 }
 
-fn bare_key(bare: &Hash256) -> Vec<u8> {
-    let mut key = Vec::with_capacity(33);
-    key.push(BARE_TXID_PREFIX);
-    key.extend_from_slice(bare.as_bytes());
+fn bare_key(bare: &Hash256) -> [u8; 33] {
+    let mut key = [0u8; 33];
+    key[0] = BARE_TXID_PREFIX;
+    key[1..].copy_from_slice(bare.as_bytes());
     key
 }
 
@@ -101,6 +101,19 @@ pub struct TxIndex {
     db: Arc<DB>,
 }
 
+/// The `txindex` family's options: a 10 bits-per-key bloom filter (about 1%
+/// false positives), so a lookup of a transaction that is not indexed, and
+/// the bare-txid lookup a txid miss falls back to, read no table for most
+/// files. Filters are per table: a table written without one (an older
+/// release) is read as before, and older releases read these tables as is.
+fn txindex_cf_options() -> Options {
+    let mut table = BlockBasedOptions::default();
+    table.set_bloom_filter(10.0, false);
+    let mut opts = Options::default();
+    opts.set_block_based_table_factory(&table);
+    opts
+}
+
 impl TxIndex {
     pub fn new(db: Arc<DB>) -> Result<Self, StorageError> {
         Ok(Self { db })
@@ -112,7 +125,10 @@ impl TxIndex {
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
 
-        let cf_descriptors = vec![ColumnFamilyDescriptor::new(CF_TXINDEX, Options::default())];
+        let cf_descriptors = vec![ColumnFamilyDescriptor::new(
+            CF_TXINDEX,
+            txindex_cf_options(),
+        )];
 
         let db = DB::open_cf_descriptors(&opts, path, cf_descriptors)
             .map_err(|e| StorageError::ChainState(e.to_string()))?;
@@ -134,7 +150,7 @@ impl TxIndex {
             .ok_or_else(|| StorageError::ChainState("Column family not found".to_string()))?;
 
         // By txid, then by bare txid, as Core's ReadTxIndex (txdb.cpp:206-218)
-        for key in [txid.as_bytes().to_vec(), bare_key(txid)] {
+        for key in [&txid.as_bytes()[..], &bare_key(txid)[..]] {
             match self.db.get_cf(cf, key) {
                 Ok(Some(bytes)) => return Ok(Some(TxLocation::from_bytes(&bytes)?)),
                 Ok(None) => {}
@@ -455,5 +471,102 @@ mod tests {
             assert_eq!(retrieved.block_hash, location.block_hash);
             assert_eq!(retrieved.tx_index, location.tx_index);
         }
+    }
+
+    /// A txindex database as releases before the bloom filter opened it
+    fn open_without_bloom_filter(path: &Path) -> TxIndex {
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+        opts.create_missing_column_families(true);
+        let cfs = vec![ColumnFamilyDescriptor::new(CF_TXINDEX, Options::default())];
+        TxIndex {
+            db: Arc::new(DB::open_cf_descriptors(&opts, path, cfs).unwrap()),
+        }
+    }
+
+    fn fixture_entry(i: u32) -> (Hash256, Hash256, TxLocation) {
+        let id = |tag: u8| {
+            let mut b = [tag; 32];
+            b[..4].copy_from_slice(&i.to_be_bytes());
+            Hash256::from_bytes(b)
+        };
+        (id(0x11), id(0x22), TxLocation::new(id(0x33), i))
+    }
+
+    fn check_index(index: &TxIndex, present: std::ops::Range<u32>, absent: std::ops::Range<u32>) {
+        for i in present {
+            let (txid, bare, location) = fixture_entry(i);
+            for key in [txid, bare] {
+                let found = index.get_location(&key).unwrap().expect("indexed");
+                assert_eq!(found.to_bytes(), location.to_bytes(), "entry {i}");
+            }
+            assert!(index.has_transaction(&txid).unwrap());
+        }
+        for i in absent {
+            let (txid, bare, _) = fixture_entry(i);
+            assert!(index.get_location(&txid).unwrap().is_none(), "entry {i}");
+            assert!(index.get_location(&bare).unwrap().is_none(), "entry {i}");
+        }
+    }
+
+    fn flush(index: &TxIndex) {
+        index
+            .db
+            .flush_cf(index.db.cf_handle(CF_TXINDEX).unwrap())
+            .unwrap();
+    }
+
+    fn filter_bytes(index: &TxIndex) -> u64 {
+        let cf = index.db.cf_handle(CF_TXINDEX).unwrap();
+        let props = index
+            .db
+            .property_value_cf(cf, "rocksdb.aggregated-table-properties")
+            .unwrap()
+            .unwrap();
+        let field = props
+            .split(';')
+            .find_map(|f| f.trim().strip_prefix("filter block size="))
+            .unwrap_or_else(|| panic!("{props}"));
+        field.trim().parse().unwrap()
+    }
+
+    /// Tables written without the bloom filter (older releases) and with it
+    /// read the same through either set of options, txid and bare-txid keys,
+    /// hits and misses, in the memtable and in flushed tables
+    #[test]
+    fn txindex_reads_agree_with_and_without_the_bloom_filter() {
+        let dir = tempdir().unwrap();
+        let entries: Vec<_> = (0..400).map(fixture_entry).collect();
+        {
+            let old = open_without_bloom_filter(dir.path());
+            old.put_tx_locations(&entries[..150]).unwrap();
+            flush(&old);
+            assert_eq!(filter_bytes(&old), 0, "older tables carry no filter");
+            old.put_tx_locations(&entries[150..200]).unwrap();
+            check_index(&old, 0..200, 200..500);
+        }
+        {
+            let index = TxIndex::open(dir.path()).unwrap();
+            check_index(&index, 0..200, 200..500);
+            flush(&index);
+            index.put_tx_locations(&entries[200..400]).unwrap();
+            flush(&index);
+            assert!(filter_bytes(&index) > 0, "new tables carry a bloom filter");
+            check_index(&index, 0..400, 400..500);
+            index.delete_location(&entries[0].0).unwrap();
+            assert!(index.get_location(&entries[0].0).unwrap().is_none());
+            assert!(
+                index.get_location(&entries[0].1).unwrap().is_some(),
+                "bare key stays"
+            );
+            index.db.compact_range_cf(
+                index.db.cf_handle(CF_TXINDEX).unwrap(),
+                None::<&[u8]>,
+                None::<&[u8]>,
+            );
+            check_index(&index, 1..400, 400..500);
+        }
+        let old = open_without_bloom_filter(dir.path());
+        check_index(&old, 1..400, 400..500);
     }
 }

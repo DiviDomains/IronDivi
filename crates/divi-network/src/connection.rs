@@ -1084,7 +1084,6 @@ impl Connection {
         last_ping_sent: &mut Option<std::time::Instant>,
         msg: NetworkMessage,
     ) -> Result<(), NetworkError> {
-        let queued = msg.wire_size();
         let Some(msg) = stats.hold_if_waiting(msg)? else {
             return Ok(());
         };
@@ -1098,7 +1097,16 @@ impl Connection {
             }
             other => other,
         };
-        let written = Self::write_message(writer, info, magic, total_bytes_sent, msg).await;
+        // Serialized once, for the write and for the charge to release: the
+        // frame's length is the `wire_size` admission charged (a fresh ping
+        // nonce is the same size), and 24 header bytes when the payload does
+        // not serialize, as `wire_size` counts it
+        let frame = msg.to_bytes(magic);
+        let queued = frame.as_ref().map_or(24, |frame| frame.len() as u64);
+        let written = match frame {
+            Ok(frame) => Self::write_frame_bytes(writer, info, total_bytes_sent, &msg, frame).await,
+            Err(e) => Err(e),
+        };
         stats.send_written(queued);
         written
     }
@@ -1112,7 +1120,17 @@ impl Connection {
         msg: NetworkMessage,
     ) -> Result<(), NetworkError> {
         let bytes = msg.to_bytes(magic)?;
+        Self::write_frame_bytes(writer, info, total_bytes_sent, &msg, bytes).await
+    }
 
+    /// Write `msg`, already serialized as `bytes`, and count it
+    async fn write_frame_bytes<W: AsyncWriteExt + Unpin>(
+        writer: &mut W,
+        info: &mut PeerInfo,
+        total_bytes_sent: &Arc<AtomicU64>,
+        msg: &NetworkMessage,
+        bytes: Vec<u8>,
+    ) -> Result<(), NetworkError> {
         write_frame(writer, &bytes).await?;
 
         // Update stats
@@ -1342,5 +1360,94 @@ mod tests {
         // (Node.cpp:823-825), as for a dialled peer that never sends its sporks
         assert!(!inactivity_exceeded(start, at(1200), None, at(20 * 60)));
         assert!(inactivity_exceeded(start, at(1200), None, at(20 * 60 + 1)));
+    }
+
+    /// A queued message goes out exactly as `to_bytes` frames it, and the
+    /// bytes its admission charged (`wire_size`) are released in full once
+    /// it is written: for a held-back ping (sent later with a fresh nonce)
+    /// as for a large frame
+    #[tokio::test]
+    async fn a_queued_message_is_framed_once_and_releases_its_charge() {
+        use crate::constants::MAINNET_MAGIC;
+        let stats = LivePeerStats::default();
+        let mut info = PeerInfo::new_inbound(1, "127.0.0.1:1".parse().unwrap());
+        let total = Arc::new(AtomicU64::new(0));
+        let mut last_ping = None;
+        let mut out = Vec::new();
+        let messages = [
+            NetworkMessage::Verack,
+            NetworkMessage::Pong(7),
+            NetworkMessage::Unknown("big".into(), vec![0xa5; 1 << 20]),
+            NetworkMessage::GetAddr,
+        ];
+        let mut expected = Vec::new();
+        for msg in &messages {
+            stats
+                .send_queued_bytes
+                .fetch_add(msg.wire_size(), Ordering::Relaxed);
+            expected.extend_from_slice(&msg.to_bytes(MAINNET_MAGIC).unwrap());
+        }
+        for msg in messages {
+            Connection::write_queued(
+                &mut out,
+                &mut info,
+                MAINNET_MAGIC,
+                &total,
+                &stats,
+                &mut last_ping,
+                msg,
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(out, expected);
+        assert_eq!(stats.send_queued_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(info.bytes_sent, expected.len() as u64);
+        assert_eq!(total.load(Ordering::Relaxed), expected.len() as u64);
+
+        // Held while the peer's sporks are out: the charge stays until written
+        stats.sporks_wait.store(true, Ordering::Release);
+        let ping = NetworkMessage::Ping(1);
+        stats
+            .send_queued_bytes
+            .fetch_add(ping.wire_size(), Ordering::Relaxed);
+        out.clear();
+        Connection::write_queued(
+            &mut out,
+            &mut info,
+            MAINNET_MAGIC,
+            &total,
+            &stats,
+            &mut last_ping,
+            ping.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(out.is_empty());
+        assert_eq!(
+            stats.send_queued_bytes.load(Ordering::Relaxed),
+            ping.wire_size()
+        );
+        assert!(stats.sporks_arrived());
+        for held in stats.take_held() {
+            Connection::write_queued(
+                &mut out,
+                &mut info,
+                MAINNET_MAGIC,
+                &total,
+                &stats,
+                &mut last_ping,
+                held,
+            )
+            .await
+            .unwrap();
+        }
+        let nonce = info.ping_nonce.expect("a fresh nonce");
+        assert_eq!(
+            out,
+            NetworkMessage::Ping(nonce).to_bytes(MAINNET_MAGIC).unwrap()
+        );
+        assert_eq!(stats.send_queued_bytes.load(Ordering::Relaxed), 0);
+        assert!(last_ping.is_some());
     }
 }

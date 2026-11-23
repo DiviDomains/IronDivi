@@ -17,19 +17,21 @@ use crate::error::CryptoError;
 use crate::keys::{message_hash, PublicKey, SecretKey};
 use secp256k1::ecdsa::{RecoverableSignature, RecoveryId, Signature as SecpSignature};
 use secp256k1::Message;
-use std::cell::RefCell;
 use std::fmt;
+use std::sync::OnceLock;
 
-thread_local! {
-    static SECP256K1: RefCell<secp256k1::Secp256k1<secp256k1::All>> = RefCell::new(secp256k1::Secp256k1::new());
-}
+/// The process-wide secp256k1 context. `Secp256k1::new()` allocates a
+/// context and randomizes it (a blinding scalar multiplication), which costs
+/// about as much as the key operation itself; the context is `Send + Sync`
+/// and only ever borrowed immutably, so one is made, once, for every thread.
+static SECP256K1: OnceLock<secp256k1::Secp256k1<secp256k1::All>> = OnceLock::new();
 
-/// Use the thread-local secp256k1 context to avoid repeated allocation
-fn with_secp<F, R>(f: F) -> R
+/// Use the shared secp256k1 context to avoid repeated allocation
+pub(crate) fn with_secp<F, R>(f: F) -> R
 where
     F: FnOnce(&secp256k1::Secp256k1<secp256k1::All>) -> R,
 {
-    SECP256K1.with(|secp| f(&secp.borrow()))
+    f(SECP256K1.get_or_init(secp256k1::Secp256k1::new))
 }
 
 /// An ECDSA signature
