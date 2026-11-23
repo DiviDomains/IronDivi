@@ -183,12 +183,29 @@ impl DirtyFlags {
     }
 }
 
-/// UTXO, spent and transaction rows to delete from disk on the next save
-#[derive(Default)]
+/// A single writer owns acknowledgement under persist_lock. A fresh insertion
+/// always clears the submitted bit, even when it repeats the same command.
+#[derive(Clone)]
+struct PendingRow<T> {
+    value: T,
+    submitted: bool,
+}
+
+impl<T> PendingRow<T> {
+    fn new(value: T) -> Self {
+        Self {
+            value,
+            submitted: false,
+        }
+    }
+}
+
+#[derive(Default, Clone)]
 struct PendingDeletes {
-    utxos: HashSet<OutPoint>,
-    spent: HashSet<OutPoint>,
-    transactions: HashSet<Hash256>,
+    utxos: HashMap<OutPoint, PendingRow<()>>,
+    spent: HashMap<OutPoint, PendingRow<()>>,
+    // A memory-only prune can remove a history value before it was saved.
+    transactions: HashMap<Hash256, PendingRow<Option<Box<WalletTx>>>>,
 }
 
 impl PendingDeletes {
@@ -427,6 +444,10 @@ pub struct WalletDb {
     /// Rows removed from memory that must also be deleted from disk on the
     /// next save (a save only writes what is in memory)
     pending_deletes: RwLock<PendingDeletes>,
+    /// History pruned from memory only (still durable, or owed as a
+    /// `pending_deletes` put): id -> block height. A clear or rollback must
+    /// delete these rows too. Taken after `pending_deletes`.
+    pruned_history: RwLock<HashMap<Hash256, Option<u32>>>,
     /// Hashes of the most recently scanned blocks by height (in memory), so a
     /// sync notices a chain switch it was not told about (invalidateblock,
     /// a missed reorg notification) and rolls back to the fork first
@@ -564,6 +585,7 @@ impl WalletDb {
             tx_listener: RwLock::new(None),
             reorg_accepted: RwLock::new(HashSet::new()),
             pending_deletes: RwLock::new(PendingDeletes::default()),
+            pruned_history: RwLock::new(HashMap::new()),
             scanned_hashes: RwLock::new(BTreeMap::new()),
             vault_mode: std::sync::atomic::AtomicBool::new(false),
             vault_min: std::sync::atomic::AtomicI64::new(0),
@@ -612,6 +634,7 @@ impl WalletDb {
             tx_listener: RwLock::new(None),
             reorg_accepted: RwLock::new(HashSet::new()),
             pending_deletes: RwLock::new(PendingDeletes::default()),
+            pruned_history: RwLock::new(HashMap::new()),
             scanned_hashes: RwLock::new(BTreeMap::new()),
             vault_mode: std::sync::atomic::AtomicBool::new(false),
             vault_min: std::sync::atomic::AtomicI64::new(0),
@@ -664,6 +687,7 @@ impl WalletDb {
             tx_listener: RwLock::new(None),
             reorg_accepted: RwLock::new(HashSet::new()),
             pending_deletes: RwLock::new(PendingDeletes::default()),
+            pruned_history: RwLock::new(HashMap::new()),
             scanned_hashes: RwLock::new(BTreeMap::new()),
             vault_mode: std::sync::atomic::AtomicBool::new(false),
             vault_min: std::sync::atomic::AtomicI64::new(0),
@@ -1041,6 +1065,7 @@ impl WalletDb {
             tx_listener: RwLock::new(None),
             reorg_accepted: RwLock::new(HashSet::new()),
             pending_deletes: RwLock::new(PendingDeletes::default()),
+            pruned_history: RwLock::new(HashMap::new()),
             scanned_hashes: RwLock::new(BTreeMap::new()),
             vault_mode: std::sync::atomic::AtomicBool::new(false),
             vault_min: std::sync::atomic::AtomicI64::new(0),
@@ -1692,9 +1717,10 @@ impl WalletDb {
         }
 
         pause_point!(self, "wallet save batch built");
+        stop_point!("wallet save batch built");
         // Synced, so it is on disk when this returns; no memtable flush needed
         db.write_batch_sync(batch)?;
-        self.clear_pending_deletes(&pending);
+        self.clear_pending_deletes();
         stop_point!("wallet deletes written");
 
         debug!("Wallet saved to disk");
@@ -1702,20 +1728,24 @@ impl WalletDb {
     }
 
     fn pending_deletes_snapshot(&self) -> PendingDeletes {
-        let p = self.pending_deletes.read();
-        PendingDeletes {
-            utxos: p.utxos.clone(),
-            spent: p.spent.clone(),
-            transactions: p.transactions.clone(),
+        let mut p = self.pending_deletes.write();
+        for row in p.utxos.values_mut() {
+            row.submitted = true;
         }
+        for row in p.spent.values_mut() {
+            row.submitted = true;
+        }
+        for row in p.transactions.values_mut() {
+            row.submitted = true;
+        }
+        p.clone()
     }
 
-    /// Forget deletes that have been written (new ones may have arrived since)
-    fn clear_pending_deletes(&self, written: &PendingDeletes) {
+    fn clear_pending_deletes(&self) {
         let mut p = self.pending_deletes.write();
-        p.utxos.retain(|o| !written.utxos.contains(o));
-        p.spent.retain(|o| !written.spent.contains(o));
-        p.transactions.retain(|t| !written.transactions.contains(t));
+        p.utxos.retain(|_, r| !r.submitted);
+        p.spent.retain(|_, r| !r.submitted);
+        p.transactions.retain(|_, r| !r.submitted);
     }
 
     fn put_pending_deletes(
@@ -1723,15 +1753,19 @@ impl WalletDb {
         db: &WalletDatabase,
         pending: &PendingDeletes,
     ) {
-        use crate::persistence::outpoint_key;
-        for outpoint in &pending.utxos {
+        use crate::persistence::{outpoint_key, serialize_tx};
+        for outpoint in pending.utxos.keys() {
             batch.delete_cf(db.cf_utxos(), outpoint_key(outpoint));
         }
-        for outpoint in &pending.spent {
+        for outpoint in pending.spent.keys() {
             batch.delete_cf(db.cf_spent(), outpoint_key(outpoint));
         }
-        for txid in &pending.transactions {
-            batch.delete_cf(db.cf_transactions(), txid.as_bytes());
+        for (txid, row) in &pending.transactions {
+            if let Some(tx) = &row.value {
+                batch.put_cf(db.cf_transactions(), txid.as_bytes(), serialize_tx(tx));
+            } else {
+                batch.delete_cf(db.cf_transactions(), txid.as_bytes());
+            }
         }
     }
 
@@ -1905,7 +1939,7 @@ impl WalletDb {
         stop_point!("wallet incremental batch built");
         // Atomic write
         db.write_batch(batch)?;
-        self.clear_pending_deletes(&pending);
+        self.clear_pending_deletes();
 
         counted::hit(Site::WalletSave);
         Ok(())
@@ -2453,7 +2487,7 @@ impl WalletDb {
             let had_data = spent_data.remove(&outpoint).is_some();
             let had_spent = spent.remove(&outpoint);
             if had_spent || had_data {
-                pending.spent.insert(outpoint);
+                pending.spent.insert(outpoint, PendingRow::new(()));
             }
             utxos.insert(outpoint, utxo);
             if had_data {
@@ -2481,9 +2515,11 @@ impl WalletDb {
         outpoint: &OutPoint,
         height: Option<u32>,
     ) -> Option<WalletUtxo> {
+        let mut pending = self.pending_deletes.write();
         let utxo = self.utxos.write().remove(outpoint);
         if let Some(ref u) = utxo {
             counted::hit(Site::WalletUtxoSpent);
+            pending.spent.remove(outpoint);
             self.spent.write().insert(*outpoint);
             if let Some(h) = height {
                 self.spent_utxo_data
@@ -2801,6 +2837,7 @@ impl WalletDb {
         }
         let mut removed = 0u32;
         for outpoint in &absent {
+            let mut pending = self.pending_deletes.write();
             if let Some(utxo) = self.utxos.write().remove(outpoint) {
                 info!(
                     "Reconciliation: removed phantom UTXO {} ({}, addr={})",
@@ -2808,7 +2845,7 @@ impl WalletDb {
                     WalletAmount(utxo.value.as_sat()),
                     WalletAddress(&utxo.address)
                 );
-                self.pending_deletes.write().utxos.insert(*outpoint);
+                pending.utxos.insert(*outpoint, PendingRow::new(()));
                 removed += 1;
             }
         }
@@ -2824,7 +2861,7 @@ impl WalletDb {
                 let restored = spent_data.remove(&outpoint).map(|(u, _)| u);
                 let was_spent = spent.remove(&outpoint);
                 if was_spent || restored.is_some() {
-                    pending.spent.insert(outpoint);
+                    pending.spent.insert(outpoint, PendingRow::new(()));
                     cleared_spent += 1;
                     if let Some(utxo) = restored {
                         if let Some(ref db) = self.db() {
@@ -3031,26 +3068,38 @@ impl WalletDb {
         info!("Clearing wallet transactions, UTXOs, and spent tracking");
         {
             let mut pending = self.pending_deletes.write();
-            pending
-                .transactions
-                .extend(self.transactions_w().drain().map(|(txid, _)| txid));
-            pending
-                .utxos
-                .extend(self.utxos.write().drain().map(|(outpoint, _)| outpoint));
+            pending.transactions.extend(
+                self.transactions_w()
+                    .drain()
+                    .map(|(txid, _)| (txid, PendingRow::new(None))),
+            );
+            // Pruned history is erased too, whether durable or still owed
+            pending.transactions.extend(
+                self.pruned_history
+                    .write()
+                    .drain()
+                    .map(|(txid, _)| (txid, PendingRow::new(None))),
+            );
+            pending.utxos.extend(
+                self.utxos
+                    .write()
+                    .drain()
+                    .map(|(outpoint, _)| (outpoint, PendingRow::new(()))),
+            );
             // A spent coin may still have a row in the UTXO table
             for outpoint in self.spent.write().drain() {
-                pending.utxos.insert(outpoint);
-                pending.spent.insert(outpoint);
+                pending.utxos.insert(outpoint, PendingRow::new(()));
+                pending.spent.insert(outpoint, PendingRow::new(()));
             }
-        }
-        self.scanned_hashes.write().clear();
-        for (outpoint, _) in self.spent_utxo_data.write().drain() {
-            if let Some(ref db) = self.db() {
-                if let Err(e) = db.remove_spent_utxo_data(&outpoint) {
-                    debug!("Failed to remove spent_utxo_data from disk: {}", e);
+            for (outpoint, _) in self.spent_utxo_data.write().drain() {
+                if let Some(ref db) = self.db() {
+                    if let Err(e) = db.remove_spent_utxo_data(&outpoint) {
+                        debug!("Failed to remove spent_utxo_data from disk: {}", e);
+                    }
                 }
             }
         }
+        self.scanned_hashes.write().clear();
         let mut dirty = self.dirty.write();
         dirty.transactions = true;
         dirty.utxos = true;
@@ -3063,8 +3112,12 @@ impl WalletDb {
         let (txid, confirmed) = (tx.txid, tx.block_height.is_some());
         // A confirmed record's timestamp is its block time, at most now
         self.note_first_seen(&txid, tx.block_hash.map(|_| tx.timestamp));
+        let mut pending = self.pending_deletes.write();
+        pending.transactions.remove(&txid);
+        self.pruned_history.write().remove(&txid);
         self.transactions_w().insert(tx.txid, tx);
         self.dirty.write().transactions = true;
+        drop(pending);
         if confirmed {
             self.reattach(&txid);
         }
@@ -3102,8 +3155,8 @@ impl WalletDb {
             .collect();
         confirmed.sort_by_key(|(height, index, _)| (*height, *index));
         let pruned: HashSet<Hash256> = {
-            let utxos = self.utxos.read();
             let spent = self.spent_utxo_data.read();
+            let utxos = self.utxos.read();
             // Spent by a transaction with at least `min_confirmations`
             let spent_deep = |op: &OutPoint| {
                 spent.get(op).is_some_and(|(_, height)| {
@@ -3129,9 +3182,23 @@ impl WalletDb {
             }
             pruned
         };
-        self.transactions
-            .write()
-            .retain(|txid, _| !pruned.contains(txid));
+        // A writer may have taken the dirty flag before committing. Wait for
+        // its outcome before deciding whether a removed value is still owed.
+        let _persist = self.persist_lock.lock();
+        let mut pending = self.pending_deletes.write();
+        let preserve = self.db().is_some() && self.dirty.read().transactions;
+        let mut memory_only = self.pruned_history.write();
+        let mut history = self.transactions_w();
+        for id in &pruned {
+            if let Some(tx) = history.remove(id) {
+                memory_only.insert(*id, tx.block_height);
+                if preserve {
+                    pending
+                        .transactions
+                        .insert(*id, PendingRow::new(Some(Box::new(tx))));
+                }
+            }
+        }
         (original, original - pruned.len())
     }
 
@@ -4948,7 +5015,7 @@ impl WalletDb {
                 .collect();
             for op in &gone {
                 utxos.remove(op);
-                pending.utxos.insert(*op);
+                pending.utxos.insert(*op, PendingRow::new(()));
             }
         }
 
@@ -4966,9 +5033,18 @@ impl WalletDb {
                         record.category != "coinbase" && record.category != "stake";
                     disconnected.push((*txid, record.timestamp, moves_to_mempool));
                 }
-                pending.transactions.insert(*txid);
+                pending.transactions.insert(*txid, PendingRow::new(None));
             }
         }
+        // History pruned from memory in the range leaves disk too (after the
+        // history guard is released: prune takes this before `transactions`)
+        self.pruned_history.write().retain(|txid, height| {
+            let gone = height.is_some_and(in_range);
+            if gone {
+                pending.transactions.insert(*txid, PendingRow::new(None));
+            }
+            !gone
+        });
 
         self.scanned_hashes
             .write()
@@ -4989,7 +5065,7 @@ impl WalletDb {
             for (outpoint, utxo) in undone {
                 spent_data.remove(&outpoint);
                 spent_set.remove(&outpoint);
-                pending.spent.insert(outpoint);
+                pending.spent.insert(outpoint, PendingRow::new(()));
                 if let Some(ref db) = self.db() {
                     if db.remove_spent_utxo_data(&outpoint).is_err() {
                         counted::hit(Site::WalletRollbackRemoveFailed);
@@ -4997,7 +5073,7 @@ impl WalletDb {
                 }
                 if utxo.height.is_some_and(in_range) {
                     // Created and spent in the range: the coin goes with its block
-                    pending.utxos.insert(outpoint);
+                    pending.utxos.insert(outpoint, PendingRow::new(()));
                     continue;
                 }
                 counted::hit(Site::WalletRollbackRestored);
@@ -5286,10 +5362,11 @@ impl WalletDb {
                 if utxos.contains_key(&op) || data.contains_key(&op) {
                     // Seen again: held now, or spent at a known height
                     if !spent.contains(&op) {
-                        pending.spent.insert(op);
+                        pending.spent.insert(op, PendingRow::new(()));
                     }
                     found += 1;
                 } else {
+                    pending.spent.remove(&op);
                     spent.insert(op);
                 }
             }
@@ -5640,6 +5717,8 @@ impl WalletDb {
             return 0;
         }
 
+        let _persist = forget.then(|| self.persist_lock.lock());
+        let mut pending = self.pending_deletes.write();
         let doomed: Vec<OutPoint> = {
             let mut utxos = self.utxos.write();
             let doomed: Vec<OutPoint> = utxos
@@ -5649,9 +5728,13 @@ impl WalletDb {
                 .collect();
             for outpoint in &doomed {
                 utxos.remove(outpoint);
+                if forget {
+                    pending.utxos.insert(*outpoint, PendingRow::new(()));
+                }
             }
             doomed
         };
+        drop(pending);
         if let Some(ref db) = self.db() {
             for outpoint in doomed.iter().filter(|_| forget) {
                 if let Err(e) = db.remove_utxo(outpoint) {

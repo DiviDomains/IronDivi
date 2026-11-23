@@ -234,3 +234,373 @@ fn failed_incremental_save_merges_addresses_marked_during_write() {
     assert!(wallet.is_address_used("before"));
     assert!(wallet.is_address_used("during"));
 }
+
+/// Reuse one transaction ID across delete, resurrection, and a second delete.
+fn repeated_delete(
+    point: &'static str,
+    save: fn(&WalletDb) -> Result<(), WalletError>,
+    overlap: bool,
+) {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("wallet");
+    let wallet = new_wallet(&path);
+    let id = Hash256::from_bytes([7; 32]);
+    let tx = WalletTx {
+        txid: id,
+        block_height: None,
+        block_hash: None,
+        confirmations: 0,
+        amount: 42,
+        category: "receive".into(),
+        timestamp: 1,
+        fee: None,
+    };
+    wallet.add_transaction(tx.clone());
+    wallet.save_incremental().unwrap();
+    wallet.clear_transactions_and_utxos();
+    wallet.add_transaction(tx);
+    let pause = fault::pause_at(&*wallet, point);
+    let saver = {
+        let wallet = Arc::clone(&wallet);
+        std::thread::spawn(move || save(&wallet))
+    };
+    pause.reached();
+    if overlap {
+        wallet.clear_transactions_and_utxos();
+    }
+    pause.resume();
+    saver.join().unwrap().unwrap();
+    if !overlap {
+        wallet.clear_transactions_and_utxos();
+    }
+    assert!(wallet.get_transaction(&id).is_none());
+    wallet.save_incremental().unwrap();
+    assert!(
+        reopen(wallet, &path).get_transaction(&id).is_none(),
+        "deleted transaction returned after reopen"
+    );
+}
+
+#[test]
+fn repeated_delete_incremental() {
+    repeated_delete(
+        "wallet incremental batch built",
+        WalletDb::save_incremental,
+        true,
+    );
+}
+#[test]
+fn repeated_delete_full() {
+    repeated_delete("wallet save batch built", WalletDb::save, true);
+}
+#[test]
+fn repeated_delete_serial_control() {
+    repeated_delete(
+        "wallet incremental batch built",
+        WalletDb::save_incremental,
+        false,
+    );
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Writer {
+    Incremental,
+    Full,
+    Replay,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum FinalState {
+    Deleted,
+    Replaced,
+    Spent,
+}
+
+fn concurrent_rows(writer: Writer, fail: bool, state: FinalState) {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("wallet");
+    let wallet = new_wallet(&path);
+    let raw = divi_primitives::transaction::Transaction::new();
+    let id = raw.txid();
+    let mut tx = WalletTx {
+        txid: id,
+        block_height: Some(1),
+        block_hash: None,
+        confirmations: 1,
+        amount: 1,
+        category: "receive".into(),
+        timestamp: 12,
+        fee: None,
+    };
+    let addr = wallet.new_receiving_address().unwrap();
+    let mut coin = WalletUtxo::new(
+        id,
+        0,
+        Amount::from_sat(10),
+        Script::new_p2pkh(addr.hash.as_bytes()),
+        addr.to_string(),
+    );
+    let op = coin.outpoint();
+    wallet.add_transaction(tx.clone());
+    wallet.add_utxo(coin.clone());
+    wallet.spend_utxo_at_height(&op, Some(3)).unwrap();
+    wallet.save().unwrap();
+    wallet.clear_transactions_and_utxos();
+    // For replacement, pause a batch containing only the old tombstones.
+    // For eviction and spend, pause a batch containing the resurrected rows.
+    if !matches!(state, FinalState::Replaced) {
+        wallet.add_transaction(tx.clone());
+        wallet.add_utxo(coin.clone());
+    }
+    let point = match writer {
+        Writer::Incremental => "wallet incremental batch built",
+        _ => "wallet save batch built",
+    };
+    if matches!(writer, Writer::Replay) {
+        *wallet.hd_replay_generation.write() = 1;
+        let db = wallet.db().unwrap();
+        let mut batch = db.create_batch();
+        batch.put_cf(db.cf_metadata(), b"hd_replay_pending", [1]);
+        db.write_batch_sync(batch).unwrap();
+    }
+    let pause = fault::pause_at(&*wallet, point);
+    let saver = {
+        let w = wallet.clone();
+        std::thread::spawn(move || {
+            if fail {
+                fault::arm(point, 0);
+            }
+            let ok = match writer {
+                Writer::Incremental => w.save_incremental().is_ok(),
+                Writer::Full => w.save().is_ok(),
+                Writer::Replay => w.sync_to_tip(0, |_| None, |_| None).is_empty(),
+            };
+            fault::disarm();
+            ok
+        })
+    };
+    pause.reached();
+    if !matches!(state, FinalState::Replaced) {
+        wallet.spend_utxo_at_height(&op, Some(4)).unwrap();
+        wallet.clear_transactions_and_utxos();
+    }
+    if !matches!(state, FinalState::Deleted) {
+        tx.amount = 23;
+        coin.value = Amount::from_sat(24);
+        wallet.add_transaction(tx);
+        wallet.add_utxo(coin);
+        if matches!(state, FinalState::Spent) {
+            wallet.spend_utxo_at_height(&op, Some(5)).unwrap();
+        }
+    }
+    pause.resume();
+    assert_eq!(saver.join().unwrap(), !fail);
+    if matches!(state, FinalState::Replaced) {
+        // This prune is memory-only even when the replacement was unsaved.
+        let mut record = wallet.get_transaction(&id).unwrap();
+        record.amount = 25;
+        wallet.add_transaction(record);
+        assert_eq!(
+            wallet.prune_transactions(1, 10, |_| Some((raw.clone(), 0))),
+            (1, 0)
+        );
+    }
+    wallet.save_incremental().unwrap();
+    let wallet = reopen(wallet, &path);
+    if matches!(writer, Writer::Replay) {
+        assert_eq!(
+            wallet.db().unwrap().hd_replay_pending().unwrap(),
+            Some(fail)
+        );
+        if fail {
+            assert!(wallet.sync_to_tip(0, |_| None, |_| None).is_empty());
+            assert_eq!(
+                wallet.db().unwrap().hd_replay_pending().unwrap(),
+                Some(false)
+            );
+        }
+    }
+    let db = wallet.db().unwrap();
+    let spent = matches!(state, FinalState::Spent);
+    assert_eq!(db.load_spent().unwrap().contains(&op), spent);
+    assert_eq!(
+        db.load_spent_utxo_data()
+            .unwrap()
+            .iter()
+            .find(|(k, _, _)| *k == op)
+            .map(|(_, u, h)| (u.value.as_sat(), *h)),
+        spent.then_some((24, 5))
+    );
+    assert_eq!(
+        db.load_utxos()
+            .unwrap()
+            .iter()
+            .find(|(k, _)| *k == op)
+            .map(|(_, u)| u.value.as_sat()),
+        matches!(state, FinalState::Replaced).then_some(24)
+    );
+    assert_eq!(
+        wallet.get_transaction(&id).map(|t| t.amount),
+        match state {
+            FinalState::Deleted => None,
+            FinalState::Replaced => Some(25),
+            FinalState::Spent => Some(23),
+        }
+    );
+}
+
+#[test]
+fn same_id_save_retry_and_restart() {
+    for writer in [Writer::Incremental, Writer::Full, Writer::Replay] {
+        for fail in [false, true] {
+            for state in [FinalState::Deleted, FinalState::Replaced, FinalState::Spent] {
+                concurrent_rows(writer, fail, state);
+            }
+        }
+    }
+}
+
+fn pruned_probe_tx() -> (divi_primitives::transaction::Transaction, WalletTx) {
+    let raw = divi_primitives::transaction::Transaction::new();
+    let tx = WalletTx {
+        txid: raw.txid(),
+        block_height: Some(1),
+        block_hash: None,
+        confirmations: 1,
+        amount: 7,
+        category: "receive".into(),
+        timestamp: 12,
+        fee: None,
+    };
+    (raw, tx)
+}
+
+#[derive(Clone, Copy)]
+enum PrunedErase {
+    None,
+    Clear,
+    Reorg,
+}
+
+fn pruned_history_survives_reopen(
+    saved_first: bool,
+    erase: PrunedErase,
+    replay_writer: bool,
+) -> bool {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("wallet");
+    let wallet = new_wallet(&path);
+    let (raw, tx) = pruned_probe_tx();
+    let id = tx.txid;
+    wallet.add_transaction(tx);
+    if saved_first {
+        if replay_writer {
+            *wallet.hd_replay_generation.write() = 1;
+            assert!(wallet.sync_to_tip(0, |_| None, |_| None).is_empty());
+            assert!(wallet.dirty.read().transactions);
+        } else {
+            wallet.save_incremental().unwrap();
+        }
+    }
+    assert_eq!(
+        wallet.prune_transactions(1, 10, |_| Some((raw.clone(), 0))),
+        (1, 0)
+    );
+    match erase {
+        PrunedErase::None => {}
+        PrunedErase::Clear => wallet.clear_transactions_and_utxos(),
+        PrunedErase::Reorg => wallet.handle_reorg(0),
+    }
+    assert!(wallet.get_transaction(&id).is_none());
+    wallet.save_incremental().unwrap();
+    reopen(wallet, &path).get_transaction(&id).is_some()
+}
+
+#[test]
+fn pruned_unsaved_tx_remains_durable() {
+    assert!(pruned_history_survives_reopen(
+        false,
+        PrunedErase::None,
+        false
+    ));
+}
+
+#[test]
+fn pruned_unsaved_tx_cleared_does_not_return() {
+    assert!(!pruned_history_survives_reopen(
+        false,
+        PrunedErase::Clear,
+        false
+    ));
+}
+
+#[test]
+fn pruned_unsaved_tx_rolled_back_does_not_return() {
+    assert!(!pruned_history_survives_reopen(
+        false,
+        PrunedErase::Reorg,
+        false
+    ));
+}
+
+#[test]
+fn pruned_saved_tx_cleared_does_not_return() {
+    assert!(!pruned_history_survives_reopen(
+        true,
+        PrunedErase::Clear,
+        false
+    ));
+}
+
+#[test]
+fn pruned_saved_tx_rolled_back_does_not_return() {
+    assert!(!pruned_history_survives_reopen(
+        true,
+        PrunedErase::Reorg,
+        false
+    ));
+}
+
+#[test]
+fn pruned_replay_saved_tx_cleared_does_not_return() {
+    assert!(!pruned_history_survives_reopen(
+        true,
+        PrunedErase::Clear,
+        true
+    ));
+}
+
+#[test]
+fn pruned_replay_saved_tx_rolled_back_does_not_return() {
+    assert!(!pruned_history_survives_reopen(
+        true,
+        PrunedErase::Reorg,
+        true
+    ));
+}
+
+#[test]
+fn pruned_unsaved_tx_cleared_during_save_does_not_return() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("wallet");
+    let wallet = new_wallet(&path);
+    let (raw, tx) = pruned_probe_tx();
+    let id = tx.txid;
+    wallet.add_transaction(tx);
+    assert_eq!(
+        wallet.prune_transactions(1, 10, |_| Some((raw.clone(), 0))),
+        (1, 0)
+    );
+    let point = "wallet incremental batch built";
+    let pause = fault::pause_at(&*wallet, point);
+    let saver = {
+        let wallet = Arc::clone(&wallet);
+        std::thread::spawn(move || wallet.save_incremental())
+    };
+    pause.reached();
+    wallet.clear_transactions_and_utxos();
+    pause.resume();
+    saver.join().unwrap().unwrap();
+    wallet.save_incremental().unwrap();
+    assert!(reopen(wallet, &path).get_transaction(&id).is_none());
+}
