@@ -170,24 +170,12 @@ impl LiveDiviChain {
     }
 
     /// `median_time_past` -- the node reports `mediantime: null` on this proxy, so
-    /// this takes the median of the last 11 block times itself, same as
-    /// `DiviBackend::median_time_past`.
+    /// this takes the median of the last 11 block times itself, from the best block
+    /// (`getbestblockhash`), same as `DiviBackend::median_time_past`. The answer is kept
+    /// with that block's hash on the [`RpcClient`] (`RpcClient::median_time_past`): while
+    /// the tip is unchanged a read is one call instead of thirteen.
     pub async fn median_time_past(&self) -> Result<u32> {
-        let tip = self.tip_height().await?;
-        let mut hash = self.rpc.call_ok("getblockhash", json!([tip])).await?;
-        let mut times = Vec::with_capacity(11);
-        for _ in 0..11 {
-            let block = self.rpc.call_ok("getblock", json!([hash, true])).await?;
-            times.push(block["time"].as_u64().ok_or_else(|| {
-                SwapError::Transient("block without time (still indexing?)".into())
-            })?);
-            match block.get("previousblockhash").filter(|p| p.is_string()) {
-                Some(prev) => hash = prev.clone(),
-                None => break,
-            }
-        }
-        times.sort_unstable();
-        Ok(times[times.len() / 2] as u32)
+        self.rpc.median_time_past().await
     }
 
     /// `build_funding`, generalized to an arbitrary `script_pubkey` (the piece
@@ -534,6 +522,63 @@ mod tests {
         mock_rpc(&server, json!({"blocks": 5})).await;
         let chain = chain_against(&server.uri());
         assert!(chain.chain_name().await.is_err());
+    }
+
+    /// The median time past is read from the best block and kept with its hash: a second
+    /// read at the same tip is one `getbestblockhash`, a new tip is read again.
+    #[tokio::test]
+    async fn median_time_past_is_kept_per_best_block() {
+        use std::sync::{Arc, Mutex as StdMutex};
+        use wiremock::{Request, Respond};
+        struct Node(Arc<StdMutex<(u64, Vec<String>)>>);
+        impl Respond for Node {
+            fn respond(&self, req: &Request) -> ResponseTemplate {
+                let body: Value = serde_json::from_slice(&req.body).unwrap();
+                let mut s = self.0.lock().unwrap();
+                let tip = s.0;
+                s.1.push(body["method"].as_str().unwrap().to_string());
+                let r = match body["method"].as_str().unwrap() {
+                    "getbestblockhash" => json!(format!("{tip:064x}")),
+                    "getblock" => {
+                        let h =
+                            u64::from_str_radix(body["params"][0].as_str().unwrap(), 16).unwrap();
+                        let mut b = json!({"hash": format!("{h:064x}"), "height": h,
+                            "time": 1_800_000_000 + h * 60});
+                        if h > 0 {
+                            b["previousblockhash"] = json!(format!("{:064x}", h - 1));
+                        }
+                        b
+                    }
+                    m => panic!("unexpected {m}"),
+                };
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"result": r, "error": null, "id": 1}))
+            }
+        }
+        let state = Arc::new(StdMutex::new((100u64, Vec::new())));
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(Node(state.clone()))
+            .mount(&server)
+            .await;
+        let chain = chain_against(&server.uri());
+        // Blocks 90..=100: the median is block 95's time.
+        assert_eq!(
+            chain.median_time_past().await.unwrap(),
+            1_800_000_000 + 95 * 60
+        );
+        assert_eq!(state.lock().unwrap().1.len(), 12);
+        assert_eq!(
+            chain.median_time_past().await.unwrap(),
+            1_800_000_000 + 95 * 60
+        );
+        assert_eq!(state.lock().unwrap().1.len(), 13);
+        state.lock().unwrap().0 = 101;
+        assert_eq!(
+            chain.median_time_past().await.unwrap(),
+            1_800_000_000 + 96 * 60
+        );
+        assert_eq!(state.lock().unwrap().1.len(), 25);
     }
 
     #[tokio::test]

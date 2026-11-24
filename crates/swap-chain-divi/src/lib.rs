@@ -901,24 +901,31 @@ impl ChainBackend for DiviBackend {
         second_source::agree_htlc_output(a, b)
     }
 
+    /// One bounded pass ([`MAX_SCAN_BLOCKS`] blocks at most) that says how far it read, so
+    /// the engine's spend cursor resumes from it (H2) instead of reading again from the lock
+    /// on every tick. With a fallback both endpoints read the same pass from the same mark and
+    /// must agree ([`second_source::agree_scan`]).
     async fn scan_spend(
         &self,
         outpoint: &Outpoint,
         from_height: u64,
         resume: Option<&divi_swap::ScanMark>,
     ) -> Result<divi_swap::SpendScan> {
-        if resume.is_some() {
-            return Ok(divi_swap::SpendScan::Reorged);
-        }
-        Ok(match self.find_spend(outpoint, from_height).await? {
-            Some(s) => divi_swap::SpendScan::Spent(s),
-            None => divi_swap::SpendScan::NotYet {
-                through: None,
-                complete: true,
-            },
-        })
+        let Some(fb) = &self.fallback else {
+            return Ok(scan_spend_on(&self.rpc, outpoint, from_height, resume)
+                .await?
+                .scan);
+        };
+        let (a, b) = tokio::join!(
+            scan_spend_on(&self.rpc, outpoint, from_height, resume),
+            scan_spend_on(fb, outpoint, from_height, resume)
+        );
+        let (a, b) = second_source::pair("find_spend", a, b)?;
+        second_source::agree_scan(a, b)
     }
 
+    /// Every block from `from_height` through the tip, then the mempool: bounded passes are
+    /// chained until one reaches the tip, so a direct read is never cut short by the window.
     async fn find_spend(&self, outpoint: &Outpoint, from_height: u64) -> Result<Option<SpendInfo>> {
         let Some(fb) = &self.fallback else {
             return find_spend_on(&self.rpc, outpoint, from_height).await;
@@ -1049,24 +1056,8 @@ async fn tip_height_on(rpc: &RpcClient) -> Result<u64> {
 }
 
 async fn median_time_past_on(rpc: &RpcClient) -> Result<u32> {
-    // The node reports `mediantime: null`, so take the median of the last 11 block times.
-    let tip = tip_height_on(rpc).await?;
-    let mut hash = rpc.call_ok("getblockhash", json!([tip])).await?;
-    let mut times = Vec::with_capacity(11);
-    for _ in 0..11 {
-        let block = rpc.call_ok("getblock", json!([hash, true])).await?;
-        times.push(block["time"].as_u64().ok_or_else(|| {
-            // A real block always has a time; its absence means a proxy-fronted
-            // node behind the one that reported this hash hasn't indexed it yet.
-            SwapError::Transient("block without time (still indexing?)".into())
-        })?);
-        match block.get("previousblockhash").filter(|p| p.is_string()) {
-            Some(prev) => hash = prev.clone(),
-            None => break,
-        }
-    }
-    times.sort_unstable();
-    Ok(times[times.len() / 2] as u32)
+    // Tip-scoped and cached on the client: see `RpcClient::median_time_past`.
+    rpc.median_time_past().await
 }
 
 async fn confirmations_on(rpc: &RpcClient, txid: &Txid) -> Result<Option<u32>> {
@@ -1102,62 +1093,198 @@ async fn htlc_output_on(
     }))
 }
 
+/// Blocks one spend-scan pass reads at most (the resumed mark's block included), as on
+/// BTC, LTC and ZEC. A pass that stops short of the tip says so (`complete: false`) and the
+/// engine's cursor resumes from its last block on the next tick.
+pub const MAX_SCAN_BLOCKS: u64 = 200;
+
+/// Passes [`find_spend_on`] makes again from its start when the chain reorganises under its
+/// own mark, before giving up for this call.
+const FIND_SPEND_RESTARTS: u32 = 3;
+
+fn scan_evidence() -> SwapError {
+    SwapError::Transient("inconsistent spend scan evidence".into())
+}
+
+/// A block hash a node reported, normalised; anything else is inconsistent evidence.
+fn evidence_hash(v: &Value) -> Result<String> {
+    v.as_str()
+        .and_then(|h| divi_swap::backend::normalize_block_hash(h).ok())
+        .ok_or_else(scan_evidence)
+}
+
+/// `getblockhash height` on one endpoint, normalised.
+async fn block_hash_on(rpc: &RpcClient, height: u64) -> Result<String> {
+    evidence_hash(&rpc.call_ok("getblockhash", json!([height])).await?)
+}
+
+/// Every block from `from_height` through the tip, then the mempool, on one endpoint: one
+/// [`scan_spend_on`] pass after another, each resuming from the last one's mark, until a pass
+/// reaches the tip. A reorg under its own mark starts it again from `from_height` (at most
+/// [`FIND_SPEND_RESTARTS`] times).
 async fn find_spend_on(
     rpc: &RpcClient,
     outpoint: &Outpoint,
     from_height: u64,
 ) -> Result<Option<SpendInfo>> {
+    let mut resume: Option<divi_swap::ScanMark> = None;
+    let mut restarts = 0;
+    loop {
+        let from = resume.as_ref().map_or(from_height, |m| m.height);
+        match scan_spend_on(rpc, outpoint, from, resume.as_ref())
+            .await?
+            .scan
+        {
+            divi_swap::SpendScan::Spent(s) => return Ok(Some(s)),
+            divi_swap::SpendScan::NotYet { complete: true, .. } => return Ok(None),
+            divi_swap::SpendScan::NotYet {
+                through: Some(mark),
+                complete: false,
+            } => resume = Some(mark),
+            divi_swap::SpendScan::NotYet { through: None, .. } => return Err(scan_evidence()),
+            divi_swap::SpendScan::Reorged => {
+                restarts += 1;
+                if restarts > FIND_SPEND_RESTARTS {
+                    return Err(SwapError::Transient(
+                        "spend scan: the chain kept reorganising under the scan".into(),
+                    ));
+                }
+                resume = None;
+            }
+        }
+    }
+}
+
+/// One pass of the spend scan on one endpoint: blocks `from_height..=end`, where `end` is the
+/// tip or [`MAX_SCAN_BLOCKS`] blocks on, whichever is lower, then the mempool if `end` is the
+/// tip.
+///
+/// With `resume` (a mark an earlier pass returned) the pass first proves the mark is still on
+/// the best chain: a tip below it, or another block at its height, is
+/// [`SpendScan::Reorged`](divi_swap::SpendScan::Reorged) and nothing else is read. The
+/// engine resumes at the mark itself (`from_height == resume.height`): its hash is checked
+/// and its transactions are not read again (the pass that returned the mark read them and saw
+/// no spend). Every later block must name the one before it as its parent, so a matching mark
+/// vouches for every block an earlier pass read.
+///
+/// A pass that stops short of the tip reads no mempool, checks its last block is still on the
+/// best chain and is `NotYet { complete: false }`: the engine may take no no-spend decision on
+/// it. A pass that reaches the tip reads the mempool, then checks the tip has not moved and is
+/// `NotYet { complete: true }`. Either way `through` is the last block read. A change under
+/// the pass, or evidence that does not fit together, is `Transient`.
+///
+/// The answer also lists every block this pass verified, by height and hash: the matched
+/// mark, then each block read. Each one names the one before it as its parent, so the list
+/// is one branch. With a fallback, [`second_source::agree_scan`] uses it to check that an
+/// endpoint whose pass ended higher read the same block at the other endpoint's last height.
+async fn scan_spend_on(
+    rpc: &RpcClient,
+    outpoint: &Outpoint,
+    from_height: u64,
+    resume: Option<&divi_swap::ScanMark>,
+) -> Result<second_source::EndpointScan> {
     let want_txid = outpoint.txid.to_rpc_hex();
     let tip = tip_height_on(rpc).await?;
-    let invalid = || SwapError::Transient("inconsistent spend scan evidence".into());
-    if from_height > tip {
-        return Err(invalid());
-    }
-    let mut parent = None;
-    for h in from_height..=tip {
-        let hash = rpc.call_ok("getblockhash", json!([h])).await?;
-        let block = rpc.call_ok("getblock", json!([hash, true])).await?;
-        if hash.as_str().and_then(|v| v.parse::<Txid>().ok()).is_none()
-            || block["hash"] != hash
-            || block["height"].as_u64() != Some(h)
-            || (h > 0 && block["previousblockhash"].as_str().and_then(|v| v.parse::<Txid>().ok()).is_none())
-            || parent
-                .as_ref()
-                .is_some_and(|p| p != &block["previousblockhash"])
-        {
-            return Err(invalid());
+    let mut start = from_height;
+    let mut parent: Option<String> = None;
+    let mut blocks: Vec<(u64, String)> = Vec::new();
+    let only = |scan: divi_swap::SpendScan| second_source::EndpointScan {
+        scan,
+        blocks: Vec::new(),
+    };
+    if let Some(mark) = resume {
+        // A mark this backend did not write proves nothing: read again from the lock.
+        let Ok(want) = divi_swap::backend::normalize_block_hash(&mark.hash) else {
+            return Ok(only(divi_swap::SpendScan::Reorged));
+        };
+        if tip < mark.height {
+            return Ok(only(divi_swap::SpendScan::Reorged));
         }
+        if from_height == mark.height {
+            if block_hash_on(rpc, mark.height).await? != want {
+                return Ok(only(divi_swap::SpendScan::Reorged));
+            }
+            // Read through by the pass that returned the mark: only its identity is needed.
+            blocks.push((mark.height, want.clone()));
+            parent = Some(want);
+            start = mark.height.checked_add(1).ok_or_else(scan_evidence)?;
+        } else if !in_best_chain_on(rpc, mark.height, &want).await? {
+            return Ok(only(divi_swap::SpendScan::Reorged));
+        }
+    }
+    if from_height > tip {
+        return Err(scan_evidence());
+    }
+    let end = tip.min(from_height.saturating_add(MAX_SCAN_BLOCKS - 1));
+    for h in start..=end {
+        let hash = block_hash_on(rpc, h).await?;
+        let block = rpc.call_ok("getblock", json!([hash, true])).await?;
+        if evidence_hash(&block["hash"])? != hash || block["height"].as_u64() != Some(h) {
+            return Err(scan_evidence());
+        }
+        let prev = match block.get("previousblockhash").filter(|p| !p.is_null()) {
+            Some(p) => Some(evidence_hash(p)?),
+            None if h == 0 => None,
+            None => return Err(scan_evidence()),
+        };
+        if parent.is_some() && prev != parent {
+            return Err(scan_evidence());
+        }
+        blocks.push((h, hash.clone()));
         parent = Some(hash);
         for txid in txids(&block["tx"], false)? {
             let tx = get_tx_on(rpc, &txid).await?;
             if tx["txid"].as_str() != Some(txid.as_str()) {
-                return Err(invalid());
+                return Err(scan_evidence());
             }
             if let Some(s) = spend_in(&tx, &want_txid, outpoint.vout, Some(h))? {
-                if Some(rpc.call_ok("getblockhash", json!([h])).await?) != parent {
-                    return Err(invalid());
+                if Some(block_hash_on(rpc, h).await?) != parent {
+                    return Err(scan_evidence());
                 }
-                return Ok(Some(s));
+                return Ok(only(divi_swap::SpendScan::Spent(s)));
             }
         }
+    }
+    let end_hash = parent.ok_or_else(scan_evidence)?;
+    let through = Some(divi_swap::ScanMark {
+        height: end,
+        hash: end_hash.clone(),
+    });
+    if end < tip {
+        // Blocks past `end` are unread: no mempool, and no no-spend decision on this pass.
+        if block_hash_on(rpc, end).await? != end_hash {
+            return Err(scan_evidence());
+        }
+        return Ok(second_source::EndpointScan {
+            scan: divi_swap::SpendScan::NotYet {
+                through,
+                complete: false,
+            },
+            blocks,
+        });
     }
     let mut found = None;
     let pool = rpc.call_ok("getrawmempool", json!([])).await?;
     for txid in txids(&pool, true)? {
         let tx = get_tx_on(rpc, &txid).await?;
         if tx["txid"].as_str() != Some(txid.as_str()) {
-            return Err(invalid());
+            return Err(scan_evidence());
         }
         if let Some(s) = spend_in(&tx, &want_txid, outpoint.vout, None)? {
             found = Some(s);
         }
     }
-    if tip_height_on(rpc).await? != tip
-        || Some(rpc.call_ok("getblockhash", json!([tip])).await?) != parent
-    {
-        return Err(invalid());
+    if tip_height_on(rpc).await? != tip || block_hash_on(rpc, tip).await? != end_hash {
+        return Err(scan_evidence());
     }
-    Ok(found)
+    let scan = match found {
+        Some(s) => divi_swap::SpendScan::Spent(s),
+        None => divi_swap::SpendScan::NotYet {
+            through,
+            complete: true,
+        },
+    };
+    Ok(second_source::EndpointScan { scan, blocks })
 }
 
 /// One endpoint's `sendrawtransaction`, with the "already known" / premature / recheck

@@ -452,30 +452,33 @@ impl BtcBackend {
     /// Scan at most [`MAX_SCAN_BLOCKS`] blocks from `from_height` for a transaction spending
     /// `outpoint`. With `resume`, the block at its height must still have its hash
     /// ([`SpendScan::Reorged`] otherwise). The mark is the last block read in full.
+    ///
+    /// The answer also lists every block read in full, by height and hash, in order. Each
+    /// one names the one before it as its parent, so the list is one branch;
+    /// [`quorum::agree_scan`] uses it to check that the endpoint whose pass ended higher read
+    /// the same block at the other endpoint's last height.
     async fn scan_blocks(
         es: &EsploraClient,
         outpoint: &Outpoint,
         from_height: u64,
         resume: Option<&ScanMark>,
-    ) -> Result<SpendScan> {
+    ) -> Result<quorum::EndpointScan> {
         let tip = tip_height_on(es).await?;
         if resume.is_some_and(|m| m.height > tip) {
-            return Ok(SpendScan::Reorged);
+            return Ok(quorum::EndpointScan::bare(SpendScan::Reorged));
         }
         if from_height > tip {
-            return Ok(SpendScan::NotYet {
-                through: None,
-                complete: true,
-            });
+            return Ok(quorum::EndpointScan::below_start(tip));
         }
         let want_txid = outpoint.txid.to_rpc_hex();
         let last = tip.min(from_height.saturating_add(MAX_SCAN_BLOCKS - 1));
         let mut through: Option<ScanMark> = None;
+        let mut blocks: Vec<(u64, String)> = Vec::new();
         for height in from_height..=last {
             let raw = es.get(&format!("/block-height/{height}")).await?;
             let hash = divi_swap::backend::normalize_block_hash(&raw)?;
             if resume.is_some_and(|m| m.height == height && m.hash != hash) {
-                return Ok(SpendScan::Reorged);
+                return Ok(quorum::EndpointScan::bare(SpendScan::Reorged));
             }
             let meta = get_json_on(es, &format!("/block/{hash}")).await?;
             let mark = ScanMark { height, hash };
@@ -487,10 +490,11 @@ impl BtcBackend {
                     divi_swap::esplora_scan::checked_page(&page, &mark, start, count, &mut seen)?
                 {
                     if let Some(info) = spend_from_tx(t, &want_txid, outpoint.vout, Some(height))? {
-                        return Ok(SpendScan::Spent(info));
+                        return Ok(quorum::EndpointScan::bare(SpendScan::Spent(info)));
                     }
                 }
             }
+            blocks.push((height, mark.hash.clone()));
             through = Some(mark);
         }
         if let Some(mark) = &through {
@@ -502,7 +506,10 @@ impl BtcBackend {
             }
         }
         let complete = last == tip;
-        Ok(SpendScan::NotYet { through, complete })
+        Ok(quorum::EndpointScan::blocks(
+            SpendScan::NotYet { through, complete },
+            blocks,
+        ))
     }
 }
 
@@ -942,7 +949,11 @@ impl ChainBackend for BtcBackend {
         resume: Option<&ScanMark>,
     ) -> Result<SpendScan> {
         let Some((primary, secondary)) = &self.quorum else {
-            return Self::find_spend_on(&self.esplora, outpoint, from_height, resume).await;
+            return Ok(
+                Self::find_spend_on(&self.esplora, outpoint, from_height, resume)
+                    .await?
+                    .scan,
+            );
         };
         let (a, b) = tokio::join!(
             Self::find_spend_on(primary, outpoint, from_height, resume),
@@ -1009,28 +1020,51 @@ impl BtcBackend {
         }))
     }
 
-    /// `scan_spend` as one endpoint view `es` answers it.
+    /// `scan_spend` as one endpoint view `es` answers it. An `/outspend` index answer lists
+    /// no blocks; the block-scan fallback lists the blocks it read ([`Self::scan_blocks`]).
     async fn find_spend_on(
         es: &EsploraClient,
         outpoint: &Outpoint,
         from_height: u64,
         resume: Option<&ScanMark>,
+    ) -> Result<quorum::EndpointScan> {
+        match es
+            .get_opt(&format!(
+                "/tx/{}/outspend/{}",
+                outpoint.txid.to_rpc_hex(),
+                outpoint.vout
+            ))
+            .await
+        {
+            // Endpoint without outspend support: fall back to scanning blocks.
+            Err(ClientError::Http(f)) if f.status == 400 || f.status == 501 => {
+                Self::scan_blocks(es, outpoint, from_height, resume).await
+            }
+            answer => Ok(quorum::EndpointScan::bare(
+                Self::outspend_answer(es, outpoint, answer).await?,
+            )),
+        }
+    }
+
+    /// The `/outspend` index answer `answer` for `outpoint`, on endpoint view `es`.
+    async fn outspend_answer(
+        es: &EsploraClient,
+        outpoint: &Outpoint,
+        answer: std::result::Result<Option<String>, ClientError>,
     ) -> Result<SpendScan> {
         // The index answers for the whole chain: nothing to resume from.
         const INDEXED: SpendScan = SpendScan::NotYet {
             through: None,
             complete: true,
         };
-        const UNKNOWN: SpendScan = SpendScan::NotYet { through: None, complete: false };
+        const UNKNOWN: SpendScan = SpendScan::NotYet {
+            through: None,
+            complete: false,
+        };
         let prev = outpoint.txid.to_rpc_hex();
-        let path = format!("/tx/{prev}/outspend/{}", outpoint.vout);
-        let outspend = match es.get_opt(&path).await {
+        let outspend = match answer {
             Ok(Some(b)) => parse_json(&b)?,
             Ok(None) => return Ok(UNKNOWN),
-            // Endpoint without outspend support: fall back to scanning blocks.
-            Err(ClientError::Http(f)) if f.status == 400 || f.status == 501 => {
-                return Self::scan_blocks(es, outpoint, from_height, resume).await;
-            }
             Err(e) => return Err(e.into()),
         };
         match outspend["spent"].as_bool() {
@@ -1042,7 +1076,7 @@ impl BtcBackend {
                 return Ok(UNKNOWN)
             }
             Some(false) => return Ok(INDEXED),
-            Some(true) => {},
+            Some(true) => {}
             None => return Ok(UNKNOWN),
         }
         let spender = outspend["txid"]

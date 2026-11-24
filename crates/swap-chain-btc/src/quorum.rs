@@ -135,13 +135,85 @@ pub(crate) fn agree_spend(a: Option<SpendInfo>, b: Option<SpendInfo>) -> Result<
     }
 }
 
+/// How one endpoint produced its spend-scan answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ScanSource {
+    /// `/tx/:txid/outspend/:vout` index answer, or a reorg / spend that needs no block list.
+    Indexed,
+    /// `scan_blocks` saw `tip < from_height` and read zero blocks at or above `from_height`.
+    BelowStart { tip: u64 },
+    /// `scan_blocks` read `blocks` (`from_height..=last`) in parent-linked order.
+    Blocks(Vec<(u64, String)>),
+}
+
+/// One endpoint's answer to one spend-scan pass, tagged with how it was obtained.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EndpointScan {
+    pub(crate) scan: SpendScan,
+    pub(crate) source: ScanSource,
+}
+
+impl EndpointScan {
+    /// An `/outspend` index answer, a reorg, or a spend.
+    pub(crate) fn bare(scan: SpendScan) -> Self {
+        EndpointScan {
+            scan,
+            source: ScanSource::Indexed,
+        }
+    }
+
+    /// `scan_blocks` when the endpoint's tip has not yet reached `from_height`.
+    pub(crate) fn below_start(tip: u64) -> Self {
+        EndpointScan {
+            scan: SpendScan::NotYet {
+                through: None,
+                complete: true,
+            },
+            source: ScanSource::BelowStart { tip },
+        }
+    }
+
+    /// `scan_blocks` with every `(height, hash)` read in full, in parent-linked order.
+    pub(crate) fn blocks(scan: SpendScan, blocks: Vec<(u64, String)>) -> Self {
+        EndpointScan {
+            scan,
+            source: ScanSource::Blocks(blocks),
+        }
+    }
+}
+
 /// Join two endpoints' answers to one spend-scan pass (H2). A spend on either side is joined
-/// as [`agree_spend`] joins it. Without one, the pass reaches only as far as both read: the
-/// lower mark (none when both marked one height with different blocks), where an index
-/// answer (no mark, `complete`) covers whatever the other side read. A reorg seen by either
-/// side voids the mark for both.
-pub(crate) fn agree_scan(a: SpendScan, b: SpendScan) -> Result<SpendScan> {
-    match (a, b) {
+/// as [`agree_spend`] joins it. A reorg seen by either side voids the mark for both. Without
+/// either, the pass reaches only as far as both read:
+///
+/// - Both block scans saw `tip < from_height` (`BelowStart`): neither reached `from_height`,
+///   no mark is saved. If only one side is `BelowStart`, the endpoints disagree on whether the
+///   chain has reached `from_height` and the read is held (`SwapError::Held`), never mistaken
+///   for an `/outspend` index answer covering the other endpoint's blocks.
+/// - An `/outspend` index answer (`Indexed`, no mark, `complete`) covers whatever the other
+///   side read: its mark.
+/// - Both block scans stopped at one height: that mark. Two different blocks there are a
+///   disagreement (held), so `hold::scan_spend` can fall back to the primary alone at the
+///   refund deadline instead of the read staying pending.
+/// - The block scans stopped at different heights: the lower mark, but only if the endpoint
+///   that read higher read that very block in this same pass. Another block there (it read
+///   another branch) is held; the height not among its blocks is `Transient`. No mark is
+///   saved in either case.
+///
+/// Both passes start at the same height, and each block read names the block before it as
+/// its parent, which its hash commits to. So one hash at the lower height means both
+/// endpoints read the same blocks from the start through it, and an honest endpoint read
+/// every transaction under the saved mark.
+pub(crate) fn agree_scan(a: EndpointScan, b: EndpointScan) -> Result<SpendScan> {
+    let EndpointScan {
+        scan: sa,
+        source: src_a,
+    } = a;
+    let EndpointScan {
+        scan: sb,
+        source: src_b,
+    } = b;
+    match (sa, sb) {
         (SpendScan::Reorged, _) | (_, SpendScan::Reorged) => Ok(SpendScan::Reorged),
         (
             SpendScan::NotYet {
@@ -152,23 +224,104 @@ pub(crate) fn agree_scan(a: SpendScan, b: SpendScan) -> Result<SpendScan> {
                 through: tb,
                 complete: cb,
             },
-        ) => {
-            let same_end = match (&ta, &tb) {
-                (Some(a), Some(b)) => a == b,
-                _ => true,
-            };
-            let through = match (ta, tb) {
-                (Some(x), Some(y)) if x.height == y.height => (x.hash == y.hash).then_some(x),
-                (Some(x), Some(y)) => Some(if x.height < y.height { x } else { y }),
-                (Some(x), None) if cb => Some(x),
-                (None, Some(y)) if ca => Some(y),
-                _ => None,
-            };
-            Ok(SpendScan::NotYet {
-                through,
-                complete: ca && cb && same_end,
-            })
-        }
+        ) => match (src_a, src_b) {
+            (ScanSource::BelowStart { .. }, ScanSource::BelowStart { .. }) => {
+                if ta.is_some() || tb.is_some() {
+                    return Err(SwapError::Transient(
+                        "find_spend: below-start scan named a block".into(),
+                    ));
+                }
+                Ok(SpendScan::NotYet {
+                    through: None,
+                    complete: ca && cb,
+                })
+            }
+            (ScanSource::BelowStart { tip }, _) | (_, ScanSource::BelowStart { tip }) => {
+                Err(disagree(
+                    "find_spend",
+                    format!("one endpoint is at tip {tip}, below scan start"),
+                ))
+            }
+            (ScanSource::Indexed, ScanSource::Indexed) => {
+                if ta.is_some() || tb.is_some() {
+                    return Err(SwapError::Transient(
+                        "find_spend: indexed scan named a block".into(),
+                    ));
+                }
+                Ok(SpendScan::NotYet {
+                    through: None,
+                    complete: ca && cb,
+                })
+            }
+            (ScanSource::Indexed, ScanSource::Blocks(_)) => {
+                let (None, Some(y)) = (ta, tb) else {
+                    return Err(SwapError::Transient(
+                        "find_spend: inconsistent indexed and block-scan marks".into(),
+                    ));
+                };
+                Ok(SpendScan::NotYet {
+                    through: ca.then_some(y),
+                    complete: ca && cb,
+                })
+            }
+            (ScanSource::Blocks(_), ScanSource::Indexed) => {
+                let (Some(x), None) = (ta, tb) else {
+                    return Err(SwapError::Transient(
+                        "find_spend: inconsistent block-scan and indexed marks".into(),
+                    ));
+                };
+                Ok(SpendScan::NotYet {
+                    through: cb.then_some(x),
+                    complete: ca && cb,
+                })
+            }
+            (ScanSource::Blocks(ba), ScanSource::Blocks(bb)) => {
+                let (Some(x), Some(y)) = (ta, tb) else {
+                    return Err(SwapError::Transient(
+                        "find_spend: block scan named no block".into(),
+                    ));
+                };
+                if x.height == y.height {
+                    if x.hash != y.hash {
+                        return Err(disagree(
+                            "find_spend",
+                            format!(
+                                "two blocks at height {}: {} and {}",
+                                x.height, x.hash, y.hash
+                            ),
+                        ));
+                    }
+                    return Ok(SpendScan::NotYet {
+                        through: Some(x),
+                        complete: ca && cb,
+                    });
+                }
+                let (low, high_blocks) = if x.height < y.height {
+                    (x, &bb)
+                } else {
+                    (y, &ba)
+                };
+                let Some((_, high_hash)) = high_blocks.iter().find(|(h, _)| *h == low.height)
+                else {
+                    return Err(SwapError::Transient(
+                        "find_spend: lower mark height missing from higher scan pass".into(),
+                    ));
+                };
+                if *high_hash != low.hash {
+                    return Err(disagree(
+                        "find_spend",
+                        format!(
+                            "two blocks at height {}: {} and {high_hash}",
+                            low.height, low.hash
+                        ),
+                    ));
+                }
+                Ok(SpendScan::NotYet {
+                    through: Some(low),
+                    complete: false,
+                })
+            }
+        },
         (a, b) => Ok(match agree_spend(a.into_spend(), b.into_spend())? {
             Some(s) => SpendScan::Spent(s),
             None => SpendScan::NotYet {

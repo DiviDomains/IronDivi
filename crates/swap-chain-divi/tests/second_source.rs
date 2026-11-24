@@ -64,6 +64,7 @@ impl Respond for Node {
         };
         match body["method"].as_str().unwrap_or("") {
             "getblockcount" => ok(json!(c.tip)),
+            "getbestblockhash" => ok(json!(block_hash(c.tip))),
             "getblockhash" => ok(json!(block_hash(p[0].as_u64().unwrap()))),
             "getblock" => {
                 let h = u64::from_str_radix(p[0].as_str().unwrap(), 16).unwrap() - 1;

@@ -457,7 +457,13 @@ async fn scan_chain(server: &MockServer, changed_at: Option<u64>) {
 
 #[tokio::test]
 async fn unreadable_outspend_index_is_unknown() {
-    for (status, body) in [(200, json!({})), (404, json!({})), (200, json!({"spent":false,"txid":"ab".repeat(32)})), (200,json!({"spent":false,"vin":0})), (200,json!({"spent":false,"status":{"confirmed":true}}))] {
+    for (status, body) in [
+        (200, json!({})),
+        (404, json!({})),
+        (200, json!({"spent":false,"txid":"ab".repeat(32)})),
+        (200, json!({"spent":false,"vin":0})),
+        (200, json!({"spent":false,"status":{"confirmed":true}})),
+    ] {
         let server = MockServer::start().await;
         let fund = outpoint();
         Mock::given(method("GET"))
@@ -467,8 +473,15 @@ async fn unreadable_outspend_index_is_unknown() {
             .await;
         let scan = backend(vec![server.uri()], MAKER_KEY)
             .scan_spend(&fund, 10, None)
-            .await.unwrap();
-        assert_eq!(scan, SpendScan::NotYet { through: None, complete: false });
+            .await
+            .unwrap();
+        assert_eq!(
+            scan,
+            SpendScan::NotYet {
+                through: None,
+                complete: false
+            }
+        );
     }
 }
 
@@ -631,41 +644,385 @@ async fn scan_spend_fallback_reports_its_reach_and_a_changed_mark() {
 }
 
 /// H2: a quorum pass reaches only as far as both endpoints read, and an index answer
-/// covers what the other endpoint scanned.
+/// covers what the other endpoint scanned. Block scans that stopped at different heights join
+/// at the lower mark only if the higher pass read that very block (O2); two blocks at one
+/// height are held.
 #[test]
 fn quorum_scan_keeps_the_lower_mark() {
+    use crate::quorum::{agree_scan, EndpointScan};
     let m = |height: u64, b: &str| ScanMark {
         height,
         hash: b.repeat(32),
     };
     let not_yet = |through: Option<ScanMark>, complete| SpendScan::NotYet { through, complete };
-    let join = |a, b| crate::quorum::agree_scan(a, b).unwrap();
-    assert_eq!(
-        join(
-            not_yet(Some(m(20, "aa")), false),
+    let pass = |through: Option<ScanMark>, complete, blocks: &[(u64, &str)]| {
+        EndpointScan::blocks(
+            SpendScan::NotYet { through, complete },
+            blocks.iter().map(|(h, b)| (*h, b.repeat(32))).collect(),
+        )
+    };
+    let held =
+        |r: Result<SpendScan>| matches!(r, Err(SwapError::Held(ref m)) if m.contains("disagree"));
+    for flip in [false, true] {
+        let join = |a: EndpointScan, b: EndpointScan| {
+            if flip {
+                agree_scan(b, a)
+            } else {
+                agree_scan(a, b)
+            }
+        };
+        // The higher pass read the lower mark's block: the lower mark, not complete.
+        assert_eq!(
+            join(
+                pass(
+                    Some(m(20, "aa")),
+                    true,
+                    &[(15, "bb"), (16, "aa"), (20, "aa")]
+                ),
+                pass(Some(m(15, "bb")), true, &[(15, "bb")])
+            )
+            .unwrap(),
             not_yet(Some(m(15, "bb")), false)
-        ),
-        not_yet(Some(m(15, "bb")), false)
-    );
-    assert_eq!(
-        join(
-            not_yet(Some(m(20, "aa")), true),
-            not_yet(Some(m(20, "bb")), true)
-        ),
-        not_yet(None, false)
-    );
-    assert_eq!(
-        join(not_yet(None, true), not_yet(Some(m(20, "aa")), false)),
-        not_yet(Some(m(20, "aa")), false)
-    );
-    assert_eq!(
-        join(not_yet(None, false), not_yet(Some(m(20, "aa")), true)),
-        not_yet(None, false)
-    );
-    assert_eq!(
-        join(SpendScan::Reorged, not_yet(None, true)),
-        SpendScan::Reorged
-    );
+        );
+        // It read another block at that height (another branch): held, no mark.
+        assert!(held(join(
+            pass(Some(m(20, "aa")), true, &[(15, "cc"), (20, "aa")]),
+            pass(Some(m(15, "bb")), true, &[(15, "bb")])
+        )));
+        // It did not read that height: Transient, no mark.
+        assert!(matches!(
+            join(
+                pass(Some(m(20, "aa")), true, &[(20, "aa")]),
+                pass(Some(m(15, "bb")), true, &[(15, "bb")])
+            ),
+            Err(SwapError::Transient(ref e)) if e.contains("missing")
+        ));
+        // Two blocks at one height: held. The same block: that mark.
+        assert!(held(join(
+            pass(Some(m(20, "aa")), true, &[(20, "aa")]),
+            pass(Some(m(20, "bb")), true, &[(20, "bb")])
+        )));
+        for (ca, cb) in [(true, true), (true, false), (false, true)] {
+            assert_eq!(
+                join(
+                    pass(Some(m(20, "aa")), ca, &[(20, "aa")]),
+                    pass(Some(m(20, "aa")), cb, &[(20, "aa")])
+                )
+                .unwrap(),
+                not_yet(Some(m(20, "aa")), ca && cb)
+            );
+        }
+        // An index answer covers what the other side read, complete as that side is.
+        for cb in [false, true] {
+            assert_eq!(
+                join(
+                    EndpointScan::bare(not_yet(None, true)),
+                    pass(Some(m(20, "aa")), cb, &[(20, "aa")])
+                )
+                .unwrap(),
+                not_yet(Some(m(20, "aa")), cb)
+            );
+        }
+        assert_eq!(
+            join(
+                EndpointScan::bare(not_yet(None, false)),
+                pass(Some(m(20, "aa")), true, &[(20, "aa")])
+            )
+            .unwrap(),
+            not_yet(None, false)
+        );
+        // F1-O2: a block-scan endpoint whose tip is below `from_height` read zero blocks at
+        // `>= from_height` and must never be treated as an `/outspend` index answer.
+        assert!(held(join(
+            EndpointScan::below_start(150),
+            pass(
+                Some(m(153, "aa")),
+                true,
+                &[(151, "aa"), (152, "aa"), (153, "aa")]
+            )
+        )));
+        assert!(held(join(
+            EndpointScan::below_start(150),
+            EndpointScan::bare(not_yet(None, true))
+        )));
+        assert_eq!(
+            join(
+                EndpointScan::below_start(150),
+                EndpointScan::below_start(149)
+            )
+            .unwrap(),
+            not_yet(None, true)
+        );
+        assert_eq!(
+            join(
+                EndpointScan::bare(SpendScan::Reorged),
+                EndpointScan::bare(not_yet(None, true))
+            )
+            .unwrap(),
+            SpendScan::Reorged
+        );
+    }
+}
+
+// ---- O2: a lower mark the higher endpoint did not read (block-scan fallback) ----
+
+/// A scripted Esplora chain that can fork, served without `/outspend` (501) so every spend
+/// read is the block-scan fallback. Blocks of a replaced branch are still served by hash.
+#[derive(Default)]
+struct EsChain {
+    best: Vec<String>,
+    /// hash -> (height, parent, transactions)
+    blocks: std::collections::HashMap<String, (u64, String, Vec<Value>)>,
+}
+
+fn es_hash(branch: u8, h: u64) -> String {
+    format!("{branch:02x}{h:062x}")
+}
+
+impl EsChain {
+    fn new(tip: u64) -> Self {
+        let mut c = EsChain::default();
+        c.extend(0, tip);
+        c
+    }
+
+    fn extend(&mut self, branch: u8, tip: u64) {
+        while self.best.len() as u64 <= tip {
+            let h = self.best.len() as u64;
+            let hash = es_hash(branch, h);
+            let parent = self.best.last().cloned().unwrap_or_else(|| "00".repeat(32));
+            let coinbase =
+                json!({"txid": format!("c{branch:01x}{h:062x}"), "vin": [{"is_coinbase": true}]});
+            self.blocks
+                .insert(hash.clone(), (h, parent, vec![coinbase]));
+            self.best.push(hash);
+        }
+    }
+
+    fn reorg(&mut self, fork: u64, branch: u8, tip: u64) {
+        self.best.truncate(fork as usize);
+        self.extend(branch, tip);
+    }
+
+    /// A claim of `fund` revealing `pre` for `h`, mined in the block at `at`.
+    fn claim(&mut self, fund: &Outpoint, at: u64, pre: &[u8; 32], h: &HtlcParams) {
+        let hash = self.best[at as usize].clone();
+        self.blocks.get_mut(&hash).unwrap().2.push(json!({
+            "txid": "ef".repeat(32),
+            "vin": [{"txid": fund.txid.to_rpc_hex(), "vout": fund.vout, "scriptsig": "",
+                     "witness": [hex::encode([0x30u8; 71]), hex::encode(pre), "01",
+                                 hex::encode(h.redeem_script())]}]
+        }));
+    }
+}
+
+#[derive(Clone)]
+struct Esplora(std::sync::Arc<std::sync::Mutex<EsChain>>);
+
+impl wiremock::Respond for Esplora {
+    fn respond(&self, req: &wiremock::Request) -> ResponseTemplate {
+        let c = self.0.lock().unwrap();
+        let parts: Vec<&str> = req.url.path().trim_start_matches('/').split('/').collect();
+        let block = |hash: &str| c.blocks.get(hash);
+        match parts.as_slice() {
+            ["blocks", "tip", "height"] => {
+                ResponseTemplate::new(200).set_body_string((c.best.len() - 1).to_string())
+            }
+            ["block-height", h] => match c.best.get(h.parse::<usize>().unwrap()) {
+                Some(hash) => ResponseTemplate::new(200).set_body_string(hash.clone()),
+                None => ResponseTemplate::new(404),
+            },
+            ["block", hash] => match block(hash) {
+                Some((height, parent, txs)) => ResponseTemplate::new(200).set_body_json(json!({
+                    "id": hash, "height": height, "previousblockhash": parent,
+                    "tx_count": txs.len()
+                })),
+                None => ResponseTemplate::new(404),
+            },
+            ["block", hash, "txs", start] => match block(hash) {
+                Some((_, _, txs)) => {
+                    let start: usize = start.parse().unwrap();
+                    let page: Vec<Value> = txs.iter().skip(start).take(25).cloned().collect();
+                    ResponseTemplate::new(200).set_body_json(Value::Array(page))
+                }
+                None => ResponseTemplate::new(404),
+            },
+            ["tx", _, "outspend", _] => ResponseTemplate::new(501),
+            _ => ResponseTemplate::new(404),
+        }
+    }
+}
+
+async fn esplora(chain: EsChain) -> (MockServer, std::sync::Arc<std::sync::Mutex<EsChain>>) {
+    let server = MockServer::start().await;
+    let chain = std::sync::Arc::new(std::sync::Mutex::new(chain));
+    Mock::given(method("GET"))
+        .respond_with(Esplora(chain.clone()))
+        .mount(&server)
+        .await;
+    (server, chain)
+}
+
+/// The two endpoints while the honest one is briefly on a fork: the liar names the real chain
+/// `H0` through 150; the honest endpoint is on `H0_148 -> H1_149 -> H1_150 -> H1_151`.
+fn o2_chains() -> (EsChain, EsChain) {
+    let liar = EsChain::new(150);
+    let mut honest = EsChain::new(148);
+    honest.extend(1, 151);
+    (liar, honest)
+}
+
+/// O2, the first pass from the lock (100): the liar's mark `(150, H0_150)` is one block below
+/// the honest one, but the honest pass read `H1_150` there. Held in either order, so no mark
+/// that would vouch for blocks the honest endpoint never read is returned.
+#[tokio::test]
+async fn quorum_scan_a_lower_mark_on_another_branch_is_held() {
+    let fund = outpoint();
+    for liar_is_primary in [true, false] {
+        let (liar, honest) = o2_chains();
+        let (l, _) = esplora(liar).await;
+        let (h, _) = esplora(honest).await;
+        let b = if liar_is_primary {
+            quorum(&l, &h)
+        } else {
+            quorum(&h, &l)
+        };
+        let r = b.scan_spend(&fund, 100, None).await;
+        assert!(
+            matches!(r, Err(SwapError::Held(ref m)) if m.contains("two blocks at height 150")),
+            "liar primary {liar_is_primary}: {r:?}"
+        );
+        // Each endpoint alone reads its own branch through its tip.
+        for (es, tip, branch) in [(&l, 150, 0), (&h, 151, 1)] {
+            let alone = backend(vec![es.uri()], MAKER_KEY);
+            assert_eq!(
+                alone.scan_spend(&fund, 100, None).await.unwrap(),
+                SpendScan::NotYet {
+                    through: Some(ScanMark {
+                        height: tip,
+                        hash: es_hash(branch, tip)
+                    }),
+                    complete: true
+                }
+            );
+        }
+    }
+}
+
+/// O2, after the fork resolves: the honest endpoint is back on `H0`, now at 152, with the
+/// claim the liar hides at 149 or 150. The quorum read is held (a spend one side only
+/// reports), and the honest primary alone, read from the lock as `hold::scan_spend` reads it
+/// at the refund deadline, finds the claim and its preimage.
+#[tokio::test]
+async fn quorum_scan_a_hidden_claim_is_found_by_the_honest_primary_after_the_fork() {
+    let fund = outpoint();
+    for claim_at in [149, 150] {
+        let (pre, hash) = new_preimage();
+        let h = htlc(hash);
+        let (liar, honest) = o2_chains();
+        let (ls, lc) = esplora(liar).await;
+        let (hs, hc) = esplora(honest).await;
+        let b = quorum(&hs, &ls);
+        assert!(matches!(
+            b.scan_spend(&fund, 100, None).await,
+            Err(SwapError::Held(_))
+        ));
+        {
+            let mut honest = hc.lock().unwrap();
+            honest.reorg(149, 0, 152);
+            honest.claim(&fund, claim_at, &pre, &h);
+            let mut liar = lc.lock().unwrap();
+            liar.extend(0, 152);
+            assert_eq!(honest.best, liar.best);
+        }
+        let r = b.scan_spend(&fund, 100, None).await;
+        assert!(
+            matches!(r, Err(SwapError::Held(_))),
+            "claim at {claim_at}: {r:?}"
+        );
+        let view = b
+            .primary_only()
+            .expect("quorum reads have a primary-only view");
+        match view.scan_spend(&fund, 100, None).await.unwrap() {
+            SpendScan::Spent(s) => {
+                assert_eq!(s.height, Some(claim_at));
+                assert_eq!(s.extract_preimage(&hash), Some(pre));
+            }
+            other => panic!("claim at {claim_at}: expected the claim, got {other:?}"),
+        }
+    }
+}
+
+/// F1-O2: when an honest `501`-outspend endpoint unwinds to `tip = 150 < floor = 151` during
+/// a reorg (or lags behind a load-balanced replica) while a lying peer is at `tip = 153` on
+/// `H0` hiding a confirmed claim in `H0_152`, the `Reorged` restart from `floor = 151`
+/// (`resume = None`) must hold (`SwapError::Held`) rather than mistaking `from_height > tip`
+/// for an `/outspend` index answer and poisoning the cursor to `(153, H0_153)`.
+#[tokio::test]
+async fn quorum_scan_endpoint_below_start_holds_and_never_poisons_cursor_after_reorg() {
+    let fund = outpoint();
+    let (pre, hash) = new_preimage();
+    let h = htlc(hash);
+    for liar_is_primary in [true, false] {
+        let liar = EsChain::new(153);
+        let honest = EsChain::new(150);
+        let (ls, _) = esplora(liar).await;
+        let (hs, hc) = esplora(honest).await;
+        let b = if liar_is_primary {
+            quorum(&ls, &hs)
+        } else {
+            quorum(&hs, &ls)
+        };
+        let stale_mark = ScanMark {
+            height: 151,
+            hash: es_hash(1, 151),
+        };
+        // Step 1: resuming at `(151, H1_151)` sees `tip = 150 < 151` -> `Reorged`.
+        assert_eq!(
+            b.scan_spend(&fund, 151, Some(&stale_mark)).await.unwrap(),
+            SpendScan::Reorged
+        );
+        // Step 2: `spend_cursor` restarts immediately at `(151, None)` while honest is still
+        // at `tip = 150 < 151`. Must hold (`Held`), saving no cursor and taking no
+        // `NoneThroughTip` decision.
+        let r = b.scan_spend(&fund, 151, None).await;
+        assert!(
+            matches!(r, Err(SwapError::Held(ref m)) if m.contains("below scan start")),
+            "liar primary {liar_is_primary}: {r:?}"
+        );
+        // Single-source below-start behavior is preserved unchanged.
+        let alone = backend(vec![hs.uri()], MAKER_KEY);
+        assert_eq!(
+            alone.scan_spend(&fund, 151, None).await.unwrap(),
+            SpendScan::NotYet {
+                through: None,
+                complete: true,
+            }
+        );
+        // Step 3: honest catches up to `H0_153` with Taker's claim in `H0_152`. Because no
+        // `(153, H0_153)` mark was saved, the next pass starts at `151` (not `153`), holds on
+        // the liar's omission, and `primary_only()` (when honest is primary) recovers the
+        // preimage from `H0_152`.
+        {
+            let mut honest = hc.lock().unwrap();
+            honest.extend(0, 153);
+            honest.claim(&fund, 152, &pre, &h);
+        }
+        assert!(matches!(
+            b.scan_spend(&fund, 151, None).await,
+            Err(SwapError::Held(_))
+        ));
+        if !liar_is_primary {
+            let view = b.primary_only().unwrap();
+            match view.scan_spend(&fund, 151, None).await.unwrap() {
+                SpendScan::Spent(s) => {
+                    assert_eq!(s.height, Some(152));
+                    assert_eq!(s.extract_preimage(&hash), Some(pre));
+                }
+                other => panic!("expected claim at 152, got {other:?}"),
+            }
+        }
+    }
 }
 
 #[tokio::test]

@@ -86,23 +86,11 @@ fn block_time(block: &Value) -> Result<u64> {
         .ok_or_else(|| SwapError::Transient("block without time (still indexing?)".into()))
 }
 
-/// Median time past over the JSON-RPC proxy (the node reports `mediantime: null`).
+/// Median time past over the JSON-RPC proxy (the node reports `mediantime: null`): the
+/// client's tip-scoped read ([`RpcClient::median_time_past`]), shared with the backend whose
+/// client this observer was made from.
 pub(crate) async fn rpc_median_time_past(rpc: &RpcClient) -> Result<u32> {
-    let tip = rpc.call_ok("getblockcount", json!([])).await?;
-    let tip = tip
-        .as_u64()
-        .ok_or_else(|| SwapError::Transient(format!("getblockcount: not a number: {tip}")))?;
-    let mut hash = rpc.call_ok("getblockhash", json!([tip])).await?;
-    let mut times = Vec::with_capacity(11);
-    for _ in 0..11 {
-        let block = rpc.call_ok("getblock", json!([hash, true])).await?;
-        times.push(block_time(&block)?);
-        match block.get("previousblockhash").filter(|p| p.is_string()) {
-            Some(prev) => hash = prev.clone(),
-            None => break,
-        }
-    }
-    median(times)
+    rpc.median_time_past().await
 }
 
 /// The JSON-RPC proxy as an observer.

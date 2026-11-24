@@ -318,14 +318,16 @@ async fn find_spend_scans_blocks() {
                 "getblockcount" => json!(102),
                 "getblockhash" => {
                     let h = body["params"][0].as_u64().unwrap();
-                    let replaced = self.fault == 2 && h == 102 && self.reads.fetch_add(1,std::sync::atomic::Ordering::SeqCst) > 0;
+                    let replaced = self.fault == 2
+                        && h == 102
+                        && self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0;
                     json!(format!("{:064x}", h + u64::from(replaced)))
-                },
+                }
                 "getblock" => {
                     let hash = body["params"][0].as_str().unwrap();
-                    let h = u64::from_str_radix(hash,16).unwrap();
+                    let h = u64::from_str_radix(hash, 16).unwrap();
                     json!({"hash":hash,"height":h,"previousblockhash":if self.fault == 3 { String::new() } else { format!("{:064x}",if self.fault == 1 {0} else {h-1}) },"tx":[self.other.to_rpc_hex(),self.spender.to_rpc_hex()]})
-                },
+                }
                 "getrawmempool" => json!([]),
                 "getrawtransaction" => {
                     let id = body["params"][0].as_str().unwrap();
@@ -342,7 +344,8 @@ async fn find_spend_scans_blocks() {
     }
     Mock::given(method("POST"))
         .respond_with(Chain {
-            fault:0, reads: Default::default(),
+            fault: 0,
+            reads: Default::default(),
             spender,
             other,
             target,
@@ -379,9 +382,28 @@ async fn find_spend_scans_blocks() {
     assert!(none.is_none());
     for fault in [1, 2, 3] {
         let server = MockServer::start().await;
-        Mock::given(method("POST")).respond_with(Chain {fault, reads: Default::default(), spender,other,target}).mount(&server).await;
+        Mock::given(method("POST"))
+            .respond_with(Chain {
+                fault,
+                reads: Default::default(),
+                spender,
+                other,
+                target,
+            })
+            .mount(&server)
+            .await;
         let b = backend(&server.uri(), SecretKey::new_random());
-        assert!(b.scan_spend(&Outpoint { txid: target, vout:5 },101,None).await.is_err());
+        assert!(b
+            .scan_spend(
+                &Outpoint {
+                    txid: target,
+                    vout: 5
+                },
+                101,
+                None
+            )
+            .await
+            .is_err());
     }
 }
 
@@ -545,8 +567,10 @@ async fn node_warmup_is_transient() {
 async fn lagging_proxy_block_not_found_is_transient() {
     let (server, node) = mock().await;
     let b = backend(&server.uri(), SecretKey::new_random());
-    node.result("getblockcount", json!(100));
-    node.result("getblockhash", json!("deadbeef"));
+    node.result(
+        "getbestblockhash",
+        json!(format!("{:064x}", 0xdead_beef_u64)),
+    );
     node.error("getblock", 500, -5, "Block not found");
     assert!(matches!(
         b.median_time_past().await,
@@ -586,8 +610,10 @@ async fn tip_height_non_numeric_is_transient() {
 async fn median_time_past_missing_time_is_transient() {
     let (server, node) = mock().await;
     let b = backend(&server.uri(), SecretKey::new_random());
-    node.result("getblockcount", json!(100));
-    node.result("getblockhash", json!("deadbeef"));
+    node.result(
+        "getbestblockhash",
+        json!(format!("{:064x}", 0xdead_beef_u64)),
+    );
     node.result("getblock", json!({"tx": []}));
     assert!(matches!(
         b.median_time_past().await,
@@ -643,7 +669,8 @@ fn txid_byte_order_round_trips() {
 async fn scan_cursor_persists_with_wallet() {
     let (server, node) = mock().await;
     node.result("getblockhash", json!("00".repeat(32)))
-        .result("getblock", json!({"tx":[txid_n(1).to_rpc_hex()]})).result("getrawtransaction", tx_json(&txid_n(1), &[], &[], 2));
+        .result("getblock", json!({"tx":[txid_n(1).to_rpc_hex()]}))
+        .result("getrawtransaction", tx_json(&txid_n(1), &[], &[], 2));
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("wallet.json");
     let key = SecretKey::new_random();
@@ -685,12 +712,19 @@ async fn scan_range_applies_blocks_in_height_order_across_concurrent_batches() {
                 "getblock" => {
                     let hash = params[0].as_str().unwrap();
                     let h = u64::from_str_radix(hash, 16).unwrap();
-                    let txs = self.blocks.get(&h).cloned().unwrap_or_else(|| vec![txid_n(0).to_rpc_hex()]);
+                    let txs = self
+                        .blocks
+                        .get(&h)
+                        .cloned()
+                        .unwrap_or_else(|| vec![txid_n(0).to_rpc_hex()]);
                     json!({"tx": txs})
                 }
                 "getrawtransaction" => {
                     let txid = params[0].as_str().unwrap();
-                    self.txs.get(txid).cloned().unwrap_or_else(|| tx_json(&txid_n(0), &[], &[], 1))
+                    self.txs
+                        .get(txid)
+                        .cloned()
+                        .unwrap_or_else(|| tx_json(&txid_n(0), &[], &[], 1))
                 }
                 _ => unreachable!("unexpected method {method}"),
             };
@@ -929,8 +963,7 @@ async fn cryptoid_mtp_is_the_median_of_the_last_11_and_is_cached() {
 async fn two_source_mtp_is_the_later_one() {
     let (rpc, node) = mock().await;
     let b = backend(&rpc.uri(), SecretKey::new_random());
-    node.result("getblockcount", json!(5))
-        .result("getblockhash", json!("h"))
+    node.result("getbestblockhash", json!(format!("{:064x}", 5)))
         .result("getblock", json!({"time": 1_000_000}));
     let (cs, _c) = cryptoid(None).await;
     let t = b.with_second_source(Arc::new(CryptoidObserver::new(&cs.uri(), "divi")));

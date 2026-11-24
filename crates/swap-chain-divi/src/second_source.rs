@@ -17,7 +17,7 @@
 //! liar can lower a number but never raise one.
 
 use divi_swap::backend::TipHeader;
-use divi_swap::{LockedOutput, SpendInfo, SwapError};
+use divi_swap::{LockedOutput, SpendInfo, SpendScan, SwapError};
 use serde_json::Value;
 
 type Result<T> = std::result::Result<T, SwapError>;
@@ -138,6 +138,124 @@ pub(crate) fn agree_spend(a: Option<SpendInfo>, b: Option<SpendInfo>) -> Result<
     }
 }
 
+/// One endpoint's answer to one spend-scan pass, with every block that pass verified.
+///
+/// `blocks` holds `(height, hash)` for the mark the pass resumed at (when it starts at the
+/// mark) and for each block it read, in order. Each block named the one before it as its
+/// parent, so the list is one branch. It is empty for a reorg or a spend, which
+/// [`agree_scan`] joins without it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EndpointScan {
+    pub(crate) scan: SpendScan,
+    pub(crate) blocks: Vec<(u64, String)>,
+}
+
+/// Join the two endpoints' answers to one spend-scan pass (P7), both read from the same start
+/// and the same mark.
+///
+/// - A reorg under the mark on either side voids it for both: [`SpendScan::Reorged`].
+/// - A spend on either side is joined as [`agree_spend`] joins it (seen by one only: held).
+/// - Neither saw a spend and both stopped at one block: that mark, `complete` only if both
+///   reached their tip. Two different blocks at one height are a disagreement (held).
+/// - Both stopped at different heights (one endpoint's tip is behind the other's, so that
+///   pass reached its tip early). Heights further apart than [`TIP_TOLERANCE_BLOCKS`] are a
+///   tip disagreement (held), as for [`agree_tip_height`]. Within it, the endpoint that read
+///   higher must have verified, in this same pass, the very block the lower one stopped at:
+///   - The same block there: the lower mark, never `complete`, so no no-spend decision is
+///     taken until both name the same last block.
+///   - Another block there: the two read different branches. That is a disagreement (held),
+///     and no mark is saved.
+///   - That height not among the blocks it verified: `Transient`, and no mark is saved.
+///
+/// The check is what makes the lower mark safe to save. Both passes started at the same
+/// height (or the same mark), and every block in each pass named the block before it as its
+/// parent. A block hash commits to its parent's hash (SHA-256), so one hash at the lower
+/// height means both endpoints read the same blocks from the start through that height. So
+/// whichever endpoint is honest read every transaction in every block under the saved mark.
+/// The next pass resumes there and checks only the mark's hash, which is then enough. That
+/// holds even if the honest endpoint was on a short-lived fork during this pass and has since
+/// moved back to the branch the other endpoint named. It costs no extra RPC: the hashes are
+/// the ones each pass already read.
+///
+/// Without the check a liar could hide a claim. Say a lying endpoint names the real chain to
+/// height `h` but leaves the claim out of a block, while the honest endpoint is briefly on a
+/// fork to `h + 1`. Their marks would join at the liar's `(h, hash)`. Once the honest
+/// endpoint returns to the real chain, its block at `h` matches the mark, so the next pass
+/// would never read the forked-over blocks again.
+pub(crate) fn agree_scan(a: EndpointScan, b: EndpointScan) -> Result<SpendScan> {
+    match (a.scan, b.scan) {
+        (SpendScan::Reorged, _) | (_, SpendScan::Reorged) => Ok(SpendScan::Reorged),
+        (
+            SpendScan::NotYet {
+                through: Some(x),
+                complete: ca,
+            },
+            SpendScan::NotYet {
+                through: Some(y),
+                complete: cb,
+            },
+        ) => {
+            if x.height == y.height {
+                if x.hash != y.hash {
+                    return Err(disagree(
+                        "find_spend",
+                        format!(
+                            "two blocks at height {}: {} and {}",
+                            x.height, x.hash, y.hash
+                        ),
+                    ));
+                }
+                return Ok(SpendScan::NotYet {
+                    through: Some(x),
+                    complete: ca && cb,
+                });
+            }
+            if x.height.abs_diff(y.height) > TIP_TOLERANCE_BLOCKS {
+                return Err(disagree(
+                    "find_spend",
+                    format!("scans ended at heights {} vs {}", x.height, y.height),
+                ));
+            }
+            let (low, high_blocks) = if x.height < y.height {
+                (x, &b.blocks)
+            } else {
+                (y, &a.blocks)
+            };
+            let Some((_, high_hash)) = high_blocks.iter().find(|(h, _)| *h == low.height) else {
+                return Err(SwapError::Transient(
+                    "find_spend: lower mark height missing from higher scan pass".into(),
+                ));
+            };
+            if *high_hash != low.hash {
+                return Err(disagree(
+                    "find_spend",
+                    format!(
+                        "two blocks at height {}: {} and {high_hash}",
+                        low.height, low.hash
+                    ),
+                ));
+            }
+            Ok(SpendScan::NotYet {
+                through: Some(low),
+                complete: false,
+            })
+        }
+        // A DIVI pass always names the last block it read.
+        (SpendScan::NotYet { through: None, .. }, SpendScan::NotYet { .. })
+        | (SpendScan::NotYet { .. }, SpendScan::NotYet { through: None, .. }) => Err(
+            SwapError::Transient("find_spend: a spend scan named no block".into()),
+        ),
+        (a, b) => Ok(match agree_spend(a.into_spend(), b.into_spend())? {
+            Some(s) => SpendScan::Spent(s),
+            // Unreachable: at least one side is a spend, and one-sided spends are held.
+            None => SpendScan::NotYet {
+                through: None,
+                complete: false,
+            },
+        }),
+    }
+}
+
 pub(crate) fn agree_mtp(a: u32, b: u32) -> Result<u32> {
     if a.abs_diff(b) > MTP_TOLERANCE_SECS {
         return Err(disagree("median_time_past", format!("{a} vs {b}")));
@@ -233,4 +351,226 @@ pub(crate) fn agree_wallet_tx(a: Value, b: Value) -> Result<Value> {
         return Err(disagree("wallet_tx", format!("transaction {id} differs")));
     }
     Ok(a)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use divi_swap::{ScanMark, Txid};
+
+    fn at(height: u64, branch: u8) -> ScanMark {
+        ScanMark {
+            height,
+            hash: format!("{branch:02x}{height:062x}"),
+        }
+    }
+
+    /// One endpoint's pass: `scan`, having verified the blocks of `branch` at `heights`.
+    fn pass(scan: SpendScan, branch: u8, heights: std::ops::RangeInclusive<u64>) -> EndpointScan {
+        EndpointScan {
+            scan,
+            blocks: heights.map(|h| (h, at(h, branch).hash)).collect(),
+        }
+    }
+
+    /// A pass that read `from..=m.height` on `m`'s branch and stopped at `m`.
+    fn not_yet_from(from: u64, m: ScanMark, complete: bool) -> EndpointScan {
+        let branch = u8::from_str_radix(&m.hash[..2], 16).unwrap();
+        let end = m.height;
+        pass(
+            SpendScan::NotYet {
+                through: Some(m),
+                complete,
+            },
+            branch,
+            from..=end,
+        )
+    }
+
+    fn not_yet(m: ScanMark, complete: bool) -> EndpointScan {
+        not_yet_from(5, m, complete)
+    }
+
+    fn bare(scan: SpendScan) -> EndpointScan {
+        EndpointScan {
+            scan,
+            blocks: Vec::new(),
+        }
+    }
+
+    fn spent(height: Option<u64>, script: u8) -> EndpointScan {
+        bare(SpendScan::Spent(SpendInfo {
+            txid: Txid([5; 32]),
+            input_index: 0,
+            height,
+            script_sig: vec![script],
+            witness: vec![],
+        }))
+    }
+
+    fn held(r: &Result<SpendScan>) -> bool {
+        matches!(r, Err(SwapError::Held(m)) if m.contains("disagree"))
+    }
+
+    fn joined(m: ScanMark, complete: bool) -> SpendScan {
+        SpendScan::NotYet {
+            through: Some(m),
+            complete,
+        }
+    }
+
+    #[test]
+    fn one_scan_pass_on_two_endpoints_is_joined_conservatively() {
+        // The same last block: that mark, complete only if both reached their tip.
+        for (ca, cb) in [(true, true), (true, false), (false, true), (false, false)] {
+            assert_eq!(
+                agree_scan(not_yet(at(9, 0), ca), not_yet(at(9, 0), cb)).unwrap(),
+                joined(at(9, 0), ca && cb)
+            );
+        }
+        // One endpoint behind on the same branch: the lower mark, never complete, whichever
+        // side is lower.
+        for behind in 1..=TIP_TOLERANCE_BLOCKS {
+            let hi = at(9 + behind, 0);
+            assert_eq!(
+                agree_scan(not_yet(at(9, 0), true), not_yet(hi.clone(), true)).unwrap(),
+                joined(at(9, 0), false)
+            );
+            assert_eq!(
+                agree_scan(not_yet(hi, true), not_yet(at(9, 0), true)).unwrap(),
+                joined(at(9, 0), false)
+            );
+        }
+        // Further apart than the tip tolerance, or two blocks at one height: held.
+        assert!(held(&agree_scan(
+            not_yet(at(9, 0), true),
+            not_yet(at(9 + TIP_TOLERANCE_BLOCKS + 1, 0), true)
+        )));
+        assert!(held(&agree_scan(
+            not_yet(at(9, 0), true),
+            not_yet(at(9, 1), true)
+        )));
+        // A reorg on either side voids the mark for both, whatever the other saw.
+        for other in [
+            not_yet(at(9, 0), true),
+            spent(Some(9), 1),
+            bare(SpendScan::Reorged),
+        ] {
+            assert_eq!(
+                agree_scan(bare(SpendScan::Reorged), other.clone()).unwrap(),
+                SpendScan::Reorged
+            );
+            assert_eq!(
+                agree_scan(other, bare(SpendScan::Reorged)).unwrap(),
+                SpendScan::Reorged
+            );
+        }
+        // A spend on one side only, or two different spends: held. The same spend: the block.
+        assert!(held(&agree_scan(
+            spent(Some(9), 1),
+            not_yet(at(9, 0), true)
+        )));
+        assert!(held(&agree_scan(not_yet(at(9, 0), false), spent(None, 1))));
+        assert!(held(&agree_scan(spent(Some(9), 1), spent(Some(9), 2))));
+        assert_eq!(
+            agree_scan(spent(None, 1), spent(Some(9), 1)).unwrap(),
+            SpendScan::Spent(SpendInfo {
+                txid: Txid([5; 32]),
+                input_index: 0,
+                height: Some(9),
+                script_sig: vec![1],
+                witness: vec![],
+            })
+        );
+        // A pass that names no block is not evidence.
+        let none = bare(SpendScan::NotYet {
+            through: None,
+            complete: true,
+        });
+        assert!(matches!(
+            agree_scan(none.clone(), not_yet(at(9, 0), true)),
+            Err(SwapError::Transient(_))
+        ));
+        assert!(matches!(
+            agree_scan(not_yet(at(9, 0), true), none),
+            Err(SwapError::Transient(_))
+        ));
+    }
+
+    /// F1: marks within the tip tolerance join at the lower one only when the endpoint that
+    /// read higher verified that very block in the same pass; another block there (it read
+    /// another branch) is held, and a height it did not verify is `Transient`. Both orders.
+    #[test]
+    fn a_lower_mark_joins_only_if_the_higher_pass_read_the_same_block_there() {
+        type Join = fn(EndpointScan, EndpointScan) -> Result<SpendScan>;
+        let orders: [(&str, Join); 2] = [
+            ("low first", |lo, hi| agree_scan(lo, hi)),
+            ("high first", |lo, hi| agree_scan(hi, lo)),
+        ];
+        for (order, join) in orders {
+            for apart in 1..=TIP_TOLERANCE_BLOCKS {
+                let (low, high) = (150, 150 + apart);
+                // The higher pass read the same branch through the lower mark.
+                assert_eq!(
+                    join(
+                        not_yet_from(100, at(low, 0), true),
+                        not_yet_from(100, at(high, 0), true)
+                    )
+                    .unwrap(),
+                    joined(at(low, 0), false),
+                    "{order}, {apart} apart, same branch"
+                );
+                // It also joins when the higher pass forked off just above the lower mark.
+                let mut above = not_yet_from(100, at(high, 1), true);
+                above.blocks[(low - 100) as usize] = (low, at(low, 0).hash);
+                assert_eq!(
+                    join(not_yet_from(100, at(low, 0), true), above).unwrap(),
+                    joined(at(low, 0), false),
+                    "{order}, {apart} apart, fork above the lower mark"
+                );
+                // The higher pass read another block at the lower height: held, for a fork at
+                // that height or any height below it in the pass.
+                for fork in [low - 1, low] {
+                    let mut forked = not_yet_from(100, at(high, 1), true);
+                    for (h, hash) in forked.blocks.iter_mut() {
+                        if *h < fork {
+                            *hash = at(*h, 0).hash;
+                        }
+                    }
+                    let r = join(not_yet_from(100, at(low, 0), true), forked);
+                    assert!(held(&r), "{order}, {apart} apart, fork at {fork}: {r:?}");
+                }
+                // The lower height is not among the blocks the higher pass verified.
+                let mut short = not_yet_from(100, at(high, 0), true);
+                short.blocks.retain(|(h, _)| *h != low);
+                assert!(
+                    matches!(
+                        join(not_yet_from(100, at(low, 0), true), short),
+                        Err(SwapError::Transient(ref m)) if m.contains("missing")
+                    ),
+                    "{order}, {apart} apart, missing"
+                );
+                let empty = bare(SpendScan::NotYet {
+                    through: Some(at(high, 0)),
+                    complete: true,
+                });
+                assert!(
+                    matches!(
+                        join(not_yet_from(100, at(low, 0), true), empty),
+                        Err(SwapError::Transient(_))
+                    ),
+                    "{order}, {apart} apart, no blocks"
+                );
+            }
+            // A resumed pass verified the mark it resumed at: an endpoint that read no new
+            // block still joins one that read one more.
+            let resumed_low = pass(joined(at(150, 0), true), 0, 150..=150);
+            let resumed_high = pass(joined(at(151, 0), true), 0, 150..=151);
+            assert_eq!(
+                join(resumed_low, resumed_high).unwrap(),
+                joined(at(150, 0), false),
+                "{order}, resumed"
+            );
+        }
+    }
 }

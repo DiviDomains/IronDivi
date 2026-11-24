@@ -9,10 +9,15 @@
 //! Minimal JSON-RPC client for the services.divi.domains proxy, with retry and error
 //! classification. No auth: the proxy allow-lists read methods plus `sendrawtransaction`.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use divi_swap::SwapError;
+use parking_lot::Mutex;
 use serde_json::{json, Value};
+
+/// Blocks whose header times give the median time past (BIP113, `CBlockIndex::GetMedianTimePast`).
+const MTP_BLOCKS: usize = 11;
 
 /// How transient failures are retried.
 #[derive(Debug, Clone, Copy)]
@@ -61,6 +66,9 @@ pub struct RpcClient {
     http: reqwest::Client,
     url: String,
     retry: RetryPolicy,
+    /// The last median time past read, keyed by the best block it was read from
+    /// ([`RpcClient::median_time_past`]). Shared by every clone of this client.
+    mtp: Arc<Mutex<Option<(String, u32)>>>,
 }
 
 impl RpcClient {
@@ -74,7 +82,72 @@ impl RpcClient {
             http,
             url: url.to_string(),
             retry,
+            mtp: Arc::default(),
         }
+    }
+
+    /// Median time past of the best block: the median of the header times of it and up to
+    /// ten ancestors (the node reports `mediantime: null`, so it is computed here).
+    ///
+    /// The walk starts from `getbestblockhash`, so every block read is an ancestor of the one
+    /// tip named (no `getblockcount` / `getblockhash` pair a new block can land between). A
+    /// block hash commits to its header time and to its parent, so the eleven times are a
+    /// function of the tip hash alone: the answer is kept with that hash and, while the best
+    /// block is unchanged, one `getbestblockhash` answers instead of twelve calls. A new tip,
+    /// including a different block at the same height after a reorg, names another hash and
+    /// is read afresh. An error is never kept, and neither is an answer whose blocks did not
+    /// prove themselves (a block that is not the one asked for, or a walk that ended short of
+    /// eleven blocks above genesis); those are returned as before, but read again next time.
+    pub async fn median_time_past(&self) -> Result<u32, SwapError> {
+        let tip = self.call_ok("getbestblockhash", json!([])).await?;
+        let tip = tip
+            .as_str()
+            .ok_or_else(|| SwapError::Transient("getbestblockhash: not a string".into()))?;
+        let tip = divi_swap::backend::normalize_block_hash(tip)?;
+        if let Some((hash, mtp)) = self.mtp.lock().as_ref() {
+            if *hash == tip {
+                return Ok(*mtp);
+            }
+        }
+        let (mtp, proven) = self.median_time_past_from(&tip).await?;
+        if proven {
+            *self.mtp.lock() = Some((tip, mtp));
+        }
+        Ok(mtp)
+    }
+
+    /// Median time past of the block `tip`, uncached, and whether every block read was the
+    /// one asked for and the walk reached eleven blocks or genesis.
+    async fn median_time_past_from(&self, tip: &str) -> Result<(u32, bool), SwapError> {
+        let mut hash = Value::String(tip.to_owned());
+        let mut times = Vec::with_capacity(MTP_BLOCKS);
+        let mut proven = true;
+        let mut reached_genesis = false;
+        for _ in 0..MTP_BLOCKS {
+            let block = self.call_ok("getblock", json!([hash, true])).await?;
+            times.push(block["time"].as_u64().ok_or_else(|| {
+                // A real block always has a time; its absence means a proxy-fronted
+                // node behind the one that reported this hash hasn't indexed it yet.
+                SwapError::Transient("block without time (still indexing?)".into())
+            })?);
+            let asked = hash
+                .as_str()
+                .and_then(|h| divi_swap::backend::normalize_block_hash(h).ok());
+            let named = block["hash"]
+                .as_str()
+                .and_then(|h| divi_swap::backend::normalize_block_hash(h).ok());
+            proven &= asked.is_some() && asked == named;
+            match block.get("previousblockhash").filter(|p| p.is_string()) {
+                Some(prev) => hash = prev.clone(),
+                None => {
+                    reached_genesis = block["height"].as_u64() == Some(0);
+                    break;
+                }
+            }
+        }
+        proven &= times.len() == MTP_BLOCKS || reached_genesis;
+        times.sort_unstable();
+        Ok((times[times.len() / 2] as u32, proven))
     }
 
     /// Call `method`; transient failures are retried with exponential backoff.
