@@ -1097,7 +1097,7 @@ impl Taker {
                 "lost: the taker leg was claimed by {} with our preimage",
                 spend.txid
             ));
-            return self.enter(r, TakerState::Lost);
+            self.enter(r, TakerState::Lost)
         }
     }
 

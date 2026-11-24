@@ -104,6 +104,9 @@ impl<T> Store<T> {
     pub fn iter(&self) -> impl Iterator<Item = (&Hash256, &T)> {
         self.entries.iter().map(|(k, e)| (k, &e.value))
     }
+    pub fn owned(&self) -> impl Iterator<Item = (&Hash256, PeerId, &T)> {
+        self.entries.iter().map(|(k, e)| (k, e.owner, &e.value))
+    }
     pub fn keys(&self) -> impl Iterator<Item = &Hash256> {
         self.entries.keys()
     }

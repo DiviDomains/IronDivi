@@ -312,16 +312,25 @@ impl Decodable for Block {
             let _len_size = CompactSize(len as u64).encoded_size();
 
             // Sanity check: typical block_sig is 65-72 bytes (recoverable ECDSA)
-            // DER signatures are usually 70-72 bytes
+            // DER signatures are usually 70-72 bytes. The length and bytes come
+            // from the peer (vchBlockSig is outside the block hash), so these
+            // notes are debug-level: a peer cannot write them into default logs.
             if !(60..=200).contains(&len) {
-                tracing::warn!(
+                tracing::debug!(
                     "BLOCK_PARSE: pos_before_sig={}, sig_len={}, header={}, tx_count_size={}, txs_size={}, tx_count={}",
                     pos_before_sig, len, header_size, tx_count_size, txs_total_size, tx_count
                 );
             }
             if len > 0 {
-                let mut sig = vec![0u8; len];
-                reader.read_exact(&mut sig)?;
+                // Reserve at most MAX_PREALLOC_BYTES up front and grow as bytes
+                // arrive, as for a script (Divi Core reads a byte vector in
+                // 5 MB steps, serialize.h Unserialize_impl): a short payload
+                // claiming a MAX_SIZE signature is refused without reserving it.
+                let mut sig = Vec::with_capacity(crate::compact::prealloc_len::<u8>(len));
+                reader.take(len as u64).read_to_end(&mut sig)?;
+                if sig.len() != len {
+                    return Err(Error::UnexpectedEof);
+                }
                 // Log first few bytes to verify it looks like a signature
                 if sig.len() >= 2 {
                     let first_byte = sig[0];
@@ -329,7 +338,7 @@ impl Decodable for Block {
                         || (0x1b..=0x22).contains(&first_byte)  // Recoverable sig recovery ID
                         || first_byte == 0x41; // Length prefix mistakenly included
                     if !valid_sig_start {
-                        tracing::warn!(
+                        tracing::debug!(
                             "block_sig doesn't start with expected bytes: {:02x?}, pos_before_sig={}",
                             &sig[..sig.len().min(8)], pos_before_sig
                         );
@@ -563,6 +572,32 @@ mod tests {
         assert!(block.is_proof_of_stake());
         assert!(block.coinbase().is_some());
         assert!(block.coinstake().is_some());
+    }
+
+    /// A signature shorter than its announced length is refused, whether the
+    /// length is near the real one or MAX_SIZE
+    #[test]
+    fn test_pos_block_truncated_signature_is_refused() {
+        let block = Block {
+            header: BlockHeader::new(),
+            transactions: vec![create_coinbase_tx(), create_coinstake_tx()],
+            block_sig: vec![0x30; 72],
+        };
+        let encoded = serialize(&block);
+        let decoded: Block = deserialize(&encoded).unwrap();
+        assert_eq!(decoded.block_sig, block.block_sig);
+        assert!(matches!(
+            deserialize::<Block>(&encoded[..encoded.len() - 1]),
+            Err(Error::UnexpectedEof)
+        ));
+        let sig_start = encoded.len() - 73;
+        let mut lying = encoded[..sig_start].to_vec();
+        lying.extend(serialize(&CompactSize(crate::compact::MAX_SIZE)));
+        lying.extend_from_slice(&[0x30; 72]);
+        assert!(matches!(
+            deserialize::<Block>(&lying),
+            Err(Error::UnexpectedEof)
+        ));
     }
 
     #[test]

@@ -464,6 +464,10 @@ fn check_terms(q: &Quote) -> std::result::Result<(), String> {
 mod tests {
     use super::*;
 
+    /// An edit that makes a case out of a valid offer or quote
+    type OfferEdit = fn(&mut Offer);
+    type QuoteEdit = fn(&mut Quote);
+
     const NOW: u64 = 1_800_000_000;
     /// 1e5 DIVI per BTC.
     const PRICE: u64 = 10_000_000_000_000;
@@ -553,7 +557,7 @@ mod tests {
 
     #[test]
     fn selected_terms_are_validated() {
-        let cases: [(fn(&mut Offer), u64, &str); 6] = [
+        let cases: [(OfferEdit, u64, &str); 6] = [
             (|_| {}, 999, "outside offer"),
             (|_| {}, 1_000_001, "outside offer"),
             (
@@ -722,7 +726,7 @@ mod tests {
 
     #[test]
     fn terms_have_a_sound_shape() {
-        let cases: [(fn(&mut Quote), &str); 4] = [
+        let cases: [(QuoteEdit, &str); 4] = [
             (|q| q.maker_timeout_secs = 0, "maker_timeout_secs is 0"),
             (
                 |q| q.taker_timeout_secs = q.maker_timeout_secs,

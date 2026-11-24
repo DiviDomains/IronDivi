@@ -171,6 +171,23 @@ pub enum PaymentValidationError {
     NoMasternodeWinner,
 }
 
+/// Whether `tx` pays `expected_payee` this crate's schedule for the masternode
+/// share.
+///
+/// **Not a consensus check, and not Divi Core's.** No block-connection path
+/// calls it; its only callers are this module's tests. It differs from Divi
+/// Core's `CMasternodePayments::IsTransactionValid` (masternode-payments.cpp:
+/// 359-411) in every input that matters there: Core takes the required amount
+/// from the block subsidy provider, accepts any payee holding at least
+/// `MNPAYMENTS_SIGNATURES_REQUIRED` (6) votes for the scoring block and
+/// accepts the block outright when no payee has 6 votes, and searches every
+/// output for each payee; this helper uses its own subsidy schedule and
+/// percentage, one expected payee and the first matching output. Core only
+/// reaches that check through `HasValidMasternodePayee`, which it skips after
+/// DeprecateMasternodes, before masternode sync, at height <= 100 and under
+/// `-override_mnpayee` (BlockIncentivesPopulator.cpp:175-229); IronDivi's
+/// block connection makes no vote-based payee check at all (see
+/// docs/security-performance-remediation-ledger.md, masternode payee matrix).
 pub fn validate_block_payment(
     tx: &Transaction,
     block_height: i32,

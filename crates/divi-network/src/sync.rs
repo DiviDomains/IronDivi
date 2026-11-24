@@ -1393,6 +1393,14 @@ impl BlockSync {
         if !parent_known && !(requested && self.block_on_its_way(&prev)) {
             self.ask_up_to(peer_id, hash, prev).await;
         }
+        // Divi Core goes no further with a block whose parent it does not know
+        // (no AddInventoryKnown, no acceptBlockForChainExtension): the getblocks
+        // is all the peer hears. One nobody asked for is still held below,
+        // within the download budget, so that it connects when its parent
+        // comes; but it cannot connect now, so it must not drive a connect or
+        // request pass, whose empty-queue check would send a getblocks of its
+        // own during initial download
+        let unrequested_orphan = !parent_known && !requested;
 
         // The tip before, to announce the new one if it moves
         let tip_before = self.chain.tip().map(|t| t.hash);
@@ -1427,6 +1435,13 @@ impl BlockSync {
             }
         }
         self.stats.write().blocks_downloaded += 1;
+        if unrequested_orphan {
+            debug!(
+                "Holding unrequested block {} from peer {}: parent {} unknown",
+                hash, peer_id, prev
+            );
+            return;
+        }
 
         // Try to connect blocks
         self.try_connect_blocks().await;
@@ -2630,16 +2645,40 @@ impl BlockSync {
     /// When blocks can't connect to our tip, we need to fill the gap. Instead of
     /// just re-requesting from the same peer (which may send the same non-connecting
     /// blocks), we force selection of a different sync peer to break the stall cycle.
+    ///
+    /// An orphan whose sender was already sent Divi Core's getblocks for it
+    /// (`ask_up_to`, main.cpp:822-833) has had its gap asked for; Core sends
+    /// nothing more for it, so neither is a getblocks sent here for orphans
+    /// that are all of that kind. One that came from a download, or whose
+    /// record the per-peer bound dropped, is asked for here as before.
     async fn request_missing_blocks_for_orphans(&self) {
         let our_height = self.chain.height();
 
-        let orphan_count = {
-            let orphans = self.orphan_blocks.read();
-            if orphans.is_empty() {
-                return;
-            }
-            orphans.len()
+        let held: Vec<(Hash256, PeerId, Hash256)> = self
+            .orphan_blocks
+            .read()
+            .owned()
+            .map(|(hash, owner, orphan)| (*hash, owner, orphan.block.header.prev_block))
+            .collect();
+        if held.is_empty() {
+            return;
+        }
+        let orphan_count = held.len();
+        let all_asked = {
+            let asked = self.blocks_requested.read();
+            held.iter().all(|(hash, owner, prev)| {
+                asked
+                    .get(owner)
+                    .is_some_and(|stops| stops.contains(hash) || stops.contains(prev))
+            })
         };
+        if all_asked {
+            debug!(
+                "{} orphan blocks wait on the getblocks already sent to their senders",
+                orphan_count
+            );
+            return;
+        }
 
         debug!(
             "Requesting blocks to fill gap at height {} for {} orphans",
@@ -3095,6 +3134,174 @@ mod tests {
         let compact = 0x1e800001;
         let target = target_from_compact(compact);
         assert!(target.is_zero(), "Negative target should give zero");
+    }
+
+    /// Divi Core `uint256::SetCompact` (uint256.cpp:296-314), transcribed:
+    /// the little-endian value and its `pfNegative` / `pfOverflow` flags
+    fn cpp_set_compact(n: u32) -> ([u8; 32], bool, bool) {
+        let size = (n >> 24) as usize;
+        let mut word = n & 0x007f_ffff;
+        let mut out = [0u8; 32];
+        if size <= 3 {
+            word >>= 8 * (3 - size);
+            out[..4].copy_from_slice(&word.to_le_bytes());
+        } else {
+            for i in 0..3 {
+                if size - 3 + i < 32 {
+                    out[size - 3 + i] = (word >> (8 * i)) as u8;
+                }
+            }
+        }
+        let negative = word != 0 && (n & 0x0080_0000) != 0;
+        let overflow =
+            word != 0 && (size > 34 || (word > 0xff && size > 33) || (word > 0xffff && size > 32));
+        (out, negative, overflow)
+    }
+
+    /// Divi Core `uint256::GetCompact(false)` (uint256.cpp:316-337)
+    fn cpp_get_compact(v: &[u8; 32]) -> u32 {
+        let mut size = 32;
+        while size > 0 && v[size - 1] == 0 {
+            size -= 1;
+        }
+        let low = |from: usize| -> u32 {
+            (0..3)
+                .filter(|i| from + i < 32)
+                .map(|i| (v[from + i] as u32) << (8 * i))
+                .sum()
+        };
+        let mut compact = if size <= 3 {
+            low(0) << (8 * (3 - size))
+        } else {
+            low(size - 3)
+        };
+        if compact & 0x0080_0000 != 0 {
+            compact >>= 8;
+            size += 1;
+        }
+        compact | ((size as u32) << 24)
+    }
+
+    /// The canonical encodings: every GetCompact of a value below 2^255, which
+    /// bounds every Divi network's PoW and PoS limit (regtest's is the largest,
+    /// ~uint256(0) >> 1, 0x207fffff)
+    fn canonical_compacts() -> Vec<u32> {
+        let mut out = Vec::new();
+        for size in 1..=32usize {
+            for mantissa in [
+                0x00_0001u32,
+                0x00_007f,
+                0x00_0080,
+                0x00_00ff,
+                0x00_ffff,
+                0x01_0000,
+                0x0f_ffff,
+                0x12_3456,
+                0x7f_ffff,
+                0x80_0000,
+                0xff_ffff,
+            ] {
+                let mut v = [0u8; 32];
+                for i in 0..3 {
+                    if size + i >= 3 && size + i - 3 < 32 {
+                        v[size + i - 3] = (mantissa >> (8 * i)) as u8;
+                    }
+                }
+                if v[31] & 0x80 != 0 {
+                    continue;
+                }
+                out.push(cpp_get_compact(&v));
+            }
+        }
+        out.extend([
+            0x1e0f_fff0, // mainnet/testnet genesis
+            0x1e0f_ffff, // mainnet PoW limit (~uint256(0) >> 20)
+            0x1e00_ffff, // PoS limit (~uint256(0) >> 24)
+            0x207f_ffff, // regtest PoW limit
+            0x1b04_04cb,
+            0x1d00_ffff,
+        ]);
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// A3: the three compact-target decoders agree with Divi Core's SetCompact
+    /// on every canonical encoding, the only kind a Divi chain can accept:
+    /// `Chain::check_block_work` requires a block's bits to equal the
+    /// GetCompact of the required target before any decoder reads them for
+    /// work or stake (chain.rs accept_block_ref 5b)
+    #[test]
+    fn compact_target_decoders_match_set_compact_on_canonical_bits() {
+        let compacts = canonical_compacts();
+        assert!(compacts.len() > 250, "{}", compacts.len());
+        for n in compacts {
+            let (cpp, negative, overflow) = cpp_set_compact(n);
+            assert!(!negative && !overflow, "0x{n:08x} is canonical");
+            assert_eq!(cpp_get_compact(&cpp), n, "0x{n:08x} round-trips");
+            assert_eq!(
+                Hash256::from_compact(n).as_bytes(),
+                &cpp,
+                "Hash256 0x{n:08x}"
+            );
+            assert_eq!(
+                divi_consensus::target::Target::from_compact(n)
+                    .to_hash256()
+                    .as_bytes(),
+                &cpp,
+                "Target 0x{n:08x}"
+            );
+            assert_eq!(target_from_compact(n).as_bytes(), &cpp, "sync 0x{n:08x}");
+        }
+    }
+
+    /// A3: on encodings GetCompact never produces, the decoders differ from
+    /// SetCompact and from each other. Recorded so a change is deliberate: none
+    /// of these reach a Divi consensus decision (see the test above); with
+    /// PrivateDivi's work check off (B3 hold) a header's bits are unchecked
+    /// anyway. `target_from_compact` and `Target` refuse with zero where Core
+    /// sets pfNegative/pfOverflow; `Hash256` keeps the sign bit in the mantissa.
+    #[test]
+    fn compact_target_decoders_on_non_canonical_bits() {
+        let hash = |n| *Hash256::from_compact(n).as_bytes();
+        let target = |n| {
+            *divi_consensus::target::Target::from_compact(n)
+                .to_hash256()
+                .as_bytes()
+        };
+        let sync = |n| *target_from_compact(n).as_bytes();
+        let zero = [0u8; 32];
+
+        // Negative flag with a nonzero mantissa: Core's magnitude ignores bit 23
+        for n in [0x1e80_0001u32, 0x1d80_ffff, 0x0380_0001, 0x0480_0000] {
+            let (cpp, negative, _) = cpp_set_compact(n);
+            assert_eq!(negative, n & 0x007f_ffff != 0, "0x{n:08x}");
+            assert_ne!(hash(n), cpp, "Hash256 keeps bit 23 of 0x{n:08x}");
+            assert_eq!(target(n), zero, "Target 0x{n:08x}");
+            assert_eq!(sync(n), zero, "sync 0x{n:08x}");
+        }
+        // Exponents 33 and 34: Core truncates past 256 bits and flags overflow
+        // only above it; Hash256 truncates the same way, the others refuse
+        for n in [0x2100_00ffu32, 0x2100_ffff, 0x2101_0000, 0x2200_00ff] {
+            let (cpp, _, overflow) = cpp_set_compact(n);
+            assert_eq!(hash(n), cpp, "Hash256 0x{n:08x}");
+            assert_eq!(target(n), zero, "Target 0x{n:08x}");
+            assert_eq!(sync(n), zero, "sync 0x{n:08x}");
+            assert_eq!(overflow, n == 0x2101_0000, "0x{n:08x}");
+        }
+        // Past 34 every decoder and Core lose the mantissa: zero, flagged
+        for n in [0x2300_0001u32, 0xff7f_ffff] {
+            let (cpp, _, overflow) = cpp_set_compact(n);
+            assert!(overflow && cpp == zero, "0x{n:08x}");
+            assert_eq!((hash(n), target(n), sync(n)), (zero, zero, zero));
+        }
+        // Zero mantissa and exponents 0..=3 that shift it away agree: zero
+        for n in [0x0000_0000u32, 0x1e00_0000, 0x0100_00ff, 0x0200_00ff] {
+            assert_eq!(cpp_set_compact(n).0, zero, "0x{n:08x}");
+            assert_eq!((hash(n), target(n), sync(n)), (zero, zero, zero));
+        }
+        // Exponent 0 with mantissa bits only Core masks: still zero for all
+        assert_eq!(hash(0x00ff_ffff), zero);
     }
 
     #[test]
@@ -4759,6 +4966,84 @@ mod tests {
             vec![child_hash],
             "a getblocks up to the block that came"
         );
+    }
+
+    /// Divi Core's getblocks is all it sends for a block nobody asked for whose
+    /// parent it lacks (main.cpp:822-833). irondivid holds the block within the
+    /// download budget, and the timeout pass that moves it to the orphans asks
+    /// for no gap of its own while that getblocks stands; with the record gone
+    /// it asks as before
+    #[tokio::test]
+    async fn a_held_unrequested_orphan_sends_no_getblocks_beyond_divi_core_s() {
+        let (sync, mut rxs, _dir) = sync_with_peers(2);
+        // Both past the version handshake, so either can be the sync peer
+        sync.update_peer_height(1, 0);
+        sync.update_peer_height(2, 0);
+        let parent = next_block(&sync.chain);
+        let parent_hash = compute_block_hash(&parent.header);
+        let tip = sync.chain.tip().unwrap();
+        let mut child = parent.clone();
+        child.header.prev_block = parent_hash;
+        child.header.time = parent.header.time + 60;
+        let mut tag = divi_storage::bip34_height_script(tip.height + 2);
+        tag.extend_from_slice(&(tip.height + 2).to_le_bytes());
+        child.transactions[0].vin[0].script_sig = divi_primitives::script::Script::from_bytes(tag);
+        child.header.merkle_root = divi_crypto::compute_merkle_root(&child.transactions);
+        child.header.nonce = 0;
+        let target = Hash256::from_compact(child.header.bits);
+        while compute_block_hash(&child.header) > target {
+            child.header.nonce += 1;
+        }
+        let child_hash = compute_block_hash(&child.header);
+        type Inboxes = HashMap<PeerId, tokio::sync::mpsc::Receiver<NetworkMessage>>;
+        fn getblocks(rxs: &mut Inboxes) -> Vec<(PeerId, Hash256)> {
+            let mut sent = Vec::new();
+            for (&id, rx) in rxs.iter_mut() {
+                while let Ok(msg) = rx.try_recv() {
+                    if let NetworkMessage::GetBlocks(m) = msg {
+                        sent.push((id, m.stop_hash));
+                    }
+                }
+            }
+            sent.sort_by_key(|(id, _)| *id);
+            sent
+        }
+
+        sync.handle_block(1, child.clone()).await;
+        assert_eq!(getblocks(&mut rxs), vec![(1, child_hash)]);
+        sync.check_timeouts().await;
+        assert!(
+            sync.orphan_blocks.read().contains_key(&child_hash),
+            "held as an orphan"
+        );
+        sync.check_timeouts().await;
+        assert_eq!(
+            getblocks(&mut rxs),
+            vec![],
+            "nothing beyond Core's getblocks"
+        );
+
+        // Sent again, Core asks up to its parent (main.cpp:828-831), and no more
+        sync.handle_block(1, child.clone()).await;
+        sync.check_timeouts().await;
+        assert_eq!(getblocks(&mut rxs), vec![(1, parent_hash)]);
+
+        // Another such block whose record is gone (the per-peer bound dropped
+        // it) has its gap filled as before
+        let mut other = child;
+        other.header.time += 1;
+        other.header.nonce = 0;
+        while compute_block_hash(&other.header) > target {
+            other.header.nonce += 1;
+        }
+        let other_hash = compute_block_hash(&other.header);
+        sync.handle_block(1, other).await;
+        assert_eq!(getblocks(&mut rxs), vec![(1, other_hash)]);
+        sync.blocks_requested.write().clear();
+        sync.check_timeouts().await;
+        let sent = getblocks(&mut rxs);
+        assert_eq!(sent.len(), 1, "one gap-filling getblocks: {sent:?}");
+        assert_eq!(sent[0].1, Hash256::zero());
     }
 
     /// A block that was asked for but whose parent is unknown and not on its way

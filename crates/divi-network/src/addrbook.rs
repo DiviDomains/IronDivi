@@ -778,6 +778,14 @@ impl AddressBook {
         n
     }
 
+    /// Empty the book and give it `key`. A new book draws its key at random,
+    /// as CAddrMan does, so which addresses share a bucket slot changes from
+    /// run to run; a fixture that counts what the book keeps fixes the key
+    #[cfg(test)]
+    pub(crate) fn reset_with_key(&self, key: [u8; 32]) {
+        *self.tables.lock() = Tables::empty(key);
+    }
+
     /// CAddrDB::Read (AddrDB.cpp:59-109): the checksum over all before it, the
     /// network magic, then the tables
     fn decode(&self, bytes: &[u8]) -> Option<Tables> {

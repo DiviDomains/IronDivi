@@ -72,7 +72,15 @@ pub mod codec;
 pub mod connection;
 pub mod gossip;
 pub mod local;
-pub mod masternode_handler;
+// An earlier masternode message handler with none of Divi Core's checks and
+// not its wire format. The node handles masternode messages through the
+// authenticated divi-rpc mn_list / mn_votes code; nothing outside this file
+// ever constructed this one, so it is compiled for its own tests only and is
+// no longer part of the public API. Its tests cover only construction and the
+// sync status, so the rest of it is dead even there
+#[cfg(test)]
+#[allow(dead_code)]
+mod masternode_handler;
 pub mod peer;
 pub mod peer_clock;
 pub mod peer_log;
@@ -102,7 +110,6 @@ pub use version::VersionMessage;
 // P2P types
 pub use codec::DiviCodec;
 pub use connection::{connect_timeout, set_connect_timeout_ms, Connection};
-pub use masternode_handler::MasternodeHandler;
 pub use peer::{LivePeerStats, PeerDirection, PeerEvent, PeerHandle, PeerId, PeerInfo, PeerState};
 pub use peer_clock::{PeerClock, Ticker};
 pub use peer_manager::{

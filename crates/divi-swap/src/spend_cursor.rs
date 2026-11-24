@@ -435,10 +435,15 @@ mod tests {
             chain.mine(2);
             let floor = b.tip_height().await.unwrap() + 1 - u64::from(confirmations);
             assert_eq!(floor, 3);
-            assert_eq!(find_spend(&store, SWAP, WATCH, &b, &at, floor, None).await.unwrap(), Found::Pending);
+            assert_eq!(
+                find_spend(&store, SWAP, WATCH, &b, &at, floor, None)
+                    .await
+                    .unwrap(),
+                Found::Pending
+            );
         }
         let store = Store::open(&db).unwrap();
-        assert!(matches!(read(&store,&b,&at).await, Found::Spend(_)));
+        assert!(matches!(read(&store, &b, &at).await, Found::Spend(_)));
     }
 
     /// A shallow reorg replaces the marked block and re-mines the claim below the old mark:
@@ -492,7 +497,7 @@ mod tests {
     #[tokio::test]
     async fn an_incomplete_window_is_pending_not_no_spend() {
         // Claim 26 blocks past the lock, window 10: the first pass reads 1..=10, short of it.
-        let (chain, b, at) = claimed_late(24, 20, 10).await;
+        let (_chain, b, at) = claimed_late(24, 20, 10).await;
         let store = Store::in_memory().unwrap();
         let got = read(&store, &b, &at).await;
         assert_eq!(got, Found::Pending);

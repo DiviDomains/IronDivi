@@ -205,7 +205,11 @@ fn cpp_divi_pq_modules_have_zero_floating_point_types() {
 
     for rel in &pq_files {
         let full = src_dir.join(rel);
-        assert!(full.exists(), "Expected C++ PQ file {} to exist", full.display());
+        assert!(
+            full.exists(),
+            "Expected C++ PQ file {} to exist",
+            full.display()
+        );
         assert_no_float_identifiers(&full);
     }
 }
@@ -236,7 +240,10 @@ fn cpp_divi_lockstep_suite_and_ffi_parity_across_dip_pq_0_through_4() {
         .arg(&pqcrypto_obj)
         .status()
         .expect("invoke gcc on divi_pqcrypto.c");
-    assert!(c_status.success(), "gcc compilation of divi_pqcrypto.c failed");
+    assert!(
+        c_status.success(),
+        "gcc compilation of divi_pqcrypto.c failed"
+    );
 
     // 1. Compile and run the standalone C++11 test suite (`pq_lockstep_tests.cpp`)
     let standalone_bin = tmp_dir.join("pq_lockstep_tests");
@@ -451,7 +458,10 @@ int main()
         .arg(&ffi_driver_bin)
         .status()
         .expect("compile ffi_parity_driver");
-    assert!(driver_compile.success(), "ffi_parity_driver compilation failed");
+    assert!(
+        driver_compile.success(),
+        "ffi_parity_driver compilation failed"
+    );
 
     let driver_out = Command::new(&ffi_driver_bin)
         .output()
@@ -498,7 +508,10 @@ int main()
     preimage_a.extend_from_slice(&(1750000100i64).to_le_bytes());
     preimage_a.extend_from_slice(&secp_sig);
     let rust_spork_hash_a = Sha256::digest(&preimage_a);
-    assert_eq!(get_val("DIP_PQ_2_SPORK_HASH_I64"), hex::encode(rust_spork_hash_a));
+    assert_eq!(
+        get_val("DIP_PQ_2_SPORK_HASH_I64"),
+        hex::encode(rust_spork_hash_a)
+    );
 
     let mut preimage_b = Vec::with_capacity(107 + 8);
     preimage_b.extend_from_slice(b"DIVI-SPORK-PAYLOAD-V1");
@@ -509,7 +522,10 @@ int main()
     preimage_b.extend_from_slice(&(1750000100i64).to_le_bytes());
     preimage_b.extend_from_slice(&secp_sig);
     let rust_spork_hash_b = Sha256::digest(&preimage_b);
-    assert_eq!(get_val("DIP_PQ_2_SPORK_HASH_STR"), hex::encode(rust_spork_hash_b));
+    assert_eq!(
+        get_val("DIP_PQ_2_SPORK_HASH_STR"),
+        hex::encode(rust_spork_hash_b)
+    );
 
     // Verify DIP-PQ-3 scripts and Bech32m address
     assert_eq!(
@@ -531,8 +547,11 @@ int main()
     pos_preimage[17..49].copy_from_slice(&[0x11u8; 32]);
     pos_preimage[49..81].copy_from_slice(&[0x22u8; 32]);
     pos_preimage[81..85].copy_from_slice(&1u32.to_le_bytes());
-    let rust_pos_hash = Sha256::digest(&pos_preimage);
-    assert_eq!(get_val("DIP_PQ_4_POS_PAYLOAD_HASH"), hex::encode(rust_pos_hash));
+    let rust_pos_hash = Sha256::digest(pos_preimage);
+    assert_eq!(
+        get_val("DIP_PQ_4_POS_PAYLOAD_HASH"),
+        hex::encode(rust_pos_hash)
+    );
 
     // Also verify Rust divi-crypto primitives match the C++ expectations on sample keys
     let fn_pk = build_sample_fn_dsa_512_pubkey(1);
@@ -562,8 +581,7 @@ int main()
     // Verify BIP39 -> PQ HD derivation & LMS verification in Rust
     let seed = [0x55u8; 64];
     let master = derive_pq_master(&seed).expect("derive master");
-    let leaf = derive_pq_leaf(&seed, 301, 0, PqSchemeId::MlDsa44, 0)
-        .expect("derive leaf");
+    let leaf = derive_pq_leaf(&seed, 301, 0, PqSchemeId::MlDsa44, 0).expect("derive leaf");
     assert_ne!(master.key_bytes(), leaf.k_leaf());
 
     let lms_pk = hex::decode(

@@ -2420,6 +2420,258 @@ mod tests {
         );
     }
 
+    /// Divi Core `CNetAddr::GetGroup` (netbase.cpp:952-1010) worked by hand for
+    /// fixed addresses: NET_UNROUTABLE 0, NET_IPV4 1, NET_IPV6 2, NET_TOR 3,
+    /// then the prefix bytes (`GetByte(15 - n)` is byte n of the 16)
+    fn core_group_cases() -> Vec<(&'static str, Vec<u8>)> {
+        vec![
+            ("1.2.3.4", vec![1, 1, 2]),
+            ("1.2.200.9", vec![1, 1, 2]),
+            ("::ffff:1.2.7.7", vec![1, 1, 2]),
+            ("1.3.3.4", vec![1, 1, 3]),
+            ("8.8.1.1", vec![1, 8, 8]),
+            // all local and unroutable addresses: one group
+            ("127.0.0.1", vec![0]),
+            ("::1", vec![0]),
+            ("10.1.2.3", vec![0]),
+            ("192.168.1.1", vec![0]),
+            ("172.16.0.1", vec![0]),
+            ("169.254.1.1", vec![0]),
+            ("fe80::1", vec![0]),
+            // IPv6 /32
+            ("2a01:4f8:c0c:1234::2", vec![2, 0x2a, 0x01, 0x04, 0xf8]),
+            ("2a01:4f8:ffff::9", vec![2, 0x2a, 0x01, 0x04, 0xf8]),
+            ("2600:1234:1::1", vec![2, 0x26, 0x00, 0x12, 0x34]),
+            ("2600:1235::1", vec![2, 0x26, 0x00, 0x12, 0x35]),
+            // he.net: /36, the low nibble filled with ones
+            ("2001:470:1:2::3", vec![2, 0x20, 0x01, 0x04, 0x70, 0x0f]),
+            ("2001:470:1f00::1", vec![2, 0x20, 0x01, 0x04, 0x70, 0x1f]),
+            // 6to4: the IPv4 address inside, so 1.2.x.x's group
+            ("2002:102:304::1", vec![1, 0x01, 0x02]),
+            // Teredo: the IPv4 address inside, inverted
+            ("2001:0:4136:e378:8000:63bf:3fff:fdd2", vec![1, 0xc0, 0x00]),
+            // OnionCat Tor: four bits after the prefix
+            ("fd87:d87e:eb43:1234::1", vec![3, 0x1f]),
+            ("fd87:d87e:eb43:f234::1", vec![3, 0xff]),
+        ]
+    }
+
+    fn book_group(ip: IpAddr) -> Vec<u8> {
+        let bytes = match ip {
+            IpAddr::V4(v4) => v4.to_ipv6_mapped().octets(),
+            IpAddr::V6(v6) => v6.octets(),
+        };
+        crate::addrbook::group(&bytes)
+    }
+
+    /// L2: the address book's group (bucket placement) is Core's byte for byte
+    #[test]
+    fn address_book_groups_are_core_get_group() {
+        for (ip, core) in core_group_cases() {
+            assert_eq!(book_group(ip.parse().unwrap()), core, "{ip}");
+        }
+    }
+
+    /// L2: the group the automatic dial rule keeps one outbound peer in
+    /// (`net_group`) partitions addresses as Core's `setConnected` of
+    /// `GetGroup` does (net.cpp:1136-1154) for IPv4 /16, mapped IPv4 and
+    /// ordinary IPv6 /32, but not for the tunnelled and special prefixes listed
+    /// here, which are therefore recorded, not claimed as parity (open, D4).
+    /// Unroutable addresses never reach the dial rule: the book refuses them.
+    #[test]
+    fn dial_groups_against_core_get_group() {
+        let cases = core_group_cases();
+        let mut differ = Vec::new();
+        for (a, core_a) in &cases {
+            for (b, core_b) in &cases {
+                if a >= b {
+                    continue;
+                }
+                let same_core = core_a == core_b;
+                let same_dial = net_group(a.parse().unwrap()) == net_group(b.parse().unwrap());
+                if same_core != same_dial {
+                    differ.push((*a, *b, same_core));
+                }
+            }
+        }
+        differ.sort();
+        let mut expected = vec![
+            // Core: one /16 with 1.2.x.x. Here: a separate /32
+            ("1.2.200.9", "2002:102:304::1", true),
+            ("1.2.3.4", "2002:102:304::1", true),
+            ("2002:102:304::1", "::ffff:1.2.7.7", true),
+            // Core: two he.net /36 groups. Here: one /32
+            ("2001:470:1:2::3", "2001:470:1f00::1", false),
+            // Core: two Tor groups. Here: both "private", with RFC1918/4193
+            ("fd87:d87e:eb43:1234::1", "fd87:d87e:eb43:f234::1", false),
+        ];
+        // Core: every unroutable address in one group. Here: loopback apart
+        // from private and link-local ranges, and Tor counted with the private
+        for loopback in ["127.0.0.1", "::1"] {
+            for other in [
+                "10.1.2.3",
+                "192.168.1.1",
+                "172.16.0.1",
+                "169.254.1.1",
+                "fe80::1",
+            ] {
+                expected.push(if loopback < other {
+                    (loopback, other, true)
+                } else {
+                    (other, loopback, true)
+                });
+            }
+        }
+        for tor in ["fd87:d87e:eb43:1234::1", "fd87:d87e:eb43:f234::1"] {
+            for private in [
+                "10.1.2.3",
+                "192.168.1.1",
+                "172.16.0.1",
+                "169.254.1.1",
+                "fe80::1",
+            ] {
+                expected.push(if tor < private {
+                    (tor, private, false)
+                } else {
+                    (private, tor, false)
+                });
+            }
+        }
+        expected.sort();
+        assert_eq!(differ, expected);
+        for ip in ["127.0.0.1", "10.1.2.3", "fe80::1", "169.254.1.1"] {
+            assert!(!crate::local::is_routable(&ip.parse().unwrap()), "{ip}");
+        }
+    }
+
+    /// A manager whose dials go to a proxy on a closed local port: nothing
+    /// leaves the machine, and on a current-thread runtime the dials it picks
+    /// are read before any dial task runs
+    fn offline_manager(connect_only: bool) -> Arc<PeerManager> {
+        let closed = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let pm = PeerManager::new(PeerManagerConfig {
+            magic: crate::REGTEST_MAGIC,
+            dns_seeds: vec![],
+            default_port: 51476,
+            connect_only,
+            proxy: Some(crate::socks5::Proxy {
+                addr: closed,
+                randomize_credentials: true,
+            }),
+            ..Default::default()
+        });
+        pm.set_local_addresses(crate::local::LocalAddresses::new(true, true, 51476));
+        pm
+    }
+
+    fn picked_groups(pm: &PeerManager) -> Vec<Vec<u8>> {
+        let mut groups: Vec<Vec<u8>> = pm
+            .connecting_addrs
+            .read()
+            .iter()
+            .map(|a| net_group(a.ip()))
+            .collect();
+        groups.sort();
+        groups
+    }
+
+    /// L2: a fixed offline candidate book through `AddrBook` and
+    /// `dial_learnt`: one attempted dial per IPv4 /16 and IPv6 /32 group, none
+    /// to the unroutable candidates; established outbound peers keep their
+    /// group, a disconnect frees it, the book survives a peers.dat round trip
+    /// with the same groups chosen, and `connect_only` dials none. Attempted
+    /// dials (`connecting_addrs`) are separated from established peers. This
+    /// shows the dial rule on these inputs, not a level of eclipse resistance.
+    #[tokio::test]
+    async fn outbound_selection_keeps_one_dial_per_group_across_restart() {
+        let candidates = [
+            "8.8.1.1:51476",
+            "8.8.2.2:51476",
+            "8.8.3.3:51476",
+            "8.9.1.1:51476",
+            "8.9.200.1:51476",
+            "9.9.9.9:51476",
+            "[2600:1234:1::1]:51476",
+            "[2600:1234:2::1]:51476",
+            "[2600:1235::1]:51476",
+            "10.0.0.1:51476",
+            "127.0.0.1:51476",
+            "[fe80::1]:51476",
+        ];
+        let addrs: Vec<SocketAddr> = candidates.iter().copied().map(sa).collect();
+        let routable_groups = {
+            let mut g: Vec<Vec<u8>> = addrs
+                .iter()
+                .filter(|a| crate::local::is_routable(&a.ip()))
+                .map(|a| net_group(a.ip()))
+                .collect();
+            g.sort();
+            g.dedup();
+            g
+        };
+        assert_eq!(routable_groups.len(), 5);
+
+        let dir = tempfile::tempdir().unwrap();
+        let pm = offline_manager(false);
+        assert_eq!(pm.address_book.open(dir.path()), 0);
+        // A fixed key: with a random one, two candidates of a group can draw
+        // the same new-table slot and the second is not kept
+        pm.address_book.reset_with_key([0x5a; 32]);
+        pm.address_book.add_seeds(&addrs);
+        assert_eq!(
+            pm.address_book.len(),
+            9,
+            "the book refuses unroutable entries"
+        );
+
+        pm.dial_learnt();
+        assert_eq!(picked_groups(&pm), routable_groups, "one dial per group");
+        let picked: Vec<SocketAddr> = pm.connecting_addrs.read().iter().copied().collect();
+
+        // The dials succeed: each becomes an outbound peer, marked good
+        let mut ids = Vec::new();
+        for addr in &picked {
+            let handle = test_handle(&addr.to_string(), false);
+            ids.push((handle.id, *addr));
+            pm.insert_test_peer(handle);
+            pm.connecting_addrs.write().remove(addr);
+            pm.address_book.good(*addr);
+        }
+        pm.dial_learnt();
+        assert!(pm.connecting_addrs.read().is_empty(), "every group is held");
+
+        // An inbound peer does not hold a group; a disconnect frees one
+        pm.insert_test_peer(test_handle("8.8.77.77:40000", true));
+        let (gone, gone_addr) = *ids
+            .iter()
+            .find(|(_, a)| net_group(a.ip()) == net_group(sa("8.8.1.1:1").ip()))
+            .unwrap();
+        pm.remove_test_peer(gone);
+        pm.dial_learnt();
+        let redial: Vec<SocketAddr> = pm.connecting_addrs.read().iter().copied().collect();
+        assert_eq!(redial.len(), 1, "{redial:?}");
+        assert_eq!(net_group(redial[0].ip()), net_group(gone_addr.ip()));
+
+        // Restart: peers.dat round trip into a fresh manager
+        pm.address_book.save().unwrap();
+        let again = offline_manager(false);
+        assert_eq!(again.address_book.open(dir.path()), 9);
+        for addr in &picked {
+            assert!(again.address_book.time_of(*addr).is_some(), "{addr} kept");
+        }
+        again.dial_learnt();
+        assert_eq!(picked_groups(&again), routable_groups);
+
+        // connect_only: the learnt book is never dialled
+        let only = offline_manager(true);
+        assert_eq!(only.address_book.open(dir.path()), 9);
+        only.dial_learnt();
+        assert!(only.connecting_addrs.read().is_empty());
+    }
+
     #[test]
     fn d4_group_claims_follow_pending_and_established_sessions() {
         for (first, same, other) in [

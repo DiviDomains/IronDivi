@@ -23,9 +23,13 @@
 use bytes::BytesMut;
 use divi_network::constants::{MAINNET_MAGIC, MAX_MESSAGE_SIZE};
 use divi_network::{DiviCodec, MessageHeader, NetworkMessage};
+use divi_primitives::amount::Amount;
 use divi_primitives::block::BlockHeader;
 use divi_primitives::compact::{CompactSize, MAX_SIZE};
+use divi_primitives::hash::Hash256;
+use divi_primitives::script::Script;
 use divi_primitives::serialize::{serialize, Encodable};
+use divi_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut};
 use proptest::prelude::*;
 use proptest::test_runner::{Config, TestRunner};
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -74,6 +78,40 @@ fn compact(n: u64) -> Vec<u8> {
     let mut v = Vec::new();
     CompactSize(n).encode(&mut v).unwrap();
     v
+}
+
+/// A coinbase and a coinstake, then a signature length of `sig_len` with no
+/// signature bytes after it
+fn pos_block_claiming_signature(sig_len: u64) -> Vec<u8> {
+    let coinbase = Transaction {
+        version: 1,
+        vin: vec![TxIn::coinbase(Script::from_bytes(vec![0x04, 0xff]))],
+        vout: vec![TxOut::new(Amount::from_divi(1), Script::new())],
+        lock_time: 0,
+    };
+    let coinstake = Transaction {
+        version: 1,
+        vin: vec![TxIn::new(
+            OutPoint::new(Hash256::from_bytes([1u8; 32]), 0),
+            Script::new(),
+            u32::MAX,
+        )],
+        vout: vec![
+            TxOut::empty(),
+            TxOut::new(Amount::from_divi(2), Script::new()),
+        ],
+        lock_time: 0,
+    };
+    assert!(coinstake.is_coinstake());
+    let mut b = serialize(&BlockHeader {
+        version: 4,
+        ..Default::default()
+    });
+    b.extend(compact(2));
+    b.extend(serialize(&coinbase));
+    b.extend(serialize(&coinstake));
+    b.extend(compact(sig_len));
+    b
 }
 
 /// Payloads whose announced sizes promise far more than they carry
@@ -138,6 +176,9 @@ fn lying_payloads() -> Vec<(&'static str, Vec<u8>)> {
         ]
         .concat(),
     ));
+    // A proof-of-stake block whose signature announces MAX_SIZE bytes: the
+    // signature is outside the block hash, so any relaying peer can set it
+    out.push(("block", pos_block_claiming_signature(MAX_SIZE)));
     // Many announced headers
     out.push(("headers", compact(1_000_000)));
     // Inventory that announces the most items a 2 MiB payload could hold

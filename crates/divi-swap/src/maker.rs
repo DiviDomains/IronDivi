@@ -1421,7 +1421,7 @@ impl Maker {
     /// where the last one stopped ([`spend_cursor`]).
     ///
     /// [`Revealed::Pending`] (a bounded spend scan short of the tip) is kept distinct from
-    /// [`Revealed::NotRevealed`]: a maker-leg refund must never go out while the taker's claim
+    /// [`Revealed::NoClaim`]: a maker-leg refund must never go out while the taker's claim
     /// could still be hiding past the scanned window (review finding S10b).
     async fn revealed_preimage(&self, r: &mut MakerRecord) -> Result<Revealed> {
         let (htlc, funding) = self.maker_leg(r)?;
@@ -1445,17 +1445,17 @@ impl Maker {
             return Ok(Revealed::Pending);
         }
         let Some(spend) = found.spend() else {
-            return Ok(Revealed::NotRevealed);
+            return Ok(Revealed::NoClaim);
         };
         if r.maker_leg_refund
             .as_ref()
             .is_some_and(|t| t.txid == spend.txid)
         {
-            return Ok(Revealed::NotRevealed);
+            return Ok(Revealed::NoClaim);
         }
         Ok(match spend.extract_preimage(&r.hash) {
             Some(p) => Revealed::Preimage(p),
-            None => Revealed::NotRevealed,
+            None => Revealed::NoClaim,
         })
     }
 }
@@ -1467,17 +1467,17 @@ enum Revealed {
     /// A spend other than our own refund carried the preimage.
     Preimage([u8; 32]),
     /// Read through the tip: no claim of ours was seen; the refund may proceed.
-    NotRevealed,
+    NoClaim,
     /// Only a bounded window was read; whether the taker claimed past it is unknown.
     Pending,
 }
 
 impl Revealed {
-    /// The preimage, if one was revealed. `Pending` and `NotRevealed` are both `None`.
+    /// The preimage, if one was revealed. `Pending` and `NoClaim` are both `None`.
     fn preimage(&self) -> Option<[u8; 32]> {
         match self {
             Revealed::Preimage(p) => Some(*p),
-            Revealed::NotRevealed | Revealed::Pending => None,
+            Revealed::NoClaim | Revealed::Pending => None,
         }
     }
 

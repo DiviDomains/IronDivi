@@ -119,13 +119,14 @@ pub fn signature_hash(
         tx.vout.len()
     };
     compact_size(&mut data, outputs as u64);
-    for n in 0..outputs {
+    // `outputs <= tx.vout.len()`: SIGHASH_SINGLE without a matching output returned above
+    for (n, output) in tx.vout.iter().enumerate().take(outputs) {
         if hash_single && n != input_index {
             // CTxOut(): value -1, empty script
             data.extend_from_slice(&(-1i64).to_le_bytes());
             compact_size(&mut data, 0);
         } else {
-            data.extend_from_slice(&serialize(&tx.vout[n]));
+            data.extend_from_slice(&serialize(output));
         }
     }
     data.extend_from_slice(&tx.lock_time.to_le_bytes());

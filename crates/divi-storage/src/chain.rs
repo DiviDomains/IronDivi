@@ -6616,6 +6616,220 @@ mod tests {
         );
     }
 
+    /// Divi Core's `GetNextWorkRequired` (DifficultyAdjuster.cpp:6-99) for the
+    /// block after `history[last]`, transcribed over u128 for targets below
+    /// 2^112 (`SetCompact`/`GetCompact` of uint256.cpp:296-337 included).
+    /// `history[h]` is block h's (time, bits); testnet constants: LAST_POW_BLOCK
+    /// 100, ProofOfWorkLimit ~uint256(0) >> 20, spacing 60.
+    fn core_next_work_required(history: &[(i64, u32)], last: usize) -> u32 {
+        fn set(n: u32) -> u128 {
+            let size = n >> 24;
+            let word = (n & 0x007f_ffff) as u128;
+            assert!(size <= 14, "keep the reference inside u128");
+            if size <= 3 {
+                word >> (8 * (3 - size))
+            } else {
+                word << (8 * (size - 3))
+            }
+        }
+        fn get(v: u128) -> u32 {
+            let mut size = (128 - v.leading_zeros()).div_ceil(8);
+            let mut compact = if size <= 3 {
+                (v << (8 * (3 - size))) as u32
+            } else {
+                (v >> (8 * (size - 3))) as u32
+            };
+            if compact & 0x0080_0000 != 0 {
+                compact >>= 8;
+                size += 1;
+            }
+            compact | (size << 24)
+        }
+        const POW_LIMIT_COMPACT: u32 = 0x1e0f_ffff;
+        const POS_LIMIT_COMPACT: u32 = 0x1e00_ffff;
+        if last == 0 || last < 24 {
+            return POW_LIMIT_COMPACT;
+        }
+        if last > 100 {
+            let mut spacing = history[last].0 - history[last - 1].0;
+            if spacing < 0 {
+                spacing = 1;
+            }
+            let new = set(history[last].1) * (39 * 60 + 2 * spacing) as u128 / (41 * 60);
+            // `bnNew <= 0 || bnNew > bnTargetLimit`: every value here is far
+            // below ~uint256(0) >> 24
+            return if new == 0 {
+                POS_LIMIT_COMPACT
+            } else {
+                get(new)
+            };
+        }
+        let (mut count, mut timespan, mut last_time) = (0i64, 0i64, 0i64);
+        let (mut average, mut previous) = (0u128, 0u128);
+        let mut reading = last;
+        while reading > 0 && count < 24 {
+            count += 1;
+            let target = set(history[reading].1);
+            average = if count == 1 {
+                target
+            } else {
+                (previous * count as u128 + target) / (count as u128 + 1)
+            };
+            previous = average;
+            if last_time > 0 {
+                timespan += last_time - history[reading].0;
+            }
+            last_time = history[reading].0;
+            reading -= 1;
+        }
+        let target_timespan = count * 60;
+        let timespan = timespan.clamp(target_timespan / 3, target_timespan * 3);
+        get(average * timespan as u128 / target_timespan as u128)
+    }
+
+    /// A3/L1: the bits a testnet block must carry at each retarget boundary,
+    /// admitted or refused through `check_block_work` (AcceptBlock -> CheckWork)
+    /// as Divi Core's DifficultyAdjuster computes them: the PoW limit while the
+    /// parent is below height 24, DarkGravity averaging over 24 blocks (with
+    /// both timespan clamps) up to the last PoW block's child, the PoS moving
+    /// average from height 102 on, with negative spacing counted as 1, zero
+    /// spacing kept and a zero result replaced by the PoS limit. The block
+    /// history is a synthetic index; only bits and times are read.
+    #[test]
+    fn difficulty_boundaries_are_admitted_as_divi_core_computes_them() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(ChainDatabase::open(dir.path()).unwrap());
+        let chain = Chain::new(
+            Arc::clone(&db),
+            ChainParams::for_network(NetworkType::Testnet, ChainMode::Divi),
+        )
+        .unwrap();
+        assert!(chain.params.check_block_work);
+
+        let spacing = |h: usize| -> i64 {
+            match h {
+                30..=53 => 1,   // 24 blocks far too fast: clamp at a third
+                60..=83 => 300, // far too slow: clamp at three times
+                101 => 75,      // PoS: ordinary spacing
+                102 => -10,     // PoS: a parent older than its own parent
+                103 => 0,       // PoS: zero spacing stays zero
+                104 => 13,      // PoS: 1 x 2366 / 2460 rounds to zero
+                105 => 100_000, // PoS: very slow
+                _ => [60, 13, 200, 45, 7, 600, 60, 90][h % 8],
+            }
+        };
+        let mut history: Vec<(i64, u32)> = vec![(1_538_000_000, 0x1e0f_fff0)];
+        for h in 1..=106usize {
+            let time = history[h - 1].0 + spacing(h);
+            let bits = if h == 104 {
+                0x0101_0000 // the value 1: the next PoS target rounds to zero
+            } else {
+                0x0e00_0000 | (0x10_0000 + (h as u32 * 0x4321) % 0x60_0000)
+            };
+            history.push((time, bits));
+        }
+        let hash_of = |h: usize| {
+            let mut b = [0xd1u8; 32];
+            b[..8].copy_from_slice(&(h as u64).to_le_bytes());
+            Hash256::from_bytes(b)
+        };
+        let mut indexes: Vec<BlockIndex> = Vec::new();
+        for (h, &(time, bits)) in history.iter().enumerate() {
+            let header = divi_primitives::block::BlockHeader {
+                version: 4,
+                prev_block: if h == 0 {
+                    Hash256::zero()
+                } else {
+                    hash_of(h - 1)
+                },
+                time: time as u32,
+                bits,
+                ..Default::default()
+            };
+            let mut index = BlockIndex::from_header(&header, h as u32, indexes.last());
+            index.hash = hash_of(h);
+            db.store_block_index_entry(&index).unwrap();
+            indexes.push(index);
+        }
+
+        let pos_shape = || {
+            let coinstake = Transaction {
+                version: 1,
+                vin: vec![TxIn::new(
+                    OutPoint::new(Hash256::from_bytes([3u8; 32]), 1),
+                    Script::new(),
+                    0xffff_ffff,
+                )],
+                vout: vec![
+                    TxOut::new(Amount::ZERO, Script::new()),
+                    TxOut::new(Amount::from_divi(1), Script::new_p2pkh(&[7u8; 20])),
+                ],
+                lock_time: 0,
+            };
+            vec![Transaction::default(), coinstake]
+        };
+        let mut seen_limit = false;
+        for parent in [
+            0usize, 1, 23, 24, 25, 53, 83, 99, 100, 101, 102, 103, 104, 105,
+        ] {
+            let required = core_next_work_required(&history, parent);
+            seen_limit |= parent > 100 && required == 0x1e00_ffff;
+            let p = &indexes[parent];
+            assert_eq!(
+                chain.get_next_bits(p).unwrap(),
+                required,
+                "block {} after parent {parent}",
+                parent + 1
+            );
+            let block_with = |bits: u32| {
+                let mut block = Block::default();
+                block.header.version = 4;
+                block.header.prev_block = p.hash;
+                block.header.time = p.time + 60;
+                block.header.bits = bits;
+                if parent >= LAST_POW_BLOCK as usize {
+                    block.transactions = pos_shape();
+                    assert!(block.is_proof_of_stake());
+                }
+                block
+            };
+            let admitted = block_with(required);
+            let hash = compute_block_hash(&admitted.header);
+            match chain.check_block_work(&admitted, &hash, p) {
+                // A PoS block is past CheckWork; a PoW block's bits are taken
+                // and only its unground nonce fails, or it meets them by chance
+                Ok(()) => {}
+                Err(e) => {
+                    let text = e.to_string();
+                    assert!(
+                        parent < LAST_POW_BLOCK as usize
+                            && (text.contains("hash doesn't match nBits")
+                                || text.contains("below minimum work")),
+                        "block {} with the required bits: {text}",
+                        parent + 1
+                    );
+                }
+            }
+            for wrong in [required + 1, required - 1, required ^ 0x0100_0000] {
+                let refused = block_with(wrong);
+                let hash = compute_block_hash(&refused.header);
+                let err = chain
+                    .check_block_work(&refused, &hash, p)
+                    .expect_err("wrong bits");
+                assert!(err.to_string().contains("bad-diffbits"), "{err}");
+                assert_eq!(err.misbehaviour_score(), 0, "CheckWork scores nothing");
+            }
+        }
+        assert!(seen_limit, "the zero PoS target is replaced by the limit");
+        // The two PoW clamps were reached: a third and three times the timespan
+        assert_eq!(
+            history[53].0 - history[30].0,
+            23,
+            "the fast window is far below 1440 / 3"
+        );
+        assert_eq!(history[83].0 - history[60].0, 23 * 300);
+    }
+
     fn create_test_chain() -> (Chain, tempfile::TempDir) {
         let dir = tempdir().unwrap();
         let db = Arc::new(ChainDatabase::open(dir.path()).unwrap());
